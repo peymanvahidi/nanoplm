@@ -1,1 +1,43 @@
-.venv
+.venv/
+.dvc
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# Environment files
+.env
+.envrc
+
+# Logs
+logs/
+*.log
+
+# Data (consider what you want to track with DVC vs git)
+data/*
+!data/.gitkeep
+
+# Model files
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.bin
+
+# UV package manager
+.uv/
+uv.lock

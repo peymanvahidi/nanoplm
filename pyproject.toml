@@ -1,13 +1,15 @@
 [project]
 name = "prott5-s"
 version = "0.1.0"
-description = "Add your description here"
+description = "Knowledge distillation for ProtT5"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "biopython>=1.85",
     "dvc>=3.59.1",
     "mlflow>=2.21.2",
     "pyyaml>=6.0.2",
     "torch>=2.6.0",
+    "tqdm>=4.67.1",
     "transformers>=4.50.2",
 ]
