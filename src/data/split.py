@@ -7,7 +7,6 @@ class Splitter(BaseProcessor):
     
     def split(self, shuffle=True):
         """Split processed data into training and validation sets."""
-        self.create_dirs()
         
         logger.info(f"Creating splits with val ratio {self.val_ratio} (shuffle={shuffle})")
         
@@ -44,7 +43,6 @@ class Splitter(BaseProcessor):
             random.shuffle(index)
         else:
             # Non-shuffled split using fast line counting
-            logger.info("Counting sequences...")
             total_sequences = count_records(self.processed_sequences)
         
         val_size = int(total_sequences * self.val_ratio)

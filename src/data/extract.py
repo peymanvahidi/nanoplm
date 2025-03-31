@@ -7,13 +7,12 @@ class Extractor(BaseProcessor):
     
     def extract(self):
         """Extract the gzipped FASTA file if needed."""
-        self.create_dirs()
         
         if self.uniref50_fasta.exists():
             logger.info(f"UniRef50 FASTA already extracted at {self.uniref50_fasta}")
             return
         
-        logger.info(f"Extracting {self.uniref50_fasta_gz}")
+        logger.info(f"Extracting {self.uniref50_fasta_gz}...")
         
         # Get file size for progress bar
         file_size = self.uniref50_fasta_gz.stat().st_size

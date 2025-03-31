@@ -4,41 +4,41 @@ stages:
     deps:
       - src/data/download.py
     outs:
-      - data/raw/uniref50.fasta.gz
+      - pipeline_output/data/raw/uniref50.fasta.gz
 
   extract:
     cmd: python3 main.py --extract-data
     deps:
       - src/data/extract.py
-      - data/raw/uniref50.fasta.gz
+      - pipeline_output/data/raw/uniref50.fasta.gz
     outs:
-      - data/raw/uniref50.fasta
+      - pipeline_output/data/raw/uniref50.fasta
 
   preprocess:
     cmd: python3 main.py --preprocess-data
     deps:
       - src/data/preprocess.py
-      - data/raw/uniref50.fasta
+      - pipeline_output/data/raw/uniref50.fasta
     params:
       - src/data/params.yaml:
           - min_sequence_length
           - max_sequence_length
           - max_seqs_number
     outs:
-      - data/processed/uniref50_processed.fasta
+      - pipeline_output/data/processed/uniref50_processed.fasta
 
   split:
     cmd: python3 main.py --split-data
     deps:
       - src/data/split.py
-      - data/processed/uniref50_processed.fasta
+      - pipeline_output/data/processed/uniref50_processed.fasta
     params:
       - src/data/params.yaml:
           - val_ratio
     outs:
-      - data/processed/train.fasta
-      - data/processed/val.fasta
-      - data/processed/dataset_info.txt
+      - pipeline_output/data/processed/train.fasta
+      - pipeline_output/data/processed/val.fasta
+      - pipeline_output/data/processed/dataset_info.txt
   
   # train:
   #   cmd: python3 main.py --train

@@ -5,74 +5,74 @@ stages:
     deps:
     - path: src/data/download.py
       hash: md5
-      md5: e6485a2f80b9af18fdf517ba166a89ec
-      size: 1238
+      md5: 27ddf14258757c6d86a05a9c90c2476d
+      size: 1276
     outs:
-    - path: data/raw/uniref50.fasta.gz
+    - path: pipeline_output/data/raw/uniref50.fasta.gz
       hash: md5
       md5: b39e4fdf12810e78e2befdf7460f255b
       size: 92924866
   extract:
     cmd: python3 main.py --extract-data
     deps:
-    - path: data/raw/uniref50.fasta.gz
+    - path: pipeline_output/data/raw/uniref50.fasta.gz
       hash: md5
       md5: b39e4fdf12810e78e2befdf7460f255b
       size: 92924866
     - path: src/data/extract.py
       hash: md5
-      md5: d8d7bb8bde3a5bb6aa21efbde36b7df3
-      size: 1264
+      md5: 23e4ea9dacde6571e01df5d538fc6bf1
+      size: 1240
     outs:
-    - path: data/raw/uniref50.fasta
+    - path: pipeline_output/data/raw/uniref50.fasta
       hash: md5
       md5: acd7214694350f9a0c097122b777c978
       size: 286365155
   preprocess:
     cmd: python3 main.py --preprocess-data
     deps:
-    - path: data/raw/uniref50.fasta
+    - path: pipeline_output/data/raw/uniref50.fasta
       hash: md5
       md5: acd7214694350f9a0c097122b777c978
       size: 286365155
     - path: src/data/preprocess.py
       hash: md5
-      md5: 73fb97df0844fa8a93c688a04c71b60d
-      size: 2059
+      md5: ee52367d2858683bb51766ad4742580b
+      size: 2011
     params:
       src/data/params.yaml:
-        max_seqs_number:
+        max_seqs_number: 202
         max_sequence_length: 512
         min_sequence_length: 20
     outs:
-    - path: data/processed/uniref50_processed.fasta
+    - path: pipeline_output/data/processed/uniref50_processed.fasta
       hash: md5
-      md5: 55beaa53a62cf0b034782863cda5352e
-      size: 183164750
+      md5: 7099fbb631785692da131ae0a98ed059
+      size: 60788
   split:
     cmd: python3 main.py --split-data
     deps:
-    - path: data/processed/uniref50_processed.fasta
+    - path: pipeline_output/data/processed/uniref50_processed.fasta
       hash: md5
-      md5: 55beaa53a62cf0b034782863cda5352e
-      size: 183164750
+      md5: 7099fbb631785692da131ae0a98ed059
+      size: 60788
     - path: src/data/split.py
       hash: md5
-      md5: 3fb7a2684ecdf1b1af9a8151ea32fc42
-      size: 5295
+      md5: fdd967a2fbffe636848682f99b36e290
+      size: 5219
     params:
       src/data/params.yaml:
         val_ratio: 0.1
     outs:
-    - path: data/processed/dataset_info.txt
+    - path: pipeline_output/data/processed/dataset_info.txt
       hash: md5
-      md5: f61f4afe5cbdde0c66d34d3f3f2b64e2
-      size: 341
-    - path: data/processed/train.fasta
+      md5: d9115ed19bb7fc98d46b042fb18cac47
+      size: 327
+    - path: pipeline_output/data/processed/train.fasta
       hash: md5
-      md5: 22572bf3a3ac5fcb582632fadec01f8c
-      size: 164847643
-    - path: data/processed/val.fasta
+      md5: 33ad6f564de82d294362182c70bcf091
+      size: 55203
+    - path: pipeline_output/data/processed/val.fasta
       hash: md5
-      md5: 92dbbfc4342d0818ac13cbd3e9744ec1
-      size: 18317107
+      md5: 1a478fe105754ec602b8054ab2a83ec1
+      size: 5585

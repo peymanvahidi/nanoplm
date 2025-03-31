@@ -1,13 +1,14 @@
 import urllib.request
+from pathlib import Path
 from tqdm import tqdm
 from .base import BaseProcessor, logger
 
 class Downloader(BaseProcessor):
     """Class for downloading the UniRef50 dataset."""
-    
+
     def download(self):
         """Download UniRef50 dataset if it doesn't exist."""
-        self.create_dirs()
+        self.create_dirs(self.raw_data_dir)
         
         logger.info(f"Checking if {self.uniref50_fasta_gz} exists")
         if self.uniref50_fasta_gz.exists():

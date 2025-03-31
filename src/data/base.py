@@ -1,10 +1,6 @@
 import yaml
-import logging
 from pathlib import Path
-
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from ..utils.logger import logger
 
 class BaseProcessor:
     """Base class with common functionality for data processing."""
@@ -17,8 +13,9 @@ class BaseProcessor:
             params_file (str): Path to the parameters file
         """
         # Set up paths
-        self.raw_data_dir = Path("data/raw")
-        self.processed_data_dir = Path("data/processed")
+        self.pipeline_output_dir = Path("pipeline_output")
+        self.raw_data_dir = self.pipeline_output_dir / "data/raw"
+        self.processed_data_dir = self.pipeline_output_dir / "data/processed"
         self.uniref50_url = "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
         self.uniref50_fasta_gz = self.raw_data_dir / "uniref50.fasta.gz"
         self.uniref50_fasta = self.raw_data_dir / "uniref50.fasta"
@@ -45,8 +42,11 @@ class BaseProcessor:
             params = yaml.safe_load(f)
         return params
     
-    def create_dirs(self):
+    def create_dirs(self, dir_name):
         """Create necessary directories if they don't exist."""
-        self.raw_data_dir.mkdir(parents=True, exist_ok=True)
-        self.processed_data_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Created directories: {self.raw_data_dir} and {self.processed_data_dir}") 
+        dir_path = Path(dir_name)
+        if dir_path.exists():
+            logger.info(f"Directory already exists: {dir_path}")
+        else:
+            dir_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Created directory: {dir_path}")

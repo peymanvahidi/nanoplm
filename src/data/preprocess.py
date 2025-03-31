@@ -4,17 +4,16 @@ from .base import BaseProcessor, logger
 
 class Preprocessor(BaseProcessor):
     """Class for preprocessing the UniRef50 dataset."""
-    
+
     def preprocess(self):
         """Process sequences according to length filters."""
-        self.create_dirs()
+        self.create_dirs(self.processed_data_dir)
         
         logger.info(f"Processing UniRef50 sequences with filters: "
                    f"min_length={self.min_sequence_length}, max_length={self.max_sequence_length}, "
                    f"max_seqs_number={self.max_seqs_number}")
         
         # First, count sequences for progress bar
-        logger.info("Counting sequences for progress tracking...")
         total_seqs = sum(1 for _ in SeqIO.parse(self.uniref50_fasta, 'fasta'))
         
         sequence_count = 0
