@@ -30,7 +30,7 @@ class BaseProcessor:
         self.max_seqs_number = self.params['max_seqs_number']
         self.min_sequence_length = self.params['min_sequence_length']
         self.max_sequence_length = self.params['max_sequence_length']
-        
+        self.batch_size = self.params['batch_size']
         # Initialize counters
         self.total_sequences = 0
         self.train_count = 0

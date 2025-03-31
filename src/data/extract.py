@@ -28,8 +28,3 @@ class Extractor(BaseProcessor):
                         pbar.update(len(chunk))
         
         logger.info(f"Extracted UniRef50 to {self.uniref50_fasta}")
-
-if __name__ == "__main__":
-    # For direct execution
-    extractor = Extractor()
-    extractor.extract()

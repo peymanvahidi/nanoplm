@@ -45,5 +45,5 @@ uv.lock
 # Pipeline output
 pipeline_output/
 
-# Mac artifacts
+# Macos artifacts
 .DS_Store

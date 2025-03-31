@@ -14,8 +14,8 @@ stages:
     outs:
       - pipeline_output/data/raw/uniref50.fasta
 
-  preprocess:
-    cmd: python3 main.py --preprocess-data
+  filter:
+    cmd: python3 main.py --filter-data
     deps:
       - src/data/preprocess.py
       - pipeline_output/data/raw/uniref50.fasta
@@ -30,7 +30,7 @@ stages:
   split:
     cmd: python3 main.py --split-data
     deps:
-      - src/data/split.py
+      - src/data/preprocess.py
       - pipeline_output/data/processed/uniref50_processed.fasta
     params:
       - src/data/params.yaml:
@@ -39,6 +39,19 @@ stages:
       - pipeline_output/data/processed/train.fasta
       - pipeline_output/data/processed/val.fasta
       - pipeline_output/data/processed/dataset_info.txt
+  
+  tokenize:
+    cmd: python3 main.py --tokenize-data
+    deps:
+      - src/data/preprocess.py
+      - pipeline_output/data/processed/train.fasta
+      - pipeline_output/data/processed/val.fasta
+    params:
+      - src/data/params.yaml:
+          - batch_size
+    outs:
+      - pipeline_output/data/processed/train_tokenized
+      - pipeline_output/data/processed/val_tokenized
   
   # train:
   #   cmd: python3 main.py --train

@@ -1,5 +1,16 @@
 # Processing parameters for UniRef50 dataset
-val_ratio: 0.1      # 10% of data used for validation
-max_seqs_number: 202  # null means process all sequences, set a number for testing
+
+# % of data used for validation
+val_ratio: 0.1
+
+# Maximum number of sequences to process, null means process all sequences
+max_seqs_number: 202
+
+# Minimum sequence length to process
 min_sequence_length: 20
+
+# Maximum sequence length to process
 max_sequence_length: 512
+
+# Batch size for tokenization
+batch_size: 32

@@ -2,7 +2,6 @@ from ..utils.logger import logger, log_stage
 from .download import Downloader
 from .extract import Extractor
 from .preprocess import Preprocessor
-from .split import Splitter
 
 class DataPipeline:
     """Complete data processing pipeline combining all steps."""
@@ -11,7 +10,6 @@ class DataPipeline:
         self.downloader = Downloader()
         self.extractor = Extractor()
         self.preprocessor = Preprocessor()
-        self.splitter = Splitter()
     
     def run_download(self):
         """Run only the download step."""
@@ -23,25 +21,26 @@ class DataPipeline:
         log_stage("EXTRACT")
         self.extractor.extract()
     
-    def run_preprocess(self):
+    def run_filter(self):
         """Run only the preprocess step."""
-        log_stage("PREPROCESS")
-        self.preprocessor.preprocess()
+        log_stage("FILTER")
+        self.preprocessor.filter_sequences()
     
     def run_split(self):
         """Run only the split step."""
         log_stage("SPLIT")
-        self.splitter.split()
+        self.preprocessor.split()
+
+    def run_tokenize(self):
+        """Run only the tokenization step."""
+        log_stage("TOKENIZE")
+        self.preprocessor.tokenize_sequences()
     
     def run_all(self):
         """Run the complete pipeline."""
         self.run_download()
         self.run_extract()
-        self.run_preprocess()
+        self.run_filter()
         self.run_split()
+        self.run_tokenize()
         logger.info("Complete pipeline execution finished!")
-
-if __name__ == "__main__":
-    # For direct execution of the full pipeline
-    data_pipeline = DataPipeline()
-    data_pipeline.run_all() 

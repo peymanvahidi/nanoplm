@@ -8,8 +8,9 @@ def main():
     # Data processing arguments
     parser.add_argument("--download-data", action="store_true", help="Run only the data download step")
     parser.add_argument("--extract-data", action="store_true", help="Run only the data extraction step")
-    parser.add_argument("--preprocess-data", action="store_true", help="Run only the data preprocessing step")
+    parser.add_argument("--filter-data", action="store_true", help="Run only the data filtering step")
     parser.add_argument("--split-data", action="store_true", help="Run only the data splitting step")
+    parser.add_argument("--tokenize-data", action="store_true", help="Run only the data tokenization step")
     
     # Add more arguments for other pipeline steps as needed
     # parser.add_argument("--train", action="store_true", help="Run only the training step")
@@ -27,11 +28,14 @@ def main():
     if args.extract_data:
         data_pipeline.run_extract()
         
-    if args.preprocess_data:
-        data_pipeline.run_preprocess()
+    if args.filter_data:
+        data_pipeline.run_filter()
         
     if args.split_data:
         data_pipeline.run_split()
+        
+    if args.tokenize_data:
+        data_pipeline.run_tokenize()
 
 if __name__ == "__main__":
     main()

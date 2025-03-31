@@ -27,8 +27,3 @@ class Downloader(BaseProcessor):
             urllib.request.urlretrieve(self.uniref50_url, self.uniref50_fasta_gz, reporthook=update_progress)
         
         logger.info(f"Downloaded UniRef50 to {self.uniref50_fasta_gz}")
-
-if __name__ == "__main__":
-    # For direct execution
-    downloader = Downloader()
-    downloader.download() 
