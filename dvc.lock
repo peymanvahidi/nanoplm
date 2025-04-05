@@ -54,8 +54,8 @@ stages:
     deps:
     - path: pipeline_output/data/processed/uniref50_processed.fasta
       hash: md5
-      md5: 7099fbb631785692da131ae0a98ed059
-      size: 60788
+      md5: 71acc0b1a97c9c5f35cf2e156da32c9b
+      size: 36604
     - path: src/data/preprocess.py
       hash: md5
       md5: 1e52c9c8336dae36ad05ea93ba18cafd
@@ -66,27 +66,27 @@ stages:
     outs:
     - path: pipeline_output/data/processed/dataset_info.txt
       hash: md5
-      md5: d9115ed19bb7fc98d46b042fb18cac47
+      md5: cf8deef511f4fb00d60deb710394caeb
       size: 327
     - path: pipeline_output/data/processed/train.fasta
       hash: md5
-      md5: 67e7d4b2ad89259ee7cf4bec93ee4c09
-      size: 54555
+      md5: 7e815426014e03685b43ef633b7e045e
+      size: 33381
     - path: pipeline_output/data/processed/val.fasta
       hash: md5
-      md5: f3eab96a2ca7c2b7fcb3ac113ed2ddae
-      size: 6233
+      md5: 32e0be3def6ae5c6176ce1ed7f2cff89
+      size: 3223
   tokenize:
     cmd: python3 main.py --tokenize-data
     deps:
     - path: pipeline_output/data/processed/train.fasta
       hash: md5
-      md5: 67e7d4b2ad89259ee7cf4bec93ee4c09
-      size: 54555
+      md5: 7e815426014e03685b43ef633b7e045e
+      size: 33381
     - path: pipeline_output/data/processed/val.fasta
       hash: md5
-      md5: f3eab96a2ca7c2b7fcb3ac113ed2ddae
-      size: 6233
+      md5: 32e0be3def6ae5c6176ce1ed7f2cff89
+      size: 3223
     - path: src/data/preprocess.py
       hash: md5
       md5: 1e52c9c8336dae36ad05ea93ba18cafd
@@ -97,13 +97,13 @@ stages:
     outs:
     - path: pipeline_output/data/processed/train_tokenized
       hash: md5
-      md5: 7cb7894b0da8227e41feba5f029d7e93.dir
-      size: 1327684
-      nfiles: 7
+      md5: 686b203843b0da1c1b38b9b6076fd21e.dir
+      size: 860004
+      nfiles: 5
     - path: pipeline_output/data/processed/val_tokenized
       hash: md5
-      md5: a7f908f8bdbfc4abd070eb0d4cc69edd.dir
-      size: 132948
+      md5: 4c7fabf6bc76ddc768ed0917fa582a40.dir
+      size: 65940
       nfiles: 2
   filter:
     cmd: python3 main.py --filter-data
@@ -118,11 +118,41 @@ stages:
       size: 11336
     params:
       src/data/params.yaml:
-        max_seqs_number: 202
+        max_seqs_number: 120
         max_sequence_length: 512
         min_sequence_length: 20
     outs:
     - path: pipeline_output/data/processed/uniref50_processed.fasta
       hash: md5
-      md5: 7099fbb631785692da131ae0a98ed059
-      size: 60788
+      md5: 71acc0b1a97c9c5f35cf2e156da32c9b
+      size: 36604
+  teacher_embeddings:
+    cmd: python3 main.py --generate-teacher-embeddings
+    deps:
+    - path: pipeline_output/data/processed/train_tokenized
+      hash: md5
+      md5: 686b203843b0da1c1b38b9b6076fd21e.dir
+      size: 860004
+      nfiles: 5
+    - path: pipeline_output/data/processed/val_tokenized
+      hash: md5
+      md5: 4c7fabf6bc76ddc768ed0917fa582a40.dir
+      size: 65940
+      nfiles: 2
+    - path: src/distillation/teacher_embed.py
+      hash: md5
+      md5: 30690ce310fe6530d55774a60379efef
+      size: 5729
+    - path: src/models/teacher.py
+      hash: md5
+      md5: 546775457601f1cfc439577e0c546ca4
+      size: 6008
+    params:
+      src/data/params.yaml:
+        batch_size: 32
+    outs:
+    - path: pipeline_output/data/processed/teacher_embeddings
+      hash: md5
+      md5: b756dfc04fdf6eddbf20beeb73939898.dir
+      size: 222358584
+      nfiles: 7

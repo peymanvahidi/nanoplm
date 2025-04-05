@@ -47,3 +47,6 @@ pipeline_output/
 
 # Macos artifacts
 .DS_Store
+
+# experiments
+experiments/
