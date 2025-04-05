@@ -53,6 +53,19 @@ stages:
       - pipeline_output/data/processed/train_tokenized
       - pipeline_output/data/processed/val_tokenized
   
+  teacher_embeddings:
+    cmd: python3 main.py --generate-teacher-embeddings
+    deps:
+      - src/distillation/teacher_embed.py
+      - src/models/teacher.py
+      - pipeline_output/data/processed/train_tokenized
+      - pipeline_output/data/processed/val_tokenized
+    params:
+      - src/data/params.yaml:
+          - batch_size
+    outs:
+      - pipeline_output/data/processed/teacher_embeddings
+  
   # train:
   #   cmd: python3 main.py --train
   #   deps:

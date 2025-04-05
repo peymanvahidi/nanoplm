@@ -21,20 +21,25 @@ class TeacherModel:
         
         Args:
             model_name_or_path: Name of the model from HuggingFace or path to saved model
-            device: Device to load the model on ("cpu", "cuda", "cuda:0", etc.)
+            device: Device to load the model on ("cpu", "cuda", "cuda:0", "mps", etc.)
             use_cache: Whether to use model caching for faster inference
         """
         self.model_name_or_path = model_name_or_path
 
         if device == "auto":
-            if torch.cuda.is_available():
-                self.device = "cuda"
-            elif torch.backends.mps.is_available():
+            # Prioritize MPS on Mac over CPU, but CUDA over MPS
+            if torch.backends.mps.is_available():
                 self.device = "mps"
+                print(f"Using MPS (Apple Metal) for GPU acceleration")
+            elif torch.cuda.is_available():
+                self.device = "cuda"
+                print(f"Using CUDA for GPU acceleration")
             else:
                 self.device = "cpu"
+                print(f"Using CPU for computation (no GPU acceleration available)")
         else:
             self.device = device
+            print(f"Using specified device: {device}")
         
         self.use_cache = use_cache
         
@@ -58,6 +63,7 @@ class TeacherModel:
     def encoder_model(self) -> T5EncoderModel:
         """Lazy-load the T5 encoder-only model when needed."""
         if self._encoder_model is None:
+            print(f"Loading encoder model to {self.device} device")
             self._encoder_model = T5EncoderModel.from_pretrained(
                 self.model_name_or_path
             ).to(self.device)
@@ -83,9 +89,16 @@ class TeacherModel:
             If output_hidden_states=True: (last_hidden_state, all_hidden_states)
         """
         with torch.no_grad():
+            # Ensure tensors are on the correct device
+            if input_ids.device.type != self.device:
+                input_ids = input_ids.to(self.device)
+            
+            if attention_mask.device.type != self.device:
+                attention_mask = attention_mask.to(self.device)
+                
             outputs = self.encoder_model(
-                input_ids=input_ids.to(self.device),
-                attention_mask=attention_mask.to(self.device),
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 output_hidden_states=output_hidden_states
             )
             

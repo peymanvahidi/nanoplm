@@ -1,5 +1,10 @@
 import argparse
+from pathlib import Path
+import torch
+
 from src.data import DataPipeline
+from src.models.teacher import TeacherModel
+from src.distillation.teacher_embed import TeacherEmbedder
 
 def main():
     # Create parser
@@ -11,6 +16,7 @@ def main():
     parser.add_argument("--filter-data", action="store_true", help="Run only the data filtering step")
     parser.add_argument("--split-data", action="store_true", help="Run only the data splitting step")
     parser.add_argument("--tokenize-data", action="store_true", help="Run only the data tokenization step")
+    parser.add_argument("--generate-teacher-embeddings", action="store_true", help="Generate embeddings using the teacher model")
     
     # Add more arguments for other pipeline steps as needed
     # parser.add_argument("--train", action="store_true", help="Run only the training step")
@@ -36,6 +42,11 @@ def main():
         
     if args.tokenize_data:
         data_pipeline.run_tokenize()
+    
+    # Generate teacher embeddings if requested
+    if args.generate_teacher_embeddings:
+        embedder = TeacherEmbedder()
+        embedder.process_all()
 
 if __name__ == "__main__":
     main()
