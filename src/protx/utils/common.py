@@ -1,7 +1,7 @@
 import os
 import yaml
+import torch
 from typing import Dict, Any
-
 
 def read_yaml(file_path: str) -> Dict[str, Any]:
     """
@@ -26,3 +26,11 @@ def read_yaml(file_path: str) -> Dict[str, Any]:
             return yaml_content
         except yaml.YAMLError as e:
             raise yaml.YAMLError(f"Error parsing YAML file {file_path}: {e}")
+
+def get_device():
+    if torch.backends.mps.is_available():
+        return "mps"
+    elif torch.backends.cuda.is_available():
+        return "cuda"
+    else:
+        return "cpu"

@@ -5,21 +5,20 @@ from ..utils.logger import logger
 class BaseProcessor:
     """Base class with common functionality for data processing."""
     
-    def __init__(self, params_file="src/data/params.yaml"):
-        """
-        Initialize the processor with paths and parameters.
-        
-        Args:
-            params_file (str): Path to the parameters file
-        """
+    def __init__(
+        self,
+        pipeline_output_dir: Path = Path("pipeline_output"),
+        params_file="src/protx/data/params.yaml"
+    ):
         # Set up paths
-        self.pipeline_output_dir = Path("pipeline_output")
+        self.pipeline_output_dir = pipeline_output_dir
         self.raw_data_dir = self.pipeline_output_dir / "data/raw"
         self.processed_data_dir = self.pipeline_output_dir / "data/processed"
         self.uniref50_url = "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+        
         self.uniref50_fasta_gz = self.raw_data_dir / "uniref50.fasta.gz"
         self.uniref50_fasta = self.raw_data_dir / "uniref50.fasta"
-        self.processed_sequences = self.processed_data_dir / "uniref50_processed.fasta"
+        self.filtered_seqs = self.processed_data_dir / "uniref50_filtered.fasta"
         self.train_file = self.processed_data_dir / "train.fasta"
         self.val_file = self.processed_data_dir / "val.fasta"
         self.info_file = self.processed_data_dir / "dataset_info.txt"
@@ -27,12 +26,12 @@ class BaseProcessor:
         # Load parameters
         self.params = self._load_params(params_file)
         self.val_ratio = self.params['val_ratio']
-        self.max_seqs_number = self.params['max_seqs_number']
-        self.min_sequence_length = self.params['min_sequence_length']
-        self.max_sequence_length = self.params['max_sequence_length']
+        self.max_seqs_num = self.params['max_seqs_num']
+        self.min_seq_len = self.params['min_seq_len']
+        self.max_seq_len = self.params['max_seq_len']
         self.batch_size = self.params['batch_size']
         # Initialize counters
-        self.total_sequences = 0
+        self.total_seqs = 0
         self.train_count = 0
         self.val_count = 0
     

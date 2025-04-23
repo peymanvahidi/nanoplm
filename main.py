@@ -1,14 +1,13 @@
 import argparse
 from pathlib import Path
-import torch
 
-from src.data import DataPipeline
-from src.models.teacher import TeacherModel
-from src.distillation.teacher_embed import TeacherEmbedder
+from src.protx.data import DataPipeline
+from src.protx.models.teacher import TeacherModel
+from src.protx.distillation.teacher_embed import TeacherEmbedder
 
 def main():
     # Create parser
-    parser = argparse.ArgumentParser(description="ProtT5-s pipeline runner")
+    parser = argparse.ArgumentParser(description="ProtX pipeline runner")
     
     # Data processing arguments
     parser.add_argument("--download-data", action="store_true", help="Run only the data download step")
@@ -25,7 +24,7 @@ def main():
     args = parser.parse_args()
     
     # Initialize the pipeline
-    data_pipeline = DataPipeline()
+    data_pipeline = DataPipeline(pipeline_output_dir=Path("pipeline_output"))
     
     # Run individual steps
     if args.download_data:

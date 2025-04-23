@@ -6,10 +6,14 @@ from .preprocess import Preprocessor
 class DataPipeline:
     """Complete data processing pipeline combining all steps."""
     
-    def __init__(self):
-        self.downloader = Downloader()
-        self.extractor = Extractor()
-        self.preprocessor = Preprocessor()
+    def __init__(self, pipeline_output_dir=None, uniref50_url=None):
+        self.downloader = Downloader(pipeline_output_dir=pipeline_output_dir)
+        self.extractor = Extractor(pipeline_output_dir=pipeline_output_dir)
+        self.preprocessor = Preprocessor(pipeline_output_dir=pipeline_output_dir)
+
+        # Set URL if provided
+        if uniref50_url:
+            self.downloader.uniref50_url = uniref50_url
     
     def run_download(self):
         """Run only the download step."""

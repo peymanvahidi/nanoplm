@@ -1,1 +1,1 @@
-# prott5-s
+# ProtX

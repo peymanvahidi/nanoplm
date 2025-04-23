@@ -2,14 +2,14 @@ stages:
   download:
     cmd: python3 main.py --download-data
     deps:
-      - src/data/download.py
+      - src/protx/data/download.py
     outs:
       - pipeline_output/data/raw/uniref50.fasta.gz
 
   extract:
     cmd: python3 main.py --extract-data
     deps:
-      - src/data/extract.py
+      - src/protx/data/extract.py
       - pipeline_output/data/raw/uniref50.fasta.gz
     outs:
       - pipeline_output/data/raw/uniref50.fasta
@@ -17,10 +17,10 @@ stages:
   filter:
     cmd: python3 main.py --filter-data
     deps:
-      - src/data/preprocess.py
+      - src/protx/data/preprocess.py
       - pipeline_output/data/raw/uniref50.fasta
     params:
-      - src/data/params.yaml:
+      - src/protx/data/params.yaml:
           - min_seq_len
           - max_seq_len
           - max_seqs_num
@@ -30,10 +30,10 @@ stages:
   split:
     cmd: python3 main.py --split-data
     deps:
-      - src/data/preprocess.py
+      - src/protx/data/preprocess.py
       - pipeline_output/data/processed/uniref50_filtered.fasta
     params:
-      - src/data/params.yaml:
+      - src/protx/data/params.yaml:
           - val_ratio
     outs:
       - pipeline_output/data/processed/train.fasta
@@ -43,11 +43,11 @@ stages:
   tokenize:
     cmd: python3 main.py --tokenize-data
     deps:
-      - src/data/preprocess.py
+      - src/protx/data/preprocess.py
       - pipeline_output/data/processed/train.fasta
       - pipeline_output/data/processed/val.fasta
     params:
-      - src/data/params.yaml:
+      - src/protx/data/params.yaml:
           - batch_size
     outs:
       - pipeline_output/data/processed/tokenized/train.h5
@@ -56,12 +56,12 @@ stages:
   teacher_embeddings:
     cmd: python3 main.py --generate-teacher-embeddings
     deps:
-      - src/distillation/teacher_embed.py
-      - src/models/teacher.py
+      - src/protx/distillation/teacher_embed.py
+      - src/protx/models/teacher.py
       - pipeline_output/data/processed/tokenized/train.h5
       - pipeline_output/data/processed/tokenized/val.h5
     params:
-      - src/data/params.yaml:
+      - src/protx/data/params.yaml:
           - batch_size
     outs:
       - pipeline_output/data/processed/teacher_embeddings/train.h5

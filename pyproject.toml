@@ -1,12 +1,13 @@
 [project]
-name = "prott5-s"
+name = "ProtX"
 version = "0.1.0"
-description = "Knowledge distillation for ProtT5"
+description = "Knowledge distillation of ProtT5"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "biopython>=1.85",
     "dvc>=3.59.1",
+    "h5py>=3.13.0",
     "ipykernel>=6.29.5",
     "mlflow>=2.21.2",
     "pyyaml>=6.0.2",

@@ -10,12 +10,9 @@ class Downloader(BaseProcessor):
         """Download UniRef50 dataset if it doesn't exist."""
         self.create_dirs(self.raw_data_dir)
         
-        logger.info(f"Checking if {self.uniref50_fasta_gz} exists")
         if self.uniref50_fasta_gz.exists():
             logger.info(f"UniRef50 already downloaded at {self.uniref50_fasta_gz}")
             return
-        
-        logger.info(f"File not found, downloading UniRef50...")
         
         # Setup for progress bar
         with tqdm(unit='B', unit_scale=True, unit_divisor=1024, desc="Downloading UniRef50") as pbar:
