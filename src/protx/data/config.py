@@ -1,30 +1,35 @@
 import yaml
 from pathlib import Path
 
-# ------------------------
-# DO NOT MODIFY THIS FILE!
-# ------------------------
-
-BASE_DIR = Path("output")
-
-RAW_DIR = BASE_DIR / "data/raw"
-PROCESSED_DIR = BASE_DIR / "data/processed"
-
-UNIREF50_URL = "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
-UNIREF50_FASTA_GZ = RAW_DIR / "uniref50.fasta.gz"
-UNIREF50_FASTA = RAW_DIR / "uniref50.fasta"
-
-FILTERED_SEQS = PROCESSED_DIR / "uniref50_filtered.fasta"
-TRAIN_FILE = PROCESSED_DIR / "train.fasta"
-VAL_FILE = PROCESSED_DIR / "val.fasta"
-INFO_FILE = PROCESSED_DIR / "dataset_info.txt"
-
-yaml_path = Path(__file__).parent / "params.yaml"
-with open(yaml_path, "r") as f:
-    data = yaml.safe_load(f)
-
-VAL_RATIO = data["val_ratio"]
-MAX_SEQS_NUM = data["max_seqs_num"]
-MIN_SEQ_LEN = data["min_seq_len"]
-MAX_SEQ_LEN = data["max_seq_len"]
-BATCH_SIZE = data["batch_size"]
+class Config:
+    def __init__(self, params_file: Path = None):
+        """Initialize configuration from a YAML file and set default constants."""
+        # Load parameters from YAML
+        if params_file is None:
+            yaml_path = Path(__file__).parent / "params.yaml"
+        else:
+            yaml_path = params_file
+            
+        with open(yaml_path, "r") as f:
+            data = yaml.safe_load(f)
+        
+        # Parameters from YAML
+        self.val_ratio = data["val_ratio"]
+        self.max_seqs_num = data["max_seqs_num"]
+        self.min_seq_len = data["min_seq_len"]
+        self.max_seq_len = data["max_seq_len"]
+        self.batch_size = data["batch_size"]
+        
+        # Hardcoded constants
+        self.base_dir = Path("output")
+        self.raw_dir = self.base_dir / "data/raw"
+        self.filter_split_dir = self.base_dir / "data/filter_split"
+        
+        self.uniref50_url = "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+        self.uniref50_fasta_gz = self.raw_dir / "uniref50.fasta.gz"
+        self.uniref50_fasta = self.raw_dir / "uniref50.fasta"
+        
+        self.filtered_seqs = self.filter_split_dir / "uniref50_filtered.fasta"
+        self.train_file = self.filter_split_dir / "train.fasta"
+        self.val_file = self.filter_split_dir / "val.fasta"
+        self.info_file = self.filter_split_dir / "dataset_info.txt"

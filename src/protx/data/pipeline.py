@@ -1,50 +1,75 @@
+from .downloader import Downloader
+from .extractor import Extractor
+from .filter_splitor import FilterSplitor
+from .dataset import ProtXDataProcessor
+
 from ..utils.logger import logger, log_stage
-from .download import Downloader
-from .extract import Extractor
-from .preprocess import Preprocessor
 
 class DataPipeline:
-    """Complete data processing pipeline combining all steps."""
     
-    def __init__(self, pipeline_output_dir=None, uniref50_url=None):
-        self.downloader = Downloader(pipeline_output_dir=pipeline_output_dir)
-        self.extractor = Extractor(pipeline_output_dir=pipeline_output_dir)
-        self.preprocessor = Preprocessor(pipeline_output_dir=pipeline_output_dir)
+    def __init__(self, config, **kwargs):
+        """
+        Initialize the pipeline with a config object and optional overrides.
+        
+        Args:
+            config: Instance of Config class containing pipeline parameters.
+            **kwargs: Optional keyword arguments to override config attributes.
+        """
+        self.config = config
+        
+        # Apply any runtime overrides from kwargs
+        for key, value in kwargs.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
+            else:
+                raise ValueError(f"Config does not have attribute '{key}'")
+        
+        self.downloader = Downloader(
+            url=self.config.uniref50_url,
+            output_file=self.config.uniref50_fasta_gz
+        )
+        self.extractor = Extractor(
+            input_file=self.config.uniref50_fasta_gz,
+            output_file=self.config.uniref50_fasta
+        )
+        self.filter_splitor = FilterSplitor(
+            input_file=self.config.uniref50_fasta,
+            output_dir=self.config.filter_split_dir,
+            min_seq_len=self.config.min_seq_len,
+            max_seq_len=self.config.max_seq_len,
+            max_seqs_num=self.config.max_seqs_num,
+            val_ratio=self.config.val_ratio,
+            info_file=self.config.info_file,
+        )
 
-        # Set URL if provided
-        if uniref50_url:
-            self.downloader.uniref50_url = uniref50_url
+        # self.protx_data_processor = ProtXDataProcessor(pipeline_output_dir=self.config.filter_split_dir)
     
-    def run_download(self):
-        """Run only the download step."""
+    def download(self):
         log_stage("DOWNLOAD")
         self.downloader.download()
     
-    def run_extract(self):
-        """Run only the extract step."""
+    def extract(self):
         log_stage("EXTRACT")
         self.extractor.extract()
     
-    def run_filter(self):
-        """Run only the preprocess step."""
-        log_stage("FILTER")
-        self.preprocessor.filter_sequences()
+    def filter_split(self):
+        log_stage("FILTER & SPLIT")
+        self.filter_splitor.filter(
+            output_file=self.config.filtered_seqs
+        )
+        self.filter_splitor.split(
+            train_file=self.config.train_file,
+            val_file=self.config.val_file
+        )
     
-    def run_split(self):
-        """Run only the split step."""
-        log_stage("SPLIT")
-        self.preprocessor.split()
-
-    def run_tokenize(self):
-        """Run only the tokenization step."""
-        log_stage("TOKENIZE")
-        self.preprocessor.tokenize_sequences()
+    # def generate_protx_training_data(self):
+    #     log_stage("ProtX Training Data Gen")
+    #     self.protx_data_processor.process_dataset()
     
     def run_all(self):
         """Run the complete pipeline."""
-        self.run_download()
-        self.run_extract()
-        self.run_filter()
-        self.run_split()
-        self.run_tokenize()
+        self.download()
+        self.extract()
+        self.filter_split()
+        # self.generate_protx_training_data()
         logger.info("Complete pipeline execution finished!")
