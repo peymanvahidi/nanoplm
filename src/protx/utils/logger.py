@@ -2,13 +2,16 @@ import logging
 import sys
 from pathlib import Path
 
-from ..data.config import BASE_DIR
+from ..data.config import Config
+
+# Create Config instance
+config = Config()
 
 # Create logs directory if it doesn't exist
-Path(BASE_DIR / "logs").mkdir(parents=True, exist_ok=True)
+Path(config.base_dir / "logs").mkdir(parents=True, exist_ok=True)
 
 # Set up file handler for all logs in a unique file per run with timestamp
-log_file = f'{BASE_DIR}/logs/pipeline.log'
+log_file = f'{config.base_dir}/logs/pipeline.log'
 file_handler = logging.FileHandler(log_file)
 file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
