@@ -3,31 +3,31 @@ stages:
   download:
     cmd: python3 main.py --download-data
     deps:
-    - path: src/protx/data/download.py
+    - path: src/protx/data/downloader.py
       hash: md5
-      md5: 0882b748847dee0423b4f1f16d8490b9
-      size: 1024
+      md5: 6a87d2d5c5f6fb35c411112b12aaf9e8
+      size: 1066
     outs:
-    - path: pipeline_output/data/raw/uniref50.fasta.gz
+    - path: output/data/raw/uniref50.fasta.gz
       hash: md5
-      md5: b39e4fdf12810e78e2befdf7460f255b
-      size: 92924866
+      md5: 227816b5b3a7cd1be65ea19e57e8f01c
+      size: 92986586
   extract:
     cmd: python3 main.py --extract-data
     deps:
-    - path: pipeline_output/data/raw/uniref50.fasta.gz
+    - path: output/data/raw/uniref50.fasta.gz
       hash: md5
-      md5: b39e4fdf12810e78e2befdf7460f255b
-      size: 92924866
-    - path: src/protx/data/extract.py
+      md5: 227816b5b3a7cd1be65ea19e57e8f01c
+      size: 92986586
+    - path: src/protx/data/extractor.py
       hash: md5
-      md5: 714aa670b0c3194120bef6cc18cdd3f1
-      size: 1764
+      md5: 4cf4c21000e5208160f578df649792ec
+      size: 1899
     outs:
-    - path: pipeline_output/data/raw/uniref50.fasta
+    - path: output/data/raw/uniref50.fasta
       hash: md5
-      md5: acd7214694350f9a0c097122b777c978
-      size: 286365155
+      md5: 7648cf32219f4e5f20aebc514817120d
+      size: 286510912
   preprocess:
     cmd: python3 main.py --preprocess-data
     deps:
@@ -58,8 +58,8 @@ stages:
       size: 15904
     - path: src/protx/data/preprocess.py
       hash: md5
-      md5: d3ece3f667f2a2dd0f968dd2635902a0
-      size: 10479
+      md5: 76d45de2e87eb88ea0e42bc09c396d33
+      size: 13670
     params:
       src/protx/data/params.yaml:
         val_ratio: 0.1
@@ -70,12 +70,12 @@ stages:
       size: 323
     - path: pipeline_output/data/processed/train.fasta
       hash: md5
-      md5: d3114b24a98457eb269891fcc474e843
-      size: 14609
+      md5: 3e3e81c0cbd55c72f1e6fb58a39a8932
+      size: 14759
     - path: pipeline_output/data/processed/val.fasta
       hash: md5
-      md5: a5ab862149ad0d734db991a819c47843
-      size: 1295
+      md5: 54dba2d17fb9eb29faefaf0b74a1b6e0
+      size: 1145
   tokenize:
     cmd: python3 main.py --tokenize-data
     deps:
@@ -112,8 +112,8 @@ stages:
       size: 286365155
     - path: src/protx/data/preprocess.py
       hash: md5
-      md5: d3ece3f667f2a2dd0f968dd2635902a0
-      size: 10479
+      md5: 76d45de2e87eb88ea0e42bc09c396d33
+      size: 13670
     params:
       src/protx/data/params.yaml:
         max_seq_len: 512
@@ -155,3 +155,37 @@ stages:
       hash: md5
       md5: e6578f11952e091cc28b89d65d757fd0
       size: 6111312
+  filter_split:
+    cmd: python3 main.py --filter-split-data
+    deps:
+    - path: output/data/raw/uniref50.fasta
+      hash: md5
+      md5: 7648cf32219f4e5f20aebc514817120d
+      size: 286510912
+    - path: src/protx/data/filter_splitor.py
+      hash: md5
+      md5: 62d1668cf8e6c151809572dddeb8c20a
+      size: 5424
+    params:
+      src/protx/data/params.yaml:
+        max_seq_len: 512
+        max_seqs_num: 50
+        min_seq_len: 20
+        val_ratio: 0.1
+    outs:
+    - path: output/data/filter_split/dataset_info.txt
+      hash: md5
+      md5: a32f631b6afb42a857ee51cdaf85ee38
+      size: 262
+    - path: output/data/filter_split/train.fasta
+      hash: md5
+      md5: 77f1e737d76f3596305a5b4e2935b7b2
+      size: 14719
+    - path: output/data/filter_split/uniref50_filtered.fasta
+      hash: md5
+      md5: 7488763186eb49222e622344670a3b69
+      size: 15904
+    - path: output/data/filter_split/val.fasta
+      hash: md5
+      md5: 4d3f1c8de4576a0c25d1293fc2a45b73
+      size: 1185

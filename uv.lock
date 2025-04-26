@@ -2113,7 +2113,7 @@ wheels = [
 ]
 
 [[package]]
-name = "prott5-s"
+name = "protx"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

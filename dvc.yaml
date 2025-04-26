@@ -9,63 +9,41 @@ stages:
   extract:
     cmd: python3 main.py --extract-data
     deps:
-      - src/protx/data/extract.py
+      - src/protx/data/extractor.py
       - output/data/raw/uniref50.fasta.gz
     outs:
       - output/data/raw/uniref50.fasta
 
-  filter:
-    cmd: python3 main.py --filter-data
+  filter_split:
+    cmd: python3 main.py --filter-split-data
     deps:
-      - src/protx/data/preprocess.py
+      - src/protx/data/filter_splitor.py
       - output/data/raw/uniref50.fasta
     params:
       - src/protx/data/params.yaml:
           - min_seq_len
           - max_seq_len
           - max_seqs_num
-    outs:
-      - output/data/processed/uniref50_filtered.fasta
-
-  split:
-    cmd: python3 main.py --split-data
-    deps:
-      - src/protx/data/preprocess.py
-      - output/data/processed/uniref50_filtered.fasta
-    params:
-      - src/protx/data/params.yaml:
           - val_ratio
     outs:
-      - output/data/processed/train.fasta
-      - output/data/processed/val.fasta
-      - output/data/processed/dataset_info.txt
+      - output/data/filter_split/uniref50_filtered.fasta
+      - output/data/filter_split/train.fasta
+      - output/data/filter_split/val.fasta
+      - output/data/filter_split/dataset_info.txt
   
-  tokenize:
-    cmd: python3 main.py --tokenize-data
-    deps:
-      - src/protx/data/preprocess.py
-      - output/data/processed/train.fasta
-      - output/data/processed/val.fasta
-    params:
-      - src/protx/data/params.yaml:
-          - batch_size
-    outs:
-      - output/data/processed/tokenized/train.h5
-      - output/data/processed/tokenized/val.h5
-  
-  teacher_embeddings:
-    cmd: python3 main.py --generate-teacher-embeddings
-    deps:
-      - src/protx/distillation/teacher_embed.py
-      - src/protx/models/teacher.py
-      - output/data/processed/tokenized/train.h5
-      - output/data/processed/tokenized/val.h5
-    params:
-      - src/protx/data/params.yaml:
-          - batch_size
-    outs:
-      - output/data/processed/teacher_embeddings/train.h5
-      - output/data/processed/teacher_embeddings/val.h5
+  # teacher_embeddings:
+  #   cmd: python3 main.py --generate-teacher-embeddings
+  #   deps:
+  #     - src/protx/distillation/teacher_embed.py
+  #     - src/protx/models/teacher.py
+  #     - output/data/processed/tokenized/train.h5
+  #     - output/data/processed/tokenized/val.h5
+  #   params:
+  #     - src/protx/data/params.yaml:
+  #         - batch_size
+  #   outs:
+  #     - output/data/processed/teacher_embeddings/train.h5
+  #     - output/data/processed/teacher_embeddings/val.h5
   
   # train:
   #   cmd: python3 main.py --train

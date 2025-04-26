@@ -42,8 +42,8 @@ data/*
 .uv/
 uv.lock
 
-# Pipeline output
-pipeline_output/
+# Outputs
+output/
 
 # Macos artifacts
 .DS_Store
