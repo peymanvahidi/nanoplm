@@ -2,11 +2,13 @@ import logging
 import sys
 from pathlib import Path
 
+from ..data.config import BASE_DIR
+
 # Create logs directory if it doesn't exist
-Path("pipeline_output").mkdir(parents=True, exist_ok=True)
+Path(BASE_DIR / "logs").mkdir(parents=True, exist_ok=True)
 
 # Set up file handler for all logs in a unique file per run with timestamp
-log_file = f'pipeline_output/pipeline.log'
+log_file = f'{BASE_DIR}/logs/pipeline.log'
 file_handler = logging.FileHandler(log_file)
 file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -19,7 +21,7 @@ console_formatter = logging.Formatter('%(message)s')
 console_handler.setFormatter(console_formatter)
 
 # Configure the logger
-logger = logging.getLogger("prott5")
+logger = logging.getLogger("protx")
 logger.setLevel(logging.INFO)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
@@ -30,4 +32,4 @@ logger.propagate = False
 # Add a helper method to log stage separators
 def log_stage(stage_name):
     separator = "="*20
-    logger.info(f"{separator}STAGE: {stage_name}{separator}") 
+    logger.info(f"{separator}STAGE: {stage_name}{separator}")

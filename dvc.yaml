@@ -2,70 +2,70 @@ stages:
   download:
     cmd: python3 main.py --download-data
     deps:
-      - src/protx/data/download.py
+      - src/protx/data/downloader.py
     outs:
-      - pipeline_output/data/raw/uniref50.fasta.gz
+      - output/data/raw/uniref50.fasta.gz
 
   extract:
     cmd: python3 main.py --extract-data
     deps:
       - src/protx/data/extract.py
-      - pipeline_output/data/raw/uniref50.fasta.gz
+      - output/data/raw/uniref50.fasta.gz
     outs:
-      - pipeline_output/data/raw/uniref50.fasta
+      - output/data/raw/uniref50.fasta
 
   filter:
     cmd: python3 main.py --filter-data
     deps:
       - src/protx/data/preprocess.py
-      - pipeline_output/data/raw/uniref50.fasta
+      - output/data/raw/uniref50.fasta
     params:
       - src/protx/data/params.yaml:
           - min_seq_len
           - max_seq_len
           - max_seqs_num
     outs:
-      - pipeline_output/data/processed/uniref50_filtered.fasta
+      - output/data/processed/uniref50_filtered.fasta
 
   split:
     cmd: python3 main.py --split-data
     deps:
       - src/protx/data/preprocess.py
-      - pipeline_output/data/processed/uniref50_filtered.fasta
+      - output/data/processed/uniref50_filtered.fasta
     params:
       - src/protx/data/params.yaml:
           - val_ratio
     outs:
-      - pipeline_output/data/processed/train.fasta
-      - pipeline_output/data/processed/val.fasta
-      - pipeline_output/data/processed/dataset_info.txt
+      - output/data/processed/train.fasta
+      - output/data/processed/val.fasta
+      - output/data/processed/dataset_info.txt
   
   tokenize:
     cmd: python3 main.py --tokenize-data
     deps:
       - src/protx/data/preprocess.py
-      - pipeline_output/data/processed/train.fasta
-      - pipeline_output/data/processed/val.fasta
+      - output/data/processed/train.fasta
+      - output/data/processed/val.fasta
     params:
       - src/protx/data/params.yaml:
           - batch_size
     outs:
-      - pipeline_output/data/processed/tokenized/train.h5
-      - pipeline_output/data/processed/tokenized/val.h5
+      - output/data/processed/tokenized/train.h5
+      - output/data/processed/tokenized/val.h5
   
   teacher_embeddings:
     cmd: python3 main.py --generate-teacher-embeddings
     deps:
       - src/protx/distillation/teacher_embed.py
       - src/protx/models/teacher.py
-      - pipeline_output/data/processed/tokenized/train.h5
-      - pipeline_output/data/processed/tokenized/val.h5
+      - output/data/processed/tokenized/train.h5
+      - output/data/processed/tokenized/val.h5
     params:
       - src/protx/data/params.yaml:
           - batch_size
     outs:
-      - pipeline_output/data/processed/teacher_embeddings/train.h5
-      - pipeline_output/data/processed/teacher_embeddings/val.h5
+      - output/data/processed/teacher_embeddings/train.h5
+      - output/data/processed/teacher_embeddings/val.h5
   
   # train:
   #   cmd: python3 main.py --train
