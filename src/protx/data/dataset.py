@@ -13,7 +13,7 @@ from ..models.student import ProtX
 from ..utils.common import get_device
 from ..utils.logger import logger
 
-class DataProcessor(Dataset):
+class ProtXDataProcessor(Dataset):
     def __init__(
         self,
         data_path: Union[str, Path],
@@ -122,3 +122,34 @@ class DataProcessor(Dataset):
         
         logger.info(f"Dataset saved successfully with {input_ids_array.shape[0]} sequences")
         return save_path
+
+
+class ProtXDataLoader(Dataset):
+    """Dataset class for loading data saved by DataProcessor"""
+    def __init__(
+        self, 
+        h5_path: Union[str, Path],
+        device: str = get_device()
+    ):
+        self.h5_file = h5py.File(Path(h5_path), "r")
+        self.device = device
+        
+        self.size = self.h5_file["input_ids"].shape[0]
+        logger.info(f"Dataset contains {self.size} sequences")
+    
+    def __len__(self):
+        return self.size
+    
+    def __getitem__(self, idx):
+        return {
+            "input_ids": torch.tensor(self.h5_file["input_ids"][idx], dtype=torch.long).to(self.device),
+            "attention_mask": torch.tensor(self.h5_file["attention_mask"][idx], dtype=torch.long).to(self.device),
+            "teacher_embeddings": torch.tensor(self.h5_file["teacher_embeddings"][idx], dtype=torch.float).to(self.device)
+        }
+    
+    def close(self):
+        if hasattr(self, 'h5_file'):
+            self.h5_file.close()
+    
+    def __del__(self):
+        self.close()
