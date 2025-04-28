@@ -31,4 +31,5 @@ class Downloader:
             
             urllib.request.urlretrieve(self.url, self.output_file, reporthook=update_progress)
         
-        logger.info(f"Downloaded {self.output_file}")
+        file_size = Path(self.output_file).stat().st_size
+        logger.info(f"Downloaded {self.output_file} ({file_size / (1024*1024):.2f} MB)")

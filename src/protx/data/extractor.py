@@ -25,6 +25,8 @@ class Extractor():
         # Get file size for progress bar
         file_size = self.input_file.stat().st_size
         
+        logger.info(f"Extracting UniRef50 FASTA from {self.input_file}")
+
         try:
             with gzip.open(self.input_file, 'rb') as f_in:
                 # Try to read a small chunk to see if it's a valid gzip file
