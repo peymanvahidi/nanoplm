@@ -42,36 +42,34 @@ class FilterSplitor():
             f"max_seqs_number={self.max_seqs_num}"
         )
         
-        # First, count sequences for progress bar
         total_seqs = sum(1 for _ in SeqIO.parse(self.input_file, 'fasta'))
         
         seq_count = 0
-        filtered_count = 0
-
-        n = min(total_seqs, self.max_seqs_num) if self.max_seqs_num else total_seqs
+        passed_count = 0
         
-        with tqdm(total=n, desc="Processing sequences") as pbar:
+        total_to_process = total_seqs if self.max_seqs_num is None else self.max_seqs_num
+        
+        with tqdm(total=total_to_process, desc="Processing sequences") as pbar:
             with open(output_file, 'w') as output_handle:
                 for record in SeqIO.parse(self.input_file, 'fasta'):
-                    seq_len = len(record.seq)
+                    seq_count += 1
 
-                    # Check sequence length
+                    seq_len = len(record.seq)
                     if self.min_seq_len <= seq_len <= self.max_seq_len:
                         SeqIO.write([record], output_handle, 'fasta')
-                        seq_count += 1
+                        passed_count += 1
                         pbar.update(1)
-                        if seq_count >= self.max_seqs_num:
-                            break
-                    else:
-                        filtered_count += 1
-                        # Only update if we're limiting sequences
-                        if self.max_seqs_num:
-                            pbar.total = min(total_seqs, self.max_seqs_num + filtered_count)
+                    
+                    # Only check max_seqs_num constraint if it's not None
+                    if self.max_seqs_num is not None and passed_count >= self.max_seqs_num:
+                        break
         
-        logger.info(f"Processed {seq_count} sequences (filtered out {filtered_count}) to {output_file}")
-        self.total_seqs = seq_count
+        logger.info(f"Processed first {seq_count} sequences out of {total_seqs}: {passed_count} sequences retrived with length in [{self.min_seq_len}, {self.max_seq_len}].")
+        logger.info(f"Output file: {output_file}")
 
-        self.filtered_seqs = output_file
+        self.processed_seqs_num = seq_count
+        self.num_filtered_seqs = passed_count
+        self.filtered_seqs_path = output_file
 
     def split(
         self,
@@ -83,20 +81,20 @@ class FilterSplitor():
         """
         logger.info(f"Creating splits with val ratio {self.val_ratio} (shuffle={self.shuffle})")
 
-        index = self._build_index(self.filtered_seqs)
-        total_seqs = len(index)
+        index = self._build_index(self.filtered_seqs_path)
+        num_filtered_seqs = len(index)
         
         if self.shuffle:
             random.shuffle(index)
         
-        val_size = int(total_seqs * self.val_ratio)
-        train_size = total_seqs - val_size
+        val_size = int(num_filtered_seqs * self.val_ratio)
+        train_size = num_filtered_seqs - val_size
         
-        logger.info(f"Sequences: {total_seqs}, Train: {train_size}, Val: {val_size}")
+        logger.info(f"Sequences: {num_filtered_seqs}, Train: {train_size}, Val: {val_size}")
         
-        with open(self.filtered_seqs, 'rb') as src:
+        with open(self.filtered_seqs_path, 'rb') as src:
             with open(train_file, 'wb') as train, open(val_file, 'wb') as val:
-                with tqdm(total=total_seqs, desc="Splitting data") as pbar:
+                with tqdm(total=num_filtered_seqs, desc="Splitting data") as pbar:
                     for i, (start, end) in enumerate(index):
                         src.seek(start)
                         data = src.read(end - start)
@@ -107,7 +105,7 @@ class FilterSplitor():
 
         self.train_count = train_size
         self.val_count = val_size
-        self.total_seqs = total_seqs
+        self.num_filtered_seqs = num_filtered_seqs
 
         self.train_file = train_file
         self.val_file = val_file
@@ -124,7 +122,7 @@ class FilterSplitor():
             f.write(f"  - Max sequence length: {self.max_seq_len}\n")
             f.write(f"  - Max sequences: {self.max_seqs_num if self.max_seqs_num else 'No limit'}\n")
             f.write(f"  - Validation ratio: {self.val_ratio}\n")
-            f.write(f"Total processed sequences: {self.total_seqs}\n")
+            f.write(f"Total processed sequences: {self.processed_seqs_num}\n")
             f.write(f"Training sequences: {self.train_count}\n")
             f.write(f"Validation sequences: {self.val_count}\n")
         
