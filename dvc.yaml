@@ -1,4 +1,5 @@
 stages:
+
   download:
     cmd: python3 main.py --download-data
     deps:
@@ -31,29 +32,14 @@ stages:
       - output/data/filter_split/val.fasta
       - output/data/filter_split/dataset_info.txt
   
-  # teacher_embeddings:
-  #   cmd: python3 main.py --generate-teacher-embeddings
+  # protx_dataset:
+  #   cmd: python3 main.py --save-protx-dataset
   #   deps:
-  #     - src/protx/distillation/teacher_embed.py
-  #     - src/protx/models/teacher.py
-  #     - output/data/processed/tokenized/train.h5
-  #     - output/data/processed/tokenized/val.h5
-  #   params:
-  #     - src/protx/data/params.yaml:
-  #         - batch_size
+  #     - src/protx/data/dataset.py
+  #     - output/data/filter_split/train.fasta
+  #     - output/data/filter_split/val.fasta
   #   outs:
-  #     - output/data/processed/teacher_embeddings/train.h5
-  #     - output/data/processed/teacher_embeddings/val.h5
+  #     - output/data/protx_dataset/train.h5
+  #     - output/data/protx_dataset/val.h5
   
-  # train:
-  #   cmd: python3 main.py --train
-  #   deps:
-  #     - main.py
-  #     - data/processed
-  #   params:
-  #     - params.yaml
-  #   outs:
-  #     - models/student
-  #   metrics:
-  #     - metrics.json:
-  #         cache: false 
+  

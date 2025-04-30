@@ -42,7 +42,8 @@ class DataPipeline:
             info_file=self.config.info_file,
         )
 
-        # self.protx_data_processor = ProtXDataProcessor(pipeline_output_dir=self.config.filter_split_dir)
+        self.protx_train_data = ProtXDataProcessor(self.config.train_file)
+        self.protx_val_data = ProtXDataProcessor(self.config.val_file)
     
     def download(self):
         log_stage("DOWNLOAD")
@@ -62,14 +63,23 @@ class DataPipeline:
             val_file=self.config.val_file
         )
     
-    # def generate_protx_training_data(self):
-    #     log_stage("ProtX Training Data Gen")
-    #     self.protx_data_processor.process_dataset()
+    def save_protx_train_dataset(self):
+        log_stage("ProtX Training Data Gen")
+        self.protx_train_data.process_dataset(
+            save_path=self.config.protx_train
+        )
+
+    def save_protx_val_dataset(self):
+        log_stage("ProtX Validation Data Gen")
+        self.protx_val_data.process_dataset(
+            save_path=self.config.protx_val
+        )
     
-    def run_all(self):
-        """Run the complete pipeline."""
+    def run_all(self, save_protx_dataset=False):
         self.download()
         self.extract()
         self.filter_split()
-        # self.generate_protx_training_data()
+        if save_protx_dataset:
+            self.save_protx_train_dataset()
+            self.save_protx_val_dataset()
         logger.info("Complete pipeline execution finished!")
