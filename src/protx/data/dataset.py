@@ -6,25 +6,57 @@ from Bio import SeqIO
 from tqdm import tqdm
 from pathlib import Path
 from typing import Union
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 from ..models.teacher import TeacherModel
-from ..models.student import ProtX
 from ..utils.common import get_device
 from ..utils.logger import logger
+
+class ProtXDataGen(IterableDataset):
+    def __init__(
+        self,
+        data_path: Union[str, Path],
+        teacher_model: TeacherModel = TeacherModel(),
+        max_seq_len: int = 512,
+        device: str = get_device()
+    ):
+        self.data_path = Path(data_path)
+        self.teacher = teacher_model
+        self.device = device
+        self.max_seq_len = max_seq_len
+
+    def __iter__(self):
+        data_gen = (
+            (record.id, str(record.seq)) 
+            for record in SeqIO.parse(self.data_path, "fasta")
+        )
+        teacher_tokenizer = self.teacher.tokenizer
+        
+        for _, sequence in data_gen:
+            teacher_seq = " ".join(list(re.sub(r"[UZOB]", "X", sequence)))
+            tokenized_seq = teacher_tokenizer.encode_plus(
+                teacher_seq,
+                add_special_tokens=True,
+                padding="max_length",
+                max_length=self.max_seq_len,
+                truncation=True,
+                return_tensors="pt"
+            )
+            yield {
+                "input_ids": tokenized_seq["input_ids"].squeeze(0),
+                "attention_mask": tokenized_seq["attention_mask"].squeeze(0)
+            }
 
 class ProtXDataProcessor(Dataset):
     def __init__(
         self,
         data_path: Union[str, Path],
-        student_model: ProtX = ProtX(),
         teacher_model: TeacherModel = TeacherModel(),
         max_seq_len: int = 512,
         batch_size: int = 32,
         device: str = get_device()
     ):
         self.data_path = Path(data_path)
-        self.student = student_model
         self.teacher = teacher_model
         self.device = device
         self.max_seq_len = max_seq_len
