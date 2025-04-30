@@ -2,10 +2,10 @@ import logging
 import sys
 from pathlib import Path
 
-from ..data.config import Config
+from ..config import DataConfig
 
 # Create Config instance
-config = Config()
+config = DataConfig()
 
 # Create logs directory if it doesn't exist
 Path(config.base_dir / "logs").mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,7 @@
 import argparse
 
-from src.protx.data.config import Config
-from src.protx.data import DataPipeline
+from .src.protx.config import DataConfig
+from .src.protx.data import DataPipeline
 
 def main():
     # Create parser
@@ -16,8 +16,8 @@ def main():
     args = parser.parse_args()
     
     # Initialize the pipeline
-    config = Config()
-    data_pipeline = DataPipeline(config)
+    data_config = DataConfig()
+    data_pipeline = DataPipeline(data_config)
     
     if args.download_data:
         data_pipeline.download()

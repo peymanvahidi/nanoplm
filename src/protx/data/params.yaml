@@ -1,9 +1,0 @@
-# Processing parameters for UniRef50 dataset
-
-# Change these parameters as needed
-
-val_ratio: 0.1
-max_seqs_num: 50
-min_seq_len: 20
-max_seq_len: 512
-batch_size: 32

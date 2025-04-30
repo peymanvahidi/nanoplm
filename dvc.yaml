@@ -4,6 +4,7 @@ stages:
     cmd: python3 main.py --download-data
     deps:
       - src/protx/data/downloader.py
+      - src/protx/config/data_config.py
     outs:
       - output/data/raw/uniref50.fasta.gz
 
@@ -12,6 +13,7 @@ stages:
     deps:
       - src/protx/data/extractor.py
       - output/data/raw/uniref50.fasta.gz
+      - src/protx/config/data_config.py
     outs:
       - output/data/raw/uniref50.fasta
 
@@ -20,12 +22,8 @@ stages:
     deps:
       - src/protx/data/filter_splitor.py
       - output/data/raw/uniref50.fasta
-    params:
-      - src/protx/data/params.yaml:
-          - min_seq_len
-          - max_seq_len
-          - max_seqs_num
-          - val_ratio
+      - src/protx/config/data_config.py
+
     outs:
       - output/data/filter_split/uniref50_filtered.fasta
       - output/data/filter_split/train.fasta

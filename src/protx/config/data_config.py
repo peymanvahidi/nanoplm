@@ -1,24 +1,14 @@
-import yaml
 from pathlib import Path
 
-class Config:
-    def __init__(self, params_file: Path = None):
-        """Initialize configuration from a YAML file and set default constants."""
-        # Load parameters from YAML
-        if params_file is None:
-            yaml_path = Path(__file__).parent / "params.yaml"
-        else:
-            yaml_path = params_file
-            
-        with open(yaml_path, "r") as f:
-            data = yaml.safe_load(f)
+class DataConfig:
+    def __init__(self):
         
         # Parameters from YAML
-        self.val_ratio = data["val_ratio"]
-        self.max_seqs_num = data["max_seqs_num"]
-        self.min_seq_len = data["min_seq_len"]
-        self.max_seq_len = data["max_seq_len"]
-        self.batch_size = data["batch_size"]
+        self.val_ratio = 0.1
+        self.max_seqs_num = 50
+        self.min_seq_len = 20
+        self.max_seq_len = 512
+        self.batch_size = 32
         
         # Hardcoded constants
         self.base_dir = Path("output")
