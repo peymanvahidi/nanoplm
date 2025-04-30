@@ -3,8 +3,6 @@ from Bio import SeqIO
 from tqdm import tqdm
 from pathlib import Path
 
-from .config import *
-
 from ..utils import create_dirs, logger
 
 class FilterSplitor():

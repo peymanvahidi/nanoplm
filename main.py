@@ -1,7 +1,7 @@
 import argparse
 
-from .src.protx.config import DataConfig
-from .src.protx.data import DataPipeline
+from src.protx.config import DataConfig
+from src.protx.data import DataPipeline
 
 def main():
     # Create parser

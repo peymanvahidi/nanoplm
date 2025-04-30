@@ -1,4 +1,3 @@
-import os
 import gzip
 import shutil
 from tqdm import tqdm
