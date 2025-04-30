@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Union
 from torch.utils.data import Dataset, IterableDataset
 
-from ..models.teacher import TeacherModel
+from ..config import DataConfig
+from ..models.teacher import ProtT5
 from ..utils.common import get_device
 from ..utils.logger import logger
 
@@ -16,7 +17,7 @@ class ProtXDataGen(IterableDataset):
     def __init__(
         self,
         data_path: Union[str, Path],
-        teacher_model: TeacherModel = TeacherModel(),
+        teacher_model: ProtT5 = ProtT5(),
         max_seq_len: int = 512,
         device: str = get_device()
     ):
@@ -51,8 +52,8 @@ class ProtXDataProcessor(Dataset):
     def __init__(
         self,
         data_path: Union[str, Path],
-        teacher_model: TeacherModel = TeacherModel(),
-        max_seq_len: int = 512,
+        teacher_model: ProtT5 = ProtT5(),
+        max_seq_len: int = DataConfig().max_seq_len,
         batch_size: int = 32,
         device: str = get_device()
     ):
