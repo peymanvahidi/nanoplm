@@ -13,10 +13,10 @@ class ProtX(nn.Module):
 
     def __init__(
         self,
-        student_dim: int = 512,
-        student_layers: int = 6,
-        student_heads: int = 8,
-        activation: str = "swiglu",
+        embed_dim: int = 512,
+        num_layers: int = 6,
+        num_heads: int = 8,
+        mlp_activation: str = "swiglu",
     ):
         super().__init__()
 
@@ -24,10 +24,10 @@ class ProtX(nn.Module):
 
         self.student_config = ModernBertConfig(
             vocab_size=self.tokenizer.vocab_size,
-            hidden_size=student_dim,
-            intermediate_size=student_dim * 2,
-            num_hidden_layers=student_layers,
-            num_attention_heads=student_heads,
+            hidden_size=embed_dim,
+            intermediate_size=embed_dim * 2,
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             attention_dropout=0.0,
@@ -38,23 +38,18 @@ class ProtX(nn.Module):
 
         self.student = ModernBertModel(self.student_config)
 
-        # swap in SwiGLU blocks if requested
-        if activation.lower() == "swiglu":
+        if mlp_activation.lower() == "swiglu":
             for layer in self.student.layers:
                 layer.mlp = ModernBertMLPSwiGLU(self.student_config)
 
-        # Project student 512‑>1024 to match teacher hidden size
-        self.proj = nn.Linear(student_dim, 1024, bias=False)
+        self.proj = nn.Linear(embed_dim, 1024, bias=False)
         self.mse_loss = nn.MSELoss(reduction="none")
 
-    # ---------------------------------------------------------------------
-    # forward pass
-    # ---------------------------------------------------------------------
     def forward(self, input_ids, attention_mask, target_repr):
         """Return (loss, student_repr?) so it fits easily into training loops."""
 
         student_out = self.student(input_ids=input_ids, attention_mask=attention_mask)
-        student_repr = self.proj(student_out.last_hidden_state)  # (B,L,1024)
+        student_repr = self.proj(student_out.last_hidden_state)  # (batch_size, seq_len, 1024)
 
         # compute MSE masked over non‑padding tokens
         mask = attention_mask.unsqueeze(-1).float()
