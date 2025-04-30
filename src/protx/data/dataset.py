@@ -43,8 +43,8 @@ class ProtXDataGen(IterableDataset):
                 return_tensors="pt"
             )
             yield {
-                "input_ids": tokenized_seq["input_ids"].squeeze(0),
-                "attention_mask": tokenized_seq["attention_mask"].squeeze(0)
+                "input_ids": tokenized_seq["input_ids"].squeeze(0).to(self.device),
+                "attention_mask": tokenized_seq["attention_mask"].squeeze(0).to(self.device)
             }
 
 class ProtXDataProcessor(Dataset):
@@ -61,20 +61,23 @@ class ProtXDataProcessor(Dataset):
         self.device = device
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
+        self._loaded = False
 
-        logger.info(f"Teacher and student models loaded on {self.device}")
-
-        self.data_gen = (
-            (record.id, str(record.seq)) 
-            for record in SeqIO.parse(self.data_path, "fasta")
-        )
-
-        logger.info(f"{self.data_path} loaded successfully.")
+    def _load(self):
+        if not self._loaded:
+            self.data_gen = (
+                (record.id, str(record.seq)) 
+                for record in SeqIO.parse(self.data_path, "fasta")
+            )
+            self._loaded = True
+            logger.info(f"{self.data_path} initialized successfully.")
 
     def __len__(self):
+        self._load()
         return sum(1 for _ in self.data_gen)
     
     def process_dataset(self, save_path: Path):
+        self._load()
         teacher_tokenizer = self.teacher.tokenizer
         teacher_model = self.teacher.encoder_model
 
