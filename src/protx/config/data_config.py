@@ -3,14 +3,13 @@ from pathlib import Path
 class DataConfig:
     def __init__(self):
         
-        # Parameters from YAML
+        # Only change these variables
         self.val_ratio = 0.1
-        self.max_seqs_num = 50
+        self.max_seqs_num = 5000
         self.min_seq_len = 20
         self.max_seq_len = 512
-        self.batch_size = 32
         
-        # Hardcoded constants
+        # Hardcoded constants (DO NOT CHANGE)
         self.base_dir = Path("output")
         self.raw_dir = self.base_dir / "data/raw"
         self.filter_split_dir = self.base_dir / "data/filter_split"
