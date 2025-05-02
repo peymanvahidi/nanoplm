@@ -2,12 +2,17 @@ from .downloader import Downloader
 from .extractor import Extractor
 from .filter_splitor import FilterSplitor
 from .dataset import ProtXDataProcessor
+from ..config import DataConfig
 
 from ..utils.logger import logger, log_stage
 
 class DataPipeline:
     
-    def __init__(self, config, **kwargs):
+    def __init__(
+        self,
+        config: DataConfig,
+        **kwargs
+    ):
         """
         Initialize the pipeline with a config object and optional overrides.
         

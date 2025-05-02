@@ -6,6 +6,7 @@ from Bio import SeqIO
 from tqdm import tqdm
 from pathlib import Path
 from typing import Union
+from transformers import PreTrainedTokenizer
 from torch.utils.data import Dataset, IterableDataset
 
 from ..config import DataConfig
@@ -17,12 +18,12 @@ class ProtXDataGen(IterableDataset):
     def __init__(
         self,
         data_path: Union[str, Path],
-        teacher_model: ProtT5 = ProtT5(),
+        teacher_tokenizer: PreTrainedTokenizer,
         max_seq_len: int = 512,
         device: str = get_device()
     ):
         self.data_path = Path(data_path)
-        self.teacher = teacher_model
+        self.tokenizer = teacher_tokenizer
         self.device = device
         self.max_seq_len = max_seq_len
 
@@ -31,11 +32,10 @@ class ProtXDataGen(IterableDataset):
             (record.id, str(record.seq)) 
             for record in SeqIO.parse(self.data_path, "fasta")
         )
-        teacher_tokenizer = self.teacher.tokenizer
         
         for _, sequence in data_gen:
             teacher_seq = " ".join(list(re.sub(r"[UZOB]", "X", sequence)))
-            tokenized_seq = teacher_tokenizer.encode_plus(
+            tokenized_seq = self.tokenizer.encode_plus(
                 teacher_seq,
                 add_special_tokens=True,
                 padding="max_length",
