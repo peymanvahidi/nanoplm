@@ -2,6 +2,7 @@ import random
 from Bio import SeqIO
 from tqdm import tqdm
 from pathlib import Path
+from io import StringIO
 
 from ..utils import create_dirs, logger
 
@@ -40,29 +41,37 @@ class FilterSplitor():
             f"max_seqs_number={self.max_seqs_num}"
         )
         
-        total_seqs = sum(1 for _ in SeqIO.parse(self.input_file, 'fasta'))
+        index = self._build_index(self.input_file)
+        total_seqs = len(index)
+        
+        if self.shuffle:
+            random.shuffle(index)
         
         seq_count = 0
         passed_count = 0
         
-        total_to_process = total_seqs if self.max_seqs_num is None else self.max_seqs_num
+        logger.info(f"Randomly selecting and filtering sequences...")
         
-        with tqdm(total=total_to_process, desc="Processing sequences") as pbar:
+        with tqdm(total=total_seqs if self.max_seqs_num is not None else total_seqs, desc="Processing sequences") as pbar:
             with open(output_file, 'w') as output_handle:
-                for record in SeqIO.parse(self.input_file, 'fasta'):
-                    seq_count += 1
-
-                    seq_len = len(record.seq)
-                    if self.min_seq_len <= seq_len <= self.max_seq_len:
-                        SeqIO.write([record], output_handle, 'fasta')
-                        passed_count += 1
-                        pbar.update(1)
-                    
-                    # Only check max_seqs_num constraint if it's not None
-                    if self.max_seqs_num is not None and passed_count >= self.max_seqs_num:
-                        break
+                with open(self.input_file, 'rb') as input_handle:
+                    for i, (start, end) in enumerate(index):
+                        input_handle.seek(start)
+                        seq_data = input_handle.read(end - start).decode('utf-8')
+                        
+                        record = next(SeqIO.parse(StringIO(seq_data), 'fasta'))
+                        seq_count += 1
+                        
+                        seq_len = len(record.seq)
+                        if self.min_seq_len <= seq_len <= self.max_seq_len:
+                            SeqIO.write([record], output_handle, 'fasta')
+                            passed_count += 1
+                            pbar.update(1)
+                        
+                        if self.max_seqs_num is not None and passed_count >= self.max_seqs_num:
+                            break
         
-        logger.info(f"Processed first {seq_count} sequences out of {total_seqs}: {passed_count} sequences retrived with length in [{self.min_seq_len}, {self.max_seq_len}].")
+        logger.info(f"Processed {seq_count} sequences out of {total_seqs}: {passed_count} sequences retrieved with length in [{self.min_seq_len}, {self.max_seq_len}].")
         logger.info(f"Output file: {output_file}")
 
         self.processed_seqs_num = seq_count
@@ -77,27 +86,21 @@ class FilterSplitor():
         """
         Split the filtered seqs to train and val.
         """
-        logger.info(f"Creating splits with val ratio {self.val_ratio} (shuffle={self.shuffle})")
-
-        index = self._build_index(self.filtered_seqs_path)
-        num_filtered_seqs = len(index)
+        logger.info(f"Creating splits with val ratio {self.val_ratio}")
         
-        if self.shuffle:
-            random.shuffle(index)
+        sequences = list(SeqIO.parse(self.filtered_seqs_path, 'fasta'))
+        num_filtered_seqs = len(sequences)
         
         val_size = int(num_filtered_seqs * self.val_ratio)
         train_size = num_filtered_seqs - val_size
         
         logger.info(f"Sequences: {num_filtered_seqs}, Train: {train_size}, Val: {val_size}")
         
-        with open(self.filtered_seqs_path, 'rb') as src:
-            with open(train_file, 'wb') as train, open(val_file, 'wb') as val:
-                with tqdm(total=num_filtered_seqs, desc="Splitting data") as pbar:
-                    for i, (start, end) in enumerate(index):
-                        src.seek(start)
-                        data = src.read(end - start)
-                        (train if i < train_size else val).write(data)
-                        pbar.update(1)
+        with tqdm(total=num_filtered_seqs, desc="Splitting data") as pbar:
+            SeqIO.write(sequences[:train_size], train_file, 'fasta')
+            SeqIO.write(sequences[train_size:], val_file, 'fasta')
+            
+            pbar.update(num_filtered_seqs)
         
         logger.info(f"Created files in {self.output_dir}")
 
