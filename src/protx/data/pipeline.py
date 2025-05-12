@@ -22,22 +22,36 @@ class DataPipeline:
         """
         self.config = config
         
-        # Apply any runtime overrides from kwargs
-        for key, value in kwargs.items():
-            if hasattr(self.config, key):
-                setattr(self.config, key, value)
-            else:
-                raise ValueError(f"Config does not have attribute '{key}'")
+        if kwargs:
+            self.config.override(kwargs)
         
-        self.downloader = Downloader(
+        
+    def download(self):
+        downloader = Downloader(
             url=self.config.uniref50_url,
             output_file=self.config.uniref50_fasta_gz
         )
-        self.extractor = Extractor(
+        try:
+            log_stage("DOWNLOAD")
+            downloader.download()
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            raise
+    
+    def extract(self):
+        extractor = Extractor(
             input_file=self.config.uniref50_fasta_gz,
             output_file=self.config.uniref50_fasta
         )
-        self.filter_splitor = FilterSplitor(
+        try:
+            log_stage("EXTRACT")
+            extractor.extract()
+        except Exception as e:
+            logger.error(f"Extract failed: {e}")
+            raise
+    
+    def filter_split(self):
+        filter_splitor = FilterSplitor(
             input_file=self.config.uniref50_fasta,
             output_dir=self.config.filter_split_dir,
             min_seq_len=self.config.min_seq_len,
@@ -46,39 +60,41 @@ class DataPipeline:
             val_ratio=self.config.val_ratio,
             info_file=self.config.info_file,
         )
-
-        self.protx_train_data = ProtXDataProcessor(self.config.train_file)
-        self.protx_val_data = ProtXDataProcessor(self.config.val_file)
-    
-    def download(self):
-        log_stage("DOWNLOAD")
-        self.downloader.download()
-    
-    def extract(self):
-        log_stage("EXTRACT")
-        self.extractor.extract()
-    
-    def filter_split(self):
-        log_stage("FILTER & SPLIT")
-        self.filter_splitor.filter(
-            output_file=self.config.filtered_seqs
-        )
-        self.filter_splitor.split(
-            train_file=self.config.train_file,
-            val_file=self.config.val_file
-        )
+        try:
+            log_stage("FILTER & SPLIT")
+            filter_splitor.filter(
+                output_file=self.config.filtered_seqs
+            )
+            filter_splitor.split(
+                    train_file=self.config.train_file,
+                    val_file=self.config.val_file
+            )
+        except Exception as e:
+            logger.error(f"Filter & Split failed: {e}")
+            raise
     
     def save_protx_train_dataset(self):
-        log_stage("ProtX Training Data Gen")
-        self.protx_train_data.process_dataset(
-            save_path=self.config.protx_train
-        )
+        protx_train_data = ProtXDataProcessor(self.config.train_file)
+        try:
+            log_stage("ProtX Training Data Gen")
+            protx_train_data.process_dataset(
+                save_path=self.config.protx_train
+            )
+        except Exception as e:
+            logger.error(f"Save ProtX Train Dataset failed: {e}")
+            raise
+    
 
     def save_protx_val_dataset(self):
-        log_stage("ProtX Validation Data Gen")
-        self.protx_val_data.process_dataset(
-            save_path=self.config.protx_val
-        )
+        protx_val_data = ProtXDataProcessor(self.config.val_file)
+        try:
+            log_stage("ProtX Validation Data Gen")
+            protx_val_data.process_dataset(
+                save_path=self.config.protx_val
+            )
+        except Exception as e:
+            logger.error(f"Save ProtX Val Dataset failed: {e}")
+            raise
     
     def run_all(self, save_protx_dataset=False):
         self.download()
