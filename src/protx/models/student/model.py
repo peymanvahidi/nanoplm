@@ -5,6 +5,7 @@ from transformers import (
     ModernBertModel,
     ModernBertConfig,
 )
+from transformers.models.t5.modeling_t5 import T5LayerNorm
 
 from .tokenizer import ProtXTokenizer
 
@@ -22,7 +23,7 @@ class ProtX(nn.Module):
 
         self.tokenizer = ProtXTokenizer()
 
-        self.student_config = ModernBertConfig(
+        self.config = ModernBertConfig(
             vocab_size=self.tokenizer.vocab_size,
             hidden_size=embed_dim,
             intermediate_size=embed_dim * 2,
@@ -36,24 +37,21 @@ class ProtX(nn.Module):
             attention_bias=False,
         )
 
-        self.student = ModernBertModel(self.student_config)
+        self.model = ModernBertModel(self.config)
 
         if mlp_activation.lower() == "swiglu":
-            for layer in self.student.layers:
-                layer.mlp = ModernBertMLPSwiGLU(self.student_config)
+            for layer in self.model.layers:
+                layer.mlp = ModernBertMLPSwiGLU(self.config)
 
         self.proj = nn.Linear(embed_dim, 1024, bias=False)
-        self.mse_loss = nn.MSELoss(reduction="none")
+        self.proj_norm = T5LayerNorm(1024)
 
     def forward(self, input_ids, attention_mask, target_repr):
-        """Return (loss, student_repr?) so it fits easily into training loops."""
-
-        student_out = self.student(input_ids=input_ids, attention_mask=attention_mask)
+        student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
         student_repr = self.proj(student_out.last_hidden_state)  # (batch_size, seq_len, 1024)
+        student_repr = self.proj_norm(student_repr)
 
-        # compute MSE masked over non‑padding tokens
         mask = attention_mask.unsqueeze(-1).float()
-        # Manually calculate MSE to avoid issues with inference tensors
         diff = ((student_repr - target_repr) ** 2) * mask
         loss = diff.sum() / mask.sum().clamp(min=1)
 
@@ -64,9 +62,9 @@ class ProtX(nn.Module):
         """Save student weights + projection only."""
         torch.save(
             {
-                "student_state_dict": self.student.state_dict(),
+                "student_state_dict": self.model.state_dict(),
                 "proj_state_dict": self.proj.state_dict(),
-                "student_config": self.student_config.to_dict(),
+                "config": self.config.to_dict(),
             },
             path,
         )
