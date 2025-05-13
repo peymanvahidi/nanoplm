@@ -44,7 +44,7 @@ class ProtXScheduler(_LRScheduler):
         self.T_0 = T_0
         self.T_mult = T_mult
         self.gamma = gamma
-        self.max_lr_threshold = max_lr_threshold if max_lr_threshold is not None else min_lr * 1.5
+        self.max_lr_threshold = max_lr_threshold if max_lr_threshold is not None else min_lr * 3
         self.max_cycle_length = max_cycle_length
         
         self.cycle = 0
@@ -271,5 +271,5 @@ if __name__ == "__main__":
         T_mult=1.25,
         gamma=0.5,
         # max_cycle_length=2000,
-        save_path="lr_schedule12.png"
+        save_path="lr_schedule13.png"
     )

@@ -12,6 +12,7 @@ from ..models.teacher import ProtT5
 from ..data.dataset import ProtXDataGen
 from ..config import DataConfig, DistillConfig
 from ..utils import create_dirs, get_device
+from .scheduler import ProtXScheduler
 
 class DistillPipeline():
     def __init__(
@@ -24,13 +25,17 @@ class DistillPipeline():
         self.distill_config = distill_config
         self.device = get_device() if not device else device
 
+        val_seqs_num = int(self.data_config.max_seqs_num * self.data_config.val_ratio)
+        train_seqs_num = self.data_config.max_seqs_num - val_seqs_num
+        self.train_batches_num = math.ceil(train_seqs_num / self.distill_config.batch_size)
+            
+
     def train(
         self,
         student: torch.nn.Module = ProtX(),
         teacher = ProtT5(),
         checkpoint_path: str = None,
-        start_epoch: int = 0,
-        epoch_lrs: list = None
+        start_epoch: int = 0
     ):
         with mlflow.start_run() as run:
             run_id = run.info.run_id
@@ -44,44 +49,38 @@ class DistillPipeline():
                 "val_ratio": self.data_config.val_ratio,
                 
                 "num_epochs": self.distill_config.num_epochs,
-                "lr": self.distill_config.lr,
                 "batch_size": self.distill_config.batch_size,
+                "warmup_steps": self.distill_config.warmup_steps,
+                "max_lr": self.distill_config.max_lr,
+                "min_lr": self.distill_config.min_lr,
+                "coinse_cycle": self.distill_config.coinse_cycle,
+                "cosine_factor": self.distill_config.cosine_factor,
+                "gamma": self.distill_config.gamma,
+
                 "student_embed_dim": self.distill_config.student_embed_dim,
                 "student_num_layers": self.distill_config.student_num_layers,
-                "student_num_heads": self.distill_config.student_num_heads
+                "student_num_heads": self.distill_config.student_num_heads,
             })
             
-            # Load checkpoint if provided
             if checkpoint_path:
-                print(f"Loading model from checkpoint: {checkpoint_path}")
-                student.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                student.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                start_epoch = checkpoint['epoch']
+
+            # Start with very low LR for warmup
+            optimizer = torch.optim.AdamW(student.parameters(), lr=1e-8)
             
-            # Set the learning rate to 3e-5 (will be overridden by scheduler)
-            self.distill_config.lr = 3e-5
-            optimizer = torch.optim.AdamW(student.parameters(), lr=1.0)  # Base LR of 1.0 for scaling
-            
-            # Calculate total training steps
-            estimated_val_seqs = int(self.data_config.max_seqs_num * self.data_config.val_ratio)
-            estimated_train_seqs = self.data_config.max_seqs_num - estimated_val_seqs
-            estimated_train_batches = math.ceil(estimated_train_seqs / self.distill_config.batch_size)
-            total_train_steps = estimated_train_batches * self.distill_config.num_epochs
-            
-            # Define per-epoch learning rates
-            if epoch_lrs is None:
-                epoch_lrs = [1e-3, 3e-4, 1e-4, 1e-4, 3e-5, 3e-5, 3e-5, 1e-5, 1e-5, 3e-6]
-            
-            # Log the learning rate schedule
-            mlflow.log_param("epoch_lrs", epoch_lrs)
-            
-            # Custom scheduler to apply epoch-specific learning rates
-            def lr_lambda(current_step: int) -> float:
-                epoch = min((current_step // estimated_train_batches) + start_epoch, 
-                            self.distill_config.num_epochs - 1)
-                if epoch < len(epoch_lrs):
-                    return epoch_lrs[epoch]
-                return epoch_lrs[-1]  # Use last LR if epoch beyond provided list
-            
-            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            # Use the new scheduler
+            scheduler = ProtXScheduler(
+                optimizer,
+                warmup_steps=self.distill_config.warmup_steps,  # 1000 steps of warmup
+                max_lr=self.distill_config.max_lr,  # Target max LR (1e-3)
+                min_lr=self.distill_config.min_lr,  # Min LR during cosine cycles
+                T_0=self.distill_config.coinse_cycle,  # Length of first cosine cycle
+                T_mult=self.distill_config.cosine_factor,  # Multiplicative factor for cycle length
+                gamma=self.distill_config.gamma  # Weight decay factor per cycle
+            )
             
             student = student.to(self.device)
             teacher_model = teacher.encoder_model.to(self.device)
@@ -91,8 +90,6 @@ class DistillPipeline():
                 batch_size=self.distill_config.batch_size
             )
             
-            estimated_val_batches = math.ceil(estimated_val_seqs / self.distill_config.batch_size)
-
             checkpoint_dir = self.distill_config.checkpoint_dir
             plots_dir = self.distill_config.plots_dir
             create_dirs(checkpoint_dir)
@@ -107,7 +104,7 @@ class DistillPipeline():
                 epoch_loss = 0.0
                 train_batches = 0
                 
-                train_iter = tqdm(train_data, total=estimated_train_batches, desc=f"Epoch {epoch+1}/{self.distill_config.num_epochs} [Train]")
+                train_iter = tqdm(train_data, desc=f"Epoch {epoch+1}/{self.distill_config.num_epochs} [Train]")
 
                 current_lr = optimizer.param_groups[0]['lr']
                 mlflow.log_metric("learning_rate", current_lr, step=epoch)
@@ -136,24 +133,21 @@ class DistillPipeline():
 
                     epoch_loss += loss.item()
                     train_batches += 1
-                    train_iter.set_postfix(loss=loss.item(), batch=f"{train_batches}/{estimated_train_batches}")
+                    train_iter.set_postfix(loss=loss.item())
                     
-                    mlflow.log_metric("step_train_loss", loss.item(), step=epoch * estimated_train_batches + train_batches)
+                    mlflow.log_metric("step_train_loss", loss.item(), step=epoch * self.train_batches_num + train_batches)
                     
-                    if train_batches >= estimated_train_batches:
-                        break
-
                 avg_train_loss = epoch_loss / train_batches if train_batches > 0 else 0
                 train_losses.append(avg_train_loss)
-                print(f"Epoch {epoch + 1}/{self.distill_config.num_epochs}, Training Loss: {avg_train_loss:.4f}")
+                print(f"Epoch {epoch + 1}/{self.distill_config.num_epochs}, Average Training Loss: {avg_train_loss:.4f}")
                 
-                mlflow.log_metric("train_loss", avg_train_loss, step=epoch)
+                mlflow.log_metric("avg_train_loss", avg_train_loss, step=epoch)
                 
                 student.eval()
                 val_loss = 0.0
                 val_batches = 0
                 
-                val_iter = tqdm(val_data, total=estimated_val_batches, desc=f"Epoch {epoch+1}/{self.distill_config.num_epochs} [Valid]")
+                val_iter = tqdm(val_data, desc=f"Epoch {epoch+1}/{self.distill_config.num_epochs} [Valid]")
                 
                 with torch.no_grad():
                     for batch in val_iter:
@@ -173,18 +167,15 @@ class DistillPipeline():
                         
                         val_loss += loss.item()
                         val_batches += 1
-                        val_iter.set_postfix(loss=loss.item(), batch=f"{val_batches}/{estimated_val_batches}")
+                        val_iter.set_postfix(loss=loss.item())
                         
-                        mlflow.log_metric("step_val_loss", loss.item(), step=epoch * estimated_val_batches + val_batches)
+                        mlflow.log_metric("step_val_loss", loss.item(), step=epoch * self.train_batches_num + val_batches)
                         
-                        if val_batches >= estimated_val_batches:
-                            break
-                    
                 avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
                 val_losses.append(avg_val_loss)
-                print(f"Validation Loss: {avg_val_loss:.4f}")
+                print(f"Epoch {epoch + 1}/{self.distill_config.num_epochs}, Average Validation Loss: {avg_val_loss:.4f}")
                 
-                mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
+                mlflow.log_metric("avg_val_loss", avg_val_loss, step=epoch)
                 
                 model_path = f"{checkpoint_dir}/{unique_id}_e{epoch+1}_tl-{avg_train_loss:.2f}_vl-{avg_val_loss:.2f}.pt"
                 torch.save(student.state_dict(), model_path)
@@ -193,7 +184,14 @@ class DistillPipeline():
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     best_model_path = f"{checkpoint_dir}/{unique_id}_best.pt"
-                    torch.save(student.state_dict(), best_model_path)
+                    torch.save(
+                        {
+                            'epoch': epoch + 1,
+                            'model_state_dict': student.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                        },
+                        best_model_path
+                    )
                     mlflow.log_artifact(best_model_path)
                     print(f"New best model saved with validation loss: {best_val_loss:.4f}")
                 
@@ -255,3 +253,7 @@ class DistillPipeline():
         )
 
         return train_loader, val_loader
+
+if __name__ == "__main__":
+    pipeline = DistillPipeline()
+    pipeline.train()
