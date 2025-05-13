@@ -7,10 +7,19 @@ class DistillConfig:
         self.checkpoint_dir = self.base_dir / "checkpoints"
         self.plots_dir = self.base_dir / "plots"
 
+        self.num_epochs = 9
         self.batch_size = 32
-        self.lr = 3e-5
-        self.num_epochs = 10
 
-        self.student_embed_dim = 512
+        # Scheduler
+        self.warmup_steps = 1000
+        self.start_lr = 1e-8
+
+        self.min_lr = 2e-6
+        self.max_lr = 1e-3
+        self.T_0 = 1000
+        self.T_mult = 1.25
+        self.gamma = 0.5
+
+        self.student_embed_dim = 256
         self.student_num_layers = 6
-        self.student_num_heads = 8
+        self.student_num_heads = 4

@@ -53,8 +53,8 @@ class DistillPipeline():
                 "warmup_steps": self.distill_config.warmup_steps,
                 "max_lr": self.distill_config.max_lr,
                 "min_lr": self.distill_config.min_lr,
-                "coinse_cycle": self.distill_config.coinse_cycle,
-                "cosine_factor": self.distill_config.cosine_factor,
+                "T_0": self.distill_config.T_0,
+                "T_mult": self.distill_config.T_mult,
                 "gamma": self.distill_config.gamma,
 
                 "student_embed_dim": self.distill_config.student_embed_dim,
@@ -68,18 +68,17 @@ class DistillPipeline():
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 start_epoch = checkpoint['epoch']
 
-            # Start with very low LR for warmup
             optimizer = torch.optim.AdamW(student.parameters(), lr=1e-8)
             
-            # Use the new scheduler
             scheduler = ProtXScheduler(
                 optimizer,
-                warmup_steps=self.distill_config.warmup_steps,  # 1000 steps of warmup
-                max_lr=self.distill_config.max_lr,  # Target max LR (1e-3)
-                min_lr=self.distill_config.min_lr,  # Min LR during cosine cycles
-                T_0=self.distill_config.coinse_cycle,  # Length of first cosine cycle
-                T_mult=self.distill_config.cosine_factor,  # Multiplicative factor for cycle length
-                gamma=self.distill_config.gamma  # Weight decay factor per cycle
+                warmup_steps=self.distill_config.warmup_steps,
+                max_lr=self.distill_config.max_lr,
+                min_lr=self.distill_config.min_lr,
+                T_0=self.distill_config.T_0,
+                T_mult=self.distill_config.T_mult,
+                gamma=self.distill_config.gamma,
+                max_cycle_length=self.distill_config.max_cycle_length
             )
             
             student = student.to(self.device)
