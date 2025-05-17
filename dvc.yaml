@@ -4,7 +4,9 @@ stages:
     cmd: python3 main.py --download-data
     deps:
       - src/protx/data/downloader.py
-      - src/protx/config/data_config.py
+    params:
+      - data_dirs.uniref50_url
+      - data_dirs.uniref50_fasta_gz
     outs:
       - output/data/raw/uniref50.fasta.gz
 
@@ -13,7 +15,9 @@ stages:
     deps:
       - src/protx/data/extractor.py
       - output/data/raw/uniref50.fasta.gz
-      - src/protx/config/data_config.py
+    params:
+      - data_dirs.uniref50_fasta_gz
+      - data_dirs.uniref50_fasta
     outs:
       - output/data/raw/uniref50.fasta
 
@@ -22,22 +26,32 @@ stages:
     deps:
       - src/protx/data/filter_splitor.py
       - output/data/raw/uniref50.fasta
-      - src/protx/config/data_config.py
-
+    params:
+      - data_dirs.uniref50_fasta
+      - data_dirs.filter_split_dir
+      - data_dirs.info_file
+      - data_params.min_seq_len
+      - data_params.max_seq_len
+      - data_params.max_seqs_num
+      - data_params.val_ratio
     outs:
       - output/data/filter_split/uniref50_filtered.fasta
       - output/data/filter_split/train.fasta
       - output/data/filter_split/val.fasta
       - output/data/filter_split/dataset_info.txt
   
-  # protx_dataset:
-  #   cmd: python3 main.py --save-protx-dataset
-  #   deps:
-  #     - src/protx/data/dataset.py
-  #     - output/data/filter_split/train.fasta
-  #     - output/data/filter_split/val.fasta
-  #   outs:
-  #     - output/data/protx_dataset/train.h5
-  #     - output/data/protx_dataset/val.h5
+  protx_dataset:
+    cmd: python3 main.py --save-protx-dataset
+    deps:
+      - src/protx/data/dataset.py
+      - output/data/filter_split/train.fasta
+      - output/data/filter_split/val.fasta
+    params:
+      - data_dirs.protx_dataset_dir
+      - data_dirs.protx_train
+      - data_dirs.protx_val
+    outs:
+      - output/data/protx_dataset/train.h5
+      - output/data/protx_dataset/val.h5
   
   

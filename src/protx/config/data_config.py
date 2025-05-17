@@ -1,33 +1,39 @@
 from pathlib import Path
+import yaml
+import os
 
 class DataConfig:
     def __init__(self):
+        # Load params from params.yaml if it exists
+        self._params = {}
+        if os.path.exists("params.yaml"):
+            with open("params.yaml", "r") as f:
+                self._params = yaml.safe_load(f)
         
-        # Only change these variables
-        self.val_ratio = 0.1
-        self.max_seqs_num = 200
-        self.min_seq_len = 20
-        self.max_seq_len = 256
+        self.base_dir = self._get_param("data_dirs.base_dir")
+        self.raw_dir = self._get_param("data_dirs.raw_dir")
         
-        # Hardcoded constants (DO NOT CHANGE)
-        self.base_dir = Path("output")
-        self.raw_dir = self.base_dir / "data/raw"
-        self.filter_split_dir = self.base_dir / "data/filter_split"
-        self.protx_dataset_dir = self.base_dir / "data/protx_dataset"
+        self.val_ratio = self._get_param("data_params.val_ratio")
+        self.max_seqs_num = self._get_param("data_params.max_seqs_num")
+        self.min_seq_len = self._get_param("data_params.min_seq_len")
+        self.max_seq_len = self._get_param("data_params.max_seq_len")
         
-        self.uniref50_url = "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
-        self.uniref50_fasta_gz = self.raw_dir / "uniref50.fasta.gz"
-        self.uniref50_fasta = self.raw_dir / "uniref50.fasta"
+        self.filter_split_dir = self._get_param("data_dirs.filter_split_dir")
+        self.protx_dataset_dir = self._get_param("data_dirs.protx_dataset_dir")
         
-        self.filtered_seqs = self.filter_split_dir / "uniref50_filtered.fasta"
-        self.train_file = self.filter_split_dir / "train.fasta"
-        self.val_file = self.filter_split_dir / "val.fasta"
-        self.info_file = self.filter_split_dir / "dataset_info.txt"
+        self.uniref50_url = self._get_param("data_dirs.uniref50_url")
+        self.uniref50_fasta_gz = self._get_param("data_dirs.uniref50_fasta_gz")
+        self.uniref50_fasta = self._get_param("data_dirs.uniref50_fasta")
+        
+        self.filtered_seqs = self._get_param("data_dirs.uniref50_filtered_fasta")
+        self.train_file = self._get_param("data_dirs.train_fasta")
+        self.val_file = self._get_param("data_dirs.val_fasta")
+        self.info_file = self._get_param("data_dirs.info_file")
 
         # These will be used if you want to precompute the embeddings
         # If they are gonna be calculated on-the-fly (suggested), these won't be used
-        self.protx_train = self.protx_dataset_dir / "train.h5"
-        self.protx_val = self.protx_dataset_dir / "val.h5"
+        self.protx_train = self._get_param("data_dirs.protx_train")
+        self.protx_val = self._get_param("data_dirs.protx_val")
         
         self.validate()
     
@@ -70,3 +76,18 @@ class DataConfig:
         for attr, value in vars(self).items():
             if isinstance(value, (str, Path)) and not str(value):
                 raise ValueError(f"{attr} must be a non-empty string or Path, got {value}")
+
+    def _get_param(self, key):
+        if "." in key:
+            parts = key.split(".")
+            current = self._params
+            for part in parts:
+                if part not in current:
+                    raise KeyError(f"Key '{key}' not found in params")
+                current = current[part]
+            return current
+        return self._params[key]
+
+if __name__ == "__main__":
+    dc = DataConfig()
+    print(dc.uniref50_url)
