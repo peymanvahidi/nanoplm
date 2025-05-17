@@ -13,7 +13,7 @@ class Downloader:
         output_file: str
     ):
         self.url = url
-        self.output_file = output_file
+        self.output_file = Path(output_file)
 
     def download(self):
         """Download UniRef50 dataset if it doesn't exist."""

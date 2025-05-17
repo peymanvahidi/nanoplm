@@ -2,7 +2,7 @@ import gzip
 import shutil
 from tqdm import tqdm
 from pathlib import Path
-
+from typing import Union
 from ..utils import logger
 
 class Extractor():
@@ -10,11 +10,11 @@ class Extractor():
 
     def __init__(
         self,
-        input_file: Path,
-        output_file: Path
+        input_file: Union[str, Path],
+        output_file: Union[str, Path]
     ):
-        self.input_file = input_file
-        self.output_file = output_file
+        self.input_file = Path(input_file)
+        self.output_file = Path(output_file)
     
     def extract(self):
         if self.output_file.exists():

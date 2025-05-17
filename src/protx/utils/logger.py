@@ -8,7 +8,7 @@ from ..config import DataConfig
 config = DataConfig()
 
 # Create logs directory if it doesn't exist
-Path(config.base_dir / "logs").mkdir(parents=True, exist_ok=True)
+(Path(config.base_dir) / "logs").mkdir(parents=True, exist_ok=True)
 
 # Set up file handler for all logs in a unique file per run with timestamp
 log_file = f'{config.base_dir}/logs/pipeline.log'

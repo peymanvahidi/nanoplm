@@ -3,6 +3,7 @@ from Bio import SeqIO
 from tqdm import tqdm
 from pathlib import Path
 from io import StringIO
+from typing import Union
 
 from ..utils import create_dirs, logger
 
@@ -11,22 +12,22 @@ class FilterSplitor():
 
     def __init__(
         self,
-        input_file: Path,
-        output_dir: Path,
+        input_file: Union[str, Path],
+        output_dir: Union[str, Path],
         min_seq_len: int,
         max_seq_len: int,
         max_seqs_num: int,
         val_ratio: float,
-        info_file: Path,
+        info_file: Union[str, Path],
         shuffle: bool = True
     ):
-        self.input_file = input_file
-        self.output_dir = output_dir
+        self.input_file = Path(input_file)
+        self.output_dir = Path(output_dir)
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         self.max_seqs_num = max_seqs_num
         self.val_ratio = val_ratio
-        self.info_file = info_file
+        self.info_file = Path(info_file)
         self.shuffle = shuffle
 
     def filter(

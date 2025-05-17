@@ -87,9 +87,16 @@ class ProtXDataProcessor(Dataset):
         all_attention_masks = []
         all_teacher_embeddings = []
         
-        logger.info(f"Processing sequences and generating embeddings...")
-        with tqdm(self.data_gen) as pbar:
-            for _, sequence in pbar:
+        # Calculate total number of sequences for progress bar
+        total_sequences = sum(1 for _ in SeqIO.parse(self.data_path, "fasta"))
+        
+        # Reset data generator after counting
+        self._loaded = False
+        self._load()
+        
+        logger.info(f"Processing {total_sequences} sequences and generating embeddings...")
+        with tqdm(total=total_sequences, desc="Generating embeddings", unit="seq") as pbar:
+            for _, sequence in self.data_gen:
                 teacher_seq = " ".join(list(re.sub(r"[UZOB]", "X", sequence)))
                 
                 batch.append(teacher_seq)
@@ -117,6 +124,7 @@ class ProtXDataProcessor(Dataset):
                     all_attention_masks.append(attention_mask.cpu().numpy())
                     all_teacher_embeddings.append(teacher_embeddings.cpu().numpy())
                     
+                    pbar.update(len(batch))
                     batch = []
             
             # Check if there are any remaining sequences
@@ -142,6 +150,8 @@ class ProtXDataProcessor(Dataset):
                 all_input_ids.append(input_ids.cpu().numpy())
                 all_attention_masks.append(attention_mask.cpu().numpy())
                 all_teacher_embeddings.append(teacher_embeddings.cpu().numpy())
+                
+                pbar.update(len(batch))
         
         input_ids_array = np.concatenate(all_input_ids, axis=0)
         attention_mask_array = np.concatenate(all_attention_masks, axis=0)
@@ -150,6 +160,9 @@ class ProtXDataProcessor(Dataset):
         logger.info(f"Input IDs shape: {input_ids_array.shape}")
         logger.info(f"Attention mask shape: {attention_mask_array.shape}")
         logger.info(f"Teacher embeddings shape: {teacher_embeddings_array.shape}")
+        
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         
         with h5py.File(save_path, "w") as f:
             f.create_dataset("input_ids", data=input_ids_array)
