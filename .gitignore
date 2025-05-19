@@ -50,3 +50,6 @@ output/
 
 # experiments
 experiments/
+
+# wandb
+wandb/
