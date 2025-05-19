@@ -38,12 +38,12 @@ class ProtXScheduler(_LRScheduler):
         last_epoch: int = -1
     ):
         self.warmup_steps = warmup_steps
-        self.initial_lr = initial_lr
-        self.max_lr = max_lr
-        self.min_lr = min_lr
-        self.T_0 = T_0
-        self.T_mult = T_mult
-        self.gamma = gamma
+        self.initial_lr = float(initial_lr)
+        self.max_lr = float(max_lr)
+        self.min_lr = float(min_lr)
+        self.T_0 = int(T_0)
+        self.T_mult = int(T_mult)
+        self.gamma = float(gamma)
         self.max_lr_threshold = max_lr_threshold if max_lr_threshold is not None else min_lr * 3
         self.max_cycle_length = max_cycle_length
         
@@ -260,16 +260,16 @@ def visualize_lr_schedule(
 
 if __name__ == "__main__":
     visualize_lr_schedule(
-        train_examples=50000,
-        batch_size=32,
+        train_examples=5000 * 0.9,
+        batch_size=64,
         num_epochs=15,
-        warmup_steps=2500,
+        warmup_steps=500,
         initial_lr=1e-8,
-        max_lr=1e-3,
+        max_lr=3e-3,
         min_lr=1e-5,
-        T_0=500,
+        T_0=300,
         T_mult=1.25,
-        gamma=0.5,
-        # max_cycle_length=2000,
-        save_path="lr_schedule13.png"
+        gamma=0.55,
+        max_cycle_length=2000,
+        save_path="lr_schedule14.png"
     )
