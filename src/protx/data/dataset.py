@@ -84,7 +84,6 @@ class ProtXDataProcessor(Dataset):
 
         batch = []
         all_input_ids = []
-        all_attention_masks = []
         all_teacher_embeddings = []
         
         # Calculate total number of sequences for progress bar
@@ -121,7 +120,6 @@ class ProtXDataProcessor(Dataset):
                         ).last_hidden_state
                     
                     all_input_ids.append(input_ids.cpu().numpy())
-                    all_attention_masks.append(attention_mask.cpu().numpy())
                     all_teacher_embeddings.append(teacher_embeddings.cpu().numpy())
                     
                     pbar.update(len(batch))
@@ -148,26 +146,22 @@ class ProtXDataProcessor(Dataset):
                     ).last_hidden_state
                 
                 all_input_ids.append(input_ids.cpu().numpy())
-                all_attention_masks.append(attention_mask.cpu().numpy())
                 all_teacher_embeddings.append(teacher_embeddings.cpu().numpy())
                 
                 pbar.update(len(batch))
         
         input_ids_array = np.concatenate(all_input_ids, axis=0)
-        attention_mask_array = np.concatenate(all_attention_masks, axis=0)
         teacher_embeddings_array = np.concatenate(all_teacher_embeddings, axis=0)
 
         logger.info(f"Input IDs shape: {input_ids_array.shape}")
-        logger.info(f"Attention mask shape: {attention_mask_array.shape}")
         logger.info(f"Teacher embeddings shape: {teacher_embeddings_array.shape}")
         
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         
         with h5py.File(save_path, "w") as f:
-            f.create_dataset("input_ids", data=input_ids_array)
-            f.create_dataset("attention_mask", data=attention_mask_array)
-            f.create_dataset("teacher_embeddings", data=teacher_embeddings_array)
+            f.create_dataset("input_ids", data=input_ids_array.astype(np.int8))
+            f.create_dataset("teacher_embeddings", data=teacher_embeddings_array.astype(np.float16))
         
         logger.info(f"Dataset saved successfully with {input_ids_array.shape[0]} sequences")
         return save_path
@@ -190,9 +184,13 @@ class ProtXDataLoader(Dataset):
         return self.size
     
     def __getitem__(self, idx):
+        input_ids = torch.tensor(self.h5_file["input_ids"][idx], dtype=torch.long)
+
+        attention_mask = (input_ids != 0).long()
+        
         return {
-            "input_ids": torch.tensor(self.h5_file["input_ids"][idx], dtype=torch.long).to(self.device),
-            "attention_mask": torch.tensor(self.h5_file["attention_mask"][idx], dtype=torch.long).to(self.device),
+            "input_ids": input_ids.to(self.device),
+            "attention_mask": attention_mask.to(self.device),
             "teacher_embeddings": torch.tensor(self.h5_file["teacher_embeddings"][idx], dtype=torch.float).to(self.device)
         }
     
