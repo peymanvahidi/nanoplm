@@ -17,6 +17,9 @@ class DataConfig:
         self.max_seqs_num = self._get_param("data_params.max_seqs_num")
         self.min_seq_len = self._get_param("data_params.min_seq_len")
         self.max_seq_len = self._get_param("data_params.max_seq_len")
+        self.seqs_num_per_file = self._get_param("data_params.seqs_num_per_file")
+        # This is batch size for embedding calculation
+        self.embed_calc_batch_size = self._get_param("data_params.embed_calc_batch_size")
         
         self.filter_split_dir = self._get_param("data_dirs.filter_split_dir")
         self.protx_dataset_dir = self._get_param("data_dirs.protx_dataset_dir")
@@ -32,8 +35,8 @@ class DataConfig:
 
         # These will be used if you want to precompute the embeddings
         # If they are gonna be calculated on-the-fly (suggested), these won't be used
-        self.protx_train = self._get_param("data_dirs.protx_train")
-        self.protx_val = self._get_param("data_dirs.protx_val")
+        self.protx_train_prefix = self._get_param("data_dirs.protx_train_prefix")
+        self.protx_val_prefix = self._get_param("data_dirs.protx_val_prefix")
         
         self.validate()
     

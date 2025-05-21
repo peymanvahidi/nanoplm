@@ -1,17 +1,18 @@
-import math
-import time
 import torch
 import wandb
 from tqdm import tqdm
-import matplotlib.pyplot as plt
+from pathlib import Path
 from transformers import PreTrainedTokenizer
 from torch.utils.data import DataLoader
+import math
+import time
 
 from ..models.student import ProtX
 from ..models.teacher import ProtT5
+from ..config import DataConfig
+from ..config.distill_config import DistillConfig
 from ..data.dataset import ProtXDataGen, ProtXDataLoader
-from ..config import DataConfig, DistillConfig
-from ..utils import create_dirs, get_device
+from ..utils import get_device, create_dirs
 from .scheduler import ProtXScheduler
 
 class DistillPipeline():
@@ -99,8 +100,12 @@ class DistillPipeline():
         
         train_data, val_data = self._load_dataset(
             teacher_tokenizer=teacher.tokenizer if self.distill_config.on_the_fly else None,
-            batch_size=self.distill_config.batch_size
+            batch_size=self.distill_config.batch_size,
+            seed=timestamp
         )
+        
+        train_batches_total = len(train_data)
+        val_batches_total = len(val_data)
         
         checkpoint_dir = self.distill_config.checkpoint_dir
         plots_dir = self.distill_config.plots_dir
@@ -112,13 +117,35 @@ class DistillPipeline():
         val_losses = []
         
         global_step = 0
+        
+        print(f"\n{'=' * 60}")
+        print(f"Starting training: {self.distill_config.num_epochs} epochs")
+        print(f"{'=' * 60}\n")
 
         for epoch in range(start_epoch, self.distill_config.num_epochs):
+            if not self.distill_config.on_the_fly and epoch > start_epoch:
+                train_data, val_data = self._load_dataset(
+                    batch_size=self.distill_config.batch_size,
+                    seed=epoch
+                )
+                # Update batch counts for progress bars
+                train_batches_total = len(train_data)
+                val_batches_total = len(val_data)
+            
             student.train()
             epoch_loss = 0.0
             train_batches = 0
             
-            train_iter = tqdm(train_data, desc=f"Epoch {epoch+1}/{self.distill_config.num_epochs} [Train]")
+            print(f"\n{'-' * 20} Epoch {epoch+1}/{self.distill_config.num_epochs} {'-' * 20}")
+            
+            train_iter = tqdm(
+                train_data, 
+                desc=f"Training",
+                leave=True,
+                ncols=100,
+                total=train_batches_total,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+            )
 
             for batch in train_iter:
                 current_lr = optimizer.param_groups[0]['lr']
@@ -148,7 +175,7 @@ class DistillPipeline():
 
                 epoch_loss += loss.item()
                 train_batches += 1
-                train_iter.set_postfix(loss=loss.item())
+                train_iter.set_postfix(loss=f"{loss.item():.2f}", lr=f"{current_lr:.6f}")
                 
                 global_step += 1
                 
@@ -159,13 +186,19 @@ class DistillPipeline():
             
             avg_train_loss = epoch_loss / train_batches if train_batches > 0 else 0
             train_losses.append(avg_train_loss)
-            print(f"Epoch {epoch + 1}/{self.distill_config.num_epochs}, Average Training Loss: {avg_train_loss:.4f}")
             
             student.eval()
             val_loss = 0.0
             val_batches = 0
             
-            val_iter = tqdm(val_data, desc=f"Epoch {epoch+1}/{self.distill_config.num_epochs} [Valid]")
+            val_iter = tqdm(
+                val_data, 
+                desc=f"Validation",
+                leave=True,
+                ncols=100,
+                total=val_batches_total,
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+            )
             
             with torch.no_grad():
                 for batch in val_iter:
@@ -188,11 +221,14 @@ class DistillPipeline():
                     
                     val_loss += loss.item()
                     val_batches += 1
-                    val_iter.set_postfix(loss=loss.item())
+                    val_iter.set_postfix(loss=f"{loss.item():.2f}")
             
             avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
             val_losses.append(avg_val_loss)
-            print(f"Epoch {epoch + 1}/{self.distill_config.num_epochs}, Average Validation Loss: {avg_val_loss:.4f}")
+            
+            print(f"\nEpoch {epoch+1}/{self.distill_config.num_epochs} Summary:")
+            print(f"  Training Loss: {avg_train_loss:.4f}")
+            print(f"  Validation Loss: {avg_val_loss:.4f}")
             
             wandb.log({
                 "avg_train_loss": avg_train_loss,
@@ -201,7 +237,6 @@ class DistillPipeline():
             
             model_path = f"{checkpoint_dir}/{unique_id}_e{epoch+1}_tl-{avg_train_loss:.2f}_vl-{avg_val_loss:.2f}.pt"
             torch.save(student.state_dict(), model_path)
-            # wandb.save(model_path)
             
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -214,71 +249,54 @@ class DistillPipeline():
                     },
                     best_model_path
                 )
-                # wandb.save(best_model_path)
-                print(f"New best model saved with validation loss: {best_val_loss:.4f}")
+                print(f"  ✓ New best model saved (val_loss: {best_val_loss:.4f})")
+            
+            print(f"{'-' * 60}")
         
-        plt.figure(figsize=(10, 6))
-        epochs = list(range(start_epoch + 1, start_epoch + len(train_losses) + 1))
-        plt.plot(epochs, train_losses, 'b-', label='Training Loss')
-        plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
-        plt.title(f'Training and Validation Loss (Run {unique_id})')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True)
+        print(f"\n{'=' * 60}")
+        print(f"Training complete!")
+        print(f"Best validation loss: {best_val_loss:.4f}")
+        print(f"{'=' * 60}\n")
         
-        plot_path = f"{plots_dir}/loss_curves_run-{unique_id}.png"
-        plt.savefig(plot_path)
-        plt.show()
-
-        print(f"Loss curves saved to {plot_path}")
-        wandb.save(plot_path)
         wandb.log({"best_val_loss": best_val_loss}, step=global_step)
         wandb.finish()
 
         return student
 
-    def _collate_fn(self, batch):
-        input_ids = torch.stack([item["input_ids"] for item in batch])
-        attention_mask = torch.stack([item["attention_mask"] for item in batch])
-        
-        result = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
-        }
-        
-        if "teacher_embeddings" in batch[0]:
-            teacher_embeddings = torch.stack([item["teacher_embeddings"] for item in batch])
-            result["teacher_embeddings"] = teacher_embeddings
-            
-        return result
-
     def _load_dataset(
         self,
         teacher_tokenizer: PreTrainedTokenizer = None,
-        batch_size: int = 32
+        batch_size: int = 32,
+        seed: int = None
     ):
         if self.distill_config.on_the_fly:
             # Use original dataset with on-the-fly embedding computation
             train_dataset = ProtXDataGen(
                 data_path=self.data_config.train_file,
                 teacher_tokenizer=teacher_tokenizer,
-                max_seq_len=self.data_config.max_seq_len
+                max_seq_len=self.data_config.max_seq_len,
+                device=self.device
             )
             val_dataset = ProtXDataGen(
                 data_path=self.data_config.val_file,
                 teacher_tokenizer=teacher_tokenizer,
-                max_seq_len=self.data_config.max_seq_len
+                max_seq_len=self.data_config.max_seq_len,
+                device=self.device
             )
         else:
-            # Use pre-calculated embeddings from h5 files
+
+            train_files = self._find_dataset_files(self.data_config.protx_train_prefix, "training")
+            val_files = self._find_dataset_files(self.data_config.protx_val_prefix, "validation")
+            
             train_dataset = ProtXDataLoader(
-                h5_path=self.data_config.protx_train,
-                device=self.device
+                h5_path=train_files,
+                device=self.device,
+                seed=seed
             )
             val_dataset = ProtXDataLoader(
-                h5_path=self.data_config.protx_val,
-                device=self.device
+                h5_path=val_files,
+                device=self.device,
+                seed=seed
             )
 
         train_loader = DataLoader(
@@ -294,6 +312,39 @@ class DistillPipeline():
         )
 
         return train_loader, val_loader
+    
+    def _collate_fn(self, batch):
+        input_ids = torch.stack([item["input_ids"] for item in batch])
+        attention_mask = torch.stack([item["attention_mask"] for item in batch])
+        
+        result = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        }
+        
+        if "teacher_embeddings" in batch[0]:
+            teacher_embeddings = torch.stack([item["teacher_embeddings"] for item in batch])
+            result["teacher_embeddings"] = teacher_embeddings
+            
+        return result
+        
+    def _find_dataset_files(
+        self,
+        file_prefix: str,
+        dataset_type: str
+    ) -> list:
+        
+        path = Path(file_prefix)
+        directory = path.parent
+        base_name = path.stem
+        
+        pattern = f"{base_name}*.h5"
+        files = sorted(list(directory.glob(pattern)))
+        
+        if not files:
+            raise FileNotFoundError(f"No {dataset_type} data files found matching {pattern} in {directory}")
+        
+        return files
 
 if __name__ == "__main__":
     pipeline = DistillPipeline()

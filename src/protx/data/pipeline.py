@@ -1,10 +1,14 @@
+from pathlib import Path
+
 from .downloader import Downloader
 from .extractor import Extractor
 from .filter_splitor import FilterSplitor
 from .dataset import ProtXDataProcessor
+
+from ..models.teacher import ProtT5
 from ..config import DataConfig
 
-from ..utils.logger import logger, log_stage
+from ..utils import logger, log_stage, get_device
 
 class DataPipeline:
     
@@ -74,24 +78,46 @@ class DataPipeline:
             raise
     
     def save_protx_train_dataset(self):
-        protx_train_data = ProtXDataProcessor(self.config.train_file)
+
+        protx_train_data = ProtXDataProcessor(
+            data_path=self.config.train_file,
+            teacher_model=ProtT5(),
+            max_seq_len=self.config.max_seq_len,
+            seqs_num_per_file=self.config.seqs_num_per_file,
+            batch_size=self.config.embed_calc_batch_size,
+            device=get_device()
+        )
+
         try:
             log_stage("ProtX Training Data Gen")
-            protx_train_data.process_dataset(
-                save_path=self.config.protx_train
+            train_files = protx_train_data.process_dataset(
+                save_path=Path(self.config.protx_train_prefix)
             )
+            logger.info(f"Created {len(train_files)} training dataset files")
+            return train_files
         except Exception as e:
             logger.error(f"Save ProtX Train Dataset failed: {e}")
             raise
     
 
     def save_protx_val_dataset(self):
-        protx_val_data = ProtXDataProcessor(self.config.val_file)
+
+        protx_val_data = ProtXDataProcessor(
+            data_path=self.config.val_file,
+            teacher_model=ProtT5(),
+            max_seq_len=self.config.max_seq_len,
+            seqs_num_per_file=self.config.seqs_num_per_file,
+            batch_size=self.config.embed_calc_batch_size,
+            device=get_device()
+        )
+        
         try:
             log_stage("ProtX Validation Data Gen")
-            protx_val_data.process_dataset(
-                save_path=self.config.protx_val
+            val_files = protx_val_data.process_dataset(
+                save_path=Path(self.config.protx_val_prefix)
             )
+            logger.info(f"Created {len(val_files)} validation dataset files")
+            return val_files
         except Exception as e:
             logger.error(f"Save ProtX Val Dataset failed: {e}")
             raise

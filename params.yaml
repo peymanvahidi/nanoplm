@@ -1,8 +1,11 @@
 data_params:
-  val_ratio: 0.1
-  max_seqs_num: 1000
+  val_ratio: 0.5
+  max_seqs_num: 100
   min_seq_len: 20
   max_seq_len: 512
+  # This batch size is used for embedding calculation
+  embed_calc_batch_size: 10
+  seqs_num_per_file: 10
 
 distill_params:
 
@@ -13,7 +16,7 @@ distill_params:
 
   on_the_fly: false
   num_epochs: 15
-  batch_size: 64
+  batch_size: 1
 
   # scheduler
   ## warmup
@@ -47,8 +50,8 @@ data_dirs:
   info_file: "output/data/filter_split/dataset_info.txt"
 
   protx_dataset_dir: "output/data/protx_dataset"
-  protx_train: "output/data/protx_dataset/train.h5"
-  protx_val: "output/data/protx_dataset/val.h5"
+  protx_train_prefix: "output/data/protx_dataset/train/train"
+  protx_val_prefix: "output/data/protx_dataset/val/val"
 
   wandb_checkpoints_dir: "output/data/wandb_checkpoints"
   plots_dir: "output/data/plots"

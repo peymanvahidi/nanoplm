@@ -1,7 +1,8 @@
 import argparse
 
-from src.protx.config import DataConfig
+from src.protx.config import DataConfig, DistillConfig
 from src.protx.data import DataPipeline
+from src.protx.distillation.pipeline import DistillPipeline
 
 def main():
     # Create parser
@@ -12,6 +13,7 @@ def main():
     parser.add_argument("--extract-data", action="store_true", help="Run data extraction step")
     parser.add_argument("--filter-split-data", action="store_true", help="Run data filtering and splitting step")
     parser.add_argument("--save-protx-dataset", action="store_true", help="Saves train/val datasets ready to be used for student model")
+    parser.add_argument("--train-model", action="store_true", help="Train the model with the specified parameters")
     
     args = parser.parse_args()
     
@@ -31,6 +33,11 @@ def main():
     if args.save_protx_dataset:
         data_pipeline.save_protx_train_dataset()
         data_pipeline.save_protx_val_dataset()
+    
+    if args.train_model:
+        distill_config = DistillConfig()
+        distill_pipeline = DistillPipeline(distill_config, data_config)
+        distill_pipeline.train()
 
 if __name__ == "__main__":
     main()
