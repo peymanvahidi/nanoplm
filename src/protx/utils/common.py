@@ -20,7 +20,7 @@ def read_yaml(file_path: str) -> Dict[str, Any]:
 def get_device():
     if torch.backends.mps.is_available():
         return "mps"
-    elif torch.backends.cuda.is_available():
+    elif torch.cuda.is_available():
         return "cuda"
     else:
         return "cpu"
