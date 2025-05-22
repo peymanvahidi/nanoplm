@@ -2,7 +2,7 @@ import torch
 import wandb
 from tqdm import tqdm
 from pathlib import Path
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer, Trainer, TrainingArguments
 from torch.utils.data import DataLoader
 import math
 import time
@@ -14,7 +14,8 @@ from ..config import DataConfig
 from ..config.distill_config import DistillConfig
 from ..data.dataset import ProtXDataGen, ProtXDataLoader
 from ..utils import get_device, create_dirs, logger
-from .scheduler import ProtXScheduler
+from .collator import DistillDataCollator
+from .callbacks import OnnxExportCallback
 
 class DistillPipeline():
     def __init__(
@@ -25,302 +26,136 @@ class DistillPipeline():
     ):
         self.data_config = data_config
         self.distill_config = distill_config
-        self.device = get_device() if not device else device
-
-        val_seqs_num = int(self.data_config.max_seqs_num * self.data_config.val_ratio)
-        train_seqs_num = self.data_config.max_seqs_num - val_seqs_num
-        self.train_batches_num = math.ceil(train_seqs_num / self.distill_config.batch_size)
-            
+        self.device = device if device else get_device()
 
     def train(
         self,
-        student: torch.nn.Module = ProtX(),
-        teacher = ProtT5(),
         checkpoint_path: str = None,
-        start_epoch: int = 0,
         project_name: str = "protx-distillation"
     ):
+
+        student = ProtX(
+            embed_dim=self.distill_config.student_embed_dim,
+            num_layers=self.distill_config.student_num_layers,
+            num_heads=self.distill_config.student_num_heads,
+        )
+
+        teacher = ProtT5()
+
         timestamp = int(time.time())
-        unique_id = f"{timestamp}"
-        
-        wandb.init(
-            project=project_name,
-            config={
-                "max_seqs_num": self.data_config.max_seqs_num,
-                "max_seq_len": self.data_config.max_seq_len,
-                "min_seq_len": self.data_config.min_seq_len,
-                "val_ratio": self.data_config.val_ratio,
-                
-                "num_epochs": self.distill_config.num_epochs,
-                "batch_size": self.distill_config.batch_size,
-                "warmup_steps": self.distill_config.warmup_steps,
-                "start_lr": self.distill_config.start_lr,
-                "max_lr": self.distill_config.max_lr,
-                "min_lr": self.distill_config.min_lr,
-                "T_0": self.distill_config.T_0,
-                "T_mult": self.distill_config.T_mult,
-                "gamma": self.distill_config.gamma,
-                "on_the_fly": self.distill_config.on_the_fly,
+        run_name = f"run-{timestamp}"
 
-                "student_embed_dim": self.distill_config.student_embed_dim,
-                "student_num_layers": self.distill_config.student_num_layers,
-                "student_num_heads": self.distill_config.student_num_heads,
-            },
-            name=f"run-{unique_id}"
-        )
-        
-        # Update unique_id to include wandb run ID
-        unique_id = f"{timestamp}-{wandb.run.id[:8]}"
-        
-        if checkpoint_path:
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
-            student.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch']
+        output_dir = Path(self.distill_config.checkpoint_dir) / run_name
+        create_dirs(output_dir)
 
-        optimizer = torch.optim.AdamW(student.parameters(), lr=self.distill_config.start_lr)
+        teacher_model_for_collator = None
+        teacher_tokenizer_for_dataset = None
         
-        scheduler = ProtXScheduler(
-            optimizer,
-            warmup_steps=self.distill_config.warmup_steps,
-            initial_lr=self.distill_config.start_lr,
-            max_lr=self.distill_config.max_lr,
-            min_lr=self.distill_config.min_lr,
-            T_0=self.distill_config.T_0,
-            T_mult=self.distill_config.T_mult,
-            gamma=self.distill_config.gamma,
-            max_cycle_length=self.distill_config.max_cycle_length
-        )
-        
-        student = student.to(self.device)
-        
-        # Only load teacher model to device if computing embeddings on-the-fly
-        teacher_model = None
         if self.distill_config.on_the_fly:
-            teacher_model = teacher.encoder_model.to(self.device)
+            teacher_model_for_collator = teacher.encoder_model
+            teacher_tokenizer_for_dataset = teacher.tokenizer
         
-        train_data, val_data = self._load_dataset(
-            teacher_tokenizer=teacher.tokenizer if self.distill_config.on_the_fly else None,
-            batch_size=self.distill_config.batch_size,
-            seed=timestamp
+        train_dataset, val_dataset = self._load_dataset(
+            teacher_tokenizer=teacher_tokenizer_for_dataset,
+        )
+
+        data_collator = DistillDataCollator(
+            teacher_model=teacher_model_for_collator,
+            on_the_fly=self.distill_config.on_the_fly
+        )
+
+        training_args = TrainingArguments(
+            output_dir=str(output_dir),
+            num_train_epochs=self.distill_config.num_epochs,
+            per_device_train_batch_size=self.distill_config.batch_size,
+            per_device_eval_batch_size=self.distill_config.batch_size * 2,
+            warmup_steps=self.distill_config.warmup_steps,
+            learning_rate=self.distill_config.max_lr,
+            logging_dir=str(output_dir / "logs"),
+            logging_strategy="steps",
+            logging_steps=30,
+            save_strategy="steps",
+            save_steps=100,
+            evaluation_strategy="steps",
+            eval_steps=30,
+            report_to="wandb",
+            run_name=run_name,
+            fp16=torch.cuda.is_available(),
+            lr_scheduler_type="cosine_with_min_lr",
+            lr_scheduler_kwargs={"min_lr": self.distill_config.min_lr}
         )
         
-        train_batches_total = len(train_data)
-        val_batches_total = len(val_data)
-        
-        checkpoint_dir = f"{self.distill_config.checkpoint_dir}/{unique_id}"
-        create_dirs(checkpoint_dir)
-        
-        best_val_loss = float('inf')
-        train_losses = []
-        val_losses = []
-        
-        global_step = 0
-        
-        print(f"\n{'=' * 60}")
-        print(f"Starting training: {self.distill_config.num_epochs} epochs")
-        print(f"{'=' * 60}\n")
+        wandb.init(project=project_name, name=run_name, config=training_args.to_dict(), reinit=True)
 
-        for epoch in range(start_epoch, self.distill_config.num_epochs):
-            if not self.distill_config.on_the_fly and epoch > start_epoch:
-                train_data, val_data = self._load_dataset(
-                    batch_size=self.distill_config.batch_size,
-                    seed=epoch
-                )
-                # Update batch counts for progress bars
-                train_batches_total = len(train_data)
-                val_batches_total = len(val_data)
-            
-            student.train()
-            epoch_loss = 0.0
-            train_batches = 0
-            
-            print(f"\n{'-' * 20} Epoch {epoch+1}/{self.distill_config.num_epochs} {'-' * 20}")
-            
-            train_iter = tqdm(
-                train_data, 
-                desc=f"Training",
-                leave=True,
-                ncols=80,
-                total=train_batches_total,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                position=0
-            )
-
-            for batch in train_iter:
-                current_lr = optimizer.param_groups[0]['lr']
-                
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                
-                if self.distill_config.on_the_fly:
-                    with torch.no_grad():
-                        teacher_embeds = teacher_model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask
-                        ).last_hidden_state
-                else:
-                    teacher_embeds = batch["teacher_embeddings"].to(self.device)
-                
-                loss = student(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    target_repr=teacher_embeds
-                )
-
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-                epoch_loss += loss.item()
-                train_batches += 1
-                train_iter.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.6f}")
-                
-                global_step += 1
-                
-                wandb.log({
-                    "learning_rate": current_lr,
-                    "train_loss": loss.item()
-                }, step=global_step)
-            
-            avg_train_loss = epoch_loss / train_batches if train_batches > 0 else 0
-            train_losses.append(avg_train_loss)
-            
-            student.eval()
-            val_loss = 0.0
-            val_batches = 0
-            
-            val_iter = tqdm(
-                val_data, 
-                desc=f"Validation",
-                leave=True,
-                ncols=80,
-                total=val_batches_total,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                position=0
-            )
-            
-            with torch.no_grad():
-                for batch in val_iter:
-                    input_ids = batch["input_ids"].to(self.device)
-                    attention_mask = batch["attention_mask"].to(self.device)
-                    
-                    if self.distill_config.on_the_fly:
-                        teacher_embeds = teacher_model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask
-                        ).last_hidden_state
-                    else:
-                        teacher_embeds = batch["teacher_embeddings"].to(self.device)
-                    
-                    loss = student(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        target_repr=teacher_embeds
-                    )
-                    
-                    val_loss += loss.item()
-                    val_batches += 1
-                    val_iter.set_postfix(loss=f"{loss.item():.4f}")
-            
-            avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
-            val_losses.append(avg_val_loss)
-            
-            print(f"\nEpoch {epoch+1}/{self.distill_config.num_epochs} Summary:")
-            print(f"  Training Loss: {avg_train_loss:.4f}")
-            print(f"  Validation Loss: {avg_val_loss:.4f}")
-            
-            wandb.log({
-                "avg_train_loss": avg_train_loss,
-                "avg_val_loss": avg_val_loss
-            }, step=global_step)
-            
-            model_path = f"{checkpoint_dir}/latest"
-            self._save_model_onnx_pt(
-                student,
-                model_path,
-                epoch,
-                optimizer,
-                self.distill_config.batch_size,
-                self.data_config.max_seq_len
-            )
-            
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                best_model_path = f"{checkpoint_dir}/best"
-                
-                self._save_model_onnx_pt(
-                    student,
-                    best_model_path,
-                    epoch,
-                    optimizer,
-                    self.distill_config.batch_size,
-                    self.data_config.max_seq_len
-                )
-                print(f"  ✓ New best model saved (val_loss: {best_val_loss:.4f})")
-            
-            print(f"{'-' * 60}")
+        onnx_export_callback = OnnxExportCallback(
+            onnx_export_path=str(output_dir / "onnx"),
+            batch_size=self.distill_config.batch_size,
+            seq_len=self.data_config.max_seq_len,
+            device=str(self.device)
+        )
         
-        print(f"\n{'=' * 60}")
-        print(f"Training complete!")
-        print(f"Best validation loss: {best_val_loss:.4f}")
-        print(f"{'=' * 60}\n")
+        trainer = Trainer(
+            model=student,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            data_collator=data_collator,
+            callbacks=[onnx_export_callback],
+        )
         
-        wandb.log({"best_val_loss": best_val_loss}, step=global_step)
+        logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
+        train_result = trainer.train(resume_from_checkpoint=checkpoint_path)
+        
+        trainer.save_model()
+        trainer.log_metrics("train", train_result.metrics)
+        trainer.save_metrics("train", train_result.metrics)
+        trainer.save_state()
+
+        if val_dataset:
+            logger.info("*** Evaluate ***")
+            metrics = trainer.evaluate()
+            trainer.log_metrics("eval", metrics)
+            trainer.save_metrics("eval", metrics)
+
         wandb.finish()
-
+        
+        logger.info(f"Training complete! Best model saved at {trainer.state.best_model_checkpoint}")
         return student
 
     def _load_dataset(
         self,
         teacher_tokenizer: PreTrainedTokenizer = None,
-        batch_size: int = 32,
         seed: int = None
     ):
         if self.distill_config.on_the_fly:
-            # Use original dataset with on-the-fly embedding computation
             train_dataset = ProtXDataGen(
                 data_path=self.data_config.train_file,
                 teacher_tokenizer=teacher_tokenizer,
                 max_seq_len=self.data_config.max_seq_len,
-                device=self.device
+                device=str(self.device)
             )
             val_dataset = ProtXDataGen(
                 data_path=self.data_config.val_file,
                 teacher_tokenizer=teacher_tokenizer,
                 max_seq_len=self.data_config.max_seq_len,
-                device=self.device
+                device=str(self.device)
             )
         else:
-
             train_files = self._find_dataset_files(self.data_config.protx_train_prefix, "training")
             val_files = self._find_dataset_files(self.data_config.protx_val_prefix, "validation")
             
             train_dataset = ProtXDataLoader(
                 h5_path=train_files,
-                device=self.device,
-                seed=seed
+                device=str(self.device),
+                seed=seed if seed is not None else int(time.time())
             )
             val_dataset = ProtXDataLoader(
                 h5_path=val_files,
-                device=self.device,
-                seed=seed
+                device=str(self.device),
+                seed=seed if seed is not None else int(time.time()) + 1
             )
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            collate_fn=self._collate_fn
-        )
         
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            collate_fn=self._collate_fn
-        )
-
-        return train_loader, val_loader
+        return train_dataset, val_dataset
     
     def _collate_fn(self, batch):
         input_ids = torch.stack([item["input_ids"] for item in batch])
