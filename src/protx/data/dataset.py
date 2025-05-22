@@ -197,15 +197,15 @@ class ProtXDataProcessor(Dataset):
         input_ids_array = np.concatenate(input_ids_list, axis=0)
         teacher_embeddings_array = np.concatenate(teacher_embeddings_list, axis=0)
         
-        logger.info(f"Saving file {file_path}")
-        logger.info(f"Input IDs shape: {input_ids_array.shape}")
-        logger.info(f"Teacher embeddings shape: {teacher_embeddings_array.shape}")
+        logger.debug(f"Saving file {file_path}")
+        logger.debug(f"Input IDs shape: {input_ids_array.shape}")
+        logger.debug(f"Teacher embeddings shape: {teacher_embeddings_array.shape}")
         
         with h5py.File(file_path, "w") as f:
             f.create_dataset("input_ids", data=input_ids_array.astype(np.int8))
             f.create_dataset("teacher_embeddings", data=teacher_embeddings_array.astype(np.float16))
         
-        logger.info(f"Saved {input_ids_array.shape[0]} sequences to {file_path}")
+        logger.debug(f"Saved {input_ids_array.shape[0]} sequences to {file_path}")
 
 class ProtXDataLoader(IterableDataset):
     def __init__(
