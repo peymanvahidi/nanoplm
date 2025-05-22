@@ -36,7 +36,7 @@ def main():
     
     if args.train_model:
         distill_config = DistillConfig()
-        distill_pipeline = DistillPipeline(distill_config, data_config)
+        distill_pipeline = DistillPipeline(data_config, distill_config)
         distill_pipeline.train()
 
 if __name__ == "__main__":
