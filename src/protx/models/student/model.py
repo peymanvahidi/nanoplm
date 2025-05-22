@@ -1,10 +1,10 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import (
     ModernBertModel,
     ModernBertConfig,
 )
+from transformers.modeling_outputs import MaskedLMOutput
 from transformers.models.t5.modeling_t5 import T5LayerNorm
 
 from .tokenizer import ProtXTokenizer
@@ -46,34 +46,31 @@ class ProtX(nn.Module):
         self.proj = nn.Linear(embed_dim, 1024, bias=False)
         self.proj_norm = T5LayerNorm(1024)
 
-    def forward(self, input_ids, attention_mask, target_repr=None):
+    def forward(self, input_ids, attention_mask, teacher_embeddings=None):
         student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
         student_repr = student_out.last_hidden_state
         
-        # If target_repr is provided, we're in training mode
-        if target_repr is not None:
+        loss = None
+
+        if teacher_embeddings is not None:
             projected_repr = self.proj(student_repr)  # (batch_size, seq_len, 1024)
             projected_repr = self.proj_norm(projected_repr)
             
             mask = attention_mask.unsqueeze(-1).float()
-            diff = ((projected_repr - target_repr) ** 2) * mask
+            teacher_embeddings = teacher_embeddings.to(projected_repr.device)
+            diff = ((projected_repr - teacher_embeddings) ** 2) * mask
             loss = diff.sum() / mask.sum().clamp(min=1)
-            return loss
         
-        # For inference, return the student representations
-        return student_repr
-
-    # optional convenience method
-    def save_student(self, path: str):
-        """Save student weights + projection only."""
-        torch.save(
-            {
-                "student_state_dict": self.model.state_dict(),
-                "proj_state_dict": self.proj.state_dict(),
-                "config": self.config.to_dict(),
-            },
-            path,
-        )
+            return MaskedLMOutput(
+                loss=loss,
+                logits=student_repr,
+                # hidden_states=student_out.hidden_states,
+                # attentions=student_out.attentions
+            )
+        
+        else:
+            # During inference, no loss is calculated
+            return student_out
 
 class SwiGLU(nn.Module):
     def forward(self, x, gate):
