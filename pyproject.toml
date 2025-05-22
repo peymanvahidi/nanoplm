@@ -9,6 +9,7 @@ dependencies = [
     "dvc>=3.59.1",
     "h5py>=3.13.0",
     "ipykernel>=6.29.5",
+    "onnx>=1.18.0",
     "pyyaml>=6.0.2",
     "seaborn>=0.13.2",
     "sentencepiece>=0.2.0",

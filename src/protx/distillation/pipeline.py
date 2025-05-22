@@ -6,13 +6,14 @@ from transformers import PreTrainedTokenizer
 from torch.utils.data import DataLoader
 import math
 import time
+import torch.onnx
 
 from ..models.student import ProtX
 from ..models.teacher import ProtT5
 from ..config import DataConfig
 from ..config.distill_config import DistillConfig
 from ..data.dataset import ProtXDataGen, ProtXDataLoader
-from ..utils import get_device, create_dirs
+from ..utils import get_device, create_dirs, logger
 from .scheduler import ProtXScheduler
 
 class DistillPipeline():
@@ -107,10 +108,8 @@ class DistillPipeline():
         train_batches_total = len(train_data)
         val_batches_total = len(val_data)
         
-        checkpoint_dir = self.distill_config.checkpoint_dir
-        plots_dir = self.distill_config.plots_dir
+        checkpoint_dir = f"{self.distill_config.checkpoint_dir}/{unique_id}"
         create_dirs(checkpoint_dir)
-        create_dirs(plots_dir)
         
         best_val_loss = float('inf')
         train_losses = []
@@ -142,9 +141,10 @@ class DistillPipeline():
                 train_data, 
                 desc=f"Training",
                 leave=True,
-                ncols=100,
+                ncols=80,
                 total=train_batches_total,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+                position=0
             )
 
             for batch in train_iter:
@@ -175,7 +175,7 @@ class DistillPipeline():
 
                 epoch_loss += loss.item()
                 train_batches += 1
-                train_iter.set_postfix(loss=f"{loss.item():.2f}", lr=f"{current_lr:.6f}")
+                train_iter.set_postfix(loss=f"{loss.item():.4f}", lr=f"{current_lr:.6f}")
                 
                 global_step += 1
                 
@@ -195,9 +195,10 @@ class DistillPipeline():
                 val_data, 
                 desc=f"Validation",
                 leave=True,
-                ncols=100,
+                ncols=80,
                 total=val_batches_total,
-                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+                bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+                position=0
             )
             
             with torch.no_grad():
@@ -221,7 +222,7 @@ class DistillPipeline():
                     
                     val_loss += loss.item()
                     val_batches += 1
-                    val_iter.set_postfix(loss=f"{loss.item():.2f}")
+                    val_iter.set_postfix(loss=f"{loss.item():.4f}")
             
             avg_val_loss = val_loss / val_batches if val_batches > 0 else 0
             val_losses.append(avg_val_loss)
@@ -235,19 +236,27 @@ class DistillPipeline():
                 "avg_val_loss": avg_val_loss
             }, step=global_step)
             
-            model_path = f"{checkpoint_dir}/{unique_id}_e{epoch+1}_tl-{avg_train_loss:.2f}_vl-{avg_val_loss:.2f}.pt"
-            torch.save(student.state_dict(), model_path)
+            model_path = f"{checkpoint_dir}/latest"
+            self._save_model_onnx_pt(
+                student,
+                model_path,
+                epoch,
+                optimizer,
+                self.distill_config.batch_size,
+                self.data_config.max_seq_len
+            )
             
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                best_model_path = f"{checkpoint_dir}/{unique_id}_best.pt"
-                torch.save(
-                    {
-                        'epoch': epoch + 1,
-                        'model_state_dict': student.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                    },
-                    best_model_path
+                best_model_path = f"{checkpoint_dir}/best"
+                
+                self._save_model_onnx_pt(
+                    student,
+                    best_model_path,
+                    epoch,
+                    optimizer,
+                    self.distill_config.batch_size,
+                    self.data_config.max_seq_len
                 )
                 print(f"  ✓ New best model saved (val_loss: {best_val_loss:.4f})")
             
@@ -346,6 +355,53 @@ class DistillPipeline():
         
         return files
 
-if __name__ == "__main__":
-    pipeline = DistillPipeline()
-    pipeline.train()
+    def _save_model_onnx_pt(
+        self,
+        model: torch.nn.Module,
+        filepath: str,
+        epoch: int,
+        optimizer: torch.optim.Optimizer,
+        batch_size: int,
+        seq_len: int
+    ):
+        self._save_model_as_onnx(model, filepath, batch_size, seq_len)
+        
+        torch.save(
+            {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            },
+            f"{filepath}.pt"
+        )
+
+    def _save_model_as_onnx(
+        self,
+        model: torch.nn.Module,
+        filepath: str,
+        batch_size: int,
+        seq_len: int
+    ):
+        if filepath.endswith('.pt'):
+            filepath = filepath[:-3] + '.onnx'
+        elif not filepath.endswith('.onnx'):
+            filepath = filepath + '.onnx'
+        
+        dummy_input_ids = torch.ones(batch_size, seq_len, dtype=torch.long).to(self.device)
+        dummy_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long).to(self.device)
+        
+        model.eval()
+        
+        torch.onnx.export(
+            model,
+            (dummy_input_ids, dummy_attention_mask),
+            filepath,
+            input_names=['input_ids', 'attention_mask'],
+            output_names=['output'],
+            dynamic_axes={
+                'input_ids': {0: 'batch_size', 1: 'sequence_length'},
+                'attention_mask': {0: 'batch_size', 1: 'sequence_length'},
+                'output': {0: 'batch_size', 1: 'sequence_length', 2: 'hidden_size'}
+            },
+            opset_version=14
+        )
