@@ -5,10 +5,10 @@ description = "Knowledge distillation of ProtT5"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.7.0",
     "biopython>=1.85",
     "dvc>=3.59.1",
     "h5py>=3.13.0",
-    "ipykernel>=6.29.5",
     "onnx>=1.18.0",
     "pyyaml>=6.0.2",
     "seaborn>=0.13.2",
