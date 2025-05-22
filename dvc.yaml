@@ -40,7 +40,7 @@ stages:
       - output/data/filter_split/val.fasta
       - output/data/filter_split/dataset_info.txt
   
-  protx_dataset:
+  save_protx_dataset:
     cmd: python3 main.py --save-protx-dataset
     deps:
       - src/protx/data/dataset.py
@@ -48,10 +48,29 @@ stages:
       - output/data/filter_split/val.fasta
     params:
       - data_dirs.protx_dataset_dir
-      - data_dirs.protx_train
-      - data_dirs.protx_val
+      - data_dirs.protx_train_prefix
+      - data_dirs.protx_val_prefix
     outs:
-      - output/data/protx_dataset/train.h5
-      - output/data/protx_dataset/val.h5
+      - output/data/protx_dataset/train/
+      - output/data/protx_dataset/val/
   
-  
+  train_model:
+    cmd: python3 main.py --train-model
+    deps:
+      - src/protx/distillation/pipeline.py
+      - output/data/protx_dataset/
+    params:
+      - distill_params.student_embed_dim
+      - distill_params.student_num_layers
+      - distill_params.student_num_heads
+      - distill_params.on_the_fly
+      - distill_params.num_epochs
+      - distill_params.batch_size
+      - distill_params.start_lr
+      - distill_params.warmup_steps
+      - distill_params.min_lr
+      - distill_params.max_lr
+      - distill_params.T_0
+      - distill_params.T_mult
+      - distill_params.gamma
+      - distill_params.max_cycle_length
