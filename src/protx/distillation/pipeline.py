@@ -1,12 +1,8 @@
 import torch
 import wandb
-from tqdm import tqdm
 from pathlib import Path
 from transformers import PreTrainedTokenizer, Trainer, TrainingArguments
-from torch.utils.data import DataLoader
-import math
 import time
-import torch.onnx
 
 from ..models.student import ProtX
 from ..models.teacher import ProtT5
@@ -189,54 +185,3 @@ class DistillPipeline():
             raise FileNotFoundError(f"No {dataset_type} data files found matching {pattern} in {directory}")
         
         return files
-
-    def _save_model_onnx_pt(
-        self,
-        model: torch.nn.Module,
-        filepath: str,
-        epoch: int,
-        optimizer: torch.optim.Optimizer,
-        batch_size: int,
-        seq_len: int
-    ):
-        self._save_model_as_onnx(model, filepath, batch_size, seq_len)
-        
-        torch.save(
-            {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-            },
-            f"{filepath}.pt"
-        )
-
-    def _save_model_as_onnx(
-        self,
-        model: torch.nn.Module,
-        filepath: str,
-        batch_size: int,
-        seq_len: int
-    ):
-        if filepath.endswith('.pt'):
-            filepath = filepath[:-3] + '.onnx'
-        elif not filepath.endswith('.onnx'):
-            filepath = filepath + '.onnx'
-        
-        dummy_input_ids = torch.ones(batch_size, seq_len, dtype=torch.long).to(self.device)
-        dummy_attention_mask = torch.ones(batch_size, seq_len, dtype=torch.long).to(self.device)
-        
-        model.eval()
-        
-        torch.onnx.export(
-            model,
-            (dummy_input_ids, dummy_attention_mask),
-            filepath,
-            input_names=['input_ids', 'attention_mask'],
-            output_names=['output'],
-            dynamic_axes={
-                'input_ids': {0: 'batch_size', 1: 'sequence_length'},
-                'attention_mask': {0: 'batch_size', 1: 'sequence_length'},
-                'output': {0: 'batch_size', 1: 'sequence_length', 2: 'hidden_size'}
-            },
-            opset_version=14
-        )
