@@ -4,7 +4,7 @@ from transformers import (
     ModernBertModel,
     ModernBertConfig,
 )
-from transformers.modeling_outputs import MaskedLMOutput
+from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.t5.modeling_t5 import T5LayerNorm
 
 from .tokenizer import ProtXTokenizer
@@ -14,9 +14,9 @@ class ProtX(nn.Module):
 
     def __init__(
         self,
-        embed_dim: int = 512,
-        num_layers: int = 6,
-        num_heads: int = 8,
+        embed_dim: int,
+        num_layers: int,
+        num_heads: int,
         mlp_activation: str = "swiglu",
     ):
         super().__init__()
@@ -46,31 +46,25 @@ class ProtX(nn.Module):
         self.proj = nn.Linear(embed_dim, 1024, bias=False)
         self.proj_norm = T5LayerNorm(1024)
 
-    def forward(self, input_ids, attention_mask, teacher_embeddings=None):
+    def forward(self, input_ids, attention_mask, training_mode = False, teacher_embeddings=None):
         student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        student_repr = student_out.last_hidden_state
         
-        loss = None
-
-        if teacher_embeddings is not None:
-            projected_repr = self.proj(student_repr)  # (batch_size, seq_len, 1024)
+        if training_mode:
+            projected_repr = self.proj(student_out.last_hidden_state)  # (batch_size, seq_len, 1024)
             projected_repr = self.proj_norm(projected_repr)
-            
-            mask = attention_mask.unsqueeze(-1).float()
-            teacher_embeddings = teacher_embeddings.to(projected_repr.device)
-            diff = ((projected_repr - teacher_embeddings) ** 2) * mask
-            loss = diff.sum() / mask.sum().clamp(min=1)
-        
-            return MaskedLMOutput(
-                loss=loss,
-                logits=student_repr,
-                # hidden_states=student_out.hidden_states,
-                # attentions=student_out.attentions
+            # training mode
+            return BaseModelOutput(
+                last_hidden_state=projected_repr,
+                hidden_states=student_out.hidden_states,
+                attentions=student_out.attentions
             )
-        
         else:
-            # During inference, no loss is calculated
-            return student_out
+            # Inference mode
+            return BaseModelOutput(
+                last_hidden_state=student_out.last_hidden_state,
+                hidden_states=student_out.hidden_states,
+                attentions=student_out.attentions
+            )
 
 class SwiGLU(nn.Module):
     def forward(self, x, gate):
