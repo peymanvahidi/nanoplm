@@ -2,7 +2,7 @@ import argparse
 
 from src.protx.config import DataConfig, DistillConfig
 from src.protx.data import DataPipeline
-from src.protx.distillation.pipeline import DistillPipeline
+from src.protx.distillation.pipeline import DistillationPipeline
 
 def main():
     # Create parser
@@ -36,7 +36,7 @@ def main():
     
     if args.train_model:
         distill_config = DistillConfig()
-        distill_pipeline = DistillPipeline(data_config, distill_config)
+        distill_pipeline = DistillationPipeline(data_config, distill_config)
         distill_pipeline.train()
 
 if __name__ == "__main__":
