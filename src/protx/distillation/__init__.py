@@ -1,5 +1,5 @@
-from .pipeline import DistillPipeline
+from .pipeline import DistillationPipeline
 
 __all__ = [
-    "DistillPipeline"
+    "DistillationPipeline"
 ]
