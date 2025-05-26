@@ -24,16 +24,19 @@ class DistillDataCollator:
             if self.teacher_model is None:
                 raise ValueError("teacher_model must be provided when on_the_fly is True.")
             
-            # Ensure teacher_model is on the same device as input_ids if using CUDA
-            # This might need adjustment based on how device placement is handled with Trainer
-            if input_ids.is_cuda and not next(self.teacher_model.parameters()).is_cuda:
-                 self.teacher_model.to(input_ids.device)
+            teacher_device = next(self.teacher_model.parameters()).device
+            
+            input_ids_teacher = input_ids.to(teacher_device)
+            attention_mask_teacher = attention_mask.to(teacher_device)
             
             with torch.no_grad():
                 teacher_embeddings = self.teacher_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask
+                    input_ids=input_ids_teacher,
+                    attention_mask=attention_mask_teacher
                 ).last_hidden_state
+                
+                # Move embeds to CPU (for multiprocessing), later Trainer will move it to GPU
+                teacher_embeddings = teacher_embeddings.cpu()
 
             batch["teacher_embeddings"] = teacher_embeddings
 
