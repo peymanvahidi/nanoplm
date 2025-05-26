@@ -11,7 +11,7 @@ from transformers import PreTrainedTokenizer
 from torch.utils.data import Dataset, IterableDataset
 
 from ..models.teacher import ProtT5
-from ..utils import get_device, logger
+from ..utils import logger
 
 class ProtXDataGen(IterableDataset):
     def __init__(
@@ -43,8 +43,8 @@ class ProtXDataGen(IterableDataset):
                 return_tensors="pt"
             )
             yield {
-                "input_ids": tokenized_seq["input_ids"].squeeze(0).to(self.device),
-                "attention_mask": tokenized_seq["attention_mask"].squeeze(0).to(self.device)
+                "input_ids": tokenized_seq["input_ids"].squeeze(0),
+                "attention_mask": tokenized_seq["attention_mask"].squeeze(0)
             }
 
 class ProtXDataProcessor(Dataset):
@@ -207,7 +207,7 @@ class ProtXDataProcessor(Dataset):
         
         logger.debug(f"Saved {input_ids_array.shape[0]} sequences to {file_path}")
 
-class ProtXDataLoader(IterableDataset):
+class ProtXDataLoader(Dataset):
     def __init__(
         self, 
         h5_path: Union[str, Path, List[Path]],
@@ -217,93 +217,73 @@ class ProtXDataLoader(IterableDataset):
         self.device = device
         self.seed = seed
         
-        # single file or multiple files
         if isinstance(h5_path, (str, Path)):
             self.h5_paths = [Path(h5_path)]
         else:
             self.h5_paths = [Path(p) for p in h5_path]
         
-        self.current_file = None
-        self.current_file_idx = -1
+        self._calculate_dataset_info()
         
-        self._calculate_dataset_size()
+        if self.seed is not None:
+            self._shuffle_files()
     
-    def _calculate_dataset_size(self):
-        """Calculate total dataset size by opening each file temporarily"""
+    def _calculate_dataset_info(self):
+        """Calculate total dataset size and create mapping from global index to file+local index"""
         self.file_sizes = []
+        self.cumulative_sizes = []
+        cumulative = 0
+        
         for path in self.h5_paths:
             with h5py.File(path, "r") as f:
-                self.file_sizes.append(f["input_ids"].shape[0])
-        self.size = sum(self.file_sizes)
+                file_size = f["input_ids"].shape[0]
+                self.file_sizes.append(file_size)
+                cumulative += file_size
+                self.cumulative_sizes.append(cumulative)
+        
+        self.total_size = cumulative
+    
+    def _shuffle_files(self):
+        """Shuffle the file order based on seed"""
+        rng = np.random.RandomState(self.seed)
+        indices = list(range(len(self.h5_paths)))
+        rng.shuffle(indices)
+        
+        self.h5_paths = [self.h5_paths[i] for i in indices]
+        self.file_sizes = [self.file_sizes[i] for i in indices]
+        
+        cumulative = 0
+        self.cumulative_sizes = []
+        for size in self.file_sizes:
+            cumulative += size
+            self.cumulative_sizes.append(cumulative)
     
     def __len__(self):
-        return self.size
+        return self.total_size
     
-    def __iter__(self):
-        # If seed is provided, shuffle the file order
-        if self.seed is not None:
-            rng = np.random.RandomState(self.seed)
-            indices = list(range(len(self.h5_paths)))
-            rng.shuffle(indices)
-            self.h5_paths = [self.h5_paths[i] for i in indices]
-            self.file_sizes = [self.file_sizes[i] for i in indices]
+    def __getitem__(self, idx):
+        if idx >= self.total_size or idx < 0:
+            raise IndexError(f"Index {idx} out of range for dataset of size {self.total_size}")
         
-        self.current_file_idx = -1
-        if self.current_file is not None:
-            self.current_file.close()
-            self.current_file = None
+        file_idx = 0
+        for i, cumsum in enumerate(self.cumulative_sizes):
+            if idx < cumsum:
+                file_idx = i
+                break
         
-        file_available = self._open_next_file()
+        if file_idx == 0:
+            local_idx = idx
+        else:
+            local_idx = idx - self.cumulative_sizes[file_idx - 1]
         
-        while file_available:
-            input_ids = torch.tensor(
-                self.current_file["input_ids"][:], 
-                dtype=torch.long
-            )
-            teacher_embeddings = torch.tensor(
-                self.current_file["teacher_embeddings"][:], 
-                dtype=torch.float
-            )
+        file_path = self.h5_paths[file_idx]
+        with h5py.File(file_path, "r") as f:
+            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.long)
+            teacher_embeddings = torch.tensor(f["teacher_embeddings"][local_idx], dtype=torch.float)
             
-            attention_masks = (input_ids != 0).long()
-            
-            for i in range(self.current_file_size):
-                yield {
-                    "input_ids": input_ids[i].to(self.device),
-                    "attention_mask": attention_masks[i].to(self.device),
-                    "teacher_embeddings": teacher_embeddings[i].to(self.device)
-                }
-            
-            del input_ids, teacher_embeddings, attention_masks
-            gc.collect()
-            
-            file_available = self._open_next_file()
-    
-    def _open_next_file(self):
-        """Open the next file in the sequence"""
-        # Close the current file if it exists
-        if self.current_file is not None:
-            self.current_file.close()
-            self.current_file = None
+            attention_mask = (input_ids != 0).long()
         
-        # Move to the next file
-        self.current_file_idx += 1
-        
-        # Check if we've gone through all files
-        if self.current_file_idx >= len(self.h5_paths):
-            return False
-        
-        # Open the next file
-        file_path = self.h5_paths[self.current_file_idx]
-        self.current_file = h5py.File(file_path, "r")
-        self.current_file_size = self.file_sizes[self.current_file_idx]
-        
-        return True
-    
-    def close(self):
-        if self.current_file is not None:
-            self.current_file.close()
-            self.current_file = None
-    
-    def __del__(self):
-        self.close()
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "teacher_embeddings": teacher_embeddings
+        }
