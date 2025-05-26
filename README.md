@@ -1,4 +1,4 @@
-# ProtX - Protein Language Model with Knowledge Distillation
+# ProtX - Distilled Protein Language Model from ProtT5
 
 ## MLOps Pipeline
 
