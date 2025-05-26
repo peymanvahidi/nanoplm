@@ -1,8 +1,12 @@
 import torch
 import wandb
 from pathlib import Path
-from transformers import PreTrainedTokenizer, Trainer, TrainingArguments
+from transformers import PreTrainedTokenizer, TrainingArguments
 import time
+
+from .collator import DistillDataCollator
+from .callbacks import OnnxExportCallback
+from .trainer import DistillationTrainer
 
 from ..models.student import ProtX
 from ..models.teacher import ProtT5
@@ -10,10 +14,8 @@ from ..config import DataConfig
 from ..config.distill_config import DistillConfig
 from ..data.dataset import ProtXDataGen, ProtXDataLoader
 from ..utils import get_device, create_dirs, logger
-from .collator import DistillDataCollator
-from .callbacks import OnnxExportCallback
 
-class DistillPipeline():
+class DistillationPipeline():
     def __init__(
         self,
         data_config: DataConfig = DataConfig(),
@@ -72,13 +74,18 @@ class DistillPipeline():
             logging_steps=30,
             save_strategy="steps",
             save_steps=100,
-            evaluation_strategy="steps",
+            eval_strategy="steps",
             eval_steps=30,
             report_to="wandb",
             run_name=run_name,
             fp16=torch.cuda.is_available(),
+            dataloader_num_workers=0,
+            dataloader_pin_memory=True,
             lr_scheduler_type="cosine_with_min_lr",
-            lr_scheduler_kwargs={"min_lr": self.distill_config.min_lr}
+            lr_scheduler_kwargs={"min_lr": self.distill_config.min_lr},
+            ddp_find_unused_parameters=False,  # Faster distributed training
+            ddp_backend="nccl" if torch.cuda.is_available() else "gloo",  # Optimal backend
+            remove_unused_columns=False,  # Keep all columns for custom loss
         )
         
         wandb.init(project=project_name, name=run_name, config=training_args.to_dict(), reinit=True)
@@ -90,7 +97,7 @@ class DistillPipeline():
             device=str(self.device)
         )
         
-        trainer = Trainer(
+        trainer = DistillationTrainer(
             model=student,
             args=training_args,
             train_dataset=train_dataset,
@@ -115,7 +122,7 @@ class DistillPipeline():
 
         wandb.finish()
         
-        logger.info(f"Training complete! Best model saved at {trainer.state.best_model_checkpoint}")
+        logger.info(f"Training complete!")
         return student
 
     def _load_dataset(
@@ -152,21 +159,6 @@ class DistillPipeline():
             )
         
         return train_dataset, val_dataset
-    
-    def _collate_fn(self, batch):
-        input_ids = torch.stack([item["input_ids"] for item in batch])
-        attention_mask = torch.stack([item["attention_mask"] for item in batch])
-        
-        result = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask
-        }
-        
-        if "teacher_embeddings" in batch[0]:
-            teacher_embeddings = torch.stack([item["teacher_embeddings"] for item in batch])
-            result["teacher_embeddings"] = teacher_embeddings
-            
-        return result
         
     def _find_dataset_files(
         self,
