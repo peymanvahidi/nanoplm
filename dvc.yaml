@@ -50,6 +50,8 @@ stages:
       - data_dirs.protx_dataset_dir
       - data_dirs.protx_train_prefix
       - data_dirs.protx_val_prefix
+      - data_params.embed_calc_batch_size
+      - data_params.seqs_num_per_file
     outs:
       - output/data/protx_dataset/train/
       - output/data/protx_dataset/val/
