@@ -1,14 +1,27 @@
 from pathlib import Path
 import yaml
 import os
+from typing import Dict, Any, Optional, Union
 
 class DataConfig:
-    def __init__(self):
-        # Load params from params.yaml if it exists
-        self._params = {}
-        if os.path.exists("params.yaml"):
-            with open("params.yaml", "r") as f:
-                self._params = yaml.safe_load(f)
+    def __init__(self, config: Optional[Union[Dict, str]] = None):
+        # Load params from provided config_dict or params.yaml
+        if isinstance(config, dict):
+            self._params = config
+        elif isinstance(config, str):
+            if os.path.exists(config):
+                self._params = {}
+                with open(Path(config), "r") as f:
+                    self._params = yaml.safe_load(f)
+            else:
+                raise FileNotFoundError(f"Config file not found: {config}")
+        else:
+            self._params = {}
+            if os.path.exists("params.yaml"):
+                with open("params.yaml", "r") as f:
+                    self._params = yaml.safe_load(f)
+            else:
+                raise FileNotFoundError("No config provided and default 'params.yaml' not found")
         
         self.base_dir = self._get_param("data_dirs.base_dir")
         self.raw_dir = self._get_param("data_dirs.raw_dir")
