@@ -1,78 +1,112 @@
 stages:
 
   download:
-    cmd: python3 main.py --download-data
+    cmd: protx download-data
+      --url ${data_dirs.uniref50_url}
+      --output ${data_dirs.uniref50_fasta_gz}
     deps:
       - src/protx/data/downloader.py
     params:
       - data_dirs.uniref50_url
       - data_dirs.uniref50_fasta_gz
     outs:
-      - output/data/raw/uniref50.fasta.gz
+      - ${data_dirs.uniref50_fasta_gz}
 
   extract:
-    cmd: python3 main.py --extract-data
+    cmd: protx extract-data
+      --input ${data_dirs.uniref50_fasta_gz}
+      --output ${data_dirs.uniref50_fasta}
     deps:
       - src/protx/data/extractor.py
-      - output/data/raw/uniref50.fasta.gz
+      - ${data_dirs.uniref50_fasta_gz}
     params:
       - data_dirs.uniref50_fasta_gz
       - data_dirs.uniref50_fasta
     outs:
-      - output/data/raw/uniref50.fasta
+      - ${data_dirs.uniref50_fasta}
 
   filter_split:
-    cmd: python3 main.py --filter-split-data
+    cmd: protx filter-split-data
+      --input ${data_dirs.uniref50_fasta}
+      --filtered-seqs ${data_dirs.uniref50_filtered_fasta}
+      --train-file ${data_dirs.train_fasta}
+      --val-file ${data_dirs.val_fasta}
+      --min-seq-len ${data_params.min_seq_len}
+      --max-seq-len ${data_params.max_seq_len}
+      --max-seqs-num ${data_params.max_seqs_num}
+      --val-ratio ${data_params.val_ratio}
+      --info-file ${data_dirs.info_file}
+      --shuffle ${data_params.shuffle}
     deps:
       - src/protx/data/filter_splitor.py
-      - output/data/raw/uniref50.fasta
+      - ${data_dirs.uniref50_fasta}
     params:
       - data_dirs.uniref50_fasta
-      - data_dirs.filter_split_dir
+      - data_dirs.uniref50_filtered_fasta
       - data_dirs.info_file
       - data_params.min_seq_len
       - data_params.max_seq_len
       - data_params.max_seqs_num
       - data_params.val_ratio
     outs:
-      - output/data/filter_split/uniref50_filtered.fasta
-      - output/data/filter_split/train.fasta
-      - output/data/filter_split/val.fasta
-      - output/data/filter_split/dataset_info.txt
+      - ${data_dirs.uniref50_filtered_fasta}
+      - ${data_dirs.train_fasta}
+      - ${data_dirs.val_fasta}
+      - ${data_dirs.info_file}
   
-  save_protx_dataset:
-    cmd: python3 main.py --save-protx-dataset
+  save_protx_train_dataset:
+    cmd: protx save-protx-dataset
+      --input-file ${data_dirs.train_fasta}
+      --teacher-model 'prott5'
+      --output-file ${data_dirs.protx_train_prefix}
+      --max-seq-len ${data_params.max_seq_len}
+      --seqs-num-per-file ${data_params.seqs_num_per_file}
+      --batch-size ${data_params.embed_calc_batch_size}
+      --device 'auto'
     deps:
       - src/protx/data/dataset.py
-      - output/data/filter_split/train.fasta
-      - output/data/filter_split/val.fasta
+      - ${data_dirs.train_fasta}
+    params:
+      - data_dirs.train_fasta
+      - data_dirs.protx_train_prefix
+      - data_params.embed_calc_batch_size
+      - data_params.seqs_num_per_file
+
+  save_protx_val_dataset:
+    cmd: protx save-protx-dataset
+      --input-file ${data_dirs.val_fasta}
+      --teacher-model 'prott5'
+      --output-file ${data_dirs.protx_val_prefix}
+      --max-seq-len ${data_params.max_seq_len}
+      --seqs-num-per-file ${data_params.seqs_num_per_file}
+      --batch-size ${data_params.embed_calc_batch_size}
+      --device 'auto'
+    deps:
+      - src/protx/data/dataset.py
+      - ${data_dirs.val_fasta}
     params:
       - data_dirs.protx_dataset_dir
-      - data_dirs.protx_train_prefix
       - data_dirs.protx_val_prefix
       - data_params.embed_calc_batch_size
       - data_params.seqs_num_per_file
-    outs:
-      - output/data/protx_dataset/train/
-      - output/data/protx_dataset/val/
   
-  train_model:
-    cmd: python3 main.py --train-model
-    deps:
-      - src/protx/distillation/pipeline.py
-      - output/data/protx_dataset/
-    params:
-      - distill_params.student_embed_dim
-      - distill_params.student_num_layers
-      - distill_params.student_num_heads
-      - distill_params.on_the_fly
-      - distill_params.num_epochs
-      - distill_params.batch_size
-      - distill_params.start_lr
-      - distill_params.warmup_steps
-      - distill_params.min_lr
-      - distill_params.max_lr
-      - distill_params.T_0
-      - distill_params.T_mult
-      - distill_params.gamma
-      - distill_params.max_cycle_length
+  # train_model:
+  #   cmd: protx train-model
+  #   deps:
+  #     - src/protx/distillation/pipeline.py
+  #     - output/data/protx_dataset/
+  #   params:
+  #     - distill_params.student_embed_dim
+  #     - distill_params.student_num_layers
+  #     - distill_params.student_num_heads
+  #     - distill_params.on_the_fly
+  #     - distill_params.num_epochs
+  #     - distill_params.batch_size
+  #     - distill_params.start_lr
+  #     - distill_params.warmup_steps
+  #     - distill_params.min_lr
+  #     - distill_params.max_lr
+  #     - distill_params.T_0
+  #     - distill_params.T_mult
+  #     - distill_params.gamma
+  #     - distill_params.max_cycle_length
