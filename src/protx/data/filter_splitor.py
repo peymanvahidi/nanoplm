@@ -13,7 +13,7 @@ class FilterSplitor():
     def __init__(
         self,
         input_file: Union[str, Path],
-        output_dir: Union[str, Path],
+        output_file: Union[str, Path],
         min_seq_len: int,
         max_seq_len: int,
         max_seqs_num: int,
@@ -22,7 +22,7 @@ class FilterSplitor():
         shuffle: bool = True
     ):
         self.input_file = Path(input_file)
-        self.output_dir = Path(output_dir)
+        self.output_file = Path(output_file)
         self.min_seq_len = min_seq_len
         self.max_seq_len = max_seq_len
         self.max_seqs_num = max_seqs_num
@@ -30,11 +30,8 @@ class FilterSplitor():
         self.info_file = Path(info_file)
         self.shuffle = shuffle
 
-    def filter(
-        self,
-        output_file: Path
-    ):
-        create_dirs(output_file)
+    def filter(self):
+        create_dirs(self.output_file)
         
         logger.info(
             f"Processing UniRef50 sequences with filters: "
@@ -54,7 +51,7 @@ class FilterSplitor():
         logger.info(f"Randomly selecting and filtering sequences...")
         
         with tqdm(total=total_seqs if self.max_seqs_num != -1 else total_seqs, desc="Processing sequences") as pbar:
-            with open(output_file, 'w') as output_handle:
+            with open(self.output_file, 'w') as output_handle:
                 with open(self.input_file, 'rb') as input_handle:
                     for i, (start, end) in enumerate(index):
                         input_handle.seek(start)
@@ -73,11 +70,11 @@ class FilterSplitor():
                             break
         
         logger.info(f"Processed {seq_count} sequences out of {total_seqs}: {passed_count} sequences retrieved with length in [{self.min_seq_len}, {self.max_seq_len}].")
-        logger.info(f"Output file: {output_file}")
+        logger.info(f"Output file: {self.output_file}")
 
         self.processed_seqs_num = seq_count
         self.num_filtered_seqs = passed_count
-        self.filtered_seqs_path = output_file
+        self.filtered_seqs_path = self.output_file
 
     def split(
         self,
@@ -102,8 +99,6 @@ class FilterSplitor():
             SeqIO.write(sequences[train_size:], val_file, 'fasta')
             
             pbar.update(num_filtered_seqs)
-        
-        logger.info(f"Created files in {self.output_dir}")
 
         self.train_count = train_size
         self.val_count = val_size
