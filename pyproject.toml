@@ -1,12 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ProtX"
 version = "0.1.0"
 description = "Knowledge distillation of ProtT5"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
+authors = [
+    {name = "Peyman Vahidi", email = "peyman.vahidi@tum.de"},
+]
 dependencies = [
     "accelerate>=1.7.0",
     "biopython>=1.85",
+    "click>=8.1.8",
     "dvc>=3.59.1",
     "h5py>=3.13.0",
     "onnx>=1.18.0",
@@ -18,3 +26,6 @@ dependencies = [
     "transformers>=4.50.2",
     "wandb>=0.19.11",
 ]
+
+[project.scripts]
+protx = "protx.cli:cli"
