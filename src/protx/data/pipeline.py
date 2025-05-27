@@ -31,6 +31,7 @@ class DataPipeline:
         
         
     def download(self):
+        """Download data - same logic as CLI download-data command"""
         downloader = Downloader(
             url=self.config.uniref50_url,
             output_file=self.config.uniref50_fasta_gz
@@ -43,6 +44,7 @@ class DataPipeline:
             raise
     
     def extract(self):
+        """Extract data - same logic as CLI extract-data command"""
         extractor = Extractor(
             input_file=self.config.uniref50_fasta_gz,
             output_file=self.config.uniref50_fasta
@@ -55,9 +57,10 @@ class DataPipeline:
             raise
     
     def filter_split(self):
+        """Filter and split data - same logic as CLI filter-split-data command"""
         filter_splitor = FilterSplitor(
             input_file=self.config.uniref50_fasta,
-            output_dir=self.config.filter_split_dir,
+            output_file=self.config.filtered_seqs,
             min_seq_len=self.config.min_seq_len,
             max_seq_len=self.config.max_seq_len,
             max_seqs_num=self.config.max_seqs_num,
@@ -66,9 +69,7 @@ class DataPipeline:
         )
         try:
             log_stage("FILTER & SPLIT")
-            filter_splitor.filter(
-                output_file=self.config.filtered_seqs
-            )
+            filter_splitor.filter()
             filter_splitor.split(
                     train_file=self.config.train_file,
                     val_file=self.config.val_file
@@ -76,9 +77,9 @@ class DataPipeline:
         except Exception as e:
             logger.error(f"Filter & Split failed: {e}")
             raise
-    
-    def save_protx_train_dataset(self):
 
+    def save_protx_train_dataset(self):
+        """Save training dataset - same logic as CLI save-protx-dataset command"""
         protx_train_data = ProtXDataProcessor(
             data_path=self.config.train_file,
             teacher_model=ProtT5(),
@@ -101,7 +102,7 @@ class DataPipeline:
     
 
     def save_protx_val_dataset(self):
-
+        """Save validation dataset - same logic as CLI save-protx-dataset command"""
         protx_val_data = ProtXDataProcessor(
             data_path=self.config.val_file,
             teacher_model=ProtT5(),
@@ -123,6 +124,7 @@ class DataPipeline:
             raise
     
     def run_all(self, save_protx_dataset=False):
+        """Run the complete pipeline - equivalent to running all CLI commands in sequence"""
         self.download()
         self.extract()
         self.filter_split()
