@@ -11,7 +11,7 @@ from transformers import PreTrainedTokenizer
 from torch.utils.data import Dataset, IterableDataset
 
 from ..models.teacher import ProtT5
-from ..utils import logger
+from ..utils import logger, get_device
 
 class ProtXDataGen(IterableDataset):
     def __init__(
@@ -59,10 +59,10 @@ class ProtXDataProcessor(Dataset):
     ):
         self.data_path = Path(data_path)
         self.teacher = teacher_model
-        self.device = device
         self.max_seq_len = max_seq_len
-        self.batch_size = batch_size
         self.seqs_num_per_file = seqs_num_per_file
+        self.batch_size = batch_size
+        self.device = device if device != "auto" else get_device()
         self._loaded = False
 
     def _load(self):
