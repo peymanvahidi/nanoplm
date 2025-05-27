@@ -53,7 +53,7 @@ class FilterSplitor():
         
         logger.info(f"Randomly selecting and filtering sequences...")
         
-        with tqdm(total=total_seqs if self.max_seqs_num is not None else total_seqs, desc="Processing sequences") as pbar:
+        with tqdm(total=total_seqs if self.max_seqs_num != -1 else total_seqs, desc="Processing sequences") as pbar:
             with open(output_file, 'w') as output_handle:
                 with open(self.input_file, 'rb') as input_handle:
                     for i, (start, end) in enumerate(index):
@@ -69,7 +69,7 @@ class FilterSplitor():
                             passed_count += 1
                             pbar.update(1)
                         
-                        if self.max_seqs_num is not None and passed_count >= self.max_seqs_num:
+                        if self.max_seqs_num != -1 and passed_count >= self.max_seqs_num:
                             break
         
         logger.info(f"Processed {seq_count} sequences out of {total_seqs}: {passed_count} sequences retrieved with length in [{self.min_seq_len}, {self.max_seq_len}].")
@@ -122,7 +122,7 @@ class FilterSplitor():
             f.write(f"Processing parameters:\n")
             f.write(f"  - Min sequence length: {self.min_seq_len}\n")
             f.write(f"  - Max sequence length: {self.max_seq_len}\n")
-            f.write(f"  - Max sequences: {self.max_seqs_num if self.max_seqs_num else 'No limit'}\n")
+            f.write(f"  - Max sequences: {self.max_seqs_num if self.max_seqs_num != -1 else 'No limit'}\n")
             f.write(f"  - Validation ratio: {self.val_ratio}\n")
             f.write(f"Total processed sequences: {self.processed_seqs_num}\n")
             f.write(f"Training sequences: {self.train_count}\n")
