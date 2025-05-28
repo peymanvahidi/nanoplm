@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for ProtX - Protein Language Model Distillation
 # Stage 1: Base image with CUDA and Python
-FROM nvidia/cuda:12.9.0-cudnn-devel-ubuntu24.04 AS base
+FROM nvcr.io/nvidia/pytorch:25.04-py3 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -8,18 +8,13 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PIP_NO_CACHE_DIR=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Install additional system dependencies if needed
 RUN apt-get update && apt-get install -y \
-    python3.12 \
-    python3.12-dev \
-    python3-pip \
     git \
     build-essential \
     libhdf5-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
-
-RUN ln -sf /usr/bin/python3.12 /usr/bin/python && \
-    ln -sf /usr/bin/python3.12 /usr/bin/python3
 
 WORKDIR /app
 

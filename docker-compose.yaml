@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
       target: development
     container_name: protx-dev
+    restart: unless-stopped
     volumes:
       - ./output:/app/output
       - ./wandb:/app/wandb
