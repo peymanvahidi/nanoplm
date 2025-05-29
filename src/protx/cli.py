@@ -11,8 +11,9 @@ from .data.extractor import Extractor
 from .data.filter_splitor import FilterSplitor
 from .data.dataset import ProtXDataProcessor
 from .data.pipeline import DataPipeline
+from .distillation.pipeline import DistillationPipeline
 from .models.teacher import ProtT5
-from .config import DataConfig
+from .config import DataConfig, DistillConfig
 from .utils import logger
 
 @click.group()
@@ -307,6 +308,19 @@ def run_pipeline(
         logger.error(f"Pipeline failed: {e}")
         click.echo(f"Pipeline failed: {e}", err=True)
         raise click.Abort()
+
+@cli.command("train-student")
+@click.help_option('--help', '-h')
+def train_student(
+    data_config: str = DataConfig(),
+    distill_config: str = DistillConfig()
+):
+    """Train the student model"""
+    pipeline = DistillationPipeline(
+        data_config=data_config,
+        distill_config=distill_config
+    )
+    pipeline.train()
 
 if __name__ == '__main__':
     cli()
