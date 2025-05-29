@@ -97,6 +97,7 @@ class ProtXDataProcessor(Dataset):
         
         batch = []
         all_input_ids = []
+        all_attention_masks = []
         all_teacher_embeddings = []
         file_count = 1
         sequence_count = 0
@@ -128,6 +129,7 @@ class ProtXDataProcessor(Dataset):
                         ).last_hidden_state
                     
                     all_input_ids.append(input_ids.cpu().numpy())
+                    all_attention_masks.append(attention_mask.cpu().numpy())
                     all_teacher_embeddings.append(teacher_embeddings.cpu().numpy())
                     
                     sequence_count += len(batch)
@@ -137,11 +139,12 @@ class ProtXDataProcessor(Dataset):
                     # Check if we need to save the file
                     if sequence_count >= self.seqs_num_per_file:
                         current_file = save_dir / f"{base_filename}{file_count}.h5"
-                        self._save_file(current_file, all_input_ids, all_teacher_embeddings)
+                        self._save_file(current_file, all_input_ids, all_attention_masks, all_teacher_embeddings)
                         saved_files.append(current_file)
                         
                         # Clear memory
                         all_input_ids = []
+                        all_attention_masks = []
                         all_teacher_embeddings = []
                         gc.collect()
                         
@@ -169,6 +172,7 @@ class ProtXDataProcessor(Dataset):
                     ).last_hidden_state
                 
                 all_input_ids.append(input_ids.cpu().numpy())
+                all_attention_masks.append(attention_mask.cpu().numpy())
                 all_teacher_embeddings.append(teacher_embeddings.cpu().numpy())
                 
                 sequence_count += len(batch)
@@ -177,11 +181,12 @@ class ProtXDataProcessor(Dataset):
             # Save any remaining data
             if all_input_ids:
                 current_file = save_dir / f"{base_filename}{file_count}.h5"
-                self._save_file(current_file, all_input_ids, all_teacher_embeddings)
+                self._save_file(current_file, all_input_ids, all_attention_masks, all_teacher_embeddings)
                 saved_files.append(current_file)
                 
                 # Clear memory
                 all_input_ids = []
+                all_attention_masks = []
                 all_teacher_embeddings = []
                 gc.collect()
         
@@ -192,17 +197,21 @@ class ProtXDataProcessor(Dataset):
         self,
         file_path: Path,
         input_ids_list: List[np.ndarray],
+        attention_masks_list: List[np.ndarray],
         teacher_embeddings_list: List[np.ndarray]
     ):
         input_ids_array = np.concatenate(input_ids_list, axis=0)
+        attention_masks_array = np.concatenate(attention_masks_list, axis=0)
         teacher_embeddings_array = np.concatenate(teacher_embeddings_list, axis=0)
         
         logger.debug(f"Saving file {file_path}")
         logger.debug(f"Input IDs shape: {input_ids_array.shape}")
+        logger.debug(f"Attention masks shape: {attention_masks_array.shape}")
         logger.debug(f"Teacher embeddings shape: {teacher_embeddings_array.shape}")
         
         with h5py.File(file_path, "w") as f:
             f.create_dataset("input_ids", data=input_ids_array.astype(np.int8))
+            f.create_dataset("attention_masks", data=attention_masks_array.astype(np.int8))
             f.create_dataset("teacher_embeddings", data=teacher_embeddings_array.astype(np.float16))
         
         logger.debug(f"Saved {input_ids_array.shape[0]} sequences to {file_path}")
@@ -222,23 +231,23 @@ class ProtXDataLoader(Dataset):
         else:
             self.h5_paths = [Path(p) for p in h5_path]
         
+        self.h5_files = [h5py.File(path, "r") for path in self.h5_paths]
+        
         self._calculate_dataset_info()
         
         if self.seed is not None:
             self._shuffle_files()
     
     def _calculate_dataset_info(self):
-        """Calculate total dataset size and create mapping from global index to file+local index"""
         self.file_sizes = []
         self.cumulative_sizes = []
         cumulative = 0
         
-        for path in self.h5_paths:
-            with h5py.File(path, "r") as f:
-                file_size = f["input_ids"].shape[0]
-                self.file_sizes.append(file_size)
-                cumulative += file_size
-                self.cumulative_sizes.append(cumulative)
+        for h5f in self.h5_files:
+            file_size = h5f["input_ids"].shape[0]
+            self.file_sizes.append(file_size)
+            cumulative += file_size
+            self.cumulative_sizes.append(cumulative)
         
         self.total_size = cumulative
     
@@ -249,6 +258,7 @@ class ProtXDataLoader(Dataset):
         rng.shuffle(indices)
         
         self.h5_paths = [self.h5_paths[i] for i in indices]
+        self.h5_files = [self.h5_files[i] for i in indices]
         self.file_sizes = [self.file_sizes[i] for i in indices]
         
         cumulative = 0
@@ -264,26 +274,40 @@ class ProtXDataLoader(Dataset):
         if idx >= self.total_size or idx < 0:
             raise IndexError(f"Index {idx} out of range for dataset of size {self.total_size}")
         
-        file_idx = 0
-        for i, cumsum in enumerate(self.cumulative_sizes):
-            if idx < cumsum:
-                file_idx = i
-                break
+        file_idx = self._find_file_index(idx)
         
         if file_idx == 0:
             local_idx = idx
         else:
             local_idx = idx - self.cumulative_sizes[file_idx - 1]
         
-        file_path = self.h5_paths[file_idx]
-        with h5py.File(file_path, "r") as f:
-            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.long)
-            teacher_embeddings = torch.tensor(f["teacher_embeddings"][local_idx], dtype=torch.float)
-            
-            attention_mask = (input_ids != 0).long()
+        h5f = self.h5_files[file_idx]
+        input_ids = torch.tensor(h5f["input_ids"][local_idx], dtype=torch.long)
+        attention_mask = torch.tensor(h5f["attention_masks"][local_idx], dtype=torch.long)
+        teacher_embeddings = torch.tensor(h5f["teacher_embeddings"][local_idx], dtype=torch.float)
         
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "teacher_embeddings": teacher_embeddings
         }
+    
+    def _find_file_index(self, idx):
+        left, right = 0, len(self.cumulative_sizes) - 1
+        
+        while left <= right:
+            mid = (left + right) // 2
+            if idx < self.cumulative_sizes[mid]:
+                if mid == 0 or idx >= self.cumulative_sizes[mid - 1]:
+                    return mid
+                right = mid - 1
+            else:
+                left = mid + 1
+        
+        return left
+    
+    def __del__(self):
+        """Clean up file handles"""
+        if hasattr(self, 'h5_files'):
+            for h5f in self.h5_files:
+                h5f.close()
