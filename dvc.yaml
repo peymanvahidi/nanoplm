@@ -102,11 +102,7 @@ stages:
       - distill_params.on_the_fly
       - distill_params.num_epochs
       - distill_params.batch_size
-      - distill_params.start_lr
       - distill_params.warmup_steps
       - distill_params.min_lr
       - distill_params.max_lr
-      - distill_params.T_0
-      - distill_params.T_mult
-      - distill_params.gamma
-      - distill_params.max_cycle_length
+      - distill_params.dataloader_num_workers
