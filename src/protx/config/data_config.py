@@ -30,7 +30,6 @@ class DataConfig:
         self.max_seqs_num = self._get_param("data_params.max_seqs_num")
         self.min_seq_len = self._get_param("data_params.min_seq_len")
         self.max_seq_len = self._get_param("data_params.max_seq_len")
-        self.seqs_num_per_file = self._get_param("data_params.seqs_num_per_file")
         # This is batch size for embedding calculation
         self.embed_calc_batch_size = self._get_param("data_params.embed_calc_batch_size")
         
