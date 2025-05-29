@@ -34,22 +34,17 @@ class DistillConfig:
         # Scheduler
         ## warmup
         self.warmup_steps = int(self._get_param("distill_params.warmup_steps"))
-        self.start_lr = float(self._get_param("distill_params.start_lr"))
 
         ## cosine annealing
         self.min_lr = float(self._get_param("distill_params.min_lr"))
         self.max_lr = float(self._get_param("distill_params.max_lr"))
-        self.T_0 = int(self._get_param("distill_params.T_0"))
-        self.T_mult = int(self._get_param("distill_params.T_mult"))
-        self.gamma = float(self._get_param("distill_params.gamma"))
-        self.max_cycle_length = self._get_param("distill_params.max_cycle_length")
 
         # student
         self.student_embed_dim = int(self._get_param("distill_params.student_embed_dim"))
         self.student_num_layers = int(self._get_param("distill_params.student_num_layers"))
         self.student_num_heads = int(self._get_param("distill_params.student_num_heads"))
 
-        self.dataloader_num_workers = int(self._get_param("distill_params.dataloader_num_workers", 0))
+        self.dataloader_num_workers = int(self._get_param("distill_params.dataloader_num_workers"))
 
     def override(self, kwargs):
         """Override configuration attributes with provided kwargs."""
