@@ -144,36 +144,15 @@ class DistillationPipeline():
                 device=str(self.device)
             )
         else:
-            train_files = self._find_dataset_files(self.data_config.protx_train_prefix, "training")
-            val_files = self._find_dataset_files(self.data_config.protx_val_prefix, "validation")
-            
             train_dataset = ProtXDataLoader(
-                h5_path=train_files,
+                h5_path=self.data_config.protx_train_prefix,
                 device=str(self.device),
                 seed=seed if seed is not None else int(time.time())
             )
             val_dataset = ProtXDataLoader(
-                h5_path=val_files,
+                h5_path=self.data_config.protx_val_prefix,
                 device=str(self.device),
                 seed=seed if seed is not None else int(time.time()) + 1
             )
         
         return train_dataset, val_dataset
-        
-    def _find_dataset_files(
-        self,
-        file_prefix: str,
-        dataset_type: str
-    ) -> list:
-        
-        path = Path(file_prefix)
-        directory = path.parent
-        base_name = path.stem
-        
-        pattern = f"{base_name}*.h5"
-        files = sorted(list(directory.glob(pattern)))
-        
-        if not files:
-            raise FileNotFoundError(f"No {dataset_type} data files found matching {pattern} in {directory}")
-        
-        return files

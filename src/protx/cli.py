@@ -230,12 +230,6 @@ def filter_split_data(
     help='Maximum sequence length'
 )
 @click.option(
-    '--seqs-num-per-file',
-    default=10_000,
-    type=int,
-    help='Number of sequences per file'
-)
-@click.option(
     '--batch-size',
     default=64,
     type=int,
@@ -252,7 +246,6 @@ def save_protx_dataset(
     teacher_model: str,
     output_file: str,
     max_seq_len: int, 
-    seqs_num_per_file: int, 
     batch_size: int, 
     device: str
 ):
@@ -266,7 +259,6 @@ def save_protx_dataset(
         data_path=input_file,
         teacher_model=teacher_model,
         max_seq_len=max_seq_len,
-        seqs_num_per_file=seqs_num_per_file,
         batch_size=batch_size,
         device=device
     )
