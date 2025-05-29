@@ -5,7 +5,6 @@ data_params:
   max_seq_len: 512
   # This batch size is used for embedding calculation
   embed_calc_batch_size: 64
-  seqs_num_per_file: 10_000
   shuffle: true
 
 distill_params:
