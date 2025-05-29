@@ -60,7 +60,6 @@ stages:
       --teacher-model 'prott5'
       --output-file ${data_dirs.protx_train_prefix}
       --max-seq-len ${data_params.max_seq_len}
-      --seqs-num-per-file ${data_params.seqs_num_per_file}
       --batch-size ${data_params.embed_calc_batch_size}
       --device 'auto'
     deps:
@@ -70,7 +69,6 @@ stages:
       - data_dirs.train_fasta
       - data_dirs.protx_train_prefix
       - data_params.embed_calc_batch_size
-      - data_params.seqs_num_per_file
 
   save_protx_val_dataset:
     cmd: protx save-protx-dataset
@@ -78,7 +76,6 @@ stages:
       --teacher-model 'prott5'
       --output-file ${data_dirs.protx_val_prefix}
       --max-seq-len ${data_params.max_seq_len}
-      --seqs-num-per-file ${data_params.seqs_num_per_file}
       --batch-size ${data_params.embed_calc_batch_size}
       --device 'auto'
     deps:
@@ -88,10 +85,9 @@ stages:
       - data_dirs.protx_dataset_dir
       - data_dirs.protx_val_prefix
       - data_params.embed_calc_batch_size
-      - data_params.seqs_num_per_file
   
   train_model:
-    cmd: protx train-student
+    cmd: torchrun --nproc_per_node=4 --nnodes=1 --master_port=29500 /usr/local/bin/protx train-student
     deps:
       - src/protx/distillation/pipeline.py
       - output/data/protx_dataset/
