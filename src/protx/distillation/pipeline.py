@@ -5,7 +5,7 @@ from transformers import PreTrainedTokenizer, TrainingArguments
 import time
 
 from .collator import DistillDataCollator
-from .callbacks import OnnxExportCallback
+# from .callbacks import OnnxExportCallback
 from .trainer import DistillationTrainer
 
 from ..models.student import ProtX
@@ -90,12 +90,13 @@ class DistillationPipeline():
         
         wandb.init(project=project_name, name=run_name, config=training_args.to_dict(), reinit=True)
 
-        onnx_export_callback = OnnxExportCallback(
-            onnx_export_path=str(output_dir / "onnx"),
-            batch_size=self.distill_config.batch_size,
-            seq_len=self.data_config.max_seq_len,
-            device=str(self.device)
-        )
+        # ONNX export disabled - will be handled by separate script after training
+        # onnx_export_callback = OnnxExportCallback(
+        #     onnx_export_path=str(output_dir / "onnx"),
+        #     batch_size=self.distill_config.batch_size,
+        #     seq_len=self.data_config.max_seq_len,
+        #     device=str(self.device)
+        # )
         
         trainer = DistillationTrainer(
             model=student,
@@ -103,7 +104,7 @@ class DistillationPipeline():
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             data_collator=data_collator,
-            callbacks=[onnx_export_callback],
+            # callbacks=[onnx_export_callback]
         )
         
         logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
