@@ -87,7 +87,7 @@ stages:
       - data_params.embed_calc_batch_size
   
   train_model:
-    cmd: torchrun --nproc_per_node=4 --nnodes=1 --master_port=29500 /usr/local/bin/protx train-student
+    cmd: protx train-student #torchrun --nproc_per_node=2 --nnodes=1 --master_port=29500 /usr/local/bin/protx train-student
     deps:
       - src/protx/distillation/pipeline.py
       - output/data/protx_dataset/
@@ -99,6 +99,10 @@ stages:
       - distill_params.num_epochs
       - distill_params.batch_size
       - distill_params.warmup_steps
+      - distill_params.start_lr
       - distill_params.min_lr
       - distill_params.max_lr
+      - distill_params.T_0
+      - distill_params.T_mult
+      - distill_params.gamma
       - distill_params.dataloader_num_workers

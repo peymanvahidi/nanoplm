@@ -34,10 +34,14 @@ class DistillConfig:
         # Scheduler
         ## warmup
         self.warmup_steps = int(self._get_param("distill_params.warmup_steps"))
+        self.start_lr = float(self._get_param("distill_params.start_lr"))
 
         ## cosine annealing
         self.min_lr = float(self._get_param("distill_params.min_lr"))
         self.max_lr = float(self._get_param("distill_params.max_lr"))
+        self.T_0 = int(self._get_param("distill_params.T_0"))
+        self.T_mult = int(self._get_param("distill_params.T_mult"))
+        self.gamma = float(self._get_param("distill_params.gamma"))
 
         # student
         self.student_embed_dim = int(self._get_param("distill_params.student_embed_dim"))
