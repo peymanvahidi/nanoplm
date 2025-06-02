@@ -26,15 +26,14 @@ class ProtXScheduler(_LRScheduler):
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
-        warmup_steps: int = 0,
-        initial_lr: float = 1e-8,
-        max_lr: float = 1e-3,
-        min_lr: float = 1e-5,
-        T_0: int = 5000,
-        T_mult: int = 2,
-        gamma: float = 1.0,
+        warmup_steps: int,
+        initial_lr: float,
+        max_lr: float,
+        min_lr: float,
+        T_0: int,
+        T_mult: float,
+        gamma: float,
         max_lr_threshold: float = None,
-        max_cycle_length: int = None,
         last_epoch: int = -1
     ):
         self.warmup_steps = warmup_steps
@@ -42,10 +41,9 @@ class ProtXScheduler(_LRScheduler):
         self.max_lr = float(max_lr)
         self.min_lr = float(min_lr)
         self.T_0 = int(T_0)
-        self.T_mult = int(T_mult)
+        self.T_mult = float(T_mult)
         self.gamma = float(gamma)
-        self.max_lr_threshold = max_lr_threshold if max_lr_threshold is not None else min_lr * 3
-        self.max_cycle_length = max_cycle_length
+        self.max_lr_threshold = max_lr_threshold if max_lr_threshold is not None else min_lr * 1.05
         
         self.cycle = 0
         self.T_i = T_0  # Current cycle length
@@ -55,6 +53,7 @@ class ProtXScheduler(_LRScheduler):
         super(ProtXScheduler, self).__init__(optimizer, last_epoch)
         
         self.init_lr()
+        self._last_lr = self.get_lr()
     
     def init_lr(self):
         self.base_lrs = []
@@ -81,6 +80,10 @@ class ProtXScheduler(_LRScheduler):
             for _ in self.base_lrs
         ]
     
+    def get_last_lr(self):
+        """Return last computed learning rate by current scheduler."""
+        return self._last_lr
+    
     def step(self, epoch=None):
         if epoch is None:
             epoch = self.last_epoch + 1
@@ -104,15 +107,15 @@ class ProtXScheduler(_LRScheduler):
                 self.T_cur = 0  # Reset position within cycle
                 # Update cycle length for next cycle
                 self.T_i = self.T_0 * (self.T_mult ** self.cycle)
-                # Apply max cycle length if set
-                if self.max_cycle_length is not None:
-                    self.T_i = min(self.T_i, self.max_cycle_length)
             else:
                 # Update position within current cycle
                 self.T_cur = steps_in_cycle
         
+        # Get new learning rates
+        self._last_lr = self.get_lr()
+        
         # Apply new learning rates
-        for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+        for param_group, lr in zip(self.optimizer.param_groups, self._last_lr):
             param_group['lr'] = lr
 
 def visualize_lr_schedule(
@@ -124,10 +127,9 @@ def visualize_lr_schedule(
     max_lr: float = 1e-3,
     min_lr: float = 1e-5,
     T_0: int = 5000,
-    T_mult: int = 2,
+    T_mult: float = 2,
     gamma: float = 0.95,
     max_lr_threshold: float = None,
-    max_cycle_length: int = None,
     figsize: tuple = (12, 6),
     save_path: str = None
 ):
@@ -146,7 +148,6 @@ def visualize_lr_schedule(
         T_mult: Multiplicative factor to increase T_i after restart
         gamma: Weight decay factor applied each cycle
         max_lr_threshold: Threshold for max_lr during cosine annealing
-        max_cycle_length: Maximum cycle length in steps (defaults to 2 epochs worth of steps)
         figsize: Figure size for the plot
         save_path: Path to save the figure (optional)
     
@@ -156,10 +157,6 @@ def visualize_lr_schedule(
     # Calculate total steps
     steps_per_epoch = math.ceil(train_examples / batch_size)
     total_steps = steps_per_epoch * num_epochs
-    
-    # Calculate max_cycle_length if not provided (2 epochs worth of steps)
-    if max_cycle_length is None:
-        max_cycle_length = 2 * steps_per_epoch
     
     # Create a dummy model and optimizer
     dummy_model = torch.nn.Linear(1, 1)
@@ -176,7 +173,6 @@ def visualize_lr_schedule(
         T_mult=T_mult,
         gamma=gamma,
         max_lr_threshold=max_lr_threshold,
-        max_cycle_length=max_cycle_length
     )
     
     # Simulate the scheduler
@@ -214,19 +210,12 @@ def visualize_lr_schedule(
     current_T = T_0
     cycle = 0
     while current_step < total_steps:
-        # Apply max cycle length constraint
-        if max_cycle_length is not None:
-            current_T = min(current_T, max_cycle_length)
-        
         current_step += current_T
         if current_step < total_steps:
             plt.axvline(x=current_step, color='g', linestyle='--', alpha=0.5, 
                         label=f'Cycle End' if cycle == 0 else None)
             cycle += 1
             next_T = current_T * T_mult
-            # Apply max cycle length constraint to next cycle too
-            if max_cycle_length is not None:
-                next_T = min(next_T, max_cycle_length)
             current_T = next_T
     
     # Set plot details
@@ -246,8 +235,6 @@ def visualize_lr_schedule(
     plt.annotate(f'Gamma: {gamma}', xy=(0.02, 0.65), xycoords='axes fraction')
     if max_lr_threshold is not None:
         plt.annotate(f'Max LR Threshold: {max_lr_threshold}', xy=(0.02, 0.60), xycoords='axes fraction')
-    plt.annotate(f'Max Cycle Length: {max_cycle_length} steps ({max_cycle_length/steps_per_epoch:.1f} epochs)', 
-                 xy=(0.02, 0.55), xycoords='axes fraction')
     
     # Add secondary axis for epochs
     ax2.set_xlabel('Epochs')
@@ -260,16 +247,15 @@ def visualize_lr_schedule(
 
 if __name__ == "__main__":
     visualize_lr_schedule(
-        train_examples=5000 * 0.9,
-        batch_size=64,
-        num_epochs=15,
-        warmup_steps=500,
+        train_examples=50000 * 0.9,
+        batch_size=256,
+        num_epochs=20,
+        warmup_steps=128,
         initial_lr=1e-8,
-        max_lr=3e-3,
-        min_lr=1e-5,
-        T_0=300,
-        T_mult=1.25,
-        gamma=0.55,
-        max_cycle_length=2000,
-        save_path="lr_schedule14.png"
+        max_lr=1e-3,
+        min_lr=1e-6,
+        T_0=75,
+        T_mult=1.2,
+        gamma=0.25,
+        save_path="lr_schedule14-n.png"
     )

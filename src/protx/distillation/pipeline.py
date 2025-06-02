@@ -3,10 +3,12 @@ import wandb
 from pathlib import Path
 from transformers import PreTrainedTokenizer, TrainingArguments
 import time
+from torch.optim import AdamW
 
 from .collator import DistillDataCollator
 # from .callbacks import OnnxExportCallback
 from .trainer import DistillationTrainer
+from .scheduler import ProtXScheduler
 
 from ..models.student import ProtX
 from ..models.teacher import ProtT5
@@ -81,11 +83,10 @@ class DistillationPipeline():
             fp16=torch.cuda.is_available(),
             dataloader_num_workers=self.distill_config.dataloader_num_workers,
             dataloader_pin_memory=True,
-            lr_scheduler_type="cosine_with_min_lr",
-            lr_scheduler_kwargs={"min_lr": self.distill_config.min_lr},
-            ddp_find_unused_parameters=False,  # Faster distributed training
-            ddp_backend="nccl" if torch.cuda.is_available() else "gloo",  # Optimal backend
+            # ddp_find_unused_parameters=False,  # Faster distributed training
+            # ddp_backend="nccl" if torch.cuda.is_available() else "gloo",  # Optimal backend
             remove_unused_columns=False,  # Keep all columns for custom loss
+            label_names=["teacher_embeddings"],
         )
         
         wandb.init(project=project_name, name=run_name, config=training_args.to_dict(), reinit=True)
@@ -98,16 +99,35 @@ class DistillationPipeline():
         #     device=str(self.device)
         # )
         
+        optimizer = AdamW(
+            student.parameters(),
+            lr=self.distill_config.max_lr
+        )
+        
+        scheduler = ProtXScheduler(
+            optimizer=optimizer,
+            warmup_steps=self.distill_config.warmup_steps,
+            initial_lr=self.distill_config.start_lr,
+            max_lr=self.distill_config.max_lr,
+            min_lr=self.distill_config.min_lr,
+            T_0=self.distill_config.T_0,
+            T_mult=self.distill_config.T_mult,
+            gamma=self.distill_config.gamma,
+        )
+        
         trainer = DistillationTrainer(
             model=student,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             data_collator=data_collator,
+            optimizers=(optimizer, scheduler),  # Pass both optimizer and scheduler
             # callbacks=[onnx_export_callback]
         )
         
         logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
+        wandb.config.update(self.distill_config)
+        
         train_result = trainer.train(resume_from_checkpoint=checkpoint_path)
         
         trainer.save_model()
@@ -116,6 +136,7 @@ class DistillationPipeline():
         trainer.save_state()
 
         if val_dataset:
+            logger.info(f"Evaluating on {len(val_dataset)} samples")
             logger.info("*** Evaluate ***")
             metrics = trainer.evaluate()
             trainer.log_metrics("eval", metrics)
