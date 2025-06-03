@@ -7,7 +7,7 @@ from tqdm import tqdm
 from ..utils import logger, create_dirs
 
 class FastaShuffler:
-    """Shuffles sequences in a FASTA file."""
+    """Memory-efficient FASTA shuffler using BioPython's indexing capabilities."""
 
     def __init__(
         self,
@@ -23,31 +23,51 @@ class FastaShuffler:
             random.seed(self.seed)
 
     def shuffle(self):
-        """Reads, shuffles, and writes FASTA sequences."""
+        """Shuffles sequences using BioPython's memory-efficient indexing."""
         create_dirs(self.output_file.parent)
 
-        logger.info(f"Reading sequences from {self.input_file}...")
-        try:
-            sequences = list(SeqIO.parse(self.input_file, "fasta"))
-        except FileNotFoundError:
+        # Check if input file exists
+        if not self.input_file.exists():
             logger.error(f"Input file not found: {self.input_file}")
-            raise
-        except Exception as e:
-            logger.error(f"Error reading FASTA file {self.input_file}: {e}")
-            raise
-        
-        logger.info(f"Shuffling {len(sequences)} sequences...")
-        random.shuffle(sequences)
-        
-        logger.info(f"Writing {len(sequences)} shuffled sequences to {self.output_file}...")
+            raise FileNotFoundError(f"Input file not found: {self.input_file}")
+
+        logger.info(f"Creating BioPython index for {self.input_file}...")
         try:
-            with open(self.output_file, "w") as out_handle:
-                SeqIO.write(sequences, out_handle, "fasta")
+            # Create memory-efficient index - doesn't load sequences into memory
+            record_dict = SeqIO.index(str(self.input_file), "fasta")
+            sequence_ids = list(record_dict.keys())
+            logger.info(f"Indexed {len(sequence_ids)} sequences")
+            
+        except Exception as e:
+            logger.error(f"Error creating BioPython index: {e}")
+            raise
+
+        if not sequence_ids:
+            logger.warning("No sequences found in input file")
+            return
+
+        # Shuffle sequence IDs (lightweight operation)
+        logger.info(f"Shuffling {len(sequence_ids)} sequence IDs...")
+        random.shuffle(sequence_ids)
+
+        # Write sequences in shuffled order
+        logger.info(f"Writing shuffled sequences to {self.output_file}...")
+        try:
+            with open(self.output_file, "w") as output_handle:
+                with tqdm(total=len(sequence_ids), desc="Writing sequences") as pbar:
+                    for seq_id in sequence_ids:
+                        record = record_dict[seq_id]  # Fast random access
+                        SeqIO.write(record, output_handle, "fasta")
+                        pbar.update(1)
+                        
         except Exception as e:
             logger.error(f"Error writing shuffled FASTA file {self.output_file}: {e}")
             raise
+        finally:
+            # Clean up the index
+            record_dict.close()
             
-        logger.info(f"Successfully shuffled sequences saved to {self.output_file}")
+        logger.info(f"Successfully shuffled {len(sequence_ids)} sequences to {self.output_file}")
 
 if __name__ == '__main__':
     # Example Usage (for testing purposes)
