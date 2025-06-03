@@ -30,6 +30,9 @@ class DataConfig:
         self.max_seqs_num = self._get_param("data_params.max_seqs_num")
         self.min_seq_len = self._get_param("data_params.min_seq_len")
         self.max_seq_len = self._get_param("data_params.max_seq_len")
+        self.filter_skip_n = self._get_param("data_params.filter_skip_n")
+        self.shuffle = self._get_param("data_params.shuffle")
+        self.shuffle_seed = self._get_param("data_params.shuffle_seed")
         # This is batch size for embedding calculation
         self.embed_calc_batch_size = self._get_param("data_params.embed_calc_batch_size")
         
@@ -39,6 +42,7 @@ class DataConfig:
         self.uniref50_url = self._get_param("data_dirs.uniref50_url")
         self.uniref50_fasta_gz = self._get_param("data_dirs.uniref50_fasta_gz")
         self.uniref50_fasta = self._get_param("data_dirs.uniref50_fasta")
+        self.shuffled_fasta_file = self._get_param("data_dirs.shuffled_fasta_file")
         
         self.filtered_seqs = self._get_param("data_dirs.uniref50_filtered_fasta")
         self.train_file = self._get_param("data_dirs.train_fasta")
