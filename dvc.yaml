@@ -25,9 +25,23 @@ stages:
     outs:
       - ${data_dirs.uniref50_fasta}
 
+  shuffle_fasta:
+    cmd: protx shuffle-fasta
+      --input ${data_dirs.uniref50_fasta}
+      --output ${data_dirs.shuffled_fasta_file}
+      --seed ${data_params.shuffle_seed}
+    deps:
+      - src/protx/data/shuffler.py
+      - ${data_dirs.uniref50_fasta}
+    params:
+      - data_dirs.shuffled_fasta_file
+      - data_params.shuffle_seed
+    outs:
+      - ${data_dirs.shuffled_fasta_file}
+
   filter_split:
     cmd: protx filter-split-data
-      --input ${data_dirs.uniref50_fasta}
+      --input ${data_dirs.shuffled_fasta_file}
       --filtered-seqs ${data_dirs.uniref50_filtered_fasta}
       --train-file ${data_dirs.train_fasta}
       --val-file ${data_dirs.val_fasta}
@@ -36,18 +50,19 @@ stages:
       --max-seqs-num ${data_params.max_seqs_num}
       --val-ratio ${data_params.val_ratio}
       --info-file ${data_dirs.info_file}
-      --shuffle ${data_params.shuffle}
+      --skip-n ${data_params.filter_skip_n}
     deps:
       - src/protx/data/filter_splitor.py
-      - ${data_dirs.uniref50_fasta}
+      - ${data_dirs.shuffled_fasta_file}
     params:
-      - data_dirs.uniref50_fasta
+      - data_dirs.shuffled_fasta_file
       - data_dirs.uniref50_filtered_fasta
       - data_dirs.info_file
       - data_params.min_seq_len
       - data_params.max_seq_len
       - data_params.max_seqs_num
       - data_params.val_ratio
+      - data_params.filter_skip_n
     outs:
       - ${data_dirs.uniref50_filtered_fasta}
       - ${data_dirs.train_fasta}

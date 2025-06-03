@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .data.downloader import Downloader
 from .data.extractor import Extractor
+from .data.shuffler import FastaShuffler
 from .data.filter_splitor import FilterSplitor
 from .data.dataset import ProtXDataProcessor
 from .data.pipeline import DataPipeline
@@ -100,6 +101,44 @@ def extract_data(input: str, output: str):
         raise click.Abort()
 
 
+@cli.command("shuffle-fasta")
+@click.help_option('--help', '-h')
+@click.option(
+    '--input',
+    '-i',
+    required=True,
+    type=click.Path(exists=True),
+    help='Input FASTA file path'
+)
+@click.option(
+    '--output',
+    '-o',
+    required=True,
+    type=click.Path(exists=False),
+    help='Output file path for the shuffled FASTA'
+)
+@click.option(
+    '--seed',
+    type=int,
+    default=None,
+    help='Random seed for shuffling (optional)'
+)
+def shuffle_fasta_cli(input: str, output: str, seed: int):
+    """Shuffle sequences in a FASTA file."""
+    try:
+        shuffler = FastaShuffler(
+            input_file=input,
+            output_file=output,
+            seed=seed
+        )
+        shuffler.shuffle()
+        click.echo(f"FASTA file shuffled successfully. Output: {output}")
+    except Exception as e:
+        logger.error(f"FASTA shuffling failed: {e}")
+        click.echo(f"FASTA shuffling failed: {e}", err=True)
+        raise click.Abort()
+
+
 @cli.command("filter-split-data")
 @click.help_option('--help', '-h')
 @click.option(
@@ -159,9 +198,10 @@ def extract_data(input: str, output: str):
     help='Info file path where the dataset will be saved'
 )
 @click.option(
-    '--shuffle',
-    default=True,
-    help='Shuffle the dataset'
+    '--skip-n',
+    default=0,
+    type=int,
+    help='Number of sequences to skip from the beginning of the input FASTA file'
 )
 def filter_split_data(
     input: str,
@@ -173,9 +213,9 @@ def filter_split_data(
     max_seqs_num: int,
     val_ratio: float,
     info_file: str,
-    shuffle: bool
+    skip_n: int
 ):
-    """Filter sequences by length and split into train/validation sets"""
+    """Filter sequences by length, optionally skip N sequences, and split into train/validation sets"""
     try:
         filter_splitor = FilterSplitor(
             input_file=input,
@@ -185,7 +225,7 @@ def filter_split_data(
             max_seqs_num=max_seqs_num,
             val_ratio=val_ratio,
             info_file=info_file,
-            shuffle=shuffle
+            skip_n=skip_n
         )
         filter_splitor.filter()
         filter_splitor.split(
@@ -221,7 +261,7 @@ def filter_split_data(
     '-o',
     required=True,
     type=click.Path(exists=False),
-    help='Output file prefix where the dataset will be saved, since several files will be created based on the number of sequences in each file.'
+    help='Output HDF5 file path where the processed dataset will be saved.'
 )
 @click.option(
     '--max-seq-len',
@@ -241,31 +281,40 @@ def filter_split_data(
     type=click.Choice(['auto', 'cuda', 'mps', 'cpu']),
     help='Device to use'
 )
+@click.option(
+    '--skip-n',
+    default=0,
+    type=int,
+    help='Number of sequences to skip from the beginning of the input FASTA file before processing'
+)
 def save_protx_dataset(
     input_file: str,
     teacher_model: str,
     output_file: str,
     max_seq_len: int, 
     batch_size: int, 
-    device: str
+    device: str,
+    skip_n: int
 ):
     """Generate ProtX datasets with teacher embeddings"""
     if teacher_model == "prott5":
-        teacher_model = ProtT5()
+        selected_teacher_model = ProtT5()
     else:
-        raise ValueError(f"Teacher model {teacher_model} not supported")
+        logger.error(f"Teacher model {teacher_model} not supported")
+        raise click.Abort()
     
     protx_data = ProtXDataProcessor(
         data_path=input_file,
-        teacher_model=teacher_model,
+        teacher_model=selected_teacher_model,
         max_seq_len=max_seq_len,
         batch_size=batch_size,
-        device=device
+        device=device,
+        skip_n=skip_n
     )
     protx_data.process_dataset(
         save_path=Path(output_file)
     )
-    click.echo(f"ProtX dataset generation completed successfully")
+    click.echo(f"ProtX dataset generation completed successfully. Output: {output_file}")
 
 
 @cli.command("run-pipeline")
@@ -273,7 +322,8 @@ def save_protx_dataset(
 @click.option(
     '--config-file',
     type=click.Path(exists=True),
-    help='Path to custom config file (defaults to params.yaml)'
+    default=None,
+    help='Path to custom YAML config file (defaults to loading params.yaml if present)'
 )
 @click.option(
     '--save-protx-dataset',
@@ -286,10 +336,7 @@ def run_pipeline(
 ):
     """Run the complete data pipeline from download to dataset creation using config file"""
     try:
-        if config_file:
-            config = DataConfig(config_file)
-        else:
-            config = DataConfig()
+        config = DataConfig(config_file if config_file else "params.yaml")
         
         pipeline = DataPipeline(config)
         pipeline.run_all(save_protx_dataset=save_protx_dataset)

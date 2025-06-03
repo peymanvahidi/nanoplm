@@ -6,6 +6,8 @@ data_params:
   # This batch size is used for embedding calculation
   embed_calc_batch_size: 64
   shuffle: true
+  shuffle_seed: 23
+  filter_skip_n: 0
 
 distill_params:
   dataloader_num_workers: 4
@@ -17,7 +19,7 @@ distill_params:
 
   on_the_fly: false
   num_epochs: 10
-  batch_size: 64
+  batch_size: 256
 
   # scheduler
   ## warmup
@@ -34,21 +36,22 @@ distill_params:
 
 ### DO NOT CHANGE CONFIGS BELOW ###
 data_dirs:
-  uniref50_url: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz" 
-  uniref50_fasta_gz: "output/data/raw/uniref50.fasta.gz"
-
   base_dir: "output/data"
   raw_dir: "output/data/raw"
+  filter_split_dir: "output/data/filter_split"
+  protx_dataset_dir: "output/data/protx_dataset"
 
+  uniref50_url: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz" 
+  uniref50_fasta_gz: "output/data/raw/uniref50.fasta.gz"
   uniref50_fasta: "output/data/raw/uniref50.fasta"
 
-  filter_split_dir: "output/data/filter_split"
+  shuffled_fasta_file: "output/data/raw/uniref50_shuffled.fasta"
+
   uniref50_filtered_fasta: "output/data/filter_split/uniref50_filtered.fasta"
   train_fasta: "output/data/filter_split/train.fasta"
   val_fasta: "output/data/filter_split/val.fasta"
   info_file: "output/data/filter_split/dataset_info.txt"
 
-  protx_dataset_dir: "output/data/protx_dataset"
   protx_train_prefix: "output/data/protx_dataset/train/train.h5"
   protx_val_prefix: "output/data/protx_dataset/val/val.h5"
 

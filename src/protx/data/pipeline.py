@@ -2,6 +2,7 @@ from pathlib import Path
 
 from .downloader import Downloader
 from .extractor import Extractor
+from .shuffler import FastaShuffler
 from .filter_splitor import FilterSplitor
 from .dataset import ProtXDataProcessor
 
@@ -56,16 +57,31 @@ class DataPipeline:
             logger.error(f"Extract failed: {e}")
             raise
     
+    def shuffle_fasta(self):
+        """Shuffle the main FASTA file."""
+        shuffler = FastaShuffler(
+            input_file=self.config.uniref50_fasta,
+            output_file=self.config.shuffled_fasta_file,
+            seed=self.config.shuffle_seed
+        )
+        try:
+            log_stage("SHUFFLE FASTA")
+            shuffler.shuffle()
+        except Exception as e:
+            logger.error(f"FASTA shuffling failed: {e}")
+            raise
+
     def filter_split(self):
         """Filter and split data - same logic as CLI filter-split-data command"""
         filter_splitor = FilterSplitor(
-            input_file=self.config.uniref50_fasta,
+            input_file=self.config.shuffled_fasta_file,
             output_file=self.config.filtered_seqs,
             min_seq_len=self.config.min_seq_len,
             max_seq_len=self.config.max_seq_len,
             max_seqs_num=self.config.max_seqs_num,
             val_ratio=self.config.val_ratio,
             info_file=self.config.info_file,
+            skip_n=self.config.filter_skip_n
         )
         try:
             log_stage("FILTER & SPLIT")
@@ -84,9 +100,9 @@ class DataPipeline:
             data_path=self.config.train_file,
             teacher_model=ProtT5(),
             max_seq_len=self.config.max_seq_len,
-            seqs_num_per_file=self.config.seqs_num_per_file,
             batch_size=self.config.embed_calc_batch_size,
-            device=get_device()
+            device=get_device(),
+            skip_n=0
         )
 
         try:
@@ -107,9 +123,9 @@ class DataPipeline:
             data_path=self.config.val_file,
             teacher_model=ProtT5(),
             max_seq_len=self.config.max_seq_len,
-            seqs_num_per_file=self.config.seqs_num_per_file,
             batch_size=self.config.embed_calc_batch_size,
-            device=get_device()
+            device=get_device(),
+            skip_n=0
         )
         
         try:
@@ -127,6 +143,7 @@ class DataPipeline:
         """Run the complete pipeline - equivalent to running all CLI commands in sequence"""
         self.download()
         self.extract()
+        self.shuffle_fasta()
         self.filter_split()
         if save_protx_dataset:
             self.save_protx_train_dataset()
