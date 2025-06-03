@@ -86,14 +86,9 @@ class ProtXDataProcessor(Dataset):
             logger.info(f"{self.data_path} initialized (with skip_n={self.skip_n}). Now ready for processing.")
 
     def __len__(self):
-        self._load()
-        
-        count = 0
-        temp_gen = SeqIO.parse(self.data_path, "fasta")
-        for i, _ in enumerate(temp_gen):
-            if i >= self.skip_n:
-                count += 1
-        return count
+        if not hasattr(self, "_cached_len"):
+            self._cached_len = max(0, sum(1 for _ in SeqIO.parse(self.data_path, "fasta")) - self.skip_n)
+        return self._cached_len
     
     def process_dataset(self, save_path: Path) -> Path:
         self._load()
