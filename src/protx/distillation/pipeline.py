@@ -83,8 +83,8 @@ class DistillationPipeline():
             fp16=torch.cuda.is_available(),
             dataloader_num_workers=self.distill_config.dataloader_num_workers,
             dataloader_pin_memory=True,
-            # ddp_find_unused_parameters=False,  # Faster distributed training
-            # ddp_backend="nccl" if torch.cuda.is_available() else "gloo",  # Optimal backend
+            ddp_find_unused_parameters=False,  # Faster distributed training
+            ddp_backend="nccl" if torch.cuda.is_available() else "gloo",  # Optimal backend
             remove_unused_columns=False,  # Keep all columns for custom loss
             label_names=["teacher_embeddings"],
         )
