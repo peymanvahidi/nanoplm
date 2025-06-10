@@ -1,43 +1,80 @@
 import torch
 import wandb
 from pathlib import Path
-from transformers import PreTrainedTokenizer, TrainingArguments
+from transformers import PreTrainedTokenizer, TrainingArguments, get_cosine_schedule_with_warmup
 import time
 from torch.optim import AdamW
+import os
 
 from .collator import DistillDataCollator
 # from .callbacks import OnnxExportCallback
 from .trainer import DistillationTrainer
-from .scheduler import ProtXScheduler
+# from .scheduler import ProtXScheduler
 
 from ..models.student import ProtX
 from ..models.teacher import ProtT5
-from ..config import DataConfig
-from ..config.distill_config import DistillConfig
+
 from ..data.dataset import ProtXDataGen, ProtXDataLoader
 from ..utils import get_device, create_dirs, logger
 
 class DistillationPipeline():
     def __init__(
         self,
-        data_config: DataConfig = DataConfig(),
-        distill_config: DistillConfig = DistillConfig(),
-        device: str = None
+        train_file: str,
+        val_file: str,
+        protx_train_prefix: str,
+        protx_val_prefix: str,
+        student_embed_dim: int,
+        student_num_layers: int,
+        student_num_heads: int,
+        on_the_fly: bool,
+        multi_gpu: bool,
+        num_epochs: int,
+        batch_size: int,
+        max_lr: float,
+        max_seqs_num: int,
+        max_seq_len: int,
+        val_ratio: float,
+        num_workers: int,
+        project_name: str,
+        checkpoint_path: str,
+        wandb_dir: str,
+        device: str,
     ):
-        self.data_config = data_config
-        self.distill_config = distill_config
+        self.train_file = train_file
+        self.val_file = val_file
+        self.protx_train_prefix = protx_train_prefix
+        self.protx_val_prefix = protx_val_prefix
+        self.student_embed_dim = student_embed_dim
+        self.student_num_layers = student_num_layers
+        self.student_num_heads = student_num_heads
+        self.on_the_fly = on_the_fly
+        self.multi_gpu = multi_gpu
+        self.num_epochs = num_epochs
+        self.batch_size = batch_size
+        self.max_lr = max_lr
+        self.max_seqs_num = max_seqs_num
+        self.max_seq_len = max_seq_len
+        self.val_ratio = val_ratio
+        self.num_workers = num_workers
+        self.project_name = project_name
+        self.checkpoint_path = checkpoint_path
+        self.wandb_dir = wandb_dir
         self.device = device if device else get_device()
 
-    def train(
-        self,
-        checkpoint_path: str = None,
-        project_name: str = "protx-distillation"
-    ):
+
+        # Initialize distributed training if multi_gpu is enabled
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.rank = int(os.environ.get("RANK", 0))
+        self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self.is_main_process = self.rank == 0
+
+    def train(self):
 
         student = ProtX(
-            embed_dim=self.distill_config.student_embed_dim,
-            num_layers=self.distill_config.student_num_layers,
-            num_heads=self.distill_config.student_num_heads,
+            embed_dim=self.student_embed_dim,
+            num_layers=self.student_num_layers,
+            num_heads=self.student_num_heads,
         )
 
         teacher = ProtT5()
@@ -45,13 +82,13 @@ class DistillationPipeline():
         timestamp = int(time.time())
         run_name = f"run-{timestamp}"
 
-        output_dir = Path(self.distill_config.checkpoint_dir) / run_name
+        output_dir = Path(self.wandb_dir) / run_name
         create_dirs(output_dir)
 
         teacher_model_for_collator = None
         teacher_tokenizer_for_dataset = None
         
-        if self.distill_config.on_the_fly:
+        if self.on_the_fly:
             teacher_model_for_collator = teacher.encoder_model
             teacher_tokenizer_for_dataset = teacher.tokenizer
         
@@ -61,36 +98,63 @@ class DistillationPipeline():
 
         data_collator = DistillDataCollator(
             teacher_model=teacher_model_for_collator,
-            on_the_fly=self.distill_config.on_the_fly
+            on_the_fly=self.on_the_fly
         )
 
-        training_args = TrainingArguments(
-            output_dir=str(output_dir),
-            num_train_epochs=self.distill_config.num_epochs,
-            per_device_train_batch_size=self.distill_config.batch_size,
-            per_device_eval_batch_size=self.distill_config.batch_size * 2,
-            warmup_steps=self.distill_config.warmup_steps,
-            learning_rate=self.distill_config.max_lr,
-            logging_dir=str(output_dir / "logs"),
-            logging_strategy="steps",
-            logging_steps=30,
-            save_strategy="steps",
-            save_steps=1000,
-            eval_strategy="steps",
-            eval_steps=30,
-            report_to="wandb",
-            run_name=run_name,
-            fp16=torch.cuda.is_available(),
-            dataloader_num_workers=self.distill_config.dataloader_num_workers,
-            dataloader_pin_memory=True,
-            ddp_find_unused_parameters=False,  # Faster distributed training
-            ddp_backend="nccl" if torch.cuda.is_available() else "gloo",  # Optimal backend
-            remove_unused_columns=False,  # Keep all columns for custom loss
-            label_names=["teacher_embeddings"],
-        )
+        # Setup GPU configuration
+        world_size, effective_batch_size = self._gpu_config()
+
+        # Calculate num_training_steps for scheduler
+        num_training_steps = ((self.max_seqs_num * (1 - self.val_ratio)) // effective_batch_size) * self.num_epochs
+
+        logger.info(f"Training configuration:")
+        logger.info(f"  Multi-GPU: {self.multi_gpu}")
+        logger.info(f"  World size: {world_size}")
+        logger.info(f"  Per-device batch size: {self.batch_size}")
+        logger.info(f"  Effective batch size: {effective_batch_size}")
+        logger.info(f"  Total training steps: {num_training_steps}")
+        logger.info(f"  Training samples: {int(self.max_seqs_num * (1 - self.val_ratio))}")
+
+        eval_steps = max(1, int(num_training_steps*0.01))  # 1% of training steps
+        save_steps = eval_steps * 5  # Make save_steps a multiple of eval_steps (5x = ~5%)
+
+        training_dict = {
+            "output_dir": str(output_dir),
+            "num_train_epochs": self.num_epochs,
+            "per_device_train_batch_size": self.batch_size,
+            "per_device_eval_batch_size": self.batch_size * 2,
+            "warmup_steps": int(num_training_steps*0.05),
+            "learning_rate": self.max_lr,
+            "logging_dir": str(output_dir / "logs"),
+            "logging_strategy": "steps",
+            "logging_steps": eval_steps,
+            "save_strategy": "steps",
+            "save_steps": save_steps,
+            "eval_strategy": "steps",
+            "eval_steps": eval_steps,
+            "report_to": "wandb",
+            "run_name": run_name,
+            "dataloader_num_workers": self.num_workers,
+            "remove_unused_columns": False,
+            "label_names": ["teacher_embeddings"],
+        }
+
+        if self.multi_gpu:
+            training_dict["fp16"] = True
+            training_dict["dataloader_pin_memory"] = True
+            training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
+
+        training_args = TrainingArguments(**training_dict)
+
+        if self.is_main_process:
+            wandb.init(
+                project=self.project_name,
+                name=run_name,
+                config=training_args.to_dict(),
+                settings=wandb.Settings(start_method="fork")
+            )
+
         
-        wandb.init(project=project_name, name=run_name, config=training_args.to_dict(), reinit=True)
-
         # ONNX export disabled - will be handled by separate script after training
         # onnx_export_callback = OnnxExportCallback(
         #     onnx_export_path=str(output_dir / "onnx"),
@@ -101,18 +165,14 @@ class DistillationPipeline():
         
         optimizer = AdamW(
             student.parameters(),
-            lr=self.distill_config.max_lr
+            lr=self.max_lr
         )
         
-        scheduler = ProtXScheduler(
+        scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
-            warmup_steps=self.distill_config.warmup_steps,
-            initial_lr=self.distill_config.start_lr,
-            max_lr=self.distill_config.max_lr,
-            min_lr=self.distill_config.min_lr,
-            T_0=self.distill_config.T_0,
-            T_mult=self.distill_config.T_mult,
-            gamma=self.distill_config.gamma,
+            num_warmup_steps=int(num_training_steps * 0.05),
+            num_training_steps=num_training_steps,
+            num_cycles=0.5
         )
         
         trainer = DistillationTrainer(
@@ -121,60 +181,91 @@ class DistillationPipeline():
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             data_collator=data_collator,
-            optimizers=(optimizer, scheduler),  # Pass both optimizer and scheduler
+            optimizers=(optimizer, scheduler),
             # callbacks=[onnx_export_callback]
         )
         
-        logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
-        wandb.config.update(self.distill_config)
+        if self.is_main_process:
+            logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
+            wandb.config.update(training_args.to_dict())
         
-        train_result = trainer.train(resume_from_checkpoint=checkpoint_path)
+        train_result = trainer.train(resume_from_checkpoint=self.checkpoint_path)
         
-        trainer.save_model()
-        trainer.log_metrics("train", train_result.metrics)
-        trainer.save_metrics("train", train_result.metrics)
-        trainer.save_state()
+        if self.is_main_process:
+            trainer.save_model()
+            trainer.log_metrics("train", train_result.metrics)
+            trainer.save_metrics("train", train_result.metrics)
+            trainer.save_state()
 
-        if val_dataset:
-            logger.info(f"Evaluating on {len(val_dataset)} samples")
-            logger.info("*** Evaluate ***")
-            metrics = trainer.evaluate()
-            trainer.log_metrics("eval", metrics)
-            trainer.save_metrics("eval", metrics)
+            if val_dataset:
+                logger.info(f"Evaluating on {len(val_dataset)} samples")
+                logger.info("*** Evaluate ***")
+                metrics = trainer.evaluate()
+                trainer.log_metrics("eval", metrics)
+                trainer.save_metrics("eval", metrics)
+            
+            best_model_path = str(output_dir)
+            wandb.run.log_artifact(
+                artifact_or_path=best_model_path,
+                name=f"best-model-{run_name}",
+                type="model",
+                aliases=["best", "latest", "production"]
+            )
 
-        wandb.finish()
-        
-        logger.info(f"Training complete!")
-        return student
+            logger.info(f"Best model saved as wandb artifact: best-model-{run_name}")
+
+            wandb.finish()
+            
+            logger.info(f"Training complete!")
 
     def _load_dataset(
         self,
         teacher_tokenizer: PreTrainedTokenizer = None,
         seed: int = None
     ):
-        if self.distill_config.on_the_fly:
+        if self.on_the_fly:
             train_dataset = ProtXDataGen(
-                data_path=self.data_config.train_file,
+                data_path=self.train_file,
                 teacher_tokenizer=teacher_tokenizer,
-                max_seq_len=self.data_config.max_seq_len,
+                max_seq_len=self.max_seq_len,
                 device=str(self.device)
             )
             val_dataset = ProtXDataGen(
-                data_path=self.data_config.val_file,
+                data_path=self.val_file,
                 teacher_tokenizer=teacher_tokenizer,
-                max_seq_len=self.data_config.max_seq_len,
+                max_seq_len=self.max_seq_len,
                 device=str(self.device)
             )
         else:
             train_dataset = ProtXDataLoader(
-                h5_path=self.data_config.protx_train_prefix,
+                h5_path=self.protx_train_prefix,
                 device=str(self.device),
                 seed=seed if seed is not None else int(time.time())
             )
             val_dataset = ProtXDataLoader(
-                h5_path=self.data_config.protx_val_prefix,
+                h5_path=self.protx_val_prefix,
                 device=str(self.device),
                 seed=seed if seed is not None else int(time.time()) + 1
             )
         
         return train_dataset, val_dataset
+
+    def _gpu_config(self):
+        """
+        Configure GPU settings and environment variables for training.
+
+        Returns:
+            tuple: (world_size, effective_batch_size)
+        """
+        gradient_accumulation_steps = 1
+
+        # Determine the world size (number of GPUs/processes)
+        world_size = self.world_size if self.multi_gpu else 1
+
+        # Calculate effective batch size (per_device_batch_size * world_size * gradient_accumulation_steps)
+        effective_batch_size = self.batch_size * world_size * gradient_accumulation_steps
+
+        # Configure environment variables based on training mode
+        os.environ["WANDB_LOG_MODEL"] = "end"
+
+        return world_size, effective_batch_size

@@ -350,14 +350,169 @@ def run_pipeline(
 
 @cli.command("train-student")
 @click.help_option('--help', '-h')
+@click.option(
+    '--train-file',
+    type=str,
+    required=True,
+    help='Path to the training file'
+)
+@click.option(
+    '--val-file',
+    type=str,
+    required=True,
+    help='Path to the validation file'
+)
+@click.option(
+    '--protx-train-prefix',
+    type=str,
+    required=True,
+    help='Prefix of the training ProtX dataset'
+)
+@click.option(
+    '--protx-val-prefix',
+    type=str,
+    required=True,
+    help='Prefix of the validation ProtX dataset'
+)
+@click.option(
+    '--student-embed-dim',
+    type=int,
+    default=512,
+    help='Embedding dimension of the student model'
+)
+@click.option(
+    '--student-num-layers',
+    type=int,
+    default=6,
+    help='Number of layers of the student model'
+)
+@click.option(
+    '--student-num-heads',
+    type=int,
+    default=8,
+    help='Number of heads of the student model'
+)
+@click.option(
+    '--on-the-fly',
+    is_flag=True,
+    help='Whether to use on-the-fly teacher embeddings'
+)
+@click.option(
+    '--multi-gpu',
+    is_flag=True,
+    help='Whether to use multiple GPUs for training'
+)
+@click.option(
+    '--num-epochs',
+    type=int,
+    default=10,
+    help='Number of epochs to train the student model'
+)
+@click.option(
+    '--batch-size',
+    type=int,
+    default=64,
+    help='Batch size for training'
+)
+@click.option(
+    '--max-lr',
+    type=float,
+    default=1e-3,
+    help='Maximum learning rate'
+)
+@click.option(
+    '--max-seqs-num',
+    type=int,
+    default=1000000,
+    help='Maximum number of sequences to use for training'
+)
+@click.option(
+    '--max-seq-len',
+    type=int,
+    default=1024,
+    help='Maximum sequence length'
+)
+@click.option(
+    '--val-ratio',
+    type=float,
+    default=0.1,
+    help='Ratio of validation set'
+)
+@click.option(
+    '--num-workers',
+    type=int,
+    default=4,
+    help='Number of workers to use for training'
+)
+@click.option(
+    '--project-name',
+    type=str,
+    default="protx_distillation",
+    help='Name of the project'
+)
+@click.option(
+    '--checkpoint-path',
+    type=str,
+    default=None,
+    help='Path to the checkpoint to resume training from'
+)
+@click.option(
+    '--wandb-dir',
+    type=str,
+    default=None,
+    help='Path to the directory to save the wandb logs'
+)
+@click.option(
+    '--device',
+    default='cuda',
+    type=click.Choice(['cuda', 'mps', 'cpu']),
+    help='Device to use'
+)
+
 def train_student(
-    data_config: str = DataConfig(),
-    distill_config: str = DistillConfig()
+    train_file: str,
+    val_file: str,
+    protx_train_prefix: str,
+    protx_val_prefix: str,
+    student_embed_dim: int,
+    student_num_layers: int,
+    student_num_heads: int,
+    on_the_fly: bool,
+    multi_gpu: bool,
+    num_epochs: int,
+    batch_size: int,
+    max_lr: float,
+    max_seqs_num: int,
+    max_seq_len: int,
+    val_ratio: float,
+    num_workers: int,
+    project_name: str,
+    checkpoint_path: str,
+    wandb_dir: str,
+    device: str
 ):
     """Train the student model"""
     pipeline = DistillationPipeline(
-        data_config=data_config,
-        distill_config=distill_config
+        train_file=train_file,
+        val_file=val_file,
+        protx_train_prefix=protx_train_prefix,
+        protx_val_prefix=protx_val_prefix,
+        student_embed_dim=student_embed_dim,
+        student_num_layers=student_num_layers,
+        student_num_heads=student_num_heads,
+        on_the_fly=on_the_fly,
+        multi_gpu=multi_gpu,
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+        max_lr=max_lr,
+        max_seqs_num=max_seqs_num,
+        max_seq_len=max_seq_len,
+        val_ratio=val_ratio,
+        num_workers=num_workers,
+        project_name=project_name,
+        checkpoint_path=checkpoint_path,
+        wandb_dir=wandb_dir,
+        device=device,
     )
     pipeline.train()
 
