@@ -115,8 +115,9 @@ class DistillationPipeline():
         logger.info(f"  Total training steps: {num_training_steps}")
         logger.info(f"  Training samples: {int(self.max_seqs_num * (1 - self.val_ratio))}")
 
-        eval_steps = max(1, int(num_training_steps*0.01))  # 1% of training steps
-        save_steps = eval_steps * 5  # Make save_steps a multiple of eval_steps (5x = ~5%)
+        # Reduce evaluation frequency for HDD to minimize I/O overhead
+        eval_steps = max(1, int(num_training_steps*0.05))  # 5% of training steps (reduced from 1%)
+        save_steps = eval_steps * 2  # Save every 2 evaluations (~10% of training)
 
         training_dict = {
             "output_dir": str(output_dir),
@@ -137,12 +138,27 @@ class DistillationPipeline():
             "dataloader_num_workers": self.num_workers,
             "remove_unused_columns": False,
             "label_names": ["teacher_embeddings"],
+            # Performance optimizations for HDD + multi-GPU
+            "dataloader_prefetch_factor": 25,  # Prefetch more batches to hide HDD latency
+            "dataloader_persistent_workers": True,  # Keep workers alive
+            "gradient_accumulation_steps": 1,  # Increase effective batch size, reduce I/O frequency
+            "prediction_loss_only": True,  # Speed up evaluation by not computing extra outputs
+            "load_best_model_at_end": False,  # Skip loading best model at end to save I/O
+            "metric_for_best_model": "eval_loss",
+            "greater_is_better": False,
         }
 
         if self.multi_gpu:
             training_dict["fp16"] = True
+            training_dict["find_unused_parameters"] = False
             training_dict["dataloader_pin_memory"] = True
             training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
+            # Additional multi-GPU optimizations
+            training_dict["ddp_find_unused_parameters"] = False
+            training_dict["ddp_bucket_cap_mb"] = 25  # Reduce bucket size for better memory efficiency
+            training_dict["bf16"] = torch.cuda.is_bf16_supported()  # Use bf16 if available (better than fp16)
+            if training_dict["bf16"]:
+                training_dict["fp16"] = False  # Use bf16 instead of fp16 if supported
 
         training_args = TrainingArguments(**training_dict)
 
@@ -257,7 +273,7 @@ class DistillationPipeline():
         Returns:
             tuple: (world_size, effective_batch_size)
         """
-        gradient_accumulation_steps = 1
+        gradient_accumulation_steps = 1  # Updated to match training config
 
         # Determine the world size (number of GPUs/processes)
         world_size = self.world_size if self.multi_gpu else 1
@@ -265,7 +281,10 @@ class DistillationPipeline():
         # Calculate effective batch size (per_device_batch_size * world_size * gradient_accumulation_steps)
         effective_batch_size = self.batch_size * world_size * gradient_accumulation_steps
 
-        # Configure environment variables based on training mode
+        # Configure environment variables for performance
         os.environ["WANDB_LOG_MODEL"] = "end"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Avoid warnings in multi-processing
+        # With 16 CPUs per GPU, use more threads for better performance
+        os.environ["OMP_NUM_THREADS"] = str(min(12, self.num_workers * 2))  # Use 12 threads or 2x num_workers
 
         return world_size, effective_batch_size
