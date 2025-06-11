@@ -150,7 +150,6 @@ class DistillationPipeline():
 
         if self.multi_gpu:
             training_dict["fp16"] = True
-            training_dict["find_unused_parameters"] = False
             training_dict["dataloader_pin_memory"] = True
             training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
             # Additional multi-GPU optimizations
