@@ -77,8 +77,6 @@ class DistillationPipeline():
             num_heads=self.student_num_heads,
         )
 
-        teacher = ProtT5()
-
         timestamp = int(time.time())
         run_name = f"run-{timestamp}"
 
@@ -89,6 +87,7 @@ class DistillationPipeline():
         teacher_tokenizer_for_dataset = None
         
         if self.on_the_fly:
+            teacher = ProtT5()
             teacher_model_for_collator = teacher.encoder_model
             teacher_tokenizer_for_dataset = teacher.tokenizer
         
@@ -102,7 +101,7 @@ class DistillationPipeline():
         )
 
         # Setup GPU configuration
-        world_size, effective_batch_size = self._gpu_config()
+        world_size, effective_batch_size = self._batch_config()
 
         # Calculate num_training_steps for scheduler
         num_training_steps = ((self.max_seqs_num * (1 - self.val_ratio)) // effective_batch_size) * self.num_epochs
@@ -116,8 +115,8 @@ class DistillationPipeline():
         logger.info(f"  Training samples: {int(self.max_seqs_num * (1 - self.val_ratio))}")
 
         # Reduce evaluation frequency for HDD to minimize I/O overhead
-        eval_steps = max(1, int(num_training_steps*0.05))  # 5% of training steps (reduced from 1%)
-        save_steps = eval_steps * 2  # Save every 2 evaluations (~10% of training)
+        eval_steps = max(1, int(num_training_steps*0.01))  # 1% of training steps
+        save_steps = eval_steps * 5  # Save every 2 evaluations (~5% of training)
 
         training_dict = {
             "output_dir": str(output_dir),
@@ -138,26 +137,13 @@ class DistillationPipeline():
             "dataloader_num_workers": self.num_workers,
             "remove_unused_columns": False,
             "label_names": ["teacher_embeddings"],
-            # Performance optimizations for HDD + multi-GPU
-            "dataloader_prefetch_factor": 25,  # Prefetch more batches to hide HDD latency
-            "dataloader_persistent_workers": True,  # Keep workers alive
-            "gradient_accumulation_steps": 1,  # Increase effective batch size, reduce I/O frequency
-            "prediction_loss_only": True,  # Speed up evaluation by not computing extra outputs
-            "load_best_model_at_end": False,  # Skip loading best model at end to save I/O
-            "metric_for_best_model": "eval_loss",
-            "greater_is_better": False,
+            "gradient_accumulation_steps": 1,
         }
 
         if self.multi_gpu:
-            training_dict["fp16"] = True
             training_dict["dataloader_pin_memory"] = True
             training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
-            # Additional multi-GPU optimizations
             training_dict["ddp_find_unused_parameters"] = False
-            training_dict["ddp_bucket_cap_mb"] = 25  # Reduce bucket size for better memory efficiency
-            training_dict["bf16"] = torch.cuda.is_bf16_supported()  # Use bf16 if available (better than fp16)
-            if training_dict["bf16"]:
-                training_dict["fp16"] = False  # Use bf16 instead of fp16 if supported
 
         training_args = TrainingArguments(**training_dict)
 
@@ -200,34 +186,22 @@ class DistillationPipeline():
             # callbacks=[onnx_export_callback]
         )
         
-        if self.is_main_process:
-            logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
-            wandb.config.update(training_args.to_dict())
+        logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
+        wandb.config.update(training_args.to_dict())
         
         train_result = trainer.train(resume_from_checkpoint=self.checkpoint_path)
         
-        if self.is_main_process:
-            trainer.save_model()
-            trainer.log_metrics("train", train_result.metrics)
-            trainer.save_metrics("train", train_result.metrics)
-            trainer.save_state()
+        trainer.save_model()
+        trainer.log_metrics("train", train_result.metrics)
+        trainer.save_metrics("train", train_result.metrics)
+        trainer.save_state()
 
-            if val_dataset:
-                logger.info(f"Evaluating on {len(val_dataset)} samples")
-                logger.info("*** Evaluate ***")
-                metrics = trainer.evaluate()
-                trainer.log_metrics("eval", metrics)
-                trainer.save_metrics("eval", metrics)
-            
-            best_model_path = str(output_dir)
-            wandb.run.log_artifact(
-                artifact_or_path=best_model_path,
-                name=f"best-model-{run_name}",
-                type="model",
-                aliases=["best", "latest", "production"]
-            )
-
-            logger.info(f"Best model saved as wandb artifact: best-model-{run_name}")
+        if val_dataset:
+            logger.info(f"Evaluating on {len(val_dataset)} samples")
+            logger.info("*** Evaluate ***")
+            metrics = trainer.evaluate()
+            trainer.log_metrics("eval", metrics)
+            trainer.save_metrics("eval", metrics)
 
             wandb.finish()
             
@@ -265,25 +239,10 @@ class DistillationPipeline():
         
         return train_dataset, val_dataset
 
-    def _gpu_config(self):
-        """
-        Configure GPU settings and environment variables for training.
-
-        Returns:
-            tuple: (world_size, effective_batch_size)
-        """
-        gradient_accumulation_steps = 1  # Updated to match training config
-
-        # Determine the world size (number of GPUs/processes)
+    def _batch_config(self):
+        gradient_accumulation_steps = 1
         world_size = self.world_size if self.multi_gpu else 1
-
-        # Calculate effective batch size (per_device_batch_size * world_size * gradient_accumulation_steps)
         effective_batch_size = self.batch_size * world_size * gradient_accumulation_steps
-
-        # Configure environment variables for performance
         os.environ["WANDB_LOG_MODEL"] = "end"
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"  # Avoid warnings in multi-processing
-        # With 16 CPUs per GPU, use more threads for better performance
-        os.environ["OMP_NUM_THREADS"] = str(min(12, self.num_workers * 2))  # Use 12 threads or 2x num_workers
 
         return world_size, effective_batch_size
