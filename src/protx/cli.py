@@ -5,6 +5,7 @@ ProtX CLI - Command Line Interface for ProtX package
 
 import click
 from pathlib import Path
+import json
 
 from .data.downloader import Downloader
 from .data.extractor import Extractor
@@ -13,6 +14,7 @@ from .data.filter_splitor import FilterSplitor
 from .data.dataset import ProtXDataProcessor
 from .data.pipeline import DataPipeline
 from .distillation.pipeline import DistillationPipeline
+from .distillation.pipeline_builder import DistillationPipelineBuilder
 from .models.teacher import ProtT5
 from .config import DataConfig, DistillConfig
 from .utils import logger
@@ -450,12 +452,12 @@ def run_pipeline(
     default="protx_distillation",
     help='Name of the project'
 )
-@click.option(
-    '--checkpoint-path',
-    type=str,
-    default=None,
-    help='Path to the checkpoint to resume training from'
-)
+# @click.option(
+#     '--checkpoint-dir',
+#     type=str,
+#     default=None,
+#     help='Path to the checkpoint directory to resume training from'
+# )
 @click.option(
     '--wandb-dir',
     type=str,
@@ -467,6 +469,19 @@ def run_pipeline(
     default='cuda',
     type=click.Choice(['cuda', 'mps', 'cpu']),
     help='Device to use'
+)
+@click.option(
+    '--lr-scheduler',
+    type=click.Choice(['cosine', 'linear', 'polynomial', 'constant']),
+    default='cosine',
+    help='Learning rate scheduler type'
+)
+@click.option(
+    '--lr-scheduler-kwargs',
+    type=str,
+    default=None,
+    help='JSON string of additional kwargs for the learning rate scheduler (optional). ' +
+         'Example: \'{"num_cycles": 1.0, "power": 1.0}\' for cosine/polynomial schedulers'
 )
 
 def train_student(
@@ -487,32 +502,139 @@ def train_student(
     val_ratio: float,
     num_workers: int,
     project_name: str,
-    checkpoint_path: str,
+    # checkpoint_dir: str,
     wandb_dir: str,
-    device: str
+    device: str,
+    lr_scheduler: str,
+    lr_scheduler_kwargs: str
 ):
     """Train the student model"""
-    pipeline = DistillationPipeline(
-        train_file=train_file,
-        val_file=val_file,
-        protx_train_prefix=protx_train_prefix,
-        protx_val_prefix=protx_val_prefix,
-        student_embed_dim=student_embed_dim,
-        student_num_layers=student_num_layers,
-        student_num_heads=student_num_heads,
-        on_the_fly=on_the_fly,
-        multi_gpu=multi_gpu,
-        num_epochs=num_epochs,
-        batch_size=batch_size,
-        max_lr=max_lr,
-        max_seqs_num=max_seqs_num,
-        max_seq_len=max_seq_len,
-        val_ratio=val_ratio,
-        num_workers=num_workers,
-        project_name=project_name,
-        checkpoint_path=checkpoint_path,
-        wandb_dir=wandb_dir,
-        device=device,
+    import json
+    
+    # Parse lr_scheduler_kwargs if provided
+    parsed_lr_kwargs = {}
+    if lr_scheduler_kwargs:
+        try:
+            parsed_lr_kwargs = json.loads(lr_scheduler_kwargs)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON for lr-scheduler-kwargs: {e}")
+            click.echo(f"Invalid JSON for lr-scheduler-kwargs: {e}", err=True)
+            raise click.Abort()
+    
+    builder = DistillationPipelineBuilder()
+
+    pipeline = (
+        builder
+            .with_training_files(
+                train_file=train_file,
+                val_file=val_file,
+                protx_train_prefix=protx_train_prefix,
+                protx_val_prefix=protx_val_prefix
+            )
+            .with_model_config(
+                student_embed_dim=student_embed_dim,
+                student_num_layers=student_num_layers,
+                student_num_heads=student_num_heads,
+            )
+            .with_training_config(
+                num_epochs=num_epochs,
+                batch_size=batch_size,
+                max_lr=max_lr,
+                max_seqs_num=max_seqs_num,
+                max_seq_len=max_seq_len,
+                val_ratio=val_ratio,
+                num_workers=num_workers,
+                lr_scheduler=lr_scheduler,
+                lr_scheduler_kwargs=parsed_lr_kwargs,
+            )
+            .with_experiment_config(
+                project_name=project_name,
+                wandb_dir=wandb_dir,
+                device=device,
+                on_the_fly=on_the_fly,
+                multi_gpu=multi_gpu,
+            )
+        .build()
+    )
+
+    pipeline.train()
+
+@cli.command("resume-training")
+@click.help_option('--help', '-h')
+@click.option(
+    '--checkpoint-dir',
+    type=str,
+    required=True,
+    help='Path to the checkpoint directory to resume training from'
+)
+@click.option(
+    '--num-epochs',
+    type=int,
+    required=True,
+    help='Number of epochs to train the student model'
+)
+@click.option(
+    '--lr',
+    type=float,
+    default=None,
+    help='Override learning rate for resumed training (optional)'
+)
+@click.option(
+    '--lr-scheduler',
+    type=click.Choice(['cosine', 'linear', 'polynomial', 'constant']),
+    default=None,
+    help='Learning rate scheduler type (optional, defaults to cosine)'
+)
+@click.option(
+    '--lr-scheduler-kwargs',
+    type=str,
+    default=None,
+    help='JSON string of additional kwargs for the learning rate scheduler (optional). ' +
+         'Example: \'{"num_cycles": 1.0, "power": 1.0}\' for cosine/polynomial schedulers'
+)
+def resume_training(
+    checkpoint_dir: str,
+    num_epochs: int,
+    lr: float,
+    lr_scheduler: str,
+    lr_scheduler_kwargs: str
+):
+    """Resume training from a checkpoint with optional learning rate and scheduler overrides.
+    
+    Examples:
+        # Resume with new learning rate:
+        protx resume-training --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr 5e-4
+        
+        # Resume with linear scheduler:
+        protx resume-training --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr-scheduler linear
+        
+        # Resume with constant learning rate:
+        protx resume-training --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr-scheduler constant
+    """
+    # Parse lr_scheduler_kwargs if provided
+    parsed_lr_kwargs = {}
+    if lr_scheduler_kwargs:
+        try:
+            parsed_lr_kwargs = json.loads(lr_scheduler_kwargs)
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON for lr-scheduler-kwargs: {e}")
+            click.echo(f"Invalid JSON for lr-scheduler-kwargs: {e}", err=True)
+            raise click.Abort()
+    
+    builder = DistillationPipelineBuilder()
+    
+    # Build overrides dict
+    overrides = {"num_epochs": num_epochs}
+    if lr is not None:
+        overrides["max_lr"] = lr
+    if lr_scheduler is not None:
+        overrides["lr_scheduler"] = lr_scheduler
+    if parsed_lr_kwargs:
+        overrides["lr_scheduler_kwargs"] = parsed_lr_kwargs
+    
+    pipeline = builder.resume_from_checkpoint(
+        checkpoint_dir=checkpoint_dir,
+        **overrides
     )
     pipeline.train()
 

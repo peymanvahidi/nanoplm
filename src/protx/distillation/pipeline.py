@@ -1,7 +1,15 @@
 import torch
 import wandb
 from pathlib import Path
-from transformers import PreTrainedTokenizer, TrainingArguments, get_cosine_schedule_with_warmup
+from safetensors.torch import load_file
+from transformers import (
+    PreTrainedTokenizer, 
+    TrainingArguments, 
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+    get_polynomial_decay_schedule_with_warmup,
+    get_constant_schedule_with_warmup
+)
 import time
 from torch.optim import AdamW
 import os
@@ -9,13 +17,14 @@ import os
 from .collator import DistillDataCollator
 # from .callbacks import OnnxExportCallback
 from .trainer import DistillationTrainer
+from .session_manager import TrainingSessionManager
 # from .scheduler import ProtXScheduler
 
 from ..models.student import ProtX
 from ..models.teacher import ProtT5
 
 from ..data.dataset import ProtXDataGen, ProtXDataLoader
-from ..utils import get_device, create_dirs, logger
+from ..utils import get_device, logger
 
 class DistillationPipeline():
     def __init__(
@@ -37,9 +46,12 @@ class DistillationPipeline():
         val_ratio: float,
         num_workers: int,
         project_name: str,
-        checkpoint_path: str,
+        checkpoint_dir: str,  # To continue training from a checkpoint
         wandb_dir: str,
         device: str,
+        lr_scheduler: str = "cosine",  # New parameter for scheduler type
+        lr_scheduler_kwargs: dict = None,  # New parameter for scheduler kwargs
+        _overrides: dict = None,
     ):
         self.train_file = train_file
         self.val_file = val_file
@@ -58,9 +70,13 @@ class DistillationPipeline():
         self.val_ratio = val_ratio
         self.num_workers = num_workers
         self.project_name = project_name
-        self.checkpoint_path = checkpoint_path
+        self.checkpoint_dir = checkpoint_dir
         self.wandb_dir = wandb_dir
         self.device = device if device else get_device()
+        self.lr_scheduler = lr_scheduler
+        self.lr_scheduler_kwargs = lr_scheduler_kwargs or {}
+        self._overrides = _overrides or {}
+        
 
 
         # Initialize distributed training if multi_gpu is enabled
@@ -77,11 +93,52 @@ class DistillationPipeline():
             num_heads=self.student_num_heads,
         )
 
-        timestamp = int(time.time())
-        run_name = f"run-{timestamp}"
+        # Setup training session (new or resumed)
+        session_manager = TrainingSessionManager(
+            checkpoint_dir=self.checkpoint_dir,
+            wandb_dir=self.wandb_dir,
+            project_name=self.project_name
+        )
+        
+        # Prepare configuration for saving (for new sessions)
+        distill_pipeline_config = {
+            "train_file": self.train_file,
+            "val_file": self.val_file,
+            "protx_train_prefix": self.protx_train_prefix,
+            "protx_val_prefix": self.protx_val_prefix,
+            "student_embed_dim": self.student_embed_dim,
+            "student_num_layers": self.student_num_layers,
+            "student_num_heads": self.student_num_heads,
+            "on_the_fly": self.on_the_fly,
+            "multi_gpu": self.multi_gpu,
+            "num_epochs": self.num_epochs,
+            "batch_size": self.batch_size,
+            "max_lr": self.max_lr,
+            "max_seqs_num": self.max_seqs_num,
+            "max_seq_len": self.max_seq_len,
+            "val_ratio": self.val_ratio,
+            "num_workers": self.num_workers,
+            "project_name": self.project_name,
+            "wandb_dir": self.wandb_dir,
+            "device": self.device,
+            "lr_scheduler": self.lr_scheduler,
+            "lr_scheduler_kwargs": self.lr_scheduler_kwargs,
+        }
+        
+        run_name, output_dir, is_resuming = session_manager.setup_session(distill_pipeline_config)
 
-        output_dir = Path(self.wandb_dir) / run_name
-        create_dirs(output_dir)
+        if is_resuming:
+            checkpoint_path = Path(self.checkpoint_dir)
+            safetensors_path = checkpoint_path / "model.safetensors"
+
+            model_loaded = False
+            if safetensors_path.exists():
+                logger.info(f"Loading model weights from {safetensors_path}")
+                state_dict = load_file(safetensors_path, device=self.device)
+                student.load_state_dict(state_dict)
+                model_loaded = True
+            if not model_loaded:
+                logger.warning(f"Could not find model weights in {self.checkpoint_dir}. Training from scratch.")
 
         teacher_model_for_collator = None
         teacher_tokenizer_for_dataset = None
@@ -118,7 +175,7 @@ class DistillationPipeline():
         eval_steps = max(1, int(num_training_steps*0.01))  # 1% of training steps
         save_steps = eval_steps * 5  # Save every 2 evaluations (~5% of training)
 
-        training_dict = {
+        trainer_dict = {
             "output_dir": str(output_dir),
             "num_train_epochs": self.num_epochs,
             "per_device_train_batch_size": self.batch_size,
@@ -141,19 +198,19 @@ class DistillationPipeline():
         }
 
         if self.multi_gpu:
-            training_dict["dataloader_pin_memory"] = True
-            training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
-            training_dict["ddp_find_unused_parameters"] = False
+            trainer_dict["dataloader_pin_memory"] = True
+            trainer_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
+            trainer_dict["ddp_find_unused_parameters"] = False
 
-        training_args = TrainingArguments(**training_dict)
+        training_args = TrainingArguments(**trainer_dict)
 
         if self.is_main_process:
-            wandb.init(
-                project=self.project_name,
-                name=run_name,
-                config=training_args.to_dict(),
-                settings=wandb.Settings(start_method="fork")
+            wandb_config = session_manager.setup_wandb_config(
+                run_name=run_name,
+                training_args=training_args,
+                is_resuming=is_resuming
             )
+            wandb.init(**wandb_config)
 
         
         # ONNX export disabled - will be handled by separate script after training
@@ -169,27 +226,57 @@ class DistillationPipeline():
             lr=self.max_lr
         )
         
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
-            num_warmup_steps=int(num_training_steps * 0.05),
-            num_training_steps=num_training_steps,
-            num_cycles=0.5
-        )
+        num_training_steps_for_scheduler = num_training_steps
         
+        # When resuming, the number of epochs is the number of *additional* epochs.
+        # We need to adjust the total steps for the scheduler accordingly.
+        if is_resuming:
+            # We assume the new `num_epochs` is the total desired number of epochs.
+            # To calculate remaining steps, we'd need to know the completed steps.
+            # For simplicity and correctness with a new scheduler, we base steps on new num_epochs.
+            logger.info("Creating a new scheduler for the resumed training.")
+        
+        scheduler = self._get_scheduler(optimizer, num_training_steps_for_scheduler)
+        
+        # Always pass optimizers as a tuple (optimizer, scheduler)
+        # Even for constant learning rate, pass (optimizer, None)
         trainer = DistillationTrainer(
             model=student,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             data_collator=data_collator,
-            optimizers=(optimizer, scheduler),
+            optimizers=(optimizer, scheduler),  # scheduler can be None for constant learning rate
             # callbacks=[onnx_export_callback]
         )
         
         logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
         wandb.config.update(training_args.to_dict())
         
-        train_result = trainer.train(resume_from_checkpoint=self.checkpoint_path)
+        # When resuming with a new learning rate, we need to start with a fresh
+        # optimizer and scheduler. The HF Trainer would otherwise load the old
+        # state from `optimizer.pt`, overwriting our new LR.
+        # The cleanest workaround is to temporarily remove the optimizer and
+        # scheduler state files if they exist.
+        if is_resuming and self._overrides.get("max_lr") is not None:
+            logger.info("New learning rate provided for resumed training. Removing old optimizer/scheduler state.")
+            optimizer_path = Path(self.checkpoint_dir) / "optimizer.pt"
+            scheduler_path = Path(self.checkpoint_dir) / "scheduler.pt"
+            
+            if optimizer_path.exists():
+                optimizer_path.unlink()
+                logger.info(f"Removed {optimizer_path}")
+            
+            if scheduler_path.exists():
+                scheduler_path.unlink()
+                logger.info(f"Removed {scheduler_path}")
+
+        # Train with or without checkpoint resumption
+        if is_resuming:
+            logger.info(f"Resuming training from checkpoint: {self.checkpoint_dir}")
+            train_result = trainer.train(resume_from_checkpoint=self.checkpoint_dir)
+        else:
+            train_result = trainer.train()
         
         trainer.save_model()
         trainer.log_metrics("train", train_result.metrics)
@@ -246,3 +333,47 @@ class DistillationPipeline():
         os.environ["WANDB_LOG_MODEL"] = "end"
 
         return world_size, effective_batch_size
+
+    def _get_scheduler(self, optimizer, num_training_steps):
+        if num_training_steps <= 0:
+            logger.warning("Number of training steps is 0 or less. No scheduler will be created.")
+            return None
+
+        logger.info(f"Creating {self.lr_scheduler} scheduler with {num_training_steps} training steps")
+        
+        # Set warmup steps to 0 if the user wants a truly constant LR from the start
+        # unless they override it via lr_scheduler_kwargs
+        warmup_steps = self.lr_scheduler_kwargs.get("num_warmup_steps", int(num_training_steps * 0.05))
+        if self.lr_scheduler == "constant":
+            warmup_steps = self.lr_scheduler_kwargs.get("num_warmup_steps", 0)
+
+        if self.lr_scheduler == "cosine":
+            return get_cosine_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=num_training_steps,
+                num_cycles=0.5,
+                **self.lr_scheduler_kwargs
+            )
+        elif self.lr_scheduler == "linear":
+            return get_linear_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=num_training_steps,
+                **self.lr_scheduler_kwargs
+            )
+        elif self.lr_scheduler == "polynomial":
+            return get_polynomial_decay_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=num_training_steps,
+                **self.lr_scheduler_kwargs
+            )
+        elif self.lr_scheduler == "constant":
+            logger.info("Using constant learning rate scheduler.")
+            return get_constant_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=warmup_steps
+            )
+        else:
+            raise ValueError(f"Unknown learning rate scheduler: {self.lr_scheduler}")
