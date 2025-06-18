@@ -69,18 +69,20 @@ class DistillationPipelineBuilder:
         num_epochs: int,
         batch_size: int,
         max_lr: float,
+        max_grad_norm: float,
         max_seqs_num: int,
         max_seq_len: int,
         val_ratio: float,
         num_workers: int,
         lr_scheduler: str = "cosine",
-        lr_scheduler_kwargs: dict = None
+        lr_scheduler_kwargs: dict = None,
     ):
         """Set training hyperparameters."""
         self.config.update({
             "num_epochs": num_epochs,
             "batch_size": batch_size,
             "max_lr": max_lr,
+            "max_grad_norm": max_grad_norm,
             "max_seqs_num": max_seqs_num,
             "max_seq_len": max_seq_len,
             "val_ratio": val_ratio,

@@ -12,11 +12,8 @@ from .data.extractor import Extractor
 from .data.shuffler import FastaShuffler
 from .data.filter_splitor import FilterSplitor
 from .data.dataset import ProtXDataProcessor
-from .data.pipeline import DataPipeline
-from .distillation.pipeline import DistillationPipeline
 from .distillation.pipeline_builder import DistillationPipelineBuilder
 from .models.teacher import ProtT5
-from .config import DataConfig, DistillConfig
 from .utils import logger
 
 @click.group()
@@ -28,7 +25,6 @@ from .utils import logger
 def cli():
     """ProtX - Knowledge distillation of ProtT5"""
     pass
-
 
 @cli.command("download-data")
 @click.help_option('--help', '-h')
@@ -69,7 +65,6 @@ def download_data(url: str, output: str, force: bool):
         logger.error(f"Download failed: {e}")
         click.echo(f"Download failed: {e}", err=True)
         raise click.Abort()
-
 
 @cli.command("extract-data")
 @click.help_option('--help', '-h')
@@ -241,7 +236,6 @@ def filter_split_data(
         click.echo(f"Filter and split failed: {e}", err=True)
         raise click.Abort()
 
-
 @cli.command("save-protx-dataset")
 @click.help_option('--help', '-h')
 @click.option(
@@ -318,38 +312,6 @@ def save_protx_dataset(
     )
     click.echo(f"ProtX dataset generation completed successfully. Output: {output_file}")
 
-
-@cli.command("run-pipeline")
-@click.help_option('--help', '-h')
-@click.option(
-    '--config-file',
-    type=click.Path(exists=True),
-    default=None,
-    help='Path to custom YAML config file (defaults to loading params.yaml if present)'
-)
-@click.option(
-    '--save-protx-dataset',
-    is_flag=True,
-    help='Also generate ProtX datasets with teacher embeddings'
-)
-def run_pipeline(
-    config_file: str,
-    save_protx_dataset: bool
-):
-    """Run the complete data pipeline from download to dataset creation using config file"""
-    try:
-        config = DataConfig(config_file if config_file else "params.yaml")
-        
-        pipeline = DataPipeline(config)
-        pipeline.run_all(save_protx_dataset=save_protx_dataset)
-        
-        click.echo("Complete pipeline execution finished successfully!")
-        
-    except Exception as e:
-        logger.error(f"Pipeline failed: {e}")
-        click.echo(f"Pipeline failed: {e}", err=True)
-        raise click.Abort()
-
 @cli.command("train-student")
 @click.help_option('--help', '-h')
 @click.option(
@@ -423,6 +385,12 @@ def run_pipeline(
     help='Maximum learning rate'
 )
 @click.option(
+    '--max-grad-norm',
+    type=float,
+    default=1.0,
+    help='Maximum gradient norm for gradient clipping'
+)
+@click.option(
     '--max-seqs-num',
     type=int,
     default=1000000,
@@ -483,7 +451,6 @@ def run_pipeline(
     help='JSON string of additional kwargs for the learning rate scheduler (optional). ' +
          'Example: \'{"num_cycles": 1.0, "power": 1.0}\' for cosine/polynomial schedulers'
 )
-
 def train_student(
     train_file: str,
     val_file: str,
@@ -497,6 +464,7 @@ def train_student(
     num_epochs: int,
     batch_size: int,
     max_lr: float,
+    max_grad_norm: float,
     max_seqs_num: int,
     max_seq_len: int,
     val_ratio: float,
@@ -506,11 +474,9 @@ def train_student(
     wandb_dir: str,
     device: str,
     lr_scheduler: str,
-    lr_scheduler_kwargs: str
+    lr_scheduler_kwargs: str,
 ):
     """Train the student model"""
-    import json
-    
     # Parse lr_scheduler_kwargs if provided
     parsed_lr_kwargs = {}
     if lr_scheduler_kwargs:
@@ -546,6 +512,7 @@ def train_student(
                 num_workers=num_workers,
                 lr_scheduler=lr_scheduler,
                 lr_scheduler_kwargs=parsed_lr_kwargs,
+                max_grad_norm=max_grad_norm,
             )
             .with_experiment_config(
                 project_name=project_name,
@@ -592,12 +559,19 @@ def train_student(
     help='JSON string of additional kwargs for the learning rate scheduler (optional). ' +
          'Example: \'{"num_cycles": 1.0, "power": 1.0}\' for cosine/polynomial schedulers'
 )
+@click.option(
+    '--max-grad-norm',
+    type=float,
+    default=None,
+    help='Override gradient clipping norm for resumed training (optional)'
+)
 def resume_training(
     checkpoint_dir: str,
     num_epochs: int,
     lr: float,
     lr_scheduler: str,
-    lr_scheduler_kwargs: str
+    lr_scheduler_kwargs: str,
+    max_grad_norm: float
 ):
     """Resume training from a checkpoint with optional learning rate and scheduler overrides.
     
@@ -627,6 +601,8 @@ def resume_training(
     overrides = {"num_epochs": num_epochs}
     if lr is not None:
         overrides["max_lr"] = lr
+    if max_grad_norm is not None:
+        overrides["max_grad_norm"] = max_grad_norm
     if lr_scheduler is not None:
         overrides["lr_scheduler"] = lr_scheduler
     if parsed_lr_kwargs:

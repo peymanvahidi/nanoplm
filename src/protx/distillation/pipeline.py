@@ -41,6 +41,7 @@ class DistillationPipeline():
         num_epochs: int,
         batch_size: int,
         max_lr: float,
+        max_grad_norm: float, # Gradient clipping threshold
         max_seqs_num: int,
         max_seq_len: int,
         val_ratio: float,
@@ -75,10 +76,9 @@ class DistillationPipeline():
         self.device = device if device else get_device()
         self.lr_scheduler = lr_scheduler
         self.lr_scheduler_kwargs = lr_scheduler_kwargs or {}
+        self.max_grad_norm = max_grad_norm
         self._overrides = _overrides or {}
         
-
-
         # Initialize distributed training if multi_gpu is enabled
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.rank = int(os.environ.get("RANK", 0))
@@ -123,6 +123,7 @@ class DistillationPipeline():
             "device": self.device,
             "lr_scheduler": self.lr_scheduler,
             "lr_scheduler_kwargs": self.lr_scheduler_kwargs,
+            "max_grad_norm": self.max_grad_norm,
         }
         
         run_name, output_dir, is_resuming = session_manager.setup_session(distill_pipeline_config)
@@ -195,6 +196,7 @@ class DistillationPipeline():
             "remove_unused_columns": False,
             "label_names": ["teacher_embeddings"],
             "gradient_accumulation_steps": 1,
+            "max_grad_norm": self.max_grad_norm,
         }
 
         if self.multi_gpu:
