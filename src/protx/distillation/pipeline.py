@@ -173,7 +173,7 @@ class DistillationPipeline():
         logger.info(f"  Training samples: {int(self.max_seqs_num * (1 - self.val_ratio))}")
 
         # Reduce evaluation frequency for HDD to minimize I/O overhead
-        eval_steps = max(1, int(num_training_steps*0.001))  # 1% of training steps
+        eval_steps = max(1, int(num_training_steps*0.01))  # 1% of training steps
         save_steps = eval_steps * 5  # Save every 2 evaluations (~5% of training)
 
         trainer_dict = {
