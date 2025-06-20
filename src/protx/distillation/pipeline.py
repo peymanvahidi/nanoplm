@@ -173,14 +173,14 @@ class DistillationPipeline():
         logger.info(f"  Training samples: {int(self.max_seqs_num * (1 - self.val_ratio))}")
 
         # Reduce evaluation frequency for HDD to minimize I/O overhead
-        eval_steps = max(1, int(num_training_steps*0.01))  # 1% of training steps
+        eval_steps = max(1, int(num_training_steps*0.001))  # 1% of training steps
         save_steps = eval_steps * 5  # Save every 2 evaluations (~5% of training)
 
         trainer_dict = {
             "output_dir": str(output_dir),
             "num_train_epochs": self.num_epochs,
             "per_device_train_batch_size": self.batch_size,
-            "per_device_eval_batch_size": self.batch_size * 2,
+            "per_device_eval_batch_size": self.batch_size,
             "warmup_steps": int(num_training_steps*0.05),
             "learning_rate": self.max_lr,
             "logging_dir": str(output_dir / "logs"),
@@ -197,10 +197,11 @@ class DistillationPipeline():
             "label_names": ["teacher_embeddings"],
             "gradient_accumulation_steps": 1,
             "max_grad_norm": self.max_grad_norm,
+            "dataloader_pin_memory": True,
+            "dataloader_prefetch_factor": 4,
         }
 
         if self.multi_gpu:
-            trainer_dict["dataloader_pin_memory"] = True
             trainer_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
             trainer_dict["ddp_find_unused_parameters"] = False
 
