@@ -232,15 +232,18 @@ def shard_h5_file(
         for i in range(n_sharded_files)
     ]
     
-    logger.info(f"Starting to shard {input_path} into {n_sharded_files} files...")
+    # Get input file size for progress display
+    input_file_size_gb = input_path.stat().st_size / (1024 ** 3)
+    
+    logger.info(f"Starting to shard {input_path} ({input_file_size_gb:.1f} GB) into {n_sharded_files} files...")
     
     # Open input file and get total size
     with h5py.File(input_path, "r") as input_h5:
         total_sequences = len(input_h5.keys())
         sequences_per_shard = total_sequences // n_sharded_files
         
-        logger.info(f"Total sequences: {total_sequences}")
-        logger.info(f"Sequences per shard: {sequences_per_shard}")
+        logger.info(f"Total sequences: {total_sequences:,}")
+        logger.info(f"Sequences per shard: {sequences_per_shard:,}")
         
         # Create shard files
         shard_files = [h5py.File(path, "w") for path in shard_paths]
@@ -249,7 +252,16 @@ def shard_h5_file(
             current_shard_idx = 0
             current_shard_count = 0
             
-            with tqdm(total=total_sequences, desc="Sharding H5 file", unit="seq") as pbar:
+            # Enhanced progress bar with more information
+            with tqdm(
+                total=total_sequences, 
+                desc=f"Sharding {base_name}.h5",
+                unit="seq",
+                unit_scale=True,
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+                dynamic_ncols=True
+            ) as pbar:
+                
                 for seq_idx in range(total_sequences):
                     # Move to next shard if current one is full (except for last shard)
                     if (current_shard_count >= sequences_per_shard and 
@@ -269,6 +281,13 @@ def shard_h5_file(
                         )
                     
                     current_shard_count += 1
+                    
+                    # Update progress bar with additional info
+                    percentage = (seq_idx + 1) / total_sequences * 100
+                    pbar.set_postfix({
+                        'Shard': f"{current_shard_idx}/{n_sharded_files-1}",
+                        'Progress': f"{percentage:.1f}%"
+                    })
                     pbar.update(1)
         
         finally:
@@ -276,13 +295,17 @@ def shard_h5_file(
             for shard_file in shard_files:
                 shard_file.close()
     
-    # Log shard information
+    # Log shard information with progress summary
+    logger.info("Sharding completed! Summary:")
+    total_output_size_gb = 0
     for i, shard_path in enumerate(shard_paths):
         with h5py.File(shard_path, "r") as shard_file:
             shard_size = len(shard_file.keys())
-            file_size_mb = shard_path.stat().st_size / (1024 * 1024)
-            logger.info(f"Shard {i}: {shard_size} sequences, {file_size_mb:.1f} MB")
+            file_size_gb = shard_path.stat().st_size / (1024 ** 3)
+            total_output_size_gb += file_size_gb
+            logger.info(f"  Shard {i:2d}: {shard_size:8,} sequences, {file_size_gb:6.1f} GB")
     
+    logger.info(f"Total output size: {total_output_size_gb:.1f} GB")
     logger.info(f"Successfully created {len(shard_paths)} shard files")
     return shard_paths
 
