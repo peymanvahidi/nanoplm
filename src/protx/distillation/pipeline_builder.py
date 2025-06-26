@@ -98,7 +98,8 @@ class DistillationPipelineBuilder:
         wandb_dir: str,
         device: str,
         on_the_fly: bool,
-        multi_gpu: bool
+        multi_gpu: bool,
+        sharded: bool = False
     ):
         """Set experiment and infrastructure configuration."""
         self.config.update({
@@ -107,6 +108,7 @@ class DistillationPipelineBuilder:
             "device": device,
             "on_the_fly": on_the_fly,
             "multi_gpu": multi_gpu,
+            "sharded": sharded,
         })
         return self
     

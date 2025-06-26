@@ -52,6 +52,7 @@ class DistillationPipeline():
         device: str,
         lr_scheduler: str = "cosine",  # New parameter for scheduler type
         lr_scheduler_kwargs: dict = None,  # New parameter for scheduler kwargs
+        sharded: bool = False,  # New parameter for sharded data loading
         _overrides: dict = None,
     ):
         self.train_file = train_file
@@ -66,6 +67,7 @@ class DistillationPipeline():
         self.num_epochs = num_epochs
         self.batch_size = batch_size
         self.max_lr = max_lr
+        self.max_grad_norm = max_grad_norm
         self.max_seqs_num = max_seqs_num
         self.max_seq_len = max_seq_len
         self.val_ratio = val_ratio
@@ -73,17 +75,24 @@ class DistillationPipeline():
         self.project_name = project_name
         self.checkpoint_dir = checkpoint_dir
         self.wandb_dir = wandb_dir
-        self.device = device if device else get_device()
+        self.device = device
         self.lr_scheduler = lr_scheduler
         self.lr_scheduler_kwargs = lr_scheduler_kwargs or {}
-        self.max_grad_norm = max_grad_norm
+        self.sharded = sharded
         self._overrides = _overrides or {}
-        
-        # Initialize distributed training if multi_gpu is enabled
-        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        self.rank = int(os.environ.get("RANK", 0))
+
+        # Store original values for proper resumption
+        if not hasattr(self, '_original_lr'):
+            self._original_lr = self.max_lr
+
+        # Apply any overrides
+        for key, value in self._overrides.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
-        self.is_main_process = self.rank == 0
+        self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.is_main_process = self.local_rank == 0
 
     def train(self):
 
@@ -254,7 +263,8 @@ class DistillationPipeline():
         )
         
         logger.info(f"Starting training with Hugging Face Trainer. Output dir: {output_dir}")
-        wandb.config.update(training_args.to_dict())
+        if self.is_main_process:
+            wandb.config.update(training_args.to_dict())
         
         # When resuming with a new learning rate, we need to start with a fresh
         # optimizer and scheduler. The HF Trainer would otherwise load the old
@@ -293,6 +303,7 @@ class DistillationPipeline():
             trainer.log_metrics("eval", metrics)
             trainer.save_metrics("eval", metrics)
 
+        if self.is_main_process:
             wandb.finish()
             
             logger.info(f"Training complete!")
@@ -319,12 +330,14 @@ class DistillationPipeline():
             train_dataset = ProtXDataLoader(
                 h5_path=self.protx_train_prefix,
                 device=str(self.device),
-                seed=seed if seed is not None else int(time.time())
+                seed=seed if seed is not None else int(time.time()),
+                sharded=self.sharded
             )
             val_dataset = ProtXDataLoader(
                 h5_path=self.protx_val_prefix,
                 device=str(self.device),
-                seed=seed if seed is not None else int(time.time()) + 1
+                seed=seed if seed is not None else int(time.time()) + 1,
+                sharded=self.sharded
             )
         
         return train_dataset, val_dataset

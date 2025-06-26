@@ -312,6 +312,53 @@ def save_protx_dataset(
     )
     click.echo(f"ProtX dataset generation completed successfully. Output: {output_file}")
 
+@cli.command("shard-h5")
+@click.help_option('--help', '-h')
+@click.option(
+    '--input-file',
+    '-i',
+    required=True,
+    type=click.Path(exists=True),
+    help='Input H5 file to shard'
+)
+@click.option(
+    '--n-shards',
+    '-n',
+    required=True,
+    type=int,
+    help='Number of shard files to create'
+)
+@click.option(
+    '--output-dir',
+    '-o',
+    type=click.Path(exists=False),
+    default=None,
+    help='Output directory for shard files (defaults to same directory as input file)'
+)
+def shard_h5_cli(
+    input_file: str,
+    n_shards: int,
+    output_dir: str
+):
+    """Shard a large H5 file into smaller files for better performance.
+    
+    Example:
+        protx shard-h5 --input-file train.h5 --n-shards 33
+        
+    This will create train_shard_0.h5, train_shard_1.h5, ..., train_shard_32.h5
+    """
+    from .data.dataset import shard_h5_file
+    
+    shard_paths = shard_h5_file(
+        input_h5_path=input_file,
+        n_sharded_files=n_shards,
+        output_dir=output_dir
+    )
+    
+    click.echo(f"Successfully created {len(shard_paths)} shard files:")
+    for path in shard_paths:
+        click.echo(f"  {path}")
+
 @cli.command("train-student")
 @click.help_option('--help', '-h')
 @click.option(
@@ -393,7 +440,7 @@ def save_protx_dataset(
 @click.option(
     '--max-seqs-num',
     type=int,
-    default=1000000,
+    required=True,
     help='Maximum number of sequences to use for training'
 )
 @click.option(
@@ -451,6 +498,11 @@ def save_protx_dataset(
     help='JSON string of additional kwargs for the learning rate scheduler (optional). ' +
          'Example: \'{"num_cycles": 1.0, "power": 1.0}\' for cosine/polynomial schedulers'
 )
+@click.option(
+    '--sharded',
+    is_flag=True,
+    help='Whether to use sharded H5 files for data loading (improves performance with large files)'
+)
 def train_student(
     train_file: str,
     val_file: str,
@@ -475,6 +527,7 @@ def train_student(
     device: str,
     lr_scheduler: str,
     lr_scheduler_kwargs: str,
+    sharded: bool,
 ):
     """Train the student model"""
     # Parse lr_scheduler_kwargs if provided
@@ -520,6 +573,7 @@ def train_student(
                 device=device,
                 on_the_fly=on_the_fly,
                 multi_gpu=multi_gpu,
+                sharded=sharded,
             )
         .build()
     )

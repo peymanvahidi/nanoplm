@@ -202,24 +202,139 @@ class ProtXDataProcessor(Dataset):
             grp.create_dataset("attention_mask", data=seq_attention_mask.astype(np.int8))
             grp.create_dataset("teacher_embeddings", data=seq_teacher_embeddings.astype(np.float16))
 
+def shard_h5_file(
+    input_h5_path: Union[str, Path], 
+    n_sharded_files: int,
+    output_dir: Optional[Union[str, Path]] = None
+) -> List[Path]:
+    """
+    Split a large H5 file into smaller sharded files.
+    
+    Args:
+        input_h5_path: Path to the input H5 file to shard
+        n_sharded_files: Number of shard files to create
+        output_dir: Directory to save sharded files (defaults to same as input file)
+        
+    Returns:
+        List of paths to the created shard files
+    """
+    input_path = Path(input_h5_path)
+    if output_dir is None:
+        output_dir = input_path.parent
+    else:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate shard file names
+    base_name = input_path.stem  # e.g., "train" from "train.h5"
+    shard_paths = [
+        output_dir / f"{base_name}_shard_{i}.h5" 
+        for i in range(n_sharded_files)
+    ]
+    
+    logger.info(f"Starting to shard {input_path} into {n_sharded_files} files...")
+    
+    # Open input file and get total size
+    with h5py.File(input_path, "r") as input_h5:
+        total_sequences = len(input_h5.keys())
+        sequences_per_shard = total_sequences // n_sharded_files
+        
+        logger.info(f"Total sequences: {total_sequences}")
+        logger.info(f"Sequences per shard: {sequences_per_shard}")
+        
+        # Create shard files
+        shard_files = [h5py.File(path, "w") for path in shard_paths]
+        
+        try:
+            current_shard_idx = 0
+            current_shard_count = 0
+            
+            with tqdm(total=total_sequences, desc="Sharding H5 file", unit="seq") as pbar:
+                for seq_idx in range(total_sequences):
+                    # Move to next shard if current one is full (except for last shard)
+                    if (current_shard_count >= sequences_per_shard and 
+                        current_shard_idx < n_sharded_files - 1):
+                        current_shard_idx += 1
+                        current_shard_count = 0
+                    
+                    # Copy sequence data to current shard
+                    source_group = input_h5[str(seq_idx)]
+                    target_group = shard_files[current_shard_idx].create_group(str(current_shard_count))
+                    
+                    # Copy all datasets from source to target
+                    for dataset_name in source_group.keys():
+                        target_group.create_dataset(
+                            dataset_name, 
+                            data=source_group[dataset_name][:]
+                        )
+                    
+                    current_shard_count += 1
+                    pbar.update(1)
+        
+        finally:
+            # Close all shard files
+            for shard_file in shard_files:
+                shard_file.close()
+    
+    # Log shard information
+    for i, shard_path in enumerate(shard_paths):
+        with h5py.File(shard_path, "r") as shard_file:
+            shard_size = len(shard_file.keys())
+            file_size_mb = shard_path.stat().st_size / (1024 * 1024)
+            logger.info(f"Shard {i}: {shard_size} sequences, {file_size_mb:.1f} MB")
+    
+    logger.info(f"Successfully created {len(shard_paths)} shard files")
+    return shard_paths
+
 class ProtXDataLoader(Dataset):
     def __init__(
         self, 
         h5_path: Union[str, Path],
         device: str,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        sharded: bool = False
     ):
         self.h5_path = Path(h5_path)
         self.device = device
         self.seed = seed
+        self.sharded = sharded
         
-        self.h5f = h5py.File(self.h5_path, "r")
-        self.total_size = len(self.h5f.keys())
+        if self.sharded:
+            self._load_sharded_files()
+        else:
+            self.h5f = h5py.File(self.h5_path, "r")
+            self.total_size = len(self.h5f.keys())
         
         self.indices = list(range(self.total_size))
         
         if self.seed is not None:
             self._shuffle_indices()
+    
+    def _load_sharded_files(self):
+        """Load multiple shard files based on the base path"""
+        base_name = self.h5_path.stem
+        parent_dir = self.h5_path.parent
+        
+        # Find all shard files
+        shard_pattern = f"{base_name}_shard_*.h5"
+        shard_files = sorted(parent_dir.glob(shard_pattern))
+        
+        if not shard_files:
+            raise FileNotFoundError(f"No shard files found matching pattern: {parent_dir / shard_pattern}")
+        
+        logger.info(f"Found {len(shard_files)} shard files")
+        
+        # Open all shard files
+        self.shard_files = [h5py.File(shard_path, "r") for shard_path in shard_files]
+        
+        # Build cumulative index to map global index to (shard_idx, local_idx)
+        self.shard_sizes = [len(shard_file.keys()) for shard_file in self.shard_files]
+        self.cumulative_sizes = np.cumsum([0] + self.shard_sizes)
+        self.total_size = sum(self.shard_sizes)
+        
+        logger.info(f"Total sequences across shards: {self.total_size}")
+        for i, size in enumerate(self.shard_sizes):
+            logger.info(f"Shard {i}: {size} sequences")
     
     def _shuffle_indices(self):
         """Shuffle the indices based on seed"""
@@ -234,7 +349,14 @@ class ProtXDataLoader(Dataset):
             raise IndexError(f"Index {idx} out of range for dataset of size {self.total_size}")
         
         actual_idx = self.indices[idx]
-        grp = self.h5f[str(actual_idx)]
+        
+        if self.sharded:
+            # Find which shard contains this index
+            shard_idx = np.searchsorted(self.cumulative_sizes[1:], actual_idx, side='right')
+            local_idx = actual_idx - self.cumulative_sizes[shard_idx]
+            grp = self.shard_files[shard_idx][str(local_idx)]
+        else:
+            grp = self.h5f[str(actual_idx)]
         
         input_ids = torch.tensor(grp["input_ids"][:], dtype=torch.long)
         attention_mask = torch.tensor(grp["attention_mask"][:], dtype=torch.long)
@@ -248,5 +370,8 @@ class ProtXDataLoader(Dataset):
     
     def __del__(self):
         """Clean up file handles"""
-        if hasattr(self, 'h5f'):
+        if self.sharded and hasattr(self, 'shard_files'):
+            for shard_file in self.shard_files:
+                shard_file.close()
+        elif hasattr(self, 'h5f'):
             self.h5f.close()
