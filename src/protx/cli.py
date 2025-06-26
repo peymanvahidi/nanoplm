@@ -335,15 +335,27 @@ def save_protx_dataset(
     default=None,
     help='Output directory for shard files (defaults to same directory as input file)'
 )
+@click.option(
+    '--total-sequences',
+    '-t',
+    type=int,
+    default=None,
+    help='Total number of sequences (if known, skips counting for faster start)'
+)
 def shard_h5_cli(
     input_file: str,
     n_shards: int,
-    output_dir: str
+    output_dir: str,
+    total_sequences: int
 ):
     """Shard a large H5 file into smaller files for better performance.
     
-    Example:
+    Examples:
+        # Basic sharding (will count sequences first)
         protx shard-h5 --input-file train.h5 --n-shards 33
+        
+        # Fast sharding (skips counting if you know the sequence count)
+        protx shard-h5 --input-file train.h5 --n-shards 33 --total-sequences 12500000
         
     This will create train_shard_0.h5, train_shard_1.h5, ..., train_shard_32.h5
     """
@@ -352,7 +364,8 @@ def shard_h5_cli(
     shard_paths = shard_h5_file(
         input_h5_path=input_file,
         n_sharded_files=n_shards,
-        output_dir=output_dir
+        output_dir=output_dir,
+        total_sequences=total_sequences
     )
     
     click.echo(f"Successfully created {len(shard_paths)} shard files:")

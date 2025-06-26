@@ -80,7 +80,7 @@ class DistillationPipeline():
         self.lr_scheduler_kwargs = lr_scheduler_kwargs or {}
         self.sharded = sharded
         self._overrides = _overrides or {}
-
+        
         # Store original values for proper resumption
         if not hasattr(self, '_original_lr'):
             self._original_lr = self.max_lr

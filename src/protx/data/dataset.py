@@ -205,7 +205,8 @@ class ProtXDataProcessor(Dataset):
 def shard_h5_file(
     input_h5_path: Union[str, Path], 
     n_sharded_files: int,
-    output_dir: Optional[Union[str, Path]] = None
+    output_dir: Optional[Union[str, Path]] = None,
+    total_sequences: Optional[int] = None
 ) -> List[Path]:
     """
     Split a large H5 file into smaller sharded files.
@@ -214,6 +215,7 @@ def shard_h5_file(
         input_h5_path: Path to the input H5 file to shard
         n_sharded_files: Number of shard files to create
         output_dir: Directory to save sharded files (defaults to same as input file)
+        total_sequences: Total number of sequences (if known, skips counting)
         
     Returns:
         List of paths to the created shard files
@@ -239,10 +241,15 @@ def shard_h5_file(
     
     # Open input file and get total size
     with h5py.File(input_path, "r") as input_h5:
-        total_sequences = len(input_h5.keys())
-        sequences_per_shard = total_sequences // n_sharded_files
+        if total_sequences is not None:
+            logger.info(f"Using provided sequence count: {total_sequences:,}")
+            sequences_count = total_sequences
+        else:
+            logger.info("Counting sequences in H5 file (this may take a while for large files)...")
+            sequences_count = len(input_h5.keys())
+            logger.info(f"Total sequences: {sequences_count:,}")
         
-        logger.info(f"Total sequences: {total_sequences:,}")
+        sequences_per_shard = sequences_count // n_sharded_files
         logger.info(f"Sequences per shard: {sequences_per_shard:,}")
         
         # Create shard files
@@ -254,7 +261,7 @@ def shard_h5_file(
             
             # Enhanced progress bar with more information
             with tqdm(
-                total=total_sequences, 
+                total=sequences_count, 
                 desc=f"Sharding {base_name}.h5",
                 unit="seq",
                 unit_scale=True,
@@ -262,7 +269,7 @@ def shard_h5_file(
                 dynamic_ncols=True
             ) as pbar:
                 
-                for seq_idx in range(total_sequences):
+                for seq_idx in range(sequences_count):
                     # Move to next shard if current one is full (except for last shard)
                     if (current_shard_count >= sequences_per_shard and 
                         current_shard_idx < n_sharded_files - 1):
@@ -283,7 +290,7 @@ def shard_h5_file(
                     current_shard_count += 1
                     
                     # Update progress bar with additional info
-                    percentage = (seq_idx + 1) / total_sequences * 100
+                    percentage = (seq_idx + 1) / sequences_count * 100
                     pbar.set_postfix({
                         'Shard': f"{current_shard_idx}/{n_sharded_files-1}",
                         'Progress': f"{percentage:.1f}%"
