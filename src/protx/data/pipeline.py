@@ -94,7 +94,7 @@ class DataPipeline:
             logger.error(f"Filter & Split failed: {e}")
             raise
 
-    def save_protx_train_dataset(self):
+    def save_protx_train_dataset(self, n_files: int = 1):
         """Save training dataset - same logic as CLI save-protx-dataset command"""
         protx_train_data = ProtXDataProcessor(
             data_path=self.config.train_file,
@@ -102,22 +102,30 @@ class DataPipeline:
             max_seq_len=self.config.max_seq_len,
             batch_size=self.config.embed_calc_batch_size,
             device=get_device(),
-            skip_n=0
+            skip_n=0,
+            n_files=n_files
         )
 
         try:
             log_stage("ProtX Training Data Gen")
-            train_files = protx_train_data.process_dataset(
+            result = protx_train_data.process_dataset(
                 save_path=Path(self.config.protx_train_prefix)
             )
-            logger.info(f"Created {len(train_files)} training dataset files")
+            
+            if n_files > 1:
+                train_files = result
+                logger.info(f"Created {len(train_files)} training dataset shard files")
+            else:
+                train_files = [result] if result else []
+                logger.info(f"Created training dataset file: {result}")
+            
             return train_files
         except Exception as e:
             logger.error(f"Save ProtX Train Dataset failed: {e}")
             raise
     
 
-    def save_protx_val_dataset(self):
+    def save_protx_val_dataset(self, n_files: int = 1):
         """Save validation dataset - same logic as CLI save-protx-dataset command"""
         protx_val_data = ProtXDataProcessor(
             data_path=self.config.val_file,
@@ -125,27 +133,35 @@ class DataPipeline:
             max_seq_len=self.config.max_seq_len,
             batch_size=self.config.embed_calc_batch_size,
             device=get_device(),
-            skip_n=0
+            skip_n=0,
+            n_files=n_files
         )
         
         try:
             log_stage("ProtX Validation Data Gen")
-            val_files = protx_val_data.process_dataset(
+            result = protx_val_data.process_dataset(
                 save_path=Path(self.config.protx_val_prefix)
             )
-            logger.info(f"Created {len(val_files)} validation dataset files")
+            
+            if n_files > 1:
+                val_files = result
+                logger.info(f"Created {len(val_files)} validation dataset shard files")
+            else:
+                val_files = [result] if result else []
+                logger.info(f"Created validation dataset file: {result}")
+            
             return val_files
         except Exception as e:
             logger.error(f"Save ProtX Val Dataset failed: {e}")
             raise
     
-    def run_all(self, save_protx_dataset=False):
+    def run_all(self, save_protx_dataset=False, n_files: int = 1):
         """Run the complete pipeline - equivalent to running all CLI commands in sequence"""
         self.download()
         self.extract()
         self.shuffle_fasta()
         self.filter_split()
         if save_protx_dataset:
-            self.save_protx_train_dataset()
-            self.save_protx_val_dataset()
+            self.save_protx_train_dataset(n_files=n_files)
+            self.save_protx_val_dataset(n_files=n_files)
         logger.info("Complete pipeline execution finished!")

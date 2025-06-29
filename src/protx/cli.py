@@ -283,6 +283,12 @@ def filter_split_data(
     type=int,
     help='Number of sequences to skip from the beginning of the input FASTA file before processing'
 )
+@click.option(
+    '--n-files',
+    default=1,
+    type=int,
+    help='Number of shard files to create (1 for single file, >1 for sharded files). Compatible with --sharded flag in training.'
+)
 def save_protx_dataset(
     input_file: str,
     teacher_model: str,
@@ -290,7 +296,8 @@ def save_protx_dataset(
     max_seq_len: int, 
     batch_size: int, 
     device: str,
-    skip_n: int
+    skip_n: int,
+    n_files: int
 ):
     """Generate ProtX datasets with teacher embeddings"""
     if teacher_model == "prott5":
@@ -305,12 +312,19 @@ def save_protx_dataset(
         max_seq_len=max_seq_len,
         batch_size=batch_size,
         device=device,
-        skip_n=skip_n
+        skip_n=skip_n,
+        n_files=n_files
     )
-    protx_data.process_dataset(
+    result = protx_data.process_dataset(
         save_path=Path(output_file)
     )
-    click.echo(f"ProtX dataset generation completed successfully. Output: {output_file}")
+    
+    if n_files > 1:
+        click.echo(f"ProtX dataset generation completed successfully. Created {len(result)} shard files:")
+        for path in result:
+            click.echo(f"  {path}")
+    else:
+        click.echo(f"ProtX dataset generation completed successfully. Output: {result}")
 
 @cli.command("shard-h5")
 @click.help_option('--help', '-h')
@@ -516,6 +530,35 @@ def shard_h5_cli(
     is_flag=True,
     help='Whether to use sharded H5 files for data loading (improves performance with large files)'
 )
+@click.option(
+    '--use-optimized-loader',
+    is_flag=True,
+    default=True,
+    help='Use optimized data loader for better performance with large datasets (default: enabled)'
+)
+@click.option(
+    '--max-open-files',
+    type=int,
+    default=5,
+    help='Maximum number of H5 files to keep open simultaneously (memory vs performance trade-off)'
+)
+@click.option(
+    '--chunk-size',
+    type=int,
+    default=32,
+    help='Number of samples to read per chunk for better I/O efficiency'
+)
+@click.option(
+    '--prefetch-batches',
+    type=int,
+    default=2,
+    help='Number of batches to prefetch in background for smoother data loading'
+)
+@click.option(
+    '--no-threading',
+    is_flag=True,
+    help='Disable threading for I/O operations (use if experiencing threading issues)'
+)
 def train_student(
     train_file: str,
     val_file: str,
@@ -541,6 +584,11 @@ def train_student(
     lr_scheduler: str,
     lr_scheduler_kwargs: str,
     sharded: bool,
+    use_optimized_loader: bool,
+    max_open_files: int,
+    chunk_size: int,
+    prefetch_batches: int,
+    no_threading: bool,
 ):
     """Train the student model"""
     # Parse lr_scheduler_kwargs if provided
@@ -587,6 +635,11 @@ def train_student(
                 on_the_fly=on_the_fly,
                 multi_gpu=multi_gpu,
                 sharded=sharded,
+                use_optimized_loader=use_optimized_loader,
+                max_open_files=max_open_files,
+                chunk_size=chunk_size,
+                prefetch_batches=prefetch_batches,
+                use_threading=not no_threading,
             )
         .build()
     )

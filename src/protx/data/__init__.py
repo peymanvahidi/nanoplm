@@ -1,5 +1,9 @@
 from .pipeline import DataPipeline
+from .dataset import ProtXDataLoader, ProtXDataLoaderOptimized, ProtXDataProcessor
 
 __all__ = [
-    "DataPipeline"
+    "DataPipeline",
+    "ProtXDataLoader", 
+    "ProtXDataLoaderOptimized",
+    "ProtXDataProcessor"
 ]

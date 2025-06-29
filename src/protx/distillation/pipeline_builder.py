@@ -99,7 +99,12 @@ class DistillationPipelineBuilder:
         device: str,
         on_the_fly: bool,
         multi_gpu: bool,
-        sharded: bool = False
+        sharded: bool = False,
+        use_optimized_loader: bool = True,
+        max_open_files: int = 5,
+        chunk_size: int = 32,
+        prefetch_batches: int = 2,
+        use_threading: bool = True
     ):
         """Set experiment and infrastructure configuration."""
         self.config.update({
@@ -109,6 +114,11 @@ class DistillationPipelineBuilder:
             "on_the_fly": on_the_fly,
             "multi_gpu": multi_gpu,
             "sharded": sharded,
+            "use_optimized_loader": use_optimized_loader,
+            "max_open_files": max_open_files,
+            "chunk_size": chunk_size,
+            "prefetch_batches": prefetch_batches,
+            "use_threading": use_threading,
         })
         return self
     

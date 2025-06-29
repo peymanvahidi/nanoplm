@@ -23,7 +23,7 @@ from .session_manager import TrainingSessionManager
 from ..models.student import ProtX
 from ..models.teacher import ProtT5
 
-from ..data.dataset import ProtXDataGen, ProtXDataLoader
+from ..data.dataset import ProtXDataGen, ProtXDataLoader, ProtXDataLoaderOptimized
 from ..utils import get_device, logger
 
 class DistillationPipeline():
@@ -53,6 +53,11 @@ class DistillationPipeline():
         lr_scheduler: str = "cosine",  # New parameter for scheduler type
         lr_scheduler_kwargs: dict = None,  # New parameter for scheduler kwargs
         sharded: bool = False,  # New parameter for sharded data loading
+        use_optimized_loader: bool = True,  # NEW: Use optimized data loader
+        max_open_files: int = 5,  # NEW: Max open H5 files in cache
+        chunk_size: int = 32,  # NEW: Samples to read per chunk
+        prefetch_batches: int = 2,  # NEW: Background prefetch batches
+        use_threading: bool = True,  # NEW: Enable threading for I/O
         _overrides: dict = None,
     ):
         self.train_file = train_file
@@ -79,6 +84,11 @@ class DistillationPipeline():
         self.lr_scheduler = lr_scheduler
         self.lr_scheduler_kwargs = lr_scheduler_kwargs or {}
         self.sharded = sharded
+        self.use_optimized_loader = use_optimized_loader
+        self.max_open_files = max_open_files
+        self.chunk_size = chunk_size
+        self.prefetch_batches = prefetch_batches
+        self.use_threading = use_threading
         self._overrides = _overrides or {}
         
         # Store original values for proper resumption
@@ -206,8 +216,8 @@ class DistillationPipeline():
             "label_names": ["teacher_embeddings"],
             "gradient_accumulation_steps": 1,
             "max_grad_norm": self.max_grad_norm,
-            "dataloader_pin_memory": True,
-            "dataloader_prefetch_factor": 4,
+            # "dataloader_pin_memory": True,
+            # "dataloader_prefetch_factor": 4,
         }
 
         if self.multi_gpu:
@@ -327,18 +337,42 @@ class DistillationPipeline():
                 device=str(self.device)
             )
         else:
-            train_dataset = ProtXDataLoader(
-                h5_path=self.protx_train_prefix,
-                device=str(self.device),
-                seed=seed if seed is not None else int(time.time()),
-                sharded=self.sharded
-            )
-            val_dataset = ProtXDataLoader(
-                h5_path=self.protx_val_prefix,
-                device=str(self.device),
-                seed=seed if seed is not None else int(time.time()) + 1,
-                sharded=self.sharded
-            )
+            if self.use_optimized_loader:
+                logger.info("Using ProtXDataLoaderOptimized for better performance")
+                train_dataset = ProtXDataLoaderOptimized(
+                    h5_path=self.protx_train_prefix,
+                    device=str(self.device),
+                    seed=seed if seed is not None else int(time.time()),
+                    sharded=self.sharded,
+                    max_open_files=self.max_open_files,
+                    chunk_size=self.chunk_size,
+                    prefetch_batches=self.prefetch_batches,
+                    use_threading=self.use_threading
+                )
+                val_dataset = ProtXDataLoaderOptimized(
+                    h5_path=self.protx_val_prefix,
+                    device=str(self.device),
+                    seed=seed if seed is not None else int(time.time()) + 1,
+                    sharded=self.sharded,
+                    max_open_files=self.max_open_files,
+                    chunk_size=self.chunk_size,
+                    prefetch_batches=self.prefetch_batches,
+                    use_threading=self.use_threading
+                )
+            else:
+                logger.info("Using standard ProtXDataLoader")
+                train_dataset = ProtXDataLoader(
+                    h5_path=self.protx_train_prefix,
+                    device=str(self.device),
+                    seed=seed if seed is not None else int(time.time()),
+                    sharded=self.sharded
+                )
+                val_dataset = ProtXDataLoader(
+                    h5_path=self.protx_val_prefix,
+                    device=str(self.device),
+                    seed=seed if seed is not None else int(time.time()) + 1,
+                    sharded=self.sharded
+                )
         
         return train_dataset, val_dataset
 
