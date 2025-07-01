@@ -216,8 +216,8 @@ class DistillationPipeline():
             "label_names": ["teacher_embeddings"],
             "gradient_accumulation_steps": 1,
             "max_grad_norm": self.max_grad_norm,
-            # "dataloader_pin_memory": True,
-            # "dataloader_prefetch_factor": 4,
+            "dataloader_pin_memory": True,
+            "dataloader_prefetch_factor": 2,
         }
 
         if self.multi_gpu:
