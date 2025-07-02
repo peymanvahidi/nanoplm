@@ -69,17 +69,19 @@ class ProtX(nn.Module):
                 attentions=student_out.attentions
             )
 
+    @staticmethod
     def load_and_generate_embeddings(
-        self,
         checkpoint_path: str,
         sequences: Union[List[str], Iterator[str]],
         batch_size: int = 32,
         max_length: int = 512,
         device: str = "cuda",
-        per_seq_embeddings: bool = True  # True for pooled, False for per-token
+        per_seq_embeddings: bool = True,  # True for pooled, False for per-token
+        mlp_activation: str = "swiglu"
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """
         Load model from checkpoint and generate embeddings for sequences.
+        Automatically detects model architecture from checkpoint.
         
         Args:
             checkpoint_path: Path to the model.safetensors file
@@ -89,24 +91,41 @@ class ProtX(nn.Module):
             device: Device to run inference on
             per_seq_embeddings: If True, return pooled sequence-level embeddings [embed_dim].
                                If False, return per-token embeddings [sequence_length, embed_dim]
+            mlp_activation: MLP activation function ("swiglu" or others)
             
         Yields:
             Tuple of (sequence, embedding_tensor) for each input sequence
             - If per_seq_embeddings=True: embedding shape is [embed_dim]
             - If per_seq_embeddings=False: embedding shape is [sequence_length, embed_dim] 
         """
+        # Automatically detect model architecture from checkpoint
+        try:
+            embed_dim, num_layers, num_heads = ProtX.inspect_checkpoint_architecture(checkpoint_path)
+            print(f"Detected architecture: embed_dim={embed_dim}, num_layers={num_layers}, num_heads={num_heads}")
+        except Exception as e:
+            print(f"Error detecting architecture: {e}")
+            return
+        
+        # Create model instance with detected architecture
+        model = ProtX(
+            embed_dim=embed_dim,
+            num_layers=num_layers, 
+            num_heads=num_heads,
+            mlp_activation=mlp_activation
+        )
+        
         # Load the checkpoint
         try:
             state_dict = load_file(checkpoint_path)
-            self.load_state_dict(state_dict, strict=False)
+            model.load_state_dict(state_dict, strict=False)
             print(f"Successfully loaded checkpoint from {checkpoint_path}")
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             return
         
         # Move model to device and set to eval mode
-        self.to(device)
-        self.eval()
+        model.to(device)
+        model.eval()
         
         # Convert sequences to list if it's an iterator
         if not isinstance(sequences, list):
@@ -118,7 +137,7 @@ class ProtX(nn.Module):
                 batch_sequences = sequences[i:i + batch_size]
                 
                 # Tokenize the batch
-                tokenized = self.tokenizer.batch_encode_plus(
+                tokenized = model.tokenizer.batch_encode_plus(
                     batch_sequences,
                     padding=True,
                     truncation=True,
@@ -131,7 +150,7 @@ class ProtX(nn.Module):
                 attention_mask = tokenized["attention_mask"].to(device)
                 
                 # Generate embeddings
-                outputs = self.forward(
+                outputs = model.forward(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     training_mode=False
@@ -157,6 +176,109 @@ class ProtX(nn.Module):
                         # Get actual sequence length (excluding padding)
                         actual_length = seq_mask.sum().item()
                         yield seq, seq_embeddings[:actual_length].cpu()
+    
+    @staticmethod
+    def inspect_checkpoint_architecture(checkpoint_path: str) -> Tuple[int, int, int]:
+        """
+        Inspect model architecture from safetensors checkpoint file.
+        
+        Args:
+            checkpoint_path: Path to the model.safetensors file
+            
+        Returns:
+            Tuple of (embed_dim, num_layers, num_heads)
+            
+        Raises:
+            ValueError: If architecture cannot be determined from checkpoint
+            FileNotFoundError: If checkpoint file doesn't exist
+        """
+        try:
+            # Load the state dict
+            state_dict = load_file(checkpoint_path)
+        except Exception as e:
+            raise FileNotFoundError(f"Error loading checkpoint from {checkpoint_path}: {e}")
+        
+        # Extract architecture information from parameter shapes
+        embed_dim = None
+        num_layers = 0
+        num_heads = None
+        
+        # Find embed_dim from various possible parameters
+        for key, tensor in state_dict.items():
+            if 'embeddings.tok_embeddings.weight' in key:
+                vocab_size, embed_dim = tensor.shape
+                break
+            elif 'model.layers.0.attn.Wo.weight' in key:
+                embed_dim, _ = tensor.shape
+                break
+            elif 'model.layers.0.mlp.Wi.weight' in key:
+                _, embed_dim = tensor.shape
+                break
+        
+        if embed_dim is None:
+            raise ValueError("Could not determine embed_dim from checkpoint")
+        
+        # Count number of layers by looking for layer-specific parameters
+        layer_indices = set()
+        for key in state_dict.keys():
+            if 'model.layers.' in key:
+                # Extract layer number from key like "model.layers.0.attn.Wo.weight"
+                parts = key.split('.')
+                for i, part in enumerate(parts):
+                    if part == 'layers' and i + 1 < len(parts):
+                        try:
+                            layer_idx = int(parts[i + 1])
+                            layer_indices.add(layer_idx)
+                        except ValueError:
+                            continue
+        
+        num_layers = len(layer_indices)
+        
+        if num_layers == 0:
+            raise ValueError("Could not determine num_layers from checkpoint")
+        
+        # Find number of attention heads from Wqkv matrix
+        for key, tensor in state_dict.items():
+            if 'model.layers.0.attn.Wqkv.weight' in key:
+                # Wqkv weight shape is [3 * embed_dim, embed_dim] for combined Q,K,V
+                qkv_dim, model_dim = tensor.shape
+                
+                if qkv_dim == 3 * embed_dim:
+                    # Standard multi-head attention patterns
+                    if embed_dim % 64 == 0:
+                        num_heads = embed_dim // 64  # head_dim = 64
+                    elif embed_dim % 32 == 0:
+                        num_heads = embed_dim // 32  # head_dim = 32
+                    elif embed_dim % 128 == 0:
+                        num_heads = embed_dim // 128  # head_dim = 128
+                    else:
+                        # Try common head counts
+                        for possible_heads in [8, 12, 16, 20, 24, 32]:
+                            if embed_dim % possible_heads == 0:
+                                num_heads = possible_heads
+                                break
+                break
+        
+        # Alternative: look for separate Q,K,V or other attention patterns
+        if num_heads is None:
+            for key, tensor in state_dict.items():
+                if 'query' in key.lower() and 'weight' in key and 'layers.0' in key:
+                    # If we find separate query weights, analyze them
+                    if len(tensor.shape) == 2:
+                        out_dim, in_dim = tensor.shape
+                        if in_dim == embed_dim:
+                            # num_heads = out_dim / head_dim, try standard head dimensions
+                            for head_dim in [32, 64, 128]:
+                                if out_dim % head_dim == 0:
+                                    num_heads = out_dim // head_dim
+                                    break
+                    break
+        
+        if num_heads is None:
+            raise ValueError("Could not determine num_heads from checkpoint")
+        
+        return embed_dim, num_layers, num_heads
+
 
 class SwiGLU(nn.Module):
     def forward(self, x, gate):
