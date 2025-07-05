@@ -202,6 +202,10 @@ class ProtX(nn.Module):
         except Exception as e:
             raise FileNotFoundError(f"Error loading checkpoint from {checkpoint_path}: {e}")
         
+        # Calculate total number of parameters
+        total_params = sum(tensor.numel() for tensor in state_dict.values())
+        print(f"Total number of parameters: {total_params:,}")
+        
         # Extract architecture information from parameter shapes
         embed_dim = None
         num_layers = 0
