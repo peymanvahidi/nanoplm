@@ -161,8 +161,12 @@ class ProtX(nn.Module):
                 
                 if per_seq_embeddings:
                     # Return pooled sequence-level embeddings (mean pooling)
-                    mask_expanded = attention_mask.unsqueeze(-1).expand(embeddings.size()).float()
-                    masked_embeddings = embeddings * mask_expanded
+                    # Exclude EOS token by removing the last position from embeddings and mask
+                    embeddings_no_eos = embeddings[:, :-1, :]  # Remove last token (EOS)
+                    mask_no_eos = attention_mask[:, :-1]  # Remove last position from mask
+                    
+                    mask_expanded = mask_no_eos.unsqueeze(-1).expand(embeddings_no_eos.size()).float()
+                    masked_embeddings = embeddings_no_eos * mask_expanded
                     summed = torch.sum(masked_embeddings, dim=1)
                     summed_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
                     mean_pooled = summed / summed_mask
@@ -171,10 +175,10 @@ class ProtX(nn.Module):
                     for j, (seq, embedding) in enumerate(zip(batch_sequences, mean_pooled)):
                         yield seq, embedding.cpu()
                 else:
-                    # Return per-token embeddings (remove padding)
+                    # Return per-token embeddings (remove padding and EOS token)
                     for j, (seq, seq_embeddings, seq_mask) in enumerate(zip(batch_sequences, embeddings, attention_mask)):
-                        # Get actual sequence length (excluding padding)
-                        actual_length = seq_mask.sum().item()
+                        # Get actual sequence length (excluding padding and EOS)
+                        actual_length = seq_mask.sum().item() - 1  # Subtract 1 for EOS token
                         yield seq, seq_embeddings[:actual_length].cpu()
     
     @staticmethod
