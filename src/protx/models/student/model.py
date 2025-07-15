@@ -34,7 +34,7 @@ class ProtX(nn.Module):
         self.config = ModernBertConfig(
             vocab_size=self.tokenizer.vocab_size,
             hidden_size=embed_dim,
-            intermediate_size=embed_dim * 8,
+            intermediate_size=embed_dim * 2,
             num_hidden_layers=num_layers,
             num_attention_heads=num_heads,
             pad_token_id=self.tokenizer.pad_token_id,
