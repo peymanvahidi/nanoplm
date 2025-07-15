@@ -11,6 +11,7 @@ from transformers.models.t5.modeling_t5 import T5LayerNorm
 from typing import Iterator, Union, List, Generator, Tuple
 
 from .tokenizer import ProtXTokenizer
+from .feature_embedding import FeatureEmbedding
 
 class ProtX(nn.Module):
     """Student model for ProtX"""
@@ -21,15 +22,19 @@ class ProtX(nn.Module):
         num_layers: int,
         num_heads: int,
         mlp_activation: str = "swiglu",
+        use_feature_embedding: bool = True,
+        feature_window_size: int = 5,
     ):
         super().__init__()
 
         self.tokenizer = ProtXTokenizer()
+        self.use_feature_embedding = use_feature_embedding
+        self.feature_window_size = feature_window_size
 
         self.config = ModernBertConfig(
             vocab_size=self.tokenizer.vocab_size,
             hidden_size=embed_dim,
-            intermediate_size=embed_dim * 2,
+            intermediate_size=embed_dim * 8,
             num_hidden_layers=num_layers,
             num_attention_heads=num_heads,
             pad_token_id=self.tokenizer.pad_token_id,
@@ -41,6 +46,17 @@ class ProtX(nn.Module):
         )
 
         self.model = ModernBertModel(self.config)
+        
+        # Replace standard embeddings with feature embeddings if enabled
+        if self.use_feature_embedding:
+            self.feature_embedding = FeatureEmbedding(
+                vocab_size=self.tokenizer.vocab_size,
+                embed_dim=embed_dim,
+                window_size=feature_window_size,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                unk_token_id=2  # Standard unk token ID
+            )
 
         if mlp_activation.lower() == "swiglu":
             for layer in self.model.layers:
@@ -50,7 +66,35 @@ class ProtX(nn.Module):
         self.proj_norm = T5LayerNorm(1024)
 
     def forward(self, input_ids, attention_mask, training_mode = False, teacher_embeddings=None):
-        student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        if self.use_feature_embedding:
+            # Clean approach: Replace embedding temporarily, let ModernBERT handle the rest
+            original_embedding = self.model.embeddings.tok_embeddings
+            
+            # Create a simple wrapper that returns our feature embeddings
+            class TempEmbedding(nn.Module):
+                def __init__(self, feature_embedding):
+                    super().__init__()
+                    self.feature_embedding = feature_embedding
+                    # Copy properties that ModernBERT might check
+                    self.num_embeddings = feature_embedding.vocab_size
+                    self.embedding_dim = feature_embedding.embed_dim
+                    
+                def forward(self, input_ids):
+                    # We need attention_mask from the outer scope
+                    return self.feature_embedding(input_ids, attention_mask)
+            
+            # Replace embedding temporarily
+            self.model.embeddings.tok_embeddings = TempEmbedding(self.feature_embedding)
+            
+            try:
+                # Let ModernBERT handle everything naturally
+                student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            finally:
+                # Always restore original embedding
+                self.model.embeddings.tok_embeddings = original_embedding
+        else:
+            # Use standard ModernBERT forward pass
+            student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
         
         if training_mode:
             projected_repr = self.proj(student_out.last_hidden_state)  # (batch_size, seq_len, 1024)
@@ -77,7 +121,9 @@ class ProtX(nn.Module):
         max_length: int = 512,
         device: str = "cuda",
         per_seq_embeddings: bool = True,  # True for pooled, False for per-token
-        mlp_activation: str = "swiglu"
+        mlp_activation: str = "swiglu",
+        use_feature_embedding: bool = False,
+        feature_window_size: int = 3
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """
         Load model from checkpoint and generate embeddings for sequences.
@@ -92,6 +138,8 @@ class ProtX(nn.Module):
             per_seq_embeddings: If True, return pooled sequence-level embeddings [embed_dim].
                                If False, return per-token embeddings [sequence_length, embed_dim]
             mlp_activation: MLP activation function ("swiglu" or others)
+            use_feature_embedding: If True, use enhanced feature embedding with hydropathy and charge
+            feature_window_size: Window size for sliding window feature computation
             
         Yields:
             Tuple of (sequence, embedding_tensor) for each input sequence
@@ -111,12 +159,36 @@ class ProtX(nn.Module):
             embed_dim=embed_dim,
             num_layers=num_layers, 
             num_heads=num_heads,
-            mlp_activation=mlp_activation
+            mlp_activation=mlp_activation,
+            use_feature_embedding=use_feature_embedding,
+            feature_window_size=feature_window_size
         )
         
         # Load the checkpoint
         try:
             state_dict = load_file(checkpoint_path)
+            
+            # Handle vocabulary size mismatch (e.g., pretrained model has mask token)
+            model_vocab_size = model.tokenizer.vocab_size
+            checkpoint_vocab_size = None
+            
+            # Find vocab size from checkpoint
+            for key, tensor in state_dict.items():
+                if 'embeddings.tok_embeddings.weight' in key:
+                    checkpoint_vocab_size = tensor.shape[0]
+                    break
+            
+            if checkpoint_vocab_size and checkpoint_vocab_size != model_vocab_size:
+                print(f"Vocabulary size mismatch: checkpoint has {checkpoint_vocab_size}, model expects {model_vocab_size}")
+                print("Adjusting checkpoint to match model vocabulary...")
+                
+                # Handle embedding layer
+                for key in list(state_dict.keys()):
+                    if 'embeddings.tok_embeddings.weight' in key:
+                        # Take only the tokens that exist in the model's vocabulary
+                        state_dict[key] = state_dict[key][:model_vocab_size]
+                        print(f"Adjusted {key} from [{checkpoint_vocab_size}, {embed_dim}] to [{model_vocab_size}, {embed_dim}]")
+            
             model.load_state_dict(state_dict, strict=False)
             print(f"Successfully loaded checkpoint from {checkpoint_path}")
         except Exception as e:
@@ -286,6 +358,154 @@ class ProtX(nn.Module):
             raise ValueError("Could not determine num_heads from checkpoint")
         
         return embed_dim, num_layers, num_heads
+
+    @staticmethod
+    def calculate_model_parameters(
+        embed_dim: int,
+        num_layers: int,
+        num_heads: int,
+        mlp_activation: str = "swiglu",
+        use_feature_embedding: bool = False,
+        feature_window_size: int = 3
+    ) -> int:
+        """
+        Calculate the total number of parameters for a ProtX model with given architecture.
+        
+        Args:
+            embed_dim: Hidden dimension size
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+            mlp_activation: MLP activation function ("swiglu" or others)
+            use_feature_embedding: Whether to use enhanced feature embedding
+            feature_window_size: Window size for feature computation
+            
+        Returns:
+            Total number of parameters
+        """
+        # Create a temporary model instance
+        model = ProtX(
+            embed_dim=embed_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            mlp_activation=mlp_activation,
+            use_feature_embedding=use_feature_embedding,
+            feature_window_size=feature_window_size
+        )
+        
+        # Count parameters
+        total_params = sum(p.numel() for p in model.parameters())
+        
+        return total_params
+    
+    @staticmethod
+    def print_parameter_breakdown(
+        embed_dim: int,
+        num_layers: int,
+        num_heads: int,
+        mlp_activation: str = "swiglu",
+        use_feature_embedding: bool = False,
+        feature_window_size: int = 3
+    ) -> None:
+        """
+        Print a detailed breakdown of parameters for a ProtX model.
+        
+        Args:
+            embed_dim: Hidden dimension size
+            num_layers: Number of transformer layers
+            num_heads: Number of attention heads
+            mlp_activation: MLP activation function ("swiglu" or others)
+            use_feature_embedding: Whether to use enhanced feature embedding
+            feature_window_size: Window size for feature computation
+        """
+        # Create a temporary model instance
+        model = ProtX(
+            embed_dim=embed_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            mlp_activation=mlp_activation,
+            use_feature_embedding=use_feature_embedding,
+            feature_window_size=feature_window_size
+        )
+        
+        print(f"ProtX Model Parameter Breakdown:")
+        print(f"Architecture: embed_dim={embed_dim}, num_layers={num_layers}, num_heads={num_heads}")
+        print(f"MLP activation: {mlp_activation}")
+        print(f"Feature embedding: {'Enabled' if use_feature_embedding else 'Disabled'}")
+        if use_feature_embedding:
+            print(f"Feature window size: {feature_window_size}")
+        print(f"Vocabulary size: {model.tokenizer.vocab_size}")
+        print("-" * 60)
+        
+        # Group parameters by component
+        component_params = {}
+        
+        for name, param in model.named_parameters():
+            param_count = param.numel()
+            
+            # Categorize parameters
+            if 'embeddings' in name or 'feature_embedding' in name:
+                component = 'Embeddings'
+            elif 'model.layers' in name:
+                layer_num = name.split('.')[2]  # Extract layer number
+                if 'attn' in name:
+                    component = f'Layer {layer_num} - Attention'
+                elif 'mlp' in name:
+                    component = f'Layer {layer_num} - MLP'
+                else:
+                    component = f'Layer {layer_num} - Other'
+            elif 'proj' in name and 'norm' not in name:
+                component = 'Final Projection'
+            elif 'proj_norm' in name:
+                component = 'Projection LayerNorm'
+            else:
+                component = 'Other'
+            
+            if component not in component_params:
+                component_params[component] = []
+            component_params[component].append((name, param_count))
+        
+        # Print breakdown by component
+        total_params = 0
+        for component, params in sorted(component_params.items()):
+            component_total = sum(count for _, count in params)
+            total_params += component_total
+            print(f"{component}: {component_total:,} parameters")
+            
+            # Show individual parameter details if requested
+            if len(params) <= 5:  # Show details for components with few parameters
+                for param_name, param_count in params:
+                    print(f"  {param_name}: {param_count:,}")
+            else:
+                # Group by type for layers with many parameters
+                param_types = {}
+                for param_name, param_count in params:
+                    param_type = param_name.split('.')[-1]  # Get the last part (weight/bias)
+                    if param_type not in param_types:
+                        param_types[param_type] = 0
+                    param_types[param_type] += param_count
+                
+                for param_type, count in param_types.items():
+                    print(f"  {param_type}: {count:,}")
+        
+        print("-" * 60)
+        print(f"Total parameters: {total_params:,}")
+        
+        # Size estimation
+        size_mb = total_params * 4 / (1024 * 1024)  # Assuming float32
+        size_gb = size_mb / 1024
+        print(f"Estimated model size (float32): {size_mb:.1f} MB ({size_gb:.2f} GB)")
+        
+        # Additional info
+        print(f"\nParameter distribution:")
+        embedding_params = sum(count for name, count in component_params.get('Embeddings', []))
+        layer_params = sum(count for component, params in component_params.items() 
+                          if 'Layer' in component for _, count in params)
+        output_params = sum(count for component, params in component_params.items() 
+                           if 'Projection' in component for _, count in params)
+        
+        print(f"  Embeddings: {embedding_params:,} ({embedding_params/total_params*100:.1f}%)")
+        print(f"  Transformer layers: {layer_params:,} ({layer_params/total_params*100:.1f}%)")
+        print(f"  Output projection: {output_params:,} ({output_params/total_params*100:.1f}%)")
 
 
 class SwiGLU(nn.Module):

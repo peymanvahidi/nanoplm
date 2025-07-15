@@ -87,3 +87,20 @@ class ProtXTokenizer(PreTrainedTokenizer):
         
         # For sequence pairs, first sequence is type 0, second is type 1
         return [0] * (len(token_ids_0) + 1) + [1] * (len(token_ids_1) + 1)
+
+    def save_vocabulary(self, save_directory, filename_prefix=None):
+        """
+        Save the tokenizer's vocabulary files. Required for checkpointing.
+        """
+        import os
+        import json
+        
+        if filename_prefix is not None:
+            vocab_file = os.path.join(save_directory, f"{filename_prefix}-vocab.json")
+        else:
+            vocab_file = os.path.join(save_directory, "vocab.json")
+        
+        with open(vocab_file, "w", encoding="utf-8") as f:
+            json.dump(self.vocab, f, ensure_ascii=False, indent=2)
+        
+        return (vocab_file,)
