@@ -23,7 +23,7 @@ class ProtX(nn.Module):
         num_heads: int,
         mlp_activation: str = "swiglu",
         use_feature_embedding: bool = True,
-        feature_window_size: int = 5,
+        feature_window_size: int = 15,
     ):
         super().__init__()
 
