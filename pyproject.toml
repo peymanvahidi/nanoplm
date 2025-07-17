@@ -30,3 +30,6 @@ dependencies = [
 
 [project.scripts]
 protx = "protx.cli:cli"
+
+[tool.setuptools.package-data]
+"protx.models.student" = ["*.csv"]
