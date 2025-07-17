@@ -1,12 +1,7 @@
-import random
 from Bio import SeqIO
 from tqdm import tqdm
 from pathlib import Path
-from io import StringIO
 from typing import Union
-import os
-import pickle
-import hashlib
 
 from ..utils import create_dirs, logger
 

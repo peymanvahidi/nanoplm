@@ -72,19 +72,20 @@ class ProtX(nn.Module):
             
             # Create a simple wrapper that returns our feature embeddings
             class TempEmbedding(nn.Module):
-                def __init__(self, feature_embedding):
+                def __init__(self, feature_embedding, attention_mask):
                     super().__init__()
                     self.feature_embedding = feature_embedding
+                    self.attention_mask = attention_mask
                     # Copy properties that ModernBERT might check
                     self.num_embeddings = feature_embedding.vocab_size
                     self.embedding_dim = feature_embedding.embed_dim
                     
                 def forward(self, input_ids):
-                    # We need attention_mask from the outer scope
-                    return self.feature_embedding(input_ids, attention_mask)
+                    # Use stored attention_mask
+                    return self.feature_embedding(input_ids, self.attention_mask)
             
             # Replace embedding temporarily
-            self.model.embeddings.tok_embeddings = TempEmbedding(self.feature_embedding)
+            self.model.embeddings.tok_embeddings = TempEmbedding(self.feature_embedding, attention_mask)
             
             try:
                 # Let ModernBERT handle everything naturally
