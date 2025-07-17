@@ -70,29 +70,37 @@ class ProtX(nn.Module):
             # Clean approach: Replace embedding temporarily, let ModernBERT handle the rest
             original_embedding = self.model.embeddings.tok_embeddings
             
+            # Store attention_mask as a temporary attribute for TempEmbedding to access
+            self._temp_attention_mask = attention_mask
+            
             # Create a simple wrapper that returns our feature embeddings
             class TempEmbedding(nn.Module):
-                def __init__(self, feature_embedding, attention_mask):
+                def __init__(self, parent_model, feature_embedding):
                     super().__init__()
+                    self.parent_model = parent_model
                     self.feature_embedding = feature_embedding
-                    self.attention_mask = attention_mask
                     # Copy properties that ModernBERT might check
                     self.num_embeddings = feature_embedding.vocab_size
                     self.embedding_dim = feature_embedding.embed_dim
                     
                 def forward(self, input_ids):
-                    # Use stored attention_mask
-                    return self.feature_embedding(input_ids, self.attention_mask)
+                    # Access attention_mask from parent model
+                    attention_mask = getattr(self.parent_model, '_temp_attention_mask', None)
+                    if attention_mask is None:
+                        raise RuntimeError("No attention_mask available in TempEmbedding")
+                    return self.feature_embedding(input_ids, attention_mask)
             
             # Replace embedding temporarily
-            self.model.embeddings.tok_embeddings = TempEmbedding(self.feature_embedding, attention_mask)
+            self.model.embeddings.tok_embeddings = TempEmbedding(self, self.feature_embedding)
             
             try:
                 # Let ModernBERT handle everything naturally
                 student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
             finally:
-                # Always restore original embedding
+                # Always restore original embedding and clean up temp attribute
                 self.model.embeddings.tok_embeddings = original_embedding
+                if hasattr(self, '_temp_attention_mask'):
+                    delattr(self, '_temp_attention_mask')
         else:
             # Use standard ModernBERT forward pass
             student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
