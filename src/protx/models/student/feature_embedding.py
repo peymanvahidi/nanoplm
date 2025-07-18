@@ -112,9 +112,27 @@ class FeatureEmbedding(nn.Module):
         Returns:
             pca_features: [batch_size, seq_len, 20] tensor of PCA feature values
         """
-        # Ensure we have proper 2D tensors
-        if input_ids.dim() != 2:
-            raise ValueError(f"Expected input_ids to have 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
+        # Handle input tensor dimensions - ModernBERT embedding layer passes 1D input_ids
+        if input_ids.dim() == 1:
+            # Convert 1D input_ids to 2D: [seq_len] -> [1, seq_len]
+            input_ids = input_ids.unsqueeze(0)
+            # For attention_mask, we need to slice it to match the sequence length
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    # Take only the portion that matches our input_ids length
+                    seq_len = input_ids.shape[1]
+                    if attention_mask.shape[1] >= seq_len:
+                        # Take from the beginning, assuming it's aligned
+                        attention_mask = attention_mask[:1, :seq_len]  # [1, seq_len]
+                    else:
+                        # Pad if attention_mask is shorter (shouldn't happen normally)
+                        pad_size = seq_len - attention_mask.shape[1]
+                        attention_mask = torch.nn.functional.pad(attention_mask[:1], (0, pad_size), value=0)
+                elif attention_mask.dim() == 1:
+                    attention_mask = attention_mask.unsqueeze(0)  # [seq_len] -> [1, seq_len]
+        elif input_ids.dim() != 2:
+            raise ValueError(f"Expected input_ids to have 1 or 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
+        
         if attention_mask is not None and attention_mask.dim() != 2:
             raise ValueError(f"Expected attention_mask to have 2 dimensions, got {attention_mask.dim()} with shape {attention_mask.shape}")
             
@@ -163,9 +181,27 @@ class FeatureEmbedding(nn.Module):
         Returns:
             embeddings: [batch_size, seq_len, embed_dim] tensor of enhanced embeddings
         """
-        # Ensure we have proper 2D tensors
-        if input_ids.dim() != 2:
-            raise ValueError(f"Expected input_ids to have 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
+        # Handle input tensor dimensions - ModernBERT embedding layer passes 1D input_ids
+        if input_ids.dim() == 1:
+            # Convert 1D input_ids to 2D: [seq_len] -> [1, seq_len]
+            input_ids = input_ids.unsqueeze(0)
+            # For attention_mask, we need to slice it to match the sequence length
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    # Take only the portion that matches our input_ids length
+                    seq_len = input_ids.shape[1]
+                    if attention_mask.shape[1] >= seq_len:
+                        # Take from the beginning, assuming it's aligned
+                        attention_mask = attention_mask[:1, :seq_len]  # [1, seq_len]
+                    else:
+                        # Pad if attention_mask is shorter (shouldn't happen normally)
+                        pad_size = seq_len - attention_mask.shape[1]
+                        attention_mask = torch.nn.functional.pad(attention_mask[:1], (0, pad_size), value=0)
+                elif attention_mask.dim() == 1:
+                    attention_mask = attention_mask.unsqueeze(0)  # [seq_len] -> [1, seq_len]
+        elif input_ids.dim() != 2:
+            raise ValueError(f"Expected input_ids to have 1 or 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
+        
         if attention_mask is not None and attention_mask.dim() != 2:
             raise ValueError(f"Expected attention_mask to have 2 dimensions, got {attention_mask.dim()} with shape {attention_mask.shape}")
         
