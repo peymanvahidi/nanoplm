@@ -112,25 +112,18 @@ class FeatureEmbedding(nn.Module):
         Returns:
             pca_features: [batch_size, seq_len, 20] tensor of PCA feature values
         """
-        # Handle input tensor dimensions - ModernBERT embedding layer passes 1D input_ids
+        # Ensure we have 2D tensors without forcing specific batch sizes
         if input_ids.dim() == 1:
-            # Convert 1D input_ids to 2D: [seq_len] -> [1, seq_len]
+            # If we get 1D input, assume it's a single sequence and add batch dimension
             input_ids = input_ids.unsqueeze(0)
-            # For attention_mask, we need to slice it to match the sequence length
-            if attention_mask is not None:
-                if attention_mask.dim() == 2:
-                    # Take only the portion that matches our input_ids length
-                    seq_len = input_ids.shape[1]
-                    if attention_mask.shape[1] >= seq_len:
-                        # Take from the beginning, assuming it's aligned
-                        attention_mask = attention_mask[:1, :seq_len]  # [1, seq_len]
-                    else:
-                        # Pad if attention_mask is shorter (shouldn't happen normally)
-                        pad_size = seq_len - attention_mask.shape[1]
-                        attention_mask = torch.nn.functional.pad(attention_mask[:1], (0, pad_size), value=0)
-                elif attention_mask.dim() == 1:
-                    attention_mask = attention_mask.unsqueeze(0)  # [seq_len] -> [1, seq_len]
-        elif input_ids.dim() != 2:
+            single_sequence = True
+        else:
+            single_sequence = False
+            
+        if attention_mask is not None and attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+        
+        if input_ids.dim() != 2:
             raise ValueError(f"Expected input_ids to have 1 or 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
         
         if attention_mask is not None and attention_mask.dim() != 2:
@@ -168,6 +161,10 @@ class FeatureEmbedding(nn.Module):
             # Sum over window and divide by window length
             pca_features[:, i, :] = window_pca.sum(dim=1) / window_lengths
         
+        # If input was single sequence, squeeze back to original form if needed
+        if single_sequence:
+            pca_features = pca_features.squeeze(0)
+            
         return pca_features
     
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -181,25 +178,18 @@ class FeatureEmbedding(nn.Module):
         Returns:
             embeddings: [batch_size, seq_len, embed_dim] tensor of enhanced embeddings
         """
-        # Handle input tensor dimensions - ModernBERT embedding layer passes 1D input_ids
+        # Ensure we have 2D tensors without forcing specific batch sizes
         if input_ids.dim() == 1:
-            # Convert 1D input_ids to 2D: [seq_len] -> [1, seq_len]
+            # If we get 1D input, assume it's a single sequence and add batch dimension
             input_ids = input_ids.unsqueeze(0)
-            # For attention_mask, we need to slice it to match the sequence length
-            if attention_mask is not None:
-                if attention_mask.dim() == 2:
-                    # Take only the portion that matches our input_ids length
-                    seq_len = input_ids.shape[1]
-                    if attention_mask.shape[1] >= seq_len:
-                        # Take from the beginning, assuming it's aligned
-                        attention_mask = attention_mask[:1, :seq_len]  # [1, seq_len]
-                    else:
-                        # Pad if attention_mask is shorter (shouldn't happen normally)
-                        pad_size = seq_len - attention_mask.shape[1]
-                        attention_mask = torch.nn.functional.pad(attention_mask[:1], (0, pad_size), value=0)
-                elif attention_mask.dim() == 1:
-                    attention_mask = attention_mask.unsqueeze(0)  # [seq_len] -> [1, seq_len]
-        elif input_ids.dim() != 2:
+            single_sequence = True
+        else:
+            single_sequence = False
+            
+        if attention_mask is not None and attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+        
+        if input_ids.dim() != 2:
             raise ValueError(f"Expected input_ids to have 1 or 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
         
         if attention_mask is not None and attention_mask.dim() != 2:
@@ -226,5 +216,9 @@ class FeatureEmbedding(nn.Module):
         
         # Apply layer normalization
         embeddings = self.layer_norm(fused_embeds)
+        
+        # If input was single sequence, squeeze back to original form if needed
+        if single_sequence:
+            embeddings = embeddings.squeeze(0)
         
         return embeddings 
