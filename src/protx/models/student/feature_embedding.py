@@ -112,13 +112,9 @@ class FeatureEmbedding(nn.Module):
         Returns:
             pca_features: [batch_size, seq_len, 20] tensor of PCA feature values
         """
-        # Ensure we have 2D tensors without forcing specific batch sizes
+        # Handle tensor dimensions
         if input_ids.dim() == 1:
-            # If we get 1D input, assume it's a single sequence and add batch dimension
             input_ids = input_ids.unsqueeze(0)
-            single_sequence = True
-        else:
-            single_sequence = False
             
         if attention_mask is not None and attention_mask.dim() == 1:
             attention_mask = attention_mask.unsqueeze(0)
@@ -160,10 +156,6 @@ class FeatureEmbedding(nn.Module):
             
             # Sum over window and divide by window length
             pca_features[:, i, :] = window_pca.sum(dim=1) / window_lengths
-        
-        # If input was single sequence, squeeze back to original form if needed
-        if single_sequence:
-            pca_features = pca_features.squeeze(0)
             
         return pca_features
     
@@ -178,13 +170,9 @@ class FeatureEmbedding(nn.Module):
         Returns:
             embeddings: [batch_size, seq_len, embed_dim] tensor of enhanced embeddings
         """
-        # Ensure we have 2D tensors without forcing specific batch sizes
+        # Handle tensor dimensions
         if input_ids.dim() == 1:
-            # If we get 1D input, assume it's a single sequence and add batch dimension
             input_ids = input_ids.unsqueeze(0)
-            single_sequence = True
-        else:
-            single_sequence = False
             
         if attention_mask is not None and attention_mask.dim() == 1:
             attention_mask = attention_mask.unsqueeze(0)
@@ -216,9 +204,5 @@ class FeatureEmbedding(nn.Module):
         
         # Apply layer normalization
         embeddings = self.layer_norm(fused_embeds)
-        
-        # If input was single sequence, squeeze back to original form if needed
-        if single_sequence:
-            embeddings = embeddings.squeeze(0)
         
         return embeddings 
