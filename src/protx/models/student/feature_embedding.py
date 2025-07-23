@@ -112,15 +112,8 @@ class FeatureEmbedding(nn.Module):
         Returns:
             pca_features: [batch_size, seq_len, 20] tensor of PCA feature values
         """
-        # Handle tensor dimensions
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-            
-        if attention_mask is not None and attention_mask.dim() == 1:
-            attention_mask = attention_mask.unsqueeze(0)
-        
         if input_ids.dim() != 2:
-            raise ValueError(f"Expected input_ids to have 1 or 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
+            raise ValueError(f"Expected input_ids to have 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
         
         if attention_mask is not None and attention_mask.dim() != 2:
             raise ValueError(f"Expected attention_mask to have 2 dimensions, got {attention_mask.dim()} with shape {attention_mask.shape}")
@@ -156,7 +149,7 @@ class FeatureEmbedding(nn.Module):
             
             # Sum over window and divide by window length
             pca_features[:, i, :] = window_pca.sum(dim=1) / window_lengths
-            
+        
         return pca_features
     
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -170,15 +163,8 @@ class FeatureEmbedding(nn.Module):
         Returns:
             embeddings: [batch_size, seq_len, embed_dim] tensor of enhanced embeddings
         """
-        # Handle tensor dimensions
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-            
-        if attention_mask is not None and attention_mask.dim() == 1:
-            attention_mask = attention_mask.unsqueeze(0)
-        
         if input_ids.dim() != 2:
-            raise ValueError(f"Expected input_ids to have 1 or 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
+            raise ValueError(f"Expected input_ids to have 2 dimensions, got {input_ids.dim()} with shape {input_ids.shape}")
         
         if attention_mask is not None and attention_mask.dim() != 2:
             raise ValueError(f"Expected attention_mask to have 2 dimensions, got {attention_mask.dim()} with shape {attention_mask.shape}")
