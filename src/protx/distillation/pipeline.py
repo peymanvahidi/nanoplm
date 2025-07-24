@@ -222,7 +222,7 @@ class DistillationPipeline():
 
         if self.multi_gpu:
             trainer_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
-            trainer_dict["ddp_find_unused_parameters"] = False
+            trainer_dict["ddp_find_unused_parameters"] = True
 
         training_args = TrainingArguments(**trainer_dict)
 
