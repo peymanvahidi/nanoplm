@@ -214,7 +214,7 @@ class DistillationPipeline():
             "dataloader_num_workers": self.num_workers,
             "remove_unused_columns": False,
             "label_names": ["teacher_embeddings"],
-            "gradient_accumulation_steps": 1,
+            "gradient_accumulation_steps": 3,
             "max_grad_norm": self.max_grad_norm,
             "dataloader_pin_memory": True,
             "dataloader_prefetch_factor": 2,
