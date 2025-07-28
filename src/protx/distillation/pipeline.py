@@ -58,6 +58,7 @@ class DistillationPipeline():
         chunk_size: int = 32,  # NEW: Samples to read per chunk
         prefetch_batches: int = 2,  # NEW: Background prefetch batches
         use_threading: bool = True,  # NEW: Enable threading for I/O
+        gradient_accumulation_steps: int = 3,  # NEW: Gradient accumulation steps
         _overrides: dict = None,
     ):
         self.train_file = train_file
@@ -89,6 +90,7 @@ class DistillationPipeline():
         self.chunk_size = chunk_size
         self.prefetch_batches = prefetch_batches
         self.use_threading = use_threading
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self._overrides = _overrides or {}
         
         # Store original values for proper resumption
@@ -143,6 +145,7 @@ class DistillationPipeline():
             "lr_scheduler": self.lr_scheduler,
             "lr_scheduler_kwargs": self.lr_scheduler_kwargs,
             "max_grad_norm": self.max_grad_norm,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
         }
         
         run_name, output_dir, is_resuming = session_manager.setup_session(distill_pipeline_config)
@@ -178,15 +181,17 @@ class DistillationPipeline():
         )
 
         # Setup GPU configuration
-        world_size, effective_batch_size = self._batch_config()
+        world_size, effective_batch_size, gradient_accumulation_steps = self._batch_config()
 
         # Calculate num_training_steps for scheduler
+        # With gradient accumulation, we need fewer training steps since each step processes more samples
         num_training_steps = ((self.max_seqs_num * (1 - self.val_ratio)) // effective_batch_size) * self.num_epochs
 
         logger.info(f"Training configuration:")
         logger.info(f"  Multi-GPU: {self.multi_gpu}")
         logger.info(f"  World size: {world_size}")
         logger.info(f"  Per-device batch size: {self.batch_size}")
+        logger.info(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
         logger.info(f"  Effective batch size: {effective_batch_size}")
         logger.info(f"  Total training steps: {num_training_steps}")
         logger.info(f"  Training samples: {int(self.max_seqs_num * (1 - self.val_ratio))}")
@@ -214,7 +219,7 @@ class DistillationPipeline():
             "dataloader_num_workers": self.num_workers,
             "remove_unused_columns": False,
             "label_names": ["teacher_embeddings"],
-            "gradient_accumulation_steps": 3,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
             "max_grad_norm": self.max_grad_norm,
             "dataloader_pin_memory": True,
             "dataloader_prefetch_factor": 2,
@@ -377,12 +382,11 @@ class DistillationPipeline():
         return train_dataset, val_dataset
 
     def _batch_config(self):
-        gradient_accumulation_steps = 1
         world_size = self.world_size if self.multi_gpu else 1
-        effective_batch_size = self.batch_size * world_size * gradient_accumulation_steps
+        effective_batch_size = self.batch_size * world_size * self.gradient_accumulation_steps
         os.environ["WANDB_LOG_MODEL"] = "end"
 
-        return world_size, effective_batch_size
+        return world_size, effective_batch_size, self.gradient_accumulation_steps
 
     def _get_scheduler(self, optimizer, num_training_steps):
         if num_training_steps <= 0:
