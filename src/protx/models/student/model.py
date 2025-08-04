@@ -22,7 +22,7 @@ class ProtX(nn.Module):
         num_layers: int,
         num_heads: int,
         mlp_activation: str = "swiglu",
-        use_feature_embedding: bool = True,
+        use_feature_embedding: bool = False,
         feature_window_size: int = 15,
     ):
         super().__init__()
@@ -64,6 +64,9 @@ class ProtX(nn.Module):
 
         self.proj = nn.Linear(embed_dim, 1024, bias=False)
         self.proj_norm = T5LayerNorm(1024)
+        
+        # Initialize projection layer with smaller weights for stability
+        nn.init.xavier_normal_(self.proj.weight, gain=0.1)
 
     def forward(self, input_ids, attention_mask, training_mode = False, teacher_embeddings=None):
         if self.use_feature_embedding:
