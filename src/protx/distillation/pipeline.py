@@ -144,7 +144,7 @@ class DistillationPipeline():
             "device": self.device,
             "lr_scheduler": self.lr_scheduler,
             "lr_scheduler_kwargs": self.lr_scheduler_kwargs,
-            "max_grad_norm": self.max_grad_norm,
+            # "max_grad_norm": self.max_grad_norm,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
         }
         
@@ -220,7 +220,7 @@ class DistillationPipeline():
             "remove_unused_columns": False,
             "label_names": ["teacher_embeddings"],
             "gradient_accumulation_steps": gradient_accumulation_steps,
-            "max_grad_norm": self.max_grad_norm,
+            # "max_grad_norm": self.max_grad_norm,
             "dataloader_pin_memory": True,
             "dataloader_prefetch_factor": 2,
         }
