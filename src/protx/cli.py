@@ -6,6 +6,7 @@ ProtX CLI - Command Line Interface for ProtX package
 import click
 from pathlib import Path
 import json
+from typing import Optional
 
 from .data.downloader import Downloader
 from .data.extractor import Extractor
@@ -461,7 +462,7 @@ def shard_h5_cli(
 @click.option(
     '--max-grad-norm',
     type=float,
-    default=1.0,
+    default=None,
     help='Maximum gradient norm for gradient clipping'
 )
 @click.option(
@@ -559,6 +560,11 @@ def shard_h5_cli(
     is_flag=True,
     help='Disable threading for I/O operations (use if experiencing threading issues)'
 )
+@click.option(
+    '--no-projection-layer',
+    is_flag=True,
+    help='Disable projection layer (student and teacher embeddings must have same dimension 1024)'
+)
 def train_student(
     train_file: str,
     val_file: str,
@@ -572,7 +578,7 @@ def train_student(
     num_epochs: int,
     batch_size: int,
     max_lr: float,
-    max_grad_norm: float,
+    max_grad_norm: Optional[float],
     max_seqs_num: int,
     max_seq_len: int,
     val_ratio: float,
@@ -589,6 +595,7 @@ def train_student(
     chunk_size: int,
     prefetch_batches: int,
     no_threading: bool,
+    no_projection_layer: bool,
 ):
     """Train the student model"""
     # Parse lr_scheduler_kwargs if provided
@@ -615,6 +622,7 @@ def train_student(
                 student_embed_dim=student_embed_dim,
                 student_num_layers=student_num_layers,
                 student_num_heads=student_num_heads,
+                projection_layer=not no_projection_layer,
             )
             .with_training_config(
                 num_epochs=num_epochs,

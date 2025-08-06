@@ -24,12 +24,14 @@ class ProtX(nn.Module):
         mlp_activation: str = "swiglu",
         use_feature_embedding: bool = False,
         feature_window_size: int = 15,
+        projection_layer: bool = True,
     ):
         super().__init__()
 
         self.tokenizer = ProtXTokenizer()
         self.use_feature_embedding = use_feature_embedding
         self.feature_window_size = feature_window_size
+        self.projection_layer = projection_layer
 
         self.config = ModernBertConfig(
             vocab_size=self.tokenizer.vocab_size,
@@ -62,11 +64,13 @@ class ProtX(nn.Module):
             for layer in self.model.layers:
                 layer.mlp = ModernBertMLPSwiGLU(self.config)
 
-        self.proj = nn.Linear(embed_dim, 1024, bias=False)
-        self.proj_norm = T5LayerNorm(1024)
-        
-        # Initialize projection layer with smaller weights for stability
-        nn.init.xavier_normal_(self.proj.weight, gain=0.1)
+        # Only add projection layer if requested
+        if self.projection_layer:
+            self.proj = nn.Linear(embed_dim, 1024, bias=False)
+            self.proj_norm = T5LayerNorm(1024)
+            
+            # Initialize projection layer with smaller weights for stability
+            nn.init.xavier_normal_(self.proj.weight, gain=0.1)
 
     def forward(self, input_ids, attention_mask, training_mode = False, teacher_embeddings=None):
         if self.use_feature_embedding:
@@ -79,16 +83,24 @@ class ProtX(nn.Module):
             student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
         
         if training_mode:
-            projected_repr = self.proj(student_out.last_hidden_state)  # (batch_size, seq_len, 1024)
-            projected_repr = self.proj_norm(projected_repr)
+            if self.projection_layer:
+                # Apply projection layer for knowledge distillation (to match teacher's 1024 dim)
+                projected_repr = self.proj(student_out.last_hidden_state)  # (batch_size, seq_len, 1024)
+                projected_repr = self.proj_norm(projected_repr)
+                output_repr = projected_repr
+            else:
+                # No projection layer - student embeddings stay at embed_dim
+                # Teacher and student should both have same embedding dimension (1024)
+                output_repr = student_out.last_hidden_state
+            
             # training mode
             return BaseModelOutput(
-                last_hidden_state=projected_repr,
+                last_hidden_state=output_repr,
                 hidden_states=student_out.hidden_states,
                 attentions=student_out.attentions
             )
         else:
-            # Inference mode
+            # Inference mode - always return raw embeddings without projection
             return BaseModelOutput(
                 last_hidden_state=student_out.last_hidden_state,
                 hidden_states=student_out.hidden_states,
@@ -105,7 +117,8 @@ class ProtX(nn.Module):
         per_seq_embeddings: bool = True,  # True for pooled, False for per-token
         mlp_activation: str = "swiglu",
         use_feature_embedding: bool = False,
-        feature_window_size: int = 3
+        feature_window_size: int = 3,
+        projection_layer: bool = True
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """
         Load model from checkpoint and generate embeddings for sequences.
@@ -122,6 +135,7 @@ class ProtX(nn.Module):
             mlp_activation: MLP activation function ("swiglu" or others)
             use_feature_embedding: If True, use enhanced feature embedding with hydropathy and charge
             feature_window_size: Window size for sliding window feature computation
+            projection_layer: If True, include projection layer to 1024 dims (default: True)
             
         Yields:
             Tuple of (sequence, embedding_tensor) for each input sequence
@@ -143,7 +157,8 @@ class ProtX(nn.Module):
             num_heads=num_heads,
             mlp_activation=mlp_activation,
             use_feature_embedding=use_feature_embedding,
-            feature_window_size=feature_window_size
+            feature_window_size=feature_window_size,
+            projection_layer=projection_layer
         )
         
         # Load the checkpoint
@@ -348,7 +363,8 @@ class ProtX(nn.Module):
         num_heads: int,
         mlp_activation: str = "swiglu",
         use_feature_embedding: bool = False,
-        feature_window_size: int = 3
+        feature_window_size: int = 3,
+        projection_layer: bool = True
     ) -> int:
         """
         Calculate the total number of parameters for a ProtX model with given architecture.
@@ -360,6 +376,7 @@ class ProtX(nn.Module):
             mlp_activation: MLP activation function ("swiglu" or others)
             use_feature_embedding: Whether to use enhanced feature embedding
             feature_window_size: Window size for feature computation
+            projection_layer: Whether to include projection layer to 1024 dims
             
         Returns:
             Total number of parameters
@@ -371,7 +388,8 @@ class ProtX(nn.Module):
             num_heads=num_heads,
             mlp_activation=mlp_activation,
             use_feature_embedding=use_feature_embedding,
-            feature_window_size=feature_window_size
+            feature_window_size=feature_window_size,
+            projection_layer=projection_layer
         )
         
         # Count parameters
@@ -386,7 +404,8 @@ class ProtX(nn.Module):
         num_heads: int,
         mlp_activation: str = "swiglu",
         use_feature_embedding: bool = False,
-        feature_window_size: int = 3
+        feature_window_size: int = 3,
+        projection_layer: bool = True
     ) -> None:
         """
         Print a detailed breakdown of parameters for a ProtX model.
@@ -398,6 +417,7 @@ class ProtX(nn.Module):
             mlp_activation: MLP activation function ("swiglu" or others)
             use_feature_embedding: Whether to use enhanced feature embedding
             feature_window_size: Window size for feature computation
+            projection_layer: Whether to include projection layer to 1024 dims
         """
         # Create a temporary model instance
         model = ProtX(
@@ -406,7 +426,8 @@ class ProtX(nn.Module):
             num_heads=num_heads,
             mlp_activation=mlp_activation,
             use_feature_embedding=use_feature_embedding,
-            feature_window_size=feature_window_size
+            feature_window_size=feature_window_size,
+            projection_layer=projection_layer
         )
         
         print(f"ProtX Model Parameter Breakdown:")

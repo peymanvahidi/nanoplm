@@ -1,7 +1,7 @@
 from .pipeline import DistillationPipeline
 from .session_manager import TrainingSessionManager
 from ..utils import logger
-
+from typing import Optional
 
 class DistillationPipelineBuilder:
     """
@@ -54,13 +54,15 @@ class DistillationPipelineBuilder:
         self,
         student_embed_dim: int,
         student_num_layers: int,
-        student_num_heads: int
+        student_num_heads: int,
+        projection_layer: bool = True
     ):
         """Set student model architecture."""
         self.config.update({
             "student_embed_dim": student_embed_dim,
             "student_num_layers": student_num_layers,
             "student_num_heads": student_num_heads,
+            "projection_layer": projection_layer,
         })
         return self
     
@@ -69,7 +71,7 @@ class DistillationPipelineBuilder:
         num_epochs: int,
         batch_size: int,
         max_lr: float,
-        max_grad_norm: float,
+        max_grad_norm: Optional[float],
         max_seqs_num: int,
         max_seq_len: int,
         val_ratio: float,

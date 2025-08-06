@@ -58,7 +58,8 @@ class DistillationPipeline():
         chunk_size: int = 32,  # NEW: Samples to read per chunk
         prefetch_batches: int = 2,  # NEW: Background prefetch batches
         use_threading: bool = True,  # NEW: Enable threading for I/O
-        gradient_accumulation_steps: int = 3,  # NEW: Gradient accumulation steps
+        gradient_accumulation_steps: int = 2,  # NEW: Gradient accumulation steps
+        projection_layer: bool = True,  # NEW: Whether to include projection layer
         _overrides: dict = None,
     ):
         self.train_file = train_file
@@ -91,6 +92,7 @@ class DistillationPipeline():
         self.prefetch_batches = prefetch_batches
         self.use_threading = use_threading
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.projection_layer = projection_layer
         self._overrides = _overrides or {}
         
         # Store original values for proper resumption
@@ -112,6 +114,7 @@ class DistillationPipeline():
             embed_dim=self.student_embed_dim,
             num_layers=self.student_num_layers,
             num_heads=self.student_num_heads,
+            projection_layer=self.projection_layer,
         )
 
         # Setup training session (new or resumed)
@@ -146,6 +149,7 @@ class DistillationPipeline():
             "lr_scheduler_kwargs": self.lr_scheduler_kwargs,
             # "max_grad_norm": self.max_grad_norm,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "projection_layer": self.projection_layer,
         }
         
         run_name, output_dir, is_resuming = session_manager.setup_session(distill_pipeline_config)
