@@ -1,38 +1,17 @@
 data_params:
   val_ratio: 0.1
-  max_seqs_num: 50000
+  max_seqs_num: 100
   min_seq_len: 20
   max_seq_len: 512
-  # This batch size is used for embedding calculation
   embed_calc_batch_size: 64
+  
   shuffle: true
   shuffle_seed: 23
+  # If you want to skip some sequences
   filter_skip_n: 0
-
-distill_params:
-  dataloader_num_workers: 4
-
-  # student
-  student_embed_dim: 512
-  student_num_layers: 6
-  student_num_heads: 8
-
-  on_the_fly: false
-  num_epochs: 10
-  batch_size: 256
-
-  # scheduler
-  ## warmup
-  start_lr: 1e-8
-  warmup_steps: 128
-
-  ## cosine annealing
-  min_lr: 1e-5
-  max_lr: 1e-3
-  T_0: 75
-  T_mult: 1.2
-  gamma: 0.25
-
+  # For sharding the train and val datasets
+  train_shards: 5
+  val_shards: 2
 
 ### DO NOT CHANGE CONFIGS BELOW ###
 data_dirs:
@@ -56,4 +35,3 @@ data_dirs:
   protx_val_prefix: "output/data/protx_dataset/val/val.h5"
 
   wandb_checkpoints_dir: "output/wandb_checkpoints"
-  plots_dir: "output/checkpoints/plots"
