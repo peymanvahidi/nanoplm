@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ProtX"
+name = "myplm"
 version = "0.1.0"
-description = "Knowledge distillation of ProtT5"
+description = "Make your own protein language model"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -30,9 +30,9 @@ dependencies = [
 ]
 
 [project.scripts]
-protx = "protx.cli:cli"
-protx-data = "protx.cli.data:data"
-protx-train = "protx.cli.train:train"
+myplm = "myplm.cli:cli"
+myplm-data = "myplm.cli.data:data"
+myplm-train = "myplm.cli.train:train"
 
 [tool.setuptools.package-data]
-"protx.models.student" = ["*.csv"]
+"myplm.models.student" = ["*.csv"]
