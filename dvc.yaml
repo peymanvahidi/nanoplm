@@ -1,7 +1,7 @@
 stages:
 
   download:
-    cmd: protx download-data
+    cmd: protx data download
       --url ${data_dirs.uniref50_url}
       --output ${data_dirs.uniref50_fasta_gz}
     deps:
@@ -13,7 +13,7 @@ stages:
       - ${data_dirs.uniref50_fasta_gz}
 
   extract:
-    cmd: protx extract-data
+    cmd: protx data extract
       --input ${data_dirs.uniref50_fasta_gz}
       --output ${data_dirs.uniref50_fasta}
     deps:
@@ -26,7 +26,7 @@ stages:
       - ${data_dirs.uniref50_fasta}
 
   shuffle_fasta:
-    cmd: protx shuffle-fasta
+    cmd: protx data shuffle
       --input ${data_dirs.uniref50_fasta}
       --output ${data_dirs.shuffled_fasta_file}
       --seed ${data_params.shuffle_seed}
@@ -40,7 +40,7 @@ stages:
       - ${data_dirs.shuffled_fasta_file}
 
   filter_split:
-    cmd: protx filter-split-data
+    cmd: protx data filter-split
       --input ${data_dirs.shuffled_fasta_file}
       --filtered-seqs ${data_dirs.uniref50_filtered_fasta}
       --train-file ${data_dirs.train_fasta}
@@ -70,13 +70,14 @@ stages:
       - ${data_dirs.info_file}
   
   save_protx_train_dataset:
-    cmd: protx save-protx-dataset
+    cmd: protx data save-dataset
       --input-file ${data_dirs.train_fasta}
       --teacher-model 'prott5'
       --output-file ${data_dirs.protx_train_prefix}
       --max-seq-len ${data_params.max_seq_len}
       --batch-size ${data_params.embed_calc_batch_size}
       --device 'auto'
+      --n-files ${data_params.train_shards}
     deps:
       - src/protx/data/dataset.py
       - ${data_dirs.train_fasta}
@@ -84,15 +85,17 @@ stages:
       - data_dirs.train_fasta
       - data_dirs.protx_train_prefix
       - data_params.embed_calc_batch_size
+      - data_params.train_shards
 
   save_protx_val_dataset:
-    cmd: protx save-protx-dataset
+    cmd: protx data save-dataset
       --input-file ${data_dirs.val_fasta}
       --teacher-model 'prott5'
       --output-file ${data_dirs.protx_val_prefix}
       --max-seq-len ${data_params.max_seq_len}
       --batch-size ${data_params.embed_calc_batch_size}
       --device 'auto'
+      --n-files ${data_params.val_shards}
     deps:
       - src/protx/data/dataset.py
       - ${data_dirs.val_fasta}
@@ -100,46 +103,4 @@ stages:
       - data_dirs.protx_dataset_dir
       - data_dirs.protx_val_prefix
       - data_params.embed_calc_batch_size
-  
-  # train_model:
-  #   cmd: protx train-student \ #torchrun --nproc_per_node=2 --nnodes=1 --master_port=29500 /usr/local/bin/protx train-student
-  #    --train-file ${data_dirs.train_fasta}
-  #    --val-file ${data_dirs.val_fasta}
-  #    --protx-train-prefix ${data_dirs.protx_train_prefix}
-  #    --protx-val-prefix ${data_dirs.protx_val_prefix}
-  #    --student-embed-dim ${distill_params.student_embed_dim}
-  #    --student-num-layers ${distill_params.student_num_layers}
-  #    --student-num-heads ${distill_params.student_num_heads}
-  #    --multi-gpu
-  #    --num-epochs ${distill_params.num_epochs}
-  #    --batch-size ${distill_params.batch_size}
-  #    --max-lr ${distill_params.max_lr}
-  #    --max-seqs-num ${data_params.max_seqs_num}
-  #    --max-seq-len ${data_params.max_seq_len}
-  #    --val-ratio ${data_params.val_ratio}
-  #    --num-workers ${distill_params.dataloader_num_workers}
-  #    --project-name ${distill_params.project_name}
-  #    --checkpoint-path ${distill_params.checkpoint_path}
-  #    --wandb-dir ${distill_params.wandb_dir}
-  #    --device ${distill_params.device}
-  #   deps:
-  #     - src/protx/distillation/pipeline.py
-  #     - output/data/protx_dataset/
-  #   params:
-  #     - data_dirs.train_fasta
-  #     - data_dirs.val_fasta
-  #     - data_dirs.protx_train_prefix
-  #     - data_dirs.protx_val_prefix
-  #     - distill_params.student_embed_dim
-  #     - distill_params.student_num_layers
-  #     - distill_params.student_num_heads
-  #     - distill_params.on_the_fly
-  #     - distill_params.multi_gpu
-  #     - distill_params.num_epochs
-  #     - distill_params.batch_size
-  #     - distill_params.max_lr
-  #     - distill_params.dataloader_num_workers
-  #     - distill_params.project_name
-  #     - distill_params.checkpoint_path
-  #     - distill_params.wandb_dir
-  #     - distill_params.device
+      - data_params.val_shards
