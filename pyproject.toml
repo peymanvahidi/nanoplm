@@ -26,10 +26,13 @@ dependencies = [
     "tqdm>=4.67.1",
     "transformers>=4.50.2",
     "wandb>=0.19.11",
+    "certifi>=2024.7.4",
 ]
 
 [project.scripts]
 protx = "protx.cli:cli"
+protx-data = "protx.cli.data:data"
+protx-train = "protx.cli.train:train"
 
 [tool.setuptools.package-data]
 "protx.models.student" = ["*.csv"]
