@@ -11,7 +11,6 @@ from transformers import (
     get_constant_schedule_with_warmup
 )
 import time
-from torch.optim import AdamW
 import os
 
 from myplm.distillation.collator import DistillDataCollator
@@ -22,6 +21,7 @@ from myplm.distillation.session_manager import TrainingSessionManager
 
 from myplm.models.student import ProtX
 from myplm.models.teacher import ProtT5
+from myplm.optim import get_optimizer
 
 from myplm.data.dataset import ProtXDataGen, ProtXDataLoader, ProtXDataLoaderOptimized
 from myplm.utils import get_device, logger
@@ -60,6 +60,7 @@ class DistillationPipeline():
         use_threading: bool = True,  # NEW: Enable threading for I/O
         gradient_accumulation_steps: int = 2,  # NEW: Gradient accumulation steps
         projection_layer: bool = True,  # NEW: Whether to include projection layer
+        optimizer_name : str = "AdamW",
         _overrides: dict = None,
     ):
         self.train_file = train_file
@@ -93,6 +94,7 @@ class DistillationPipeline():
         self.use_threading = use_threading
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.projection_layer = projection_layer
+        self.optimizer_name = optimizer_name
         self._overrides = _overrides or {}
         
         # Store original values for proper resumption
@@ -147,6 +149,7 @@ class DistillationPipeline():
             "device": self.device,
             "lr_scheduler": self.lr_scheduler,
             "lr_scheduler_kwargs": self.lr_scheduler_kwargs,
+            "optimizer_name": self.optimizer_name,
             # "max_grad_norm": self.max_grad_norm,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "projection_layer": self.projection_layer,
@@ -252,12 +255,13 @@ class DistillationPipeline():
         #     seq_len=self.data_config.max_seq_len,
         #     device=str(self.device)
         # )
-        
-        optimizer = AdamW(
-            student.parameters(),
-            lr=self.max_lr
+        optimizer = get_optimizer(
+            name=self.optimizer_name,
+            params=student.parameters(),
+            lr=self.max_lr,
         )
         
+
         num_training_steps_for_scheduler = num_training_steps
         
         # When resuming, the number of epochs is the number of *additional* epochs.

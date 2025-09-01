@@ -78,6 +78,7 @@ class DistillationPipelineBuilder:
         num_workers: int,
         lr_scheduler: str = "cosine",
         lr_scheduler_kwargs: dict = None,
+        optimizer_name: str = "AdamW",
     ):
         """Set training hyperparameters."""
         self.config.update({
@@ -91,6 +92,7 @@ class DistillationPipelineBuilder:
             "num_workers": num_workers,
             "lr_scheduler": lr_scheduler,
             "lr_scheduler_kwargs": lr_scheduler_kwargs or {},
+            "optimizer_name": optimizer_name,
         })
         return self
     

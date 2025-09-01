@@ -150,6 +150,12 @@ def train():
     help='Learning rate scheduler type'
 )
 @click.option(
+    '--optimizer',
+    type=str,
+    default='AdamW',
+    help='Optimizer to use (e.g., AdamW, Muon)'
+)
+@click.option(
     '--lr-scheduler-kwargs',
     type=str,
     default=None,
@@ -219,6 +225,7 @@ def train_student(
     device: str,
     lr_scheduler: str,
     lr_scheduler_kwargs: str,
+    optimizer: str,
     sharded: bool,
     use_optimized_loader: bool,
     max_open_files: int,
@@ -265,6 +272,7 @@ def train_student(
                 lr_scheduler=lr_scheduler,
                 lr_scheduler_kwargs=parsed_lr_kwargs,
                 max_grad_norm=max_grad_norm,
+                optimizer_name=optimizer,
             )
             .with_experiment_config(
                 project_name=project_name,
@@ -311,6 +319,12 @@ def train_student(
     help='Learning rate scheduler type (optional, defaults to cosine)'
 )
 @click.option(
+    '--optimizer',
+    type=str,
+    default=None,
+    help='Optimizer to use (optional, e.g., AdamW, Muon)'
+)
+@click.option(
     '--lr-scheduler-kwargs',
     type=str,
     default=None,
@@ -328,6 +342,7 @@ def resume_training(
     num_epochs: int,
     lr: float,
     lr_scheduler: str,
+    optimizer: str,
     lr_scheduler_kwargs: str,
     max_grad_norm: float
 ):
@@ -365,6 +380,8 @@ def resume_training(
         overrides["lr_scheduler"] = lr_scheduler
     if parsed_lr_kwargs:
         overrides["lr_scheduler_kwargs"] = parsed_lr_kwargs
+    if optimizer is not None:
+        overrides["optimizer_name"] = optimizer
     
     pipeline = builder.resume_from_checkpoint(
         checkpoint_dir=checkpoint_dir,
