@@ -148,7 +148,9 @@ def extract(input: str, output: str, force: bool):
     # Resolve output path
     if not output:
         output = Path(input).parent / Path(input).name.replace(".gz", "")
-    
+    else:
+        output = Path(output)
+
     # Create output directory
     create_dirs(output)
     
