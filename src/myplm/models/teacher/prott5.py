@@ -1,6 +1,6 @@
 import re
 import torch
-from typing import Dict
+from typing import Dict, Optional
 from transformers import (
     T5ForConditionalGeneration, 
     T5EncoderModel, 
@@ -8,15 +8,14 @@ from transformers import (
 )
 
 from myplm.models.teacher.base import BaseTeacher
-from myplm.utils.common import get_device
 
 class ProtT5(BaseTeacher):
     def __init__(
         self, 
         model_name: str = "Rostlab/prot_t5_xl_uniref50",
-        device: str = get_device()
+        device: Optional[str] = None
     ):
-        self.device = device
+        super().__init__(device=device)
         self.model_name = model_name
 
     @property
