@@ -1,10 +1,15 @@
 import abc
 import torch.nn as nn
+from typing import Optional
 
 from transformers import PreTrainedTokenizerBase
+from myplm.utils.common import get_device
 
 
 class BaseTeacher(abc.ABC):
+    def __init__(self, device: Optional[str] = None) -> None:
+        # Store as string to be compatible with torch .to(device)
+        self.device: str = str(device) if device is not None else get_device()
 
     @property
     @abc.abstractmethod
