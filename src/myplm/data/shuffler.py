@@ -46,9 +46,7 @@ class FastaShuffler:
 
     def shuffle(self):
         if not self.input_path.exists():
-            msg = f"Input file not found: {self.input_path}"
-            logger.error(msg)
-            raise FileNotFoundError(msg)
+            raise ShufflingError(f"Input file not found: {self.input_path}")
 
         backend = self._choose_backend()
         logger.info(f"Using backend: {backend}")
