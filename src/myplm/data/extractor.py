@@ -37,5 +37,5 @@ class Extractor:
                             pbar.update(len(chunk))
         except gzip.BadGzipFile:
             raise ExtractionError("File is not gzipped")
-
-        logger.info(f"Extracted dataset to: {self.output_path}")
+        except EOFError:
+            raise ExtractionError("Corrupted or incomplete gzip file - file ended before the end-of-stream marker was reached")
