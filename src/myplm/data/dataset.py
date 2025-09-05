@@ -1,7 +1,9 @@
 import re
 import h5py
 import torch
+import threading
 import numpy as np
+
 from Bio import SeqIO
 from tqdm import tqdm
 from pathlib import Path
@@ -9,35 +11,35 @@ from typing import Union, List, Optional, Dict
 from transformers import PreTrainedTokenizer
 from torch.utils.data import Dataset, IterableDataset
 from collections import OrderedDict
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
-from myplm.models.teacher import ProtT5
-from myplm.utils import logger, get_device
+from myplm.models.teacher import BaseTeacher
+from myplm.utils import logger, get_device, create_dirs
 
-class ProtXDataGen(IterableDataset):
+class KDDatasetOnTheFly(IterableDataset):
     def __init__(
         self,
-        data_path: Union[str, Path],
-        teacher_tokenizer: PreTrainedTokenizer,
+        input_fasta: Union[str, Path],
+        teacher: BaseTeacher,
         max_seq_len: int,
         device: str
     ):
-        self.data_path = Path(data_path)
-        self.tokenizer = teacher_tokenizer
+        self.input_fasta = Path(input_fasta)
+        self.teacher = teacher
         self.device = device
         self.max_seq_len = max_seq_len
 
     def __iter__(self):
         data_gen = (
             (record.id, str(record.seq)) 
-            for record in SeqIO.parse(self.data_path, "fasta")
+            for record in SeqIO.parse(self.input_fasta, "fasta")
         )
         
         for _, sequence in data_gen:
-            teacher_seq = " ".join(list(re.sub(r"[UZOB]", "X", sequence)))
-            tokenized_seq = self.tokenizer.encode_plus(
-                teacher_seq,
+            preprocessed_seq = self.teacher.preprocess(sequence)
+
+            tokenized_seq = self.teacher.tokenizer.encode_plus(
+                preprocessed_seq,
                 add_special_tokens=True,
                 padding="max_length",
                 max_length=self.max_seq_len,
@@ -49,32 +51,45 @@ class ProtXDataGen(IterableDataset):
                 "attention_mask": tokenized_seq["attention_mask"].squeeze(0)
             }
 
-class ProtXDataProcessor(Dataset):
+class SaveKDDataset(Dataset):
     def __init__(
         self,
-        data_path: Union[str, Path],
-        teacher_model: ProtT5,
+        input_fasta: Union[str, Path],
+        output_path: Union[str, Path],
+        teacher: BaseTeacher,
+        mode: str,
         max_seq_len: int,
         batch_size: int,
         device: str,
         skip_n: int = 0,
-        n_files: int = 1
+        n_files: int = 1,
+        force: bool = False
     ):
-        self.data_path = Path(data_path)
-        self.teacher = teacher_model
+        
+        self.input_fasta = Path(input_fasta)
+        self.output_path = Path(output_path)
+        self.teacher = teacher
+        self.mode = mode
         self.max_seq_len = max_seq_len
         self.batch_size = batch_size
         self.device = device if device != "auto" else get_device()
         self.skip_n = skip_n
         self.n_files = n_files
-        self._loaded = False
+        self.force = force
+        self.data_gen = None
+        self._cached_len = None
+    
+    def __len__(self):
+        if self._cached_len is None:
+            self._cached_len = max(0, sum(1 for _ in SeqIO.parse(self.input_fasta, "fasta")) - self.skip_n)
+        return self._cached_len
 
     def _load(self):
-        if not self._loaded:
-            raw_generator = SeqIO.parse(self.data_path, "fasta")
+        if not self.data_gen:
+            raw_generator = SeqIO.parse(self.input_fasta, "fasta")
             
             if self.skip_n > 0:
-                logger.info(f"Skipping first {self.skip_n} sequences from {self.data_path}.")
+                logger.info(f"Skipping first {self.skip_n} sequences from {self.input_fasta}.")
                 for _ in range(self.skip_n):
                     try:
                         next(raw_generator)
@@ -86,99 +101,83 @@ class ProtXDataProcessor(Dataset):
                 (record.id, str(record.seq)) 
                 for record in raw_generator
             )
-            self._loaded = True
-            logger.info(f"{self.data_path} initialized (with skip_n={self.skip_n}). Now ready for processing.")
-
-    def __len__(self):
-        if not hasattr(self, "_cached_len"):
-            self._cached_len = max(0, sum(1 for _ in SeqIO.parse(self.data_path, "fasta")) - self.skip_n)
-        return self._cached_len
+            logger.info(f"{self.input_fasta} initialized (with skip_n={self.skip_n}). Now ready for processing.")
     
-    def process_dataset(self, save_path: Path) -> Union[Path, List[Path]]:
+    def process_dataset(self) -> Union[Path, List[Path]]:
         self._load()
 
-        teacher_tokenizer = self.teacher.tokenizer
-        teacher_model = self.teacher.encoder_model
-        
-        total_sequences_in_fasta = sum(1 for _ in SeqIO.parse(self.data_path, "fasta"))
-        num_sequences_to_process = total_sequences_in_fasta - self.skip_n
-        if num_sequences_to_process < 0:
-            num_sequences_to_process = 0
-        
-        logger.info(f"Found {total_sequences_in_fasta} total sequences in {self.data_path}.")
-        if self.skip_n > 0:
-            logger.info(f"Skipping {self.skip_n} sequences. Attempting to process {num_sequences_to_process} sequences.")
+        if self.mode == "get_embeddings":
+            self.teacher_model = self.teacher.encoder_model
         else:
-            logger.info(f"Processing {num_sequences_to_process} sequences.")
+            raise ValueError(f"Invalid mode: {self.mode}")
+        
+        self.teacher_tokenizer = self.teacher.tokenizer
+        create_dirs(self.output_path)
 
-        if self.n_files > 1:
-            logger.info(f"Creating {self.n_files} sharded files during processing.")
-            return self._process_dataset_sharded(save_path, teacher_tokenizer, teacher_model, num_sequences_to_process)
+        total_sequences_in_fasta = self.__len__() + self.skip_n
+
+        # Log dataset summary
+        skip_info = f" (skipping {self.skip_n})" if self.skip_n > 0 else ""
+        file_info = f"{self.n_files} sharded files" if self.n_files > 1 else "single file"
+
+        logger.info(f"Dataset: {total_sequences_in_fasta:,} sequences → {self.__len__():,} to process{skip_info}")
+        logger.info(f"Output: {file_info} at {self.output_path}")
+
+        if self.n_files == 1:
+            return self._process_dataset_single()
+        elif self.n_files > 1:
+            return self._process_dataset_sharded()
         else:
-            return self._process_dataset_single(save_path, teacher_tokenizer, teacher_model, num_sequences_to_process)
+            raise ValueError(f"Invalid number of files: {self.n_files}")
     
-    def _process_dataset_single(self, save_path: Path, teacher_tokenizer, teacher_model, num_sequences_to_process: int) -> Path:
+    def _process_dataset_single(self) -> Path:
         """Process dataset into a single H5 file (original behavior)"""
-        save_path = Path(save_path)
-        save_path.parent.mkdir(parents=True, exist_ok=True)
         
         batch = []
-        current_h5_offset = 0
-        mode = "w"
 
-        if save_path.exists():
-            logger.info(f"Found existing HDF5 file at {save_path}. Will append new data.")
-            mode = "a"
-            try:
-                with h5py.File(save_path, "r") as h5f_check:
-                    current_h5_offset = len(h5f_check.keys())
-                logger.info(f"Existing HDF5 file contains {current_h5_offset} entries. New entries will start from this index.")
-            except Exception as e:
-                logger.error(f"Error reading existing HDF5 file {save_path} to determine offset. Please check the file. Error: {e}")
-                raise
+        if self.output_path.exists():
+
+            if self.force:
+                logger.info(f"Found existing HDF5 file at {self.output_path}. Will overwrite existing file.")
+                self.output_path.unlink()
+            else:
+                raise FileExistsError(f"Found existing HDF5 file at {self.output_path}. Use --force to overwrite existing file.")
+
         else:
-            logger.info(f"No existing HDF5 file at {save_path}. Creating new file.")
+            logger.info(f"No existing HDF5 file at {self.output_path}. Creating new file.")
 
-        sequences_actually_processed_this_run = 0
-        with h5py.File(save_path, mode) as h5f:
-            _current_fasta_iter = SeqIO.parse(self.data_path, "fasta")
-            if self.skip_n > 0:
-                for _ in range(self.skip_n):
-                    try: next(_current_fasta_iter)
-                    except StopIteration: break
-            
-            processing_generator = (
-                (record.id, str(record.seq)) 
-                for record in _current_fasta_iter
-            )
+        processed_sequences = 0
+        with h5py.File(self.output_path, "w") as h5f:
 
-            with tqdm(total=num_sequences_to_process, desc="Generating embeddings", unit="seq") as pbar:
-                for _, sequence in processing_generator:
-                    teacher_seq = " ".join(list(re.sub(r"[UZOB]", "X", sequence)))
+            with tqdm(total=self.__len__(), desc="Generating embeddings", unit="seq") as pbar:
+                for _, sequence in self.data_gen:
+                    teacher_seq = self.teacher.preprocess(sequence)
                     batch.append(teacher_seq)
 
+                    # Process the batch if it's full
                     if len(batch) == self.batch_size:
                         self._process_and_save_batch(
-                            h5f, batch, teacher_tokenizer, teacher_model, current_h5_offset + sequences_actually_processed_this_run
+                            h5f=h5f,
+                            batch=batch,
+                            start_index=processed_sequences
                         )
-                        sequences_actually_processed_this_run += len(batch)
+                        processed_sequences += len(batch)
                         pbar.update(len(batch))
                         batch = []
                 
+                # Process any remaining sequences in the last batch
                 if batch:
                     self._process_and_save_batch(
-                        h5f, batch, teacher_tokenizer, teacher_model, current_h5_offset + sequences_actually_processed_this_run
+                        h5f=h5f,
+                        batch=batch,
+                        start_index=processed_sequences
                     )
-                    sequences_actually_processed_this_run += len(batch)
+                    processed_sequences += len(batch)
                     pbar.update(len(batch))
-        
-        total_entries_in_h5_after_run = 0
-        with h5py.File(save_path, "r") as h5f_final_check:
-            total_entries_in_h5_after_run = len(h5f_final_check.keys())
 
-        logger.info(f"Processed and saved {sequences_actually_processed_this_run} new sequences.")
-        logger.info(f"Dataset now contains {total_entries_in_h5_after_run} total sequences at {save_path}.")
-        return save_path
+        logger.info(f"Processed and saved {processed_sequences} new sequences.")
+        logger.info(f"Dataset: {self.output_path}.")
+        return self.output_path
     
     def _process_dataset_sharded(self, save_path: Path, teacher_tokenizer, teacher_model, num_sequences_to_process: int) -> List[Path]:
         """Process dataset into multiple sharded H5 files"""
