@@ -11,7 +11,8 @@ from myplm.config.datasets import DATASET_URLS
 from myplm.data.downloader import Downloader, DownloadError
 from myplm.data.extractor import Extractor, ExtractionError
 from myplm.data.shuffler import FastaShuffler, ShufflingError
-from myplm.data.filter_splitor import FilterSplitor
+from myplm.data.filterer import Filterer, FilterError
+from myplm.data.splitor import Splitor, SplitError
 from myplm.data.dataset import ProtXDataProcessor, shard_h5_file
 from myplm.models.teacher import ProtT5
 
@@ -158,7 +159,9 @@ def extract(input: str, output: str, force: bool):
 
     except (ExtractionError, EOFError, OSError) as e:
         if isinstance(e, EOFError):
-            raise click.ClickException("Extraction failed: Corrupted or incomplete gzip file")
+            raise click.ClickException(
+                "Extraction failed: Corrupted or incomplete gzip file"
+            )
         elif isinstance(e, OSError):
             raise click.ClickException(f"Extraction failed: {e}")
         else:
@@ -217,47 +220,38 @@ def shuffle(input: str, output: str, backend: str, seed: int):
         raise click.ClickException(f"FASTA shuffling failed: {e}")
 
 
-@data.command("filter-split")
+@data.command("filter")
 @click.option(
     "--input",
     "-i",
     required=True,
     type=click.Path(exists=True),
-    help="Input file path where the dataset is saved",
+    help="Input FASTA file to filter",
 )
 @click.option(
-    "--filtered-seqs",
+    "--output",
     "-o",
     required=True,
     type=click.Path(exists=False),
-    help="Output file path where the filtered dataset will be saved",
+    help="Output FASTA path for filtered sequences",
 )
 @click.option(
-    "--train-file",
-    required=True,
-    type=click.Path(exists=False),
-    help="Output file path where the splitted dataset will be saved",
+    "--min-seq-len",
+    default=20,
+    type=int,
+    help="Minimum sequence length",
 )
 @click.option(
-    "--val-file",
-    required=True,
-    type=click.Path(exists=False),
-    help="Output file path where the splitted dataset will be saved",
+    "--max-seq-len",
+    default=1024,
+    type=int,
+    help="Maximum sequence length",
 )
-@click.option("--min-seq-len", default=20, type=int, help="Minimum sequence length")
-@click.option("--max-seq-len", default=1024, type=int, help="Maximum sequence length")
 @click.option(
-    "--max-seqs-num",
+    "--seqs-num",
     default=-1,
     type=int,
-    help="Maximum number of sequences (-1 for all)",
-)
-@click.option("--val-ratio", default=0.1, type=float, help="Validation ratio")
-@click.option(
-    "--info-file",
-    required=True,
-    type=click.Path(exists=False),
-    help="Info file path where the dataset will be saved",
+    help="Number of sequences to retrieve (-1 for all)",
 )
 @click.option(
     "--skip-n",
@@ -266,38 +260,91 @@ def shuffle(input: str, output: str, backend: str, seed: int):
     help="Number of sequences to skip from the beginning of the input FASTA file",
 )
 @click.help_option("--help", "-h")
-def filter_split(
+def filter(
     input: str,
-    filtered_seqs: str,
-    train_file: str,
-    val_file: str,
+    output: str,
     min_seq_len: int,
     max_seq_len: int,
-    max_seqs_num: int,
-    val_ratio: float,
-    info_file: str,
+    seqs_num: int,
     skip_n: int,
 ):
-    """Filter sequences by length, optionally skip N sequences, and split into train/validation sets"""
+    """Filter sequences by length and optional max count."""
+    input_path = Path(input)
+    output_path = Path(output)
+
+    create_dirs(output_path)
+
+    if output_path.is_dir():
+        output_path = output_path / input_path.name.replace(".fasta", "_filtered.fasta")
+
     try:
-        filter_splitor = FilterSplitor(
-            input_file=input,
-            output_file=filtered_seqs,
+        filterer = Filterer(
+            input_path=input_path,
+            output_path=output_path,
             min_seq_len=min_seq_len,
             max_seq_len=max_seq_len,
-            max_seqs_num=max_seqs_num,
-            val_ratio=val_ratio,
-            info_file=info_file,
+            seqs_num=seqs_num,
             skip_n=skip_n,
         )
-        filter_splitor.filter()
-        filter_splitor.split(train_file=train_file, val_file=val_file)
-        click.echo("Data filtering and splitting completed successfully")
+        filterer.filter()
+        click.echo("Filtering completed successfully")
+    except (FilterError, FileNotFoundError, ValueError) as e:
+        raise click.ClickException(f"Filtering failed: {e}")
 
-    except Exception as e:
-        logger.error(f"Filter and split failed: {e}")
-        click.echo(f"Filter and split failed: {e}", err=True)
-        raise click.Abort()
+
+@data.command("split")
+@click.option(
+    "--input",
+    "-i",
+    required=True,
+    type=click.Path(exists=True),
+    help="Filtered FASTA input file",
+)
+@click.option(
+    "--output",
+    "-o",
+    required=True,
+    type=click.Path(exists=False),
+    help="Output file path / directory for the train split",
+)
+@click.option(
+    "--val-ratio",
+    default=0.1,
+    type=float,
+    help="Validation ratio",
+)
+@click.help_option("--help", "-h")
+def split(
+    input: str,
+    output: str,
+    val_ratio: float,
+):
+    """Split a filtered FASTA into train/val sets."""
+    input_path = Path(input)
+    output_path = Path(output)
+
+    create_dirs(output_path)
+
+    if not output_path.is_dir():
+        click.echo("Output must be a directory")
+    else:
+        train_file_path = output_path / "train.fasta"
+        val_file_path = output_path / "val.fasta"
+
+    try:
+        splitor = Splitor(
+            input_file=input_path,
+            train_file=train_file_path,
+            val_file=val_file_path,
+            val_ratio=val_ratio,
+        )
+        train_size, val_size = splitor.split()
+        click.echo(
+            f"Splitting completed successfully.\nTrain file: {train_file_path}\nVal file: {val_file_path}\nTrain size: {train_size}, Val size: {val_size}"
+        )
+
+    except (SplitError, FileNotFoundError, ValueError) as e:
+        raise click.ClickException(f"Splitting failed: {e}")
 
 
 @data.command("save-dataset")
