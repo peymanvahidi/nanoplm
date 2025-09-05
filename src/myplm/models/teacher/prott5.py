@@ -1,3 +1,4 @@
+import re
 import torch
 from typing import Dict
 from transformers import (
@@ -6,9 +7,10 @@ from transformers import (
     T5Tokenizer
 )
 
+from myplm.models.teacher.base import BaseTeacher
 from myplm.utils.common import get_device
 
-class ProtT5:
+class ProtT5(BaseTeacher):
     def __init__(
         self, 
         model_name: str = "Rostlab/prot_t5_xl_uniref50",
@@ -16,7 +18,7 @@ class ProtT5:
     ):
         self.device = device
         self.model_name = model_name
-    
+
     @property
     def full_model(self) -> T5ForConditionalGeneration:
         full_model = T5ForConditionalGeneration.from_pretrained(
@@ -45,3 +47,8 @@ class ProtT5:
         if layer_name in state_dict:
             return state_dict[layer_name]
         raise ValueError(f"Layer {layer_name} not found in model.")
+    
+    def preprocess(self, sequence: str) -> str:
+        seq = (sequence or "").strip().upper()
+        seq = re.sub(r"[UZOB]", "X", seq)
+        return " ".join(list(seq))
