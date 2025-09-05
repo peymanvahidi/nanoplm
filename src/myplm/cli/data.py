@@ -65,7 +65,7 @@ def download(dataset: str | None, output: str | None, url: str | None, force: bo
       myplm data download --url https://example.com/data.fasta.gz -o data_directory/mydata.fasta.gz
     """
 
-    output = Path(output)
+    output_path = Path(output)
 
     # Validate arguments
     if not dataset and not url:
@@ -80,10 +80,10 @@ def download(dataset: str | None, output: str | None, url: str | None, force: bo
     else:
         dataset_url = url
 
-    create_dirs(output)
+    create_dirs(output_path)
 
     # Get output  path
-    if output.is_dir():
+    if output_path.is_dir():
         output_path = output_path / Path(dataset_url).name
 
     # Check if output path already exists
