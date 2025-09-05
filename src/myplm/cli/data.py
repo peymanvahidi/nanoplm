@@ -118,9 +118,9 @@ def download(dataset: str | None, output: str | None, url: str | None, force: bo
 @click.option(
     "--output",
     "-o",
-    required=False,
+    required=True,
     type=click.Path(exists=False),
-    help="Output file path where the dataset will be saved. If not provided it will be saved in the same directory as the input file",
+    help="Output file path / directory where the dataset will be saved.",
 )
 @click.option(
     "--force",
@@ -133,15 +133,13 @@ def download(dataset: str | None, output: str | None, url: str | None, force: bo
 def extract(input: str, output: str, force: bool):
     """Extract compressed dataset files"""
     input_path = Path(input)
+    output_path = Path(output)
+
+    create_dirs(output_path)
 
     # Resolve output file path
-    if not output:
-        output_path = input_path.parent / input_path.name.replace(".gz", "")
-    else:
-        output_path = Path(output)
-
-    # Create output file directory
-    create_dirs(output_path)
+    if output_path.is_dir():
+        output_path = output_path / input_path.name.replace(".gz", "")
 
     # Check if output file already exists
     if output_path.exists():
@@ -156,9 +154,15 @@ def extract(input: str, output: str, force: bool):
     try:
         extractor = Extractor(input_path=input_path, output_path=output_path)
         extractor.extract()
+        click.echo(f"Extraction completed successfully. Output: {output_path}")
 
-    except ExtractionError as e:
-        raise click.ClickException(f"Extraction failed: {e}")
+    except (ExtractionError, EOFError, OSError) as e:
+        if isinstance(e, EOFError):
+            raise click.ClickException("Extraction failed: Corrupted or incomplete gzip file")
+        elif isinstance(e, OSError):
+            raise click.ClickException(f"Extraction failed: {e}")
+        else:
+            raise click.ClickException(f"Extraction failed: {e}")
 
 
 @data.command("shuffle")
