@@ -106,6 +106,8 @@ def download(dataset: str | None, output: str | None, url: str | None, force: bo
 
     except DownloadError as e:
         raise click.ClickException(f"Download failed: {e}")
+    except Exception as e:
+        raise click.ClickException(f"An unexpected error occurred during download: {e}")
 
 
 @data.command("extract")
@@ -166,6 +168,8 @@ def extract(input: str, output: str, force: bool):
             raise click.ClickException(f"Extraction failed: {e}")
         else:
             raise click.ClickException(f"Extraction failed: {e}")
+    except Exception as e:
+        raise click.ClickException(f"An unexpected error occurred during extraction: {e}")
 
 
 @data.command("shuffle")
@@ -218,6 +222,8 @@ def shuffle(input: str, output: str, backend: str, seed: int):
         shuffler.shuffle()
     except ShufflingError as e:
         raise click.ClickException(f"FASTA shuffling failed: {e}")
+    except Exception as e:
+        raise click.ClickException(f"An unexpected error occurred during shuffling: {e}")
 
 
 @data.command("filter")
@@ -288,8 +294,10 @@ def filter(
         )
         filterer.filter()
         click.echo("Filtering completed successfully")
-    except (FilterError, FileNotFoundError, ValueError) as e:
+    except FilterError as e:
         raise click.ClickException(f"Filtering failed: {e}")
+    except Exception as e:
+        raise click.ClickException(f"An unexpected error occurred during filtering: {e}")
 
 
 @data.command("split")
@@ -343,8 +351,10 @@ def split(
             f"Splitting completed successfully.\nTrain file: {train_file_path}\nVal file: {val_file_path}\nTrain size: {train_size}, Val size: {val_size}"
         )
 
-    except (SplitError, FileNotFoundError, ValueError) as e:
+    except SplitError as e:
         raise click.ClickException(f"Splitting failed: {e}")
+    except Exception as e:
+        raise click.ClickException(f"An unexpected error occurred during splitting: {e}")
 
 
 @data.command("save-dataset")
