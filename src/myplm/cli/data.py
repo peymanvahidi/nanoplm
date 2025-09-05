@@ -178,7 +178,7 @@ def extract(input: str, output: str, force: bool):
     "-o",
     required=True,
     type=click.Path(exists=False),
-    help="Output file path for the shuffled FASTA",
+    help="Output file path / directory for the shuffled FASTA",
 )
 @click.option(
     "--backend",
@@ -203,8 +203,7 @@ def shuffle(input: str, output: str, backend: str, seed: int):
 
     if output_path.is_dir():
         # replace .fasta with _shuffled.fasta
-        output_name = input_path.stem + "_shuffled.fasta"
-        output_path = output_path / output_name
+        output_path = output_path / input_path.name.replace(".fasta", "_shuffled.fasta")
 
     try:
         shuffler = FastaShuffler(
