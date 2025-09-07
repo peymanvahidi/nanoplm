@@ -13,7 +13,7 @@ from myplm.data.extractor import Extractor, ExtractionError
 from myplm.data.shuffler import FastaShuffler, ShufflingError
 from myplm.data.filterer import Filterer, FilterError
 from myplm.data.splitor import Splitor, SplitError
-from myplm.data.dataset import ProtXDataProcessor, shard_h5_file
+from myplm.data.dataset import SaveKDDataset, shard_h5_file
 from myplm.models.teacher import ProtT5
 
 from myplm.utils import logger, create_dirs
@@ -169,7 +169,9 @@ def extract(input: str, output: str, force: bool):
         else:
             raise click.ClickException(f"Extraction failed: {e}")
     except Exception as e:
-        raise click.ClickException(f"An unexpected error occurred during extraction: {e}")
+        raise click.ClickException(
+            f"An unexpected error occurred during extraction: {e}"
+        )
 
 
 @data.command("shuffle")
@@ -223,7 +225,9 @@ def shuffle(input: str, output: str, backend: str, seed: int):
     except ShufflingError as e:
         raise click.ClickException(f"FASTA shuffling failed: {e}")
     except Exception as e:
-        raise click.ClickException(f"An unexpected error occurred during shuffling: {e}")
+        raise click.ClickException(
+            f"An unexpected error occurred during shuffling: {e}"
+        )
 
 
 @data.command("filter")
@@ -297,7 +301,9 @@ def filter(
     except FilterError as e:
         raise click.ClickException(f"Filtering failed: {e}")
     except Exception as e:
-        raise click.ClickException(f"An unexpected error occurred during filtering: {e}")
+        raise click.ClickException(
+            f"An unexpected error occurred during filtering: {e}"
+        )
 
 
 @data.command("split")
@@ -354,16 +360,25 @@ def split(
     except SplitError as e:
         raise click.ClickException(f"Splitting failed: {e}")
     except Exception as e:
-        raise click.ClickException(f"An unexpected error occurred during splitting: {e}")
+        raise click.ClickException(
+            f"An unexpected error occurred during splitting: {e}"
+        )
 
 
-@data.command("save-dataset")
+@data.command("save-kd-dataset")
 @click.option(
-    "--input-file",
+    "--input",
     "-i",
     required=True,
     type=click.Path(exists=True),
     help="Input file path where the dataset is saved",
+)
+@click.option(
+    "--output",
+    "-o",
+    required=True,
+    type=click.Path(exists=False),
+    help="Output HDF5 file path where the processed dataset will be saved.",
 )
 @click.option(
     "--teacher-model",
@@ -373,15 +388,29 @@ def split(
     help="Teacher model to use",
 )
 @click.option(
-    "--output-file",
-    "-o",
-    required=True,
-    type=click.Path(exists=False),
-    help="Output HDF5 file path where the processed dataset will be saved.",
+    "--max-seq-len",
+    default=1024,
+    type=int,
+    help="Maximum sequence length used for teacher embedding calculation, all sequences would be padded / truncated to this length",
 )
-@click.option("--max-seq-len", default=1024, type=int, help="Maximum sequence length")
 @click.option(
-    "--batch-size", default=64, type=int, help="Batch size for embedding calculation"
+    "--n-files",
+    default=1,
+    type=int,
+    help="Number of shard files to create (1 for single file, >1 for sharded files).",
+)
+@click.option(
+    "--batch-size",
+    default=4,
+    type=int,
+    help="Batch size for teacher embedding calculation",
+)
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Force overwrite existing output file",
+    default=False,
 )
 @click.option(
     "--device",
@@ -395,49 +424,69 @@ def split(
     type=int,
     help="Number of sequences to skip from the beginning of the input FASTA file before processing",
 )
-@click.option(
-    "--n-files",
-    default=1,
-    type=int,
-    help="Number of shard files to create (1 for single file, >1 for sharded files). Compatible with --sharded flag in training.",
-)
 @click.help_option("--help", "-h")
-def save_dataset(
-    input_file: str,
+def save_kd_dataset(
+    input: str,
+    output: str,
     teacher_model: str,
-    output_file: str,
     max_seq_len: int,
+    n_files: int,
     batch_size: int,
+    force: bool,
     device: str,
     skip_n: int,
-    n_files: int,
 ):
-    """Generate ProtX datasets with teacher embeddings"""
+
+    if n_files < 1:
+        raise click.ClickException("n-files must be at least 1")
+    if batch_size < 1:
+        raise click.ClickException("batch-size must be at least 1")
+    if max_seq_len < 1:
+        raise click.ClickException("max-seq-len must be at least 1")
+    if skip_n < 0:
+        raise click.ClickException("skip-n must be at least 0")
+
+    input_path = Path(input)
+    output_path = Path(output)
+
+    create_dirs(output_path)
+
+    if output_path.is_dir():
+        output_path = output_path / input_path.name.replace(".fasta", "_kd_dataset.h5")
+    else:
+        if not str(output_path).endswith(".h5"):
+            raise click.ClickException("Output must end with .h5 or be a directory")
+
+    """Generate knowledge distillation datasets with teacher embeddings"""
     if teacher_model == "prott5":
         selected_teacher_model = ProtT5()
     else:
-        logger.error(f"Teacher model {teacher_model} not supported")
-        raise click.Abort()
+        click.ClickException(f"Teacher model {teacher_model} not supported")
 
-    protx_data = ProtXDataProcessor(
-        data_path=input_file,
-        teacher_model=selected_teacher_model,
+    kd_data = SaveKDDataset(
+        input_fasta=input_path,
+        output_path=output_path,
+        teacher=selected_teacher_model,
+        mode="get_embeddings",
         max_seq_len=max_seq_len,
         batch_size=batch_size,
         device=device,
         skip_n=skip_n,
         n_files=n_files,
+        force=force,
     )
-    result = protx_data.process_dataset(save_path=Path(output_file))
+    result = kd_data.process_dataset()
 
     if n_files > 1:
         click.echo(
-            f"ProtX dataset generation completed successfully. Created {len(result)} shard files:"
+            f"Knowledge distillation dataset generation completed successfully. Created {len(result)} shard files:"
         )
         for path in result:
             click.echo(f"  {path}")
     else:
-        click.echo(f"ProtX dataset generation completed successfully. Output: {result}")
+        click.echo(
+            f"Knowledge distillation dataset generation completed successfully. Output: {result}"
+        )
 
 
 @data.command("shard")
