@@ -16,6 +16,49 @@ data_params:
   train_shards: 5
   val_shards: 2
 
+pretraining_params:
+  # Model architecture
+  embed_dim: 256
+  num_layers: 6
+  num_heads: 8
+  mlp_activation: "swiglu"
+  
+  # Sequence parameters
+  max_seq_len: 512
+  min_seq_len: 20
+  subsample_ratio: 1.0
+  
+  # MLM parameters
+  mlm_probability: 0.15
+  mask_token_probability: 0.8
+  random_token_probability: 0.1
+  leave_unchanged_probability: 0.1
+  
+  # Training parameters
+  num_epochs: 3
+  batch_size: 16
+  learning_rate: 5e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_steps: -1
+  gradient_accumulation_steps: 1
+  
+  # Logging and saving
+  logging_steps: 100
+  eval_steps: 500
+  save_steps: 1000
+  save_total_limit: 3
+  
+  # Technical parameters
+  fp16: false
+  dataloader_num_workers: 0
+  seed: 42
+  device: "auto"
+  
+  # W&B settings
+  wandb_project: "protx_pretraining"
+  wandb_run_name: null
+
 ### DO NOT CHANGE CONFIGS BELOW ###
 data_dirs:
   base_dir: "output/data"
@@ -39,3 +82,4 @@ data_dirs:
   kd_val_dir: "output/data/kd_dataset/val"
 
   wandb_checkpoints_dir: "output/wandb_checkpoints"
+  mlm_checkpoints_dir: "output/mlm_checkpoints"

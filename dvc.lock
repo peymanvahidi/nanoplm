@@ -1,33 +1,45 @@
 schema: '2.0'
 stages:
   download:
-    cmd: python3 main.py --download-data
+    cmd: myplm data download --url 
+      https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz
+      -o output/data/raw/uniref50.fasta.gz
     deps:
-    - path: src/protx/data/downloader.py
+    - path: src/myplm/data/downloader.py
       hash: md5
-      md5: 6a87d2d5c5f6fb35c411112b12aaf9e8
-      size: 1066
+      md5: 02d71a6c8dd1ef8a1147684b606b1e0f
+      size: 2308
+    params:
+      params.yaml:
+        data_dirs.compressed_fasta: output/data/raw/uniref50.fasta.gz
+        data_dirs.url: 
+          https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz
     outs:
     - path: output/data/raw/uniref50.fasta.gz
       hash: md5
-      md5: 227816b5b3a7cd1be65ea19e57e8f01c
-      size: 92986586
+      md5: 54e5460f7950fe1a66df187ca9dda1df
+      size: 93100075
   extract:
-    cmd: python3 main.py --extract-data
+    cmd: myplm data extract -i output/data/raw/uniref50.fasta.gz -o 
+      output/data/raw/uniref50.fasta
     deps:
     - path: output/data/raw/uniref50.fasta.gz
       hash: md5
-      md5: 227816b5b3a7cd1be65ea19e57e8f01c
-      size: 92986586
-    - path: src/protx/data/extractor.py
+      md5: 54e5460f7950fe1a66df187ca9dda1df
+      size: 93100075
+    - path: src/myplm/data/extractor.py
       hash: md5
-      md5: 4cf4c21000e5208160f578df649792ec
-      size: 1899
+      md5: 512cd3f6de000113a4d89834b948ad33
+      size: 1398
+    params:
+      params.yaml:
+        data_dirs.compressed_fasta: output/data/raw/uniref50.fasta.gz
+        data_dirs.extracted_fasta: output/data/raw/uniref50.fasta
     outs:
     - path: output/data/raw/uniref50.fasta
       hash: md5
-      md5: 7648cf32219f4e5f20aebc514817120d
-      size: 286510912
+      md5: e535ce25d0bf7967d3a18c6e6a7f3f38
+      size: 286776098
   preprocess:
     cmd: python3 main.py --preprocess-data
     deps:
@@ -50,32 +62,28 @@ stages:
       md5: 7099fbb631785692da131ae0a98ed059
       size: 60788
   split:
-    cmd: python3 main.py --split-data
+    cmd: myplm data split -i output/data/filter/uniref50_filtered.fasta -o 
+      output/data/split --val-ratio 0.1
     deps:
-    - path: pipeline_output/data/processed/uniref50_filtered.fasta
+    - path: output/data/filter/uniref50_filtered.fasta
       hash: md5
-      md5: 7488763186eb49222e622344670a3b69
-      size: 15904
-    - path: src/protx/data/preprocess.py
+      md5: c5817e3e2541de66ed12d0c2f5b1e0d1
+      size: 38422
+    - path: src/myplm/data/splitor.py
       hash: md5
-      md5: 76d45de2e87eb88ea0e42bc09c396d33
-      size: 13670
+      md5: a6c271c9f2c439f386d074e0c2aa93d9
+      size: 1584
     params:
-      src/protx/data/params.yaml:
-        val_ratio: 0.1
+      params.yaml:
+        data_dirs.filtered_fasta: output/data/filter/uniref50_filtered.fasta
+        data_dirs.splitted_fasta_dir: output/data/split
+        data_params.val_ratio: 0.1
     outs:
-    - path: pipeline_output/data/processed/dataset_info.txt
+    - path: output/data/split
       hash: md5
-      md5: 57e851068dc7a4224c8ba7f1ac060847
-      size: 323
-    - path: pipeline_output/data/processed/train.fasta
-      hash: md5
-      md5: 3e3e81c0cbd55c72f1e6fb58a39a8932
-      size: 14759
-    - path: pipeline_output/data/processed/val.fasta
-      hash: md5
-      md5: 54dba2d17fb9eb29faefaf0b74a1b6e0
-      size: 1145
+      md5: 00814df350aac3d25bcf53cd53e9bdf2.dir
+      size: 38422
+      nfiles: 2
   tokenize:
     cmd: python3 main.py --tokenize-data
     deps:
@@ -104,26 +112,30 @@ stages:
       md5: 23d6698d8961b260cffefbfc2451dee0
       size: 32192
   filter:
-    cmd: python3 main.py --filter-data
+    cmd: myplm data filter -i output/data/raw/uniref50_shuffled.fasta -o 
+      output/data/filter/uniref50_filtered.fasta --min-seq-len 20 --max-seq-len 
+      512 --seqs-num 100 --skip-n 0
     deps:
-    - path: pipeline_output/data/raw/uniref50.fasta
+    - path: output/data/raw/uniref50_shuffled.fasta
       hash: md5
-      md5: acd7214694350f9a0c097122b777c978
-      size: 286365155
-    - path: src/protx/data/preprocess.py
+      md5: 881ddcb151c839c672608181f9f021a0
+      size: 286776098
+    - path: src/myplm/data/filterer.py
       hash: md5
-      md5: 76d45de2e87eb88ea0e42bc09c396d33
-      size: 13670
+      md5: 6f2d3b909ebae82c37a54617b613e69e
+      size: 2704
     params:
-      src/protx/data/params.yaml:
-        max_seq_len: 512
-        max_seqs_num: 50
-        min_seq_len: 20
+      params.yaml:
+        data_dirs.shuffled_fasta: output/data/raw/uniref50_shuffled.fasta
+        data_params.filter_skip_n: 0
+        data_params.max_seq_len: 512
+        data_params.min_seq_len: 20
+        data_params.seqs_num: 100
     outs:
-    - path: pipeline_output/data/processed/uniref50_filtered.fasta
+    - path: output/data/filter/uniref50_filtered.fasta
       hash: md5
-      md5: 7488763186eb49222e622344670a3b69
-      size: 15904
+      md5: c5817e3e2541de66ed12d0c2f5b1e0d1
+      size: 38422
   teacher_embeddings:
     cmd: python3 main.py --generate-teacher-embeddings
     deps:
@@ -189,3 +201,78 @@ stages:
       hash: md5
       md5: 4d3f1c8de4576a0c25d1293fc2a45b73
       size: 1185
+  shuffle:
+    cmd: myplm data shuffle -i output/data/raw/uniref50.fasta -o 
+      output/data/raw/uniref50_shuffled.fasta --seed 24
+    deps:
+    - path: output/data/raw/uniref50.fasta
+      hash: md5
+      md5: e535ce25d0bf7967d3a18c6e6a7f3f38
+      size: 286776098
+    - path: src/myplm/data/shuffler.py
+      hash: md5
+      md5: b208a57a9b09e387960a00faa121bfcc
+      size: 4113
+    params:
+      params.yaml:
+        data_dirs.shuffled_fasta: output/data/raw/uniref50_shuffled.fasta
+        data_params.shuffle_seed: 24
+    outs:
+    - path: output/data/raw/uniref50_shuffled.fasta
+      hash: md5
+      md5: 881ddcb151c839c672608181f9f021a0
+      size: 286776098
+  save_kd_train_dataset:
+    cmd: myplm data save-kd-dataset -i output/data/split/train.fasta -o 
+      output/data/kd_dataset/train --teacher-model prott5 --max-seq-len 512 
+      --n-files 5 --batch-size 2 --device auto --skip-n 0
+    deps:
+    - path: output/data/split/train.fasta
+      hash: md5
+      md5: e0cf11a687fce31f878e2741dc9fba1f
+      size: 35098
+    - path: src/myplm/data/dataset.py
+      hash: md5
+      md5: 0a2434193b6c6cfcbcf827dcd4b16378
+      size: 33493
+    params:
+      params.yaml:
+        data_dirs.kd_train_dir: output/data/kd_dataset/train
+        data_dirs.splitted_fasta_dir: output/data/split
+        data_params.embed_calc_batch_size: 2
+        data_params.filter_skip_n: 0
+        data_params.max_seq_len: 512
+        data_params.train_shards: 5
+    outs:
+    - path: output/data/kd_dataset/train
+      hash: md5
+      md5: 4f16f3e8711cbf6031183a5d40dd9ff1.dir
+      size: 94650240
+      nfiles: 5
+  save_kd_val_dataset:
+    cmd: myplm data save-kd-dataset -i output/data/split/val.fasta -o 
+      output/data/kd_dataset/val --teacher-model prott5 --max-seq-len 512 
+      --n-files 2 --batch-size 2 --device auto --skip-n 0
+    deps:
+    - path: output/data/split/val.fasta
+      hash: md5
+      md5: 10d6cc4f6a43f613a0ad75c80c8b2038
+      size: 3324
+    - path: src/myplm/data/dataset.py
+      hash: md5
+      md5: 0a2434193b6c6cfcbcf827dcd4b16378
+      size: 33493
+    params:
+      params.yaml:
+        data_dirs.kd_val_dir: output/data/kd_dataset/val
+        data_dirs.splitted_fasta_dir: output/data/split
+        data_params.embed_calc_batch_size: 2
+        data_params.filter_skip_n: 0
+        data_params.max_seq_len: 512
+        data_params.val_shards: 2
+    outs:
+    - path: output/data/kd_dataset/val
+      hash: md5
+      md5: 21e8af826cc46dc0492723a104a35b8c.dir
+      size: 10519296
+      nfiles: 2
