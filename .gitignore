@@ -1,5 +1,4 @@
 .venv/
-.dvc
 # Python cache files
 __pycache__/
 *.py[cod]

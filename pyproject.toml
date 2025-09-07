@@ -27,6 +27,7 @@ dependencies = [
     "transformers>=4.50.2",
     "wandb>=0.19.11",
     "certifi>=2024.7.4",
+    "ipython>=9.5.0",
 ]
 
 [project.scripts]
