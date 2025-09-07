@@ -1,106 +1,121 @@
 stages:
 
   download:
-    cmd: protx data download
-      --url ${data_dirs.uniref50_url}
-      --output ${data_dirs.uniref50_fasta_gz}
+    cmd: myplm data download
+      --url ${data_dirs.url}
+      -o ${data_dirs.compressed_fasta}
     deps:
-      - src/protx/data/downloader.py
+      - src/myplm/data/downloader.py
     params:
-      - data_dirs.uniref50_url
-      - data_dirs.uniref50_fasta_gz
+      - data_dirs.url
+      - data_dirs.compressed_fasta
     outs:
-      - ${data_dirs.uniref50_fasta_gz}
+      - ${data_dirs.compressed_fasta}
 
   extract:
-    cmd: protx data extract
-      --input ${data_dirs.uniref50_fasta_gz}
-      --output ${data_dirs.uniref50_fasta}
+    cmd: myplm data extract
+      -i ${data_dirs.compressed_fasta}
+      -o ${data_dirs.extracted_fasta}
     deps:
-      - src/protx/data/extractor.py
-      - ${data_dirs.uniref50_fasta_gz}
+      - src/myplm/data/extractor.py
+      - ${data_dirs.compressed_fasta}
     params:
-      - data_dirs.uniref50_fasta_gz
-      - data_dirs.uniref50_fasta
+      - data_dirs.compressed_fasta
+      - data_dirs.extracted_fasta
     outs:
-      - ${data_dirs.uniref50_fasta}
+      - ${data_dirs.extracted_fasta}
 
-  shuffle_fasta:
-    cmd: protx data shuffle
-      --input ${data_dirs.uniref50_fasta}
-      --output ${data_dirs.shuffled_fasta_file}
+  shuffle:
+    cmd: myplm data shuffle
+      -i ${data_dirs.extracted_fasta}
+      -o ${data_dirs.shuffled_fasta}
       --seed ${data_params.shuffle_seed}
     deps:
-      - src/protx/data/shuffler.py
-      - ${data_dirs.uniref50_fasta}
+      - src/myplm/data/shuffler.py
+      - ${data_dirs.extracted_fasta}
     params:
-      - data_dirs.shuffled_fasta_file
+      - data_dirs.shuffled_fasta
       - data_params.shuffle_seed
     outs:
-      - ${data_dirs.shuffled_fasta_file}
-
-  filter_split:
-    cmd: protx data filter-split
-      --input ${data_dirs.shuffled_fasta_file}
-      --filtered-seqs ${data_dirs.uniref50_filtered_fasta}
-      --train-file ${data_dirs.train_fasta}
-      --val-file ${data_dirs.val_fasta}
+      - ${data_dirs.shuffled_fasta}
+  
+  filter:
+    cmd: myplm data filter
+      -i ${data_dirs.shuffled_fasta}
+      -o ${data_dirs.filtered_fasta}
       --min-seq-len ${data_params.min_seq_len}
       --max-seq-len ${data_params.max_seq_len}
-      --max-seqs-num ${data_params.max_seqs_num}
-      --val-ratio ${data_params.val_ratio}
-      --info-file ${data_dirs.info_file}
+      --seqs-num ${data_params.seqs_num}
       --skip-n ${data_params.filter_skip_n}
     deps:
-      - src/protx/data/filter_splitor.py
-      - ${data_dirs.shuffled_fasta_file}
+      - src/myplm/data/filterer.py
+      - ${data_dirs.shuffled_fasta}
     params:
-      - data_dirs.shuffled_fasta_file
-      - data_dirs.uniref50_filtered_fasta
-      - data_dirs.info_file
+      - data_dirs.shuffled_fasta
       - data_params.min_seq_len
       - data_params.max_seq_len
-      - data_params.max_seqs_num
-      - data_params.val_ratio
+      - data_params.seqs_num
       - data_params.filter_skip_n
     outs:
-      - ${data_dirs.uniref50_filtered_fasta}
-      - ${data_dirs.train_fasta}
-      - ${data_dirs.val_fasta}
-      - ${data_dirs.info_file}
+      - ${data_dirs.filtered_fasta}
   
-  save_protx_train_dataset:
-    cmd: protx data save-dataset
-      --input-file ${data_dirs.train_fasta}
-      --teacher-model 'prott5'
-      --output-file ${data_dirs.protx_train_prefix}
+  split:
+    cmd: myplm data split
+      -i ${data_dirs.filtered_fasta}
+      -o ${data_dirs.splitted_fasta_dir}
+      --val-ratio ${data_params.val_ratio}
+    deps:
+      - src/myplm/data/splitor.py
+      - ${data_dirs.filtered_fasta}
+    params:
+      - data_dirs.filtered_fasta
+      - data_dirs.splitted_fasta_dir
+      - data_params.val_ratio
+    outs:
+      - ${data_dirs.splitted_fasta_dir}
+  
+  save_kd_train_dataset:
+    cmd: myplm data save-kd-dataset
+      -i ${data_dirs.splitted_fasta_dir}/train.fasta
+      -o ${data_dirs.kd_train_dir}
+      --teacher-model ${data_params.teacher_model}
       --max-seq-len ${data_params.max_seq_len}
-      --batch-size ${data_params.embed_calc_batch_size}
-      --device 'auto'
       --n-files ${data_params.train_shards}
-    deps:
-      - src/protx/data/dataset.py
-      - ${data_dirs.train_fasta}
-    params:
-      - data_dirs.train_fasta
-      - data_dirs.protx_train_prefix
-      - data_params.embed_calc_batch_size
-      - data_params.train_shards
-
-  save_protx_val_dataset:
-    cmd: protx data save-dataset
-      --input-file ${data_dirs.val_fasta}
-      --teacher-model 'prott5'
-      --output-file ${data_dirs.protx_val_prefix}
-      --max-seq-len ${data_params.max_seq_len}
       --batch-size ${data_params.embed_calc_batch_size}
-      --device 'auto'
-      --n-files ${data_params.val_shards}
+      --device ${data_params.device}
+      --skip-n ${data_params.filter_skip_n}
     deps:
-      - src/protx/data/dataset.py
-      - ${data_dirs.val_fasta}
+      - src/myplm/data/dataset.py
+      - ${data_dirs.splitted_fasta_dir}/train.fasta
     params:
-      - data_dirs.protx_dataset_dir
-      - data_dirs.protx_val_prefix
+      - data_dirs.splitted_fasta_dir
+      - data_dirs.kd_train_dir
+      - data_params.max_seq_len
+      - data_params.train_shards
       - data_params.embed_calc_batch_size
+      - data_params.filter_skip_n
+    outs:
+      - ${data_dirs.kd_train_dir}
+
+  save_kd_val_dataset:
+    cmd: myplm data save-kd-dataset
+      -i ${data_dirs.splitted_fasta_dir}/val.fasta
+      -o ${data_dirs.kd_val_dir}
+      --teacher-model ${data_params.teacher_model}
+      --max-seq-len ${data_params.max_seq_len}
+      --n-files ${data_params.val_shards}
+      --batch-size ${data_params.embed_calc_batch_size}
+      --device ${data_params.device}
+      --skip-n ${data_params.filter_skip_n}
+    deps:
+      - src/myplm/data/dataset.py
+      - ${data_dirs.splitted_fasta_dir}/val.fasta
+    params:
+      - data_dirs.splitted_fasta_dir
+      - data_dirs.kd_val_dir
+      - data_params.max_seq_len
       - data_params.val_shards
+      - data_params.embed_calc_batch_size
+      - data_params.filter_skip_n
+    outs:
+      - ${data_dirs.kd_val_dir}

@@ -22,11 +22,14 @@ def read_yaml(file_path: str) -> Dict[str, Any]:
 
 def get_device():
     if torch.backends.mps.is_available():
-        return "mps"
+        device = "mps"
     elif torch.cuda.is_available():
-        return "cuda"
+        device = "cuda"
     else:
-        return "cpu"
+        device = "cpu"
+    
+    logger.info(f"Using device: {device}")
+    return device
 
 def create_dirs(path: Union[str, Path]):
     dir_path = Path(path)

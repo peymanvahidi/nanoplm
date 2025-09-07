@@ -1,12 +1,15 @@
 data_params:
   val_ratio: 0.1
-  max_seqs_num: 100
+  seqs_num: 100
   min_seq_len: 20
   max_seq_len: 512
-  embed_calc_batch_size: 64
+  teacher_model: "prott5"
+  embed_calc_batch_size: 4
+
+  device: "auto"
   
   shuffle: true
-  shuffle_seed: 23
+  shuffle_seed: 24
   # If you want to skip some sequences
   filter_skip_n: 0
   # For sharding the train and val datasets
@@ -17,21 +20,22 @@ data_params:
 data_dirs:
   base_dir: "output/data"
   raw_dir: "output/data/raw"
-  filter_split_dir: "output/data/filter_split"
-  protx_dataset_dir: "output/data/protx_dataset"
 
-  uniref50_url: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz" 
-  uniref50_fasta_gz: "output/data/raw/uniref50.fasta.gz"
-  uniref50_fasta: "output/data/raw/uniref50.fasta"
+  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+  # swissprot: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+  # trembl: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz"
+  # uniref50: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
+  # uniref90: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"
+  # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"
+  compressed_fasta: "output/data/raw/uniref50.fasta.gz"
+  extracted_fasta: "output/data/raw/uniref50.fasta"
 
-  shuffled_fasta_file: "output/data/raw/uniref50_shuffled.fasta"
+  shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"
 
-  uniref50_filtered_fasta: "output/data/filter_split/uniref50_filtered.fasta"
-  train_fasta: "output/data/filter_split/train.fasta"
-  val_fasta: "output/data/filter_split/val.fasta"
-  info_file: "output/data/filter_split/dataset_info.txt"
+  filtered_fasta: "output/data/filter/uniref50_filtered.fasta"
+  splitted_fasta_dir: "output/data/split"
 
-  protx_train_prefix: "output/data/protx_dataset/train/train.h5"
-  protx_val_prefix: "output/data/protx_dataset/val/val.h5"
+  kd_train_dir: "output/data/kd_dataset/train"
+  kd_val_dir: "output/data/kd_dataset/val"
 
   wandb_checkpoints_dir: "output/wandb_checkpoints"
