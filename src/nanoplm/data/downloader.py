@@ -4,7 +4,7 @@ import urllib.request
 from pathlib import Path
 from tqdm import tqdm
 
-from myplm.utils import create_dirs, logger
+from nanoplm.utils import create_dirs, logger
 
 
 class DownloadError(Exception):

@@ -14,17 +14,17 @@ import time
 from torch.optim import AdamW
 import os
 
-from myplm.distillation.collator import DistillDataCollator
-# from myplm.distillation.callbacks import OnnxExportCallback
-from myplm.distillation.trainer import DistillationTrainer
-from myplm.distillation.session_manager import TrainingSessionManager
-# from myplm.distillation.scheduler import ProtXScheduler
+from nanoplm.distillation.collator import DistillDataCollator
+# from nanoplm.distillation.callbacks import OnnxExportCallback
+from nanoplm.distillation.trainer import DistillationTrainer
+from nanoplm.distillation.session_manager import TrainingSessionManager
+# from nanoplm.distillation.scheduler import ProtXScheduler
 
-from myplm.models.student import ProtX
-from myplm.models.teacher import BaseTeacher, ProtT5
+from nanoplm.models.student import ProtX
+from nanoplm.models.teacher import BaseTeacher, ProtT5
 
-from myplm.data.dataset import KDDatasetOnTheFly, LoadKDDataset, LoadKDDatasetOptimized
-from myplm.utils import get_device, logger
+from nanoplm.data.dataset import KDDatasetOnTheFly, LoadKDDataset, LoadKDDatasetOptimized
+from nanoplm.utils import get_device, logger
 
 class DistillationPipeline():
     def __init__(

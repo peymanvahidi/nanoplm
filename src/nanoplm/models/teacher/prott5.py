@@ -7,7 +7,7 @@ from transformers import (
     T5Tokenizer
 )
 
-from myplm.models.teacher.base import BaseTeacher
+from nanoplm.models.teacher.base import BaseTeacher
 
 class ProtT5(BaseTeacher):
     def __init__(

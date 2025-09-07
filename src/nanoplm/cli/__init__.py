@@ -1,7 +1,7 @@
 import click
 
-from myplm.cli.data import data
-from myplm.cli.train import train
+from nanoplm.cli.data import data
+from nanoplm.cli.train import train
 
 
 @click.group(invoke_without_command=True)

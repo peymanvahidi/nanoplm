@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-MypLM CLI - Data subcommands for MypLM package
+nanoPLM CLI - Data subcommands for nanoPLM package
 """
 
 import click
 from pathlib import Path
 
-from myplm.config.datasets import DATASET_URLS
+from nanoplm.config.datasets import DATASET_URLS
 
-from myplm.data.downloader import Downloader, DownloadError
-from myplm.data.extractor import Extractor, ExtractionError
-from myplm.data.shuffler import FastaShuffler, ShufflingError
-from myplm.data.filterer import Filterer, FilterError
-from myplm.data.splitor import Splitor, SplitError
-from myplm.data.dataset import SaveKDDataset, shard_h5_file
-from myplm.models.teacher import ProtT5
+from nanoplm.data.downloader import Downloader, DownloadError
+from nanoplm.data.extractor import Extractor, ExtractionError
+from nanoplm.data.shuffler import FastaShuffler, ShufflingError
+from nanoplm.data.filterer import Filterer, FilterError
+from nanoplm.data.splitor import Splitor, SplitError
+from nanoplm.data.dataset import SaveKDDataset, shard_h5_file
+from nanoplm.models.teacher import ProtT5
 
-from myplm.utils import logger, create_dirs
+from nanoplm.utils import logger, create_dirs
 
 
 @click.group(name="data")
@@ -62,8 +62,8 @@ def download(dataset: str | None, output: str | None, url: str | None, force: bo
     Examples:
 
     \b
-      myplm data download uniref50 -o data_directory
-      myplm data download --url https://example.com/data.fasta.gz -o data_directory/mydata.fasta.gz
+      nanoplm data download uniref50 -o data_directory
+      nanoplm data download --url https://example.com/data.fasta.gz -o data_directory/mydata.fasta.gz
     """
 
     output_path = Path(output)

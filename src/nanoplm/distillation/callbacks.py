@@ -2,8 +2,8 @@ import torch
 import os
 from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
 
-from myplm.utils import create_dirs
-from myplm.models.student import ProtX
+from nanoplm.utils import create_dirs
+from nanoplm.models.student import ProtX
 
 class OnnxExportCallback(TrainerCallback):
     def __init__(

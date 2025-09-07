@@ -18,8 +18,8 @@ from transformers import (
 from transformers.modeling_outputs import MaskedLMOutput
 import math
 
-from myplm.models.student.model import ProtX
-from myplm.models.student.tokenizer import ProtXTokenizer
+from nanoplm.models.student.model import ProtX
+from nanoplm.models.student.tokenizer import ProtXTokenizer
 
 
 class ProtXMLMTokenizer(ProtXTokenizer):
@@ -286,7 +286,7 @@ class ProtXMLM(PreTrainedModel):
         # Create base ProtX model but modify config for MLM
         from transformers import ModernBertConfig
         from transformers.models.t5.modeling_t5 import T5LayerNorm
-        from myplm.models.student.model import ModernBertMLPSwiGLU
+        from nanoplm.models.student.model import ModernBertMLPSwiGLU
         
         self.bert_config = ModernBertConfig(
             vocab_size=self.vocab_size,

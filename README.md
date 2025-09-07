@@ -1,1 +1,1 @@
-# myPLM - Make your own protein language model
+# nanoPLM - Make your own protein language model

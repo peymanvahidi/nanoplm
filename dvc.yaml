@@ -1,11 +1,11 @@
 stages:
 
   download:
-    cmd: myplm data download
+    cmd: nanoplm data download
       --url ${data_dirs.url}
       -o ${data_dirs.compressed_fasta}
     deps:
-      - src/myplm/data/downloader.py
+      - src/nanoplm/data/downloader.py
     params:
       - data_dirs.url
       - data_dirs.compressed_fasta
@@ -13,11 +13,11 @@ stages:
       - ${data_dirs.compressed_fasta}
 
   extract:
-    cmd: myplm data extract
+    cmd: nanoplm data extract
       -i ${data_dirs.compressed_fasta}
       -o ${data_dirs.extracted_fasta}
     deps:
-      - src/myplm/data/extractor.py
+      - src/nanoplm/data/extractor.py
       - ${data_dirs.compressed_fasta}
     params:
       - data_dirs.compressed_fasta
@@ -26,12 +26,12 @@ stages:
       - ${data_dirs.extracted_fasta}
 
   shuffle:
-    cmd: myplm data shuffle
+    cmd: nanoplm data shuffle
       -i ${data_dirs.extracted_fasta}
       -o ${data_dirs.shuffled_fasta}
       --seed ${data_params.shuffle_seed}
     deps:
-      - src/myplm/data/shuffler.py
+      - src/nanoplm/data/shuffler.py
       - ${data_dirs.extracted_fasta}
     params:
       - data_dirs.shuffled_fasta
@@ -40,7 +40,7 @@ stages:
       - ${data_dirs.shuffled_fasta}
   
   filter:
-    cmd: myplm data filter
+    cmd: nanoplm data filter
       -i ${data_dirs.shuffled_fasta}
       -o ${data_dirs.filtered_fasta}
       --min-seq-len ${data_params.min_seq_len}
@@ -48,7 +48,7 @@ stages:
       --seqs-num ${data_params.seqs_num}
       --skip-n ${data_params.filter_skip_n}
     deps:
-      - src/myplm/data/filterer.py
+      - src/nanoplm/data/filterer.py
       - ${data_dirs.shuffled_fasta}
     params:
       - data_dirs.shuffled_fasta
@@ -60,12 +60,12 @@ stages:
       - ${data_dirs.filtered_fasta}
   
   split:
-    cmd: myplm data split
+    cmd: nanoplm data split
       -i ${data_dirs.filtered_fasta}
       -o ${data_dirs.splitted_fasta_dir}
       --val-ratio ${data_params.val_ratio}
     deps:
-      - src/myplm/data/splitor.py
+      - src/nanoplm/data/splitor.py
       - ${data_dirs.filtered_fasta}
     params:
       - data_dirs.filtered_fasta
@@ -75,7 +75,7 @@ stages:
       - ${data_dirs.splitted_fasta_dir}
   
   save_kd_train_dataset:
-    cmd: myplm data save-kd-dataset
+    cmd: nanoplm data save-kd-dataset
       -i ${data_dirs.splitted_fasta_dir}/train.fasta
       -o ${data_dirs.kd_train_dir}
       --teacher-model ${data_params.teacher_model}
@@ -85,7 +85,7 @@ stages:
       --device ${data_params.device}
       --skip-n ${data_params.filter_skip_n}
     deps:
-      - src/myplm/data/dataset.py
+      - src/nanoplm/data/dataset.py
       - ${data_dirs.splitted_fasta_dir}/train.fasta
     params:
       - data_dirs.splitted_fasta_dir
@@ -98,7 +98,7 @@ stages:
       - ${data_dirs.kd_train_dir}
 
   save_kd_val_dataset:
-    cmd: myplm data save-kd-dataset
+    cmd: nanoplm data save-kd-dataset
       -i ${data_dirs.splitted_fasta_dir}/val.fasta
       -o ${data_dirs.kd_val_dir}
       --teacher-model ${data_params.teacher_model}
@@ -108,7 +108,7 @@ stages:
       --device ${data_params.device}
       --skip-n ${data_params.filter_skip_n}
     deps:
-      - src/myplm/data/dataset.py
+      - src/nanoplm/data/dataset.py
       - ${data_dirs.splitted_fasta_dir}/val.fasta
     params:
       - data_dirs.splitted_fasta_dir

@@ -13,8 +13,8 @@ from torch.utils.data import Dataset, IterableDataset
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-from myplm.models.teacher import BaseTeacher
-from myplm.utils import logger, get_device, create_dirs
+from nanoplm.models.teacher import BaseTeacher
+from nanoplm.utils import logger, get_device, create_dirs
 
 
 class KDDatasetOnTheFly(IterableDataset):

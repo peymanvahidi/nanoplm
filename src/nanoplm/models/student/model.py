@@ -10,8 +10,8 @@ from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.t5.modeling_t5 import T5LayerNorm
 from typing import Iterator, Union, List, Generator, Tuple
 
-from myplm.models.student.tokenizer import ProtXTokenizer
-from myplm.models.student.feature_embedding import FeatureEmbedding
+from nanoplm.models.student.tokenizer import ProtXTokenizer
+from nanoplm.models.student.feature_embedding import FeatureEmbedding
 
 class ProtX(nn.Module):
     """Student model for ProtX"""

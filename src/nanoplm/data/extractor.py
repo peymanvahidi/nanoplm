@@ -3,7 +3,7 @@ from tqdm import tqdm
 from pathlib import Path
 from typing import Union
 
-from myplm.utils import logger
+from nanoplm.utils import logger
 
 
 class ExtractionError(Exception):

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Tuple, Dict, Any, Optional
 import wandb
 
-from myplm.utils import logger
+from nanoplm.utils import logger
 
 
 class TrainingSessionManager:

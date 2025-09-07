@@ -3,7 +3,7 @@ import torch.nn as nn
 from typing import Optional
 
 from transformers import PreTrainedTokenizerBase
-from myplm.utils.common import get_device
+from nanoplm.utils.common import get_device
 
 
 class BaseTeacher(abc.ABC):

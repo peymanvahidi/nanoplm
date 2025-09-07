@@ -7,7 +7,7 @@ from typing import Union, Optional, Literal
 
 from Bio import SeqIO
 from tqdm import tqdm
-from myplm.utils import logger, get_caller_dir
+from nanoplm.utils import logger, get_caller_dir
 
 Backend = Literal["seqkit", "biopython"]
 

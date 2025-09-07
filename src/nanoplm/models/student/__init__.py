@@ -1,7 +1,7 @@
-from .model import ProtX
-from .tokenizer import ProtXTokenizer
-from .feature_embedding import FeatureEmbedding
-from .pretraining import (
+from nanoplm.models.student.model import ProtX
+from nanoplm.models.student.tokenizer import ProtXTokenizer
+from nanoplm.models.student.feature_embedding import FeatureEmbedding
+from nanoplm.models.student.pretraining import (
     ProtXMLMConfig,
     ProtXMLM,
     ProtXMLMTokenizer,

@@ -1,6 +1,6 @@
-from myplm.distillation.pipeline import DistillationPipeline
-from myplm.distillation.session_manager import TrainingSessionManager
-from myplm.utils import logger
+from nanoplm.distillation.pipeline import DistillationPipeline
+from nanoplm.distillation.session_manager import TrainingSessionManager
+from nanoplm.utils import logger
 from typing import Optional
 
 class DistillationPipelineBuilder:

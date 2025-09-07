@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-MyPLM CLI - Training subcommands for MyPLM package
+nanoPLM CLI - Training subcommands for nanoPLM package
 """
 
 import click
 import json
 from typing import Optional
 
-from myplm.distillation.pipeline_builder import DistillationPipelineBuilder
-from myplm.utils import logger
+from nanoplm.distillation.pipeline_builder import DistillationPipelineBuilder
+from nanoplm.utils import logger
 
 
 @click.group(name="train")
 @click.help_option('--help', '-h')
 def train():
-    """Training-related commands: student, resume."""
+    """Group of commands for training models."""
     pass
 
 @train.command("student")
@@ -35,13 +35,13 @@ def train():
     '--protx-train-prefix',
     type=str,
     required=True,
-    help='Prefix of the training MypLM dataset'
+    help='Prefix of the training nanoplm dataset'
 )
 @click.option(
     '--protx-val-prefix',
     type=str,
     required=True,
-    help='Prefix of the validation MypLM dataset'
+    help='Prefix of the validation nanoplm dataset'
 )
 @click.option(
     '--student-embed-dim',

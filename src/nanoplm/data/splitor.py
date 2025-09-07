@@ -4,7 +4,7 @@ from typing import Union, Dict
 from Bio import SeqIO
 from tqdm import tqdm
 
-from myplm.utils import logger, create_dirs
+from nanoplm.utils import logger, create_dirs
 
 
 class SplitError(Exception):

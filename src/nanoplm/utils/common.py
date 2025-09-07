@@ -7,7 +7,7 @@ from IPython import get_ipython
 from pathlib import Path
 from typing import Dict, Any, Union
 
-from myplm.utils.logger import logger
+from nanoplm.utils.logger import logger
 
 def read_yaml(file_path: str) -> Dict[str, Any]:
     if not os.path.exists(file_path):
@@ -65,21 +65,21 @@ def get_caller_dir() -> Path:
     # Get the full call stack
     frame = inspect.currentframe()
     try:
-        # Get package path to identify frames within myplm
-        myplm_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Get package path to identify frames within nanoplm
+        nanoplm_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
         # Start from the immediate caller
         caller_frame = frame.f_back
         
-        # Traverse up the stack until we find a frame outside myplm
+        # Traverse up the stack until we find a frame outside nanoplm
         while caller_frame:
             caller_file = caller_frame.f_code.co_filename
             
-            # If the frame is not from within myplm package or standard library
-            if (not caller_file.startswith(myplm_path) and 
+            # If the frame is not from within nanoplm package or standard library
+            if (not caller_file.startswith(nanoplm_path) and 
                 not caller_file.startswith(sys.prefix) and
                 not caller_file == '<string>'):  # Ignore REPL or eval frames
-                # Found a frame outside myplm - likely the user's code
+                # Found a frame outside nanoplm - likely the user's code
                 return Path(os.path.dirname(os.path.abspath(caller_file)))
             
             # Move up to the next frame
