@@ -2,16 +2,11 @@ import logging
 import sys
 from pathlib import Path
 
-from myplm.config import DataConfig
-
-# Create Config instance
-config = DataConfig()
-
 # Create logs directory if it doesn't exist
-(Path(config.base_dir) / "logs").mkdir(parents=True, exist_ok=True)
+(Path("output") / "logs").mkdir(parents=True, exist_ok=True)
 
 # Set up file handler for all logs in a unique file per run with timestamp
-log_file = f'{config.base_dir}/logs/pipeline.log'
+log_file = f'output/logs/pipeline.log'
 file_handler = logging.FileHandler(log_file)
 file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')

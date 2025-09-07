@@ -21,9 +21,9 @@ from myplm.distillation.session_manager import TrainingSessionManager
 # from myplm.distillation.scheduler import ProtXScheduler
 
 from myplm.models.student import ProtX
-from myplm.models.teacher import ProtT5
+from myplm.models.teacher import BaseTeacher, ProtT5
 
-from myplm.data.dataset import ProtXDataGen, ProtXDataLoader, ProtXDataLoaderOptimized
+from myplm.data.dataset import KDDatasetOnTheFly, LoadKDDataset, LoadKDDatasetOptimized
 from myplm.utils import get_device, logger
 
 class DistillationPipeline():
@@ -168,15 +168,14 @@ class DistillationPipeline():
                 logger.warning(f"Could not find model weights in {self.checkpoint_dir}. Training from scratch.")
 
         teacher_model_for_collator = None
-        teacher_tokenizer_for_dataset = None
         
+        teacher = None
         if self.on_the_fly:
             teacher = ProtT5()
             teacher_model_for_collator = teacher.encoder_model
-            teacher_tokenizer_for_dataset = teacher.tokenizer
         
         train_dataset, val_dataset = self._load_dataset(
-            teacher_tokenizer=teacher_tokenizer_for_dataset,
+            teacher=teacher,
         )
 
         data_collator = DistillDataCollator(
@@ -226,8 +225,8 @@ class DistillationPipeline():
             "label_names": ["teacher_embeddings"],
             "gradient_accumulation_steps": gradient_accumulation_steps,
             # "max_grad_norm": self.max_grad_norm,
-            "dataloader_pin_memory": True,
-            "dataloader_prefetch_factor": 2,
+            # "dataloader_pin_memory": True,
+            # "dataloader_prefetch_factor": 2,
         }
 
         if self.multi_gpu:
@@ -330,26 +329,26 @@ class DistillationPipeline():
 
     def _load_dataset(
         self,
-        teacher_tokenizer: PreTrainedTokenizer = None,
+        teacher: BaseTeacher = None,
         seed: int = None
     ):
         if self.on_the_fly:
-            train_dataset = ProtXDataGen(
-                data_path=self.train_file,
-                teacher_tokenizer=teacher_tokenizer,
+            train_dataset = KDDatasetOnTheFly(
+                input_fasta=self.train_file,
+                teacher=teacher,
                 max_seq_len=self.max_seq_len,
                 device=str(self.device)
             )
-            val_dataset = ProtXDataGen(
-                data_path=self.val_file,
-                teacher_tokenizer=teacher_tokenizer,
+            val_dataset = KDDatasetOnTheFly(
+                input_fasta=self.val_file,
+                teacher=teacher,
                 max_seq_len=self.max_seq_len,
                 device=str(self.device)
             )
         else:
             if self.use_optimized_loader:
-                logger.info("Using ProtXDataLoaderOptimized for better performance")
-                train_dataset = ProtXDataLoaderOptimized(
+                logger.info("Using LoadKDDatasetOptimized for better performance")
+                train_dataset = LoadKDDatasetOptimized(
                     h5_path=self.protx_train_prefix,
                     device=str(self.device),
                     seed=seed if seed is not None else int(time.time()),
@@ -359,7 +358,7 @@ class DistillationPipeline():
                     prefetch_batches=self.prefetch_batches,
                     use_threading=self.use_threading
                 )
-                val_dataset = ProtXDataLoaderOptimized(
+                val_dataset = LoadKDDatasetOptimized(
                     h5_path=self.protx_val_prefix,
                     device=str(self.device),
                     seed=seed if seed is not None else int(time.time()) + 1,
@@ -370,14 +369,14 @@ class DistillationPipeline():
                     use_threading=self.use_threading
                 )
             else:
-                logger.info("Using standard ProtXDataLoader")
-                train_dataset = ProtXDataLoader(
+                logger.info("Using standard LoadKDDataset")
+                train_dataset = LoadKDDataset(
                     h5_path=self.protx_train_prefix,
                     device=str(self.device),
                     seed=seed if seed is not None else int(time.time()),
                     sharded=self.sharded
                 )
-                val_dataset = ProtXDataLoader(
+                val_dataset = LoadKDDataset(
                     h5_path=self.protx_val_prefix,
                     device=str(self.device),
                     seed=seed if seed is not None else int(time.time()) + 1,
