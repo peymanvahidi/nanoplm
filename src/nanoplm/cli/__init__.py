@@ -2,6 +2,7 @@ import click
 
 from nanoplm.cli.data import data
 from nanoplm.cli.train import train
+from nanoplm.cli.pretrain import pretrain
 
 
 @click.group(invoke_without_command=True)
@@ -18,3 +19,4 @@ def cli(ctx):
 # Attach grouped subcommands
 cli.add_command(data)
 cli.add_command(train)
+cli.add_command(pretrain)

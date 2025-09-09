@@ -1,25 +1,23 @@
+import re
 from transformers import PreTrainedTokenizer
 
 
-class ModernBertTokenizer(PreTrainedTokenizer):
+class ProtModernBertTokenizer(PreTrainedTokenizer):
     def __init__(
         self,
-        vocab=None,
         unk_token="<unk>",
         pad_token="<pad>",
         eos_token="</s>",
         mask_token="<mask>",
     ):
         # Default vocabulary mapping: amino acids + special tokens (pad/eos/unk/mask)
-        default_vocab = {
+        self.vocab = {
             "A": 4, "L": 5, "G": 6, "V": 7, "S": 8, "R": 9, "E": 10, "D": 11,
             "T": 12, "I": 13, "P": 14, "K": 15, "F": 16, "Q": 17, "N": 18,
             "Y": 19, "M": 20, "H": 21, "W": 22, "C": 23, "X": 24, "B": 25,
             "O": 26, "U": 27, "Z": 28,
             pad_token: 0, eos_token: 1, unk_token: 2, mask_token: 3,
         }
-
-        self.vocab = vocab if vocab is not None else default_vocab
 
         super().__init__(
             unk_token=unk_token,
@@ -53,6 +51,11 @@ class ModernBertTokenizer(PreTrainedTokenizer):
         if index in self.added_tokens_decoder:
             return self.added_tokens_decoder[index].content
         return {v: k for k, v in self.vocab.items()}.get(index, self.unk_token)
+    
+    def preprocess(self, sequence: str) -> str:
+        seq = (sequence or "").strip().upper()
+        seq = re.sub(r"[UZOB]", "X", seq)
+        return seq
 
     def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
         # Append EOS to each sequence; no BOS token used

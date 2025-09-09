@@ -1,9 +1,7 @@
-from .model import ModernBertForMaskedLM, ModernBertForMaskedLMConfig, create_modernbert_mlm
-from .tokenizer import ModernBertTokenizer
+from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM
+from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 __all__ = [
-    "ModernBertForMaskedLM",
-    "ModernBertForMaskedLMConfig",
-    "ModernBertTokenizer",
-    "create_modernbert_mlm",
+    "ProtModernBertMLM",
+    "ProtModernBertTokenizer"
 ]
