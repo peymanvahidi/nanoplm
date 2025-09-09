@@ -1,8 +1,8 @@
-import math
 import torch
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from transformers import PreTrainedTokenizer
 from dataclasses import dataclass
+from nanoplm.utils.logger import logger
 
 
 @dataclass
@@ -10,16 +10,19 @@ class MLMDataCollator:
     """Data collator for masked language modeling"""
 
     tokenizer: PreTrainedTokenizer
-    mlm_probability: float = 0.15
-    mask_token_probability: float = 0.8
-    random_token_probability: float = 0.1
-    leave_unchanged_probability: float = 0.1
+    mlm_probability: float
+    mask_token_probability: float
+    random_token_probability: float
+    leave_unchanged_probability: float
 
     def __post_init__(self):
         # Verify probabilities sum to 1
         total_prob = self.mask_token_probability + self.random_token_probability + self.leave_unchanged_probability
-        if not math.isclose(total_prob, 1.0, rel_tol=1e-5):
-            raise ValueError(f"Masking probabilities must sum to 1.0, got {total_prob}")
+        if total_prob != 1.0:
+            logger.info(f"Total of masking probabilities is {total_prob}, normalizing to 1.0")
+            self.mask_token_probability = self.mask_token_probability / total_prob
+            self.random_token_probability = self.random_token_probability / total_prob
+            self.leave_unchanged_probability = 1 - (self.mask_token_probability + self.random_token_probability)
 
         # Precompute allowed token ids for random replacement (exclude specials and [MASK])
         vocab_ids = list(self.tokenizer.get_vocab().values())
