@@ -2,6 +2,8 @@ from torch.utils.data import Dataset
 from Bio import SeqIO
 from typing import List, Dict
 from transformers import PreTrainedTokenizer
+from pathlib import Path
+import os
 
 from nanoplm.utils.logger import logger
 
@@ -21,6 +23,21 @@ class FastaMLMDataset(Dataset):
         self.fasta_path = str(fasta_path)
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
+
+        # Validate that the FASTA file exists and is readable
+        fasta_path_obj = Path(self.fasta_path)
+        if not fasta_path_obj.exists():
+            raise FileNotFoundError(f"FASTA file not found: {self.fasta_path}")
+
+        if not fasta_path_obj.is_file():
+            raise ValueError(f"Path is not a file: {self.fasta_path}")
+
+        if not os.access(self.fasta_path, os.R_OK):
+            raise PermissionError(f"FASTA file is not readable: {self.fasta_path}")
+
+        # Check if the file has any content
+        if fasta_path_obj.stat().st_size == 0:
+            raise ValueError(f"FASTA file is empty: {self.fasta_path}")
 
         # Create or open a persistent SQLite-backed index for random access.
         # This avoids storing all sequences in RAM.
