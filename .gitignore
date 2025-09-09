@@ -52,3 +52,9 @@ experiments/
 
 # wandb
 wandb/
+
+# Coverage reports
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
