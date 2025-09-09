@@ -1,6 +1,5 @@
-import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any, Union
+from typing import Optional, Tuple, Union
 from pathlib import Path
 
 from torch.utils.data import Dataset
@@ -10,39 +9,38 @@ from transformers import (
     TrainingArguments,
 )
 
-from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM
-from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
+from nanoplm.pretraining.models.modern_bert import (
+    ProtModernBertMLM,
+    ProtModernBertTokenizer,
+)
 from nanoplm.pretraining.dataset import FastaMLMDataset
 from nanoplm.pretraining.collator import MLMDataCollator
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
+
 
 @dataclass
 class PretrainingConfig:
     train_fasta: Union[str, Path]
     val_fasta: Union[str, Path]
     output_dir: str = "output/pretraining"
-    max_length: int = 512
+    max_length: int = 1024
     batch_size: int = 32
-    num_epochs: int = 3
-    learning_rate: float = 5e-4
+    num_epochs: int = 10
+    learning_rate: float = 3e-6
     weight_decay: float = 0.0
-    warmup_ratio: float = 0.0
-    mlm_probability: float = 0.15
+    warmup_ratio: float = 0.05
+    mlm_probability: float = 0.3
     gradient_accumulation_steps: int = 1
     eval_steps: Optional[int] = None
     save_steps: Optional[int] = None
-    logging_steps: int = 50
     seed: int = 42
     mask_replace_prob: float = 0.8
     random_token_prob: float = 0.1
     leave_unchanged_prob: float = 0.1
 
 
-def run_pretraining(
-    model: ProtModernBertMLM,
-    config: PretrainingConfig
-) -> None:
+def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None:
 
     device = get_device()
 
@@ -53,7 +51,7 @@ def run_pretraining(
         train_fasta=config.train_fasta,
         val_fasta=config.val_fasta,
         max_length=config.max_length,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
     )
     collator = MLMDataCollator(
         tokenizer=tokenizer,
@@ -74,7 +72,7 @@ def run_pretraining(
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
         warmup_ratio=config.warmup_ratio,
-        logging_steps=config.logging_steps,
+        logging_steps=config.eval_steps,
         eval_strategy="steps" if config.eval_steps else "no",
         eval_steps=config.eval_steps,
         save_steps=config.save_steps,
@@ -100,12 +98,12 @@ def run_pretraining(
         optimizers=[optimizer, None],
     )
 
-    logger.info("Starting Trainer.fit()")
+    logger.info("Starting Trainer")
     trainer.train()
 
     logger.info("Saving final model and tokenizer")
     trainer.save_model(config.output_dir)
-    tokenizer.save_pretrained(config.output_dir)
+
 
 def _create_datasets(
     train_fasta: Union[str, Path],
