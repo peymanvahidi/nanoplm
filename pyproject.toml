@@ -34,6 +34,13 @@ dependencies = [
 nanoplm = "nanoplm.cli:cli"
 nanoplm-data = "nanoplm.cli.data:data"
 nanoplm-train = "nanoplm.cli.train:train"
+nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
 
 [tool.setuptools.package-data]
 "nanoplm.models.student" = ["*.csv"]
+
+[tool.pytest.ini_options]
+# Add src directory to Python path so we can import nanoplm modules
+pythonpath = ["src"]
+# Directory containing test files
+testpaths = ["tests"]
