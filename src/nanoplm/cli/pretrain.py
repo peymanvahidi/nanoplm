@@ -43,6 +43,12 @@ def pretrain():
     required=True,
     help="Validation FASTA path"
 )
+@click.option(
+    "--ckp-dir",
+    type=str,
+    default="output/pretraining",
+    help="Checkpoint directory"
+)
 # Training hyperparameters
 @click.option(
     "--max-length",
@@ -193,6 +199,7 @@ def run(
     # dataset/output
     train_fasta: str,
     val_fasta: str,
+    ckp_dir: str,
     # training hp
     max_length: int,
     batch_size: int,
@@ -224,7 +231,9 @@ def run(
 
     # Build config from CLI arguments
     cfg = PretrainingConfig(
-        train_fasta=train_fasta, val_fasta=val_fasta,
+        train_fasta=train_fasta,
+        val_fasta=val_fasta,
+        ckp_dir=ckp_dir,
         max_length=max_length,
         batch_size=batch_size,
         num_epochs=num_epochs,
@@ -351,6 +360,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  # Note: these paths are RELATIVE to where you RUN the command NOT the YAML file.\n"
         "  train_fasta: data/train.fasta\n"
         "  val_fasta: data/val.fasta\n"
+        "\n"
+        "  # Output model path\n"
+        "  ckp_dir: output/pretraining\n"
         "\n"
         "  # Training hyperparameters\n"
         "  max_length: 1024\n"

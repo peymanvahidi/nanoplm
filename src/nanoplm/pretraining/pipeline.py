@@ -23,7 +23,7 @@ from nanoplm.utils.common import get_device, create_dirs
 class PretrainingConfig:
     train_fasta: Union[str, Path]
     val_fasta: Union[str, Path]
-    output_dir: str = "output/pretraining"
+    ckp_dir: str = "output/pretraining"
     max_length: int = 1024
     batch_size: int = 32
     num_epochs: int = 10
@@ -61,10 +61,10 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
         leave_unchanged_probability=config.leave_unchanged_prob,
     )
 
-    create_dirs(config.output_dir)
+    create_dirs(config.ckp_dir)
 
     args = TrainingArguments(
-        output_dir=config.output_dir,
+        output_dir=config.ckp_dir,
         per_device_train_batch_size=config.batch_size,
         per_device_eval_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -102,7 +102,7 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
     trainer.train()
 
     logger.info("Saving final model and tokenizer")
-    trainer.save_model(config.output_dir)
+    trainer.save_model(config.ckp_dir)
 
 
 def _create_datasets(
