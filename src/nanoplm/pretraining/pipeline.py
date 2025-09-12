@@ -1,9 +1,9 @@
+import torch
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 from pathlib import Path
 
 from torch.utils.data import Dataset
-from torch.optim import AdamW
 from transformers import (
     Trainer,
     TrainingArguments,
@@ -27,18 +27,24 @@ class PretrainingConfig:
     max_length: int = 1024
     batch_size: int = 32
     num_epochs: int = 10
+    warmup_ratio: float = 0.05
+    optimizer: str = "adamw"
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-8
     learning_rate: float = 3e-6
     weight_decay: float = 0.0
-    warmup_ratio: float = 0.05
-    mlm_probability: float = 0.3
     gradient_accumulation_steps: int = 1
-    eval_steps: Optional[int] = None
-    save_steps: Optional[int] = None
-    seed: int = 42
+    mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
     random_token_prob: float = 0.1
     leave_unchanged_prob: float = 0.1
-
+    eval_steps: Optional[int] = None
+    save_steps: Optional[int] = None
+    seed: int = 42
+    num_workers: int = 0
+    multi_gpu: bool = False
+    run_name: str = "nanoplm-pretraining"
 
 def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None:
 
@@ -63,30 +69,45 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
 
     create_dirs(config.ckp_dir)
 
-    args = TrainingArguments(
-        output_dir=config.ckp_dir,
-        per_device_train_batch_size=config.batch_size,
-        per_device_eval_batch_size=config.batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        num_train_epochs=config.num_epochs,
-        learning_rate=config.learning_rate,
-        weight_decay=config.weight_decay,
-        warmup_ratio=config.warmup_ratio,
-        logging_steps=config.eval_steps,
-        eval_strategy="steps" if config.eval_steps else "no",
-        eval_steps=config.eval_steps,
-        save_steps=config.save_steps,
-        save_total_limit=2,
-        seed=config.seed,
-        report_to=["wandb"],
-        # dataloader_pin_memory=True,
-        # dataloader_num_workers=max(os.cpu_count() - 1, 1),
-    )
+    training_dict = {
+        "output_dir": config.ckp_dir,
+        "per_device_train_batch_size": config.batch_size,
+        "per_device_eval_batch_size": config.batch_size,
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "num_train_epochs": config.num_epochs,
+        "learning_rate": config.learning_rate,
+        "weight_decay": config.weight_decay,
+        "warmup_ratio": config.warmup_ratio,
+        "logging_strategy": "steps",
+        "logging_steps": config.eval_steps,
+        "logging_dir": Path(config.ckp_dir) / "logs",
+        "eval_strategy": "steps" if config.eval_steps else "no",
+        "eval_steps": config.eval_steps,
+        "save_strategy": "steps",
+        "save_steps": config.save_steps,
+        "seed": config.seed,
+        "report_to": "wandb",
+        "run_name": config.run_name,
+        "dataloader_pin_memory": True if device == "cuda" else False,
+        "dataloader_num_workers": config.num_workers,
+    }
 
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-    )
+    # Configure optimizer through TrainingArguments
+    optimizer_name = config.optimizer.lower()
+    if optimizer_name == "adamw":
+        training_dict["optim"] = "adamw_torch"
+    elif optimizer_name == "stable_adamw":
+        training_dict["optim"] = "stable_adamw"
+        if config.optim_args:
+            training_dict["optim_args"] = config.optim_args
+    else:
+        raise ValueError(f"Invalid optimizer: {config.optimizer}. Currently supported: [adamw, stable_adamw]")
+
+    if config.multi_gpu:
+        training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
+        training_dict["ddp_find_unused_parameters"] = True
+    
+    args = TrainingArguments(**training_dict)
 
     trainer = Trainer(
         model=model,
@@ -95,7 +116,6 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
         train_dataset=train_ds,
         eval_dataset=val_ds,
         processing_class=tokenizer,
-        optimizers=[optimizer, None],
     )
 
     logger.info("Starting Trainer")

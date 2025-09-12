@@ -280,14 +280,14 @@ def from_yaml(config: str):
     """Run pretraining from a YAML file with training and model parameters.
 
     Expected YAML structure:
-    training: {...}
+    pretraining: {...}
     model: {...}
     """
 
     raw = read_yaml(config)
 
     # Allow both nested and flat formats; prefer nested under key 'training'
-    pretrain_dict = raw.get("training")
+    pretrain_dict = raw.get("pretraining")
     model_dict = raw.get("model")
 
     # validate and load config
@@ -355,7 +355,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_dropout: 0.0\n"
         "  classifier_activation: gelu\n"
         "\n"
-        "training:\n"
+        "pretraining:\n"
         "  # Dataset\n"
         "  # Note: these paths are RELATIVE to where you RUN the command NOT the YAML file.\n"
         "  train_fasta: data/train.fasta\n"
@@ -364,21 +364,28 @@ def get_yaml(output: Optional[str], force: bool):
         "  # Output model path\n"
         "  ckp_dir: output/pretraining\n"
         "\n"
-        "  # Training hyperparameters\n"
+        "  # Hyperparameters\n"
         "  max_length: 1024\n"
         "  batch_size: 32\n"
         "  num_epochs: 10\n"
+        "  warmup_ratio: 0.05\n"
+        "  optimizer: adamw\n" # adamw, stable_adamw
+        "  adam_beta1: 0.9\n"
+        "  adam_beta2: 0.999\n"
+        "  adam_epsilon: 1e-8\n"
         "  learning_rate: 3e-6\n"
         "  weight_decay: 0.0\n"
-        "  warmup_ratio: 0.05\n"
-        "  mlm_probability: 0.3\n"
         "  gradient_accumulation_steps: 1\n"
-        "  eval_steps: 100\n"
-        "  save_steps: 1000\n"
-        "  seed: 42\n"
+        "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
         "  leave_unchanged_prob: 0.1\n"
+        "  eval_steps: 100\n"
+        "  save_steps: 1000\n"
+        "  seed: 42\n"
+        "  num_workers: 0\n"
+        "  multi_gpu: False\n"
+        "  run_name: nanoplm-pretraining\n"
     )
 
     # If forcing, remove existing file first
@@ -427,6 +434,19 @@ def _load_pretrain_config(d: Dict[str, Any]) -> PretrainingConfig:
             kwargs['learning_rate'] = float(kwargs['learning_rate'])
         except ValueError:
             raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
+    
+    if isinstance(kwargs.get('multi_gpu'), bool):
+        pass
+    elif isinstance(kwargs.get('multi_gpu'), str):
+        value = kwargs['multi_gpu'].lower()
+        if value == 'true':
+            kwargs['multi_gpu'] = True
+        elif value == 'false':
+            kwargs['multi_gpu'] = False
+        else:
+            raise ValueError(f"Invalid multi_gpu value: {kwargs['multi_gpu']}. [True/False/true/false]")
+    else:
+        raise ValueError(f"Invalid multi_gpu value: {kwargs['multi_gpu']}. Must be a boolean or string [True/False/true/false]")
 
     return PretrainingConfig(**kwargs)
 
