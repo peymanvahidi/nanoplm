@@ -39,12 +39,14 @@ class PretrainingConfig:
     mask_replace_prob: float = 0.8
     random_token_prob: float = 0.1
     keep_probability: float = 0.1
-    eval_steps: Optional[int] = None
-    save_steps: Optional[int] = None
+    logging_steps_percentage: float = 0.01
+    eval_steps_percentage: float = 0.025
+    save_steps_percentage: float = 0.1
     seed: int = 42
     num_workers: int = 0
     multi_gpu: bool = False
     run_name: str = "nanoplm-pretraining"
+
 
 def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None:
 
@@ -69,6 +71,10 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
 
     create_dirs(config.ckp_dir)
 
+    global_batch_size = config.gradient_accumulation_steps * config.batch_size
+
+    total_steps = config.num_epochs * len(train_ds) // global_batch_size
+
     training_dict = {
         "output_dir": config.ckp_dir,
         "per_device_train_batch_size": config.batch_size,
@@ -79,12 +85,12 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
         "weight_decay": config.weight_decay,
         "warmup_ratio": config.warmup_ratio,
         "logging_strategy": "steps",
-        "logging_steps": config.eval_steps,
+        "logging_steps": int(total_steps * config.logging_steps_percentage),
         "logging_dir": Path(config.ckp_dir) / "logs",
-        "eval_strategy": "steps" if config.eval_steps else "no",
-        "eval_steps": config.eval_steps,
+        "eval_strategy": "steps",
+        "eval_steps": int(total_steps * config.eval_steps_percentage),
         "save_strategy": "steps",
-        "save_steps": config.save_steps,
+        "save_steps": int(total_steps * config.save_steps_percentage),
         "seed": config.seed,
         "report_to": "wandb",
         "run_name": config.run_name,
@@ -99,12 +105,14 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
     elif optimizer_name == "stable_adamw":
         training_dict["optim"] = "stable_adamw"
     else:
-        raise ValueError(f"Invalid optimizer: {config.optimizer}. Currently supported: [adamw, stable_adamw]")
+        raise ValueError(
+            f"Invalid optimizer: {config.optimizer}. Currently supported: [adamw, stable_adamw]"
+        )
 
     if config.multi_gpu:
         training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
         training_dict["ddp_find_unused_parameters"] = True
-    
+
     args = TrainingArguments(**training_dict)
 
     trainer = Trainer(
