@@ -33,6 +33,8 @@ class ProtModernBertTokenizer(PreTrainedTokenizer):
 
         self.model_input_names = ["input_ids", "attention_mask"]
 
+        self.id_to_token = {v: k for k, v in self.vocab.items()}
+
     @property
     def vocab_size(self) -> int:
         return len(self.vocab)
@@ -50,7 +52,7 @@ class ProtModernBertTokenizer(PreTrainedTokenizer):
     def _convert_id_to_token(self, index):
         if index in self.added_tokens_decoder:
             return self.added_tokens_decoder[index].content
-        return {v: k for k, v in self.vocab.items()}.get(index, self.unk_token)
+        return self.id_to_token.get(index, self.unk_token)
     
     def preprocess(self, sequence: str) -> str:
         seq = (sequence or "").strip().upper()
@@ -69,6 +71,9 @@ class ProtModernBertTokenizer(PreTrainedTokenizer):
         if token_ids_1 and token_ids_1[-1] != self.eos_token_id:
             token_ids_1 = token_ids_1 + [self.eos_token_id]
         return token_ids_0 + token_ids_1
+    
+    def get_vocab(self):
+        return {**self.vocab, **self.get_added_vocab()}
 
     def get_special_tokens_mask(self, token_ids_0, token_ids_1=None, already_has_special_tokens=False):
         if already_has_special_tokens:
