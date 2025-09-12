@@ -129,7 +129,7 @@ def pretrain():
     help="Probability of replacing masked tokens with random tokens"
 )
 @click.option(
-    "--leave-unchanged-prob",
+    "--keep-probability",
     type=float,
     default=0.1,
     help="Probability of leaving masked tokens unchanged"
@@ -214,7 +214,7 @@ def run(
     seed: int,
     mask_replace_prob: float,
     random_token_prob: float,
-    leave_unchanged_prob: float,
+    keep_probability: float,
     # model hp
     hidden_size: int,
     intermediate_size: int,
@@ -247,7 +247,7 @@ def run(
         seed=seed,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
-        leave_unchanged_prob=leave_unchanged_prob)
+        keep_probability=keep_probability)
     
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
@@ -379,7 +379,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
-        "  leave_unchanged_prob: 0.1\n"
+        "  keep_probability: 0.1\n"
         "  eval_steps: 100\n"
         "  save_steps: 1000\n"
         "  seed: 42\n"

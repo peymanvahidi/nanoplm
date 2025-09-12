@@ -1,121 +1,141 @@
 import torch
-from typing import Dict, Any, List
-from transformers import PreTrainedTokenizer
-from dataclasses import dataclass
-from nanoplm.utils.logger import logger
+from typing import Iterable, Optional, List
+from transformers import DataCollatorForLanguageModeling
 
 
-@dataclass
-class MLMDataCollator:
-    """Data collator for masked language modeling"""
+class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
+    """
+    Protein-aware MLM collator:
+      - custom (mask, random, keep) proportions
+      - random replacements drawn only from non-special tokens
+      - never masks at padding (attention_mask == 0)
+    """
 
-    tokenizer: PreTrainedTokenizer
-    mlm_probability: float
-    mask_token_probability: float
-    random_token_probability: float
-    leave_unchanged_probability: float
-
-    def __post_init__(self):
-        # Verify probabilities sum to 1
-        total_prob = self.mask_token_probability + self.random_token_probability + self.leave_unchanged_probability
-        if total_prob != 1.0:
-            logger.info(f"Total of masking probabilities is {total_prob}, normalizing to 1.0")
-            self.mask_token_probability = self.mask_token_probability / total_prob
-            self.random_token_probability = self.random_token_probability / total_prob
-            self.leave_unchanged_probability = 1 - (self.mask_token_probability + self.random_token_probability)
-
-        # Precompute allowed token ids for random replacement (exclude specials and [MASK])
-        vocab_ids = list(self.tokenizer.get_vocab().values())
-        special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
-        if getattr(self.tokenizer, "mask_token_id", None) is not None:
-            special_ids.add(self.tokenizer.mask_token_id)
-        self._allowed_random_token_ids = torch.tensor(
-            [tid for tid in vocab_ids if tid not in special_ids], dtype=torch.long
+    def __init__(
+        self,
+        tokenizer,
+        mlm_probability: float = 0.03,
+        mask_token_probability: float = 0.80,
+        random_token_probability: float = 0.10,
+        keep_probability: float = 0.10,
+        *,
+        extra_excluded_token_ids: Optional[Iterable[int]] = None,
+        **kwargs,
+    ):
+        # parent handles dynamic padding, tensor type, etc.
+        super().__init__(
+            tokenizer=tokenizer, mlm=True, mlm_probability=mlm_probability, **kwargs
         )
 
-    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """
-        Apply MLM masking to a batch of examples
+        # normalize split (robust to slight mis-specified sums)
+        total = mask_token_probability + random_token_probability + keep_probability
+        self.p_mask = mask_token_probability / total
+        self.p_rand = random_token_probability / total
+        self.p_keep = keep_probability / total
 
-        Args:
-            examples: List of dictionaries with 'input_ids' and 'attention_mask'
+        if getattr(self.tokenizer, "mask_token_id", None) is None:
+            raise ValueError("Tokenizer must define a mask_token_id for MLM.")
 
-        Returns:
-            Dictionary with masked input_ids, attention_mask, and labels
+        # Build the pool for random replacements: all vocab ids minus specials (and optional extras)
+        vocab_ids = list(self.tokenizer.get_vocab().values())
+        special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
+        special_ids.add(self.tokenizer.mask_token_id)
+        if extra_excluded_token_ids:
+            special_ids.update(extra_excluded_token_ids)
+
+        allowed = [tid for tid in vocab_ids if tid not in special_ids]
+        if not allowed:
+            raise ValueError(
+                "No allowable token ids for random replacement after exclusions."
+            )
+        self.allowed_random_token_ids = torch.tensor(allowed, dtype=torch.long)
+
+    def torch_mask_tokens(
+        self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None
+    ):
         """
-        # Dynamic padding using tokenizer for variable-length sequences
+        Mirrors HF logic but uses custom p_mask/p_rand/p_keep and a restricted random pool.
+        """
+        labels = inputs.clone()
+
+        # base Bernoulli for whether a position is subject to any corruption
+        probability_matrix = torch.full(
+            labels.shape, self.mlm_probability, device=inputs.device
+        )
+
+        if special_tokens_mask is None:
+            # compute via tokenizer
+            special_tokens_mask = [
+                self.tokenizer.get_special_tokens_mask(
+                    val.tolist(), already_has_special_tokens=True
+                )
+                for val in labels
+            ]
+            special_tokens_mask = torch.tensor(
+                special_tokens_mask, dtype=torch.bool, device=inputs.device
+            )
+
+        # never corrupt special positions
+        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
+
+        # sample which positions to corrupt at all
+        masked_indices = torch.bernoulli(probability_matrix).to(torch.bool)
+        labels[~masked_indices] = -100  # ignore in loss
+
+        if masked_indices.any():
+            # Within the selected positions, decide mask / random / keep
+            dice = torch.rand(size=inputs.shape, device=inputs.device)
+
+            mask_choice = (dice < self.p_mask) & masked_indices
+            rand_choice = (
+                (dice >= self.p_mask)
+                & (dice < self.p_mask + self.p_rand)
+                & masked_indices
+            )
+            # keep_choice is implicit
+
+            # 1) replace with [MASK]
+            inputs[mask_choice] = self.tokenizer.mask_token_id
+
+            # 2) replace with random non-special token
+            if rand_choice.any():
+                pool = self.allowed_random_token_ids.to(inputs.device)
+                n = rand_choice.sum().item()
+                idxs = torch.randint(
+                    low=0, high=pool.numel(), size=(n,), device=inputs.device
+                )
+                inputs[rand_choice] = pool[idxs]
+
+            # 3) keep_choice -> unchanged
+        return inputs, labels
+
+    def __call__(self, examples: List[dict]):
         batch = self.tokenizer.pad(
             examples,
             padding=True,
-            return_tensors="pt",
-            pad_to_multiple_of=8,
+            return_tensors=self.return_tensors,
+            pad_to_multiple_of=self.pad_to_multiple_of,
         )
 
         input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
 
-        # Clone input_ids for labels (original unmasked tokens)
-        labels = input_ids.clone()
+        # Build/augment special mask
+        if "special_tokens_mask" in batch:
+            special = batch["special_tokens_mask"].bool()
+        else:
+            special = [
+                self.tokenizer.get_special_tokens_mask(
+                    v.tolist(), already_has_special_tokens=True
+                )
+                for v in input_ids
+            ]
+            special = torch.tensor(special, dtype=torch.bool, device=input_ids.device)
 
-        # Create probability matrix for masking
-        probability_matrix = torch.full(labels.shape, self.mlm_probability)
+        # Forbid masking where attention_mask == 0 (padding, packed slack, etc.)
+        if "attention_mask" in batch:
+            special |= ~batch["attention_mask"].bool()
 
-        # Don't mask special tokens (use tokenizer utility)
-        special_tokens_mask = self._get_special_tokens_mask(input_ids)
-        probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-
-        # Don't mask padding tokens
-        probability_matrix.masked_fill_(~attention_mask.bool(), value=0.0)
-
-        # Sample tokens to mask
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-
-        # Set labels to -100 for non-masked tokens AND padding tokens (ignore in loss)
-        labels[~masked_indices] = -100
-        # Also set padding positions to -100 (they should always be ignored)
-        labels[~attention_mask.bool()] = -100
-
-        # Apply different masking strategies
-        self._apply_masking_strategies(input_ids, masked_indices)
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
-        }
-
-    def _get_special_tokens_mask(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get mask of special tokens that shouldn't be masked using the tokenizer's logic."""
-        seq_masks: List[List[int]] = [
-            self.tokenizer.get_special_tokens_mask(seq.tolist(), already_has_special_tokens=True)
-            for seq in input_ids
-        ]
-        return torch.tensor(seq_masks, dtype=torch.bool, device=input_ids.device)
-
-    def _apply_masking_strategies(self, input_ids: torch.Tensor, masked_indices: torch.Tensor):
-        """Apply different masking strategies to selected tokens"""
-        # Allowed random replacement token ids (move to current device lazily)
-        allowed_ids = self._allowed_random_token_ids.to(input_ids.device)
-
-        # 80% of the time: replace with [MASK] token
-        mask_token_indices = masked_indices.clone()
-        mask_prob = torch.rand(input_ids.shape, device=input_ids.device) < self.mask_token_probability
-        mask_token_indices &= mask_prob
-        input_ids[mask_token_indices] = self.tokenizer.mask_token_id
-
-        # 10% of the time: replace with random amino acid token
-        random_token_indices = masked_indices.clone()
-        random_token_indices &= ~mask_token_indices
-        random_prob = torch.rand(input_ids.shape, device=input_ids.device) < (
-            self.random_token_probability / (self.random_token_probability + self.leave_unchanged_probability)
-        )
-        random_token_indices &= random_prob
-
-        if random_token_indices.any():
-            num_random = random_token_indices.sum().item()
-            # Sample uniformly from allowed token ids
-            idxs = torch.randint(low=0, high=allowed_ids.numel(), size=(num_random,), device=input_ids.device)
-            random_tokens = allowed_ids[idxs]
-            input_ids[random_token_indices] = random_tokens
-
-        # 10% of the time: leave unchanged (already done implicitly)
+        inputs, labels = self.torch_mask_tokens(input_ids, special_tokens_mask=special)
+        batch["input_ids"] = inputs
+        batch["labels"] = labels
+        return batch

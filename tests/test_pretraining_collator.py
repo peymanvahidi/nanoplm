@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Test suite for the custom MLMDataCollator to verify it works correctly.
+Test suite for the custom ProtDataCollatorForLM to verify it works correctly.
 """
 
 import torch
 import numpy as np
-from nanoplm.pretraining.collator import MLMDataCollator
+from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 
@@ -14,12 +14,12 @@ def test_collator_basic_functionality():
     print("Testing basic collator functionality...")
 
     tokenizer = ProtModernBertTokenizer()
-    collator = MLMDataCollator(
+    collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
         mlm_probability=0.0,  # No masking for basic test
         mask_token_probability=0.8,
         random_token_probability=0.1,
-        leave_unchanged_probability=0.1
+        keep_probability=0.1
     )
 
     # Create test sequences of different lengths
@@ -67,12 +67,12 @@ def test_mlm_masking_probabilities():
 
     tokenizer = ProtModernBertTokenizer()
     mlm_prob = 0.5  # High probability to ensure masking occurs
-    collator = MLMDataCollator(
+    collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
         mlm_probability=mlm_prob,
         mask_token_probability=0.8,
         random_token_probability=0.1,
-        leave_unchanged_probability=0.1
+        keep_probability=0.1
     )
 
     # Create a simple test sequence
@@ -93,14 +93,20 @@ def test_mlm_masking_probabilities():
     attention_mask = batch['attention_mask'][0]
 
     # Verify masking occurred (some positions changed)
-    original_tokens = torch.tensor(tokenized[0]['input_ids'] + [tokenizer.eos_token_id])
+    original_tokens = torch.tensor(tokenized[0]['input_ids'])
     changed_positions = (input_ids != original_tokens)
     assert changed_positions.sum() > 0, "Some masking should occur with mlm_probability=0.5"
 
-    # Verify labels are correct: -100 for unchanged positions, original tokens for masked
-    unchanged_positions = ~changed_positions & attention_mask.bool()
-    if unchanged_positions.sum() > 0:
-        assert (labels[unchanged_positions] == -100).all(), "Unchanged positions should have -100 labels"
+    # Verify labels are correct: -100 for positions not selected for masking, original tokens for positions that were masked
+    # Positions not selected for masking should have -100 labels
+    masked_indices = (labels != -100)  # Positions that were selected for masking
+    non_masked_positions = ~masked_indices & attention_mask.bool()
+    if non_masked_positions.sum() > 0:
+        assert (labels[non_masked_positions] == -100).all(), "Non-masked positions should have -100 labels"
+
+    # Positions that were masked should preserve original tokens in labels
+    if masked_indices.sum() > 0:
+        assert (labels[masked_indices] == original_tokens[masked_indices]).all(), "Masked positions should preserve original tokens in labels"
 
     # Verify padding positions have -100 labels
     padding_positions = ~attention_mask.bool()
@@ -115,12 +121,12 @@ def test_special_tokens_not_masked():
     print("Testing special token protection...")
 
     tokenizer = ProtModernBertTokenizer()
-    collator = MLMDataCollator(
+    collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
         mlm_probability=1.0,  # Mask everything except specials
         mask_token_probability=0.8,
         random_token_probability=0.1,
-        leave_unchanged_probability=0.1
+        keep_probability=0.1
     )
 
     # Create sequence with EOS token
@@ -149,12 +155,12 @@ def test_masking_strategies():
 
     tokenizer = ProtModernBertTokenizer()
     # Set probabilities to clearly distinguish strategies
-    collator = MLMDataCollator(
+    collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
         mlm_probability=1.0,  # Mask all eligible tokens
         mask_token_probability=0.5,
         random_token_probability=0.3,
-        leave_unchanged_probability=0.2
+        keep_probability=0.2
     )
 
     # Create a long sequence to get good statistics
@@ -223,12 +229,12 @@ def test_random_token_replacement():
     print("Testing random token replacement...")
 
     tokenizer = ProtModernBertTokenizer()
-    collator = MLMDataCollator(
+    collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
         mlm_probability=1.0,
         mask_token_probability=0.0,  # No MASK tokens
         random_token_probability=1.0,  # All masked tokens get random replacement
-        leave_unchanged_probability=0.0
+        keep_probability=0.0
     )
 
     sequence = "MKALCLLLLPVLGLLTGSSGS" * 3
@@ -267,12 +273,12 @@ def test_edge_cases():
     print("Testing edge cases...")
 
     tokenizer = ProtModernBertTokenizer()
-    collator = MLMDataCollator(
+    collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
         mlm_probability=0.15,
         mask_token_probability=0.8,
         random_token_probability=0.1,
-        leave_unchanged_probability=0.1
+        keep_probability=0.1
     )
 
     # Test with empty sequence
@@ -304,12 +310,12 @@ def test_probability_validation():
 
     # Valid probabilities should work
     try:
-        collator = MLMDataCollator(
+        collator = ProtDataCollatorForLM(
             tokenizer=tokenizer,
             mlm_probability=0.15,
             mask_token_probability=0.8,
             random_token_probability=0.1,
-            leave_unchanged_probability=0.1
+            keep_probability=0.1
         )
         print("✓ Valid probabilities accepted")
     except ValueError:
@@ -317,15 +323,15 @@ def test_probability_validation():
 
     # Invalid probabilities should be normalized (not raise error)
     try:
-        collator = MLMDataCollator(
+        collator = ProtDataCollatorForLM(
             tokenizer=tokenizer,
             mlm_probability=0.15,
             mask_token_probability=0.5,
             random_token_probability=0.3,
-            leave_unchanged_probability=0.3  # Sum > 1.0 - should be normalized
+            keep_probability=0.3  # Sum > 1.0 - should be normalized
         )
         # Should not raise an error, but should normalize probabilities
-        total_prob = collator.mask_token_probability + collator.random_token_probability + collator.leave_unchanged_probability
+        total_prob = collator.p_mask + collator.p_rand + collator.p_keep
         assert abs(total_prob - 1.0) < 1e-6, f"Probabilities should be normalized to sum to 1.0, got {total_prob}"
         print("✓ Invalid probabilities correctly normalized")
     except ValueError:
@@ -336,7 +342,7 @@ def test_probability_validation():
 
 def main():
     """Run all collator tests"""
-    print("Running MLMDataCollator tests...\n")
+    print("Running ProtDataCollatorForLM tests...\n")
 
     test_collator_basic_functionality()
     print()

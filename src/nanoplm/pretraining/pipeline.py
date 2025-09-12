@@ -14,7 +14,7 @@ from nanoplm.pretraining.models.modern_bert import (
     ProtModernBertTokenizer,
 )
 from nanoplm.pretraining.dataset import FastaMLMDataset
-from nanoplm.pretraining.collator import MLMDataCollator
+from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
@@ -38,7 +38,7 @@ class PretrainingConfig:
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
     random_token_prob: float = 0.1
-    leave_unchanged_prob: float = 0.1
+    keep_probability: float = 0.1
     eval_steps: Optional[int] = None
     save_steps: Optional[int] = None
     seed: int = 42
@@ -59,12 +59,12 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
         max_length=config.max_length,
         tokenizer=tokenizer,
     )
-    collator = MLMDataCollator(
+    collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
         mlm_probability=config.mlm_probability,
         mask_token_probability=config.mask_replace_prob,
         random_token_probability=config.random_token_prob,
-        leave_unchanged_probability=config.leave_unchanged_prob,
+        keep_probability=config.keep_probability,
     )
 
     create_dirs(config.ckp_dir)
@@ -98,8 +98,6 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
         training_dict["optim"] = "adamw_torch"
     elif optimizer_name == "stable_adamw":
         training_dict["optim"] = "stable_adamw"
-        if config.optim_args:
-            training_dict["optim_args"] = config.optim_args
     else:
         raise ValueError(f"Invalid optimizer: {config.optimizer}. Currently supported: [adamw, stable_adamw]")
 
