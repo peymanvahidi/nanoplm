@@ -41,7 +41,7 @@ class ProtModernBertTokenizer(PreTrainedTokenizer):
         return self.vocab
 
     def _tokenize(self, text):
-        # Simple character-level tokenization over protein sequences
+        text = self.preprocess(text)
         return list(text)
 
     def _convert_token_to_id(self, token):
