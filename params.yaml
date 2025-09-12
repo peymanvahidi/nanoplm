@@ -1,8 +1,9 @@
 data_params:
-  val_ratio: 0.1
-  seqs_num: 100
+  seqs_num: 20000
   min_seq_len: 20
   max_seq_len: 512
+  val_ratio: 0.1
+
   teacher_model: "prott5"
   embed_calc_batch_size: 4
 
@@ -16,11 +17,8 @@ data_params:
   train_shards: 5
   val_shards: 2
 
-### DO NOT CHANGE CONFIGS BELOW ###
+# Data directories
 data_dirs:
-  base_dir: "output/data"
-  raw_dir: "output/data/raw"
-
   url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
   # swissprot: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
   # trembl: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz"
@@ -37,5 +35,3 @@ data_dirs:
 
   kd_train_dir: "output/data/kd_dataset/train"
   kd_val_dir: "output/data/kd_dataset/val"
-
-  wandb_checkpoints_dir: "output/wandb_checkpoints"
