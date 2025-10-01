@@ -45,6 +45,7 @@ class PretrainingConfig:
     seed: int = 42
     num_workers: int = 0
     multi_gpu: bool = False
+    world_size: int = 1
     run_name: str = "nanoplm-pretraining"
 
 
@@ -71,7 +72,7 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
 
     create_dirs(config.ckp_dir)
 
-    global_batch_size = config.gradient_accumulation_steps * config.batch_size
+    global_batch_size = config.gradient_accumulation_steps * config.batch_size * config.world_size
 
     total_steps = config.num_epochs * len(train_ds) // global_batch_size
 
