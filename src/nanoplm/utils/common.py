@@ -3,6 +3,7 @@ import yaml
 import torch
 import inspect
 import sys
+import subprocess
 from IPython import get_ipython
 from pathlib import Path
 from typing import Dict, Any, Union
@@ -90,3 +91,49 @@ def get_caller_dir() -> Path:
     finally:
         # Clean up the frame to prevent memory leaks
         del frame
+
+def inside_git_repo(work_dir: Path) -> bool:
+    """
+    Check if inside a Git work tree.
+    
+    Args:
+        work_dir: Directory path to check
+        
+    Returns:
+        bool: True if inside a Git repository, False otherwise
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=str(work_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def is_git_subdir(work_dir: Path) -> bool:
+    """
+    Check if work_dir is a subdirectory of a Git repository (not at root).
+    
+    Args:
+        work_dir: Directory path to check
+        
+    Returns:
+        bool: True if work_dir is a subdirectory of a Git repo, False otherwise
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(work_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if result.returncode == 0:
+            git_root = Path(result.stdout.strip()).resolve()
+            return git_root != work_dir.resolve()
+        return False
+    except FileNotFoundError:
+        return False
