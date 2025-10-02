@@ -386,6 +386,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  seed: 42\n"
         "  num_workers: 0\n"
         "  multi_gpu: False\n"
+        "  world_size: 1\n"
         "  run_name: nanoplm-pretraining\n"
     )
 
