@@ -738,10 +738,16 @@ def get_yaml(output: str | None, force: bool):
     help="Path to a params.yaml to copy into the working directory before running.",
 )
 @click.option(
+    "--distillation",
+    is_flag=True,
+    default=False,
+    help="Run full pipeline including knowledge distillation dataset preparation. By default, only runs up to split stage.",
+)
+@click.option(
     "--target",
     type=str,
     required=False,
-    help="DVC stage to reproduce (e.g., split). If omitted, runs full pipeline.",
+    help="DVC stage to reproduce (e.g., split). Overrides --distillation flag if specified.",
 )
 @click.option(
     "--no-auto-init",
@@ -765,6 +771,7 @@ def get_yaml(output: str | None, force: bool):
 )
 def repro(
     params_path: str | None,
+    distillation: bool,
     target: str | None,
     no_auto_init: bool,
     force_repro: bool,
@@ -772,10 +779,13 @@ def repro(
 ):
     """Run the DVC data pipeline, optionally with a specific params file.
 
+    By default, runs pipeline up to the 'split' stage, which is sufficient for pretraining.
+    Use --distillation to include knowledge distillation dataset preparation stages.
+
     This will:
     - Optionally initialize DVC in the current directory.
     - If --params is given, copy it to params.yaml in the working directory.
-    - Run `dvc repro` optionally for a specific stage.
+    - Run `dvc repro` for the specified stages.
     """
 
     cwd = Path.cwd()
@@ -807,6 +817,11 @@ def repro(
         raise click.ClickException(
             f"dvc.yaml not found in {work_dir}. Create a pipeline first or copy the sample from the nanoPLM repo."
         )
+
+    # Determine the target stage
+    if target is None and not distillation:
+        target = "split"
+        click.echo("Running pipeline up to 'split' stage (use --distillation to include KD dataset preparation)")
 
     # Build repro command
     cmd: list[str] = ["dvc", "repro"]
