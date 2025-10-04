@@ -83,8 +83,32 @@ def pretrain():
 @click.option(
     "--warmup-ratio",
     type=float,
-    default=0.1,
+    default=0.05,
     help="Warmup ratio"
+)
+@click.option(
+    "--optimizer",
+    type=click.Choice(["adamw", "stable_adamw"], case_sensitive=False),
+    default="adamw",
+    help="Optimizer to use"
+)
+@click.option(
+    "--adam-beta1",
+    type=float,
+    default=0.9,
+    help="Adam beta1"
+)
+@click.option(
+    "--adam-beta2",
+    type=float,
+    default=0.999,
+    help="Adam beta2"
+)
+@click.option(
+    "--adam-epsilon",
+    type=float,
+    default=1e-8,
+    help="Adam epsilon"
 )
 @click.option(
     "--mlm-probability",
@@ -99,21 +123,27 @@ def pretrain():
     help="Gradient accumulation steps",
 )
 @click.option(
-    "--eval-steps",
-    type=int,
-    default=100,
-    help="Evaluation steps interval"
+    "--logging-steps-percentage",
+    type=float,
+    default=0.01,
+    help="Fraction of total steps between log events"
 )
 @click.option(
-    "--save-steps",
-    type=int,
-    default=1000,
-    help="Checkpoint save steps"
+    "--eval-steps-percentage",
+    type=float,
+    default=0.025,
+    help="Fraction of total steps between evaluations"
+)
+@click.option(
+    "--save-steps-percentage",
+    type=float,
+    default=0.1,
+    help="Fraction of total steps between checkpoint saves"
 )
 @click.option(
     "--seed",
     type=int,
-    default=25,
+    default=42,
     help="Random seed"
 )
 @click.option(
@@ -133,6 +163,30 @@ def pretrain():
     type=float,
     default=0.1,
     help="Probability of leaving masked tokens unchanged"
+)
+@click.option(
+    "--num-workers",
+    type=int,
+    default=0,
+    help="Number of DataLoader workers"
+)
+@click.option(
+    "--multi-gpu",
+    is_flag=True,
+    default=False,
+    help="Enable multi-GPU training"
+)
+@click.option(
+    "--world-size",
+    type=int,
+    default=1,
+    help="Total number of processes for distributed training, use auto if you want to use all available GPUs"
+)
+@click.option(
+    "--run-name",
+    type=str,
+    default="nanoplm-pretraining",
+    help="Run name for experiment tracking"
 )
 # Model hyperparameters (ModernBERT)
 @click.option(
@@ -207,14 +261,23 @@ def run(
     learning_rate: float,
     weight_decay: float,
     warmup_ratio: float,
+    optimizer: str,
+    adam_beta1: float,
+    adam_beta2: float,
+    adam_epsilon: float,
     mlm_probability: float,
     gradient_accumulation_steps: int,
-    eval_steps: int,
-    save_steps: int,
+    logging_steps_percentage: float,
+    eval_steps_percentage: float,
+    save_steps_percentage: float,
     seed: int,
     mask_replace_prob: float,
     random_token_prob: float,
     keep_probability: float,
+    num_workers: int,
+    multi_gpu: bool,
+    world_size: int,
+    run_name: str,
     # model hp
     hidden_size: int,
     intermediate_size: int,
@@ -240,14 +303,24 @@ def run(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
+        optimizer=optimizer,
+        adam_beta1=adam_beta1,
+        adam_beta2=adam_beta2,
+        adam_epsilon=adam_epsilon,
         mlm_probability=mlm_probability,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        eval_steps=eval_steps,
-        save_steps=save_steps,
-        seed=seed,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
-        keep_probability=keep_probability)
+        keep_probability=keep_probability,
+        logging_steps_percentage=logging_steps_percentage,
+        eval_steps_percentage=eval_steps_percentage,
+        save_steps_percentage=save_steps_percentage,
+        seed=seed,
+        num_workers=num_workers,
+        multi_gpu=multi_gpu,
+        world_size=world_size,
+        run_name=run_name,
+    )
     
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
@@ -348,28 +421,28 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_hidden_layers: 16\n"
         "  num_attention_heads: 16\n"
         "  vocab_size: 29\n"
-        "  mlp_activation: swiglu\n"
+        "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
-        "  mlp_bias: false\n"
-        "  attention_bias: false\n"
+        "  mlp_bias: False\n"
+        "  attention_bias: False\n"
         "  attention_dropout: 0.0\n"
-        "  classifier_activation: gelu\n"
+        "  classifier_activation: \"gelu\"\n"
         "\n"
         "pretraining:\n"
         "  # Dataset\n"
         "  # Note: these paths are RELATIVE to where you RUN the command NOT the YAML file.\n"
-        "  train_fasta: output/data/split/train.fasta\n"
-        "  val_fasta: output/data/split/val.fasta\n"
+        "  train_fasta: \"output/data/split/train.fasta\"\n"
+        "  val_fasta: \"output/data/split/val.fasta\"\n"
         "\n"
         "  # Output model path\n"
-        "  ckp_dir: output/pretraining_checkpoints\n"
+        "  ckp_dir: \"output/pretraining_checkpoints\"\n"
         "\n"
         "  # Hyperparameters\n"
         "  max_length: 1024\n"
         "  batch_size: 32\n"
         "  num_epochs: 10\n"
         "  warmup_ratio: 0.05\n"
-        "  optimizer: adamw # adamw, stable_adamw\n"
+        "  optimizer: \"adamw\" # adamw, stable_adamw\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
@@ -386,8 +459,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  seed: 42\n"
         "  num_workers: 0\n"
         "  multi_gpu: False\n"
-        "  world_size: 1\n"
-        "  run_name: nanoplm-pretraining\n"
+        "  world_size: 1 # Use \"auto\" if you want to use all available GPUs\n"
+        "  run_name: \"nanoplm-pretraining\"\n"
     )
 
     # If forcing, remove existing file first
