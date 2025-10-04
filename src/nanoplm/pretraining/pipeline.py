@@ -1,3 +1,4 @@
+import os
 import torch
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -45,7 +46,7 @@ class PretrainingConfig:
     seed: int = 42
     num_workers: int = 0
     multi_gpu: bool = False
-    world_size: int = 1
+    world_size: Union[int, str] = 1
     run_name: str = "nanoplm-pretraining"
 
 
@@ -72,6 +73,10 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
 
     create_dirs(config.ckp_dir)
 
+    if config.world_size == "auto":
+        env_ws = os.environ.get("WORLD_SIZE")
+        config.world_size = int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
+
     global_batch_size = config.gradient_accumulation_steps * config.batch_size * config.world_size
 
     total_steps = config.num_epochs * len(train_ds) // global_batch_size
@@ -86,12 +91,12 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
         "weight_decay": config.weight_decay,
         "warmup_ratio": config.warmup_ratio,
         "logging_strategy": "steps",
-        "logging_steps": int(total_steps * config.logging_steps_percentage),
+        "logging_steps": max(1, int(total_steps * config.logging_steps_percentage)),
         "logging_dir": Path(config.ckp_dir) / "logs",
         "eval_strategy": "steps",
-        "eval_steps": int(total_steps * config.eval_steps_percentage),
+        "eval_steps": max(1, int(total_steps * config.eval_steps_percentage)),
         "save_strategy": "steps",
-        "save_steps": int(total_steps * config.save_steps_percentage),
+        "save_steps": max(1, int(total_steps * config.save_steps_percentage)),
         "seed": config.seed,
         "report_to": "wandb",
         "run_name": config.run_name,
