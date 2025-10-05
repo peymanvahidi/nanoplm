@@ -1,24 +1,24 @@
 <div align="center">
 
-# nanoPLM
+<img src="https://github.com/user-attachments/assets/dd520214-1f12-44c6-a6da-716934e4e981" alt="logo" width="600"/>
 
-**From FASTA to foundation model — fast.**
+**F**rom **F**ASTA to **F**oundation model — **F**ast.
 
 </div>
 
-<p>Ship a protein language model without writing a training loop. nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a single YAML to control everything.</p>
+<p>🚀 Ship a protein language model without writing a training loop. nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a simple YAML files to control everything.</p>
 
 ---
 
 ## 🧬 What makes nanoPLM different?
 
-- **Zero boilerplate**: Generate a ready‑to‑edit `pretrain.yaml` and hit run.
-- **Data you can trust**: Deterministic shuffle/split pipelines using `dvc`.
-- **Scale sensibly**: Multi‑GPU ready; CPU works for tiny runs.
+- **Control everything with simple YAML files**: Prepare your data and Pretrain your model, with YAML files.
+- **Data you can trust**: Using Data Version Control (DVC) under the hood.
+- **Scale sensibly**: Multi‑GPU ready.
 
 ---
 
-## Install
+## 🛠️ Install
 
 Clone the repo and then
 
@@ -29,27 +29,49 @@ PyPi package comming soon!
 
 ---
 
-## 🤖 Zero‑to‑model in 3 commands
+## 🤖 Zero‑to‑model in 4 commands
 
-1) Prepare data
+### 1. Get data YAML file
 
 ```bash
-dvc repro split # Prepare and split dataset into train/val
+nanoplm data get-yaml
 ```
 
-2) Create a starter YAML
+You'll get a params.yaml and dvc.yaml files. Just edit the params.yaml if you want.
+> We're using DVC under the hood, so you can track your data version.
+
+[This](#data-preparation-yaml) is the YAML file you get for data preparation.
+
+### 2. Prepare your data
+
+Use the command below to prepare your data for pLM pretraining (you'll get train and val FASTAs)
+
+```bash
+nanoplm data from-yaml <path/to/params.yaml>
+```
+
+Or if you want to prepare your data for Knowledge distillation also use the `--distillation` flag.
+This way two extra stages for calculating teacher embeddings for train and val files would also happen.
+
+```bash
+nanoplm data from-yaml <path/to/params.yaml> --distillation
+```
+
+📊 Now your data is ready! Let's start the training.
+
+### 3. Get a pretrain YAML file
 
 ```bash
 nanoplm pretrain get-yaml
 ```
 
-This writes a YAML to your current directory. Prefer a different folder?
+This writes the pretraining YAML to your current directory. Prefer a different folder?
 
 ```bash
-nanoplm pretrain get-yaml <output_dir>
+nanoplm pretrain get-yaml <output/dir>
 ```
 
-3) Train
+### 4. Start your pretraining
 
 ```bash
 nanoplm pretrain from-yaml <path/to/pretrain.yaml>
@@ -57,7 +79,49 @@ nanoplm pretrain from-yaml <path/to/pretrain.yaml>
 
 ---
 
-## The YAML you’ll edit
+## Data Preparation YAML
+
+```yaml
+data_params:
+  seqs_num: 20000
+  min_seq_len: 20
+  max_seq_len: 512
+  val_ratio: 0.1
+
+  teacher_model: "prott5"
+  embed_calc_batch_size: 4
+
+  device: "auto"
+  
+  shuffle: true
+  shuffle_seed: 24
+  # If you want to skip some sequences
+  filter_skip_n: 0
+  # For sharding the train and val datasets for KNOWLEDGE DISTILLATION
+  train_shards: 5
+  val_shards: 2
+
+# Data directories
+data_dirs:
+  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+  # swissprot: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+  # trembl: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz"
+  # uniref50: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
+  # uniref90: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"
+  # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"
+  compressed_fasta: "output/data/raw/uniref50.fasta.gz"
+  extracted_fasta: "output/data/raw/uniref50.fasta"
+
+  shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"
+
+  filtered_fasta: "output/data/filter/uniref50_filtered.fasta"
+  splitted_fasta_dir: "output/data/split"
+
+  kd_train_dir: "output/data/kd_dataset/train"
+  kd_val_dir: "output/data/kd_dataset/val"
+```
+
+## Pretraining YAML
 
 ```yaml
 # Pretraining configuration for nanoPLM
@@ -68,28 +132,28 @@ model:
   num_hidden_layers: 16
   num_attention_heads: 16
   vocab_size: 29
-  mlp_activation: swiglu
+  mlp_activation: "swiglu"
   mlp_dropout: 0.0
-  mlp_bias: false
-  attention_bias: false
+  mlp_bias: False
+  attention_bias: False
   attention_dropout: 0.0
-  classifier_activation: gelu
+  classifier_activation: "gelu"
 
 pretraining:
   # Dataset
   # Note: these paths are RELATIVE to where you RUN the command NOT the YAML file.
-  train_fasta: output/data/split/train.fasta
-  val_fasta: output/data/split/val.fasta
+  train_fasta: "output/data/split/train.fasta"
+  val_fasta: "output/data/split/val.fasta"
 
   # Output model path
-  ckp_dir: output/pretraining_checkpoints
+  ckp_dir: "output/pretraining_checkpoints"
 
   # Hyperparameters
   max_length: 1024
   batch_size: 32
   num_epochs: 10
   warmup_ratio: 0.05
-  optimizer: adamw # adamw, stable_adamw
+  optimizer: "adamw" # adamw, stable_adamw
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
@@ -106,7 +170,8 @@ pretraining:
   seed: 42
   num_workers: 0
   multi_gpu: False
-  run_name: nanoplm-pretraining
+  world_size: 1 # Use "auto" if you want to use all available GPUs
+  run_name: "nanoplm-pretraining"
 ```
 
 Tip: Paths are resolved relative to where you run the command (not where the YAML lives).
