@@ -152,6 +152,10 @@ pretraining:
   max_length: 1024
   batch_size: 32
   num_epochs: 10
+  # Info for lazy dataset loading
+  # True: Low memory usage, tokenize on-demand (slower iteration, faster startup)
+  # False: High memory usage, tokenize all sequences at once (faster iteration, slower startup)
+  lazy_dataset: False
   warmup_ratio: 0.05
   optimizer: "adamw" # adamw, stable_adamw
   adam_beta1: 0.9
