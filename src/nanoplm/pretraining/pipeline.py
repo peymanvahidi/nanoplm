@@ -28,6 +28,7 @@ class PretrainingConfig:
     max_length: int = 1024
     batch_size: int = 32
     num_epochs: int = 10
+    lazy_dataset: bool = False
     warmup_ratio: float = 0.05
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
@@ -61,6 +62,7 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
         train_fasta=config.train_fasta,
         val_fasta=config.val_fasta,
         max_length=config.max_length,
+        lazy=config.lazy_dataset,
         tokenizer=tokenizer,
     )
     collator = ProtDataCollatorForLM(
@@ -141,6 +143,7 @@ def _create_datasets(
     train_fasta: Union[str, Path],
     val_fasta: Union[str, Path],
     max_length: int,
+    lazy: bool,
     tokenizer: ProtModernBertTokenizer,
 ) -> Tuple[Dataset, Optional[Dataset]]:
 
@@ -148,12 +151,14 @@ def _create_datasets(
         fasta_path=train_fasta,
         tokenizer=tokenizer,
         max_length=max_length,
+        lazy=lazy,
     )
 
     val_ds = FastaMLMDataset(
         fasta_path=val_fasta,
         tokenizer=tokenizer,
         max_length=max_length,
+        lazy=lazy,
     )
 
     return train_ds, val_ds

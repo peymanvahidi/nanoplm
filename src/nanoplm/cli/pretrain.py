@@ -69,6 +69,12 @@ def pretrain():
     help="Number of epochs"
 )
 @click.option(
+    "--lazy-dataset",
+    is_flag=True,
+    default=False,
+    help="Use lazy dataset loading"
+)
+@click.option(
     "--learning-rate",
     type=float,
     default=3e-6,
@@ -258,6 +264,7 @@ def run(
     max_length: int,
     batch_size: int,
     num_epochs: int,
+    lazy_dataset: bool,
     learning_rate: float,
     weight_decay: float,
     warmup_ratio: float,
@@ -300,6 +307,7 @@ def run(
         max_length=max_length,
         batch_size=batch_size,
         num_epochs=num_epochs,
+        lazy_dataset=lazy_dataset,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
@@ -441,6 +449,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  max_length: 1024\n"
         "  batch_size: 32\n"
         "  num_epochs: 10\n"
+        "  # Info for lazy dataset loading\n"
+        "  # True: Low memory usage, tokenize on-demand (slower iteration, faster startup)\n"
+        "  # False: High memory usage, tokenize all sequences at once (faster iteration, slower startup)\n"
+        "  lazy_dataset: False\n"
         "  warmup_ratio: 0.05\n"
         "  optimizer: \"adamw\" # adamw, stable_adamw\n"
         "  adam_beta1: 0.9\n"

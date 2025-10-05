@@ -9,9 +9,12 @@ from nanoplm.utils.logger import logger
 
 
 class FastaMLMDataset(Dataset):
-    """FASTA dataset that tokenizes sequences lazily for MLM pretraining.
+    """FASTA dataset that tokenizes sequences for MLM pretraining.
 
     Uses an on-disk index for random access and defers padding to the collator.
+
+    If initialized with lazy=False, all sequences are tokenized eagerly during
+    construction and kept in memory for faster iteration at the cost of RAM.
     """
 
     def __init__(
@@ -19,10 +22,12 @@ class FastaMLMDataset(Dataset):
         fasta_path: str,
         tokenizer: PreTrainedTokenizer,
         max_length: int,
+        lazy: bool = False,
     ) -> None:
         self.fasta_path = str(fasta_path)
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
+        self.lazy = bool(lazy)
 
         # Validate that the FASTA file exists and is readable
         fasta_path_obj = Path(self.fasta_path)
@@ -49,15 +54,52 @@ class FastaMLMDataset(Dataset):
             raise ValueError(f"No sequences found in FASTA: {self.fasta_path}")
 
         logger.info(
-            f"Loaded FASTA: {self.fasta_path} with {len(self._keys):,} sequences (max_length={self.max_length})."
+            f"Loaded FASTA: {self.fasta_path} with {len(self._keys):,} sequences (max_length={self.max_length}, lazy={self.lazy})."
         )
 
+        # If not lazy, tokenize all sequences now and store them in memory
+        self._encodings = None
+        if not self.lazy:
+            encodings: List[Dict[str, any]] = []
+            for key in self._keys:
+                record = self._index[key]
+                sequence = str(record.seq)
+                sequence = self.tokenizer.preprocess(sequence)
+
+                encoding = self.tokenizer(
+                    sequence,
+                    add_special_tokens=True,
+                    padding=False,  # defer padding to the collator for dynamic padding
+                    max_length=self.max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+
+                encodings.append(
+                    {
+                        "input_ids": encoding["input_ids"].squeeze(0),
+                        "attention_mask": encoding["attention_mask"].squeeze(0),
+                    }
+                )
+
+            self._encodings = encodings
+            logger.info(
+                f"Eagerly tokenized and cached {len(self._encodings):,} sequences in memory."
+            )
+
     def __len__(self) -> int:
-        return len(self._keys)
+        if self.lazy:
+            return len(self._keys)
+        return len(self._encodings) if self._encodings is not None else 0
 
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
-        if idx < 0 or idx >= len(self._keys):
-            raise IndexError(f"Index {idx} out of bounds for dataset of size {len(self)}")
+        if idx < 0 or idx >= len(self):
+            raise IndexError(
+                f"Index {idx} out of bounds for dataset of size {len(self)}"
+            )
+
+        if not self.lazy:
+            return self._encodings[idx]
 
         key = self._keys[idx]
         record = self._index[key]
@@ -70,7 +112,7 @@ class FastaMLMDataset(Dataset):
             padding=False,  # defer padding to the collator for dynamic padding
             max_length=self.max_length,
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
         )
 
         return {

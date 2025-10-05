@@ -269,6 +269,44 @@ MAIGTMAIGTMAIGT
             assert isinstance(seq['input_ids'], torch.Tensor), "input_ids should be tensor"
             assert isinstance(seq['attention_mask'], torch.Tensor), "attention_mask should be tensor"
 
+    def test_dataset_lazy_vs_non_lazy(self, temp_fasta_file, tokenizer):
+        """Test lazy vs non-lazy loading modes."""
+        # Test lazy mode (default)
+        lazy_dataset = FastaMLMDataset(
+            fasta_path=temp_fasta_file,
+            tokenizer=tokenizer,
+            max_length=128,
+            lazy=True
+        )
+
+        # Test non-lazy mode
+        non_lazy_dataset = FastaMLMDataset(
+            fasta_path=temp_fasta_file,
+            tokenizer=tokenizer,
+            max_length=128,
+            lazy=False
+        )
+
+        # Both should have same length
+        assert len(lazy_dataset) == len(non_lazy_dataset), "Datasets should have same length"
+
+        # Non-lazy dataset should have cached encodings
+        assert hasattr(non_lazy_dataset, '_encodings'), "Non-lazy dataset should have _encodings"
+        assert non_lazy_dataset._encodings is not None, "_encodings should be populated"
+        assert len(non_lazy_dataset._encodings) == len(non_lazy_dataset), "Should cache all encodings"
+
+        # Lazy dataset should not have cached encodings
+        assert not hasattr(lazy_dataset, '_encodings') or lazy_dataset._encodings is None, "Lazy dataset should not cache encodings"
+
+        # Results should be identical
+        for i in range(len(lazy_dataset)):
+            lazy_sample = lazy_dataset[i]
+            non_lazy_sample = non_lazy_dataset[i]
+
+            # Compare tensors
+            assert torch.equal(lazy_sample['input_ids'], non_lazy_sample['input_ids']), f"input_ids should match for index {i}"
+            assert torch.equal(lazy_sample['attention_mask'], non_lazy_sample['attention_mask']), f"attention_mask should match for index {i}"
+
     def test_dataset_memory_efficiency(self, temp_fasta_file, tokenizer):
         """Test that dataset doesn't load all sequences into memory."""
         dataset = FastaMLMDataset(
