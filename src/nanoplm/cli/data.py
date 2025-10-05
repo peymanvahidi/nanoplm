@@ -728,14 +728,12 @@ def get_yaml(output: str | None, force: bool):
     click.echo(f"Both files are written to: {output_path} directory.\nEdit the params.yaml file and use `nanoplm data repro` to run the pipeline.")
 
 
-@data.command("repro")
+@data.command("from-yaml")
 @click.help_option("--help", "-h")
-@click.option(
-    "--params",
-    "params_path",
-    type=click.Path(exists=True, dir_okay=False, readable=True, resolve_path=True),
-    required=False,
-    help="Path to a params.yaml to copy into the working directory before running.",
+@click.argument(
+    "config",
+    default="params.yaml",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
 )
 @click.option(
     "--distillation",
@@ -769,54 +767,66 @@ def get_yaml(output: str | None, force: bool):
     default=False,
     help="Run 'dvc repro' with -v for verbose output.",
 )
-def repro(
-    params_path: str | None,
+def from_yaml(
+    config: str,
     distillation: bool,
     target: str | None,
     no_auto_init: bool,
     force_repro: bool,
     verbose: bool,
 ):
-    """Run the DVC data pipeline, optionally with a specific params file.
+    """Run the DVC data pipeline from a YAML file with training and model parameters.
 
     By default, runs pipeline up to the 'split' stage, which is sufficient for pretraining.
     Use --distillation to include knowledge distillation dataset preparation stages.
 
     This will:
     - Optionally initialize DVC in the current directory.
-    - If --params is given, copy it to params.yaml in the working directory.
     - Run `dvc repro` for the specified stages.
     """
 
-    cwd = Path.cwd()
+    config = Path(config)
 
-    work_dir = Path(params_path).parent if params_path else cwd
+    if config.is_absolute():
+        cwd = config.parent
+        params_yaml = config
+    else:
+        params_yaml = Path.cwd() / config
+        cwd = params_yaml.parent
 
-    dvc_dir = work_dir / ".dvc"
+    dvc_yaml = cwd / "dvc.yaml"
+    dvc_dir = cwd / ".dvc"
+
+    if not dvc_yaml.exists():
+        raise click.ClickException(
+            f"dvc.yaml not found in {cwd}."
+            "\nUse `nanoplm data get-yaml` to generate a dvc.yaml file."
+        )
+    
+    if not params_yaml.exists():
+        raise click.ClickException(
+            f"params.yaml not found in {cwd}."
+            "\nUse `nanoplm data get-yaml` to generate a params.yaml file."
+        )
+
     if not dvc_dir.exists():
         if not no_auto_init:
             try:
                 init_cmd = ["dvc", "init", "-q"]
-                if not inside_git_repo(work_dir):
+                if not inside_git_repo(cwd):
                     init_cmd.append("--no-scm")
-                elif is_git_subdir(work_dir):
+                elif is_git_subdir(cwd):
                     init_cmd.append("--subdir")
-                subprocess.run(init_cmd, cwd=str(work_dir), check=True)
-                click.echo(f"Initialized DVC repository in: {work_dir}")
+                subprocess.run(init_cmd, cwd=str(cwd), check=True)
+                click.echo(f"Initialized DVC repository in: {cwd}")
             except (subprocess.CalledProcessError, FileNotFoundError) as e:
                 raise click.ClickException(
-                    f"Failed to initialize DVC in {work_dir}. Ensure DVC is installed and on PATH. Details: {e}"
+                    f"Failed to initialize DVC in {cwd}. Ensure DVC is installed and on PATH. Details: {e}"
                 )
         else:
             raise click.ClickException(
-                f"DVC is not initialized in {work_dir}. Run 'dvc init' first."
+                f"DVC is not initialized in {cwd}. Run 'dvc init' first."
             )
-
-    dvc_yaml = work_dir / "dvc.yaml"
-    if not dvc_yaml.exists():
-        raise click.ClickException(
-            f"dvc.yaml not found in {work_dir}. Create a pipeline first or copy the sample from the nanoPLM repo."
-        )
 
     # Determine the target stage
     if target is None and not distillation:
@@ -831,19 +841,9 @@ def repro(
         cmd.append("-f")
     if target:
         cmd.append(target)
-
-    params_dst = work_dir / "params.yaml"
-
-    if params_path is not None:
-        src = Path(params_path)
-        try:
-            if src.resolve() != params_dst.resolve():
-                shutil.copy2(src, params_dst)
-        except FileNotFoundError:
-            raise click.ClickException(f"Params file not found: {src}")
     
     try:
-        subprocess.run(cmd, cwd=str(work_dir), check=True)
+        subprocess.run(cmd, cwd=str(cwd), check=True)
     except FileNotFoundError:
         raise click.ClickException("'dvc' command not found. Please install DVC (pip install dvc).")
     except subprocess.CalledProcessError as e:

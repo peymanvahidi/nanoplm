@@ -355,6 +355,7 @@ def run(
 )
 @click.argument(
     "config",
+    default="pretrain.yaml",
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
 def from_yaml(config: str):
@@ -364,8 +365,16 @@ def from_yaml(config: str):
     pretraining: {...}
     model: {...}
     """
+    config = Path(config)
 
-    raw = read_yaml(config)
+    if config.is_absolute():
+        cwd = config.parent
+        pretrain_yaml = config
+    else:
+        cwd = Path.cwd()
+        pretrain_yaml = cwd / config
+
+    raw = read_yaml(pretrain_yaml)
 
     # Allow both nested and flat formats; prefer nested under key 'training'
     pretrain_dict = raw.get("pretraining")
