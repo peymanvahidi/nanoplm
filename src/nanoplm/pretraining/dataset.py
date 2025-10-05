@@ -2,6 +2,7 @@ from torch.utils.data import Dataset
 from Bio import SeqIO
 from typing import List, Dict
 from transformers import PreTrainedTokenizer
+from tqdm import tqdm
 from pathlib import Path
 import os
 
@@ -61,7 +62,7 @@ class FastaMLMDataset(Dataset):
         self._encodings = None
         if not self.lazy:
             encodings: List[Dict[str, any]] = []
-            for key in self._keys:
+            for key in tqdm(self._keys, desc="Tokenizing sequences", total=len(self._keys)):
                 record = self._index[key]
                 sequence = str(record.seq)
                 sequence = self.tokenizer.preprocess(sequence)
