@@ -16,7 +16,6 @@ import os
 from nanoplm.distillation.collator import DistillDataCollator
 from nanoplm.distillation.trainer import DistillationTrainer
 from nanoplm.distillation.session_manager import TrainingSessionManager
-# from nanoplm.distillation.scheduler import ProtXScheduler
 
 from nanoplm.models.student import ProtX
 from nanoplm.models.teacher import BaseTeacher, ProtT5
