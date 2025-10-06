@@ -455,7 +455,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
         "\n"
         "  # Hyperparameters\n"
-        "  max_length: 1024\n"
+        "  max_length: 512\n"
         "  batch_size: 32\n"
         "  num_epochs: 10\n"
         "  # Info for lazy dataset loading\n"
