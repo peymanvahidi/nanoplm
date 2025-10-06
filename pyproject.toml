@@ -34,7 +34,6 @@ dependencies = [
     "click>=8.1.8",
     "dvc>=3.59.1",
     "h5py>=3.13.0",
-    "onnx>=1.17.0",
     "pyyaml>=6.0.2",
     "safetensors>=0.4.0",
     "seaborn>=0.13.2",
@@ -60,7 +59,5 @@ nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
 "nanoplm.models.student" = ["*.csv"]
 
 [tool.pytest.ini_options]
-# Add src directory to Python path so we can import nanoplm modules
 pythonpath = ["src"]
-# Directory containing test files
 testpaths = ["tests"]
