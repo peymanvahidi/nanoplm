@@ -20,12 +20,11 @@
 
 ## 🛠️ Install
 
-Clone the repo and then
+Install the package from PyPi
 
 ```bash
-pip install .
+pip install nanoplm
 ```
-PyPi package comming soon!
 
 ---
 
