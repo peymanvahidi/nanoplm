@@ -58,3 +58,5 @@ wandb/
 coverage.xml
 htmlcov/
 .pytest_cache/
+
+scripts/
