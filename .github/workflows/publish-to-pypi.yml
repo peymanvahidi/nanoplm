@@ -76,32 +76,3 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
-
-  publish-to-github-packages:
-    name: Publish to GitHub Packages
-    needs:
-      - build
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-      contents: read
-    steps:
-      - name: Download all the dists
-        uses: actions/download-artifact@v4
-        with:
-          name: python-package-distributions
-          path: dist/
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-      - name: Install Twine
-        run: |
-          python -m pip install --upgrade pip
-          pip install twine
-      - name: Publish to GitHub Packages
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: twine upload --repository-url https://pypi.pkg.github.com/${{ github.repository_owner }}/ --verbose dist/*
-
