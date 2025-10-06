@@ -88,16 +88,17 @@ data_params:
   max_seq_len: 512
   val_ratio: 0.1
 
-  teacher_model: "prott5"
-  embed_calc_batch_size: 4
-
   device: "auto"
   
   shuffle: true
   shuffle_seed: 24
+
   # If you want to skip some sequences
   filter_skip_n: 0
-  # For sharding the train and val datasets for KNOWLEDGE DISTILLATION
+
+  # These are only needed for KNOWLEDGE DISTILLATION, no need to change them if you want to do pretraining only
+  teacher_model: "prott5"
+  embed_calc_batch_size: 4
   train_shards: 5
   val_shards: 2
 
@@ -117,6 +118,7 @@ data_dirs:
   filtered_fasta: "output/data/filter/uniref50_filtered.fasta"
   splitted_fasta_dir: "output/data/split"
 
+  # These dirs are only used for KNOWLEDGE DISTILLATION, no need to change them if you want to do pretraining only
   kd_train_dir: "output/data/kd_dataset/train"
   kd_val_dir: "output/data/kd_dataset/val"
 ```
