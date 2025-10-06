@@ -101,7 +101,7 @@ jobs:
           pip install twine
       - name: Publish to GitHub Packages
         env:
-          TWINE_USERNAME: ${{ github.actor }}
+          TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: twine upload --repository-url https://pypi.pkg.github.com/${{ github.repository_owner }}/ dist/*
+        run: twine upload --repository-url https://pypi.pkg.github.com/${{ github.repository_owner }}/ --verbose dist/*
 
