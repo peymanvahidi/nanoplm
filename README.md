@@ -93,6 +93,7 @@ data_params:
 
   device: "auto"
   
+  shuffle_backend: "biopython" # or "seqkit" (faster, but you need to install it)
   shuffle: true
   shuffle_seed: 24
 
@@ -154,7 +155,7 @@ pretraining:
   ckp_dir: "output/pretraining_checkpoints"
 
   # Hyperparameters
-  max_length: 1024
+  max_length: 512
   batch_size: 32
   num_epochs: 10
   # Info for lazy dataset loading
