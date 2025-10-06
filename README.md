@@ -4,11 +4,14 @@
 
 **F**rom **F**ASTA to **F**oundation model — **F**ast.
 
-</div>
+[![GitHub Actions](https://img.shields.io/github/actions/workflow/status/heispv/nanoplm/publish-to-pypi.yml?style=plastic&logo=github-actions&label=CI)](https://github.com/heispv/nanoplm/actions/workflows/publish-to-pypi.yml)
+[![License](https://img.shields.io/github/license/heispv/nanoplm?style=plastic&color=orange&logo=github&label=License)](./LICENSE)
+[![PyPI Version](https://img.shields.io/pypi/v/nanoplm?style=plastic&color=4b8bbe&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/nanoplm/)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=plastic)](https://github.com/psf/black)
 
 <p>🚀 Ship a protein language model without writing a training loop. nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a simple YAML files to control everything.</p>
 
----
+</div>
 
 ## 🧬 What makes nanoPLM different?
 
