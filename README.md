@@ -47,14 +47,18 @@ You'll get a params.yaml and dvc.yaml files. Just edit the params.yaml if you wa
 Use the command below to prepare your data for pLM pretraining (you'll get train and val FASTAs)
 
 ```bash
-nanoplm data from-yaml <path/to/params.yaml>
+nanoplm data from-yaml
 ```
+
+> By default, this uses `params.yaml` in your current directory. You can optionally specify a different path argument (relative or absolute) if needed.
+Like: `nanoplm data from-yaml <path/to/params.yaml>`
+
 
 Or if you want to prepare your data for Knowledge distillation also use the `--distillation` flag.
 This way two extra stages for calculating teacher embeddings for train and val files would also happen.
 
 ```bash
-nanoplm data from-yaml <path/to/params.yaml> --distillation
+nanoplm data from-yaml --distillation
 ```
 
 📊 Now your data is ready! Let's start the training.
@@ -65,17 +69,16 @@ nanoplm data from-yaml <path/to/params.yaml> --distillation
 nanoplm pretrain get-yaml
 ```
 
-This writes the pretraining YAML to your current directory. Prefer a different folder?
-
-```bash
-nanoplm pretrain get-yaml <output/dir>
-```
+> This writes the pretraining YAML to your current directory. Prefer a different folder?
+Use: `nanoplm pretrain get-yaml <output/dir>`
 
 ### 4. Start your pretraining
 
 ```bash
-nanoplm pretrain from-yaml <path/to/pretrain.yaml>
+nanoplm pretrain from-yaml
 ```
+
+> By default, this uses `pretrain.yaml` in your current directory. You can optionally specify a different path argument (relative or absolute) if needed.
 
 ---
 
