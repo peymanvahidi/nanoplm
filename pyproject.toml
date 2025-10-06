@@ -1,16 +1,33 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=61.0", "wheel>0.37.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nanoplm"
 version = "0.1.0"
-description = "Make your own protein language model"
+description = "Make your own protein language model, faster than ever."
+license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
-    {name = "Peyman Vahidi", email = "peyman.vahidi@tum.de"},
+    {name = "Peyman Vahidi", email = "peyman.vahidi@helmholtz-munich.de"},
 ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Natural Language :: English",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+keywords = ["bioinformatics", "protein-language-model", "large-language-models"]
 dependencies = [
     "accelerate>=1.7.0",
     "biopython>=1.85",
@@ -35,6 +52,9 @@ nanoplm = "nanoplm.cli:cli"
 nanoplm-data = "nanoplm.cli.data:data"
 nanoplm-distill = "nanoplm.cli.distill:distill"
 nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
+
+[project.urls]
+"Homepage" = "https://github.com/heispv/nanoplm"
 
 [tool.setuptools.package-data]
 "nanoplm.models.student" = ["*.csv"]
