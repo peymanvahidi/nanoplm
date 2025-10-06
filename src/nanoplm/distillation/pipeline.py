@@ -3,7 +3,6 @@ import wandb
 from pathlib import Path
 from safetensors.torch import load_file
 from transformers import (
-    PreTrainedTokenizer, 
     TrainingArguments, 
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
@@ -15,7 +14,6 @@ from torch.optim import AdamW
 import os
 
 from nanoplm.distillation.collator import DistillDataCollator
-# from nanoplm.distillation.callbacks import OnnxExportCallback
 from nanoplm.distillation.trainer import DistillationTrainer
 from nanoplm.distillation.session_manager import TrainingSessionManager
 # from nanoplm.distillation.scheduler import ProtXScheduler
@@ -242,15 +240,6 @@ class DistillationPipeline():
                 is_resuming=is_resuming
             )
             wandb.init(**wandb_config)
-
-        
-        # ONNX export disabled - will be handled by separate script after training
-        # onnx_export_callback = OnnxExportCallback(
-        #     onnx_export_path=str(output_dir / "onnx"),
-        #     batch_size=self.distill_config.batch_size,
-        #     seq_len=self.data_config.max_seq_len,
-        #     device=str(self.device)
-        # )
         
         optimizer = AdamW(
             student.parameters(),
