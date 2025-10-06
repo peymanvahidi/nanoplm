@@ -62,7 +62,7 @@ class FastaShuffler:
                 return "seqkit"
             else:
                 raise ShufflingError(
-                    "seqkit is not available. Install it or use another backend."
+                    "`seqkit` is not available. Install it first, or use `biopython` backend."
                 )
         elif self.backend == "biopython":
             return "biopython"
