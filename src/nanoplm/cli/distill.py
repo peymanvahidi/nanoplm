@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-nanoPLM CLI - Training subcommands for nanoPLM package
+nanoPLM CLI - Distillation subcommands for nanoPLM package
 """
 
 import click
@@ -11,13 +11,13 @@ from nanoplm.distillation.pipeline_builder import DistillationPipelineBuilder
 from nanoplm.utils import logger
 
 
-@click.group(name="train")
+@click.group(name="distill")
 @click.help_option('--help', '-h')
-def train():
-    """Group of commands for training models."""
+def distill():
+    """Group of commands for distillation models."""
     pass
 
-@train.command("student")
+@distill.command("run")
 @click.help_option('--help', '-h')
 @click.option(
     '--train-file',
@@ -195,7 +195,7 @@ def train():
     is_flag=True,
     help='Disable projection layer (student and teacher embeddings must have same dimension 1024)'
 )
-def train_student(
+def run(
     train_file: str,
     val_file: str,
     protx_train_prefix: str,
@@ -227,7 +227,7 @@ def train_student(
     no_threading: bool,
     no_projection_layer: bool,
 ):
-    """Train the student model"""
+    """Distill the teacher model into a student model"""
     # Parse lr_scheduler_kwargs if provided
     parsed_lr_kwargs = {}
     if lr_scheduler_kwargs:
@@ -284,7 +284,7 @@ def train_student(
 
     pipeline.train()
 
-@train.command("resume")
+@distill.command("run-resume")
 @click.help_option('--help', '-h')
 @click.option(
     '--checkpoint-dir',
@@ -323,7 +323,7 @@ def train_student(
     default=None,
     help='Override gradient clipping norm for resumed training (optional)'
 )
-def resume_training(
+def resume_distillation(
     checkpoint_dir: str,
     num_epochs: int,
     lr: float,
@@ -331,17 +331,17 @@ def resume_training(
     lr_scheduler_kwargs: str,
     max_grad_norm: float
 ):
-    """Resume training from a checkpoint with optional learning rate and scheduler overrides.
+    """Resume distillation from a checkpoint with optional learning rate and scheduler overrides.
     
     Examples:
         # Resume with new learning rate:
-        protx train resume --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr 5e-4
+        protx distill resume --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr 5e-4
 
         # Resume with linear scheduler:
-        protx train resume --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr-scheduler linear
+        protx distill resume --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr-scheduler linear
 
         # Resume with constant learning rate:
-        protx train resume --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr-scheduler constant
+        protx distill resume --checkpoint-dir ./run-123/checkpoint-1500 --num-epochs 20 --lr-scheduler constant
     """
     # Parse lr_scheduler_kwargs if provided
     parsed_lr_kwargs = {}

@@ -33,7 +33,7 @@ dependencies = [
 [project.scripts]
 nanoplm = "nanoplm.cli:cli"
 nanoplm-data = "nanoplm.cli.data:data"
-nanoplm-train = "nanoplm.cli.train:train"
+nanoplm-distill = "nanoplm.cli.distill:distill"
 nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
 
 [tool.setuptools.package-data]

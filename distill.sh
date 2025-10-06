@@ -1,4 +1,4 @@
-nanoplm train student \
+nanoplm distill run \
     --protx-train-prefix output/data/kd_dataset/train/train_kd_dataset.h5 \
     --protx-val-prefix output/data/kd_dataset/val/val_kd_dataset.h5 \
     --train-file output/data/split/train.fasta \
