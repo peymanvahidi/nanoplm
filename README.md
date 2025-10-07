@@ -39,10 +39,9 @@ pip install nanoplm
 nanoplm data get-yaml
 ```
 
-You'll get a params.yaml and dvc.yaml files. Just edit the params.yaml if you want.
-> We're using DVC under the hood, so you can track your data version.
+>You'll get [this](#data-preparation-yaml) params.yaml and dvc.yaml files. Just edit the params.yaml if you want.
 
-[This](#data-preparation-yaml) is the YAML file you get for data preparation.
+> We're using DVC under the hood, so you can track your data version.
 
 ### 2. Prepare your data
 
@@ -71,7 +70,7 @@ nanoplm data from-yaml --distillation
 nanoplm pretrain get-yaml
 ```
 
-> This writes the pretraining YAML to your current directory. Prefer a different folder?
+> This writes [this](#pretraining-yaml) pretraining YAML to your current directory. Prefer a different folder?
 Use: `nanoplm pretrain get-yaml <output/dir>`
 
 ### 4. Start your pretraining
