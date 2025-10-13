@@ -51,7 +51,17 @@ class PretrainingConfig:
     run_name: str = "nanoplm-pretraining"
 
 
-def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None:
+@dataclass
+class ResumeConfig:
+    checkpoint_dir: str
+    num_epochs: int
+
+
+def run_pretraining(
+    model: ProtModernBertMLM,
+    pretrain_config: PretrainingConfig,
+    resume_config: Optional[ResumeConfig] = None,
+) -> None:
 
     device = get_device()
 
@@ -59,65 +69,65 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
     model.to(device)
 
     train_ds, val_ds = _create_datasets(
-        train_fasta=config.train_fasta,
-        val_fasta=config.val_fasta,
-        max_length=config.max_length,
-        lazy=config.lazy_dataset,
+        train_fasta=pretrain_config.train_fasta,
+        val_fasta=pretrain_config.val_fasta,
+        max_length=pretrain_config.max_length,
+        lazy=pretrain_config.lazy_dataset,
         tokenizer=tokenizer,
     )
     collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
-        mlm_probability=config.mlm_probability,
-        mask_token_probability=config.mask_replace_prob,
-        random_token_probability=config.random_token_prob,
-        keep_probability=config.keep_probability,
+        mlm_probability=pretrain_config.mlm_probability,
+        mask_token_probability=pretrain_config.mask_replace_prob,
+        random_token_probability=pretrain_config.random_token_prob,
+        keep_probability=pretrain_config.keep_probability,
     )
 
-    create_dirs(config.ckp_dir)
+    create_dirs(pretrain_config.ckp_dir)
 
-    if config.world_size == "auto":
+    if pretrain_config.world_size == "auto":
         env_ws = os.environ.get("WORLD_SIZE")
-        config.world_size = int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
+        pretrain_config.world_size = int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
 
-    global_batch_size = config.gradient_accumulation_steps * config.batch_size * config.world_size
+    global_batch_size = pretrain_config.gradient_accumulation_steps * pretrain_config.batch_size * pretrain_config.world_size
 
-    total_steps = config.num_epochs * len(train_ds) // global_batch_size
+    total_steps = pretrain_config.num_epochs * len(train_ds) // global_batch_size
 
     training_dict = {
-        "output_dir": config.ckp_dir,
-        "per_device_train_batch_size": config.batch_size,
-        "per_device_eval_batch_size": config.batch_size,
-        "gradient_accumulation_steps": config.gradient_accumulation_steps,
-        "num_train_epochs": config.num_epochs,
-        "learning_rate": config.learning_rate,
-        "weight_decay": config.weight_decay,
-        "warmup_ratio": config.warmup_ratio,
+        "output_dir": pretrain_config.ckp_dir,
+        "per_device_train_batch_size": pretrain_config.batch_size,
+        "per_device_eval_batch_size": pretrain_config.batch_size,
+        "gradient_accumulation_steps": pretrain_config.gradient_accumulation_steps,
+        "num_train_epochs": pretrain_config.num_epochs,
+        "learning_rate": pretrain_config.learning_rate,
+        "weight_decay": pretrain_config.weight_decay,
+        "warmup_ratio": pretrain_config.warmup_ratio,
         "logging_strategy": "steps",
-        "logging_steps": max(1, int(total_steps * config.logging_steps_percentage)),
-        "logging_dir": Path(config.ckp_dir) / "logs",
+        "logging_steps": max(1, int(total_steps * pretrain_config.logging_steps_percentage)),
+        "logging_dir": Path(pretrain_config.ckp_dir) / "logs",
         "eval_strategy": "steps",
-        "eval_steps": max(1, int(total_steps * config.eval_steps_percentage)),
+        "eval_steps": max(1, int(total_steps * pretrain_config.eval_steps_percentage)),
         "save_strategy": "steps",
-        "save_steps": max(1, int(total_steps * config.save_steps_percentage)),
-        "seed": config.seed,
+        "save_steps": max(1, int(total_steps * pretrain_config.save_steps_percentage)),
+        "seed": pretrain_config.seed,
         "report_to": "wandb",
-        "run_name": config.run_name,
+        "run_name": pretrain_config.run_name,
         "dataloader_pin_memory": True if device == "cuda" else False,
-        "dataloader_num_workers": config.num_workers,
+        "dataloader_num_workers": pretrain_config.num_workers,
     }
 
     # Configure optimizer through TrainingArguments
-    optimizer_name = config.optimizer.lower()
+    optimizer_name = pretrain_config.optimizer.lower()
     if optimizer_name == "adamw":
         training_dict["optim"] = "adamw_torch"
     elif optimizer_name == "stable_adamw":
         training_dict["optim"] = "stable_adamw"
     else:
         raise ValueError(
-            f"Invalid optimizer: {config.optimizer}. Currently supported: [adamw, stable_adamw]"
+            f"Invalid optimizer: {pretrain_config.optimizer}. Currently supported: [adamw, stable_adamw]"
         )
 
-    if config.multi_gpu:
+    if pretrain_config.multi_gpu:
         training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
         training_dict["ddp_find_unused_parameters"] = True
 
@@ -136,7 +146,7 @@ def run_pretraining(model: ProtModernBertMLM, config: PretrainingConfig) -> None
     trainer.train()
 
     logger.info("Saving final model and tokenizer")
-    trainer.save_model(config.ckp_dir)
+    trainer.save_model(pretrain_config.ckp_dir)
 
 
 def _create_datasets(
