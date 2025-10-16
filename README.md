@@ -184,7 +184,7 @@ pretraining:
   num_workers: 0
   multi_gpu: False
   world_size: 1 # Use "auto" if you want to use all available GPUs
-  run_name: "nanoplm-pretraining"
+  project_name: "nanoplm-pretraining"
 ```
 
 Tip: Paths are resolved relative to where you run the command (not where the YAML lives).
