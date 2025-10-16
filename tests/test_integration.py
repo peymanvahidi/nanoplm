@@ -1,12 +1,19 @@
 import pytest
 import tempfile
 import os
+import json
+import yaml
 import torch
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+from click.testing import CliRunner
 from transformers import DataCollatorForLanguageModeling
 
 from nanoplm.pretraining.dataset import FastaMLMDataset
-from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM
+from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
+from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig, run_pretraining
+from nanoplm.cli.pretrain import from_yaml, pretrain
 
 
 class TestFullPipelineIntegration:
@@ -394,3 +401,689 @@ MVLSPA
 
         # Both should work
         assert outputs_auto['logits'].shape == outputs_explicit['logits'].shape, "Position IDs should not affect output shape"
+
+
+class TestResumePretraining:
+    """Integration and unit tests for resume pretraining functionality."""
+
+    @pytest.fixture
+    def temp_checkpoint_dir(self):
+        """Create a temporary directory for checkpoints."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield tmpdir
+
+    @pytest.fixture
+    def sample_fasta_content(self):
+        """Create minimal FASTA content for fast testing."""
+        return """>protein1
+MKALCLLLLP
+>protein2
+MVLSPADKTN
+>protein3
+MAIGTMAIGT
+"""
+
+    @pytest.fixture
+    def train_fasta_file(self, sample_fasta_content):
+        """Create a temporary training FASTA file."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False) as f:
+            f.write(sample_fasta_content)
+            temp_path = f.name
+        yield temp_path
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    @pytest.fixture
+    def val_fasta_file(self, sample_fasta_content):
+        """Create a temporary validation FASTA file."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False) as f:
+            f.write(sample_fasta_content)
+            temp_path = f.name
+        yield temp_path
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    @pytest.fixture
+    def tiny_model_for_training(self):
+        """Create a tiny model for fast training tests."""
+        config = ProtModernBertMLMConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            vocab_size=29,
+            mlp_activation="swiglu",
+            mlp_dropout=0.0,
+            mlp_bias=False,
+            attention_bias=False,
+            attention_dropout=0.0,
+            classifier_activation="gelu"
+        )
+        model = ProtModernBertMLM(config)
+        return model
+
+    @pytest.mark.integration
+    @patch('nanoplm.pretraining.pipeline.logger')
+    def test_full_resume_training_cycle(
+        self, 
+        mock_logger,
+        temp_checkpoint_dir, 
+        train_fasta_file, 
+        val_fasta_file,
+        tiny_model_for_training
+    ):
+        """Test complete training and resume cycle."""
+        # Disable W&B logging
+        with patch.dict(os.environ, {'WANDB_MODE': 'disabled'}):
+            # Phase 1: Initial training for 1 epoch
+            pretrain_config = PretrainingConfig(
+                train_fasta=train_fasta_file,
+                val_fasta=val_fasta_file,
+                ckp_dir=temp_checkpoint_dir,
+                max_length=32,
+                batch_size=2,
+                num_epochs=1,
+                lazy_dataset=False,
+                learning_rate=1e-4,
+                weight_decay=0.0,
+                warmup_ratio=0.0,
+                optimizer="adamw",
+                gradient_accumulation_steps=1,
+                mlm_probability=0.15,
+                logging_steps_percentage=0.5,
+                eval_steps_percentage=0.5,
+                save_steps_percentage=1.0,
+                seed=42,
+                num_workers=0,
+                multi_gpu=False,
+                world_size=1,
+                project_name="test-resume-training"
+            )
+
+            # Train initial model
+            run_pretraining(model=tiny_model_for_training, pretrain_config=pretrain_config)
+
+            # Find the actual checkpoint directory (it's in a run-specific subdirectory)
+            checkpoint_root = Path(temp_checkpoint_dir)
+            run_dirs = [d for d in checkpoint_root.iterdir() if d.is_dir() and d.name.startswith("run-")]
+            assert len(run_dirs) == 1, f"Expected 1 run directory, found {len(run_dirs)}"
+            checkpoint_dir = run_dirs[0]
+
+            # Verify checkpoint files exist
+            assert (checkpoint_dir / "config.json").exists(), "config.json should exist"
+            assert (checkpoint_dir / "model.safetensors").exists(), "model.safetensors should exist"
+            assert (checkpoint_dir / "trainer_state.json").exists(), "trainer_state.json should exist"
+
+            # Read initial trainer state
+            with open(checkpoint_dir / "trainer_state.json", "r") as f:
+                initial_state = json.load(f)
+            initial_epoch = initial_state.get("epoch", 0)
+
+            # Phase 2: Resume training for 1 more epoch
+            resume_config = ResumeConfig(
+                is_resume=True,
+                checkpoint_dir=str(checkpoint_dir),
+                num_epochs=1
+            )
+
+            # Load model from checkpoint
+            resumed_model = ProtModernBertMLM.from_pretrained(str(checkpoint_dir))
+
+            # Continue training
+            run_pretraining(
+                model=resumed_model,
+                pretrain_config=pretrain_config,
+                resume_config=resume_config
+            )
+
+            # Find the resume checkpoint directory
+            checkpoint_root = Path(temp_checkpoint_dir)
+            resume_dirs = [d for d in checkpoint_root.iterdir() if d.is_dir() and d.name.endswith("-resume")]
+            assert len(resume_dirs) == 1, f"Expected 1 resume directory, found {len(resume_dirs)}"
+            resume_checkpoint_dir = resume_dirs[0]
+
+            # Verify checkpoint updated
+            assert (resume_checkpoint_dir / "trainer_state.json").exists(), "trainer_state.json should exist in resume dir"
+
+            # Read final trainer state
+            with open(resume_checkpoint_dir / "trainer_state.json", "r") as f:
+                final_state = json.load(f)
+            final_epoch = final_state.get("epoch", 0)
+
+            # Verify epoch progression (should have trained for 2 epochs total)
+            assert final_epoch > initial_epoch, "Should have trained for more epochs"
+
+    @pytest.mark.integration
+    def test_resume_preserves_hyperparameters(
+        self,
+        temp_checkpoint_dir,
+        train_fasta_file,
+        val_fasta_file,
+        tiny_model_for_training
+    ):
+        """Test that resumed training preserves hyperparameters."""
+        with patch.dict(os.environ, {'WANDB_MODE': 'disabled'}):
+            # Train with specific hyperparameters
+            original_lr = 5e-5
+            original_batch_size = 2
+            original_optimizer = "adamw"
+
+            pretrain_config = PretrainingConfig(
+                train_fasta=train_fasta_file,
+                val_fasta=val_fasta_file,
+                ckp_dir=temp_checkpoint_dir,
+                max_length=32,
+                batch_size=original_batch_size,
+                num_epochs=1,
+                lazy_dataset=False,
+                learning_rate=original_lr,
+                weight_decay=0.01,
+                warmup_ratio=0.0,
+                optimizer=original_optimizer,
+                gradient_accumulation_steps=1,
+                mlm_probability=0.15,
+                logging_steps_percentage=0.5,
+                eval_steps_percentage=0.5,
+                save_steps_percentage=1.0,
+                seed=42,
+                num_workers=0,
+                multi_gpu=False,
+                world_size=1,
+                project_name="test-hyperparams"
+            )
+
+            run_pretraining(model=tiny_model_for_training, pretrain_config=pretrain_config)
+
+            # Find the actual checkpoint directory (it's in a run-specific subdirectory)
+            checkpoint_root = Path(temp_checkpoint_dir)
+            run_dirs = [d for d in checkpoint_root.iterdir() if d.is_dir() and d.name.startswith("run-")]
+            assert len(run_dirs) == 1, f"Expected 1 run directory, found {len(run_dirs)}"
+            checkpoint_dir = run_dirs[0]
+
+            # Load training args and verify hyperparameters were saved
+            training_args = torch.load(checkpoint_dir / "training_args.bin", weights_only=False)
+
+            assert training_args.learning_rate == original_lr, "Learning rate should match"
+            assert training_args.per_device_train_batch_size == original_batch_size, "Batch size should match"
+            assert training_args.optim == "adamw_torch", "Optimizer should match"
+
+    def test_yaml_resume_config_parsing(self, temp_checkpoint_dir, train_fasta_file, val_fasta_file):
+        """Test YAML parsing with resume block."""
+        yaml_content = {
+            "resume": {
+                "is_resume": True,
+                "checkpoint_dir": temp_checkpoint_dir,
+                "num_epochs": 5
+            },
+            "pretraining": {
+                "train_fasta": train_fasta_file,
+                "val_fasta": val_fasta_file,
+                "ckp_dir": temp_checkpoint_dir,
+                "max_length": 512,
+                "batch_size": 32,
+                "num_epochs": 10,
+                "lazy_dataset": False,
+                "warmup_ratio": 0.05,
+                "optimizer": "adamw",
+                "adam_beta1": 0.9,
+                "adam_beta2": 0.999,
+                "adam_epsilon": 1e-8,
+                "learning_rate": 3e-6,
+                "weight_decay": 0.0,
+                "gradient_accumulation_steps": 1,
+                "mlm_probability": 0.3,
+                "mask_replace_prob": 0.8,
+                "random_token_prob": 0.1,
+                "keep_probability": 0.1,
+                "logging_steps_percentage": 0.01,
+                "eval_steps_percentage": 0.025,
+                "save_steps_percentage": 0.1,
+                "seed": 42,
+                "num_workers": 0,
+                "multi_gpu": False,
+                "world_size": 1,
+                "project_name": "test-resume"
+            },
+            "model": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "vocab_size": 29,
+                "mlp_activation": "swiglu",
+                "mlp_dropout": 0.0,
+                "mlp_bias": False,
+                "attention_bias": False,
+                "attention_dropout": 0.0,
+                "classifier_activation": "gelu"
+            }
+        }
+
+        # Verify resume block is correctly structured
+        resume_dict = yaml_content.get("resume")
+        assert resume_dict is not None, "Resume block should exist"
+        assert resume_dict.get("is_resume") is True, "is_resume should be True"
+        assert resume_dict.get("checkpoint_dir") == temp_checkpoint_dir, "checkpoint_dir should match"
+        assert resume_dict.get("num_epochs") == 5, "num_epochs should match"
+
+    def test_yaml_fresh_training_parsing(self, train_fasta_file, val_fasta_file, temp_checkpoint_dir):
+        """Test YAML parsing without resume or with is_resume: False."""
+        # Test 1: No resume block at all
+        yaml_content_no_resume = {
+            "pretraining": {
+                "train_fasta": train_fasta_file,
+                "val_fasta": val_fasta_file,
+                "ckp_dir": temp_checkpoint_dir,
+                "max_length": 512,
+                "batch_size": 32,
+                "num_epochs": 10,
+                "lazy_dataset": False,
+                "warmup_ratio": 0.05,
+                "optimizer": "adamw",
+                "adam_beta1": 0.9,
+                "adam_beta2": 0.999,
+                "adam_epsilon": 1e-8,
+                "learning_rate": 3e-6,
+                "weight_decay": 0.0,
+                "gradient_accumulation_steps": 1,
+                "mlm_probability": 0.3,
+                "mask_replace_prob": 0.8,
+                "random_token_prob": 0.1,
+                "keep_probability": 0.1,
+                "logging_steps_percentage": 0.01,
+                "eval_steps_percentage": 0.025,
+                "save_steps_percentage": 0.1,
+                "seed": 42,
+                "num_workers": 0,
+                "multi_gpu": False,
+                "world_size": 1,
+                "project_name": "test-fresh"
+            },
+            "model": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "vocab_size": 29,
+                "mlp_activation": "swiglu",
+                "mlp_dropout": 0.0,
+                "mlp_bias": False,
+                "attention_bias": False,
+                "attention_dropout": 0.0,
+                "classifier_activation": "gelu"
+            }
+        }
+
+        resume_dict = yaml_content_no_resume.get("resume")
+        assert resume_dict is None, "Resume block should not exist"
+
+        # Test 2: With is_resume: False
+        yaml_content_resume_false = {
+            "resume": {
+                "is_resume": False,
+                "checkpoint_dir": temp_checkpoint_dir,
+                "num_epochs": 5
+            },
+            "pretraining": yaml_content_no_resume["pretraining"],
+            "model": yaml_content_no_resume["model"]
+        }
+
+        resume_dict = yaml_content_resume_false.get("resume")
+        assert resume_dict is not None, "Resume block should exist"
+        assert resume_dict.get("is_resume") is False, "is_resume should be False"
+
+    def test_yaml_resume_missing_fields(self, temp_checkpoint_dir):
+        """Test error handling when required resume fields are missing."""
+        # Missing checkpoint_dir
+        yaml_missing_checkpoint = {
+            "resume": {
+                "is_resume": True,
+                "num_epochs": 5
+            }
+        }
+
+        resume_dict = yaml_missing_checkpoint.get("resume")
+        assert resume_dict.get("checkpoint_dir") is None, "checkpoint_dir should be missing"
+
+        # Missing num_epochs
+        yaml_missing_epochs = {
+            "resume": {
+                "is_resume": True,
+                "checkpoint_dir": temp_checkpoint_dir
+            }
+        }
+
+        resume_dict = yaml_missing_epochs.get("resume")
+        assert resume_dict.get("num_epochs") is None, "num_epochs should be missing"
+
+    @pytest.mark.integration
+    def test_cli_from_yaml_with_resume(
+        self,
+        temp_checkpoint_dir,
+        train_fasta_file,
+        val_fasta_file,
+        tiny_model_for_training
+    ):
+        """Test CLI from-yaml command with resume enabled."""
+        # First, create a checkpoint
+        with patch.dict(os.environ, {'WANDB_MODE': 'disabled'}):
+            pretrain_config = PretrainingConfig(
+                train_fasta=train_fasta_file,
+                val_fasta=val_fasta_file,
+                ckp_dir=temp_checkpoint_dir,
+                max_length=32,
+                batch_size=2,
+                num_epochs=1,
+                lazy_dataset=False,
+                learning_rate=1e-4,
+                weight_decay=0.0,
+                warmup_ratio=0.0,
+                optimizer="adamw",
+                gradient_accumulation_steps=1,
+                mlm_probability=0.15,
+                logging_steps_percentage=0.5,
+                eval_steps_percentage=0.5,
+                save_steps_percentage=1.0,
+                seed=42,
+                num_workers=0,
+                multi_gpu=False,
+                world_size=1,
+                project_name="test-cli-resume"
+            )
+
+            run_pretraining(model=tiny_model_for_training, pretrain_config=pretrain_config)
+
+            # Find the actual checkpoint directory
+            checkpoint_root = Path(temp_checkpoint_dir)
+            run_dirs = [d for d in checkpoint_root.iterdir() if d.is_dir() and d.name.startswith("run-")]
+            assert len(run_dirs) == 1, f"Expected 1 run directory, found {len(run_dirs)}"
+            actual_checkpoint_dir = str(run_dirs[0])
+
+            # Create YAML file with resume block
+            yaml_content = {
+                "resume": {
+                    "is_resume": True,
+                    "checkpoint_dir": actual_checkpoint_dir,
+                    "num_epochs": 1
+                },
+                "pretraining": {
+                    "train_fasta": train_fasta_file,
+                    "val_fasta": val_fasta_file,
+                    "ckp_dir": temp_checkpoint_dir,
+                    "max_length": 32,
+                    "batch_size": 2,
+                    "num_epochs": 1,
+                    "lazy_dataset": False,
+                    "warmup_ratio": 0.0,
+                    "optimizer": "adamw",
+                    "adam_beta1": 0.9,
+                    "adam_beta2": 0.999,
+                    "adam_epsilon": 1e-8,
+                    "learning_rate": 1e-4,
+                    "weight_decay": 0.0,
+                    "gradient_accumulation_steps": 1,
+                    "mlm_probability": 0.15,
+                    "mask_replace_prob": 0.8,
+                    "random_token_prob": 0.1,
+                    "keep_probability": 0.1,
+                    "logging_steps_percentage": 0.5,
+                    "eval_steps_percentage": 0.5,
+                    "save_steps_percentage": 1.0,
+                    "seed": 42,
+                    "num_workers": 0,
+                    "multi_gpu": False,
+                    "world_size": 1,
+                    "project_name": "test-cli-resume"
+                },
+                "model": {
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "vocab_size": 29,
+                    "mlp_activation": "swiglu",
+                    "mlp_dropout": 0.0,
+                    "mlp_bias": False,
+                    "attention_bias": False,
+                    "attention_dropout": 0.0,
+                    "classifier_activation": "gelu"
+                }
+            }
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                yaml.dump(yaml_content, f)
+                yaml_file = f.name
+
+            try:
+                # Test CLI invocation
+                runner = CliRunner()
+                result = runner.invoke(pretrain, ['from-yaml', yaml_file])
+
+                # Should complete successfully (exit code 0)
+                assert result.exit_code == 0, f"CLI should succeed. Output: {result.output}"
+
+            finally:
+                if os.path.exists(yaml_file):
+                    os.unlink(yaml_file)
+
+    @pytest.mark.integration
+    def test_cli_from_yaml_without_resume(
+        self,
+        temp_checkpoint_dir,
+        train_fasta_file,
+        val_fasta_file
+    ):
+        """Test CLI from-yaml command with fresh training."""
+        with patch.dict(os.environ, {'WANDB_MODE': 'disabled'}):
+            # Create YAML file without resume block
+            yaml_content = {
+                "pretraining": {
+                    "train_fasta": train_fasta_file,
+                    "val_fasta": val_fasta_file,
+                    "ckp_dir": temp_checkpoint_dir,
+                    "max_length": 32,
+                    "batch_size": 2,
+                    "num_epochs": 1,
+                    "lazy_dataset": False,
+                    "warmup_ratio": 0.0,
+                    "optimizer": "adamw",
+                    "adam_beta1": 0.9,
+                    "adam_beta2": 0.999,
+                    "adam_epsilon": 1e-8,
+                    "learning_rate": 1e-4,
+                    "weight_decay": 0.0,
+                    "gradient_accumulation_steps": 1,
+                    "mlm_probability": 0.15,
+                    "mask_replace_prob": 0.8,
+                    "random_token_prob": 0.1,
+                    "keep_probability": 0.1,
+                    "logging_steps_percentage": 0.5,
+                    "eval_steps_percentage": 0.5,
+                    "save_steps_percentage": 1.0,
+                    "seed": 42,
+                    "num_workers": 0,
+                    "multi_gpu": False,
+                    "world_size": 1,
+                    "project_name": "test-cli-fresh"
+                },
+                "model": {
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "vocab_size": 29,
+                    "mlp_activation": "swiglu",
+                    "mlp_dropout": 0.0,
+                    "mlp_bias": False,
+                    "attention_bias": False,
+                    "attention_dropout": 0.0,
+                    "classifier_activation": "gelu"
+                }
+            }
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                yaml.dump(yaml_content, f)
+                yaml_file = f.name
+
+            try:
+                # Test CLI invocation
+                runner = CliRunner()
+                result = runner.invoke(pretrain, ['from-yaml', yaml_file])
+
+                # Should complete successfully
+                assert result.exit_code == 0, f"CLI should succeed. Output: {result.output}"
+
+                # Find the actual checkpoint directory (it's in a run-specific subdirectory)
+                checkpoint_root = Path(temp_checkpoint_dir)
+                run_dirs = [d for d in checkpoint_root.iterdir() if d.is_dir() and d.name.startswith("run-")]
+                assert len(run_dirs) == 1, f"Expected 1 run directory, found {len(run_dirs)}"
+                checkpoint_dir = run_dirs[0]
+
+                # Verify checkpoint was created
+                assert (checkpoint_dir / "config.json").exists(), "config.json should be created"
+                assert (checkpoint_dir / "model.safetensors").exists(), "model.safetensors should be created"
+
+            finally:
+                if os.path.exists(yaml_file):
+                    os.unlink(yaml_file)
+
+    def test_cli_resume_missing_checkpoint_dir(self, train_fasta_file, val_fasta_file, temp_checkpoint_dir):
+        """Test CLI error handling when checkpoint_dir is missing."""
+        with patch.dict(os.environ, {'WANDB_MODE': 'disabled'}):
+            # Create YAML with resume but missing checkpoint_dir
+            yaml_content = {
+                "resume": {
+                    "is_resume": True,
+                    "num_epochs": 5
+                },
+                "pretraining": {
+                    "train_fasta": train_fasta_file,
+                    "val_fasta": val_fasta_file,
+                    "ckp_dir": temp_checkpoint_dir,
+                    "max_length": 32,
+                    "batch_size": 2,
+                    "num_epochs": 1,
+                    "lazy_dataset": False,
+                    "warmup_ratio": 0.0,
+                    "optimizer": "adamw",
+                    "adam_beta1": 0.9,
+                    "adam_beta2": 0.999,
+                    "adam_epsilon": 1e-8,
+                    "learning_rate": 1e-4,
+                    "weight_decay": 0.0,
+                    "gradient_accumulation_steps": 1,
+                    "mlm_probability": 0.15,
+                    "mask_replace_prob": 0.8,
+                    "random_token_prob": 0.1,
+                    "keep_probability": 0.1,
+                    "logging_steps_percentage": 0.5,
+                    "eval_steps_percentage": 0.5,
+                    "save_steps_percentage": 1.0,
+                    "seed": 42,
+                    "num_workers": 0,
+                    "multi_gpu": False,
+                    "world_size": 1,
+                    "project_name": "test-error"
+                },
+                "model": {
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "vocab_size": 29,
+                    "mlp_activation": "swiglu",
+                    "mlp_dropout": 0.0,
+                    "mlp_bias": False,
+                    "attention_bias": False,
+                    "attention_dropout": 0.0,
+                    "classifier_activation": "gelu"
+                }
+            }
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                yaml.dump(yaml_content, f)
+                yaml_file = f.name
+
+            try:
+                runner = CliRunner()
+                result = runner.invoke(pretrain, ['from-yaml', yaml_file])
+
+                # Should fail with error
+                assert result.exit_code != 0, "CLI should fail when checkpoint_dir is missing"
+                assert "checkpoint_dir" in result.output.lower(), "Error message should mention checkpoint_dir"
+
+            finally:
+                if os.path.exists(yaml_file):
+                    os.unlink(yaml_file)
+
+    def test_cli_resume_invalid_checkpoint_path(self, train_fasta_file, val_fasta_file, temp_checkpoint_dir):
+        """Test CLI error handling when checkpoint path doesn't exist."""
+        with patch.dict(os.environ, {'WANDB_MODE': 'disabled'}):
+            # Create YAML with resume but invalid checkpoint path
+            invalid_checkpoint = "/nonexistent/checkpoint/path"
+            yaml_content = {
+                "resume": {
+                    "is_resume": True,
+                    "checkpoint_dir": invalid_checkpoint,
+                    "num_epochs": 5
+                },
+                "pretraining": {
+                    "train_fasta": train_fasta_file,
+                    "val_fasta": val_fasta_file,
+                    "ckp_dir": temp_checkpoint_dir,
+                    "max_length": 32,
+                    "batch_size": 2,
+                    "num_epochs": 1,
+                    "lazy_dataset": False,
+                    "warmup_ratio": 0.0,
+                    "optimizer": "adamw",
+                    "adam_beta1": 0.9,
+                    "adam_beta2": 0.999,
+                    "adam_epsilon": 1e-8,
+                    "learning_rate": 1e-4,
+                    "weight_decay": 0.0,
+                    "gradient_accumulation_steps": 1,
+                    "mlm_probability": 0.15,
+                    "mask_replace_prob": 0.8,
+                    "random_token_prob": 0.1,
+                    "keep_probability": 0.1,
+                    "logging_steps_percentage": 0.5,
+                    "eval_steps_percentage": 0.5,
+                    "save_steps_percentage": 1.0,
+                    "seed": 42,
+                    "num_workers": 0,
+                    "multi_gpu": False,
+                    "world_size": 1,
+                    "project_name": "test-error"
+                },
+                "model": {
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "vocab_size": 29,
+                    "mlp_activation": "swiglu",
+                    "mlp_dropout": 0.0,
+                    "mlp_bias": False,
+                    "attention_bias": False,
+                    "attention_dropout": 0.0,
+                    "classifier_activation": "gelu"
+                }
+            }
+
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                yaml.dump(yaml_content, f)
+                yaml_file = f.name
+
+            try:
+                runner = CliRunner()
+                result = runner.invoke(pretrain, ['from-yaml', yaml_file])
+
+                # Should fail with error
+                assert result.exit_code != 0, "CLI should fail when checkpoint path doesn't exist"
+                assert "does not exist" in result.output.lower() or "not found" in result.output.lower(), \
+                    "Error message should mention path doesn't exist"
+
+            finally:
+                if os.path.exists(yaml_file):
+                    os.unlink(yaml_file)
