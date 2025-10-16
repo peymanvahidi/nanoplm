@@ -511,9 +511,9 @@ def get_yaml(output: Optional[str], force: bool):
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
-def _load_pretrain_config(d: Dict[str, Any]) -> PretrainingConfig:
+def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     expected_keys = set(PretrainingConfig.__annotations__.keys())
-    present_keys = set(d.keys())
+    present_keys = set(config.keys())
 
     missing = []
     extra = []
@@ -524,7 +524,7 @@ def _load_pretrain_config(d: Dict[str, Any]) -> PretrainingConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = d.get(key)
+        value = config.get(key)
         if value is None:
             missing.append(key)
             continue
@@ -566,9 +566,12 @@ def _load_pretrain_config(d: Dict[str, Any]) -> PretrainingConfig:
 
     return PretrainingConfig(**kwargs)
 
-def _load_model_config(d: Dict[str, Any]) -> ProtModernBertMLMConfig:
+def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
+    if config is None:
+        raise ValueError("Model configuration is required but not found in YAML")
+
     expected_keys = set(ProtModernBertMLMConfig.__annotations__.keys())
-    present_keys = set(d.keys())
+    present_keys = set(config.keys())
 
     missing = []
     extra = []
@@ -579,7 +582,7 @@ def _load_model_config(d: Dict[str, Any]) -> ProtModernBertMLMConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = d.get(key)
+        value = config.get(key)
         if value is None:
             missing.append(key)
             continue
@@ -601,9 +604,12 @@ def _load_model_config(d: Dict[str, Any]) -> ProtModernBertMLMConfig:
 
     return ProtModernBertMLMConfig(**kwargs)
 
-def _load_resume_config(d: Dict[str, Any]) -> ResumeConfig:
+def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
+    if config is None:
+        return ResumeConfig(is_resume=False, checkpoint_dir="", num_epochs=0)
+
     expected_keys = set(ResumeConfig.__annotations__.keys())
-    present_keys = set(d.keys())
+    present_keys = set(config.keys())
 
     missing = []
     extra = []
@@ -613,7 +619,7 @@ def _load_resume_config(d: Dict[str, Any]) -> ResumeConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = d.get(key)
+        value = config.get(key)
         if value is None:
             missing.append(key)
             continue
