@@ -4,11 +4,14 @@ nanoPLM CLI - Pretraining subcommands for MLM pretraining
 """
 
 import click
+import json
+import yaml
 from typing import Optional, Dict, Any
 from pathlib import Path
 
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
+    ResumeConfig,
     run_pretraining,
 )
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
@@ -189,10 +192,10 @@ def pretrain():
     help="Total number of processes for distributed training, use auto if you want to use all available GPUs"
 )
 @click.option(
-    "--run-name",
+    "--project-name",
     type=str,
     default="nanoplm-pretraining",
-    help="Run name for experiment tracking"
+    help="Weights & Biases project name (new runs named run-DDMMHHMM, unique)"
 )
 # Model hyperparameters (ModernBERT)
 @click.option(
@@ -284,7 +287,7 @@ def run(
     num_workers: int,
     multi_gpu: bool,
     world_size: int,
-    run_name: str,
+    project_name: str,
     # model hp
     hidden_size: int,
     intermediate_size: int,
@@ -327,7 +330,7 @@ def run(
         num_workers=num_workers,
         multi_gpu=multi_gpu,
         world_size=world_size,
-        run_name=run_name,
+        project_name=project_name,
     )
     
     model_cfg = ProtModernBertMLMConfig(
@@ -345,7 +348,7 @@ def run(
 
     model = ProtModernBertMLM(model_cfg)
 
-    run_pretraining(model=model, config=cfg)
+    run_pretraining(model=model, pretrain_config=cfg)
 
 
 @pretrain.command("from-yaml")
@@ -364,6 +367,10 @@ def from_yaml(config: str):
     Expected YAML structure:
     pretraining: {...}
     model: {...}
+    resume: {...}
+
+    If resume.is_resume is True, training will resume from the given
+    checkpoint using the hyperparameters in the 'pretraining' block.
     """
     config = Path(config)
 
@@ -379,14 +386,20 @@ def from_yaml(config: str):
     # Allow both nested and flat formats; prefer nested under key 'training'
     pretrain_dict = raw.get("pretraining")
     model_dict = raw.get("model")
+    resume_dict = raw.get("resume")
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
     model_config = _load_model_config(model_dict)
+    resume_config = _load_resume_config(resume_dict)
 
     model = ProtModernBertMLM(config=model_config)
 
-    run_pretraining(model=model, config=pretrain_config)
+    run_pretraining(
+        model=model,
+        pretrain_config=pretrain_config,
+        resume_config=resume_config if resume_config.is_resume else None,
+    )
 
 
 @pretrain.command("get-yaml")
@@ -481,7 +494,14 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_workers: 0\n"
         "  multi_gpu: False\n"
         "  world_size: 1 # Use \"auto\" if you want to use all available GPUs\n"
-        "  run_name: \"nanoplm-pretraining\"\n"
+        "  project_name: \"nanoplm-pretraining\"\n"
+        "\n"
+        "resume:\n"
+        "  # Set is_resume: true to resume training from a checkpoint\n"
+        "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
+        "  is_resume: False\n"
+        "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
+        "  num_epochs: 5\n"
     )
 
     # If forcing, remove existing file first
@@ -580,3 +600,44 @@ def _load_model_config(d: Dict[str, Any]) -> ProtModernBertMLMConfig:
         )
 
     return ProtModernBertMLMConfig(**kwargs)
+
+def _load_resume_config(d: Dict[str, Any]) -> ResumeConfig:
+    expected_keys = set(ResumeConfig.__annotations__.keys())
+    present_keys = set(d.keys())
+
+    missing = []
+    extra = []
+    kwargs: Dict[str, Any] = {}
+
+    for key in present_keys:
+        if key not in expected_keys:
+            extra.append(key)
+            continue
+        value = d.get(key)
+        if value is None:
+            missing.append(key)
+            continue
+        kwargs[key] = value
+
+
+    checkpoint_dir = kwargs.get("checkpoint_dir")
+    num_epochs = kwargs.get("num_epochs")
+    is_resume = kwargs.get("is_resume", False)
+
+    if is_resume:
+        if not checkpoint_dir:
+            raise click.ClickException(
+                "Resume requested but 'checkpoint_dir' is missing under 'resume'"
+            )
+        if not num_epochs:
+            raise click.ClickException(
+                "Resume requested but 'num_epochs' is missing under 'resume'"
+            )
+
+        checkpoint_path = Path(checkpoint_dir)
+        if not checkpoint_path.exists():
+            raise click.ClickException(
+                f"Checkpoint directory does not exist: {checkpoint_dir}"
+            )
+
+    return ResumeConfig(**kwargs)
