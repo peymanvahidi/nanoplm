@@ -32,6 +32,11 @@ class PretrainingConfig:
     batch_size: int = 32
     num_epochs: int = 10
     lazy_dataset: bool = False
+    train_hdf5: str = "output/data/split/train_hdf5"
+    val_hdf5: str = "output/data/split/val_hdf5"
+    samples_per_shard: int = 1000000
+    max_workers: int = 1
+    load_shards: bool = False
     warmup_ratio: float = 0.05
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
@@ -156,6 +161,11 @@ def run_pretraining(
         max_length=pretrain_config.max_length,
         lazy=pretrain_config.lazy_dataset,
         tokenizer=tokenizer,
+        train_hdf5=pretrain_config.train_hdf5,
+        val_hdf5=pretrain_config.val_hdf5,
+        samples_per_shard=pretrain_config.samples_per_shard,
+        max_workers=pretrain_config.max_workers,
+        load_shards=pretrain_config.load_shards
     )
     collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
@@ -272,6 +282,11 @@ def _create_datasets(
     max_length: int,
     lazy: bool,
     tokenizer: ProtModernBertTokenizer,
+    train_hdf5: Union[str, Path],
+    val_hdf5: Union[str, Path],
+    samples_per_shard: int,
+    max_workers: int,
+    load_shards: bool
 ) -> Tuple[Dataset, Optional[Dataset]]:
 
     train_ds = FastaMLMDataset(
@@ -279,6 +294,10 @@ def _create_datasets(
         tokenizer=tokenizer,
         max_length=max_length,
         lazy=lazy,
+        hdf5_dir=train_hdf5,
+        samples_per_shard=samples_per_shard,
+        max_workers=max_workers,
+        load_shards=load_shards
     )
 
     val_ds = FastaMLMDataset(
@@ -286,6 +305,10 @@ def _create_datasets(
         tokenizer=tokenizer,
         max_length=max_length,
         lazy=lazy,
+        hdf5_dir=val_hdf5,
+        samples_per_shard=samples_per_shard,
+        max_workers=max_workers,
+        load_shards=load_shards # for 
     )
 
     return train_ds, val_ds

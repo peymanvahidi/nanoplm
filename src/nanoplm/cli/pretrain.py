@@ -16,6 +16,7 @@ from nanoplm.pretraining.pipeline import (
 )
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
 from nanoplm.utils.common import read_yaml, create_dirs
+from nanoplm.utils.logger import logger
 
 
 @click.group(name="pretrain")
@@ -348,6 +349,10 @@ def run(
 
     model = ProtModernBertMLM(model_cfg)
 
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    total_params = sum(p.numel() for p in model_parameters)
+    logger.info(f"Total Trainable Parameters: {total_params}")
+
     run_pretraining(model=model, pretrain_config=cfg)
 
 
@@ -394,6 +399,10 @@ def from_yaml(config: str):
     resume_config = _load_resume_config(resume_dict)
 
     model = ProtModernBertMLM(config=model_config)
+
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    total_params = sum(p.numel() for p in model_parameters)
+    logger.info(f"Total Trainable Parameters: {total_params}")
 
     run_pretraining(
         model=model,
@@ -473,9 +482,15 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_epochs: 10\n"
         "  # Info for lazy dataset loading\n"
         "  # True: Low memory usage, tokenize on-demand (slower iteration, faster startup)\n"
-        "  # False: High memory usage, tokenize all sequences at once (faster iteration, slower startup)\n"
+        "  # False: High memory usage, tokenize all sequences at once and save to sharded hdf5 files in train_hdf5 and val_hdf5 directories \n"
+        "  # max_workers controls the number of cpus processing different shards \n"
+        "  # load_shards True means that you can pre-processed the dataset and simply wish to reload the shards \n"
         "  lazy_dataset: False\n"
-        "  warmup_ratio: 0.05\n"
+        "  train_hdf5: \"output/data/split/train_hdf5\"\n"
+        "  val_hdf5: \"output/data/split/val_hdf5\"\n"
+        "  samples_per_shard: 1000000\n"
+        "  max_workers: 1\n"
+        "  load_shards: True\n"
         "  optimizer: \"adamw\" # adamw, stable_adamw\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
