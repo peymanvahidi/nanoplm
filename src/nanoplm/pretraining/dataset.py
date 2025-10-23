@@ -14,17 +14,53 @@ from nanoplm.utils.logger import logger
 import bisect
 
 def process_shard(args):
-    shard_idx, shard_seqs, tokenizer, max_length, output_dir = args
+    shard_idx, fasta_path, db_path, shard_keys, tokenizer, max_length, output_dir = args
+
+    # Each process must open its own index
+    index = SeqIO.index_db(db_path, [fasta_path], "fasta")
 
     shard_path = Path(output_dir) / f"train_{shard_idx:04d}.h5"
     input_ids_list = []
     attention_masks = []
 
-    for seq in tqdm(shard_seqs, desc=f"Tokenizing shard {shard_idx}", leave=False):
-        tokens = tokenizer(seq, truncation=True, max_length=max_length)
-        input_ids_list.append(tokens["input_ids"])
-        attention_masks.append(tokens["attention_mask"])
+    for key in tqdm(shard_keys, desc=f"Tokenizing shard {shard_idx}", leave=False):
+        record = index[key]
+        seq = str(record.seq)
+        seq_len = len(seq)
 
+        # for seqs above max_length
+        if seq_len > max_length:
+
+            for start in range(0, len(seq), max_length):
+                chunk = seq[start:start + max_length]
+
+                encoding = tokenizer(
+                    chunk,
+                    add_special_tokens=True,
+                    padding=False,
+                    max_length=max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+
+                input_ids_list.append(encoding["input_ids"].squeeze(0))
+                attention_masks.append(encoding["attention_mask"].squeeze(0))
+
+        else:
+
+            encoding = tokenizer(
+                seq,
+                add_special_tokens=True,
+                padding=False,
+                max_length=max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+
+            input_ids_list.append(encoding["input_ids"].squeeze(0))
+            attention_masks.append(encoding["attention_mask"].squeeze(0))
+
+    # Write results
     with h5py.File(shard_path, "w") as h5f:
         total = len(input_ids_list)
         h5f.create_dataset('input_ids', (total,), dtype=h5py.special_dtype(vlen=np.int32))
@@ -34,6 +70,7 @@ def process_shard(args):
             h5f['input_ids'][i] = np.array(input_ids_list[i], dtype=np.int32)
             h5f['attention_mask'][i] = np.array(attention_masks[i], dtype=np.int32)
 
+    index.close()
     return str(shard_path)
 
 class FastaMLMDataset(Dataset):
@@ -123,15 +160,19 @@ class FastaMLMDataset(Dataset):
                     logger.info(f"Splitting {total_seqs:,} sequences into {num_shards} shards "
                         f"({self.samples_per_shard:,} per file)")
 
-                    shards = [
+                    sharded_keys = [
                         self._keys[i * samples_per_shard : (i + 1) * samples_per_shard]
                         for i in range(num_shards)
                     ]
 
-                    args = [(i, shard, self.tokenizer, self.max_length, hdf5_path_obj) for i, shard in enumerate(shards)]
+                    
+                    args = [
+                        (i, self.fasta_path, self._db_path, keys, self.tokenizer, self.max_length, hdf5_path_obj)
+                        for i, keys in enumerate(sharded_keys)
+                    ]
 
                     with ProcessPoolExecutor(max_workers=self.max_workers or os.cpu_count()) as executor:
-                        list(executor.map(process_shard, args))
+                        results = list(executor.map(process_shard, args))
 
                     # with h5py.File(hdf5_path_obj, "w") as h5f:
                     #     index = 0 
@@ -196,6 +237,8 @@ class FastaMLMDataset(Dataset):
     def _get_shard(self, idx):
         """Return (shard_index, local_index_in_shard)"""
         shard_idx = bisect.bisect_right(self.cum_lengths, idx)
+        print(shard_idx)
+        print(idx)
         if shard_idx > 0:
             idx -= self.cum_lengths[shard_idx - 1]
         return shard_idx, idx
@@ -217,7 +260,6 @@ class FastaMLMDataset(Dataset):
             #     "attention_mask": attention_mask.squeeze(0),
             # }
             # determine which shard and local index
-
 
             shard_idx = bisect.bisect_right(self.cum_lengths, idx)
             local_idx = idx if shard_idx == 0 else idx - self.cum_lengths[shard_idx - 1]
