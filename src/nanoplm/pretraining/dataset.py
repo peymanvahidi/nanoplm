@@ -28,37 +28,39 @@ def process_shard(args):
         seq = str(record.seq)
         seq_len = len(seq)
 
-        # for seqs above max_length
-        if seq_len > max_length:
+        # easier to just split the input FASTA
 
-            for start in range(0, len(seq), max_length):
-                chunk = seq[start:start + max_length]
+        # # for seqs above max_length
+        # if seq_len > max_length:
 
-                encoding = tokenizer(
-                    chunk,
-                    add_special_tokens=True,
-                    padding=False,
-                    max_length=max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
+        #     for start in range(0, len(seq), max_length):
+        #         chunk = seq[start:start + max_length]
 
-                input_ids_list.append(encoding["input_ids"].squeeze(0))
-                attention_masks.append(encoding["attention_mask"].squeeze(0))
+        #         encoding = tokenizer(
+        #             chunk,
+        #             add_special_tokens=True,
+        #             padding=False,
+        #             max_length=max_length,
+        #             truncation=True,
+        #             return_tensors="pt",
+        #         )
 
-        else:
+        #         input_ids_list.append(encoding["input_ids"].squeeze(0))
+        #         attention_masks.append(encoding["attention_mask"].squeeze(0))
 
-            encoding = tokenizer(
-                seq,
-                add_special_tokens=True,
-                padding=False,
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
+        # else:
 
-            input_ids_list.append(encoding["input_ids"].squeeze(0))
-            attention_masks.append(encoding["attention_mask"].squeeze(0))
+        encoding = tokenizer(
+            seq,
+            add_special_tokens=True,
+            padding=False,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        input_ids_list.append(encoding["input_ids"].squeeze(0))
+        attention_masks.append(encoding["attention_mask"].squeeze(0))
 
     # Write results
     with h5py.File(shard_path, "w") as h5f:
