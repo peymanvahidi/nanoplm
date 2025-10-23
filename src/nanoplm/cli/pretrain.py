@@ -352,6 +352,7 @@ def run(
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
+    logger.info(f"Attention implementation: {model.config._attn_implementation}")
 
     run_pretraining(model=model, pretrain_config=cfg)
 
@@ -403,6 +404,7 @@ def from_yaml(config: str):
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
+    logger.info(f"Attention implementation: {model.config._attn_implementation}")
 
     run_pretraining(
         model=model,

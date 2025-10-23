@@ -119,6 +119,8 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
 
         input_ids = batch["input_ids"]
 
+        print(input_ids)
+
         # Build/augment special mask
         if "special_tokens_mask" in batch:
             special = batch["special_tokens_mask"].bool()
@@ -138,4 +140,19 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         inputs, labels = self.torch_mask_tokens(input_ids, special_tokens_mask=special)
         batch["input_ids"] = inputs
         batch["labels"] = labels
+
+        for key in ["input_ids", "labels"]:
+            t = batch[key].flatten()
+            
+            print(f"\nToken counts for {key}:")
+            print(f"\n{key}: shape = {t.shape}")
+            
+            # Exclude -100 (the ignore_index for labels)
+            if key == "labels":
+                t = t[t != -100]
+            
+            counts = torch.bincount(t)
+            for token_id, count in enumerate(counts):
+                if count > 0:
+                    print(f"  Token {token_id}: {count.item()}")
         return batch
