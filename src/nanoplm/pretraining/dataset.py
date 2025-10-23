@@ -237,8 +237,6 @@ class FastaMLMDataset(Dataset):
     def _get_shard(self, idx):
         """Return (shard_index, local_index_in_shard)"""
         shard_idx = bisect.bisect_right(self.cum_lengths, idx)
-        print(shard_idx)
-        print(idx)
         if shard_idx > 0:
             idx -= self.cum_lengths[shard_idx - 1]
         return shard_idx, idx
