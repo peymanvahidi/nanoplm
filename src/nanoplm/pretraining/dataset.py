@@ -31,7 +31,7 @@ class FastaMLMDataset(Dataset):
         lazy: bool = False,
         hdf5_dir: str = None,
         samples_per_shard: int = 10000,
-        max_workers: int | None = None,
+        max_workers: int = -1,
         load_shards: bool = False,
     ) -> None:
 
@@ -39,9 +39,9 @@ class FastaMLMDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
         self.lazy = bool(lazy)
-        self.hdf5_dir = Path(hdf5_dir)
+        self.hdf5_dir = Path(hdf5_dir) if hdf5_dir is not None else None
         self.samples_per_shard = int(samples_per_shard)
-        self.max_workers = max_workers if max_workers else os.cpu_count()
+        self.max_workers = os.cpu_count() if max_workers == -1 else max_workers
         self.load_shards = bool(load_shards)
 
         # Validate that the FASTA file exists and is readable
@@ -74,6 +74,9 @@ class FastaMLMDataset(Dataset):
 
         # If not lazy, tokenize all sequences eagerly and store in HDF5 shards on disk
         if not self.lazy:
+            if self.hdf5_dir is None:
+                raise ValueError("hdf5_dir must be provided when lazy=False")
+            
             # Check if shards already exist
             shards_exist = self.hdf5_dir.exists() and len(list(self.hdf5_dir.glob("*.h5"))) > 0
 
@@ -88,15 +91,6 @@ class FastaMLMDataset(Dataset):
                 # Load existing shards
                 logger.info(f"Found existing HDF5 shards in {self.hdf5_dir}, loading them.")
                 self.shard_paths = sorted(self.hdf5_dir.glob("*.h5"))
-
-                # Read shard lengths without keeping files open
-                self.lengths = []
-                for path in self.shard_paths:
-                    with h5py.File(path, "r") as f:
-                        n = len(f["input_ids"])
-                    self.lengths.append(n)
-
-                self.cum_lengths = np.cumsum(self.lengths)
             
             else:
                 # User wants to create fresh shards
@@ -144,6 +138,17 @@ class FastaMLMDataset(Dataset):
                 logger.info(
                     f"Eagerly tokenized {len(self._keys):,} sequences and saved to {len(results)} hdf5 shards."
                 )
+                
+            self.shard_paths = sorted(self.hdf5_dir.glob("*.h5"))
+            
+            # Read shard lengths without keeping files open
+            self.lengths = []
+            for path in self.shard_paths:
+                with h5py.File(path, "r") as f:
+                    n = len(f["input_ids"])
+                self.lengths.append(n)
+
+            self.cum_lengths = np.cumsum(self.lengths)
 
     def __len__(self) -> int:
         if self.lazy:
