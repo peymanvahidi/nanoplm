@@ -42,7 +42,8 @@ MAIGT
         dataset = FastaMLMDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
-            max_length=128
+            max_length=128,
+            lazy=True
         )
 
         assert len(dataset) == 3, "Should have 3 sequences"
@@ -53,7 +54,8 @@ MAIGT
         dataset = FastaMLMDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
-            max_length=128
+            max_length=128,
+            lazy=True
         )
 
         # Test first sequence
@@ -84,7 +86,8 @@ MAIGT
             dataset = FastaMLMDataset(
                 fasta_path=long_fasta_path,
                 tokenizer=tokenizer,
-                max_length=50  # Short max_length to force truncation
+                max_length=50,  # Short max_length to force truncation
+                lazy=True
             )
 
             sample = dataset[0]
@@ -97,7 +100,8 @@ MAIGT
         dataset = FastaMLMDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
-            max_length=128
+            max_length=128,
+            lazy=True
         )
 
         # Test negative index
@@ -123,7 +127,8 @@ MAIGT
                 FastaMLMDataset(
                     fasta_path=empty_path,
                     tokenizer=tokenizer,
-                    max_length=128
+                    max_length=128,
+                    lazy=True
                 )
         finally:
             os.unlink(empty_path)
@@ -141,7 +146,8 @@ MAIGT
             dataset = FastaMLMDataset(
                 fasta_path=simple_path,
                 tokenizer=tokenizer,
-                max_length=128
+                max_length=128,
+                lazy=True
             )
 
             sample = dataset[0]
@@ -162,7 +168,8 @@ MAIGT
         dataset = FastaMLMDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
-            max_length=128
+            max_length=128,
+            lazy=True
         )
 
         # Check that index file was created
@@ -173,7 +180,8 @@ MAIGT
         dataset2 = FastaMLMDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
-            max_length=128
+            max_length=128,
+            lazy=True
         )
 
         # Should work without recreating index
@@ -220,7 +228,8 @@ MAIGTMAIGTMAIGT
         dataset = FastaMLMDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
-            max_length=64
+            max_length=64,
+            lazy=True
         )
 
         # Get a batch of samples
@@ -255,7 +264,8 @@ MAIGTMAIGTMAIGT
         dataset = FastaMLMDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
-            max_length=128
+            max_length=128,
+            lazy=True
         )
 
         # Test iteration
@@ -271,6 +281,8 @@ MAIGTMAIGTMAIGT
 
     def test_dataset_lazy_vs_non_lazy(self, temp_fasta_file, tokenizer):
         """Test lazy vs non-lazy loading modes."""
+        import tempfile
+        
         # Test lazy mode (default)
         lazy_dataset = FastaMLMDataset(
             fasta_path=temp_fasta_file,
@@ -279,40 +291,43 @@ MAIGTMAIGTMAIGT
             lazy=True
         )
 
-        # Test non-lazy mode
-        non_lazy_dataset = FastaMLMDataset(
-            fasta_path=temp_fasta_file,
-            tokenizer=tokenizer,
-            max_length=128,
-            lazy=False
-        )
+        # Create temporary directory for HDF5 shards
+        with tempfile.TemporaryDirectory() as temp_hdf5_dir:
+            # Test non-lazy mode
+            non_lazy_dataset = FastaMLMDataset(
+                fasta_path=temp_fasta_file,
+                tokenizer=tokenizer,
+                max_length=128,
+                lazy=False,
+                hdf5_dir=temp_hdf5_dir
+            )
 
-        # Both should have same length
-        assert len(lazy_dataset) == len(non_lazy_dataset), "Datasets should have same length"
+            # Both should have same length
+            assert len(lazy_dataset) == len(non_lazy_dataset), "Datasets should have same length"
 
-        # Non-lazy dataset should have cached encodings
-        assert hasattr(non_lazy_dataset, '_encodings'), "Non-lazy dataset should have _encodings"
-        assert non_lazy_dataset._encodings is not None, "_encodings should be populated"
-        assert len(non_lazy_dataset._encodings) == len(non_lazy_dataset), "Should cache all encodings"
+            # Non-lazy dataset should have HDF5 shards
+            assert hasattr(non_lazy_dataset, 'shard_paths'), "Non-lazy dataset should have shard_paths"
+            assert len(non_lazy_dataset.shard_paths) > 0, "Should have created HDF5 shards"
 
-        # Lazy dataset should not have cached encodings
-        assert not hasattr(lazy_dataset, '_encodings') or lazy_dataset._encodings is None, "Lazy dataset should not cache encodings"
+            # Lazy dataset should not have shard_paths
+            assert not hasattr(lazy_dataset, 'shard_paths'), "Lazy dataset should not have shard_paths"
 
-        # Results should be identical
-        for i in range(len(lazy_dataset)):
-            lazy_sample = lazy_dataset[i]
-            non_lazy_sample = non_lazy_dataset[i]
+            # Results should be identical
+            for i in range(len(lazy_dataset)):
+                lazy_sample = lazy_dataset[i]
+                non_lazy_sample = non_lazy_dataset[i]
 
-            # Compare tensors
-            assert torch.equal(lazy_sample['input_ids'], non_lazy_sample['input_ids']), f"input_ids should match for index {i}"
-            assert torch.equal(lazy_sample['attention_mask'], non_lazy_sample['attention_mask']), f"attention_mask should match for index {i}"
+                # Compare tensors
+                assert torch.equal(lazy_sample['input_ids'], non_lazy_sample['input_ids']), f"input_ids should match for index {i}"
+                assert torch.equal(lazy_sample['attention_mask'], non_lazy_sample['attention_mask']), f"attention_mask should match for index {i}"
 
     def test_dataset_memory_efficiency(self, temp_fasta_file, tokenizer):
         """Test that dataset doesn't load all sequences into memory."""
         dataset = FastaMLMDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
-            max_length=128
+            max_length=128,
+            lazy=True
         )
 
         # Access all sequences
