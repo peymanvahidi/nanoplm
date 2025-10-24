@@ -1,79 +1,18 @@
-from torch.utils.data import Dataset
-from Bio import SeqIO
-from typing import List, Dict
-from transformers import PreTrainedTokenizer
-from tqdm import tqdm
-from pathlib import Path
-import torch
 import os
+import torch
 import h5py
+import bisect
 import numpy as np
 from math import ceil
+from Bio import SeqIO
+from typing import List, Dict
+from tqdm import tqdm
+from pathlib import Path
+from torch.utils.data import Dataset
+from transformers import PreTrainedTokenizer
 from concurrent.futures import ProcessPoolExecutor
-from nanoplm.utils.logger import logger
-import bisect
 
-def process_shard(args):
-    shard_idx, fasta_path, db_path, shard_keys, tokenizer, max_length, output_dir = args
-
-    # Each process must open its own index
-    index = SeqIO.index_db(db_path, [fasta_path], "fasta")
-
-    shard_path = Path(output_dir) / f"train_{shard_idx:04d}.h5"
-    input_ids_list = []
-    attention_masks = []
-
-    for key in tqdm(shard_keys, desc=f"Tokenizing shard {shard_idx}", leave=False):
-        record = index[key]
-        seq = str(record.seq)
-        seq_len = len(seq)
-
-        # easier to just split the input FASTA
-
-        # # for seqs above max_length
-        # if seq_len > max_length:
-
-        #     for start in range(0, len(seq), max_length):
-        #         chunk = seq[start:start + max_length]
-
-        #         encoding = tokenizer(
-        #             chunk,
-        #             add_special_tokens=True,
-        #             padding=False,
-        #             max_length=max_length,
-        #             truncation=True,
-        #             return_tensors="pt",
-        #         )
-
-        #         input_ids_list.append(encoding["input_ids"].squeeze(0))
-        #         attention_masks.append(encoding["attention_mask"].squeeze(0))
-
-        # else:
-
-        encoding = tokenizer(
-            seq,
-            add_special_tokens=True,
-            padding=False,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        input_ids_list.append(encoding["input_ids"].squeeze(0))
-        attention_masks.append(encoding["attention_mask"].squeeze(0))
-
-    # Write results
-    with h5py.File(shard_path, "w") as h5f:
-        total = len(input_ids_list)
-        h5f.create_dataset('input_ids', (total,), dtype=h5py.special_dtype(vlen=np.int32))
-        h5f.create_dataset('attention_mask', (total,), dtype=h5py.special_dtype(vlen=np.int32))
-
-        for i in tqdm(range(total), desc=f"Writing Shard {shard_idx}", leave=False):
-            h5f['input_ids'][i] = np.array(input_ids_list[i], dtype=np.int32)
-            h5f['attention_mask'][i] = np.array(attention_masks[i], dtype=np.int32)
-
-    index.close()
-    return str(shard_path)
+from nanoplm.utils import logger, create_dirs
 
 class FastaMLMDataset(Dataset):
     """FASTA dataset that tokenizes sequences for MLM pretraining.
@@ -91,19 +30,19 @@ class FastaMLMDataset(Dataset):
         max_length: int,
         lazy: bool = False,
         hdf5_dir: str = None,
-        samples_per_shard: int = 1000000,
-        max_workers: int = 1,
-        load_shards: bool = False
+        samples_per_shard: int = 10000,
+        max_workers: int | None = None,
+        load_shards: bool = False,
     ) -> None:
+
         self.fasta_path = str(fasta_path)
         self.tokenizer = tokenizer
         self.max_length = int(max_length)
         self.lazy = bool(lazy)
         self.hdf5_dir = Path(hdf5_dir)
         self.samples_per_shard = int(samples_per_shard)
-        self.max_workers = int(max_workers)
+        self.max_workers = max_workers if max_workers else os.cpu_count()
         self.load_shards = bool(load_shards)
-
 
         # Validate that the FASTA file exists and is readable
         fasta_path_obj = Path(self.fasta_path)
@@ -133,116 +72,83 @@ class FastaMLMDataset(Dataset):
             f"Loaded FASTA: {self.fasta_path} with {len(self._keys):,} sequences (max_length={self.max_length}, lazy={self.lazy})."
         )
 
-
-        # If not lazy, tokenize all sequences now and store them in memory
-        self._encodings = None
-
+        # If not lazy, tokenize all sequences eagerly and store in HDF5 shards on disk
         if not self.lazy:
+            # Check if shards already exist
+            shards_exist = self.hdf5_dir.exists() and len(list(self.hdf5_dir.glob("*.h5"))) > 0
 
-            if not self.load_shards:
-
-
-                
-                # bool for actually creating hdf5
-                create_hdf5 = True
-
-                # Validate if the FASTA file exists and is readable - if not skip
-                hdf5_path_obj = Path(self.hdf5_dir)
-
-
-                if create_hdf5:
-                    logger.info(f"Creating {hdf5_path_obj}")
-
-                    # create directory
-                    hdf5_path_obj.mkdir(parents=True, exist_ok=True)
-
-                    total_seqs = len(self._keys)
-                    num_shards = ceil(total_seqs / self.samples_per_shard)
-
-                    logger.info(f"Splitting {total_seqs:,} sequences into {num_shards} shards "
-                        f"({self.samples_per_shard:,} per file)")
-
-                    sharded_keys = [
-                        self._keys[i * samples_per_shard : (i + 1) * samples_per_shard]
-                        for i in range(num_shards)
-                    ]
-
-                    
-                    args = [
-                        (i, self.fasta_path, self._db_path, keys, self.tokenizer, self.max_length, hdf5_path_obj)
-                        for i, keys in enumerate(sharded_keys)
-                    ]
-
-                    with ProcessPoolExecutor(max_workers=self.max_workers or os.cpu_count()) as executor:
-                        results = list(executor.map(process_shard, args))
-
-                    # with h5py.File(hdf5_path_obj, "w") as h5f:
-                    #     index = 0 
-                    #     total_groups = len(self._keys)
-                    #     h5f.create_dataset('input_ids', (total_groups,), dtype=h5py.special_dtype(vlen=np.int32))
-                    #     h5f.create_dataset('attention_mask', (total_groups,), dtype=h5py.special_dtype(vlen=np.int32))
-
-                    #     i = 0
-                    #     for key in tqdm(self._keys, desc="Tokenizing sequences", total=len(self._keys)):
-                    #         record = self._index[key]
-                    #         sequence = str(record.seq)
-                    #         sequence = self.tokenizer.preprocess(sequence)
-
-                    #         encoding = self.tokenizer(
-                    #             sequence,
-                    #             add_special_tokens=True,
-                    #             padding=False,  # defer padding to the collator for dynamic padding
-                    #             max_length=self.max_length,
-                    #             truncation=True,
-                    #             return_tensors="pt",
-                    #         )
-
-                    #         h5f["input_ids"][index] = encoding["input_ids"].squeeze(0).cpu().numpy()
-                    #         h5f["attention_mask"][index] =  encoding["attention_mask"].squeeze(0).cpu().numpy()
-                    #         index += 1
-
-                    logger.info(
-                        f"Eagerly tokenized {len(self._keys):,} sequences and saved to hdf5."
+            if self.load_shards:
+                if not shards_exist:
+                    # User expects shards to exist but they don't
+                    raise FileNotFoundError(
+                        f"load_shards=True but no HDF5 shards found in {self.hdf5_dir}. "
+                        f"Set load_shards=False to create them."
                     )
-                else:
-                    logger.info(f"✅ {hdf5_path_obj} has correct format.")
-        
+                
+                # Load existing shards
+                logger.info(f"Found existing HDF5 shards in {self.hdf5_dir}, loading them.")
+                self.shard_paths = sorted(self.hdf5_dir.glob("*.h5"))
 
+                # Read shard lengths without keeping files open
+                self.lengths = []
+                for path in self.shard_paths:
+                    with h5py.File(path, "r") as f:
+                        n = len(f["input_ids"])
+                    self.lengths.append(n)
 
-            # Discover all shard files in directory (sorted)
-            self.shard_paths = sorted(self.hdf5_dir.glob("*.h5"))
-            if not self.shard_paths:
-                raise FileNotFoundError(f"No HDF5 shards found in {self.hdf5_dir}")
+                self.cum_lengths = np.cumsum(self.lengths)
+            
+            else:
+                # User wants to create fresh shards
+                if shards_exist:
+                    raise FileExistsError(
+                        f"load_shards=False but HDF5 shards already exist in {self.hdf5_dir}. "
+                        f"Either remove them, change the shard directory, or set load_shards=True to use them."
+                    )
+                
+                # Create new shards
+                logger.info(f"Creating HDF5 shards in {self.hdf5_dir}")
+                create_dirs(self.hdf5_dir)
 
-            # Open shards or just record lengths
-            self.shards = []
-            self.lengths = []
+                total_seqs = len(self._keys)
+                num_shards = ceil(total_seqs / self.samples_per_shard)
 
-            for path in self.shard_paths:
-                with h5py.File(path, "r") as f:
-                    n = len(f["input_ids"])
-                self.lengths.append(n)
-                self.shards.append(h5py.File(path, "r"))
+                logger.info(
+                    f"Splitting {total_seqs:,} sequences into {num_shards} shards "
+                    f"({self.samples_per_shard:,} per file)"
+                )
 
-            self.cum_lengths = np.cumsum(self.lengths)
+                sharded_keys = [
+                    self._keys[i * self.samples_per_shard : (i + 1) * self.samples_per_shard]
+                    for i in range(num_shards)
+                ]
 
-            self.shards = [h5py.File(path, "r") for path in self.shard_paths]
+                args = [
+                    (
+                        i,
+                        self.fasta_path,
+                        self._db_path,
+                        keys,
+                        self.tokenizer,
+                        self.max_length,
+                        self.hdf5_dir,
+                    )
+                    for i, keys in enumerate(sharded_keys)
+                ]
 
+                with ProcessPoolExecutor(
+                    max_workers=self.max_workers
+                ) as executor:
+                    results = list(executor.map(process_shard, args))
 
-
+                logger.info(
+                    f"Eagerly tokenized {len(self._keys):,} sequences and saved to {len(results)} hdf5 shards."
+                )
 
     def __len__(self) -> int:
         if self.lazy:
             return len(self._keys)
         return int(self.cum_lengths[-1])
-
-    def _get_shard(self, idx):
-        """Return (shard_index, local_index_in_shard)"""
-        shard_idx = bisect.bisect_right(self.cum_lengths, idx)
-        if shard_idx > 0:
-            idx -= self.cum_lengths[shard_idx - 1]
-        return shard_idx, idx
-
 
     def __getitem__(self, idx: int) -> Dict[str, List[int]]:
         if idx < 0 or idx >= len(self):
@@ -251,29 +157,19 @@ class FastaMLMDataset(Dataset):
             )
 
         if not self.lazy:
-            # # read from the hdf5 file
-            # input_ids = torch.tensor(self.h5f['input_ids'][idx], dtype=torch.long)
-            # attention_mask = torch.tensor(self.h5f['attention_mask'][idx], dtype=torch.long)
-
-            # return {
-            #     "input_ids": input_ids.squeeze(0),
-            #     "attention_mask": attention_mask.squeeze(0),
-            # }
-            # determine which shard and local index
-
-            shard_idx = bisect.bisect_right(self.cum_lengths, idx)
-            local_idx = idx if shard_idx == 0 else idx - self.cum_lengths[shard_idx - 1]
+            shard_idx, local_idx = self._get_shard(idx)
 
             # Open shard and read
             with h5py.File(self.shard_paths[shard_idx], "r") as f:
                 input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.long)
-                attention_mask = torch.tensor(f["attention_mask"][local_idx], dtype=torch.long)
-
+                attention_mask = torch.tensor(
+                    f["attention_mask"][local_idx], dtype=torch.long
+                )
 
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-    }
+            }
 
         key = self._keys[idx]
         record = self._index[key]
@@ -293,3 +189,54 @@ class FastaMLMDataset(Dataset):
             "input_ids": encoding["input_ids"].squeeze(0),  # Remove batch dimension
             "attention_mask": encoding["attention_mask"].squeeze(0),  # Remove batch dimension
         }
+    
+    def _get_shard(self, idx: int) -> tuple[int, int]:
+        """Return (shard_index, local_index_in_shard)"""
+        shard_idx = bisect.bisect_right(self.cum_lengths, idx)
+        if shard_idx > 0:
+            idx -= self.cum_lengths[shard_idx - 1]
+        return shard_idx, idx
+
+
+def process_shard(args):
+    shard_idx, fasta_path, db_path, shard_keys, tokenizer, max_length, output_dir = args
+
+    # Each process must open its own index
+    index = SeqIO.index_db(db_path, [fasta_path], "fasta")
+
+    shard_path = Path(output_dir) / f"train_{shard_idx:04d}.h5"
+    input_ids_list = []
+    attention_masks = []
+
+    for key in tqdm(shard_keys, desc=f"Tokenizing shard {shard_idx}", leave=False):
+        record = index[key]
+        seq = str(record.seq)
+
+        encoding = tokenizer(
+            seq,
+            add_special_tokens=True,
+            padding=False,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        input_ids_list.append(encoding["input_ids"].squeeze(0))
+        attention_masks.append(encoding["attention_mask"].squeeze(0))
+
+    # Write results
+    with h5py.File(shard_path, "w") as h5f:
+        total = len(input_ids_list)
+        h5f.create_dataset(
+            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.int32)
+        )
+        h5f.create_dataset(
+            "attention_mask", (total,), dtype=h5py.special_dtype(vlen=np.int32)
+        )
+
+        for i in tqdm(range(total), desc=f"Writing Shard {shard_idx}", leave=False):
+            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.int32)
+            h5f["attention_mask"][i] = np.array(attention_masks[i], dtype=np.int32)
+
+    index.close()
+    return str(shard_path)
