@@ -17,7 +17,10 @@ from nanoplm.pretraining.models.modern_bert import (
     ProtModernBertMLM,
     ProtModernBertTokenizer,
 )
-from nanoplm.pretraining.dataset import FastaMLMDataset
+from nanoplm.pretraining.dataset import (
+    LazyFastaMLMDataset,
+    LoadShardedFastaMLMDataset,
+)
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
@@ -34,9 +37,6 @@ class PretrainingConfig:
     lazy_dataset: bool = False
     train_hdf5: str = "output/data/split/train_hdf5"
     val_hdf5: str = "output/data/split/val_hdf5"
-    samples_per_shard: int = 1000000
-    max_workers: int = 1
-    load_shards: bool = False
     warmup_ratio: float = 0.05
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
@@ -114,7 +114,9 @@ def _prepare_run_and_steps(
             current_epoch = trainer_state.get("epoch", 0)
             num_epochs = current_epoch + resume_config.num_epochs
 
-            training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
+            training_args_path = (
+                Path(resume_config.checkpoint_dir) / "training_args.bin"
+            )
             if training_args_path.exists():
                 original_args = torch.load(training_args_path, weights_only=False)
                 logging_steps = original_args.logging_steps
@@ -125,19 +127,33 @@ def _prepare_run_and_steps(
                 )
             else:
                 total_steps = num_epochs * len(train_ds) // global_batch_size
-                logging_steps = max(1, int(total_steps * pretrain_config.logging_steps_percentage))
-                eval_steps = max(1, int(total_steps * pretrain_config.eval_steps_percentage))
-                save_steps = max(1, int(total_steps * pretrain_config.save_steps_percentage))
+                logging_steps = max(
+                    1, int(total_steps * pretrain_config.logging_steps_percentage)
+                )
+                eval_steps = max(
+                    1, int(total_steps * pretrain_config.eval_steps_percentage)
+                )
+                save_steps = max(
+                    1, int(total_steps * pretrain_config.save_steps_percentage)
+                )
         else:
             num_epochs = resume_config.num_epochs
             total_steps = num_epochs * len(train_ds) // global_batch_size
-            logging_steps = max(1, int(total_steps * pretrain_config.logging_steps_percentage))
-            eval_steps = max(1, int(total_steps * pretrain_config.eval_steps_percentage))
-            save_steps = max(1, int(total_steps * pretrain_config.save_steps_percentage))
+            logging_steps = max(
+                1, int(total_steps * pretrain_config.logging_steps_percentage)
+            )
+            eval_steps = max(
+                1, int(total_steps * pretrain_config.eval_steps_percentage)
+            )
+            save_steps = max(
+                1, int(total_steps * pretrain_config.save_steps_percentage)
+            )
     else:
         num_epochs = pretrain_config.num_epochs
         total_steps = num_epochs * len(train_ds) // global_batch_size
-        logging_steps = max(1, int(total_steps * pretrain_config.logging_steps_percentage))
+        logging_steps = max(
+            1, int(total_steps * pretrain_config.logging_steps_percentage)
+        )
         eval_steps = max(1, int(total_steps * pretrain_config.eval_steps_percentage))
         save_steps = max(1, int(total_steps * pretrain_config.save_steps_percentage))
 
@@ -155,18 +171,33 @@ def run_pretraining(
     tokenizer = model.tokenizer
     model.to(device)
 
-    train_ds, val_ds = _create_datasets(
-        train_fasta=pretrain_config.train_fasta,
-        val_fasta=pretrain_config.val_fasta,
-        max_length=pretrain_config.max_length,
-        lazy=pretrain_config.lazy_dataset,
-        tokenizer=tokenizer,
-        train_hdf5=pretrain_config.train_hdf5,
-        val_hdf5=pretrain_config.val_hdf5,
-        samples_per_shard=pretrain_config.samples_per_shard,
-        max_workers=pretrain_config.max_workers,
-        load_shards=pretrain_config.load_shards
-    )
+    if pretrain_config.lazy_dataset:
+        # Use lazy loading: tokenize on-the-fly from FASTA
+        logger.info("Using LazyFastaMLMDataset for on-the-fly tokenization")
+        train_ds, val_ds = _create_lazy_datasets(
+            train_fasta=pretrain_config.train_fasta,
+            val_fasta=pretrain_config.val_fasta,
+            max_length=pretrain_config.max_length,
+            tokenizer=tokenizer,
+        )
+    else:
+        # Load pre-tokenized HDF5 shards
+        logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
+        logger.info(f"Expected train shards: {pretrain_config.train_hdf5}")
+        logger.info(f"Expected val shards: {pretrain_config.val_hdf5}")
+
+        try:
+            train_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.train_hdf5)
+            val_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.val_hdf5)
+        except FileNotFoundError as e:
+            logger.error(
+                f"HDF5 shards not found! You need to create them first.\n"
+                f"Run: nanoplm data from-yaml --pretrain <your_data_config.yaml>\n"
+                f"Or set lazy_dataset=True in your pretrain.yaml to use on-the-fly tokenization.\n"
+                f"Error: {e}"
+            )
+            raise
+
     collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
         mlm_probability=pretrain_config.mlm_probability,
@@ -181,20 +212,30 @@ def run_pretraining(
     if pretrain_config.multi_gpu:
         if pretrain_config.world_size == "auto":
             env_ws = os.environ.get("WORLD_SIZE")
-            effective_world_size = int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
+            effective_world_size = (
+                int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
+            )
         else:
-            effective_world_size = int(pretrain_config.world_size) if  pretrain_config.world_size else 1
+            effective_world_size = (
+                int(pretrain_config.world_size) if pretrain_config.world_size else 1
+            )
     else:
         effective_world_size = 1
 
-    global_batch_size = pretrain_config.gradient_accumulation_steps * pretrain_config.batch_size * effective_world_size
+    global_batch_size = (
+        pretrain_config.gradient_accumulation_steps
+        * pretrain_config.batch_size
+        * effective_world_size
+    )
 
     # Prepare run info and step intervals in a single place
-    run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps = _prepare_run_and_steps(
-        pretrain_config=pretrain_config,
-        resume_config=resume_config,
-        train_ds=train_ds,
-        global_batch_size=global_batch_size,
+    run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps = (
+        _prepare_run_and_steps(
+            pretrain_config=pretrain_config,
+            resume_config=resume_config,
+            train_ds=train_ds,
+            global_batch_size=global_batch_size,
+        )
     )
 
     # Configure Weights & Biases via environment variables so HF Trainer attaches correctly
@@ -251,20 +292,25 @@ def run_pretraining(
     )
 
     logger.info("Starting Trainer")
-    
+
     # Start training and capture W&B run ID immediately after trainer initialization
     try:
         if resume_config:
-            logger.info(f"Resuming training from checkpoint: {resume_config.checkpoint_dir}")
+            logger.info(
+                f"Resuming training from checkpoint: {resume_config.checkpoint_dir}"
+            )
             trainer.train(resume_from_checkpoint=resume_config.checkpoint_dir)
         else:
             trainer.train()
-            
+
         # Capture and save W&B run ID for future resumes (if W&B is active)
         if wandb.run is not None:
             actual_run_id = wandb.run.id
             run_id_path = Path(output_dir) / "wandb_run_id.txt"
-            if not run_id_path.exists() or run_id_path.read_text().strip() != actual_run_id:
+            if (
+                not run_id_path.exists()
+                or run_id_path.read_text().strip() != actual_run_id
+            ):
                 run_id_path.write_text(actual_run_id, encoding="utf-8")
                 logger.info(f"Saved W&B run ID: {actual_run_id}")
     except Exception as e:
@@ -276,39 +322,23 @@ def run_pretraining(
     trainer.save_state()
 
 
-def _create_datasets(
+def _create_lazy_datasets(
     train_fasta: Union[str, Path],
     val_fasta: Union[str, Path],
     max_length: int,
-    lazy: bool,
     tokenizer: ProtModernBertTokenizer,
-    train_hdf5: Union[str, Path],
-    val_hdf5: Union[str, Path],
-    samples_per_shard: int,
-    max_workers: int,
-    load_shards: bool
 ) -> Tuple[Dataset, Optional[Dataset]]:
 
-    train_ds = FastaMLMDataset(
+    train_ds = LazyFastaMLMDataset(
         fasta_path=train_fasta,
         tokenizer=tokenizer,
         max_length=max_length,
-        lazy=lazy,
-        hdf5_dir=train_hdf5,
-        samples_per_shard=samples_per_shard,
-        max_workers=max_workers,
-        load_shards=load_shards
     )
 
-    val_ds = FastaMLMDataset(
+    val_ds = LazyFastaMLMDataset(
         fasta_path=val_fasta,
         tokenizer=tokenizer,
         max_length=max_length,
-        lazy=lazy,
-        hdf5_dir=val_hdf5,
-        samples_per_shard=samples_per_shard,
-        max_workers=max_workers,
-        load_shards=load_shards # for 
     )
 
     return train_ds, val_ds
