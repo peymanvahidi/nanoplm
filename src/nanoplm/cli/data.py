@@ -616,7 +616,7 @@ def get_yaml(output: str | None, force: bool):
         "\n"
         "# If you want to generate pretraining shards, set enable to True\n"
         "pretrain_config:\n"
-        "  enable: False\n"
+        "  enable: True\n"
         '  train_hdf5: "output/data/pretrain_shards/train_hdf5"\n'
         '  val_hdf5: "output/data/pretrain_shards/val_hdf5"\n'
         "  samples_per_shard: 10000\n"
