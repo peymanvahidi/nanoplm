@@ -5,7 +5,6 @@ nanoPLM CLI - Data subcommands for nanoPLM package
 
 import click
 from pathlib import Path
-import shutil
 import subprocess
 
 from nanoplm.config.datasets import DATASET_URLS
@@ -17,9 +16,11 @@ from nanoplm.data.filterer import Filterer, FilterError
 from nanoplm.data.splitor import Splitor, SplitError
 from nanoplm.data.dataset import SaveKDDataset, shard_h5_file
 from nanoplm.models.teacher import ProtT5
+from nanoplm.pretraining.dataset import SaveShardedFastaMLMDataset
+from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 from nanoplm.utils import create_dirs
-from nanoplm.utils.common import inside_git_repo, is_git_subdir
+from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml
 
 
 @click.group(name="data")
@@ -586,7 +587,9 @@ def get_yaml(output: str | None, force: bool):
             existing.append(str(dvc_path))
         if existing:
             raise click.ClickException(
-                "File(s) already exist: " + ", ".join(existing) + ". Use --force to overwrite."
+                "File(s) already exist: "
+                + ", ".join(existing)
+                + ". Use --force to overwrite."
             )
 
     template = (
@@ -596,9 +599,9 @@ def get_yaml(output: str | None, force: bool):
         "  max_seq_len: 512\n"
         "  val_ratio: 0.1\n"
         "\n"
-        "  device: \"auto\"\n"
+        '  device: "auto"\n'
         "  \n"
-        "  shuffle_backend: \"biopython\" # or \"seqkit\" (faster, but you need to install it)\n"
+        '  shuffle_backend: "biopython" # or "seqkit" (faster, but you need to install it)\n'
         "  shuffle: true\n"
         "  shuffle_seed: 24\n"
         "\n"
@@ -606,30 +609,39 @@ def get_yaml(output: str | None, force: bool):
         "  filter_skip_n: 0\n"
         "\n"
         "  # These are only needed for KNOWLEDGE DISTILLATION, no need to change them if you want to do pretraining only\n"
-        "  teacher_model: \"prott5\"\n"
+        '  teacher_model: "prott5"\n'
         "  embed_calc_batch_size: 4\n"
         "  train_shards: 5\n"
         "  val_shards: 2\n"
         "\n"
+        "# If you want to generate pretraining shards, set enable to True\n"
+        "pretrain_config:\n"
+        "  enable: False\n"
+        '  train_hdf5: "output/data/pretrain_shards/train_hdf5"\n'
+        '  val_hdf5: "output/data/pretrain_shards/val_hdf5"\n'
+        "  samples_per_shard: 10000\n"
+        "  max_workers: -1  # -1 to use all available CPUs\n"
+        "  force: False\n"
+        "\n"
         "# Data directories\n"
         "data_dirs:\n"
-        "  url: \"https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz\"\n"
-        "  # swissprot: \"https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz\"\n"
-        "  # trembl: \"https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz\"\n"
-        "  # uniref50: \"https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz\"\n"
-        "  # uniref90: \"https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz\"\n"
-        "  # uniref100: \"https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz\"\n"
-        "  compressed_fasta: \"output/data/raw/uniref50.fasta.gz\"\n"
-        "  extracted_fasta: \"output/data/raw/uniref50.fasta\"\n"
+        '  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"\n'
+        '  # swissprot: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"\n'
+        '  # trembl: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz"\n'
+        '  # uniref50: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"\n'
+        '  # uniref90: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"\n'
+        '  # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"\n'
+        '  compressed_fasta: "output/data/raw/uniref50.fasta.gz"\n'
+        '  extracted_fasta: "output/data/raw/uniref50.fasta"\n'
         "\n"
-        "  shuffled_fasta: \"output/data/raw/uniref50_shuffled.fasta\"\n"
+        '  shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"\n'
         "\n"
-        "  filtered_fasta: \"output/data/filter/uniref50_filtered.fasta\"\n"
-        "  splitted_fasta_dir: \"output/data/split\"\n"
+        '  filtered_fasta: "output/data/filter/uniref50_filtered.fasta"\n'
+        '  splitted_fasta_dir: "output/data/split"\n'
         "\n"
         "  # These dirs are only used for KNOWLEDGE DISTILLATION, no need to change them if you want to do pretraining only\n"
-        "  kd_train_dir: \"output/data/kd_dataset/train\"\n"
-        "  kd_val_dir: \"output/data/kd_dataset/val\"\n"
+        '  kd_train_dir: "output/data/kd_dataset/train"\n'
+        '  kd_val_dir: "output/data/kd_dataset/val"\n'
     )
 
     if force and params_path.exists():
@@ -729,7 +741,9 @@ def get_yaml(output: str | None, force: bool):
 
     dvc_path.write_text(dvc_yaml_template, encoding="utf-8")
 
-    click.echo(f"Both files are written to: {output_path} directory.\nEdit the params.yaml file and use `nanoplm data repro` to run the pipeline.")
+    click.echo(
+        f"Both files are written to: {output_path} directory.\nEdit the params.yaml file and use `nanoplm data repro` to run the pipeline."
+    )
 
 
 @data.command("from-yaml")
@@ -806,7 +820,7 @@ def from_yaml(
             f"dvc.yaml not found in {cwd}."
             "\nUse `nanoplm data get-yaml` to generate a dvc.yaml file."
         )
-    
+
     if not params_yaml.exists():
         raise click.ClickException(
             f"params.yaml not found in {cwd}."
@@ -835,7 +849,9 @@ def from_yaml(
     # Determine the target stage
     if target is None and not distillation:
         target = "split"
-        click.echo("Running pipeline up to 'split' stage (use --distillation to include KD dataset preparation)")
+        click.echo(
+            "Running pipeline up to 'split' stage (use --distillation to include KD dataset preparation)"
+        )
 
     # Build repro command
     cmd: list[str] = ["dvc", "repro"]
@@ -845,10 +861,88 @@ def from_yaml(
         cmd.append("-f")
     if target:
         cmd.append(target)
-    
+
     try:
         subprocess.run(cmd, cwd=str(cwd), check=True)
     except FileNotFoundError:
-        raise click.ClickException("'dvc' command not found. Please install DVC (pip install dvc).")
+        raise click.ClickException(
+            "'dvc' command not found. Please install DVC (pip install dvc)."
+        )
     except subprocess.CalledProcessError as e:
         raise click.ClickException(f"dvc repro failed with exit code {e.returncode}")
+
+    # Rest is for pretraining shard generation
+    try:
+        params = read_yaml(str(params_yaml))
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+    except Exception as e:
+        raise click.ClickException(f"Failed to read params.yaml: {e}") from e
+
+    data_params = params.get("data_params")
+    data_dirs = params.get("data_dirs")
+    pretrain_config = params.get("pretrain_config")
+
+    pretrain_enabled = pretrain_config.get("enable")
+
+    if pretrain_enabled and distillation:
+        raise click.ClickException(
+            "Pretraining shard generation and distillation cannot be run together"
+        )
+
+    if pretrain_enabled:
+        splitted_dir = data_dirs.get("splitted_fasta_dir")
+
+        train_fasta = _resolve_path(Path(splitted_dir) / "train.fasta", cwd)
+        val_fasta = _resolve_path(Path(splitted_dir) / "val.fasta", cwd)
+
+        train_hdf5_dir = _resolve_path(pretrain_config.get("train_hdf5"), cwd)
+        val_hdf5_dir = _resolve_path(pretrain_config.get("val_hdf5"), cwd)
+        create_dirs(train_hdf5_dir)
+        create_dirs(val_hdf5_dir)
+
+        max_seq_len = data_params.get("max_seq_len")
+        samples_per_shard = pretrain_config.get("samples_per_shard")
+        max_workers = pretrain_config.get("max_workers")
+        force = pretrain_config.get("force")
+
+        tokenizer = ProtModernBertTokenizer()
+
+        click.echo("Creating HDF5 shards for training dataset...")
+        train_saver = SaveShardedFastaMLMDataset(
+            fasta_path=str(train_fasta),
+            tokenizer=tokenizer,
+            max_length=max_seq_len,
+            output_dir=str(train_hdf5_dir),
+            samples_per_shard=samples_per_shard,
+            max_workers=max_workers,
+            force=force,
+        )
+        train_shards = train_saver.create_shards()
+
+        click.echo("Creating HDF5 shards for validation dataset...")
+        val_saver = SaveShardedFastaMLMDataset(
+            fasta_path=str(val_fasta),
+            tokenizer=tokenizer,
+            max_length=max_seq_len,
+            output_dir=str(val_hdf5_dir),
+            samples_per_shard=samples_per_shard,
+            max_workers=max_workers,
+            force=force,
+        )
+        val_shards = val_saver.create_shards()
+
+        click.echo(
+            "Pretraining shard generation complete:\n"
+            f"  Train shards: {len(train_shards)} -> {train_hdf5_dir}\n"
+            f"  Val shards:   {len(val_shards)} -> {val_hdf5_dir}"
+        )
+    else:
+        click.echo("Pretraining shard generation is disabled in params.yaml")
+
+
+def _resolve_path(path_value: str | Path, cwd: Path) -> Path:
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = (cwd / path).resolve()
+    return path
