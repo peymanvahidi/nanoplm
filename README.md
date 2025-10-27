@@ -109,6 +109,15 @@ data_params:
   train_shards: 5
   val_shards: 2
 
+# If you want to generate pretraining shards, set enable to True
+pretrain_config:
+  enable: True
+  train_hdf5: "output/data/pretrain_shards/train_hdf5"
+  val_hdf5: "output/data/pretrain_shards/val_hdf5"
+  samples_per_shard: 10000
+  max_workers: 2  # -1 to use all available CPUs
+  force: False
+
 # Data directories
 data_dirs:
   url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
@@ -161,16 +170,24 @@ pretraining:
   max_length: 512
   batch_size: 32
   num_epochs: 10
-  # Info for lazy dataset loading
-  # True: Low memory usage, tokenize on-demand (slower iteration, faster startup)
-  # False: High memory usage, tokenize all sequences at once (faster iteration, slower startup)
+
+  # Dataset loading strategy:
+  # - lazy_dataset: True  => tokenize on-the-fly from FASTA
+  #                          Slower iteration, no preprocessing needed
+  # - lazy_dataset: False => load pre-tokenized HDF5 shards
+  #                          Faster iteration, requires preprocessing
+  # Important: To have the shards, you need to set pretrain_config.enable to True in the params.yaml file
+  # and run 'nanoplm data from-yaml' to create shards
   lazy_dataset: False
-  warmup_ratio: 0.05
+  train_hdf5: "output/data/pretrain_shards/train_hdf5"
+  val_hdf5: "output/data/pretrain_shards/val_hdf5"
+
   optimizer: "adamw" # adamw, stable_adamw
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
   learning_rate: 3e-6
+  warmup_ratio: 0.05
   weight_decay: 0.0
   gradient_accumulation_steps: 1
   mlm_probability: 0.3
@@ -185,6 +202,13 @@ pretraining:
   multi_gpu: False
   world_size: 1 # Use "auto" if you want to use all available GPUs
   project_name: "nanoplm-pretraining"
+
+resume:
+  # Set is_resume: true to resume training from a checkpoint
+  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir
+  is_resume: False
+  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
+  num_epochs: 5
 ```
 
 Tip: Paths are resolved relative to where you run the command (not where the YAML lives).
