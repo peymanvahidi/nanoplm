@@ -620,7 +620,7 @@ def get_yaml(output: str | None, force: bool):
         '  train_hdf5: "output/data/pretrain_shards/train_hdf5"\n'
         '  val_hdf5: "output/data/pretrain_shards/val_hdf5"\n'
         "  samples_per_shard: 10000\n"
-        "  max_workers: -1  # -1 to use all available CPUs\n"
+        "  max_workers: 2  # -1 to use all available CPUs\n"
         "  force: False\n"
         "\n"
         "# Data directories\n"
