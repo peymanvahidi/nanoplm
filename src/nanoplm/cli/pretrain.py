@@ -15,7 +15,7 @@ from nanoplm.pretraining.pipeline import (
     run_pretraining,
 )
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
-from nanoplm.utils.common import read_yaml, create_dirs
+from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
 
@@ -352,7 +352,7 @@ def run(
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
-    logger.info(f"Attention implementation: {model.config._attn_implementation}")
+    logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     run_pretraining(model=model, pretrain_config=cfg)
 
@@ -404,8 +404,8 @@ def from_yaml(config: str):
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
-    logger.info(f"Attention implementation: {model.config._attn_implementation}")
-
+    logger.info(f"Flash attention available: {is_flash_attention_available()}")
+        
     run_pretraining(
         model=model,
         pretrain_config=pretrain_config,

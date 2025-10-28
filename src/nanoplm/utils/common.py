@@ -10,6 +10,23 @@ from typing import Dict, Any, Union
 
 from nanoplm.utils.logger import logger
 
+import torch
+from torch.nn.attention import sdpa_kernel, SDPBackend
+
+def is_flash_attention_available():
+    if not torch.cuda.is_available():
+        return False
+
+    # small dummy tensors just to test
+    q = k = v = torch.randn(1, 1, 1, 1, device="cuda", dtype=torch.float16)
+    try:
+        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
+            torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        return True
+    except RuntimeError:
+        return False
+
+
 def read_yaml(file_path: str) -> Dict[str, Any]:
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
