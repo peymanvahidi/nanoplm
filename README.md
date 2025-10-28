@@ -178,6 +178,7 @@ pretraining:
   #                          Faster iteration, requires preprocessing
   # Important: To have the shards, you need to set pretrain_config.enable to True in the params.yaml file
   # and run 'nanoplm data from-yaml' to create shards
+  # or your need to run 'nanoplm data save-pretrain-dataset' using your desired FASTA file as input to create shards
   lazy_dataset: False
   train_hdf5: "output/data/pretrain_shards/train_hdf5"
   val_hdf5: "output/data/pretrain_shards/val_hdf5"
@@ -206,9 +207,10 @@ pretraining:
 resume:
   # Set is_resume: true to resume training from a checkpoint
   # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir
+  # extra_epochs: adds to 'pretraining.num_epochs' to define total epochs.
   is_resume: False
   checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
-  num_epochs: 5
+  extra_epochs: 0
 ```
 
 Tip: Paths are resolved relative to where you run the command (not where the YAML lives).
