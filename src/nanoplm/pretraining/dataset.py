@@ -226,7 +226,7 @@ def process_shard(args):
     # Each process must open its own index
     index = SeqIO.index_db(db_path, [fasta_path], "fasta")
 
-    shard_path = Path(output_dir) / f"train_{shard_idx:04d}.h5"
+    shard_path = Path(output_dir) / f"shard_{shard_idx:04d}.h5"
     input_ids_list = []
     attention_masks = []
 
