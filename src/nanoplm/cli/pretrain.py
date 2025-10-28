@@ -519,9 +519,10 @@ def get_yaml(output: Optional[str], force: bool):
         "resume:\n"
         "  # Set is_resume: true to resume training from a checkpoint\n"
         "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
+        "  # extra_epochs: adds to 'pretraining.num_epochs' to define total epochs.\n"
         "  is_resume: False\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
-        "  num_epochs: 5\n"
+        "  extra_epochs: 0\n"
     )
 
     # If forcing, remove existing file first
@@ -626,7 +627,7 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
 
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     if config is None:
-        return ResumeConfig(is_resume=False, checkpoint_dir="", num_epochs=0)
+        return ResumeConfig(is_resume=False, checkpoint_dir="", extra_epochs=None)
 
     expected_keys = set(ResumeConfig.__annotations__.keys())
     present_keys = set(config.keys())
@@ -645,19 +646,16 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             continue
         kwargs[key] = value
 
-
     checkpoint_dir = kwargs.get("checkpoint_dir")
-    num_epochs = kwargs.get("num_epochs")
+
+    if "extra_epochs" in config:
+        kwargs["extra_epochs"] = config.get("extra_epochs")
     is_resume = kwargs.get("is_resume", False)
 
     if is_resume:
         if not checkpoint_dir:
             raise click.ClickException(
                 "Resume requested but 'checkpoint_dir' is missing under 'resume'"
-            )
-        if not num_epochs:
-            raise click.ClickException(
-                "Resume requested but 'num_epochs' is missing under 'resume'"
             )
 
         checkpoint_path = Path(checkpoint_dir)

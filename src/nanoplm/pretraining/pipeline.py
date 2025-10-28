@@ -63,7 +63,7 @@ class PretrainingConfig:
 class ResumeConfig:
     is_resume: bool
     checkpoint_dir: str
-    num_epochs: int
+    extra_epochs: Optional[int] = None
 
 
 def _prepare_run_and_steps(
@@ -107,17 +107,16 @@ def _prepare_run_and_steps(
 
     # Compute epochs and step intervals
     if resume_config and resume_config.is_resume:
-        trainer_state_path = Path(resume_config.checkpoint_dir) / "trainer_state.json"
-        if trainer_state_path.exists():
-            with open(trainer_state_path, "r") as f:
-                trainer_state = json.load(f)
-            current_epoch = trainer_state.get("epoch", 0)
-            num_epochs = current_epoch + resume_config.num_epochs
+        training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
 
-            training_args_path = (
-                Path(resume_config.checkpoint_dir) / "training_args.bin"
-            )
-            if training_args_path.exists():
+        if resume_config.extra_epochs > 0:
+            num_epochs = pretrain_config.num_epochs + int(resume_config.extra_epochs)
+        else:
+            num_epochs = pretrain_config.num_epochs
+
+        # Preserve original logging/eval/save intervals when available
+        if training_args_path.exists():
+            try:
                 original_args = torch.load(training_args_path, weights_only=False)
                 logging_steps = original_args.logging_steps
                 eval_steps = original_args.eval_steps
@@ -125,7 +124,7 @@ def _prepare_run_and_steps(
                 logger.info(
                     f"Resuming with preserved intervals: save_steps={save_steps}, eval_steps={eval_steps}"
                 )
-            else:
+            except Exception:
                 total_steps = num_epochs * len(train_ds) // global_batch_size
                 logging_steps = max(
                     1, int(total_steps * pretrain_config.logging_steps_percentage)
@@ -137,7 +136,6 @@ def _prepare_run_and_steps(
                     1, int(total_steps * pretrain_config.save_steps_percentage)
                 )
         else:
-            num_epochs = resume_config.num_epochs
             total_steps = num_epochs * len(train_ds) // global_batch_size
             logging_steps = max(
                 1, int(total_steps * pretrain_config.logging_steps_percentage)
