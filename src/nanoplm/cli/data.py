@@ -493,6 +493,88 @@ def save_kd_dataset(
         )
 
 
+@data.command("save-pretrain-dataset")
+@click.option(
+    "--input",
+    "-i",
+    required=True,
+    type=click.Path(exists=True),
+    help="Input FASTA file path where the dataset is saved",
+)
+@click.option(
+    "--output",
+    "-o",
+    required=True,
+    type=click.Path(exists=False),
+    help="Output HDF5 directory path where the processed dataset will be saved.",
+)
+@click.option(
+    "--max-seq-len",
+    default=1024,
+    type=int,
+    help="Maximum sequence length, all sequences would be padded / truncated to this length",
+)
+@click.option(
+    "--max-workers",
+    default=2,
+    type=int,
+    help="Number of CPUs. Use --max-workers -1 to use all available CPUs",
+)
+@click.option(
+    "--samples-per-shard",
+    default=10000,
+    type=int,
+    help="Number of samples to save per hdf5 file shard",
+)
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    help="Force overwrite existing output file",
+    default=False,
+)
+@click.help_option("--help", "-h")
+def save_pretrain_dataset(
+    input: str,
+    output: str,
+    max_seq_len: int,
+    max_workers: int,
+    samples_per_shard: int,
+    force: bool,
+
+):
+
+    if samples_per_shard < 1:
+        raise click.ClickException("samples_per_shard must be at least 1")
+    if max_seq_len < 1:
+        raise click.ClickException("max-seq-len must be at least 1")
+    if max_workers < 1 and max_workers != -1:
+        raise click.ClickException("max_workers must be either -1 (use all available cores) or at least 1")
+
+    input_path = Path(input)
+    hdf5_output_dir = Path(output)
+    create_dirs(hdf5_output_dir)
+
+    tokenizer = ProtModernBertTokenizer()
+
+    click.echo("Creating HDF5 shards for pretraining ")
+    saver = SaveShardedFastaMLMDataset(
+        fasta_path=str(input_path),
+        tokenizer=tokenizer,
+        max_length=max_seq_len,
+        output_dir=str(hdf5_output_dir),
+        samples_per_shard=samples_per_shard,
+        max_workers=max_workers,
+        force=force,
+    )
+    shards = saver.create_shards()
+
+
+    click.echo(
+                "Pretraining shard generation complete:\n"
+                f"  shards: {len(shards)} -> {hdf5_output_dir}\n"
+            )
+
 @data.command("shard")
 @click.option(
     "--input-file",

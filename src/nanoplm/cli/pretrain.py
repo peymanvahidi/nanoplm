@@ -490,6 +490,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  #                          Faster iteration, requires preprocessing\n"
         "  # Important: To have the shards, you need to set pretrain_config.enable to True in the params.yaml file\n"
         "  # and run 'nanoplm data from-yaml' to create shards\n"
+        "  # or your need to run 'nanoplm data save-pretrain-dataset' using your desired FASTA file as input to create shards\n"
         "  lazy_dataset: False\n"
         "  train_hdf5: \"output/data/pretrain_shards/train_hdf5\"\n"
         "  val_hdf5: \"output/data/pretrain_shards/val_hdf5\"\n"
