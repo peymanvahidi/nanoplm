@@ -170,6 +170,13 @@ def run_pretraining(
     model.to(device)
 
     if pretrain_config.lazy_dataset:
+        if pretrain_config.train_fasta is None or pretrain_config.val_fasta is None:
+            raise ValueError("Train and validation FASTA files are required when lazy-dataset mode is enabled")
+        if not Path(pretrain_config.train_fasta).exists():
+            raise FileNotFoundError(f"Train FASTA file not found: {pretrain_config.train_fasta}")
+        if not Path(pretrain_config.val_fasta).exists():
+            raise FileNotFoundError(f"Validation FASTA file not found: {pretrain_config.val_fasta}")
+
         # Use lazy loading: tokenize on-the-fly from FASTA
         logger.info("Using LazyFastaMLMDataset for on-the-fly tokenization")
         train_ds, val_ds = _create_lazy_datasets(
@@ -179,6 +186,13 @@ def run_pretraining(
             tokenizer=tokenizer,
         )
     else:
+        if pretrain_config.train_hdf5 is None or pretrain_config.val_hdf5 is None:
+            raise ValueError("Train and validation HDF5 directories are required when lazy-dataset mode is disabled")
+        if not Path(pretrain_config.train_hdf5).exists():
+            raise FileNotFoundError(f"Train HDF5 directory not found: {pretrain_config.train_hdf5}")
+        if not Path(pretrain_config.val_hdf5).exists():
+            raise FileNotFoundError(f"Validation HDF5 directory not found: {pretrain_config.val_hdf5}")
+
         # Load pre-tokenized HDF5 shards
         logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
         logger.info(f"Expected train shards: {pretrain_config.train_hdf5}")
