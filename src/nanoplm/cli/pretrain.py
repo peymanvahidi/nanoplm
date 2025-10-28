@@ -4,8 +4,6 @@ nanoPLM CLI - Pretraining subcommands for MLM pretraining
 """
 
 import click
-import json
-import yaml
 from typing import Optional, Dict, Any
 from pathlib import Path
 
@@ -38,14 +36,22 @@ def pretrain():
 @click.option(
     "--train-fasta",
     type=str,
-    required=True,
     help="Training FASTA path"
 )
 @click.option(
     "--val-fasta",
     type=str,
-    required=True,
     help="Validation FASTA path"
+)
+@click.option(
+    "--train-hdf5",
+    type=str,
+    help="Directory of pre-tokenized training HDF5 shards (used when --lazy-dataset is False)"
+)
+@click.option(
+    "--val-hdf5",
+    type=str,
+    help="Directory of pre-tokenized validation HDF5 shards (used when --lazy-dataset is False)"
 )
 @click.option(
     "--ckp-dir",
@@ -188,9 +194,9 @@ def pretrain():
 )
 @click.option(
     "--world-size",
-    type=int,
-    default=1,
-    help="Total number of processes for distributed training, use auto if you want to use all available GPUs"
+    type=str,
+    default="1",
+    help="Total number of processes for distributed training; use 'auto' to use all available GPUs"
 )
 @click.option(
     "--project-name",
@@ -263,6 +269,8 @@ def run(
     # dataset/output
     train_fasta: str,
     val_fasta: str,
+    train_hdf5: str,
+    val_hdf5: str,
     ckp_dir: str,
     # training hp
     max_length: int,
@@ -287,7 +295,7 @@ def run(
     keep_probability: float,
     num_workers: int,
     multi_gpu: bool,
-    world_size: int,
+    world_size: str,
     project_name: str,
     # model hp
     hidden_size: int,
@@ -307,6 +315,8 @@ def run(
     cfg = PretrainingConfig(
         train_fasta=train_fasta,
         val_fasta=val_fasta,
+        train_hdf5=train_hdf5,
+        val_hdf5=val_hdf5,
         ckp_dir=ckp_dir,
         max_length=max_length,
         batch_size=batch_size,
