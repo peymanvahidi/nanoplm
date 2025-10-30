@@ -36,6 +36,7 @@ class PretrainingConfig:
     adam_epsilon: float = 1e-8
     learning_rate: float = 3e-6
     weight_decay: float = 0.0
+    max_grad_norm: float = 1.0  # Gradient clipping threshold
     gradient_accumulation_steps: int = 1
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
@@ -49,6 +50,7 @@ class PretrainingConfig:
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
     run_name: str = "nanoplm-pretraining"
+    bf16: bool = False
 
 
 @dataclass
@@ -101,6 +103,7 @@ def run_pretraining(
         "num_train_epochs": pretrain_config.num_epochs,
         "learning_rate": pretrain_config.learning_rate,
         "weight_decay": pretrain_config.weight_decay,
+        "max_grad_norm": pretrain_config.max_grad_norm,
         "warmup_ratio": pretrain_config.warmup_ratio,
         "logging_strategy": "steps",
         "logging_steps": max(1, int(total_steps * pretrain_config.logging_steps_percentage)),
@@ -114,6 +117,7 @@ def run_pretraining(
         "run_name": pretrain_config.run_name,
         "dataloader_pin_memory": True if device == "cuda" else False,
         "dataloader_num_workers": pretrain_config.num_workers,
+        "bf16": pretrain_config.bf16,
     }
 
     # Configure optimizer through TrainingArguments
