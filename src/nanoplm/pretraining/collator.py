@@ -138,4 +138,5 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         inputs, labels = self.torch_mask_tokens(input_ids, special_tokens_mask=special)
         batch["input_ids"] = inputs
         batch["labels"] = labels
+
         return batch

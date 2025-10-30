@@ -9,10 +9,12 @@ from pathlib import Path
 
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
+    ResumeConfig,
     run_pretraining,
 )
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
-from nanoplm.utils.common import read_yaml, create_dirs
+from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
+from nanoplm.utils.logger import logger
 
 
 @click.group(name="pretrain")
@@ -34,14 +36,22 @@ def pretrain():
 @click.option(
     "--train-fasta",
     type=str,
-    required=True,
     help="Training FASTA path"
 )
 @click.option(
     "--val-fasta",
     type=str,
-    required=True,
     help="Validation FASTA path"
+)
+@click.option(
+    "--train-hdf5",
+    type=str,
+    help="Directory of pre-tokenized training HDF5 shards (used when --lazy-dataset is False)"
+)
+@click.option(
+    "--val-hdf5",
+    type=str,
+    help="Directory of pre-tokenized validation HDF5 shards (used when --lazy-dataset is False)"
 )
 @click.option(
     "--ckp-dir",
@@ -190,15 +200,15 @@ def pretrain():
 )
 @click.option(
     "--world-size",
-    type=int,
-    default=1,
-    help="Total number of processes for distributed training, use auto if you want to use all available GPUs"
+    type=str,
+    default="1",
+    help="Total number of processes for distributed training; use 'auto' to use all available GPUs"
 )
 @click.option(
-    "--run-name",
+    "--project-name",
     type=str,
     default="nanoplm-pretraining",
-    help="Run name for experiment tracking"
+    help="Weights & Biases project name (new runs named run-DDMMHHMM, unique)"
 )
 # Model hyperparameters (ModernBERT)
 @click.option(
@@ -265,6 +275,8 @@ def run(
     # dataset/output
     train_fasta: str,
     val_fasta: str,
+    train_hdf5: str,
+    val_hdf5: str,
     ckp_dir: str,
     # training hp
     max_length: int,
@@ -290,8 +302,8 @@ def run(
     keep_probability: float,
     num_workers: int,
     multi_gpu: bool,
-    world_size: int,
-    run_name: str,
+    world_size: str,
+    project_name: str,
     # model hp
     hidden_size: int,
     intermediate_size: int,
@@ -310,6 +322,8 @@ def run(
     cfg = PretrainingConfig(
         train_fasta=train_fasta,
         val_fasta=val_fasta,
+        train_hdf5=train_hdf5,
+        val_hdf5=val_hdf5,
         ckp_dir=ckp_dir,
         max_length=max_length,
         batch_size=batch_size,
@@ -335,7 +349,7 @@ def run(
         num_workers=num_workers,
         multi_gpu=multi_gpu,
         world_size=world_size,
-        run_name=run_name,
+        project_name=project_name,
     )
     
     model_cfg = ProtModernBertMLMConfig(
@@ -353,7 +367,12 @@ def run(
 
     model = ProtModernBertMLM(model_cfg)
 
-    run_pretraining(model=model, config=cfg)
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    total_params = sum(p.numel() for p in model_parameters)
+    logger.info(f"Total Trainable Parameters: {total_params}")
+    logger.info(f"Flash attention available: {is_flash_attention_available()}")
+
+    run_pretraining(model=model, pretrain_config=cfg)
 
 
 @pretrain.command("from-yaml")
@@ -372,6 +391,10 @@ def from_yaml(config: str):
     Expected YAML structure:
     pretraining: {...}
     model: {...}
+    resume: {...}
+
+    If resume.is_resume is True, training will resume from the given
+    checkpoint using the hyperparameters in the 'pretraining' block.
     """
     config = Path(config)
 
@@ -387,14 +410,25 @@ def from_yaml(config: str):
     # Allow both nested and flat formats; prefer nested under key 'training'
     pretrain_dict = raw.get("pretraining")
     model_dict = raw.get("model")
+    resume_dict = raw.get("resume")
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
     model_config = _load_model_config(model_dict)
+    resume_config = _load_resume_config(resume_dict)
 
     model = ProtModernBertMLM(config=model_config)
 
-    run_pretraining(model=model, pretrain_config=pretrain_config)
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    total_params = sum(p.numel() for p in model_parameters)
+    logger.info(f"Total Trainable Parameters: {total_params}")
+    logger.info(f"Flash attention available: {is_flash_attention_available()}")
+        
+    run_pretraining(
+        model=model,
+        pretrain_config=pretrain_config,
+        resume_config=resume_config if resume_config.is_resume else None,
+    )
 
 
 @pretrain.command("get-yaml")
@@ -466,16 +500,25 @@ def get_yaml(output: Optional[str], force: bool):
         "  max_length: 512\n"
         "  batch_size: 32\n"
         "  num_epochs: 10\n"
-        "  # Info for lazy dataset loading\n"
-        "  # True: Low memory usage, tokenize on-demand (slower iteration, faster startup)\n"
-        "  # False: High memory usage, tokenize all sequences at once (faster iteration, slower startup)\n"
+        "\n"
+        "  # Dataset loading strategy:\n"
+        "  # - lazy_dataset: True  => tokenize on-the-fly from FASTA\n"
+        "  #                          Slower iteration, no preprocessing needed\n"
+        "  # - lazy_dataset: False => load pre-tokenized HDF5 shards\n"
+        "  #                          Faster iteration, requires preprocessing\n"
+        "  # Important: To have the shards, you need to set pretrain_config.enable to True in the params.yaml file\n"
+        "  # and run 'nanoplm data from-yaml' to create shards\n"
+        "  # or your need to run 'nanoplm data save-pretrain-dataset' using your desired FASTA file as input to create shards\n"
         "  lazy_dataset: False\n"
-        "  warmup_ratio: 0.05\n"
+        "  train_hdf5: \"output/data/pretrain_shards/train_hdf5\"\n"
+        "  val_hdf5: \"output/data/pretrain_shards/val_hdf5\"\n"
+        "\n"
         "  optimizer: \"adamw\" # adamw, stable_adamw\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 3e-6\n"
+        "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
         "  max_grad_norm: 1.0  # Gradient clipping for stability\n"
         "  gradient_accumulation_steps: 1\n"
@@ -490,7 +533,15 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_workers: 0\n"
         "  multi_gpu: False\n"
         "  world_size: 1 # Use \"auto\" if you want to use all available GPUs\n"
-        "  run_name: \"nanoplm-pretraining\"\n"
+        "  project_name: \"nanoplm-pretraining\"\n"
+        "\n"
+        "resume:\n"
+        "  # Set is_resume: true to resume training from a checkpoint\n"
+        "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
+        "  # extra_epochs: adds to 'pretraining.num_epochs' to define total epochs.\n"
+        "  is_resume: False\n"
+        "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
+        "  extra_epochs: 0\n"
     )
 
     # If forcing, remove existing file first
@@ -500,9 +551,9 @@ def get_yaml(output: Optional[str], force: bool):
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
-def _load_pretrain_config(d: Dict[str, Any]) -> PretrainingConfig:
+def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     expected_keys = set(PretrainingConfig.__annotations__.keys())
-    present_keys = set(d.keys())
+    present_keys = set(config.keys())
 
     missing = []
     extra = []
@@ -513,7 +564,7 @@ def _load_pretrain_config(d: Dict[str, Any]) -> PretrainingConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = d.get(key)
+        value = config.get(key)
         if value is None:
             missing.append(key)
             continue
@@ -555,9 +606,12 @@ def _load_pretrain_config(d: Dict[str, Any]) -> PretrainingConfig:
 
     return PretrainingConfig(**kwargs)
 
-def _load_model_config(d: Dict[str, Any]) -> ProtModernBertMLMConfig:
+def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
+    if config is None:
+        raise ValueError("Model configuration is required but not found in YAML")
+
     expected_keys = set(ProtModernBertMLMConfig.__annotations__.keys())
-    present_keys = set(d.keys())
+    present_keys = set(config.keys())
 
     # Define which keys are optional (triangular attention parameters)
     optional_keys = {
@@ -581,7 +635,7 @@ def _load_model_config(d: Dict[str, Any]) -> ProtModernBertMLMConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = d.get(key)
+        value = config.get(key)
         if value is None:
             missing.append(key)
             continue
@@ -601,3 +655,44 @@ def _load_model_config(d: Dict[str, Any]) -> ProtModernBertMLMConfig:
         )
 
     return ProtModernBertMLMConfig(**kwargs)
+
+def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
+    if config is None:
+        return ResumeConfig(is_resume=False, checkpoint_dir="", extra_epochs=None)
+
+    expected_keys = set(ResumeConfig.__annotations__.keys())
+    present_keys = set(config.keys())
+
+    missing = []
+    extra = []
+    kwargs: Dict[str, Any] = {}
+
+    for key in present_keys:
+        if key not in expected_keys:
+            extra.append(key)
+            continue
+        value = config.get(key)
+        if value is None:
+            missing.append(key)
+            continue
+        kwargs[key] = value
+
+    checkpoint_dir = kwargs.get("checkpoint_dir")
+
+    if "extra_epochs" in config:
+        kwargs["extra_epochs"] = config.get("extra_epochs")
+    is_resume = kwargs.get("is_resume", False)
+
+    if is_resume:
+        if not checkpoint_dir:
+            raise click.ClickException(
+                "Resume requested but 'checkpoint_dir' is missing under 'resume'"
+            )
+
+        checkpoint_path = Path(checkpoint_dir)
+        if not checkpoint_path.exists():
+            raise click.ClickException(
+                f"Checkpoint directory does not exist: {checkpoint_dir}"
+            )
+
+    return ResumeConfig(**kwargs)
