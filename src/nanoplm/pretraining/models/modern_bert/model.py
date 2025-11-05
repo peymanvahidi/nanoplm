@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import MaskedLMOutput
 
-from transformers import ModernBertConfig, ModernBertForMaskedLM, ModernBertModel
+from transformers import ModernBertConfig, ModernBertForMaskedLM, ModernBertModel, ModernBertPredictionHead
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.models.student.triangular_attention import PairwiseTriangularBlock, create_triangular_attention_layer
 
@@ -60,7 +60,8 @@ class ProtModernBertMLM(nn.Module):
             eos_token_id=self.tokenizer.eos_token_id,
             bos_token_id=None,
             unk_token_id=self.tokenizer.unk_token_id,
-            mask_token_id=self.tokenizer.mask_token_id
+            mask_token_id=self.tokenizer.mask_token_id,
+            #_attn_implementation="eager"
         )
         
         if self.use_triangular_attention:
@@ -77,97 +78,55 @@ class ProtModernBertMLM(nn.Module):
         """Setup standard single ModernBERT - clean and simple"""
         self.bert_model = ModernBertForMaskedLM(self.config)
 
-    def _setup_modular_architecture(self, config):
-        """Setup modular segments with triangular attention - clean separation"""
-        # Set triangular attention parameters
-        self.triangular_layers = config.triangular_layers or [3, 11]
-        self.triangular_pair_dim = config.triangular_pair_dim or config.hidden_size
-        self.triangular_heads = config.triangular_heads or 4
-        self.triangular_dropout = config.triangular_dropout or 0.1
-        
-        print(f"   residue_dim: {config.hidden_size}")
-        print(f"   triangular_layers: {self.triangular_layers}")
-        print(f"   triangular_pair_dim: {self.triangular_pair_dim}")
-        print(f"   triangular_heads: {self.triangular_heads}")
-        print(f"   triangular_dropout: {self.triangular_dropout}")
-        
-        # Parse triangular layer indices
-        if isinstance(self.triangular_layers, str):
-            if self.triangular_layers.lower() == "all":
-                triangular_indices = list(range(1, config.num_hidden_layers))
+    def _setup_modular_architecture(self, cfg: ProtModernBertMLMConfig):
+            # parse triangular layers
+            if isinstance(cfg.triangular_layers, str):
+                if cfg.triangular_layers.lower() == "all":
+                    tri_layers = list(range(1, cfg.num_hidden_layers))
+                else:
+                    tri_layers = [int(x.strip()) for x in cfg.triangular_layers.split(",")]
             else:
-                triangular_indices = [int(x.strip()) for x in self.triangular_layers.split(',')]
-        else:
-            triangular_indices = self.triangular_layers
-        
-        triangular_indices = sorted(triangular_indices)
-        print(f"   Triangular attention after layers: {triangular_indices}")
-        
-        # Calculate segment boundaries
-        segment_boundaries = [0] + [idx + 1 for idx in triangular_indices] + [config.num_hidden_layers]
-        self.segments = [(segment_boundaries[i], segment_boundaries[i+1]) for i in range(len(segment_boundaries)-1)]
-        
-        print(f"   ModernBERT segments: {self.segments}")
-        
-        # Create separate ModernBERT instances for each segment
-        self.bert_segments = nn.ModuleList()
-        self.triangular_blocks = nn.ModuleList()
-        
-        for i, (start_layer, end_layer) in enumerate(self.segments):
-            segment_layers = end_layer - start_layer
-            
-            # Create ModernBERT config for this segment
-            segment_config = ModernBertConfig(
-                vocab_size=config.vocab_size,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                num_hidden_layers=segment_layers,
-                num_attention_heads=config.num_attention_heads,
-                max_position_embeddings=1024,
-                mlp_dropout=config.mlp_dropout,
-                mlp_bias=config.mlp_bias,
-                attention_bias=config.attention_bias,
-                attention_dropout=config.attention_dropout,
-                classifier_activation=config.classifier_activation,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                bos_token_id=None,
-                unk_token_id=self.tokenizer.unk_token_id,
-                mask_token_id=self.tokenizer.mask_token_id
-            )
-            
-            # All segments are ModernBertModel (encoder only)
-            bert_segment = ModernBertModel(segment_config)
-            if i == 0:
-                print(f"   📦 Segment {i}: ModernBERT layers {start_layer}-{end_layer-1} (with embeddings)")
-            else:
-                print(f"   📦 Segment {i}: ModernBERT layers {start_layer}-{end_layer-1} (encoder only)")
-            
-            self.bert_segments.append(bert_segment)
-            
-            # Add triangular attention after each segment except the last
-            if i < len(self.segments) - 1:
-                triangular_block = create_triangular_attention_layer(
-                    residue_dim=config.hidden_size,
-                    pair_dim=self.triangular_pair_dim,
-                    num_heads=self.triangular_heads,
-                    dropout=self.triangular_dropout
-                )
-                self.triangular_blocks.append(triangular_block)
-                print(f"   🔺 Triangular attention block {i} created")
-        if len(self.bert_segments) > 1:
-            shared_embeddings = self.bert_segments[0].embeddings
-            for seg in self.bert_segments[1:]:
-                seg.embeddings = shared_embeddings
-        # Create shared MLM head (like a normal ModernBERT)
-        self.head = nn.Linear(config.hidden_size, config.hidden_size)
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
-        # TODO: Tok_embeddings has high grad norm!
-        
-        print(f"   🎯 Shared MLM head created with stabilized initialization")
-        
-        # Add gradient hooks for debugging
-        self._setup_gradient_hooks()
+                tri_layers = cfg.triangular_layers or [3, 11]
+
+            tri_layers = sorted(tri_layers)
+            segment_boundaries = [0] + [i + 1 for i in tri_layers] + [cfg.num_hidden_layers]
+            self.segments = [(segment_boundaries[i], segment_boundaries[i + 1])
+                            for i in range(len(segment_boundaries) - 1)]
+
+            print(f"   Segments: {self.segments}")
+
+            # build submodules
+            self.bert_segments = nn.ModuleList()
+            self.triangular_blocks = nn.ModuleList()
+
+            shared_embeddings = None
+
+            for i, (start, end) in enumerate(self.segments):
+                seg_cfg = self.config.to_dict()
+                seg_cfg = ModernBertConfig(**seg_cfg)
+                seg_cfg.num_hidden_layers = end - start
+                bert_segment = ModernBertModel(seg_cfg)
+                print("➡️ Embedding attributes:", dir(bert_segment.embeddings))
+
+                if shared_embeddings is None:
+                    shared_embeddings = bert_segment.embeddings
+                else:
+                    bert_segment.embeddings = shared_embeddings
+
+                self.bert_segments.append(bert_segment)
+
+                if i < len(self.segments) - 1:
+                    tri_block = create_triangular_attention_layer(
+                        residue_dim=cfg.hidden_size,
+                        pair_dim=cfg.triangular_pair_dim or cfg.hidden_size,
+                        num_heads=cfg.triangular_heads or 4,
+                        dropout=cfg.triangular_dropout or 0.1,
+                    )
+                    self.triangular_blocks.append(tri_block)
+
+            self.head = ModernBertPredictionHead(config)
+            self.decoder = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=cfg.decoder_bias)
+
 
     def _print_parameter_count(self):
         """Print detailed parameter count for the model"""
@@ -245,123 +204,117 @@ class ProtModernBertMLM(nn.Module):
             )
 
     def _forward_modular(self, input_ids, attention_mask=None, position_ids=None, 
-                        inputs_embeds=None, labels=None, output_attentions=None, 
-                        output_hidden_states=None, return_dict=None, **kwargs):
+                            inputs_embeds=None, labels=None, output_attentions=None, 
+                            output_hidden_states=None, return_dict=None, **kwargs):
         """
-        Modular forward pass: run separate ModernBERT segments with triangular attention
+        Modular forward pass with gradient and hidden-state debugging
         """
-        
         # Filter kwargs to only include parameters that ModernBertModel accepts
-        bert_kwargs = {}
-        valid_bert_params = {
+        bert_kwargs = {k: v for k, v in kwargs.items() if k in {
             'head_mask', 'encoder_hidden_states', 'encoder_attention_mask',
             'past_key_values', 'use_cache', 'output_attentions', 'output_hidden_states', 
             'return_dict', 'training'
-        }
-        for key, value in kwargs.items():
-            if key in valid_bert_params:
-                bert_kwargs[key] = value
-        
-        all_hidden_states = []
-        all_attentions = []
-        current_hidden_state = None
-        
-        # Process each segment sequentially
-        for segment_idx, bert_segment in enumerate(self.bert_segments):
-            if segment_idx == 0:
-                # First segment: use input_ids and get embeddings
-                segment_outputs = bert_segment(
+        }}
+
+        hidden_states = None
+        all_hidden_states = [] if output_hidden_states else None
+
+        for i, bert_segment in enumerate(self.bert_segments):
+            if i == 0:
+                seg_out = bert_segment(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    inputs_embeds=inputs_embeds,
-                    output_attentions=output_attentions,
-                    output_hidden_states=True,
+                    output_hidden_states=output_hidden_states,
                     return_dict=True,
-                    **bert_kwargs
                 )
-                current_hidden_state = segment_outputs.last_hidden_state
             else:
-                # Subsequent segments: use inputs_embeds from previous segment
-                segment_outputs = bert_segment(
-                    inputs_embeds=current_hidden_state,
+                seg_out = bert_segment(
+                    inputs_embeds=hidden_states,
                     attention_mask=attention_mask,
-                    output_attentions=output_attentions,
-                    output_hidden_states=True,
+                    output_hidden_states=output_hidden_states,
                     return_dict=True,
-                    **bert_kwargs
                 )
-                current_hidden_state = segment_outputs.last_hidden_state
-            
-            # Collect hidden states and attentions
-            if output_hidden_states:
-                all_hidden_states.extend(segment_outputs.hidden_states)
-            if output_attentions and segment_outputs.attentions:
-                all_attentions.extend(segment_outputs.attentions)
-            
-            # Apply triangular attention after this segment (except the last)
-            if segment_idx < len(self.triangular_blocks):
-                triangular_block = self.triangular_blocks[segment_idx]
-                enhanced_hidden_state, _ = triangular_block(
-                    current_hidden_state, 
-                    pair_repr=None, 
-                    mask=attention_mask
-                )
-                current_hidden_state = enhanced_hidden_state
-        
-        # Use shared MLM head on final hidden state (simulates normal ModernBERT)
-        prediction_scores = self.decoder(self.head(current_hidden_state))
-        
-        # Compute loss if labels are provided
-        masked_lm_loss = None
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
 
-        if not return_dict:
-            output = (prediction_scores,) + (tuple(all_hidden_states) if output_hidden_states else (), tuple(all_attentions) if output_attentions else ())
-            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+            hidden_states = seg_out.last_hidden_state
+            hidden_states = self.bert_segments[i].embeddings.norm(hidden_states)
+
+            # DEBUG: hidden states stats
+            print(f"[Segment {i}] hidden_states min/max/mean/std:",
+                hidden_states.min().item(), hidden_states.max().item(),
+                hidden_states.mean().item(), hidden_states.std().item())
+
+            if output_hidden_states:
+                all_hidden_states.extend(seg_out.hidden_states)
+
+            # Optional triangular block
+            if i < len(self.triangular_blocks):
+                tri_block = self.triangular_blocks[i]
+                hidden_states, _ = tri_block(hidden_states, pair_repr=None, mask=attention_mask)
+
+                print(f"[Segment {i}] after triangular min/max/mean/std:",
+                    hidden_states.min().item(), hidden_states.max().item(),
+                    hidden_states.mean().item(), hidden_states.std().item())
+
+        # DEBUG: hook to capture gradients
+        def grad_hook(name):
+            def hook(grad):
+                print(f"GRAD {name}: norm={grad.norm().item():.6f}, mean={grad.mean().item():.6f}, std={grad.std().item():.6f}")
+            return hook
+
+        # Register hooks for head and decoder
+        self.head.weight.register_hook(grad_hook("head.weight"))
+        self.decoder.weight.register_hook(grad_hook("decoder.weight"))
+
+        logits = self.decoder(self.head(hidden_states))
+
+        loss = None
+        if labels is not None:
+            loss = self.ForMaskedLMLoss(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                ignore_index=-100
+            )
+            print(f"⚠️ loss (per token): {loss.item():.6f}")
 
         return MaskedLMOutput(
-            loss=masked_lm_loss,
-            logits=prediction_scores,
+            loss=loss,
+            logits=logits,
             hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
-            attentions=tuple(all_attentions) if output_attentions else None,
         )
     
-    def _setup_gradient_hooks(self):
-        """Setup gradient hooks to debug gradient explosion"""
-        
-        def make_hook(name):
-            def hook(grad):
-                if grad is not None and torch.rand(1).item() < 0.01:
-                    grad_norm = grad.norm().item()
-                    grad_mean = grad.mean().item()
-                    grad_std = grad.std().item()
-                    print(f"🚨 GRAD {name}: norm={grad_norm:.2f}, mean={grad_mean:.6f}, std={grad_std:.6f}")
-                    if grad_norm > 100:
-                        print(f"⚠️  HIGH GRADIENT in {name}: {grad_norm:.2f}")
-                return grad
-            return hook
-        
-        if self.use_triangular_attention:
-            # Hook ModernBERT segments
-            for i, segment in enumerate(self.bert_segments):
-                for name, param in segment.named_parameters():
-                    if param.requires_grad:
-                        param.register_hook(make_hook(f"Segment{i}.{name}"))
-            
-            # Hook triangular blocks
-            for i, block in enumerate(self.triangular_blocks):
-                for name, param in block.named_parameters():
-                    if param.requires_grad:
-                        param.register_hook(make_hook(f"Triangular{i}.{name}"))
-            
-            # Hook MLM head
-            for name, param in self.head.named_parameters():
-                if param.requires_grad:
-                    param.register_hook(make_hook(f"MLMHead.{name}"))
-            
-            for name, param in self.decoder.named_parameters():
-                if param.requires_grad:
-                    param.register_hook(make_hook(f"MLMDecoder.{name}"))
+    @staticmethod
+    def ForMaskedLMLoss(
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        vocab_size: int,
+        num_items_in_batch: Optional[torch.Tensor] = None,
+        ignore_index: int = -100,
+        **kwargs,
+    ):
+        # Upcast to float if we need to compute the loss to avoid potential precision issues
+        logits = logits.float()
+
+        # Flatten the tokens
+        logits = logits.view(-1, vocab_size)
+        labels = labels.view(-1)
+
+        labels = labels.to(logits.device)
+        loss = fixed_cross_entropy(logits, labels, num_items_in_batch, ignore_index, **kwargs)
+        return loss
+    
+def fixed_cross_entropy(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    num_items_in_batch: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+    **kwargs,
+) -> torch.Tensor:
+    reduction = "sum" if num_items_in_batch is not None else "mean"
+    loss = nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction=reduction)
+    if reduction == "sum":
+        # just in case users pass an int for num_items_in_batch, which could be the case for custom trainer
+        if torch.is_tensor(num_items_in_batch):
+            num_items_in_batch = num_items_in_batch.to(loss.device)
+        loss = loss / num_items_in_batch
+    return loss
