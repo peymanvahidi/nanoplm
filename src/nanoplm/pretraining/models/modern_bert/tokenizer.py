@@ -3,6 +3,7 @@ from tokenizers import Tokenizer
 from tokenizers.normalizers import Replace
 from tokenizers.pre_tokenizers import Split
 from tokenizers.models import WordLevel
+from tokenizers.processors import TemplateProcessing
 
 
 class ProtModernBertTokenizer(PreTrainedTokenizerFast):
@@ -28,6 +29,14 @@ class ProtModernBertTokenizer(PreTrainedTokenizerFast):
         tokenizer.normalizer = Replace(r"[UZOB]", "X")
 
         tokenizer.pre_tokenizer = Split(pattern="", behavior="isolated")
+
+        tokenizer.post_processor = TemplateProcessing(
+            single=f"$A {eos_token}",
+            pair=f"$A {eos_token} $B:1 {eos_token}:1",
+            special_tokens=[
+                (eos_token, vocab[eos_token]),
+            ],
+        )
 
         super().__init__(
             tokenizer_object=tokenizer,
