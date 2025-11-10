@@ -68,6 +68,5 @@ class ProtModernBertTokenizer(PreTrainedTokenizerFast):
             eos_token=eos_token,
             mask_token=mask_token,
             bos_token=bos_token if use_bos_token else None,
-            model_input_names=["input_ids", "attention_mask"],
             **kwargs,
         )
