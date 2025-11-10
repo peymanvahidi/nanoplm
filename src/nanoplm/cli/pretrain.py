@@ -87,8 +87,8 @@ def pretrain():
 @click.option(
     "--learning-rate",
     type=float,
-    default=3e-6,
-    help="Learning rate"
+    default=1e-3,
+    help="Maximum Learning rate in the warmup"
 )
 @click.option(
     "--weight-decay",
@@ -517,7 +517,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 3e-6\n"
+        "  learning_rate: 1e-3\n # This is the maximum learning in the warmup phase"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
         "  gradient_accumulation_steps: 1\n"
