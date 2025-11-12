@@ -79,14 +79,14 @@ class TriangularSelfAttention(nn.Module):
     def forward(
         self, 
         pair_repr: torch.Tensor,
-        mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Forward pass of triangular attention.
         
         Args:
             pair_repr: Pair representation tensor of shape (B, N, N, C)
-            mask: Optional attention mask of shape (B, N, N)
+            attention_mask: Optional attention attention_mask of shape (B, N, N)
             
         Returns:
             Updated pair representation of shape (B, N, N, C)
@@ -99,7 +99,7 @@ class TriangularSelfAttention(nn.Module):
         normed_input = self.norm(pair_repr)
         
         # Always use NVIDIA cuEquivariance (availability checked in __init__)
-        output = self._cuequivariance_triangular_attention(normed_input, mask)
+        output = self._cuequivariance_triangular_attention(normed_input, attention_mask)
         
         # Apply gating (residual connection with learned gate)
         gate = torch.sigmoid(self.gate_proj(pair_repr))
@@ -110,7 +110,7 @@ class TriangularSelfAttention(nn.Module):
     def _cuequivariance_triangular_attention(
         self, 
         pair_repr: torch.Tensor, 
-        mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Use NVIDIA cuEquivariance optimized triangular attention kernel"""
         B, N, _, C = pair_repr.shape
@@ -137,27 +137,27 @@ class TriangularSelfAttention(nn.Module):
         
         # Convert mask format for cuEquivariance: (B, N, 1, 1, K) where K=N
         attn_mask = None
-        if mask is not None:
+        if attention_mask is not None:
             
             # Convert mask to boolean first if needed
-            if mask.dtype != torch.bool:
+            if attention_mask.dtype != torch.bool:
                 # Assume 1 = valid, 0 = invalid for non-boolean masks
-                mask = mask.bool()
-            
+                attention_mask = attention_mask.bool()
+
             # Handle different mask dimensions and convert to cuEquivariance format (B, N, 1, 1, K)
-            if mask.dim() == 2:  # (B, N) sequence mask
+            if attention_mask.dim() == 2:  # (B, N) sequence mask
                 # Expand to cuEquivariance format: (B, N, 1, 1, N)
                 # Each query position N can attend to all valid key positions
-                B_mask, N_mask = mask.shape
+                B_mask, N_mask = attention_mask.shape
                 # Create query mask: each query position gets the full sequence mask
                 # (B, N) -> (B, N, 1, 1, N)
-                attn_mask = mask.unsqueeze(2).unsqueeze(3).unsqueeze(4)  # (B, N, 1, 1, 1)
+                attn_mask = attention_mask.unsqueeze(2).unsqueeze(3).unsqueeze(4)  # (B, N, 1, 1, 1)
                 attn_mask = attn_mask.expand(B_mask, N_mask, 1, 1, N_mask)  # (B, N, 1, 1, N)
                 # Apply sequence validity: both query and key must be valid
-                key_valid = mask.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B, 1, 1, 1, N)
+                key_valid = attention_mask.unsqueeze(1).unsqueeze(2).unsqueeze(3)  # (B, 1, 1, 1, N)
                 attn_mask = attn_mask & key_valid  # (B, N, 1, 1, N)
             else:
-                print(f"⚠️  Unsupported mask dimension: {mask.dim()}, using no mask", file=sys.stderr)
+                print(f"⚠️  Unsupported mask dimension: {attention_mask.dim()}, using no mask", file=sys.stderr)
                 attn_mask = None
         
         # API: triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False)
@@ -304,8 +304,6 @@ class PairwiseTriangularBlock(nn.Module):
         # --- Normalizations & gating ---
         self.norm_pair_to_residue = nn.LayerNorm(pair_dim)
 
-        self.scale_pair_to_residue = 0.25  # Fixed scaling factor
-
         self._init_weights()
 
     def _init_weights(self):
@@ -324,7 +322,7 @@ class PairwiseTriangularBlock(nn.Module):
         self,
         residue_repr: torch.Tensor,
         pair_repr: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass combining residue and pair representations.
@@ -332,7 +330,7 @@ class PairwiseTriangularBlock(nn.Module):
         Args:
             residue_repr: (B, N, residue_dim)
             pair_repr: Optional (B, N, N, pair_dim)
-            mask: Optional (B, N, N)
+            attention_mask: Optional (B, N, N)
         """
         B, N, _ = residue_repr.shape
 
@@ -341,21 +339,20 @@ class PairwiseTriangularBlock(nn.Module):
             pair_repr = self._create_pair_representation(residue_repr)
 
         # --- Triangular attention updates ---
-        pair_repr = self.tri_attn_row(pair_repr, mask=mask) # already includes norm & gating
-        pair_repr = self.tri_attn_col(pair_repr, mask=mask) # already includes norm & gating
+        pair_repr = self.tri_attn_row(pair_repr, attention_mask=attention_mask) # already includes norm & gating
+        pair_repr = self.tri_attn_col(pair_repr, attention_mask=attention_mask) # already includes norm & gating
 
         # --- Pair → Residue projection ---
         pair_repr_normed = self.norm_pair_to_residue(pair_repr)
         
-        # FIXED SCALING: Use constant scaling factor
-        aggregated_info = pair_repr_normed.mean(dim=2) * self.scale_pair_to_residue
+        aggregated_info = pair_repr_normed.mean(dim=2)
         
         updated_residue = self.pair_to_residue(aggregated_info)
 
         # --- Residual update ---
         residue_repr = residue_repr + updated_residue
 
-        return residue_repr, pair_repr
+        return residue_repr, pair_repr_normed
 
     
     def _create_pair_representation(self, residue_repr: torch.Tensor) -> torch.Tensor:
