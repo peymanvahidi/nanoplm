@@ -63,24 +63,18 @@ class ModernBertForMaskedLMWithTriangularAttention(ModernBertPreTrainedModel):
         }
 
         if isinstance(module, ModernBertEmbeddings):
-            print("=== Initializing Weights for ModernBertEmbeddings ===")
             init_weight(module.tok_embeddings, stds["embedding"])
         elif isinstance(module, ModernBertMLP):
-            print("=== Initializing Weights for ModernBertMLP ===")
             init_weight(module.Wi, stds["in"])
             init_weight(module.Wo, stds["out"])
         elif isinstance(module, ModernBertAttention):
-            print("=== Initializing Weights for ModernBertAttention ===")
             init_weight(module.Wqkv, stds["in"])
             init_weight(module.Wo, stds["out"])
         elif isinstance(module, ModernBertPredictionHead):
-            print("=== Initializing Weights for ModernBertPredictionHead ===")
             init_weight(module.dense, stds["out"])
         elif isinstance(module, ModernBertForMaskedLM) or isinstance(module, ModernBertForMaskedLMWithTriangularAttention):
-            print("=== Initializing Weights for ModernBertForMaskedLMWithTriangularAttention ===")
             init_weight(module.decoder, stds["out"])
         elif isinstance(module, nn.LayerNorm):
-            print("=== Initializing Weights for nn.LayerNorm ===")
             module.weight.data.fill_(1.0)
             if module.bias is not None:
                 module.bias.data.zero_()
@@ -267,24 +261,18 @@ class ModernBertModelWithTriangularAttention(ModernBertPreTrainedModel):
         }
 
         if isinstance(module, ModernBertEmbeddings):
-            print("=== Initializing Weights for ModernBertEmbeddings ===")
             init_weight(module.tok_embeddings, stds["embedding"])
         elif isinstance(module, ModernBertMLP):
-            print("=== Initializing Weights for ModernBertMLP ===")
             init_weight(module.Wi, stds["in"])
             init_weight(module.Wo, stds["out"])
         elif isinstance(module, ModernBertAttention):
-            print("=== Initializing Weights for ModernBertAttention ===")
             init_weight(module.Wqkv, stds["in"])
             init_weight(module.Wo, stds["out"])
         elif isinstance(module, ModernBertPredictionHead):
-            print("=== Initializing Weights for ModernBertPredictionHead ===")
             init_weight(module.dense, stds["out"])
         elif isinstance(module, ModernBertForMaskedLM) or isinstance(module, ModernBertForMaskedLMWithTriangularAttention):
-            print("=== Initializing Weights for ModernBertForMaskedLMWithTriangularAttention ===")
             init_weight(module.decoder, stds["out"])
         elif isinstance(module, nn.LayerNorm):
-            print("=== Initializing Weights for nn.LayerNorm ===")
             module.weight.data.fill_(1.0)
             if module.bias is not None:
                 module.bias.data.zero_()

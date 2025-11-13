@@ -69,13 +69,13 @@ class TriangularSelfAttention(nn.Module):
             nn.init.xavier_uniform_(module.weight, gain=0.25)
         
         # Initialize output projection with even smaller gain
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.05)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
         nn.init.zeros_(self.out_proj.bias)
         
         # Initialize gate to favor residual (conservative start)
         nn.init.zeros_(self.gate_proj.weight)
-        nn.init.constant_(self.gate_proj.bias, -2.0)  # sigmoid(-2) ≈ 0.12, favors original input
-            
+        nn.init.constant_(self.gate_proj.bias, -1.5)  # sigmoid(-1.5) ≈ 0.18, favors original input
+
     def forward(
         self, 
         pair_repr: torch.Tensor,
@@ -163,6 +163,8 @@ class TriangularSelfAttention(nn.Module):
         # API: triangle_attention(q, k, v, bias, mask=None, scale=None, return_aux=False)
         try:
             from cuequivariance_torch import triangle_attention
+            from cuequivariance_ops_torch import init_triton_cache
+            init_triton_cache()
         except ImportError as e:
             raise ImportError(
                 f"Failed to import cuEquivariance triangle_attention. "
@@ -313,7 +315,7 @@ class PairwiseTriangularBlock(nn.Module):
         nn.init.xavier_uniform_(self.residue_to_pair_right.weight)
         nn.init.zeros_(self.residue_to_pair_right.bias)
 
-        nn.init.xavier_uniform_(self.pair_to_residue.weight, gain=0.02)
+        nn.init.xavier_uniform_(self.pair_to_residue.weight, gain=0.2)
         nn.init.zeros_(self.pair_to_residue.bias)
 
         print("✅ PairwiseTriangularBlock initialized (learnable mixing + conservative scaling)")
