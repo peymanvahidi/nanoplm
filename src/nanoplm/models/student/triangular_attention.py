@@ -133,7 +133,7 @@ class TriangularSelfAttention(nn.Module):
         v = v.permute(0, 1, 3, 2, 4)  # (B, N, N, H, D) -> (B, N, H, N, D)
         
         # Create bias tensor (required parameter): (B, 1, H, Q, K) = (B, 1, H, N, N)
-        bias = torch.zeros(B, 1, self.num_heads, N, N, device=q.device, dtype=torch.float32)
+        bias = torch.zeros(B, 1, self.num_heads, N, N, device=q.device, dtype=torch.bfloat16)
         
         # Convert mask format for cuEquivariance: (B, N, 1, 1, K) where K=N
         attn_mask = None
