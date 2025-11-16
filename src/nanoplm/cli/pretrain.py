@@ -271,6 +271,7 @@ def run(
     val_fasta: str,
     train_hdf5: str,
     val_hdf5: str,
+    load_all_in_memory: bool,
     ckp_dir: str,
     # training hp
     max_length: int,
@@ -317,6 +318,7 @@ def run(
         val_fasta=val_fasta,
         train_hdf5=train_hdf5,
         val_hdf5=val_hdf5,
+        load_all_in_memory=load_all_in_memory,
         ckp_dir=ckp_dir,
         max_length=max_length,
         batch_size=batch_size,
@@ -504,6 +506,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  lazy_dataset: False\n"
         "  train_hdf5: \"output/data/pretrain_shards/train_hdf5\"\n"
         "  val_hdf5: \"output/data/pretrain_shards/val_hdf5\"\n"
+        "  load_all_in_memory: False\n"
         "\n"
         "  optimizer: \"adamw\" # adamw, stable_adamw\n"
         "  adam_beta1: 0.9\n"

@@ -37,6 +37,7 @@ class PretrainingConfig:
     lazy_dataset: bool = False
     train_hdf5: str = "output/data/split/train_hdf5"
     val_hdf5: str = "output/data/split/val_hdf5"
+    load_all_in_memory: bool = False
     warmup_ratio: float = 0.05
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
@@ -53,7 +54,7 @@ class PretrainingConfig:
     eval_steps_percentage: float = 0.025
     save_steps_percentage: float = 0.1
     seed: int = 42
-    num_workers: int = 0
+    num_workers: int = 8
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
     project_name: str = "nanoplm-pretraining"
@@ -199,8 +200,8 @@ def run_pretraining(
         logger.info(f"Expected val shards: {pretrain_config.val_hdf5}")
 
         try:
-            train_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.train_hdf5)
-            val_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.val_hdf5)
+            train_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.train_hdf5, load_all_in_memory=pretrain_config.load_all_in_memory)
+            val_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.val_hdf5, load_all_in_memory=pretrain_config.load_all_in_memory)
         except FileNotFoundError as e:
             logger.error(
                 f"HDF5 shards not found! You need to create them first.\n"
@@ -275,6 +276,8 @@ def run_pretraining(
         "run_name": run_name,
         "dataloader_pin_memory": True if device == "cuda" else False,
         "dataloader_num_workers": pretrain_config.num_workers,
+        "dataloader_prefetch_factor": 2,
+        "dataloader_persistent_workers": True if pretrain_config.num_workers > 0 else False,
     }
 
     # Configure optimizer through TrainingArguments
