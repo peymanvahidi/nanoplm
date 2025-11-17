@@ -54,7 +54,8 @@ class PretrainingConfig:
     eval_steps_percentage: float = 0.025
     save_steps_percentage: float = 0.1
     seed: int = 42
-    num_workers: int = 8
+    num_workers: Union[int, str] = "auto"
+    prefetch_factor: int = 2
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
     project_name: str = "nanoplm-pretraining"
@@ -255,6 +256,8 @@ def run_pretraining(
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name
     os.environ["WANDB_NAME"] = run_name
 
+    num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
+
     training_dict = {
         "output_dir": output_dir,
         "per_device_train_batch_size": pretrain_config.batch_size,
@@ -275,10 +278,13 @@ def run_pretraining(
         "report_to": "wandb",
         "run_name": run_name,
         "dataloader_pin_memory": True if device == "cuda" else False,
-        "dataloader_num_workers": pretrain_config.num_workers,
-        "dataloader_prefetch_factor": 2,
-        "dataloader_persistent_workers": True if pretrain_config.num_workers > 0 else False,
+        "dataloader_num_workers": num_workers,
+        "dataloader_persistent_workers": False,
     }
+
+    if num_workers > 0:
+        training_dict["dataloader_prefetch_factor"] = pretrain_config.prefetch_factor
+        training_dict["dataloader_persistent_workers"] = True
 
     # Configure optimizer through TrainingArguments
     optimizer_name = pretrain_config.optimizer.lower()
@@ -336,6 +342,40 @@ def run_pretraining(
     trainer.save_model(output_dir)
     trainer.save_state()
 
+def _get_num_workers(user_value: Union[int, str], world_size: int) -> int:
+
+    if isinstance(user_value, str) and user_value == "auto":
+        cpu_cores = os.cpu_count() or 1
+
+        # Leave some room for OS / other processes
+        max_reasonable = max(1, cpu_cores - 2)
+
+        # Heuristic: 4 workers per GPU is a good starting point
+        workers_per_gpu = 4
+        target = workers_per_gpu * max(1, world_size)
+
+        workers = max(1, min(target, max_reasonable))   
+
+        logger.info(f"Auto-setting num_workers to {workers} for {world_size} GPU(s).")
+
+        return workers
+
+    # Normalize string values to int if possible
+    if isinstance(user_value, str):
+        try:
+            user_value = int(user_value)
+        except ValueError:
+            raise ValueError(
+                f"Invalid num_workers value: {user_value}. Must be a non-negative integer or 'auto'"
+            )
+
+    # At this point we expect an int
+    if isinstance(user_value, int) and user_value >= 0:
+        return user_value
+    else:
+        raise ValueError(
+            f"Invalid num_workers value: {user_value}. Must be a non-negative integer"
+        )
 
 def _create_lazy_datasets(
     train_fasta: Union[str, Path],
