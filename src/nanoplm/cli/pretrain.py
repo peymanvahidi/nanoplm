@@ -93,14 +93,20 @@ def pretrain():
 @click.option(
     "--learning-rate",
     type=float,
-    default=1e-3,
-    help="Maximum Learning rate in the warmup"
+    default=3e-6,
+    help="Learning rate"
 )
 @click.option(
     "--weight-decay",
     type=float,
     default=0.0,
     help="Weight decay"
+)
+@click.option(
+    "--max-grad-norm",
+    type=float,
+    default=1.0,
+    help="Maximum gradient norm for clipping"
 )
 @click.option(
     "--warmup-ratio",
@@ -242,12 +248,6 @@ def pretrain():
     help="Number of attention heads",
 )
 @click.option(
-    "--vocab-size",
-    type=int,
-    default=32,
-    help="Number of the vocabs being used in the model (should be equal to the vocab size in the tokenizer)"
-)
-@click.option(
     "--mlp-activation",
     type=click.Choice(["swiglu"], case_sensitive=False),
     default="swiglu",
@@ -298,6 +298,7 @@ def run(
     lazy_dataset: bool,
     learning_rate: float,
     weight_decay: float,
+    max_grad_norm: float,
     warmup_ratio: float,
     optimizer: str,
     adam_beta1: float,
@@ -322,7 +323,6 @@ def run(
     intermediate_size: int,
     num_hidden_layers: int,
     num_attention_heads: int,
-    vocab_size: int,
     mlp_activation: str,
     mlp_dropout: float,
     mlp_bias: bool,
@@ -346,6 +346,7 @@ def run(
         lazy_dataset=lazy_dataset,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
         warmup_ratio=warmup_ratio,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
@@ -372,7 +373,6 @@ def run(
         intermediate_size=intermediate_size,
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
-        vocab_size=vocab_size,
         mlp_activation=mlp_activation,
         mlp_dropout=mlp_dropout,
         mlp_bias=mlp_bias,
@@ -495,7 +495,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  intermediate_size: 2048\n"
         "  num_hidden_layers: 16\n"
         "  num_attention_heads: 16\n"
-        "  vocab_size: 32\n"
+        "  vocab_size: 29\n"
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: False\n"
@@ -534,9 +534,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-3\n # This is the maximum learning in the warmup phase \n"
+        "  learning_rate: 3e-6\n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
+        "  max_grad_norm: 1.0  # Gradient clipping for stability\n"
         "  gradient_accumulation_steps: 1\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
@@ -630,6 +631,19 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     expected_keys = set(ProtModernBertMLMConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
+    # Define which keys are optional (triangular attention parameters)
+    optional_keys = {
+        'use_triangular_attention',
+        'triangular_layers', 
+        'triangular_pair_dim',
+        'triangular_heads',
+        'triangular_dropout', 
+        'triangular_mode'
+    }
+    
+    # Required keys are all keys except optional ones
+    required_keys = expected_keys - optional_keys
+
     missing = []
     extra = []
     kwargs: Dict[str, Any] = {}
@@ -645,8 +659,7 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
             continue
         kwargs[key] = value
 
-    # Any expected-but-absent keys are also missing
-    for key in expected_keys:
+    for key in required_keys:
         if key not in present_keys:
             missing.append(key)
 

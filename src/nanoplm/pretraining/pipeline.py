@@ -43,8 +43,9 @@ class PretrainingConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
-    learning_rate: float = 1e-3
+    learning_rate: float = 3e-6
     weight_decay: float = 0.0
+    max_grad_norm: float = 1.0  # Gradient clipping threshold
     gradient_accumulation_steps: int = 1
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
@@ -59,6 +60,8 @@ class PretrainingConfig:
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
     project_name: str = "nanoplm-pretraining"
+    bf16: bool = False
+    save_safetensors:  bool = True
 
 
 @dataclass
@@ -170,6 +173,7 @@ def run_pretraining(
 
     tokenizer = model.tokenizer
     model.to(device)
+    model = model.to(torch.bfloat16) if pretrain_config.bf16 else model
 
     if pretrain_config.lazy_dataset:
         if pretrain_config.train_fasta is None or pretrain_config.val_fasta is None:
@@ -266,6 +270,7 @@ def run_pretraining(
         "num_train_epochs": num_epochs,
         "learning_rate": pretrain_config.learning_rate,
         "weight_decay": pretrain_config.weight_decay,
+        "max_grad_norm": pretrain_config.max_grad_norm,
         "warmup_ratio": pretrain_config.warmup_ratio,
         "logging_strategy": "steps",
         "logging_steps": logging_steps,
@@ -280,6 +285,8 @@ def run_pretraining(
         "dataloader_pin_memory": True if device == "cuda" else False,
         "dataloader_num_workers": num_workers,
         "dataloader_persistent_workers": False,
+        "bf16": pretrain_config.bf16,
+        "save_safetensors": pretrain_config.save_safetensors,
     }
 
     if num_workers > 0:
