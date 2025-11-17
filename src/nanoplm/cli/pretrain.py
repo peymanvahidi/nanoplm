@@ -517,7 +517,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-3\n # This is the maximum learning in the warmup phase"
+        "  learning_rate: 1e-3\n # This is the maximum learning in the warmup phase \n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
         "  gradient_accumulation_steps: 1\n"
