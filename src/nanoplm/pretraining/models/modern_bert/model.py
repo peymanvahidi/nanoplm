@@ -14,7 +14,7 @@ class ProtModernBertMLMConfig:
     intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
-    vocab_size: int = 29
+    vocab_size: int = 32
     mlp_activation: str = "swiglu"
     mlp_dropout: float = 0.0
     mlp_bias: bool = False
