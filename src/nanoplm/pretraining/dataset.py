@@ -200,12 +200,13 @@ class LoadShardedFastaMLMDataset(Dataset):
 
         shard_idx, local_idx = self._get_shard(idx)
 
-        # Open shard and read
+        # Open shard and read as uint8 to save memory
+        # Cast to long will happen on GPU in collator
         with h5py.File(self.shard_paths[shard_idx], "r") as f:
-            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.long)
+            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.uint8)
 
         # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding (pad_token_id=0)
-        attention_mask = (input_ids != 0).long()
+        attention_mask = (input_ids != 0).to(torch.uint8)
 
         return {
             "input_ids": input_ids,
@@ -248,11 +249,11 @@ def process_shard(args):
     with h5py.File(shard_path, "w") as h5f:
         total = len(input_ids_list)
         h5f.create_dataset(
-            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.int32)
+            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.uint8)
         )
 
         for i in tqdm(range(total), desc=f"Writing Shard {shard_idx}", leave=False):
-            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.int32)
+            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.uint8)
 
     index.close()
     return str(shard_path)
