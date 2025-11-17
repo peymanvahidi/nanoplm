@@ -117,6 +117,10 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
 
+        # Ensure tensors are in long dtype (what HF models expect)
+        batch["input_ids"] = batch["input_ids"].long()
+        batch["attention_mask"] = batch["attention_mask"].long()
+
         input_ids = batch["input_ids"]
 
         # Build/augment special mask

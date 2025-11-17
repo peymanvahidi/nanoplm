@@ -43,7 +43,7 @@ class PretrainingConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
-    learning_rate: float = 3e-6
+    learning_rate: float = 1e-3
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 1
     mlm_probability: float = 0.3
