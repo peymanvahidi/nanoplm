@@ -87,8 +87,8 @@ def pretrain():
 @click.option(
     "--learning-rate",
     type=float,
-    default=1e-3,
-    help="Maximum Learning rate in the warmup"
+    default=3e-6,
+    help="Learning rate"
 )
 @click.option(
     "--weight-decay",
@@ -236,12 +236,6 @@ def pretrain():
     help="Number of attention heads",
 )
 @click.option(
-    "--vocab-size",
-    type=int,
-    default=32,
-    help="Number of the vocabs being used in the model (should be equal to the vocab size in the tokenizer)"
-)
-@click.option(
     "--mlp-activation",
     type=click.Choice(["swiglu"], case_sensitive=False),
     default="swiglu",
@@ -315,7 +309,6 @@ def run(
     intermediate_size: int,
     num_hidden_layers: int,
     num_attention_heads: int,
-    vocab_size: int,
     mlp_activation: str,
     mlp_dropout: float,
     mlp_bias: bool,
@@ -364,7 +357,6 @@ def run(
         intermediate_size=intermediate_size,
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
-        vocab_size=vocab_size,
         mlp_activation=mlp_activation,
         mlp_dropout=mlp_dropout,
         mlp_bias=mlp_bias,
@@ -487,7 +479,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  intermediate_size: 2048\n"
         "  num_hidden_layers: 16\n"
         "  num_attention_heads: 16\n"
-        "  vocab_size: 32\n"
+        "  vocab_size: 29\n"
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: False\n"
@@ -525,7 +517,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-3\n # This is the maximum learning in the warmup phase \n"
+        "  learning_rate: 3e-6\n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
         "  max_grad_norm: 1.0  # Gradient clipping for stability\n"
