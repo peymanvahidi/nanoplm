@@ -54,6 +54,12 @@ def pretrain():
     help="Directory of pre-tokenized validation HDF5 shards (used when --lazy-dataset is False)"
 )
 @click.option(
+    "--load-all-in-memory",
+    is_flag=True,
+    default=False,
+    help="Load all dataset in memory"
+)
+@click.option(
     "--ckp-dir",
     type=str,
     default="output/pretraining",
