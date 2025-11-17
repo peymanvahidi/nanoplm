@@ -295,10 +295,7 @@ class LoadShardedFastaMLMDataset(Dataset):
         for inputs, masks in self._in_memory_shards:
             self._flat_inputs.extend(inputs)
             self._flat_masks.extend(masks)
-        try:
-            logger.info(f"Flat indexing enabled: {len(self._flat_inputs):,} samples")
-        except Exception:
-            pass
+        logger.info(f"Flat indexing enabled: {len(self._flat_inputs):,} samples")
 
 
 def process_shard(args):
@@ -425,18 +422,15 @@ def _read_shard_for_worker(path_str: str):
 
     Returns a tuple (indexable_path_str, (inputs_list, masks_list)).
     """
-    import h5py
-    import numpy as _np
-    from pathlib import Path as _Path
 
-    path = _Path(path_str)
+    path = Path(path_str)
     inputs = []
     masks = []
     with h5py.File(path, "r") as f:
         n = len(f["input_ids"])
         # Bulk read each variable-length element into a numpy array
         for i in range(n):
-            inputs.append(_np.array(f["input_ids"][i], dtype=_np.int32))
-            masks.append(_np.array(f["attention_mask"][i], dtype=_np.int32))
+            inputs.append(np.array(f["input_ids"][i], dtype=np.int32))
+            masks.append(np.array(f["attention_mask"][i], dtype=np.int32))
 
     return path_str, (inputs, masks)
