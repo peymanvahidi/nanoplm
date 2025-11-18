@@ -206,15 +206,25 @@ class LoadShardedFastaMLMDataset(Dataset):
             # Use ProcessPoolExecutor to let each worker open its own HDF5 file
             try:
                 with ProcessPoolExecutor(max_workers=max_workers) as exe:
-                    futures = {exe.submit(_read_shard_for_worker, str(p)): idx for idx, p in enumerate(self.shard_paths)}
-                    for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading shards", leave=False):
+                    futures = {
+                        exe.submit(_read_shard_for_worker, str(p)): idx
+                        for idx, p in enumerate(self.shard_paths)
+                    }
+                    for fut in tqdm(
+                        as_completed(futures),
+                        total=len(futures),
+                        desc="Loading shards",
+                        leave=False,
+                    ):
                         idx = futures[fut]
                         try:
                             _, data = fut.result()
                             self._in_memory_shards[idx] = data
                         except Exception:
                             # If any worker fails, fall back to sequential loading
-                            logger.warning("Parallel shard loading failed; falling back to sequential load.")
+                            logger.warning(
+                                "Parallel shard loading failed; falling back to sequential load."
+                            )
                             raise
 
                 # Verify none are None
@@ -224,6 +234,7 @@ class LoadShardedFastaMLMDataset(Dataset):
 
                 # Build flat index for O(1) global access
                 self._build_flat_index()
+
             except Exception:
                 # Fallback: sequential load with safe bulk reads
                 logger.info("Falling back to sequential shard loading...")
@@ -236,12 +247,16 @@ class LoadShardedFastaMLMDataset(Dataset):
                         inputs = [None] * n
                         masks = [None] * n
                         for j in range(n):
-                            inputs[j] = np.array(f["input_ids"][j], dtype=np.int32)
-                            masks[j] = np.array(f["attention_mask"][j], dtype=np.int32)
+                            # Store tokens as uint8 to minimize memory; ids are cast to torch.long at training time.
+                            arr = np.array(f["input_ids"][j], dtype=np.uint8)
+                            inputs[j] = arr
+                            # Derive attention_mask on-the-fly as uint8 as well (1 for non-padding, 0 for padding).
+                            masks[j] = (arr != 0).astype(np.uint8)
                         self._in_memory_shards.append((inputs, masks))
 
                 # Build flat index for O(1) global access after sequential fallback
                 self._build_flat_index()
+
         else:
             logger.info("Using streaming mode.")
 
@@ -260,13 +275,14 @@ class LoadShardedFastaMLMDataset(Dataset):
         if self._in_memory:
             # If flat indexing exists, use it for true O(1) access
             if hasattr(self, "_flat_inputs") and hasattr(self, "_flat_masks"):
-                input_ids = torch.tensor(self._flat_inputs[idx], dtype=torch.long)
-                attention_mask = torch.tensor(self._flat_masks[idx], dtype=torch.long)
+                # We have both the inputs and masks in memory, so we can return them directly
+                input_ids = torch.tensor(self._flat_inputs[idx], dtype=torch.uint8)
+                attention_mask = torch.tensor(self._flat_masks[idx], dtype=torch.uint8)
                 return {"input_ids": input_ids, "attention_mask": attention_mask}
 
             inputs, masks = self._in_memory_shards[shard_idx]
-            input_ids = torch.tensor(inputs[local_idx], dtype=torch.long)
-            attention_mask = torch.tensor(masks[local_idx], dtype=torch.long)
+            input_ids = torch.tensor(inputs[local_idx], dtype=torch.uint8)
+            attention_mask = torch.tensor(masks[local_idx], dtype=torch.uint8)
             return {"input_ids": input_ids, "attention_mask": attention_mask}
 
         # Streaming path: open file on-demand
@@ -296,6 +312,90 @@ class LoadShardedFastaMLMDataset(Dataset):
             self._flat_inputs.extend(inputs)
             self._flat_masks.extend(masks)
         logger.info(f"Flat indexing enabled: {len(self._flat_inputs):,} samples")
+
+
+class LazyFastaMLMDataset(Dataset):
+    """FASTA dataset that tokenizes sequences lazily for MLM pretraining.
+
+    Uses an on-disk index for random access and defers padding to the collator.
+    """
+
+    def __init__(
+        self,
+        fasta_path: str,
+        tokenizer: PreTrainedTokenizer,
+        max_length: int,
+    ) -> None:
+        self.fasta_path = str(fasta_path)
+        self.tokenizer = tokenizer
+        self.max_length = int(max_length)
+
+        # Validate that the FASTA file exists and is readable
+        fasta_path_obj = Path(self.fasta_path)
+        if not fasta_path_obj.exists():
+            raise FileNotFoundError(f"FASTA file not found: {self.fasta_path}")
+
+        if not fasta_path_obj.is_file():
+            raise ValueError(f"Path is not a file: {self.fasta_path}")
+
+        if not os.access(self.fasta_path, os.R_OK):
+            raise PermissionError(f"FASTA file is not readable: {self.fasta_path}")
+
+        # Check if the file has any content
+        if fasta_path_obj.stat().st_size == 0:
+            raise ValueError(f"FASTA file is empty: {self.fasta_path}")
+
+        # Create or open a persistent SQLite-backed index for random access.
+        # This avoids storing all sequences in RAM.
+        self._db_path = f"{self.fasta_path}.idx"
+
+        temp_index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
+        self._keys: List[str] = list(temp_index.keys())
+        temp_index.close()
+
+        if len(self._keys) == 0:
+            raise ValueError(f"No sequences found in FASTA: {self.fasta_path}")
+
+        logger.info(
+            f"Loaded FASTA: {self.fasta_path} with {len(self._keys):,} sequences (max_length={self.max_length})."
+        )
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
+        if idx < 0 or idx >= len(self._keys):
+            raise IndexError(
+                f"Index {idx} out of bounds for dataset of size {len(self)}"
+            )
+
+        key = self._keys[idx]
+
+        # Create index on-demand to avoid multiprocessing pickle issues
+        index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
+        try:
+            record = index[key]
+            sequence = str(record.seq)
+        finally:
+            index.close()
+
+        # sequence = self.tokenizer.preprocess(sequence)
+
+        encoding = self.tokenizer(
+            sequence,
+            add_special_tokens=True,
+            padding=False,  # defer padding to the collator for dynamic padding
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        return {
+            "input_ids": encoding["input_ids"].squeeze(0),  # Remove batch dimension
+            "attention_mask": encoding["attention_mask"].squeeze(
+                0
+            ),  # Remove batch dimension
+        }
 
 
 def process_shard(args):
@@ -335,82 +435,6 @@ def process_shard(args):
     index.close()
     return str(shard_path)
 
-
-class LazyFastaMLMDataset(Dataset):
-    """FASTA dataset that tokenizes sequences lazily for MLM pretraining.
-
-    Uses an on-disk index for random access and defers padding to the collator.
-    """
-
-    def __init__(
-        self,
-        fasta_path: str,
-        tokenizer: PreTrainedTokenizer,
-        max_length: int,
-    ) -> None:
-        self.fasta_path = str(fasta_path)
-        self.tokenizer = tokenizer
-        self.max_length = int(max_length)
-
-        # Validate that the FASTA file exists and is readable
-        fasta_path_obj = Path(self.fasta_path)
-        if not fasta_path_obj.exists():
-            raise FileNotFoundError(f"FASTA file not found: {self.fasta_path}")
-
-        if not fasta_path_obj.is_file():
-            raise ValueError(f"Path is not a file: {self.fasta_path}")
-
-        if not os.access(self.fasta_path, os.R_OK):
-            raise PermissionError(f"FASTA file is not readable: {self.fasta_path}")
-
-        # Check if the file has any content
-        if fasta_path_obj.stat().st_size == 0:
-            raise ValueError(f"FASTA file is empty: {self.fasta_path}")
-
-        # Create or open a persistent SQLite-backed index for random access.
-        # This avoids storing all sequences in RAM.
-        self._db_path = f"{self.fasta_path}.idx"
-        self._index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
-        self._keys: List[str] = list(self._index.keys())
-
-        if len(self._keys) == 0:
-            raise ValueError(f"No sequences found in FASTA: {self.fasta_path}")
-
-        logger.info(
-            f"Loaded FASTA: {self.fasta_path} with {len(self._keys):,} sequences (max_length={self.max_length})."
-        )
-
-    def __len__(self) -> int:
-        return len(self._keys)
-
-    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
-        if idx < 0 or idx >= len(self._keys):
-            raise IndexError(
-                f"Index {idx} out of bounds for dataset of size {len(self)}"
-            )
-
-        key = self._keys[idx]
-        record = self._index[key]
-        sequence = str(record.seq)
-        sequence = self.tokenizer.preprocess(sequence)
-
-        encoding = self.tokenizer(
-            sequence,
-            add_special_tokens=True,
-            padding=False,  # defer padding to the collator for dynamic padding
-            max_length=self.max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        return {
-            "input_ids": encoding["input_ids"].squeeze(0),  # Remove batch dimension
-            "attention_mask": encoding["attention_mask"].squeeze(
-                0
-            ),  # Remove batch dimension
-        }
-
-
 def _read_shard_for_worker(path_str: str):
     """Helper for parallel shard loading in separate processes.
 
@@ -422,9 +446,12 @@ def _read_shard_for_worker(path_str: str):
     masks = []
     with h5py.File(path, "r") as f:
         n = len(f["input_ids"])
-        # Bulk read each variable-length element into a numpy array
+        # Bulk read each variable-length element into a numpy array and derive attention masks
         for i in range(n):
-            inputs.append(np.array(f["input_ids"][i], dtype=np.int32))
-            masks.append(np.array(f["attention_mask"][i], dtype=np.int32))
+            # Store tokens as uint8 to minimize memory; ids are cast to torch.long at training time.
+            arr = np.array(f["input_ids"][i], dtype=np.uint8)
+            inputs.append(arr)
+            # Derive attention_mask on-the-fly as uint8 (1 for non-padding, 0 for padding).
+            masks.append((arr != 0).astype(np.uint8))
 
     return path_str, (inputs, masks)
