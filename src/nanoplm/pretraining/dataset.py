@@ -271,10 +271,10 @@ class LoadShardedFastaMLMDataset(Dataset):
 
         # Streaming path: open file on-demand
         with h5py.File(self.shard_paths[shard_idx], "r") as f:
-            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.long)
-            attention_mask = torch.tensor(
-                f["attention_mask"][local_idx], dtype=torch.long
-            )
+            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.uint8)
+
+        # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding (pad_token_id=0)
+        attention_mask = (input_ids != 0).to(torch.uint8)
 
         return {
             "input_ids": input_ids,
@@ -306,7 +306,6 @@ def process_shard(args):
 
     shard_path = Path(output_dir) / f"shard_{shard_idx:04d}.h5"
     input_ids_list = []
-    attention_masks = []
 
     for key in tqdm(shard_keys, desc=f"Tokenizing shard {shard_idx}", leave=False):
         record = index[key]
@@ -322,21 +321,16 @@ def process_shard(args):
         )
 
         input_ids_list.append(encoding["input_ids"].squeeze(0))
-        attention_masks.append(encoding["attention_mask"].squeeze(0))
 
     # Write results
     with h5py.File(shard_path, "w") as h5f:
         total = len(input_ids_list)
         h5f.create_dataset(
-            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.int32)
-        )
-        h5f.create_dataset(
-            "attention_mask", (total,), dtype=h5py.special_dtype(vlen=np.int32)
+            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.uint8)
         )
 
         for i in tqdm(range(total), desc=f"Writing Shard {shard_idx}", leave=False):
-            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.int32)
-            h5f["attention_mask"][i] = np.array(attention_masks[i], dtype=np.int32)
+            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.uint8)
 
     index.close()
     return str(shard_path)
