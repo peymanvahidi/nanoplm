@@ -348,8 +348,10 @@ class LazyFastaMLMDataset(Dataset):
         # Create or open a persistent SQLite-backed index for random access.
         # This avoids storing all sequences in RAM.
         self._db_path = f"{self.fasta_path}.idx"
-        self._index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
-        self._keys: List[str] = list(self._index.keys())
+
+        temp_index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
+        self._keys: List[str] = list(temp_index.keys())
+        temp_index.close()
 
         if len(self._keys) == 0:
             raise ValueError(f"No sequences found in FASTA: {self.fasta_path}")
@@ -368,8 +370,15 @@ class LazyFastaMLMDataset(Dataset):
             )
 
         key = self._keys[idx]
-        record = self._index[key]
-        sequence = str(record.seq)
+
+        # Create index on-demand to avoid multiprocessing pickle issues
+        index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
+        try:
+            record = index[key]
+            sequence = str(record.seq)
+        finally:
+            index.close()
+
         # sequence = self.tokenizer.preprocess(sequence)
 
         encoding = self.tokenizer(
