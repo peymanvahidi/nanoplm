@@ -206,15 +206,25 @@ class LoadShardedFastaMLMDataset(Dataset):
             # Use ProcessPoolExecutor to let each worker open its own HDF5 file
             try:
                 with ProcessPoolExecutor(max_workers=max_workers) as exe:
-                    futures = {exe.submit(_read_shard_for_worker, str(p)): idx for idx, p in enumerate(self.shard_paths)}
-                    for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading shards", leave=False):
+                    futures = {
+                        exe.submit(_read_shard_for_worker, str(p)): idx
+                        for idx, p in enumerate(self.shard_paths)
+                    }
+                    for fut in tqdm(
+                        as_completed(futures),
+                        total=len(futures),
+                        desc="Loading shards",
+                        leave=False,
+                    ):
                         idx = futures[fut]
                         try:
                             _, data = fut.result()
                             self._in_memory_shards[idx] = data
                         except Exception:
                             # If any worker fails, fall back to sequential loading
-                            logger.warning("Parallel shard loading failed; falling back to sequential load.")
+                            logger.warning(
+                                "Parallel shard loading failed; falling back to sequential load."
+                            )
                             raise
 
                 # Verify none are None
@@ -224,6 +234,7 @@ class LoadShardedFastaMLMDataset(Dataset):
 
                 # Build flat index for O(1) global access
                 self._build_flat_index()
+
             except Exception:
                 # Fallback: sequential load with safe bulk reads
                 logger.info("Falling back to sequential shard loading...")
@@ -236,12 +247,16 @@ class LoadShardedFastaMLMDataset(Dataset):
                         inputs = [None] * n
                         masks = [None] * n
                         for j in range(n):
-                            inputs[j] = np.array(f["input_ids"][j], dtype=np.int32)
-                            masks[j] = np.array(f["attention_mask"][j], dtype=np.int32)
+                            # Store tokens as uint8 to minimize memory; ids are cast to torch.long at training time.
+                            arr = np.array(f["input_ids"][j], dtype=np.uint8)
+                            inputs[j] = arr
+                            # Derive attention_mask on-the-fly as uint8 as well (1 for non-padding, 0 for padding).
+                            masks[j] = (arr != 0).astype(np.uint8)
                         self._in_memory_shards.append((inputs, masks))
 
                 # Build flat index for O(1) global access after sequential fallback
                 self._build_flat_index()
+
         else:
             logger.info("Using streaming mode.")
 
@@ -260,13 +275,14 @@ class LoadShardedFastaMLMDataset(Dataset):
         if self._in_memory:
             # If flat indexing exists, use it for true O(1) access
             if hasattr(self, "_flat_inputs") and hasattr(self, "_flat_masks"):
-                input_ids = torch.tensor(self._flat_inputs[idx], dtype=torch.long)
-                attention_mask = torch.tensor(self._flat_masks[idx], dtype=torch.long)
+                # We have both the inputs and masks in memory, so we can return them directly
+                input_ids = torch.tensor(self._flat_inputs[idx], dtype=torch.uint8)
+                attention_mask = torch.tensor(self._flat_masks[idx], dtype=torch.uint8)
                 return {"input_ids": input_ids, "attention_mask": attention_mask}
 
             inputs, masks = self._in_memory_shards[shard_idx]
-            input_ids = torch.tensor(inputs[local_idx], dtype=torch.long)
-            attention_mask = torch.tensor(masks[local_idx], dtype=torch.long)
+            input_ids = torch.tensor(inputs[local_idx], dtype=torch.uint8)
+            attention_mask = torch.tensor(masks[local_idx], dtype=torch.uint8)
             return {"input_ids": input_ids, "attention_mask": attention_mask}
 
         # Streaming path: open file on-demand
@@ -296,44 +312,6 @@ class LoadShardedFastaMLMDataset(Dataset):
             self._flat_inputs.extend(inputs)
             self._flat_masks.extend(masks)
         logger.info(f"Flat indexing enabled: {len(self._flat_inputs):,} samples")
-
-
-def process_shard(args):
-    shard_idx, fasta_path, db_path, shard_keys, tokenizer, max_length, output_dir = args
-
-    # Each process must open its own index
-    index = SeqIO.index_db(db_path, [fasta_path], "fasta")
-
-    shard_path = Path(output_dir) / f"shard_{shard_idx:04d}.h5"
-    input_ids_list = []
-
-    for key in tqdm(shard_keys, desc=f"Tokenizing shard {shard_idx}", leave=False):
-        record = index[key]
-        seq = str(record.seq)
-
-        encoding = tokenizer(
-            seq,
-            add_special_tokens=True,
-            padding=False,
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        input_ids_list.append(encoding["input_ids"].squeeze(0))
-
-    # Write results
-    with h5py.File(shard_path, "w") as h5f:
-        total = len(input_ids_list)
-        h5f.create_dataset(
-            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.uint8)
-        )
-
-        for i in tqdm(range(total), desc=f"Writing Shard {shard_idx}", leave=False):
-            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.uint8)
-
-    index.close()
-    return str(shard_path)
 
 
 class LazyFastaMLMDataset(Dataset):
@@ -392,7 +370,7 @@ class LazyFastaMLMDataset(Dataset):
         key = self._keys[idx]
         record = self._index[key]
         sequence = str(record.seq)
-        sequence = self.tokenizer.preprocess(sequence)
+        # sequence = self.tokenizer.preprocess(sequence)
 
         encoding = self.tokenizer(
             sequence,
@@ -411,6 +389,43 @@ class LazyFastaMLMDataset(Dataset):
         }
 
 
+def process_shard(args):
+    shard_idx, fasta_path, db_path, shard_keys, tokenizer, max_length, output_dir = args
+
+    # Each process must open its own index
+    index = SeqIO.index_db(db_path, [fasta_path], "fasta")
+
+    shard_path = Path(output_dir) / f"shard_{shard_idx:04d}.h5"
+    input_ids_list = []
+
+    for key in tqdm(shard_keys, desc=f"Tokenizing shard {shard_idx}", leave=False):
+        record = index[key]
+        seq = str(record.seq)
+
+        encoding = tokenizer(
+            seq,
+            add_special_tokens=True,
+            padding=False,
+            max_length=max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        input_ids_list.append(encoding["input_ids"].squeeze(0))
+
+    # Write results
+    with h5py.File(shard_path, "w") as h5f:
+        total = len(input_ids_list)
+        h5f.create_dataset(
+            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.uint8)
+        )
+
+        for i in tqdm(range(total), desc=f"Writing Shard {shard_idx}", leave=False):
+            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.uint8)
+
+    index.close()
+    return str(shard_path)
+
 def _read_shard_for_worker(path_str: str):
     """Helper for parallel shard loading in separate processes.
 
@@ -422,9 +437,12 @@ def _read_shard_for_worker(path_str: str):
     masks = []
     with h5py.File(path, "r") as f:
         n = len(f["input_ids"])
-        # Bulk read each variable-length element into a numpy array
+        # Bulk read each variable-length element into a numpy array and derive attention masks
         for i in range(n):
-            inputs.append(np.array(f["input_ids"][i], dtype=np.int32))
-            masks.append(np.array(f["attention_mask"][i], dtype=np.int32))
+            # Store tokens as uint8 to minimize memory; ids are cast to torch.long at training time.
+            arr = np.array(f["input_ids"][i], dtype=np.uint8)
+            inputs.append(arr)
+            # Derive attention_mask on-the-fly as uint8 (1 for non-padding, 0 for padding).
+            masks.append((arr != 0).astype(np.uint8))
 
     return path_str, (inputs, masks)
