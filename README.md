@@ -149,7 +149,7 @@ model:
   intermediate_size: 2048
   num_hidden_layers: 16
   num_attention_heads: 16
-  vocab_size: 29
+  vocab_size: 32
   mlp_activation: "swiglu"
   mlp_dropout: 0.0
   mlp_bias: False
@@ -182,12 +182,14 @@ pretraining:
   lazy_dataset: False
   train_hdf5: "output/data/pretrain_shards/train_hdf5"
   val_hdf5: "output/data/pretrain_shards/val_hdf5"
+  load_all_in_memory: False
 
   optimizer: "adamw" # adamw, stable_adamw
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
-  learning_rate: 3e-6
+  learning_rate: 1e-3
+ # This is the maximum learning in the warmup phase 
   warmup_ratio: 0.05
   weight_decay: 0.0
   gradient_accumulation_steps: 1
@@ -199,7 +201,8 @@ pretraining:
   eval_steps_percentage: 0.025 # 40 evaluations in total 
   save_steps_percentage: 0.1 # 10 saves in total 
   seed: 42
-  num_workers: 0
+  num_workers: "auto"
+  prefetch_factor: 2
   multi_gpu: False
   world_size: 1 # Use "auto" if you want to use all available GPUs
   project_name: "nanoplm-pretraining"
