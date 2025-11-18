@@ -4,7 +4,7 @@ nanoPLM CLI - Pretraining subcommands for MLM pretraining
 """
 
 import click
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from pathlib import Path
 
 from nanoplm.pretraining.pipeline import (
@@ -52,6 +52,12 @@ def pretrain():
     "--val-hdf5",
     type=str,
     help="Directory of pre-tokenized validation HDF5 shards (used when --lazy-dataset is False)"
+)
+@click.option(
+    "--load-all-in-memory",
+    is_flag=True,
+    default=False,
+    help="Load all dataset in memory"
 )
 @click.option(
     "--ckp-dir",
@@ -182,9 +188,15 @@ def pretrain():
 )
 @click.option(
     "--num-workers",
+    type=Union[int, str],
+    default=None,
+    help="Number of DataLoader workers. Use 'auto' to use all available CPUs"
+)
+@click.option(
+    "--prefetch-factor",
     type=int,
-    default=0,
-    help="Number of DataLoader workers"
+    default=2,
+    help="DataLoader prefetch factor"
 )
 @click.option(
     "--multi-gpu",
@@ -277,6 +289,7 @@ def run(
     val_fasta: str,
     train_hdf5: str,
     val_hdf5: str,
+    load_all_in_memory: bool,
     ckp_dir: str,
     # training hp
     max_length: int,
@@ -299,7 +312,8 @@ def run(
     mask_replace_prob: float,
     random_token_prob: float,
     keep_probability: float,
-    num_workers: int,
+    num_workers: Union[int, str],
+    prefetch_factor: int,
     multi_gpu: bool,
     world_size: str,
     project_name: str,
@@ -324,6 +338,7 @@ def run(
         val_fasta=val_fasta,
         train_hdf5=train_hdf5,
         val_hdf5=val_hdf5,
+        load_all_in_memory=load_all_in_memory,
         ckp_dir=ckp_dir,
         max_length=max_length,
         batch_size=batch_size,
@@ -346,6 +361,7 @@ def run(
         save_steps_percentage=save_steps_percentage,
         seed=seed,
         num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
         multi_gpu=multi_gpu,
         world_size=world_size,
         project_name=project_name,
@@ -512,6 +528,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  lazy_dataset: False\n"
         "  train_hdf5: \"output/data/pretrain_shards/train_hdf5\"\n"
         "  val_hdf5: \"output/data/pretrain_shards/val_hdf5\"\n"
+        "  load_all_in_memory: False\n"
         "\n"
         "  optimizer: \"adamw\" # adamw, stable_adamw\n"
         "  adam_beta1: 0.9\n"
@@ -529,7 +546,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  eval_steps_percentage: 0.025 # 40 evaluations in total \n"
         "  save_steps_percentage: 0.1 # 10 saves in total \n"
         "  seed: 42\n"
-        "  num_workers: 0\n"
+        "  num_workers: \"auto\"\n"
+        "  prefetch_factor: 2\n"
         "  multi_gpu: False\n"
         "  world_size: 1 # Use \"auto\" if you want to use all available GPUs\n"
         "  project_name: \"nanoplm-pretraining\"\n"

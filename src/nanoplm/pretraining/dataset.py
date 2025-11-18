@@ -10,7 +10,7 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from nanoplm.utils import logger, create_dirs
 
@@ -146,18 +146,19 @@ class SaveShardedFastaMLMDataset:
 class LoadShardedFastaMLMDataset(Dataset):
     """Dataset for loading pre-tokenized sequences from HDF5 shards.
 
-    This class provides fast random access to pre-tokenized sequences stored in
-    HDF5 shards created by SaveShardedFastaMLMDataset.
-
-    This is a proper PyTorch Dataset for use during training.
+    Supports two modes:
+    - streaming (default)
+    - load_all_in_memory: read all shards into memory (dict) at init
     """
 
-    def __init__(self, hdf5_dir: str) -> None:
+    def __init__(self, hdf5_dir: str, load_all_in_memory: bool = False) -> None:
         """
         Args:
             hdf5_dir: Directory containing HDF5 shard files (*.h5)
+            load_all_in_memory: Whether to load all shards into memory (default: False)
         """
         self.hdf5_dir = Path(hdf5_dir)
+        self._in_memory = bool(load_all_in_memory)
 
         # Validate directory exists
         if not self.hdf5_dir.exists():
@@ -189,6 +190,61 @@ class LoadShardedFastaMLMDataset(Dataset):
             f"Loaded {int(self.cum_lengths[-1]):,} pre-tokenized sequences from {len(self.shard_paths)} shards"
         )
 
+        # In-memory option: load all shard data into Python lists
+        if self._in_memory:
+            logger.info("Loading all shards into memory (parallel)...")
+            num_shards = len(self.shard_paths)
+            # Decide number of workers: use up to half of CPUs but not more than shards
+            try:
+                max_workers = max(1, min((os.cpu_count() or 1) // 2, num_shards))
+            except Exception:
+                max_workers = 1
+
+            # Prepare result container
+            self._in_memory_shards = [None] * num_shards
+
+            # Use ProcessPoolExecutor to let each worker open its own HDF5 file
+            try:
+                with ProcessPoolExecutor(max_workers=max_workers) as exe:
+                    futures = {exe.submit(_read_shard_for_worker, str(p)): idx for idx, p in enumerate(self.shard_paths)}
+                    for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading shards", leave=False):
+                        idx = futures[fut]
+                        try:
+                            _, data = fut.result()
+                            self._in_memory_shards[idx] = data
+                        except Exception:
+                            # If any worker fails, fall back to sequential loading
+                            logger.warning("Parallel shard loading failed; falling back to sequential load.")
+                            raise
+
+                # Verify none are None
+                for i, entry in enumerate(self._in_memory_shards):
+                    if entry is None:
+                        raise RuntimeError(f"Shard {i} not loaded correctly")
+
+                # Build flat index for O(1) global access
+                self._build_flat_index()
+            except Exception:
+                # Fallback: sequential load with safe bulk reads
+                logger.info("Falling back to sequential shard loading...")
+                self._in_memory_shards = []
+                for i, path in enumerate(self.shard_paths, start=1):
+                    if i % 10 == 0 or i == num_shards:
+                        logger.info(f"Loading shard {i}/{num_shards}...")
+                    with h5py.File(path, "r") as f:
+                        n = len(f["input_ids"])
+                        inputs = [None] * n
+                        masks = [None] * n
+                        for j in range(n):
+                            inputs[j] = np.array(f["input_ids"][j], dtype=np.int32)
+                            masks[j] = np.array(f["attention_mask"][j], dtype=np.int32)
+                        self._in_memory_shards.append((inputs, masks))
+
+                # Build flat index for O(1) global access after sequential fallback
+                self._build_flat_index()
+        else:
+            logger.info("Using streaming mode.")
+
     def __len__(self) -> int:
         return int(self.cum_lengths[-1])
 
@@ -200,8 +256,20 @@ class LoadShardedFastaMLMDataset(Dataset):
 
         shard_idx, local_idx = self._get_shard(idx)
 
-        # Open shard and read as uint8 to save memory
-        # Cast to long will happen on GPU in collator
+        # In-memory fast path
+        if self._in_memory:
+            # If flat indexing exists, use it for true O(1) access
+            if hasattr(self, "_flat_inputs") and hasattr(self, "_flat_masks"):
+                input_ids = torch.tensor(self._flat_inputs[idx], dtype=torch.long)
+                attention_mask = torch.tensor(self._flat_masks[idx], dtype=torch.long)
+                return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+            inputs, masks = self._in_memory_shards[shard_idx]
+            input_ids = torch.tensor(inputs[local_idx], dtype=torch.long)
+            attention_mask = torch.tensor(masks[local_idx], dtype=torch.long)
+            return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+        # Streaming path: open file on-demand
         with h5py.File(self.shard_paths[shard_idx], "r") as f:
             input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.uint8)
 
@@ -219,6 +287,15 @@ class LoadShardedFastaMLMDataset(Dataset):
         if shard_idx > 0:
             idx -= self.cum_lengths[shard_idx - 1]
         return shard_idx, idx
+
+    def _build_flat_index(self) -> None:
+        """Build flat input/mask lists from self._in_memory_shards for O(1) global indexing."""
+        self._flat_inputs = []
+        self._flat_masks = []
+        for inputs, masks in self._in_memory_shards:
+            self._flat_inputs.extend(inputs)
+            self._flat_masks.extend(masks)
+        logger.info(f"Flat indexing enabled: {len(self._flat_inputs):,} samples")
 
 
 def process_shard(args):
@@ -332,3 +409,22 @@ class LazyFastaMLMDataset(Dataset):
                 0
             ),  # Remove batch dimension
         }
+
+
+def _read_shard_for_worker(path_str: str):
+    """Helper for parallel shard loading in separate processes.
+
+    Returns a tuple (indexable_path_str, (inputs_list, masks_list)).
+    """
+
+    path = Path(path_str)
+    inputs = []
+    masks = []
+    with h5py.File(path, "r") as f:
+        n = len(f["input_ids"])
+        # Bulk read each variable-length element into a numpy array
+        for i in range(n):
+            inputs.append(np.array(f["input_ids"][i], dtype=np.int32))
+            masks.append(np.array(f["attention_mask"][i], dtype=np.int32))
+
+    return path_str, (inputs, masks)
