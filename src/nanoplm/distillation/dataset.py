@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, IterableDataset
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-from nanoplm.models.teacher import BaseTeacher
+from nanoplm.distillation.models.teacher import BaseTeacher
 from nanoplm.utils import logger, get_device, create_dirs
 
 
@@ -773,10 +773,43 @@ class LoadKDDatasetOptimized(Dataset):
             "prefetch_cache_size": len(self._prefetch_cache),
         }
 
+    def __getstate__(self):
+        """Prepare state for pickling (needed for multiprocessing DataLoader)"""
+        state = self.__dict__.copy()
+        # Remove non-picklable objects
+        state["_file_cache"] = OrderedDict()  # Don't pickle open file handles
+        state["_cache_lock"] = None
+        state["_prefetch_cache"] = {}
+        state["_prefetch_lock"] = None
+        state["_prefetch_executor"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Restore state after unpickling"""
+        self.__dict__.update(state)
+        # Recreate locks and executor
+        self._cache_lock = threading.Lock()
+        self._prefetch_lock = threading.Lock()
+        self._file_cache = OrderedDict()
+        self._prefetch_cache = {}
+        if self.use_threading:
+            self._prefetch_executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="ProtX-Prefetch"
+            )
+
     def __del__(self):
         """Clean up file handles and threads"""
-        # Close all cached files
-        with self._cache_lock:
+        # Close all cached files (handle case where lock might be None after pickle)
+        if hasattr(self, "_cache_lock") and self._cache_lock is not None:
+            with self._cache_lock:
+                if hasattr(self, "_file_cache"):
+                    for shard_file in self._file_cache.values():
+                        try:
+                            shard_file.close()
+                        except:
+                            pass
+                    self._file_cache.clear()
+        elif hasattr(self, "_file_cache"):
             for shard_file in self._file_cache.values():
                 try:
                     shard_file.close()
@@ -785,8 +818,8 @@ class LoadKDDatasetOptimized(Dataset):
             self._file_cache.clear()
 
         # Shutdown thread pool
-        if self._prefetch_executor:
-            self._prefetch_executor.shutdown(wait=True)
+        if hasattr(self, "_prefetch_executor") and self._prefetch_executor:
+            self._prefetch_executor.shutdown(wait=False)
 
 
 def shard_h5_file(
