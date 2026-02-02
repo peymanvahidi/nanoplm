@@ -274,8 +274,6 @@ def from_yaml(config: str):
         num_layers=model_config.num_layers,
         num_heads=model_config.num_heads,
         mlp_activation=model_config.mlp_activation,
-        use_feature_embedding=model_config.use_feature_embedding,
-        feature_window_size=model_config.feature_window_size,
         projection_layer=model_config.projection_layer,
     )
 
@@ -337,8 +335,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_layers: 6\n"
         "  num_heads: 8\n"
         "  mlp_activation: \"swiglu\"\n"
-        "  use_feature_embedding: False\n"
-        "  feature_window_size: 15\n"
         "  projection_layer: True\n"
         "\n"
         "distillation:\n"
@@ -478,7 +474,7 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
             raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'on_the_fly', 'sharded', 'use_optimized_loader', 'use_threading']:
+    for bool_key in ['multi_gpu', 'on_the_fly', 'sharded', 'use_optimized_loader', 'use_threading', 'projection_layer']:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):

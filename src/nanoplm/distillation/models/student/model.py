@@ -11,7 +11,26 @@ from transformers.models.t5.modeling_t5 import T5LayerNorm
 from typing import Iterator, Union, List, Generator, Tuple
 
 from nanoplm.distillation.models.student.tokenizer import ProtXTokenizer
-from nanoplm.distillation.models.student.feature_embedding import FeatureEmbedding
+
+
+class SwiGLU(nn.Module):
+    def forward(self, x, gate):
+        return F.silu(gate) * x
+
+
+class ModernBertMLPSwiGLU(nn.Module):
+    """Replacement MLP that applies SwiGLU to each ModernBERT layer."""
+
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.Wi = nn.Linear(config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias)
+        self.drop = nn.Dropout(config.mlp_dropout)
+        self.act = SwiGLU()
+        self.Wo = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+
+    def forward(self, hidden_states):
+        x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
+        return self.Wo(self.drop(self.act(x, gate)))
 
 
 class ProtX(nn.Module):
@@ -23,15 +42,11 @@ class ProtX(nn.Module):
         num_layers: int,
         num_heads: int,
         mlp_activation: str = "swiglu",
-        use_feature_embedding: bool = False,
-        feature_window_size: int = 15,
         projection_layer: bool = True,
     ):
         super().__init__()
 
         self.tokenizer = ProtXTokenizer()
-        self.use_feature_embedding = use_feature_embedding
-        self.feature_window_size = feature_window_size
         self.projection_layer = projection_layer
 
         self.config = ModernBertConfig(
@@ -50,17 +65,6 @@ class ProtX(nn.Module):
 
         self.model = ModernBertModel(self.config)
 
-        # Replace standard embeddings with feature embeddings if enabled
-        if self.use_feature_embedding:
-            self.feature_embedding = FeatureEmbedding(
-                vocab_size=self.tokenizer.vocab_size,
-                embed_dim=embed_dim,
-                window_size=feature_window_size,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                unk_token_id=2  # Standard unk token ID
-            )
-
         if mlp_activation.lower() == "swiglu":
             for layer in self.model.layers:
                 layer.mlp = ModernBertMLPSwiGLU(self.config)
@@ -71,14 +75,7 @@ class ProtX(nn.Module):
             self.proj_norm = T5LayerNorm(1024)
 
     def forward(self, input_ids, attention_mask, training_mode=False, teacher_embeddings=None):
-        if self.use_feature_embedding:
-            # Generate embeddings using our custom feature embedding layer
-            inputs_embeds = self.feature_embedding(input_ids, attention_mask)
-            # Pass the generated embeddings directly to the model
-            student_out = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
-        else:
-            # Use standard ModernBERT forward pass with token IDs
-            student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
 
         if training_mode:
             if self.projection_layer:
@@ -114,8 +111,6 @@ class ProtX(nn.Module):
         device: str = "cuda",
         per_seq_embeddings: bool = True,  # True for pooled, False for per-token
         mlp_activation: str = "swiglu",
-        use_feature_embedding: bool = False,
-        feature_window_size: int = 3,
         projection_layer: bool = True
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """
@@ -131,8 +126,6 @@ class ProtX(nn.Module):
             per_seq_embeddings: If True, return pooled sequence-level embeddings [embed_dim].
                                If False, return per-token embeddings [sequence_length, embed_dim]
             mlp_activation: MLP activation function ("swiglu" or others)
-            use_feature_embedding: If True, use enhanced feature embedding with hydropathy and charge
-            feature_window_size: Window size for sliding window feature computation
             projection_layer: If True, include projection layer to 1024 dims (default: True)
 
         Yields:
@@ -154,8 +147,6 @@ class ProtX(nn.Module):
             num_layers=num_layers,
             num_heads=num_heads,
             mlp_activation=mlp_activation,
-            use_feature_embedding=use_feature_embedding,
-            feature_window_size=feature_window_size,
             projection_layer=projection_layer
         )
 
@@ -360,8 +351,6 @@ class ProtX(nn.Module):
         num_layers: int,
         num_heads: int,
         mlp_activation: str = "swiglu",
-        use_feature_embedding: bool = False,
-        feature_window_size: int = 3,
         projection_layer: bool = True
     ) -> int:
         """
@@ -372,8 +361,6 @@ class ProtX(nn.Module):
             num_layers: Number of transformer layers
             num_heads: Number of attention heads
             mlp_activation: MLP activation function ("swiglu" or others)
-            use_feature_embedding: Whether to use enhanced feature embedding
-            feature_window_size: Window size for feature computation
             projection_layer: Whether to include projection layer to 1024 dims
 
         Returns:
@@ -385,8 +372,6 @@ class ProtX(nn.Module):
             num_layers=num_layers,
             num_heads=num_heads,
             mlp_activation=mlp_activation,
-            use_feature_embedding=use_feature_embedding,
-            feature_window_size=feature_window_size,
             projection_layer=projection_layer
         )
 
@@ -401,8 +386,6 @@ class ProtX(nn.Module):
         num_layers: int,
         num_heads: int,
         mlp_activation: str = "swiglu",
-        use_feature_embedding: bool = False,
-        feature_window_size: int = 3,
         projection_layer: bool = True
     ) -> None:
         """
@@ -413,8 +396,6 @@ class ProtX(nn.Module):
             num_layers: Number of transformer layers
             num_heads: Number of attention heads
             mlp_activation: MLP activation function ("swiglu" or others)
-            use_feature_embedding: Whether to use enhanced feature embedding
-            feature_window_size: Window size for feature computation
             projection_layer: Whether to include projection layer to 1024 dims
         """
         # Create a temporary model instance
@@ -423,17 +404,12 @@ class ProtX(nn.Module):
             num_layers=num_layers,
             num_heads=num_heads,
             mlp_activation=mlp_activation,
-            use_feature_embedding=use_feature_embedding,
-            feature_window_size=feature_window_size,
             projection_layer=projection_layer
         )
 
         print(f"ProtX Model Parameter Breakdown:")
         print(f"Architecture: embed_dim={embed_dim}, num_layers={num_layers}, num_heads={num_heads}")
         print(f"MLP activation: {mlp_activation}")
-        print(f"Feature embedding: {'Enabled' if use_feature_embedding else 'Disabled'}")
-        if use_feature_embedding:
-            print(f"Feature window size: {feature_window_size}")
         print(f"Vocabulary size: {model.tokenizer.vocab_size}")
         print("-" * 60)
 
@@ -444,7 +420,7 @@ class ProtX(nn.Module):
             param_count = param.numel()
 
             # Categorize parameters
-            if 'embeddings' in name or 'feature_embedding' in name:
+            if 'embeddings' in name:
                 component = 'Embeddings'
             elif 'model.layers' in name:
                 layer_num = name.split('.')[2]  # Extract layer number
@@ -507,23 +483,3 @@ class ProtX(nn.Module):
         print(f"  Embeddings: {embedding_params:,} ({embedding_params/total_params*100:.1f}%)")
         print(f"  Transformer layers: {layer_params:,} ({layer_params/total_params*100:.1f}%)")
         print(f"  Output projection: {output_params:,} ({output_params/total_params*100:.1f}%)")
-
-
-class SwiGLU(nn.Module):
-    def forward(self, x, gate):
-        return F.silu(gate) * x
-
-
-class ModernBertMLPSwiGLU(nn.Module):
-    """Replacement MLP that applies SwiGLU to each ModernBERT layer."""
-
-    def __init__(self, config: ModernBertConfig):
-        super().__init__()
-        self.Wi = nn.Linear(config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias)
-        self.drop = nn.Dropout(config.mlp_dropout)
-        self.act = SwiGLU()
-        self.Wo = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
-
-    def forward(self, hidden_states):
-        x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
-        return self.Wo(self.drop(self.act(x, gate)))
