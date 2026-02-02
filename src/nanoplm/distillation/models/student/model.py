@@ -1,14 +1,13 @@
+from dataclasses import dataclass
+from typing import Generator, Iterator, List, Tuple, Union
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
 from safetensors.torch import load_file
-from transformers import (
-    ModernBertModel,
-    ModernBertConfig,
-)
+from transformers import ModernBertConfig, ModernBertModel
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.t5.modeling_t5 import T5LayerNorm
-from typing import Iterator, Union, List, Generator, Tuple
 
 from nanoplm.distillation.models.student.tokenizer import ProtXTokenizer
 
@@ -32,75 +31,82 @@ class ModernBertMLPSwiGLU(nn.Module):
         x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
         return self.Wo(self.drop(self.act(x, gate)))
 
+@dataclass
+class ProtXConfig:
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    vocab_size: int = 32
+    mlp_activation: str = "swiglu"
+    mlp_dropout: float = 0.0
+    mlp_bias: bool = False
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    classifier_activation: str = "gelu"
+    projection_layer: bool = True
 
-class ProtX(nn.Module):
+
+class ProtX(ModernBertModel):
     """Student model for ProtX"""
 
     def __init__(
         self,
-        embed_dim: int,
-        num_layers: int,
-        num_heads: int,
-        mlp_activation: str = "swiglu",
-        projection_layer: bool = True,
+        config: ProtXConfig
     ):
-        super().__init__()
-
         self.tokenizer = ProtXTokenizer()
-        self.projection_layer = projection_layer
+        self._use_projection_layer = config.projection_layer
 
-        self.config = ModernBertConfig(
+        modern_bert_config = ModernBertConfig(
             vocab_size=self.tokenizer.vocab_size,
-            hidden_size=embed_dim,
-            intermediate_size=embed_dim * 2,
-            num_hidden_layers=num_layers,
-            num_attention_heads=num_heads,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
-            attention_dropout=0.0,
-            mlp_dropout=0.0,
-            mlp_bias=False,
-            attention_bias=False,
+            attention_dropout=config.attention_dropout,
+            mlp_dropout=config.mlp_dropout,
+            mlp_bias=config.mlp_bias,
+            attention_bias=config.attention_bias,
+            classifier_activation=config.classifier_activation,
         )
 
-        self.model = ModernBertModel(self.config)
+        super().__init__(modern_bert_config)
 
-        if mlp_activation.lower() == "swiglu":
-            for layer in self.model.layers:
-                layer.mlp = ModernBertMLPSwiGLU(self.config)
+        # Apply SwiGLU activation to MLP layers if specified
+        if config.mlp_activation.lower() == "swiglu":
+            for layer in self.layers:
+                layer.mlp = ModernBertMLPSwiGLU(modern_bert_config)
 
         # Only add projection layer if requested
-        if self.projection_layer:
-            self.proj = nn.Linear(embed_dim, 1024, bias=False)
-            self.proj_norm = T5LayerNorm(1024)
+        if self._use_projection_layer:
+            self.proj = nn.Linear(config.hidden_size, 1024, bias=False)
+            self.proj_norm = T5LayerNorm(1024)  # Hardcoded based on teacher model (ProtT5)
 
-    def forward(self, input_ids, attention_mask, training_mode=False, teacher_embeddings=None):
-        student_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
+    def forward(self, input_ids, attention_mask, training_mode=False):
+        outputs = super().forward(input_ids=input_ids, attention_mask=attention_mask)
 
         if training_mode:
-            if self.projection_layer:
+            if self._use_projection_layer:
                 # Apply projection layer for knowledge distillation (to match teacher's 1024 dim)
-                projected_repr = self.proj(student_out.last_hidden_state)  # (batch_size, seq_len, 1024)
+                projected_repr = self.proj(outputs.last_hidden_state)  # (batch_size, seq_len, 1024)
                 projected_repr = self.proj_norm(projected_repr)
                 output_repr = projected_repr
             else:
                 # No projection layer - student embeddings stay at embed_dim
                 # Teacher and student should both have same embedding dimension (1024)
-                output_repr = student_out.last_hidden_state
+                output_repr = outputs.last_hidden_state
 
             # training mode
             return BaseModelOutput(
                 last_hidden_state=output_repr,
-                hidden_states=student_out.hidden_states,
-                attentions=student_out.attentions
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions
             )
         else:
             # Inference mode - always return raw embeddings without projection
-            return BaseModelOutput(
-                last_hidden_state=student_out.last_hidden_state,
-                hidden_states=student_out.hidden_states,
-                attentions=student_out.attentions
-            )
+            return outputs
 
     @staticmethod
     def load_and_generate_embeddings(
@@ -142,13 +148,15 @@ class ProtX(nn.Module):
             return
 
         # Create model instance with detected architecture
-        model = ProtX(
-            embed_dim=embed_dim,
-            num_layers=num_layers,
-            num_heads=num_heads,
+        config = ProtXConfig(
+            hidden_size=embed_dim,
+            intermediate_size=embed_dim * 2,
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
             mlp_activation=mlp_activation,
             projection_layer=projection_layer
         )
+        model = ProtX(config)
 
         # Load the checkpoint
         try:
@@ -274,10 +282,10 @@ class ProtX(nn.Module):
             if 'embeddings.tok_embeddings.weight' in key:
                 vocab_size, embed_dim = tensor.shape
                 break
-            elif 'model.layers.0.attn.Wo.weight' in key:
+            elif 'layers.0.attn.Wo.weight' in key:
                 embed_dim, _ = tensor.shape
                 break
-            elif 'model.layers.0.mlp.Wi.weight' in key:
+            elif 'layers.0.mlp.Wi.weight' in key:
                 _, embed_dim = tensor.shape
                 break
 
@@ -287,8 +295,8 @@ class ProtX(nn.Module):
         # Count number of layers by looking for layer-specific parameters
         layer_indices = set()
         for key in state_dict.keys():
-            if 'model.layers.' in key:
-                # Extract layer number from key like "model.layers.0.attn.Wo.weight"
+            if 'layers.' in key:
+                # Extract layer number from key like "layers.0.attn.Wo.weight"
                 parts = key.split('.')
                 for i, part in enumerate(parts):
                     if part == 'layers' and i + 1 < len(parts):
@@ -305,7 +313,7 @@ class ProtX(nn.Module):
 
         # Find number of attention heads from Wqkv matrix
         for key, tensor in state_dict.items():
-            if 'model.layers.0.attn.Wqkv.weight' in key:
+            if 'layers.0.attn.Wqkv.weight' in key:
                 # Wqkv weight shape is [3 * embed_dim, embed_dim] for combined Q,K,V
                 qkv_dim, model_dim = tensor.shape
 
@@ -367,13 +375,15 @@ class ProtX(nn.Module):
             Total number of parameters
         """
         # Create a temporary model instance
-        model = ProtX(
-            embed_dim=embed_dim,
-            num_layers=num_layers,
-            num_heads=num_heads,
+        config = ProtXConfig(
+            hidden_size=embed_dim,
+            intermediate_size=embed_dim * 4,  # Standard transformer ratio
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
             mlp_activation=mlp_activation,
             projection_layer=projection_layer
         )
+        model = ProtX(config)
 
         # Count parameters
         total_params = sum(p.numel() for p in model.parameters())
@@ -399,13 +409,15 @@ class ProtX(nn.Module):
             projection_layer: Whether to include projection layer to 1024 dims
         """
         # Create a temporary model instance
-        model = ProtX(
-            embed_dim=embed_dim,
-            num_layers=num_layers,
-            num_heads=num_heads,
+        config = ProtXConfig(
+            hidden_size=embed_dim,
+            intermediate_size=embed_dim * 4,  # Standard transformer ratio
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
             mlp_activation=mlp_activation,
             projection_layer=projection_layer
         )
+        model = ProtX(config)
 
         print(f"ProtX Model Parameter Breakdown:")
         print(f"Architecture: embed_dim={embed_dim}, num_layers={num_layers}, num_heads={num_heads}")
@@ -422,8 +434,8 @@ class ProtX(nn.Module):
             # Categorize parameters
             if 'embeddings' in name:
                 component = 'Embeddings'
-            elif 'model.layers' in name:
-                layer_num = name.split('.')[2]  # Extract layer number
+            elif 'layers.' in name and 'embeddings' not in name:
+                layer_num = name.split('layers.')[1].split('.')[0]  # Extract layer number
                 if 'attn' in name:
                     component = f'Layer {layer_num} - Attention'
                 elif 'mlp' in name:

@@ -3,19 +3,20 @@
 nanoPLM CLI - Distillation subcommands for nanoPLM package
 """
 
-import click
-import json
-from typing import Optional, Dict, Any, Union
 from pathlib import Path
+from typing import Any, Dict, Optional
 
+import click
+
+from nanoplm.distillation.models.student import ProtX
+from nanoplm.distillation.models.student.model import ProtXConfig
 from nanoplm.distillation.pipeline import (
     DistillationConfig,
-    StudentModelConfig,
     ResumeConfig,
+    StudentModelConfig,
     run_distillation,
 )
-from nanoplm.distillation.models.student import ProtX
-from nanoplm.utils.common import read_yaml, create_dirs
+from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
 
 
@@ -53,19 +54,25 @@ def distill():
     help='Prefix path for validation H5 dataset'
 )
 @click.option(
-    '--embed-dim',
+    '--hidden-size',
     type=int,
     default=512,
-    help='Embedding dimension of the student model'
+    help='Hidden dimension of the student model'
 )
 @click.option(
-    '--num-layers',
+    '--intermediate-size',
+    type=int,
+    default=1024,
+    help='Intermediate (MLP) dimension of the student model'
+)
+@click.option(
+    '--num-hidden-layers',
     type=int,
     default=6,
     help='Number of layers of the student model'
 )
 @click.option(
-    '--num-heads',
+    '--num-attention-heads',
     type=int,
     default=8,
     help='Number of attention heads of the student model'
@@ -167,9 +174,10 @@ def run(
     val_fasta: str,
     train_h5_prefix: str,
     val_h5_prefix: str,
-    embed_dim: int,
-    num_layers: int,
-    num_heads: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_hidden_layers: int,
+    num_attention_heads: int,
     on_the_fly: bool,
     multi_gpu: bool,
     num_epochs: int,
@@ -189,13 +197,15 @@ def run(
 ):
     """Distill the teacher model into a student model"""
 
-    # Create student model
-    model = ProtX(
-        embed_dim=embed_dim,
-        num_layers=num_layers,
-        num_heads=num_heads,
+    # Create student model config
+    model_config = ProtXConfig(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=num_attention_heads,
         projection_layer=not no_projection_layer,
     )
+    model = ProtX(model_config)
 
     # Create distillation config
     distill_config = DistillationConfig(
@@ -268,14 +278,21 @@ def from_yaml(config: str):
     distill_config = _load_distill_config(distill_dict)
     resume_config = _load_resume_config(resume_dict)
 
-    # Create student model
-    model = ProtX(
-        embed_dim=model_config.embed_dim,
-        num_layers=model_config.num_layers,
-        num_heads=model_config.num_heads,
+    # Create student model config (field names now match between StudentModelConfig and ProtXConfig)
+    protx_config = ProtXConfig(
+        hidden_size=model_config.hidden_size,
+        intermediate_size=model_config.intermediate_size,
+        num_hidden_layers=model_config.num_hidden_layers,
+        num_attention_heads=model_config.num_attention_heads,
         mlp_activation=model_config.mlp_activation,
+        mlp_dropout=model_config.mlp_dropout,
+        mlp_bias=model_config.mlp_bias,
+        attention_bias=model_config.attention_bias,
+        attention_dropout=model_config.attention_dropout,
+        classifier_activation=model_config.classifier_activation,
         projection_layer=model_config.projection_layer,
     )
+    model = ProtX(protx_config)
 
     # Log model info
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
@@ -331,11 +348,17 @@ def get_yaml(output: Optional[str], force: bool):
         "# Distillation configuration for nanoPLM\n"
         "\n"
         "model:\n"
-        "  embed_dim: 512\n"
-        "  num_layers: 6\n"
-        "  num_heads: 8\n"
+        "  hidden_size: 512\n"
+        "  intermediate_size: 1024\n"
+        "  num_hidden_layers: 6\n"
+        "  num_attention_heads: 8\n"
         "  mlp_activation: \"swiglu\"\n"
-        "  projection_layer: True\n"
+        "  mlp_dropout: 0.0\n"
+        "  mlp_bias: False\n"
+        "  attention_bias: False\n"
+        "  attention_dropout: 0.0\n"
+        "  classifier_activation: \"gelu\"\n"
+        "  projection_layer: True  # Set to False if student hidden_size matches teacher (1024)\n"
         "\n"
         "distillation:\n"
         "  # Dataset paths\n"
