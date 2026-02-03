@@ -8,16 +8,14 @@ from typing import Any, Dict, Optional
 
 import click
 
-from nanoplm.distillation.models.student import ProtX
-from nanoplm.distillation.models.student.model import ProtXConfig
+from nanoplm.distillation.models.student import ProtXConfig
 from nanoplm.distillation.pipeline import (
     DistillationConfig,
     ResumeConfig,
-    StudentModelConfig,
     run_distillation,
+    run_distillation_native,
 )
 from nanoplm.utils.common import create_dirs, read_yaml
-from nanoplm.utils.logger import logger
 
 
 @click.group(name="distill")
@@ -30,28 +28,22 @@ def distill():
 @distill.command("run")
 @click.help_option('--help', '-h')
 @click.option(
+    '--dataset-dir',
+    type=str,
+    required=False,
+    help='Path to dataset directory containing .data_manifest (from nanoplm data from-yaml)'
+)
+@click.option(
     '--train-fasta',
     type=str,
-    required=True,
-    help='Path to the training FASTA file'
+    required=False,
+    help='Path to the training FASTA file (required for --on-the-fly mode)'
 )
 @click.option(
     '--val-fasta',
     type=str,
-    required=True,
-    help='Path to the validation FASTA file'
-)
-@click.option(
-    '--train-h5-prefix',
-    type=str,
-    required=True,
-    help='Prefix path for training H5 dataset'
-)
-@click.option(
-    '--val-h5-prefix',
-    type=str,
-    required=True,
-    help='Prefix path for validation H5 dataset'
+    required=False,
+    help='Path to the validation FASTA file (required for --on-the-fly mode)'
 )
 @click.option(
     '--hidden-size',
@@ -80,7 +72,7 @@ def distill():
 @click.option(
     '--on-the-fly',
     is_flag=True,
-    help='Whether to use on-the-fly teacher embeddings'
+    help='Use on-the-fly teacher embeddings (requires --train-fasta and --val-fasta)'
 )
 @click.option(
     '--multi-gpu',
@@ -104,24 +96,6 @@ def distill():
     type=float,
     default=1e-3,
     help='Maximum learning rate'
-)
-@click.option(
-    '--max-seqs-num',
-    type=int,
-    required=True,
-    help='Maximum number of sequences to use for training'
-)
-@click.option(
-    '--max-seq-len',
-    type=int,
-    default=1024,
-    help='Maximum sequence length'
-)
-@click.option(
-    '--val-ratio',
-    type=float,
-    default=0.1,
-    help='Ratio of validation set'
 )
 @click.option(
     '--num-workers',
@@ -148,11 +122,6 @@ def distill():
     help='Learning rate scheduler type'
 )
 @click.option(
-    '--sharded',
-    is_flag=True,
-    help='Whether to use sharded H5 files for data loading'
-)
-@click.option(
     '--no-projection-layer',
     is_flag=True,
     help='Disable projection layer (student and teacher embeddings must have same dimension 1024)'
@@ -169,11 +138,15 @@ def distill():
     default=42,
     help='Random seed'
 )
+@click.option(
+    '--use-native',
+    is_flag=True,
+    help='Use native PyTorch training loop (no HuggingFace Trainer)'
+)
 def run(
-    train_fasta: str,
-    val_fasta: str,
-    train_h5_prefix: str,
-    val_h5_prefix: str,
+    dataset_dir: Optional[str],
+    train_fasta: Optional[str],
+    val_fasta: Optional[str],
     hidden_size: int,
     intermediate_size: int,
     num_hidden_layers: int,
@@ -183,19 +156,32 @@ def run(
     num_epochs: int,
     batch_size: int,
     learning_rate: float,
-    max_seqs_num: int,
-    max_seq_len: int,
-    val_ratio: float,
     num_workers: int,
     project_name: str,
     ckp_dir: str,
     lr_scheduler: str,
-    sharded: bool,
     no_projection_layer: bool,
     gradient_accumulation_steps: int,
     seed: int,
+    use_native: bool,
 ):
-    """Distill the teacher model into a student model"""
+    """Distill the teacher model into a student model.
+
+    Either provide --dataset-dir (reads from manifest) or --on-the-fly with FASTA files.
+    """
+
+    # Validate input options
+    if on_the_fly:
+        if not train_fasta or not val_fasta:
+            raise click.ClickException(
+                "--train-fasta and --val-fasta are required when using --on-the-fly mode"
+            )
+    else:
+        if not dataset_dir:
+            raise click.ClickException(
+                "--dataset-dir is required when not using --on-the-fly mode.\n"
+                "Run 'nanoplm data from-yaml' with pipeline_mode: 'distillation' first."
+            )
 
     # Create student model config
     model_config = ProtXConfig(
@@ -205,24 +191,18 @@ def run(
         num_attention_heads=num_attention_heads,
         projection_layer=not no_projection_layer,
     )
-    model = ProtX(model_config)
 
     # Create distillation config
     distill_config = DistillationConfig(
+        dataset_dir=dataset_dir,
         train_fasta=train_fasta,
         val_fasta=val_fasta,
-        train_h5_prefix=train_h5_prefix,
-        val_h5_prefix=val_h5_prefix,
         num_epochs=num_epochs,
         batch_size=batch_size,
         learning_rate=learning_rate,
         gradient_accumulation_steps=gradient_accumulation_steps,
         lr_scheduler=lr_scheduler,
-        max_seq_len=max_seq_len,
-        max_seqs_num=max_seqs_num,
-        val_ratio=val_ratio,
         on_the_fly=on_the_fly,
-        sharded=sharded,
         num_workers=num_workers,
         ckp_dir=ckp_dir,
         project_name=project_name,
@@ -230,13 +210,12 @@ def run(
         seed=seed,
     )
 
-    # Log model info
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-    total_params = sum(p.numel() for p in model_parameters)
-    logger.info(f"Total Trainable Parameters: {total_params}")
-
-    # Run distillation
-    run_distillation(model=model, distill_config=distill_config)
+    # Run distillation (choose implementation based on flag)
+    train_func = run_distillation_native if use_native else run_distillation
+    train_func(
+        model_config=model_config,
+        distill_config=distill_config,
+    )
 
 
 @distill.command("from-yaml")
@@ -246,7 +225,12 @@ def run(
     default="distill.yaml",
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
-def from_yaml(config: str):
+@click.option(
+    '--use-native',
+    is_flag=True,
+    help='Use native PyTorch training loop (no HuggingFace Trainer). Can also be set in YAML.'
+)
+def from_yaml(config: str, use_native: bool):
     """Run distillation from a YAML configuration file.
 
     Expected YAML structure:
@@ -278,8 +262,12 @@ def from_yaml(config: str):
     distill_config = _load_distill_config(distill_dict)
     resume_config = _load_resume_config(resume_dict)
 
+    # Check if use_native is set in YAML (CLI flag overrides)
+    yaml_use_native = distill_dict.get("use_native", False) if distill_dict else False
+    final_use_native = use_native or yaml_use_native
+
     # Create student model config (field names now match between StudentModelConfig and ProtXConfig)
-    protx_config = ProtXConfig(
+    model_config = ProtXConfig(
         hidden_size=model_config.hidden_size,
         intermediate_size=model_config.intermediate_size,
         num_hidden_layers=model_config.num_hidden_layers,
@@ -292,16 +280,11 @@ def from_yaml(config: str):
         classifier_activation=model_config.classifier_activation,
         projection_layer=model_config.projection_layer,
     )
-    model = ProtX(protx_config)
 
-    # Log model info
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-    total_params = sum(p.numel() for p in model_parameters)
-    logger.info(f"Total Trainable Parameters: {total_params}")
-
-    # Run distillation
-    run_distillation(
-        model=model,
+    # Run distillation (choose implementation based on flag)
+    train_func = run_distillation_native if final_use_native else run_distillation
+    train_func(
+        model_config=model_config,
         distill_config=distill_config,
         resume_config=resume_config if resume_config.is_resume else None,
     )
@@ -346,6 +329,14 @@ def get_yaml(output: Optional[str], force: bool):
 
     template = (
         "# Distillation configuration for nanoPLM\n"
+        "#\n"
+        "# IMPORTANT: Before running distillation, ensure you have prepared your data with:\n"
+        "#   1. Set pipeline_mode: 'distillation' in params.yaml\n"
+        "#   2. Set distillation_config.on_the_fly in params.yaml:\n"
+        "#      - false (default): Pre-compute teacher embeddings during data preparation\n"
+        "#      - true: Generate teacher embeddings on-the-fly during training\n"
+        "#   3. Run: nanoplm data from-yaml\n"
+        "# This will generate a .data_manifest file with the appropriate configuration.\n"
         "\n"
         "model:\n"
         "  hidden_size: 512\n"
@@ -354,22 +345,26 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_attention_heads: 8\n"
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
-        "  mlp_bias: False\n"
-        "  attention_bias: False\n"
+        "  mlp_bias: false\n"
+        "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
-        "  projection_layer: True  # Set to False if student hidden_size matches teacher (1024)\n"
+        "  projection_layer: true  # Set to false if student hidden_size matches teacher (1024)\n"
         "\n"
         "distillation:\n"
-        "  # Dataset paths\n"
-        "  # Note: these paths are RELATIVE to where you RUN the command NOT the YAML file.\n"
-        "  train_fasta: \"output/data/split/train.fasta\"\n"
-        "  val_fasta: \"output/data/split/val.fasta\"\n"
-        "  train_h5_prefix: \"output/data/kd_dataset/train/train_kd_dataset.h5\"\n"
-        "  val_h5_prefix: \"output/data/kd_dataset/val/val_kd_dataset.h5\"\n"
+        "\n"
+        "  # Training implementation\n"
+        "  use_native: false  # Set to true for native PyTorch training loop (no HuggingFace Trainer)\n"
+        "\n"
+        "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
+        "  # The manifest automatically provides:\n"
+        "  #   - max_seq_len, max_seqs_num, val_ratio\n"
+        "  #   - on_the_fly mode and dataset paths (FASTA or H5)\n"
+        "  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.\n"
+        "  dataset_dir: \"output/data/distillation_data\"\n"
         "\n"
         "  # Output checkpoint path\n"
-        "  ckp_dir: \"output/distillation\"\n"
+        "  ckp_dir: \"output/distillation_checkpoints\"\n"
         "\n"
         "  # Training hyperparameters\n"
         "  num_epochs: 10\n"
@@ -382,19 +377,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  lr_scheduler: \"cosine\"  # cosine, linear, polynomial, constant\n"
         "  lr_scheduler_kwargs: {}\n"
         "\n"
-        "  # Dataset config\n"
-        "  max_seq_len: 1024\n"
-        "  max_seqs_num: 100000\n"
-        "  val_ratio: 0.1\n"
-        "  on_the_fly: False\n"
-        "  sharded: False\n"
-        "\n"
         "  # Data loader optimization\n"
-        "  use_optimized_loader: True\n"
+        "  use_optimized_loader: true\n"
         "  max_open_files: 5\n"
         "  chunk_size: 32\n"
         "  prefetch_batches: 2\n"
-        "  use_threading: True\n"
+        "  use_threading: true\n"
         "  num_workers: 4\n"
         "\n"
         "  # Checkpointing\n"
@@ -404,7 +392,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  save_steps_percentage: 0.05\n"
         "\n"
         "  # Distributed training\n"
-        "  multi_gpu: False\n"
+        "  multi_gpu: false\n"
         "  world_size: 1\n"
         "  seed: 42\n"
         "\n"
@@ -412,7 +400,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  # Set is_resume: true to resume training from a checkpoint\n"
         "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
         "  # extra_epochs: adds to 'distillation.num_epochs' to define total epochs.\n"
-        "  is_resume: False\n"
+        "  is_resume: false\n"
         "  checkpoint_dir: \"output/distillation/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
     )
@@ -425,12 +413,12 @@ def get_yaml(output: Optional[str], force: bool):
     click.echo(f"Template written to: {output_path}")
 
 
-def _load_model_config(config: Dict[str, Any]) -> StudentModelConfig:
+def _load_model_config(config: Dict[str, Any]) -> ProtXConfig:
     """Load and validate model configuration from YAML."""
     if config is None:
         raise ValueError("Model configuration is required but not found in YAML")
 
-    expected_keys = set(StudentModelConfig.__annotations__.keys())
+    expected_keys = set(ProtXConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
     extra = []
@@ -449,7 +437,7 @@ def _load_model_config(config: Dict[str, Any]) -> StudentModelConfig:
             f"Unexpected model configuration keys: {', '.join(sorted(extra))}"
         )
 
-    return StudentModelConfig(**kwargs)
+    return ProtXConfig(**kwargs)
 
 
 def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
@@ -460,12 +448,8 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
     expected_keys = set(DistillationConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
-    missing = []
     extra = []
     kwargs: Dict[str, Any] = {}
-
-    # Required keys (those without defaults)
-    required_keys = {"train_fasta", "val_fasta", "train_h5_prefix", "val_h5_prefix"}
 
     for key in present_keys:
         if key not in expected_keys:
@@ -475,18 +459,16 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
         if value is not None:
             kwargs[key] = value
 
-    # Check for required keys
-    for key in required_keys:
-        if key not in kwargs or kwargs[key] is None:
-            missing.append(key)
-
-    if missing:
-        raise ValueError(
-            f"Missing required distillation configuration keys: {', '.join(sorted(missing))}"
-        )
     if extra:
         raise ValueError(
             f"Unexpected distillation configuration keys: {', '.join(sorted(extra))}"
+        )
+
+    # Validate: dataset_dir is required (manifest provides all dataset configuration)
+    if not kwargs.get('dataset_dir'):
+        raise ValueError(
+            "dataset_dir is required. It should point to a directory containing .data_manifest file.\n"
+            "Run 'nanoplm data from-yaml' with pipeline_mode: 'distillation' to generate the manifest."
         )
 
     # Handle learning_rate conversion
@@ -497,7 +479,7 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
             raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'on_the_fly', 'sharded', 'use_optimized_loader', 'use_threading', 'projection_layer']:
+    for bool_key in ['multi_gpu', 'on_the_fly', 'sharded', 'use_optimized_loader', 'use_threading']:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):

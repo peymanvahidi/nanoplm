@@ -14,6 +14,7 @@ from nanoplm.data.extractor import Extractor, ExtractionError
 from nanoplm.data.shuffler import FastaShuffler, ShufflingError
 from nanoplm.data.filterer import Filterer, FilterError
 from nanoplm.data.splitor import Splitor, SplitError
+from nanoplm.data.manifest import PretrainManifest, DistillationManifest, write_manifest
 from nanoplm.distillation.dataset import SaveKDDataset, shard_h5_file
 from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.pretraining.dataset import SaveShardedFastaMLMDataset
@@ -399,9 +400,9 @@ def split(
 )
 @click.option(
     "--samples-per-shard",
-    default=0,
+    default=-1,
     type=int,
-    help="Number of samples per shard file. Use 0 for a single file (no sharding).",
+    help="Number of samples per shard file. Use -1 for a single file (no sharding).",
 )
 @click.option(
     "--batch-size",
@@ -441,8 +442,8 @@ def save_kd_dataset(
     skip_n: int,
 ):
     """Generate knowledge distillation datasets with teacher embeddings."""
-    if samples_per_shard < 0:
-        raise click.ClickException("samples-per-shard must be 0 or positive")
+    if samples_per_shard < -1 or samples_per_shard == 0:
+        raise click.ClickException("samples-per-shard must be -1 (no sharding) or a positive number (not 0)")
     if batch_size < 1:
         raise click.ClickException("batch-size must be at least 1")
     if max_seq_len < 1:
@@ -693,20 +694,21 @@ def get_yaml(output: str | None, force: bool):
         "  filter_skip_n: 0\n"
         "\n"
         "# Pretrain config (used when pipeline_mode: 'pretrain')\n"
+        "# A .data_manifest file will be created in output_dir for use by pretrain pipeline\n"
         "pretrain_config:\n"
-        '  train_hdf5: "output/data/pretrain_shards/train_hdf5"\n'
-        '  val_hdf5: "output/data/pretrain_shards/val_hdf5"\n'
-        "  samples_per_shard: 10000\n"
+        '  output_dir: "output/data/pretrain_data"  # Will contain train/ and val/ subdirs\n'
+        "  samples_per_shard: 2000\n"
         "  max_workers: 2  # -1 to use all available CPUs\n"
         "  force: false\n"
         "\n"
         "# Distillation config (used when pipeline_mode: 'distillation')\n"
+        "# A .data_manifest file will be created in output_dir for use by distill pipeline\n"
         "distillation_config:\n"
+        '  output_dir: "output/data/distillation_data"  # Will contain train/ and val/ subdirs\n'
+        "  on_the_fly: false  # If true, skip embedding generation (embeddings computed during training)\n"
+        "  samples_per_shard: 2000  # -1 for single file (no sharding)\n"
         '  teacher_model: "prott5"\n'
         "  embed_calc_batch_size: 4\n"
-        "  samples_per_shard: 10000  # 0 for single file (no sharding)\n"
-        '  kd_train_dir: "output/data/kd_dataset/train"\n'
-        '  kd_val_dir: "output/data/kd_dataset/val"\n'
         "\n"
         "# Data directories\n"
         "data_dirs:\n"
@@ -788,34 +790,34 @@ def get_yaml(output: str | None, force: bool):
         "      - ${data_dirs.splitted_fasta_dir}\n"
         "\n"
         "  save_kd_train_dataset:\n"
-        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/train.fasta -o ${distillation_config.kd_train_dir} --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
+        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/train.fasta -o ${distillation_config.output_dir}/train --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
         "    deps:\n"
         "      - ${data_dirs.splitted_fasta_dir}/train.fasta\n"
         "    params:\n"
         "      - data_dirs.splitted_fasta_dir\n"
-        "      - distillation_config.kd_train_dir\n"
+        "      - distillation_config.output_dir\n"
         "      - distillation_config.teacher_model\n"
         "      - distillation_config.samples_per_shard\n"
         "      - distillation_config.embed_calc_batch_size\n"
         "      - data_params.max_seq_len\n"
         "      - data_params.filter_skip_n\n"
         "    outs:\n"
-        "      - ${distillation_config.kd_train_dir}\n"
+        "      - ${distillation_config.output_dir}/train\n"
         "\n"
         "  save_kd_val_dataset:\n"
-        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/val.fasta -o ${distillation_config.kd_val_dir} --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
+        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/val.fasta -o ${distillation_config.output_dir}/val --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
         "    deps:\n"
         "      - ${data_dirs.splitted_fasta_dir}/val.fasta\n"
         "    params:\n"
         "      - data_dirs.splitted_fasta_dir\n"
-        "      - distillation_config.kd_val_dir\n"
+        "      - distillation_config.output_dir\n"
         "      - distillation_config.teacher_model\n"
         "      - distillation_config.samples_per_shard\n"
         "      - distillation_config.embed_calc_batch_size\n"
         "      - data_params.max_seq_len\n"
         "      - data_params.filter_skip_n\n"
         "    outs:\n"
-        "      - ${distillation_config.kd_val_dir}\n"
+        "      - ${distillation_config.output_dir}/val\n"
     )
 
     if force and dvc_path.exists():
@@ -941,16 +943,23 @@ def from_yaml(
                 f"DVC is not initialized in {cwd}. Run 'dvc init' first."
             )
 
+    # Check if on_the_fly mode is enabled for distillation
+    distillation_config = params.get("distillation_config", {})
+    on_the_fly = distillation_config.get("on_the_fly", False)
+
     # Determine the target stage based on pipeline_mode
     if target is None:
-        if pipeline_mode == "distillation":
+        if pipeline_mode == "distillation" and not on_the_fly:
             # Run full DVC pipeline including KD stages
             target = None  # No target means run all stages
-            click.echo("Running full pipeline for distillation (pipeline_mode: 'distillation')")
+            click.echo("Running full pipeline for distillation (pipeline_mode: 'distillation', on_the_fly: false)")
         else:
-            # For 'none' and 'pretrain', only run up to split stage
+            # For 'none', 'pretrain', and 'distillation' with on_the_fly, only run up to split stage
             target = "split"
-            click.echo(f"Running pipeline up to 'split' stage (pipeline_mode: '{pipeline_mode}')")
+            if pipeline_mode == "distillation" and on_the_fly:
+                click.echo(f"Running pipeline up to 'split' stage (pipeline_mode: 'distillation', on_the_fly: true)")
+            else:
+                click.echo(f"Running pipeline up to 'split' stage (pipeline_mode: '{pipeline_mode}')")
 
     # Build repro command
     cmd: list[str] = ["dvc", "repro"]
@@ -982,15 +991,17 @@ def from_yaml(
         train_fasta = _resolve_path(Path(splitted_dir) / "train.fasta", cwd)
         val_fasta = _resolve_path(Path(splitted_dir) / "val.fasta", cwd)
 
-        train_hdf5_dir = _resolve_path(pretrain_config.get("train_hdf5", "output/data/pretrain_shards/train_hdf5"), cwd)
-        val_hdf5_dir = _resolve_path(pretrain_config.get("val_hdf5", "output/data/pretrain_shards/val_hdf5"), cwd)
+        # Use output_dir with train/ and val/ subdirectories
+        output_dir = _resolve_path(pretrain_config.get("output_dir", "output/data/pretrain_shards"), cwd)
+        train_hdf5_dir = output_dir / "train"
+        val_hdf5_dir = output_dir / "val"
         create_dirs(train_hdf5_dir)
         create_dirs(val_hdf5_dir)
 
-        max_seq_len = data_params.get("max_seq_len", 1024)
-        samples_per_shard = pretrain_config.get("samples_per_shard", 10000)
-        max_workers = pretrain_config.get("max_workers", 2)
-        force = pretrain_config.get("force", False)
+        max_seq_len = data_params.get("max_seq_len")
+        samples_per_shard = pretrain_config.get("samples_per_shard")
+        max_workers = pretrain_config.get("max_workers")
+        force = pretrain_config.get("force")
 
         tokenizer = ProtModernBertTokenizer()
 
@@ -1005,6 +1016,7 @@ def from_yaml(
             force=force,
         )
         train_shards = train_saver.create_shards()
+        train_sequences = len(train_saver._keys)
 
         click.echo("Creating HDF5 shards for validation dataset...")
         val_saver = SaveShardedFastaMLMDataset(
@@ -1017,14 +1029,116 @@ def from_yaml(
             force=force,
         )
         val_shards = val_saver.create_shards()
+        val_sequences = len(val_saver._keys)
+
+        # Write manifest
+        manifest = PretrainManifest(
+            pipeline_mode="pretrain",
+            seqs_num=data_params.get("seqs_num"),
+            min_seq_len=data_params.get("min_seq_len"),
+            max_seq_len=max_seq_len,
+            val_ratio=data_params.get("val_ratio"),
+            train_dir="train",
+            val_dir="val",
+            train_sequences=train_sequences,
+            val_sequences=val_sequences,
+            sharded=True,
+            samples_per_shard=samples_per_shard,
+        )
+        manifest_path = write_manifest(output_dir, manifest)
 
         click.echo(
             "Pretraining shard generation complete:\n"
-            f"  Train shards: {len(train_shards)} -> {train_hdf5_dir}\n"
-            f"  Val shards:   {len(val_shards)} -> {val_hdf5_dir}"
+            f"  Train shards: {len(train_shards)} ({train_sequences} sequences) -> {train_hdf5_dir}\n"
+            f"  Val shards:   {len(val_shards)} ({val_sequences} sequences) -> {val_hdf5_dir}\n"
+            f"  Manifest: {manifest_path}"
         )
     elif pipeline_mode == "distillation":
-        click.echo("Distillation dataset generation complete (via DVC pipeline)")
+        # Write manifest for distillation
+        distillation_config = params.get("distillation_config", {})
+        output_dir = _resolve_path(distillation_config.get("output_dir", "output/data/kd_dataset"), cwd)
+        on_the_fly = distillation_config.get("on_the_fly", False)
+
+        if on_the_fly:
+            # On-the-fly mode: Create manifest with FASTA paths (no embedding generation)
+            data_dirs = params.get("data_dirs", {})
+            splitted_dir = data_dirs.get("splitted_fasta_dir")
+            if not splitted_dir:
+                raise click.ClickException("data_dirs.splitted_fasta_dir is required for distillation mode")
+
+            train_fasta = _resolve_path(Path(splitted_dir) / "train.fasta", cwd)
+            val_fasta = _resolve_path(Path(splitted_dir) / "val.fasta", cwd)
+
+            # Count sequences from FASTA files
+            train_sequences = _count_sequences_in_fasta(train_fasta)
+            val_sequences = _count_sequences_in_fasta(val_fasta)
+
+            manifest = DistillationManifest(
+                pipeline_mode="distillation",
+                seqs_num=data_params.get("seqs_num"),
+                min_seq_len=data_params.get("min_seq_len"),
+                max_seq_len=data_params.get("max_seq_len"),
+                val_ratio=data_params.get("val_ratio"),
+                train_dir="train",
+                val_dir="val",
+                train_sequences=train_sequences,
+                val_sequences=val_sequences,
+                teacher_model=distillation_config.get("teacher_model"),
+                on_the_fly=True,
+                train_fasta=str(train_fasta),
+                val_fasta=str(val_fasta),
+            )
+            manifest_path = write_manifest(output_dir, manifest)
+
+            click.echo(
+                f"Distillation manifest created (on-the-fly mode):\n"
+                f"  Train FASTA: {train_fasta} ({train_sequences} sequences)\n"
+                f"  Val FASTA: {val_fasta} ({val_sequences} sequences)\n"
+                f"  Manifest: {manifest_path}\n"
+                f"  Note: Teacher embeddings will be generated during training"
+            )
+        else:
+            # Pre-computed mode: Create manifest with H5 paths (after DVC pipeline completes)
+            # Count sequences from generated files
+            train_sequences = _count_sequences_in_dir(output_dir / "train")
+            val_sequences = _count_sequences_in_dir(output_dir / "val")
+
+            # Determine H5 prefix names
+            train_h5_files = list((output_dir / "train").glob("*.h5"))
+            val_h5_files = list((output_dir / "val").glob("*.h5"))
+
+            # Get the base prefix (e.g., "train_kd_dataset.h5" from "train_kd_dataset_shard_0000.h5")
+            train_h5_prefix = _get_h5_prefix(train_h5_files) if train_h5_files else "train_kd_dataset.h5"
+            val_h5_prefix = _get_h5_prefix(val_h5_files) if val_h5_files else "val_kd_dataset.h5"
+
+            samples_per_shard = distillation_config.get("samples_per_shard")
+            sharded = samples_per_shard > 0
+
+            manifest = DistillationManifest(
+                pipeline_mode="distillation",
+                seqs_num=data_params.get("seqs_num"),
+                min_seq_len=data_params.get("min_seq_len"),
+                max_seq_len=data_params.get("max_seq_len"),
+                val_ratio=data_params.get("val_ratio"),
+                train_dir="train",
+                val_dir="val",
+                train_sequences=train_sequences,
+                val_sequences=val_sequences,
+                sharded=sharded,
+                samples_per_shard=samples_per_shard,
+                teacher_model=distillation_config.get("teacher_model"),
+                train_h5_prefix=train_h5_prefix,
+                val_h5_prefix=val_h5_prefix,
+                on_the_fly=False,
+            )
+            manifest_path = write_manifest(output_dir, manifest)
+
+            click.echo(
+                f"Distillation dataset generation complete:\n"
+                f"  Train: {train_sequences} sequences -> {output_dir / 'train'}\n"
+                f"  Val: {val_sequences} sequences -> {output_dir / 'val'}\n"
+                f"  Manifest: {manifest_path}"
+            )
     else:
         click.echo("Data preparation complete (pipeline_mode: 'none')")
 
@@ -1034,3 +1148,82 @@ def _resolve_path(path_value: str | Path, cwd: Path) -> Path:
     if not path.is_absolute():
         path = (cwd / path).resolve()
     return path
+
+
+def _count_sequences_in_dir(directory: Path) -> int:
+    """Count total sequences in all H5 files in a directory.
+    This is to handle these two scenarios (otherwise we could have calcualted these using max_seq_num and val_ratio)
+    1. If you request 20,000 sequences but the file ends after finding only 15,000 valid ones, it stops there. In this case, using the calculation would be wrong (you'd mistakenly think you have 20,000).
+    2. If you use seqs_num: -1 (the default for "use everything"), you don't know the final count until the process finishes.
+
+    Supports two formats:
+    1. KD dataset format: each sequence is a numbered group (e.g., "0", "1", "2")
+    2. Array format: sequences stored as arrays in datasets like "input_ids", "embeddings", etc.
+    """
+    import h5py
+
+    total = 0
+    h5_files = list(directory.glob("*.h5"))
+
+    for h5_file in h5_files:
+        try:
+            with h5py.File(h5_file, "r") as f:
+                # Try to count groups first (KD dataset format)
+                # Groups are named with string integers like "0", "1", "2"
+                group_count = 0
+                for key in f.keys():
+                    if key.isdigit():
+                        group_count += 1
+
+                if group_count > 0:
+                    total += group_count
+                else:
+                    # Fall back to common dataset names (array format)
+                    if "input_ids" in f:
+                        total += len(f["input_ids"])
+                    elif "sequences" in f:
+                        total += len(f["sequences"])
+                    elif "embeddings" in f:
+                        total += len(f["embeddings"])
+                    elif "teacher_embeddings" in f:
+                        total += len(f["teacher_embeddings"])
+        except Exception:
+            pass
+
+    return total
+
+
+def _get_h5_prefix(h5_files: list) -> str:
+    """Get the base H5 prefix from a list of H5 files.
+
+    For sharded files like "train_kd_dataset_shard_0000.h5", returns "train_kd_dataset.h5".
+    For single files like "train_kd_dataset.h5", returns the filename as-is.
+    """
+    if not h5_files:
+        return ""
+
+    first_file = Path(h5_files[0]).name
+
+    # Check if it's a sharded file
+    if "_shard_" in first_file:
+        # Extract prefix before "_shard_"
+        prefix = first_file.split("_shard_")[0]
+        return f"{prefix}.h5"
+    else:
+        return first_file
+
+
+def _count_sequences_in_fasta(fasta_path: Path) -> int:
+    """Count sequences in a FASTA file."""
+    from Bio import SeqIO
+
+    count = 0
+    try:
+        with open(fasta_path, "r") as f:
+            for _ in SeqIO.parse(f, "fasta"):
+                count += 1
+    except Exception as e:
+        click.echo(f"Warning: Could not count sequences in {fasta_path}: {e}", err=True)
+        return 0
+
+    return count

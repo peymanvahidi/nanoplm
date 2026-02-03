@@ -18,39 +18,37 @@ from nanoplm.utils import logger, get_device, create_dirs
 
 
 class KDDatasetOnTheFly(IterableDataset):
+    """
+    On-the-fly dataset that yields raw sequences for tokenization in the collator.
+
+    The collator will handle:
+    - Student tokenization (for student model input)
+    - Teacher tokenization and embedding computation (for distillation target)
+    """
     def __init__(
         self,
         input_fasta: Union[str, Path],
         teacher: BaseTeacher,
         max_seq_len: int,
         device: str,
+        read_batch_size: int = 32,  # Kept for potential future batched processing
     ):
         self.input_fasta = Path(input_fasta)
         self.teacher = teacher
         self.device = device
         self.max_seq_len = max_seq_len
+        self.read_batch_size = read_batch_size
 
     def __iter__(self):
+        """Yield raw sequences for tokenization in collator."""
         data_gen = (
             (record.id, str(record.seq))
             for record in SeqIO.parse(self.input_fasta, "fasta")
         )
 
         for _, sequence in data_gen:
-            preprocessed_seq = self.teacher.preprocess(sequence)
-
-            tokenized_seq = self.teacher.tokenizer.encode_plus(
-                preprocessed_seq,
-                add_special_tokens=True,
-                padding="max_length",
-                max_length=self.max_seq_len,
-                truncation=True,
-                return_tensors="pt",
-            )
-            yield {
-                "input_ids": tokenized_seq["input_ids"].squeeze(0),
-                "attention_mask": tokenized_seq["attention_mask"].squeeze(0),
-            }
+            # Yield raw sequence - collator will tokenize with both student and teacher tokenizers
+            yield {"raw_sequence": sequence}
 
 
 class SaveKDDataset(Dataset):
@@ -64,10 +62,24 @@ class SaveKDDataset(Dataset):
         batch_size: int,
         device: str,
         skip_n: int = 0,
-        n_files: int = 1,
+        samples_per_shard: int = 10000,
         force: bool = False,
     ):
+        """
+        Save knowledge distillation dataset with teacher embeddings.
 
+        Args:
+            input_fasta: Path to input FASTA file
+            output_path: Path to output H5 file (or prefix for sharded files)
+            teacher: Teacher model for generating embeddings
+            mode: Processing mode (currently only "get_embeddings")
+            max_seq_len: Maximum sequence length
+            batch_size: Batch size for teacher embedding calculation
+            device: Device to use ("auto", "cuda", "mps", "cpu")
+            skip_n: Number of sequences to skip from the beginning
+            samples_per_shard: Number of samples per shard file (-1 for single file)
+            force: Force overwrite existing files
+        """
         self.input_fasta = Path(input_fasta)
         self.output_path = Path(output_path)
         self.teacher = teacher
@@ -76,7 +88,14 @@ class SaveKDDataset(Dataset):
         self.batch_size = batch_size
         self.device = device if device != "auto" else get_device()
         self.skip_n = skip_n
-        self.n_files = n_files
+
+        # Validate samples_per_shard
+        if samples_per_shard < -1 or samples_per_shard == 0:
+            raise ValueError(
+                f"samples_per_shard must be -1 (no sharding) or a positive number, got {samples_per_shard}"
+            )
+
+        self.samples_per_shard = samples_per_shard
         self.force = force
         self.data_gen = None
         self._cached_len = None
@@ -122,26 +141,29 @@ class SaveKDDataset(Dataset):
         create_dirs(self.output_path)
 
         total_sequences_in_fasta = self.__len__() + self.skip_n
+        total_to_process = self.__len__()
 
         # Log dataset summary
         skip_info = f" (skipping {self.skip_n})" if self.skip_n > 0 else ""
-        file_info = (
-            f"{self.n_files} sharded files" if self.n_files > 1 else "single file"
-        )
 
         logger.info(
-            f"Dataset: {total_sequences_in_fasta:,} sequences → {self.__len__():,} to process{skip_info}"
-        )
-        logger.info(
-            f"{file_info} will be created at {self.output_path.parent} directory"
+            f"Dataset: {total_sequences_in_fasta:,} sequences → {total_to_process:,} to process{skip_info}"
         )
 
-        if self.n_files == 1:
+        # Determine if sharding is needed based on samples_per_shard
+        if self.samples_per_shard == -1 or total_to_process <= self.samples_per_shard:
+            # Single file mode
+            logger.info(f"Single file will be created at {self.output_path}")
             return self._process_dataset_single()
-        elif self.n_files > 1:
-            return self._process_dataset_sharded()
         else:
-            raise ValueError(f"Invalid number of files: {self.n_files}")
+            # Calculate number of shards needed
+            import math
+            self.n_files = math.ceil(total_to_process / self.samples_per_shard)
+            logger.info(
+                f"{self.n_files} sharded files will be created "
+                f"(~{self.samples_per_shard:,} samples per shard) at {self.output_path.parent}"
+            )
+            return self._process_dataset_sharded()
 
     def _process_dataset_single(self) -> Path:
         """Process dataset into a single H5 file (original behavior)"""
@@ -195,7 +217,7 @@ class SaveKDDataset(Dataset):
         return self.output_path
 
     def _process_dataset_sharded(self) -> List[Path]:
-        """Process dataset into multiple sharded H5 files"""
+        """Process dataset into multiple sharded H5 files based on samples_per_shard"""
 
         # Generate shard file names
         base_name = self.output_path.stem
@@ -203,15 +225,6 @@ class SaveKDDataset(Dataset):
         shard_paths = [
             output_dir / f"{base_name}_shard_{i}.h5" for i in range(self.n_files)
         ]
-
-        # Calculate sequences per shard
-        sequences_per_shard = self.__len__() // self.n_files
-        # Add remaining sequences to the last shard
-        sequences_in_last_shard = sequences_per_shard + (self.__len__() % self.n_files)
-        if self.__len__() % self.n_files > 0:
-            logger.info(
-                f"Last shard will contain: {sequences_in_last_shard:,} sequences"
-            )
 
         # Check for existing files and handle them
         for shard_path in shard_paths:
@@ -251,19 +264,11 @@ class SaveKDDataset(Dataset):
                     batch.append(teacher_seq)
 
                     if len(batch) == self.batch_size:
-                        # Check if processing this batch would exceed the shard limit
-                        current_shard_target = (
-                            sequences_in_last_shard
-                            if current_shard_idx == self.n_files - 1
-                            else sequences_per_shard
-                        )
-
-                        # If current shard would be overfilled and we're not on the last shard, switch
+                        # Check if current shard is full and we're not on the last shard
                         if (
-                            current_shard_count + len(batch) > current_shard_target
+                            current_shard_count + len(batch) > self.samples_per_shard
                             and current_shard_idx < self.n_files - 1
                         ):
-
                             # Close current file and move to next
                             current_h5_file.close()
                             logger.info(
@@ -342,8 +347,17 @@ class SaveKDDataset(Dataset):
         batch: List[str],
         start_index: int,
     ):
-        batch_encoding = self.teacher_tokenizer.batch_encode_plus(
-            batch,
+        """
+        Process a batch of sequences and save to H5 file.
+
+        IMPORTANT: Stores STUDENT-tokenized input_ids (for student model),
+        but computes teacher embeddings using teacher tokenization.
+        """
+        from nanoplm.distillation.models.student.tokenizer import ProtXTokenizer
+
+        # Teacher tokenization for computing embeddings
+        teacher_encoding = self.teacher_tokenizer.batch_encode_plus(
+            batch,  # Preprocessed sequences like "M K T"
             add_special_tokens=True,
             padding="max_length",
             max_length=self.max_seq_len,
@@ -351,18 +365,34 @@ class SaveKDDataset(Dataset):
             return_tensors="pt",
         )
 
+        # Student tokenization for storage (what student model will receive)
+        # Convert preprocessed ("M K T") back to raw ("MKT")
+        raw_sequences = [seq.replace(" ", "") for seq in batch]
+        student_tokenizer = ProtXTokenizer()
+        student_encoding = student_tokenizer.batch_encode_plus(
+            raw_sequences,
+            add_special_tokens=True,
+            padding="max_length",
+            max_length=self.max_seq_len,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        # Compute teacher embeddings using teacher tokenization
         with torch.no_grad():
-            input_ids = batch_encoding["input_ids"].to(self.device)
-            attention_mask = batch_encoding["attention_mask"].to(self.device)
+            teacher_input_ids = teacher_encoding["input_ids"].to(self.device)
+            teacher_attention_mask = teacher_encoding["attention_mask"].to(self.device)
 
             teacher_embeddings = self.teacher_model(
-                input_ids=input_ids, attention_mask=attention_mask
+                input_ids=teacher_input_ids, attention_mask=teacher_attention_mask
             ).last_hidden_state
 
+        # Save STUDENT-tokenized input_ids and attention_mask
+        # Save TEACHER embeddings (target for student to match)
         for i, (seq_input_ids, seq_attention_mask, seq_teacher_embeddings) in enumerate(
             zip(
-                input_ids.cpu().numpy(),
-                attention_mask.cpu().numpy(),
+                student_encoding["input_ids"].cpu().numpy(),
+                student_encoding["attention_mask"].cpu().numpy(),
                 teacher_embeddings.cpu().numpy(),
             )
         ):
@@ -382,6 +412,20 @@ class SaveKDDataset(Dataset):
 
 
 class LoadKDDataset(Dataset):
+    """
+    Load knowledge distillation dataset from H5 files.
+
+    This dataset automatically detects whether the data is stored as:
+    - Multiple sharded files: {h5_path.stem}_shard_*.h5
+    - Single file: {h5_path}
+
+    Args:
+        h5_path: Path to the H5 file (prefix for sharded files)
+        device: Device to load tensors to
+        seed: Random seed for shuffling (optional)
+        sharded: Deprecated - now auto-detected based on files present
+    """
+
     def __init__(
         self,
         h5_path: Union[str, Path],
@@ -392,7 +436,9 @@ class LoadKDDataset(Dataset):
         self.h5_path = Path(h5_path)
         self.device = device
         self.seed = seed
-        self.sharded = sharded
+
+        # Auto-detect sharded vs single file
+        self.sharded = self._detect_sharding()
 
         if self.sharded:
             self._load_sharded_files()
@@ -404,6 +450,41 @@ class LoadKDDataset(Dataset):
 
         if self.seed is not None:
             self._shuffle_indices()
+
+    def _detect_sharding(self) -> bool:
+        """
+        Auto-detect whether the dataset is sharded or stored as a single file.
+
+        Returns:
+            True if sharded files exist, False if single file exists
+
+        Raises:
+            FileNotFoundError: If neither sharded nor single file exists
+        """
+        base_name = self.h5_path.stem
+        parent_dir = self.h5_path.parent
+
+        # Check for sharded files first
+        shard_pattern = f"{base_name}_shard_*.h5"
+        shard_files = list(parent_dir.glob(shard_pattern))
+
+        if shard_files:
+            logger.info(f"Detected sharded dataset: found {len(shard_files)} shard files")
+            return True
+
+        # Check for single file
+        if self.h5_path.exists():
+            logger.info(f"Detected single-file dataset: {self.h5_path.name}")
+            return False
+
+        # Neither exists - provide helpful error message
+        raise FileNotFoundError(
+            f"No dataset files found at {self.h5_path}.\n"
+            f"Looked for:\n"
+            f"  - Sharded files: {parent_dir / shard_pattern}\n"
+            f"  - Single file: {self.h5_path}\n"
+            f"Please ensure you have run 'nanoplm data from-yaml' with pipeline_mode: 'distillation'"
+        )
 
     def _load_sharded_files(self):
         """Load multiple shard files based on the base path"""
@@ -487,6 +568,20 @@ class LoadKDDatasetOptimized(Dataset):
     - Chunked reading for better I/O performance
     - Optional prefetching with threading
     - Reduced memory footprint
+
+    This dataset automatically detects whether the data is stored as:
+    - Multiple sharded files: {h5_path.stem}_shard_*.h5
+    - Single file: {h5_path}
+
+    Args:
+        h5_path: Path to the H5 file (prefix for sharded files)
+        device: Device to load tensors to
+        seed: Random seed for shuffling (optional)
+        sharded: Deprecated - now auto-detected based on files present
+        max_open_files: Maximum number of shard files to keep open simultaneously
+        chunk_size: Number of samples to read in a single I/O operation
+        prefetch_batches: Number of batches to prefetch in background
+        use_threading: Whether to enable background prefetching threads
     """
 
     def __init__(
@@ -503,7 +598,6 @@ class LoadKDDatasetOptimized(Dataset):
         self.h5_path = Path(h5_path)
         self.device = device
         self.seed = seed
-        self.sharded = sharded
         self.max_open_files = max_open_files
         self.chunk_size = chunk_size
         self.prefetch_batches = prefetch_batches
@@ -522,6 +616,9 @@ class LoadKDDatasetOptimized(Dataset):
         self._cache_hits = 0
         self._cache_misses = 0
         self._prefetch_hits = 0
+
+        # Auto-detect sharded vs single file
+        self.sharded = self._detect_sharding()
 
         if self.sharded:
             self._load_sharded_files_optimized()
@@ -547,6 +644,41 @@ class LoadKDDatasetOptimized(Dataset):
         logger.info(f"  - Chunk size: {self.chunk_size}")
         logger.info(f"  - Prefetch batches: {self.prefetch_batches}")
         logger.info(f"  - Threading enabled: {self.use_threading}")
+
+    def _detect_sharding(self) -> bool:
+        """
+        Auto-detect whether the dataset is sharded or stored as a single file.
+
+        Returns:
+            True if sharded files exist, False if single file exists
+
+        Raises:
+            FileNotFoundError: If neither sharded nor single file exists
+        """
+        base_name = self.h5_path.stem
+        parent_dir = self.h5_path.parent
+
+        # Check for sharded files first
+        shard_pattern = f"{base_name}_shard_*.h5"
+        shard_files = list(parent_dir.glob(shard_pattern))
+
+        if shard_files:
+            logger.info(f"Detected sharded dataset: found {len(shard_files)} shard files")
+            return True
+
+        # Check for single file
+        if self.h5_path.exists():
+            logger.info(f"Detected single-file dataset: {self.h5_path.name}")
+            return False
+
+        # Neither exists - provide helpful error message
+        raise FileNotFoundError(
+            f"No dataset files found at {self.h5_path}.\n"
+            f"Looked for:\n"
+            f"  - Sharded files: {parent_dir / shard_pattern}\n"
+            f"  - Single file: {self.h5_path}\n"
+            f"Please ensure you have run 'nanoplm data from-yaml' with pipeline_mode: 'distillation'"
+        )
 
     def _get_file_size(self, path: Path) -> int:
         """Get number of sequences in H5 file without keeping it open"""

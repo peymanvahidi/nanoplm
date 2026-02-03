@@ -1,6 +1,5 @@
 from nanoplm.distillation.pipeline import (
     DistillationConfig,
-    StudentModelConfig,
     ResumeConfig,
     run_distillation,
 )

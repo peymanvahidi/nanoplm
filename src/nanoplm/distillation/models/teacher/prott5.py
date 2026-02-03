@@ -8,6 +8,7 @@ from transformers import (
 )
 
 from nanoplm.distillation.models.teacher.base import BaseTeacher
+from nanoplm.utils import logger
 
 
 class ProtT5(BaseTeacher):
@@ -18,6 +19,7 @@ class ProtT5(BaseTeacher):
     ):
         super().__init__(device=device)
         self.model_name = model_name
+        self._encoder_model = None  # Cache encoder model
 
     @property
     def full_model(self) -> T5ForConditionalGeneration:
@@ -28,10 +30,24 @@ class ProtT5(BaseTeacher):
 
     @property
     def encoder_model(self) -> T5EncoderModel:
-        encoder_model = T5EncoderModel.from_pretrained(
-            self.model_name
-        ).to(self.device).eval()
-        return encoder_model
+        if self._encoder_model is None:
+            self._encoder_model = T5EncoderModel.from_pretrained(
+                self.model_name
+            ).to(self.device)
+            self._encoder_model.eval()
+
+            # Compile for optimized execution (10-30% speedup after warmup)
+            # Only compile on CUDA - MPS doesn't support pickle of compiled models
+            # which breaks multiprocessing DataLoader
+            if hasattr(torch, 'compile') and torch.cuda.is_available() and 'cuda' in self.device:
+                self._encoder_model = torch.compile(
+                    self._encoder_model,
+                    mode="reduce-overhead",  # Optimized for repeated calls
+                    fullgraph=False  # Allow graph breaks for compatibility
+                )
+                logger.info("Teacher model compiled with torch.compile()")
+
+        return self._encoder_model
 
     @property
     def tokenizer(self) -> T5Tokenizer:

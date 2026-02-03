@@ -34,24 +34,10 @@ def pretrain():
 )
 # Dataset and output
 @click.option(
-    "--train-fasta",
+    "--dataset-dir",
     type=str,
-    help="Training FASTA path"
-)
-@click.option(
-    "--val-fasta",
-    type=str,
-    help="Validation FASTA path"
-)
-@click.option(
-    "--train-hdf5",
-    type=str,
-    help="Directory of pre-tokenized training HDF5 shards (used when --lazy-dataset is False)"
-)
-@click.option(
-    "--val-hdf5",
-    type=str,
-    help="Directory of pre-tokenized validation HDF5 shards (used when --lazy-dataset is False)"
+    required=True,
+    help="Path to dataset directory containing .data_manifest (from nanoplm data from-yaml)"
 )
 @click.option(
     "--load-all-in-memory",
@@ -67,12 +53,6 @@ def pretrain():
 )
 # Training hyperparameters
 @click.option(
-    "--max-length",
-    type=int,
-    default=1024,
-    help="Max sequence length"
-)
-@click.option(
     "--batch-size",
     type=int,
     default=32,
@@ -83,12 +63,6 @@ def pretrain():
     type=int,
     default=10,
     help="Number of epochs"
-)
-@click.option(
-    "--lazy-dataset",
-    is_flag=True,
-    default=False,
-    help="Use lazy dataset loading"
 )
 @click.option(
     "--learning-rate",
@@ -285,17 +259,12 @@ def pretrain():
 )
 def run(
     # dataset/output
-    train_fasta: str,
-    val_fasta: str,
-    train_hdf5: str,
-    val_hdf5: str,
+    dataset_dir: str,
     load_all_in_memory: bool,
     ckp_dir: str,
     # training hp
-    max_length: int,
     batch_size: int,
     num_epochs: int,
-    lazy_dataset: bool,
     learning_rate: float,
     weight_decay: float,
     warmup_ratio: float,
@@ -334,16 +303,11 @@ def run(
 
     # Build config from CLI arguments
     cfg = PretrainingConfig(
-        train_fasta=train_fasta,
-        val_fasta=val_fasta,
-        train_hdf5=train_hdf5,
-        val_hdf5=val_hdf5,
+        dataset_dir=dataset_dir,
         load_all_in_memory=load_all_in_memory,
         ckp_dir=ckp_dir,
-        max_length=max_length,
         batch_size=batch_size,
         num_epochs=num_epochs,
-        lazy_dataset=lazy_dataset,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
@@ -489,6 +453,11 @@ def get_yaml(output: Optional[str], force: bool):
 
     template = (
         "# Pretraining configuration for nanoPLM\n"
+        "#\n"
+        "# IMPORTANT: Before running pretraining, ensure you have prepared your data with:\n"
+        "#   1. Set pipeline_mode: 'pretrain' in params.yaml\n"
+        "#   2. Run: nanoplm data from-yaml\n"
+        "# This will generate the HDF5 shards and a .data_manifest file.\n"
         "\n"
         "model:\n"
         "  hidden_size: 1024\n"
@@ -498,43 +467,31 @@ def get_yaml(output: Optional[str], force: bool):
         "  vocab_size: 32\n"
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
-        "  mlp_bias: False\n"
-        "  attention_bias: False\n"
+        "  mlp_bias: false\n"
+        "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
         "\n"
         "pretraining:\n"
-        "  # Dataset\n"
-        "  # Note: these paths are RELATIVE to where you RUN the command NOT the YAML file.\n"
-        "  train_fasta: \"output/data/split/train.fasta\"\n"
-        "  val_fasta: \"output/data/split/val.fasta\"\n"
+        "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
+        "  # The manifest provides: max_length and HDF5 shard paths\n"
+        "  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.\n"
+        "  dataset_dir: \"output/data/pretrain_data\"\n"
         "\n"
         "  # Output model path\n"
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
         "\n"
         "  # Hyperparameters\n"
-        "  max_length: 512\n"
+        "  # max_length: 512  # If not set, uses value from manifest\n"
         "  batch_size: 32\n"
         "  num_epochs: 10\n"
+        "  load_all_in_memory: True\n # Set to False if you don't have enough RAM\n"
         "\n"
-        "  # Dataset loading strategy:\n"
-        "  # - lazy_dataset: True  => tokenize on-the-fly from FASTA\n"
-        "  #                          Slower iteration, no preprocessing needed\n"
-        "  # - lazy_dataset: False => load pre-tokenized HDF5 shards\n"
-        "  #                          Faster iteration, requires preprocessing\n"
-        "  # Important: To have the shards, you need to set pretrain_config.enable to True in the params.yaml file\n"
-        "  # and run 'nanoplm data from-yaml' to create shards\n"
-        "  # or your need to run 'nanoplm data save-pretrain-dataset' using your desired FASTA file as input to create shards\n"
-        "  lazy_dataset: False\n"
-        "  train_hdf5: \"output/data/pretrain_shards/train_hdf5\"\n"
-        "  val_hdf5: \"output/data/pretrain_shards/val_hdf5\"\n"
-        "  load_all_in_memory: False\n"
-        "\n"
-        "  optimizer: \"adamw\" # adamw, stable_adamw\n"
+        "  optimizer: \"adamw\"  # adamw, stable_adamw\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-3\n # This is the maximum learning in the warmup phase \n"
+        "  learning_rate: 1e-3  # Maximum learning rate in warmup phase\n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
         "  gradient_accumulation_steps: 1\n"
@@ -542,21 +499,21 @@ def get_yaml(output: Optional[str], force: bool):
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
         "  keep_probability: 0.1\n"
-        "  logging_steps_percentage: 0.01 # 100 logging in total \n"
-        "  eval_steps_percentage: 0.025 # 40 evaluations in total \n"
-        "  save_steps_percentage: 0.1 # 10 saves in total \n"
+        "  logging_steps_percentage: 0.01  # 100 logging in total\n"
+        "  eval_steps_percentage: 0.025  # 40 evaluations in total\n"
+        "  save_steps_percentage: 0.1  # 10 saves in total\n"
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
-        "  multi_gpu: False\n"
-        "  world_size: 1 # Use \"auto\" if you want to use all available GPUs\n"
+        "  multi_gpu: false\n"
+        "  world_size: 1  # Use \"auto\" if you want to use all available GPUs\n"
         "  project_name: \"nanoplm-pretraining\"\n"
         "\n"
         "resume:\n"
         "  # Set is_resume: true to resume training from a checkpoint\n"
         "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
         "  # extra_epochs: adds to 'pretraining.num_epochs' to define total epochs.\n"
-        "  is_resume: False\n"
+        "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
     )
@@ -569,12 +526,18 @@ def get_yaml(output: Optional[str], force: bool):
     click.echo(f"Template written to: {output_path}")
 
 def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
+    if config is None:
+        raise ValueError("Pretraining configuration is required but not found in YAML")
+
     expected_keys = set(PretrainingConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
-    missing = []
     extra = []
     kwargs: Dict[str, Any] = {}
+
+    # Required key
+    if 'dataset_dir' not in config or not config['dataset_dir']:
+        raise ValueError("dataset_dir is required in pretraining configuration")
 
     # Classify provided keys in one pass
     for key in present_keys:
@@ -582,20 +545,9 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             extra.append(key)
             continue
         value = config.get(key)
-        if value is None:
-            missing.append(key)
-            continue
-        kwargs[key] = value
+        if value is not None:
+            kwargs[key] = value
 
-    # Any expected-but-absent keys are also missing
-    for key in expected_keys:
-        if key not in present_keys:
-            missing.append(key)
-
-    if missing:
-        raise ValueError(
-            f"Missing required training configuration keys: {', '.join(sorted(missing))}"
-        )
     if extra:
         raise ValueError(
             f"Unexpected training configuration keys: {', '.join(sorted(extra))}"
@@ -607,19 +559,15 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             kwargs['learning_rate'] = float(kwargs['learning_rate'])
         except ValueError:
             raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
-    
-    if isinstance(kwargs.get('multi_gpu'), bool):
-        pass
-    elif isinstance(kwargs.get('multi_gpu'), str):
-        value = kwargs['multi_gpu'].lower()
-        if value == 'true':
-            kwargs['multi_gpu'] = True
-        elif value == 'false':
-            kwargs['multi_gpu'] = False
-        else:
-            raise ValueError(f"Invalid multi_gpu value: {kwargs['multi_gpu']}. [True/False/true/false]")
-    else:
-        raise ValueError(f"Invalid multi_gpu value: {kwargs['multi_gpu']}. Must be a boolean or string [True/False/true/false]")
+
+    # Handle boolean values
+    for bool_key in ['multi_gpu', 'load_all_in_memory']:
+        if bool_key in kwargs:
+            value = kwargs[bool_key]
+            if isinstance(value, bool):
+                continue
+            elif isinstance(value, str):
+                kwargs[bool_key] = value.lower() == 'true'
 
     return PretrainingConfig(**kwargs)
 
