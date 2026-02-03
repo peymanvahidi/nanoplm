@@ -398,10 +398,10 @@ def split(
     help="Maximum sequence length used for teacher embedding calculation, all sequences would be padded / truncated to this length",
 )
 @click.option(
-    "--n-files",
-    default=1,
+    "--samples-per-shard",
+    default=0,
     type=int,
-    help="Number of shard files to create (1 for single file, >1 for sharded files).",
+    help="Number of samples per shard file. Use 0 for a single file (no sharding).",
 )
 @click.option(
     "--batch-size",
@@ -434,15 +434,15 @@ def save_kd_dataset(
     output: str,
     teacher_model: str,
     max_seq_len: int,
-    n_files: int,
+    samples_per_shard: int,
     batch_size: int,
     force: bool,
     device: str,
     skip_n: int,
 ):
-
-    if n_files < 1:
-        raise click.ClickException("n-files must be at least 1")
+    """Generate knowledge distillation datasets with teacher embeddings."""
+    if samples_per_shard < 0:
+        raise click.ClickException("samples-per-shard must be 0 or positive")
     if batch_size < 1:
         raise click.ClickException("batch-size must be at least 1")
     if max_seq_len < 1:
@@ -461,11 +461,10 @@ def save_kd_dataset(
         if not str(output_path).endswith(".h5"):
             raise click.ClickException("Output must end with .h5 or be a directory")
 
-    """Generate knowledge distillation datasets with teacher embeddings"""
     if teacher_model == "prott5":
         selected_teacher_model = ProtT5()
     else:
-        click.ClickException(f"Teacher model {teacher_model} not supported")
+        raise click.ClickException(f"Teacher model {teacher_model} not supported")
 
     kd_data = SaveKDDataset(
         input_fasta=input_path,
@@ -476,12 +475,12 @@ def save_kd_dataset(
         batch_size=batch_size,
         device=device,
         skip_n=skip_n,
-        n_files=n_files,
+        samples_per_shard=samples_per_shard,
         force=force,
     )
     result = kd_data.process_dataset()
 
-    if n_files > 1:
+    if isinstance(result, list):
         click.echo(
             f"Knowledge distillation dataset generation completed successfully. Created {len(result)} shard files:"
         )
@@ -676,34 +675,38 @@ def get_yaml(output: str | None, force: bool):
 
     template = (
         "data_params:\n"
+        "  # Pipeline mode: 'pretrain', 'distillation', or 'none'\n"
+        "  # - 'pretrain': Generate HDF5 shards for MLM pretraining\n"
+        "  # - 'distillation': Generate teacher embeddings for knowledge distillation\n"
+        "  # - 'none': Only run data preparation (download, filter, split)\n"
+        '  pipeline_mode: "pretrain"\n'
+        "\n"
         "  seqs_num: 20000\n"
         "  min_seq_len: 20\n"
         "  max_seq_len: 512\n"
         "  val_ratio: 0.1\n"
-        "\n"
         '  device: "auto"\n'
-        "  \n"
-        '  shuffle_backend: "biopython" # or "seqkit" (faster, but you need to install it)\n'
+        "\n"
+        '  shuffle_backend: "biopython"  # or "seqkit" (faster, requires installation)\n'
         "  shuffle: true\n"
         "  shuffle_seed: 24\n"
-        "\n"
-        "  # If you want to skip some sequences\n"
         "  filter_skip_n: 0\n"
         "\n"
-        "  # These are only needed for KNOWLEDGE DISTILLATION, no need to change them if you want to do pretraining only\n"
-        '  teacher_model: "prott5"\n'
-        "  embed_calc_batch_size: 4\n"
-        "  train_shards: 5\n"
-        "  val_shards: 2\n"
-        "\n"
-        "# If you want to generate pretraining shards, set enable to True\n"
+        "# Pretrain config (used when pipeline_mode: 'pretrain')\n"
         "pretrain_config:\n"
-        "  enable: True\n"
         '  train_hdf5: "output/data/pretrain_shards/train_hdf5"\n'
         '  val_hdf5: "output/data/pretrain_shards/val_hdf5"\n'
         "  samples_per_shard: 10000\n"
         "  max_workers: 2  # -1 to use all available CPUs\n"
-        "  force: False\n"
+        "  force: false\n"
+        "\n"
+        "# Distillation config (used when pipeline_mode: 'distillation')\n"
+        "distillation_config:\n"
+        '  teacher_model: "prott5"\n'
+        "  embed_calc_batch_size: 4\n"
+        "  samples_per_shard: 10000  # 0 for single file (no sharding)\n"
+        '  kd_train_dir: "output/data/kd_dataset/train"\n'
+        '  kd_val_dir: "output/data/kd_dataset/val"\n'
         "\n"
         "# Data directories\n"
         "data_dirs:\n"
@@ -715,15 +718,9 @@ def get_yaml(output: str | None, force: bool):
         '  # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"\n'
         '  compressed_fasta: "output/data/raw/uniref50.fasta.gz"\n'
         '  extracted_fasta: "output/data/raw/uniref50.fasta"\n'
-        "\n"
         '  shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"\n'
-        "\n"
         '  filtered_fasta: "output/data/filter/uniref50_filtered.fasta"\n'
         '  splitted_fasta_dir: "output/data/split"\n'
-        "\n"
-        "  # These dirs are only used for KNOWLEDGE DISTILLATION, no need to change them if you want to do pretraining only\n"
-        '  kd_train_dir: "output/data/kd_dataset/train"\n'
-        '  kd_val_dir: "output/data/kd_dataset/val"\n'
     )
 
     if force and params_path.exists():
@@ -734,6 +731,7 @@ def get_yaml(output: str | None, force: bool):
     dvc_yaml_template = (
         "# This is a template for a DVC pipeline for the data pipeline.\n"
         "# DO NOT EDIT THIS FILE, IT IS AUTO-GENERATED.\n"
+        "# The KD stages are only run when pipeline_mode is 'distillation'.\n"
         "stages:\n"
         "\n"
         "  download:\n"
@@ -790,32 +788,34 @@ def get_yaml(output: str | None, force: bool):
         "      - ${data_dirs.splitted_fasta_dir}\n"
         "\n"
         "  save_kd_train_dataset:\n"
-        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/train.fasta -o ${data_dirs.kd_train_dir} --teacher-model ${data_params.teacher_model} --max-seq-len ${data_params.max_seq_len} --n-files ${data_params.train_shards} --batch-size ${data_params.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
+        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/train.fasta -o ${distillation_config.kd_train_dir} --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
         "    deps:\n"
         "      - ${data_dirs.splitted_fasta_dir}/train.fasta\n"
         "    params:\n"
         "      - data_dirs.splitted_fasta_dir\n"
-        "      - data_dirs.kd_train_dir\n"
+        "      - distillation_config.kd_train_dir\n"
+        "      - distillation_config.teacher_model\n"
+        "      - distillation_config.samples_per_shard\n"
+        "      - distillation_config.embed_calc_batch_size\n"
         "      - data_params.max_seq_len\n"
-        "      - data_params.train_shards\n"
-        "      - data_params.embed_calc_batch_size\n"
         "      - data_params.filter_skip_n\n"
         "    outs:\n"
-        "      - ${data_dirs.kd_train_dir}\n"
+        "      - ${distillation_config.kd_train_dir}\n"
         "\n"
         "  save_kd_val_dataset:\n"
-        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/val.fasta -o ${data_dirs.kd_val_dir} --teacher-model ${data_params.teacher_model} --max-seq-len ${data_params.max_seq_len} --n-files ${data_params.val_shards} --batch-size ${data_params.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
+        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/val.fasta -o ${distillation_config.kd_val_dir} --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
         "    deps:\n"
         "      - ${data_dirs.splitted_fasta_dir}/val.fasta\n"
         "    params:\n"
         "      - data_dirs.splitted_fasta_dir\n"
-        "      - data_dirs.kd_val_dir\n"
+        "      - distillation_config.kd_val_dir\n"
+        "      - distillation_config.teacher_model\n"
+        "      - distillation_config.samples_per_shard\n"
+        "      - distillation_config.embed_calc_batch_size\n"
         "      - data_params.max_seq_len\n"
-        "      - data_params.val_shards\n"
-        "      - data_params.embed_calc_batch_size\n"
         "      - data_params.filter_skip_n\n"
         "    outs:\n"
-        "      - ${data_dirs.kd_val_dir}\n"
+        "      - ${distillation_config.kd_val_dir}\n"
     )
 
     if force and dvc_path.exists():
@@ -836,16 +836,10 @@ def get_yaml(output: str | None, force: bool):
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
 @click.option(
-    "--distillation",
-    is_flag=True,
-    default=False,
-    help="Run full pipeline including knowledge distillation dataset preparation. By default, only runs up to split stage.",
-)
-@click.option(
     "--target",
     type=str,
     required=False,
-    help="DVC stage to reproduce (e.g., split). Overrides --distillation flag if specified.",
+    help="DVC stage to reproduce (e.g., split). Overrides pipeline_mode if specified.",
 )
 @click.option(
     "--no-auto-init",
@@ -869,20 +863,21 @@ def get_yaml(output: str | None, force: bool):
 )
 def from_yaml(
     config: str,
-    distillation: bool,
     target: str | None,
     no_auto_init: bool,
     force_repro: bool,
     verbose: bool,
 ):
-    """Run the DVC data pipeline from a YAML file with training and model parameters.
+    """Run the DVC data pipeline from a YAML file.
 
-    By default, runs pipeline up to the 'split' stage, which is sufficient for pretraining.
-    Use --distillation to include knowledge distillation dataset preparation stages.
+    The pipeline_mode in params.yaml controls what dataset is generated:
+    - 'none': Only run data preparation (download, filter, split)
+    - 'pretrain': Generate HDF5 shards for MLM pretraining
+    - 'distillation': Generate teacher embeddings for knowledge distillation
 
     This will:
     - Optionally initialize DVC in the current directory.
-    - Run `dvc repro` for the specified stages.
+    - Run `dvc repro` for the appropriate stages based on pipeline_mode.
     """
 
     config = Path(config)
@@ -909,6 +904,24 @@ def from_yaml(
             "\nUse `nanoplm data get-yaml` to generate a params.yaml file."
         )
 
+    # Read params early to get pipeline_mode
+    try:
+        params = read_yaml(str(params_yaml))
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+    except Exception as e:
+        raise click.ClickException(f"Failed to read params.yaml: {e}") from e
+
+    data_params = params.get("data_params", {})
+    pipeline_mode = data_params.get("pipeline_mode", "pretrain")
+
+    # Validate pipeline_mode
+    valid_modes = {"none", "pretrain", "distillation"}
+    if pipeline_mode not in valid_modes:
+        raise click.ClickException(
+            f"Invalid pipeline_mode: '{pipeline_mode}'. Must be one of: {', '.join(sorted(valid_modes))}"
+        )
+
     if not dvc_dir.exists():
         if not no_auto_init:
             try:
@@ -928,12 +941,16 @@ def from_yaml(
                 f"DVC is not initialized in {cwd}. Run 'dvc init' first."
             )
 
-    # Determine the target stage
-    if target is None and not distillation:
-        target = "split"
-        click.echo(
-            "Running pipeline up to 'split' stage (use --distillation to include KD dataset preparation)"
-        )
+    # Determine the target stage based on pipeline_mode
+    if target is None:
+        if pipeline_mode == "distillation":
+            # Run full DVC pipeline including KD stages
+            target = None  # No target means run all stages
+            click.echo("Running full pipeline for distillation (pipeline_mode: 'distillation')")
+        else:
+            # For 'none' and 'pretrain', only run up to split stage
+            target = "split"
+            click.echo(f"Running pipeline up to 'split' stage (pipeline_mode: '{pipeline_mode}')")
 
     # Build repro command
     cmd: list[str] = ["dvc", "repro"]
@@ -953,40 +970,27 @@ def from_yaml(
     except subprocess.CalledProcessError as e:
         raise click.ClickException(f"dvc repro failed with exit code {e.returncode}")
 
-    # Rest is for pretraining shard generation
-    try:
-        params = read_yaml(str(params_yaml))
-    except FileNotFoundError as e:
-        raise click.ClickException(str(e)) from e
-    except Exception as e:
-        raise click.ClickException(f"Failed to read params.yaml: {e}") from e
+    # Generate pretraining shards if pipeline_mode is 'pretrain'
+    if pipeline_mode == "pretrain":
+        data_dirs = params.get("data_dirs", {})
+        pretrain_config = params.get("pretrain_config", {})
 
-    data_params = params.get("data_params")
-    data_dirs = params.get("data_dirs")
-    pretrain_config = params.get("pretrain_config")
-
-    pretrain_enabled = pretrain_config.get("enable")
-
-    if pretrain_enabled and distillation:
-        raise click.ClickException(
-            "Pretraining shard generation and distillation cannot be run together"
-        )
-
-    if pretrain_enabled:
         splitted_dir = data_dirs.get("splitted_fasta_dir")
+        if not splitted_dir:
+            raise click.ClickException("data_dirs.splitted_fasta_dir is required for pretrain mode")
 
         train_fasta = _resolve_path(Path(splitted_dir) / "train.fasta", cwd)
         val_fasta = _resolve_path(Path(splitted_dir) / "val.fasta", cwd)
 
-        train_hdf5_dir = _resolve_path(pretrain_config.get("train_hdf5"), cwd)
-        val_hdf5_dir = _resolve_path(pretrain_config.get("val_hdf5"), cwd)
+        train_hdf5_dir = _resolve_path(pretrain_config.get("train_hdf5", "output/data/pretrain_shards/train_hdf5"), cwd)
+        val_hdf5_dir = _resolve_path(pretrain_config.get("val_hdf5", "output/data/pretrain_shards/val_hdf5"), cwd)
         create_dirs(train_hdf5_dir)
         create_dirs(val_hdf5_dir)
 
-        max_seq_len = data_params.get("max_seq_len")
-        samples_per_shard = pretrain_config.get("samples_per_shard")
-        max_workers = pretrain_config.get("max_workers")
-        force = pretrain_config.get("force")
+        max_seq_len = data_params.get("max_seq_len", 1024)
+        samples_per_shard = pretrain_config.get("samples_per_shard", 10000)
+        max_workers = pretrain_config.get("max_workers", 2)
+        force = pretrain_config.get("force", False)
 
         tokenizer = ProtModernBertTokenizer()
 
@@ -1019,8 +1023,10 @@ def from_yaml(
             f"  Train shards: {len(train_shards)} -> {train_hdf5_dir}\n"
             f"  Val shards:   {len(val_shards)} -> {val_hdf5_dir}"
         )
+    elif pipeline_mode == "distillation":
+        click.echo("Distillation dataset generation complete (via DVC pipeline)")
     else:
-        click.echo("Pretraining shard generation is disabled in params.yaml")
+        click.echo("Data preparation complete (pipeline_mode: 'none')")
 
 
 def _resolve_path(path_value: str | Path, cwd: Path) -> Path:
