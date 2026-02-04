@@ -225,12 +225,7 @@ def run(
     default="distill.yaml",
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
-@click.option(
-    '--use-native',
-    is_flag=True,
-    help='Use native PyTorch training loop (no HuggingFace Trainer). Can also be set in YAML.'
-)
-def from_yaml(config: str, use_native: bool):
+def from_yaml(config: str):
     """Run distillation from a YAML configuration file.
 
     Expected YAML structure:
@@ -241,18 +236,23 @@ def from_yaml(config: str, use_native: bool):
     If resume.is_resume is True, training will resume from the given
     checkpoint using the hyperparameters in the 'distillation' block.
     """
-    config = Path(config)
-
-    if config.is_absolute():
-        cwd = config.parent
-        distill_yaml = config
-    else:
-        cwd = Path.cwd()
-        distill_yaml = cwd / config
+    config_path = Path(config)
+    distill_yaml = config_path if config_path.is_absolute() else Path.cwd() / config_path
 
     raw = read_yaml(distill_yaml)
 
-    # Allow both nested and flat formats
+    # Validate YAML structure
+    if not isinstance(raw, dict):
+        raise click.ClickException("YAML config must be a dictionary")
+
+    expected_keys = {"model", "distillation"}
+    missing_keys = expected_keys - set(raw.keys())
+    if missing_keys:
+        raise click.ClickException(
+            f"Missing required sections in YAML: {', '.join(sorted(missing_keys))}"
+        )
+
+    # Extract config sections
     model_dict = raw.get("model")
     distill_dict = raw.get("distillation")
     resume_dict = raw.get("resume")
@@ -262,27 +262,8 @@ def from_yaml(config: str, use_native: bool):
     distill_config = _load_distill_config(distill_dict)
     resume_config = _load_resume_config(resume_dict)
 
-    # Check if use_native is set in YAML (CLI flag overrides)
-    yaml_use_native = distill_dict.get("use_native", False) if distill_dict else False
-    final_use_native = use_native or yaml_use_native
-
-    # Create student model config (field names now match between StudentModelConfig and ProtXConfig)
-    model_config = ProtXConfig(
-        hidden_size=model_config.hidden_size,
-        intermediate_size=model_config.intermediate_size,
-        num_hidden_layers=model_config.num_hidden_layers,
-        num_attention_heads=model_config.num_attention_heads,
-        mlp_activation=model_config.mlp_activation,
-        mlp_dropout=model_config.mlp_dropout,
-        mlp_bias=model_config.mlp_bias,
-        attention_bias=model_config.attention_bias,
-        attention_dropout=model_config.attention_dropout,
-        classifier_activation=model_config.classifier_activation,
-        projection_layer=model_config.projection_layer,
-    )
-
-    # Run distillation (choose implementation based on flag)
-    train_func = run_distillation_native if final_use_native else run_distillation
+    # Run distillation (choose implementation based on YAML setting)
+    train_func = run_distillation_native if distill_config.use_native else run_distillation
     train_func(
         model_config=model_config,
         distill_config=distill_config,
