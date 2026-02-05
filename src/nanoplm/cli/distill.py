@@ -3,8 +3,9 @@
 nanoPLM CLI - Distillation subcommands for nanoPLM package
 """
 
+import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 import click
 
@@ -12,8 +13,7 @@ from nanoplm.distillation.models.student import ProtXConfig
 from nanoplm.distillation.pipeline import (
     DistillationConfig,
     ResumeConfig,
-    run_distillation,
-    run_distillation_native,
+    run_distillation
 )
 from nanoplm.utils.common import create_dirs, read_yaml
 
@@ -27,24 +27,14 @@ def distill():
 
 @distill.command("run")
 @click.help_option('--help', '-h')
+# Dataset options
 @click.option(
     '--dataset-dir',
     type=str,
     required=False,
-    help='Path to dataset directory containing .data_manifest (from nanoplm data from-yaml)'
+    help='Path to dataset directory containing .data_manifest (required unless --resume-from is used)'
 )
-@click.option(
-    '--train-fasta',
-    type=str,
-    required=False,
-    help='Path to the training FASTA file (required for --on-the-fly mode)'
-)
-@click.option(
-    '--val-fasta',
-    type=str,
-    required=False,
-    help='Path to the validation FASTA file (required for --on-the-fly mode)'
-)
+# Model architecture options
 @click.option(
     '--hidden-size',
     type=int,
@@ -70,15 +60,45 @@ def distill():
     help='Number of attention heads of the student model'
 )
 @click.option(
-    '--on-the-fly',
-    is_flag=True,
-    help='Use on-the-fly teacher embeddings (requires --train-fasta and --val-fasta)'
+    '--mlp-activation',
+    type=str,
+    default='swiglu',
+    help='MLP activation function (swiglu, gelu, relu, etc.)'
 )
 @click.option(
-    '--multi-gpu',
-    is_flag=True,
-    help='Whether to use multiple GPUs for training'
+    '--mlp-dropout',
+    type=float,
+    default=0.0,
+    help='Dropout probability for MLP layers'
 )
+@click.option(
+    '--mlp-bias/--no-mlp-bias',
+    default=False,
+    help='Whether to use bias in MLP layers'
+)
+@click.option(
+    '--attention-bias/--no-attention-bias',
+    default=False,
+    help='Whether to use bias in attention layers'
+)
+@click.option(
+    '--attention-dropout',
+    type=float,
+    default=0.0,
+    help='Dropout probability for attention layers'
+)
+@click.option(
+    '--classifier-activation',
+    type=str,
+    default='gelu',
+    help='Activation function for classifier head'
+)
+@click.option(
+    '--projection-layer/--no-projection-layer',
+    default=True,
+    help='Enable/disable projection layer (disable if student hidden_size matches teacher 1024)'
+)
+# Training hyperparameters
 @click.option(
     '--num-epochs',
     type=int,
@@ -98,10 +118,66 @@ def distill():
     help='Maximum learning rate'
 )
 @click.option(
+    '--gradient-accumulation-steps',
+    type=int,
+    default=1,
+    help='Gradient accumulation steps'
+)
+@click.option(
+    '--warmup-ratio',
+    type=float,
+    default=0.05,
+    help='Ratio of total training steps used for warmup'
+)
+# LR scheduler options
+@click.option(
+    '--lr-scheduler',
+    type=click.Choice(['cosine', 'linear', 'polynomial', 'constant']),
+    default='cosine',
+    help='Learning rate scheduler type'
+)
+@click.option(
+    '--lr-scheduler-kwargs',
+    type=str,
+    default='{}',
+    help='JSON string with additional LR scheduler arguments (e.g., \'{"power": 2}\')'
+)
+# Data loader optimization options
+@click.option(
+    '--max-open-files',
+    type=int,
+    default=5,
+    help='Maximum number of open HDF5 files (for optimized loader)'
+)
+@click.option(
+    '--chunk-size',
+    type=int,
+    default=32,
+    help='Chunk size for optimized loader'
+)
+@click.option(
+    '--prefetch-batches',
+    type=int,
+    default=2,
+    help='Number of batches to prefetch'
+)
+@click.option(
+    '--use-threading/--no-threading',
+    default=True,
+    help='Use threading for data loading'
+)
+@click.option(
     '--num-workers',
     type=int,
-    default=4,
+    default=8,
     help='Number of workers to use for data loading'
+)
+# Checkpointing options
+@click.option(
+    '--ckp-dir',
+    type=str,
+    default="output/distillation",
+    help='Directory to save checkpoints'
 )
 @click.option(
     '--project-name',
@@ -110,27 +186,34 @@ def distill():
     help='Name of the W&B project'
 )
 @click.option(
-    '--ckp-dir',
-    type=str,
-    default="output/distillation",
-    help='Directory to save checkpoints'
-)
-@click.option(
-    '--lr-scheduler',
-    type=click.Choice(['cosine', 'linear', 'polynomial', 'constant']),
-    default='cosine',
-    help='Learning rate scheduler type'
-)
-@click.option(
-    '--no-projection-layer',
-    is_flag=True,
-    help='Disable projection layer (student and teacher embeddings must have same dimension 1024)'
-)
-@click.option(
-    '--gradient-accumulation-steps',
+    '--logging-steps',
     type=int,
-    default=1,
-    help='Gradient accumulation steps'
+    default=10,
+    help='Number of steps between logging'
+)
+@click.option(
+    '--eval-steps',
+    type=int,
+    default=50,
+    help='Number of steps between evaluations'
+)
+@click.option(
+    '--save-steps',
+    type=int,
+    default=100,
+    help='Number of steps between checkpoint saves'
+)
+# Distributed training options
+@click.option(
+    '--multi-gpu',
+    is_flag=True,
+    help='Whether to use multiple GPUs for training'
+)
+@click.option(
+    '--world-size',
+    type=str,
+    default='1',
+    help='Number of GPUs to use (or "auto" for automatic detection)'
 )
 @click.option(
     '--seed',
@@ -138,49 +221,127 @@ def distill():
     default=42,
     help='Random seed'
 )
+# Resume options
 @click.option(
-    '--use-native',
-    is_flag=True,
-    help='Use native PyTorch training loop (no HuggingFace Trainer)'
+    '--resume-from',
+    type=str,
+    default=None,
+    help='Path to checkpoint directory to resume training from'
+)
+@click.option(
+    '--extra-epochs',
+    type=int,
+    default=0,
+    help='Additional epochs to train when resuming (added to num-epochs)'
 )
 def run(
     dataset_dir: Optional[str],
-    train_fasta: Optional[str],
-    val_fasta: Optional[str],
     hidden_size: int,
     intermediate_size: int,
     num_hidden_layers: int,
     num_attention_heads: int,
-    on_the_fly: bool,
-    multi_gpu: bool,
+    mlp_activation: str,
+    mlp_dropout: float,
+    mlp_bias: bool,
+    attention_bias: bool,
+    attention_dropout: float,
+    classifier_activation: str,
+    projection_layer: bool,
     num_epochs: int,
     batch_size: int,
     learning_rate: float,
-    num_workers: int,
-    project_name: str,
-    ckp_dir: str,
-    lr_scheduler: str,
-    no_projection_layer: bool,
     gradient_accumulation_steps: int,
+    warmup_ratio: float,
+    lr_scheduler: str,
+    lr_scheduler_kwargs: str,
+    max_open_files: int,
+    chunk_size: int,
+    prefetch_batches: int,
+    use_threading: bool,
+    num_workers: int,
+    ckp_dir: str,
+    project_name: str,
+    logging_steps: int,
+    eval_steps: int,
+    save_steps: int,
+    multi_gpu: bool,
+    world_size: str,
     seed: int,
-    use_native: bool,
+    resume_from: Optional[str],
+    extra_epochs: int,
 ):
     """Distill the teacher model into a student model.
 
-    Either provide --dataset-dir (reads from manifest) or --on-the-fly with FASTA files.
+    Requires --dataset-dir pointing to a directory with .data_manifest file
+    (generated by 'nanoplm data from-yaml' with pipeline_mode: 'distillation').
+
+    When using --resume-from, --dataset-dir is optional as dataset configuration
+    is loaded from the checkpoint's training_config.json.
     """
 
-    # Validate input options
-    if on_the_fly:
-        if not train_fasta or not val_fasta:
+    # Validate: either dataset_dir or resume_from must be provided
+    if not dataset_dir and not resume_from:
+        raise click.ClickException(
+            "--dataset-dir is required unless --resume-from is specified.\n"
+            "Run 'nanoplm data from-yaml' with pipeline_mode: 'distillation' first."
+        )
+
+    # If resuming without dataset_dir, load it from checkpoint's training_config.json
+    if resume_from and not dataset_dir:
+        resume_path = Path(resume_from)
+        if not resume_path.exists():
             raise click.ClickException(
-                "--train-fasta and --val-fasta are required when using --on-the-fly mode"
+                f"Resume checkpoint directory does not exist: {resume_from}"
             )
-    else:
-        if not dataset_dir:
+
+        # Find the run directory (parent of checkpoint directory)
+        # Checkpoint is typically at: ckp_dir/run-name/checkpoint-N
+        run_dir = resume_path.parent
+        training_config_path = run_dir / "training_config.json"
+
+        if not training_config_path.exists():
             raise click.ClickException(
-                "--dataset-dir is required when not using --on-the-fly mode.\n"
-                "Run 'nanoplm data from-yaml' with pipeline_mode: 'distillation' first."
+                f"Cannot resume without --dataset-dir: training_config.json not found in {run_dir}\n"
+                "Please provide --dataset-dir explicitly."
+            )
+
+        try:
+            with open(training_config_path, "r") as f:
+                saved_config = json.load(f)
+
+            # Extract dataset_dir from saved config if available
+            # The training_config.json stores individual paths, not dataset_dir
+            # We need to reconstruct or require dataset_dir
+            # For now, check if there's a dataset_dir stored, otherwise use the paths directly
+            click.echo(f"Loading dataset configuration from: {training_config_path}")
+
+            # The saved config has: train_fasta, val_fasta, train_h5_prefix, val_h5_prefix
+            # We'll pass these to DistillationConfig directly when dataset_dir is not provided
+        except (json.JSONDecodeError, IOError) as e:
+            raise click.ClickException(
+                f"Failed to read training_config.json: {e}\n"
+                "Please provide --dataset-dir explicitly."
+            )
+
+    # Parse lr_scheduler_kwargs JSON string
+    try:
+        lr_scheduler_kwargs_dict = json.loads(lr_scheduler_kwargs)
+    except json.JSONDecodeError as e:
+        raise click.ClickException(
+            f"Invalid JSON for --lr-scheduler-kwargs: {e}\n"
+            f"Example: --lr-scheduler-kwargs '{{\"power\": 2}}'"
+        )
+
+    # Parse world_size (can be int or "auto")
+    world_size_value: Union[int, str]
+    if world_size.lower() == "auto":
+        world_size_value = "auto"
+    else:
+        try:
+            world_size_value = int(world_size)
+        except ValueError:
+            raise click.ClickException(
+                f"Invalid --world-size value: {world_size}. Must be an integer or 'auto'."
             )
 
     # Create student model config
@@ -189,32 +350,86 @@ def run(
         intermediate_size=intermediate_size,
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
-        projection_layer=not no_projection_layer,
+        mlp_activation=mlp_activation,
+        mlp_dropout=mlp_dropout,
+        mlp_bias=mlp_bias,
+        attention_bias=attention_bias,
+        attention_dropout=attention_dropout,
+        classifier_activation=classifier_activation,
+        projection_layer=projection_layer,
     )
 
     # Create distillation config
-    distill_config = DistillationConfig(
-        dataset_dir=dataset_dir,
-        train_fasta=train_fasta,
-        val_fasta=val_fasta,
-        num_epochs=num_epochs,
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        lr_scheduler=lr_scheduler,
-        on_the_fly=on_the_fly,
-        num_workers=num_workers,
-        ckp_dir=ckp_dir,
-        project_name=project_name,
-        multi_gpu=multi_gpu,
-        seed=seed,
-    )
+    # Base config from CLI arguments
+    distill_config_kwargs = {
+        "num_epochs": num_epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "warmup_ratio": warmup_ratio,
+        "lr_scheduler": lr_scheduler,
+        "lr_scheduler_kwargs": lr_scheduler_kwargs_dict,
+        "max_open_files": max_open_files,
+        "chunk_size": chunk_size,
+        "prefetch_batches": prefetch_batches,
+        "use_threading": use_threading,
+        "num_workers": num_workers,
+        "ckp_dir": ckp_dir,
+        "project_name": project_name,
+        "logging_steps": logging_steps,
+        "eval_steps": eval_steps,
+        "save_steps": save_steps,
+        "multi_gpu": multi_gpu,
+        "world_size": world_size_value,
+        "seed": seed,
+    }
 
-    # Run distillation (choose implementation based on flag)
-    train_func = run_distillation_native if use_native else run_distillation
-    train_func(
+    # Add dataset configuration
+    if dataset_dir:
+        # Use manifest-based configuration
+        distill_config_kwargs["dataset_dir"] = dataset_dir
+    elif resume_from:
+        # Load dataset paths from checkpoint's training_config.json
+        # saved_config was loaded earlier in the validation block
+        distill_config_kwargs["train_fasta"] = saved_config.get("train_fasta")
+        distill_config_kwargs["val_fasta"] = saved_config.get("val_fasta")
+        distill_config_kwargs["train_h5_prefix"] = saved_config.get("train_h5_prefix")
+        distill_config_kwargs["val_h5_prefix"] = saved_config.get("val_h5_prefix")
+        distill_config_kwargs["max_seq_len"] = saved_config.get("max_seq_len")
+        distill_config_kwargs["max_seqs_num"] = saved_config.get("max_seqs_num")
+        distill_config_kwargs["val_ratio"] = saved_config.get("val_ratio")
+        distill_config_kwargs["on_the_fly"] = saved_config.get("on_the_fly", False)
+        distill_config_kwargs["sharded"] = saved_config.get("sharded")
+        # Also load train/val sequence counts if available
+        distill_config_kwargs["train_sequences"] = saved_config.get("train_sequences")
+        distill_config_kwargs["val_sequences"] = saved_config.get("val_sequences")
+
+        # Filter out None values for paths (they might be stored as "None" strings)
+        for key in ["train_fasta", "val_fasta", "train_h5_prefix", "val_h5_prefix"]:
+            if distill_config_kwargs.get(key) in (None, "None", "null"):
+                distill_config_kwargs[key] = None
+
+    distill_config = DistillationConfig(**distill_config_kwargs)
+
+    # Create resume config if resuming
+    resume_config = None
+    if resume_from:
+        resume_path = Path(resume_from)
+        if not resume_path.exists():
+            raise click.ClickException(
+                f"Resume checkpoint directory does not exist: {resume_from}"
+            )
+        resume_config = ResumeConfig(
+            is_resume=True,
+            checkpoint_dir=resume_from,
+            extra_epochs=extra_epochs if extra_epochs > 0 else None,
+        )
+
+    # Run distillation
+    run_distillation(
         model_config=model_config,
         distill_config=distill_config,
+        resume_config=resume_config,
     )
 
 
@@ -263,8 +478,7 @@ def from_yaml(config: str):
     resume_config = _load_resume_config(resume_dict)
 
     # Run distillation (choose implementation based on YAML setting)
-    train_func = run_distillation_native if distill_config.use_native else run_distillation
-    train_func(
+    run_distillation(
         model_config=model_config,
         distill_config=distill_config,
         resume_config=resume_config if resume_config.is_resume else None,
@@ -334,9 +548,6 @@ def get_yaml(output: Optional[str], force: bool):
         "\n"
         "distillation:\n"
         "\n"
-        "  # Training implementation\n"
-        "  use_native: false  # Set to true for native PyTorch training loop (no HuggingFace Trainer)\n"
-        "\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
         "  # The manifest automatically provides:\n"
         "  #   - max_seq_len, max_seqs_num, val_ratio\n"
@@ -359,7 +570,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  lr_scheduler_kwargs: {}\n"
         "\n"
         "  # Data loader optimization\n"
-        "  use_optimized_loader: true\n"
         "  max_open_files: 5\n"
         "  chunk_size: 32\n"
         "  prefetch_batches: 2\n"
@@ -368,9 +578,9 @@ def get_yaml(output: Optional[str], force: bool):
         "\n"
         "  # Checkpointing\n"
         "  project_name: \"nanoplm-distillation\"\n"
-        "  logging_steps_percentage: 0.01\n"
-        "  eval_steps_percentage: 0.01\n"
-        "  save_steps_percentage: 0.05\n"
+        "  logging_steps: 10\n"
+        "  eval_steps: 50\n"
+        "  save_steps: 100\n"
         "\n"
         "  # Distributed training\n"
         "  multi_gpu: false\n"
@@ -460,7 +670,10 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
             raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'on_the_fly', 'sharded', 'use_optimized_loader', 'use_threading']:
+    bool_keys = [
+        'multi_gpu', 'on_the_fly', 'sharded', 'use_threading',
+    ]
+    for bool_key in bool_keys:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):

@@ -18,9 +18,10 @@ from nanoplm.pretraining.models.modern_bert import (
     ProtModernBertMLM,
     ProtModernBertTokenizer,
 )
-from nanoplm.pretraining.dataset import LoadShardedFastaMLMDataset
+from nanoplm.pretraining.dataset import LoadShardedFastaMLMDataset, get_pretraining_worker_init_fn
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.validation import validate_pretrain_dataset, ValidationError
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
@@ -55,9 +56,9 @@ class PretrainingConfig:
     keep_probability: float = 0.1
 
     # Logging/checkpointing
-    logging_steps_percentage: float = 0.01
-    eval_steps_percentage: float = 0.025
-    save_steps_percentage: float = 0.1
+    logging_steps: int = 10
+    eval_steps: int = 50
+    save_steps: int = 100
     seed: int = 42
 
     # Data loading
@@ -218,38 +219,27 @@ def _prepare_run_and_steps(
                 # Use ceiling division to ensure at least 1 step per epoch
                 steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
                 total_steps = num_epochs * steps_per_epoch
-                logging_steps = max(
-                    1, int(total_steps * pretrain_config.logging_steps_percentage)
-                )
-                eval_steps = max(
-                    1, int(total_steps * pretrain_config.eval_steps_percentage)
-                )
-                save_steps = max(
-                    1, int(total_steps * pretrain_config.save_steps_percentage)
-                )
+                # Use direct step counts from config (clamped to valid range)
+                logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
+                eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
+                save_steps = max(1, min(total_steps, pretrain_config.save_steps))
         else:
             # Use ceiling division to ensure at least 1 step per epoch
             steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
             total_steps = num_epochs * steps_per_epoch
-            logging_steps = max(
-                1, int(total_steps * pretrain_config.logging_steps_percentage)
-            )
-            eval_steps = max(
-                1, int(total_steps * pretrain_config.eval_steps_percentage)
-            )
-            save_steps = max(
-                1, int(total_steps * pretrain_config.save_steps_percentage)
-            )
+            # Use direct step counts from config (clamped to valid range)
+            logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
+            eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
+            save_steps = max(1, min(total_steps, pretrain_config.save_steps))
     else:
         num_epochs = pretrain_config.num_epochs
         # Use ceiling division to ensure at least 1 step per epoch
         steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
         total_steps = num_epochs * steps_per_epoch
-        logging_steps = max(
-            1, int(total_steps * pretrain_config.logging_steps_percentage)
-        )
-        eval_steps = max(1, int(total_steps * pretrain_config.eval_steps_percentage))
-        save_steps = max(1, int(total_steps * pretrain_config.save_steps_percentage))
+        # Use direct step counts from config (clamped to valid range)
+        logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
+        eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
+        save_steps = max(1, min(total_steps, pretrain_config.save_steps))
 
     return run_name, wandb_run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps, resume_step
 
@@ -267,9 +257,23 @@ def run_pretraining(
 
     # Read manifest and resolve paths
     dataset_dir = Path(pretrain_config.dataset_dir)
+
+    # Validate dataset before starting training
+    logger.info(f"Validating pretraining dataset at {dataset_dir}...")
+    try:
+        validation_result = validate_pretrain_dataset(dataset_dir)
+        logger.info(f"Dataset validated: {validation_result['manifest']['train_sequences']:,} train, "
+                    f"{validation_result['manifest']['val_sequences']:,} val sequences")
+    except ValidationError as e:
+        logger.error(f"Dataset validation failed: {e}")
+        raise
+    except FileNotFoundError as e:
+        logger.error(f"Dataset not found: {e}")
+        raise
+
     manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(
-        manifest=manifest, 
+        manifest=manifest,
         expected_mode="pretrain"
     )
 

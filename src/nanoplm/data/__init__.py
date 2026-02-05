@@ -11,6 +11,18 @@ from nanoplm.data.manifest import (
     validate_manifest_for_pipeline,
     get_dataset_paths,
 )
+from nanoplm.data.file_pool import (
+    ThreadSafeFileHandlePool,
+    detect_file_limits,
+    worker_init_fn_factory,
+)
+from nanoplm.data.validation import (
+    validate_dataset_manifest,
+    validate_shard_files,
+    validate_pretrain_dataset,
+    validate_distillation_dataset,
+    ValidationError,
+)
 
 __all__ = [
     "Filterer",
@@ -26,4 +38,12 @@ __all__ = [
     "read_manifest",
     "validate_manifest_for_pipeline",
     "get_dataset_paths",
+    "ThreadSafeFileHandlePool",
+    "detect_file_limits",
+    "worker_init_fn_factory",
+    "validate_dataset_manifest",
+    "validate_shard_files",
+    "validate_pretrain_dataset",
+    "validate_distillation_dataset",
+    "ValidationError",
 ]

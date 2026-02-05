@@ -119,22 +119,22 @@ def pretrain():
     help="Gradient accumulation steps",
 )
 @click.option(
-    "--logging-steps-percentage",
-    type=float,
-    default=0.01,
-    help="Fraction of total steps between log events"
+    "--logging-steps",
+    type=int,
+    default=10,
+    help="Number of steps between log events"
 )
 @click.option(
-    "--eval-steps-percentage",
-    type=float,
-    default=0.025,
-    help="Fraction of total steps between evaluations"
+    "--eval-steps",
+    type=int,
+    default=50,
+    help="Number of steps between evaluations"
 )
 @click.option(
-    "--save-steps-percentage",
-    type=float,
-    default=0.1,
-    help="Fraction of total steps between checkpoint saves"
+    "--save-steps",
+    type=int,
+    default=100,
+    help="Number of steps between checkpoint saves"
 )
 @click.option(
     "--seed",
@@ -274,9 +274,9 @@ def run(
     adam_epsilon: float,
     mlm_probability: float,
     gradient_accumulation_steps: int,
-    logging_steps_percentage: float,
-    eval_steps_percentage: float,
-    save_steps_percentage: float,
+    logging_steps: int,
+    eval_steps: int,
+    save_steps: int,
     seed: int,
     mask_replace_prob: float,
     random_token_prob: float,
@@ -320,9 +320,9 @@ def run(
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
         keep_probability=keep_probability,
-        logging_steps_percentage=logging_steps_percentage,
-        eval_steps_percentage=eval_steps_percentage,
-        save_steps_percentage=save_steps_percentage,
+        logging_steps=logging_steps,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
         seed=seed,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
@@ -499,9 +499,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
         "  keep_probability: 0.1\n"
-        "  logging_steps_percentage: 0.01  # 100 logging in total\n"
-        "  eval_steps_percentage: 0.025  # 40 evaluations in total\n"
-        "  save_steps_percentage: 0.1  # 10 saves in total\n"
+        "  logging_steps: 10\n"
+        "  eval_steps: 50\n"
+        "  save_steps: 100\n"
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
