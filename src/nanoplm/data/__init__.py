@@ -13,8 +13,7 @@ from nanoplm.data.manifest import (
 )
 from nanoplm.data.file_pool import (
     ThreadSafeFileHandlePool,
-    detect_file_limits,
-    worker_init_fn_factory,
+    detect_file_limits
 )
 from nanoplm.data.validation import (
     validate_dataset_manifest,
