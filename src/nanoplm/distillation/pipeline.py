@@ -54,6 +54,10 @@ class DistillationConfig:
     gradient_accumulation_steps: int = 1
     warmup_ratio: float = 0.05
 
+    # Mixed precision
+    bf16: bool = True
+    tf32: bool = True
+
     # LR scheduler
     lr_scheduler: str = "cosine"
     lr_scheduler_kwargs: Optional[Dict[str, Any]] = None
@@ -636,6 +640,9 @@ def run_distillation(
         "label_names": ["teacher_embeddings"],
         "gradient_accumulation_steps": distill_config.gradient_accumulation_steps,
         "seed": distill_config.seed,
+        "bf16": distill_config.bf16 and is_cuda and torch.cuda.is_bf16_supported(),
+        "fp16": distill_config.bf16 and ((is_cuda and not torch.cuda.is_bf16_supported()) or device == "mps"),
+        "tf32": distill_config.tf32 and is_cuda,
     }
 
     if distill_config.multi_gpu:

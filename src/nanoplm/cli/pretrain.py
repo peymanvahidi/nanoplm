@@ -173,6 +173,16 @@ def pretrain():
     help="DataLoader prefetch factor"
 )
 @click.option(
+    "--bf16/--no-bf16",
+    default=True,
+    help="Enable mixed precision training (bf16 if supported, fp16 fallback)"
+)
+@click.option(
+    "--tf32/--no-tf32",
+    default=True,
+    help="Enable TF32 mode on Ampere+ GPUs for faster fp32 matmuls"
+)
+@click.option(
     "--multi-gpu",
     is_flag=True,
     default=False,
@@ -283,6 +293,8 @@ def run(
     keep_probability: float,
     num_workers: Union[int, str],
     prefetch_factor: int,
+    bf16: bool,
+    tf32: bool,
     multi_gpu: bool,
     world_size: str,
     project_name: str,
@@ -326,6 +338,8 @@ def run(
         seed=seed,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
+        bf16=bf16,
+        tf32=tf32,
         multi_gpu=multi_gpu,
         world_size=world_size,
         project_name=project_name,
@@ -505,6 +519,17 @@ def get_yaml(output: Optional[str], force: bool):
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
+        "\n"
+        "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
+        "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
+        "  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32\n"
+        "  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback\n"
+        "  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)\n"
+        "  #   - CPU: fp32 (no mixed precision)\n"
+        "  bf16: true\n"
+        "  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)\n"
+        "             # Provides 3x faster fp32 matmuls with negligible precision loss\n"
+        "\n"
         "  multi_gpu: false\n"
         "  world_size: 1  # Use \"auto\" if you want to use all available GPUs\n"
         "  project_name: \"nanoplm-pretraining\"\n"
@@ -561,7 +586,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'load_all_in_memory']:
+    for bool_key in ['multi_gpu', 'load_all_in_memory', 'bf16', 'tf32']:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):

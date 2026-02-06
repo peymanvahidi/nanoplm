@@ -203,6 +203,17 @@ def distill():
     default=100,
     help='Number of steps between checkpoint saves'
 )
+# Mixed precision options
+@click.option(
+    '--bf16/--no-bf16',
+    default=True,
+    help='Enable mixed precision training (bf16 if supported, fp16 fallback)'
+)
+@click.option(
+    '--tf32/--no-tf32',
+    default=True,
+    help='Enable TF32 mode on Ampere+ GPUs for faster fp32 matmuls'
+)
 # Distributed training options
 @click.option(
     '--multi-gpu',
@@ -259,6 +270,8 @@ def run(
     prefetch_batches: int,
     use_threading: bool,
     num_workers: int,
+    bf16: bool,
+    tf32: bool,
     ckp_dir: str,
     project_name: str,
     logging_steps: int,
@@ -374,6 +387,8 @@ def run(
         "prefetch_batches": prefetch_batches,
         "use_threading": use_threading,
         "num_workers": num_workers,
+        "bf16": bf16,
+        "tf32": tf32,
         "ckp_dir": ckp_dir,
         "project_name": project_name,
         "logging_steps": logging_steps,
@@ -582,6 +597,16 @@ def get_yaml(output: Optional[str], force: bool):
         "  eval_steps: 50\n"
         "  save_steps: 100\n"
         "\n"
+        "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
+        "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
+        "  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32\n"
+        "  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback\n"
+        "  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)\n"
+        "  #   - CPU: fp32 (no mixed precision)\n"
+        "  bf16: true\n"
+        "  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)\n"
+        "             # Provides 3x faster fp32 matmuls with negligible precision loss\n"
+        "\n"
         "  # Distributed training\n"
         "  multi_gpu: false\n"
         "  world_size: 1\n"
@@ -671,7 +696,7 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
 
     # Handle boolean values
     bool_keys = [
-        'multi_gpu', 'on_the_fly', 'sharded', 'use_threading',
+        'multi_gpu', 'on_the_fly', 'sharded', 'use_threading', 'bf16', 'tf32',
     ]
     for bool_key in bool_keys:
         if bool_key in kwargs:

@@ -49,6 +49,10 @@ class PretrainingConfig:
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 1
 
+    # Mixed precision
+    bf16: bool = True
+    tf32: bool = True
+
     # MLM settings
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
@@ -387,6 +391,9 @@ def run_pretraining(
         "save_strategy": "steps",
         "save_steps": save_steps,
         "seed": pretrain_config.seed,
+        "bf16": pretrain_config.bf16 and device == "cuda" and torch.cuda.is_bf16_supported(),
+        "fp16": pretrain_config.bf16 and ((device == "cuda" and not torch.cuda.is_bf16_supported()) or device == "mps"),
+        "tf32": pretrain_config.tf32 and device == "cuda",
         "report_to": "wandb",
         "run_name": wandb_run_name,
         "dataloader_pin_memory": True if device == "cuda" else False,
