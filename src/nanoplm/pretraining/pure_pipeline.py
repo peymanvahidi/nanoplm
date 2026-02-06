@@ -125,6 +125,7 @@ def _evaluate(
     model: torch.nn.Module,
     eval_loader: DataLoader,
     device: torch.device,
+    distributed: bool = False,
 ) -> float:
     model.eval()
     total_loss = 0.0
@@ -141,6 +142,12 @@ def _evaluate(
         bs = batch["input_ids"].size(0)
         total_loss += loss.item() * bs
         total_samples += bs
+
+    # All-reduce across ranks so each process gets the global mean eval loss
+    if distributed and dist.is_initialized():
+        stats = torch.tensor([total_loss, total_samples], device=device)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_loss, total_samples = stats[0].item(), stats[1].item()
 
     model.train()
     return total_loss / max(1, total_samples)
@@ -239,10 +246,8 @@ def run_pure_pretraining(
     """Pure-torch training loop — drop-in replacement for ``run_pretraining``."""
 
     _set_seed(pretrain_config.seed)
-    device = torch.device(get_device())
-
     tokenizer = model.tokenizer
-    model.to(device)
+    device = torch.device(get_device())
 
     # ---- datasets (same logic as HF pipeline) ---------------------------
     if pretrain_config.lazy_dataset:
@@ -340,14 +345,18 @@ def run_pure_pretraining(
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         device = torch.device(f"cuda:{local_rank}")
         model.to(device)
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
         train_sampler = DistributedSampler(
             train_ds, shuffle=True, seed=pretrain_config.seed
         )
     else:
+        model.to(device)
         train_sampler = RandomSampler(train_ds)
 
-    eval_sampler = SequentialSampler(val_ds)
+    if pretrain_config.multi_gpu:
+        eval_sampler = DistributedSampler(val_ds, shuffle=False)
+    else:
+        eval_sampler = SequentialSampler(val_ds)
 
     # ---- data loaders ----------------------------------------------------
     train_loader = DataLoader(
@@ -391,19 +400,37 @@ def run_pure_pretraining(
             model, optimizer, scheduler, resume_config.checkpoint_dir, device
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
+    resume_micro_step = 0
+    resume_epoch = start_epoch
+    if resume_config and resume_config.is_resume:
+        steps_completed_in_epoch = max(0, start_step - start_epoch * steps_per_epoch)
+        resume_micro_step = steps_completed_in_epoch * pretrain_config.gradient_accumulation_steps
+        if resume_micro_step >= len(train_loader):
+            resume_micro_step = 0
+            start_epoch = min(start_epoch + 1, num_epochs)
+            resume_epoch = start_epoch
+        if resume_micro_step > 0:
+            logger.info(
+                f"Skipping {resume_micro_step} micro-steps in resumed epoch {resume_epoch}"
+            )
 
     # ---- W&B -------------------------------------------------------------
     is_main = local_rank == 0
+    wandb_enabled = False
     if is_main:
-        wandb.init(
-            project=pretrain_config.project_name,
-            name=run_name,
-            config={
-                "pretrain": pretrain_config.__dict__,
-                "total_steps": total_steps,
-                "warmup_steps": warmup_steps,
-            },
-        )
+        try:
+            wandb.init(
+                project=pretrain_config.project_name,
+                name=run_name,
+                config={
+                    "pretrain": pretrain_config.__dict__,
+                    "total_steps": total_steps,
+                    "warmup_steps": warmup_steps,
+                },
+            )
+            wandb_enabled = wandb.run is not None
+        except Exception as exc:
+            logger.warning(f"W&B init failed; continuing without logging. Error: {exc}")
 
     # ---- training loop ---------------------------------------------------
     logger.info(
@@ -414,11 +441,13 @@ def run_pure_pretraining(
     )
 
     global_step = start_step
+    torch.set_float32_matmul_precision('high')
     model.train()
 
     # tokens/sec tracking
-    _tok_count = 0          # tokens processed since last log
-    _tok_t0 = time.perf_counter()  # wall-clock at last log
+    _tok_count = 0              # non-padding tokens processed since last log
+    _raw_tok_count = 0          # raw tokens processed since last log
+    _tok_t0: Optional[float] = None  # wall-clock at first micro-step after last log
 
     for epoch in range(start_epoch, num_epochs):
         if hasattr(train_sampler, "set_epoch"):
@@ -427,10 +456,15 @@ def run_pure_pretraining(
         accum_loss = 0.0
 
         for micro_step, batch in enumerate(train_loader):
+            if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
+                continue
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # count non-padding tokens in this micro-batch
+            # count tokens in this micro-batch
+            if _raw_tok_count == 0:
+                _tok_t0 = time.perf_counter()
             _tok_count += int(batch["attention_mask"].sum().item())
+            _raw_tok_count += int(batch["attention_mask"].numel())
 
             out = model(
                 input_ids=batch["input_ids"],
@@ -455,61 +489,107 @@ def run_pure_pretraining(
 
                 # --- tokens/sec (every step) ---
                 _tok_t1 = time.perf_counter()
+                if _tok_t0 is None:
+                    _tok_t0 = _tok_t1
                 _tok_elapsed = _tok_t1 - _tok_t0
-                tokens_per_sec = _tok_count / max(_tok_elapsed, 1e-9)
+                tok_count = float(_tok_count)
+                raw_tok_count = float(_raw_tok_count)
+                tok_elapsed = float(_tok_elapsed)
+                if pretrain_config.multi_gpu and dist.is_initialized():
+                    tok_tensor = torch.tensor(tok_count, device=device)
+                    raw_tok_tensor = torch.tensor(raw_tok_count, device=device)
+                    time_tensor = torch.tensor(tok_elapsed, device=device)
+                    dist.all_reduce(tok_tensor, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(raw_tok_tensor, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(time_tensor, op=dist.ReduceOp.MAX)
+                    tok_count = tok_tensor.item()
+                    raw_tok_count = raw_tok_tensor.item()
+                    tok_elapsed = time_tensor.item()
+                tokens_per_sec = tok_count / max(tok_elapsed, 1e-9)
+                raw_tokens_per_sec = raw_tok_count / max(tok_elapsed, 1e-9)
                 _tok_count = 0
-                _tok_t0 = _tok_t1
+                _raw_tok_count = 0
+                _tok_t0 = None
 
                 if is_main:
                     lr = scheduler.get_last_lr()[0]
-                    wandb.log(
-                        {
-                            "train/loss": accum_loss,
-                            "train/grad_norm": grad_norm,
-                            "train/learning_rate": lr,
-                            "train/epoch": epoch + (micro_step + 1) / len(train_loader),
-                            "train/global_step": global_step,
-                            "train/tokens_per_sec": tokens_per_sec,
-                        },
-                        step=global_step,
-                    )
+                    if wandb_enabled and wandb.run is not None:
+                        try:
+                            wandb.log(
+                                {
+                                    "train/loss": accum_loss,
+                                    "train/grad_norm": grad_norm,
+                                    "train/learning_rate": lr,
+                                    "train/epoch": epoch + (micro_step + 1) / len(train_loader),
+                                    "train/global_step": global_step,
+                                    "train/tokens_per_sec": tokens_per_sec,
+                                    "train/raw_tokens_per_sec": raw_tokens_per_sec,
+                                },
+                                step=global_step,
+                            )
+                        except Exception as exc:
+                            wandb_enabled = False
+                            logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
                     logger.info(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={accum_loss:.4f}  lr={lr:.2e}  "
                         f"grad_norm={grad_norm:.4f}  "
-                        f"tok/s={tokens_per_sec:,.0f}"
+                        f"tok/s={tokens_per_sec:,.0f}  "
+                        f"raw_tok/s={raw_tokens_per_sec:,.0f}"
                     )
 
                 accum_loss = 0.0
 
                 # --- evaluation ---
                 if global_step % eval_steps == 0:
-                    eval_loss = _evaluate(model, eval_loader, device)
+                    eval_loss = _evaluate(model, eval_loader, device, distributed=pretrain_config.multi_gpu)
                     if is_main:
-                        wandb.log({"eval/loss": eval_loss}, step=global_step)
+                        if wandb_enabled and wandb.run is not None:
+                            try:
+                                wandb.log({"eval/loss": eval_loss}, step=global_step)
+                            except Exception as exc:
+                                wandb_enabled = False
+                                logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
                         logger.info(
                             f"[step {global_step}] eval_loss={eval_loss:.4f}"
                         )
                     model.train()
+                    if pretrain_config.multi_gpu and dist.is_initialized():
+                        dist.barrier()
 
                 # --- checkpoint ---
-                if is_main and global_step % save_steps == 0:
-                    _save_checkpoint(
-                        model, optimizer, scheduler,
-                        global_step, epoch, output_dir,
-                        logging_steps, eval_steps, save_steps,
-                    )
+                if global_step % save_steps == 0:
+                    if pretrain_config.multi_gpu and dist.is_initialized():
+                        dist.barrier()
+                    if is_main:
+                        _save_checkpoint(
+                            model, optimizer, scheduler,
+                            global_step, epoch, output_dir,
+                            logging_steps, eval_steps, save_steps,
+                        )
+                    if pretrain_config.multi_gpu and dist.is_initialized():
+                        dist.barrier()
+
+        if resume_micro_step > 0 and epoch == resume_epoch:
+            resume_micro_step = 0
 
     # ---- final save & cleanup --------------------------------------------
+    if pretrain_config.multi_gpu and dist.is_initialized():
+        dist.barrier()
     if is_main:
         _save_checkpoint(
             model, optimizer, scheduler,
             global_step, num_epochs, output_dir,
             logging_steps, eval_steps, save_steps,
         )
-        if wandb.run is not None:
-            run_id_path = Path(output_dir) / "wandb_run_id.txt"
-            run_id_path.write_text(wandb.run.id, encoding="utf-8")
-            wandb.finish()
+        if wandb_enabled and wandb.run is not None:
+            try:
+                run_id_path = Path(output_dir) / "wandb_run_id.txt"
+                run_id_path.write_text(wandb.run.id, encoding="utf-8")
+                wandb.finish()
+            except Exception as exc:
+                logger.warning(f"W&B finalize failed. Error: {exc}")
+    if pretrain_config.multi_gpu and dist.is_initialized():
+        dist.barrier()
 
     logger.info("Pure-torch pretraining complete.")

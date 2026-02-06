@@ -89,17 +89,17 @@ class ModernBertConfig:
 # ---------------------------------------------------------------------------
 
 _ACT_FN = {
-    "gelu": nn.GELU(),
-    "relu": nn.ReLU(),
-    "silu": nn.SiLU(),
-    "tanh": nn.Tanh(),
+    "gelu": nn.GELU,
+    "relu": nn.ReLU,
+    "silu": nn.SiLU,
+    "tanh": nn.Tanh,
 }
 
 
 def _get_act(name: str) -> nn.Module:
     if name not in _ACT_FN:
         raise ValueError(f"Unsupported activation: {name!r}")
-    return _ACT_FN[name]
+    return _ACT_FN[name]()
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,12 @@ class ModernBertRotaryEmbedding(nn.Module):
         position_ids: torch.LongTensor,
         layer_type: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(cos, sin)`` of shape ``(B, S, head_dim)`` cast to ``x.dtype``."""
+        """
+        Return ``(cos, sin)`` of shape ``(B, S, head_dim)`` cast to ``x.dtype``.
+
+        Internally, RoPE freqs are computed with shape ``(B, S, head_dim//2)``
+        and concatenated to ``(B, S, head_dim)`` before applying ``cos``/``sin``.
+        """
         inv_freq: torch.Tensor = getattr(self, f"{layer_type}_inv_freq")
 
         # inv_freq: (head_dim//2,) → (1, head_dim//2, 1)
@@ -566,12 +571,19 @@ class ModernBertForMaskedLM(nn.Module):
             # Re-compute inv_freq (matches HF's _init_weights for RoPE)
             for layer_type in module.unique_layer_types:
                 theta = module.config.rope_theta[layer_type]
+                buf = getattr(module, f"{layer_type}_inv_freq")
                 inv_freq = 1.0 / (
                     theta ** (
-                        torch.arange(0, module.config.head_dim, 2, dtype=torch.float) / module.config.head_dim
+                        torch.arange(
+                            0,
+                            module.config.head_dim,
+                            2,
+                            dtype=torch.float,
+                            device=buf.device,
+                        ) / module.config.head_dim
                     )
                 )
-                getattr(module, f"{layer_type}_inv_freq").copy_(inv_freq)
+                buf.copy_(inv_freq)
                 getattr(module, f"{layer_type}_original_inv_freq").copy_(inv_freq)
 
     # ----- forward ----------------------------------------------------------
