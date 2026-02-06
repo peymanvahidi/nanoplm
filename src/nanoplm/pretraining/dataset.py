@@ -210,20 +210,16 @@ class LoadShardedFastaMLMDataset(Dataset):
             futures = {exe.submit(_read_shard_for_worker_shm, str(p)): idx for idx, p in enumerate(self.shard_paths)}
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading shards", leave=False):
                 idx = futures[fut]
-                shm_info = fut.result()
-                futures_data[idx] = shm_info
+                futures_data[idx] = fut.result()
 
-        for inputs_arr, masks_arr in futures_data:
-            # Allocate SharedMemory
-            shm_in = shared_memory.SharedMemory(create=True, size=inputs_arr.nbytes)
-            shm_mask = shared_memory.SharedMemory(create=True, size=masks_arr.nbytes)
-
-            np.copyto(np.ndarray(inputs_arr.shape, dtype=np.uint8, buffer=shm_in.buf), inputs_arr)
-            np.copyto(np.ndarray(masks_arr.shape, dtype=np.uint8, buffer=shm_mask.buf), masks_arr)
+        # Attach to SharedMemory blocks created by workers (no data copy needed)
+        for shm_in_name, shm_mask_name, shape in futures_data:
+            shm_in = shared_memory.SharedMemory(name=shm_in_name, create=False)
+            shm_mask = shared_memory.SharedMemory(name=shm_mask_name, create=False)
 
             self._shm_input_ids.append(shm_in)
             self._shm_attention_masks.append(shm_mask)
-            self._shard_shapes.append(inputs_arr.shape)
+            self._shard_shapes.append(shape)
 
         logger.info("SharedMemory shards loaded.")
 
@@ -398,15 +394,35 @@ def process_shard(args):
 
 
 def _read_shard_for_worker_shm(path_str: str):
-    """Read a shard for SharedMemory loading, return fixed-size padded arrays."""
+    """Read a shard directly into SharedMemory, return metadata only.
+
+    Allocates SharedMemory in the worker process and populates it from HDF5,
+    avoiding pickle serialization of large numpy arrays across the process boundary.
+    Returns only lightweight metadata (names + shape, ~200 bytes).
+    """
     path = Path(path_str)
     with h5py.File(path, "r") as f:
         n = len(f["input_ids"])
         shard_arrays = [np.array(f["input_ids"][i], dtype=np.uint8) for i in range(n)]
         max_len = max(a.shape[0] for a in shard_arrays)
-        inputs = np.zeros((n, max_len), dtype=np.uint8)
-        masks = np.zeros((n, max_len), dtype=np.uint8)
-        for i, arr in enumerate(shard_arrays):
-            inputs[i, :len(arr)] = arr
-            masks[i, :len(arr)] = 1
-    return inputs, masks
+
+    shape = (n, max_len)
+    nbytes = n * max_len  # uint8: 1 byte per element
+
+    shm_in = shared_memory.SharedMemory(create=True, size=nbytes)
+    shm_mask = shared_memory.SharedMemory(create=True, size=nbytes)
+
+    inputs = np.ndarray(shape, dtype=np.uint8, buffer=shm_in.buf)
+    masks = np.ndarray(shape, dtype=np.uint8, buffer=shm_mask.buf)
+    inputs[:] = 0
+    masks[:] = 0
+
+    for i, arr in enumerate(shard_arrays):
+        inputs[i, :len(arr)] = arr
+        masks[i, :len(arr)] = 1
+
+    shm_in_name, shm_mask_name = shm_in.name, shm_mask.name
+    shm_in.close()
+    shm_mask.close()
+
+    return shm_in_name, shm_mask_name, shape
