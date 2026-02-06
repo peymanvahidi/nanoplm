@@ -42,7 +42,13 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             eos_token_id=self.tokenizer.eos_token_id,
             bos_token_id=None,  # Not used in our tokenizer
             unk_token_id=self.tokenizer.unk_token_id,
-            mask_token_id=self.tokenizer.mask_token_id
+            mask_token_id=self.tokenizer.mask_token_id,
+            loss_type="ForMaskedLM",
         )
 
         super().__init__(self.config)
+        # PreTrainedModel.__init__ auto-infers loss_type from class name via
+        # regex against LOSS_MAPPING keys. "ProtModernBertMLM" doesn't contain
+        # "ForMaskedLM", so it falls back to None → ForCausalLMLoss (which
+        # shifts labels left by 1 — wrong for MLM). Override it here.
+        self.loss_type = "ForMaskedLM"
