@@ -182,22 +182,23 @@ def run_benchmark(label, load_fn, shard_paths, max_workers):
 
     cleanup_shm_blocks(shm_blocks)
 
-    peak_mb = peak_bytes / (1024 * 1024)
+    heap_mb = peak_bytes / (1024 * 1024)
     shm_mb = total_shm_bytes / (1024 * 1024)
+    total_mb = heap_mb + shm_mb
 
     print(f"  {label}")
     print(f"    Wall time:            {elapsed:.2f}s")
-    print(f"    Parent peak memory:   {peak_mb:.1f} MB")
-    print(f"    SharedMemory total:   {shm_mb:.1f} MB")
-    print(f"    Overhead (peak-shm):  {peak_mb - shm_mb:.1f} MB")
+    print(f"    Parent heap (pickle): {heap_mb:.1f} MB  (tracemalloc)")
+    print(f"    SharedMemory:         {shm_mb:.1f} MB  (OS-managed)")
+    print(f"    Total memory:         {total_mb:.1f} MB  (heap + shm)")
     print()
 
     return {
         "label": label,
         "wall_time": elapsed,
-        "peak_mb": peak_mb,
+        "heap_mb": heap_mb,
         "shm_mb": shm_mb,
-        "overhead_mb": peak_mb - shm_mb,
+        "total_mb": total_mb,
     }
 
 
@@ -260,11 +261,13 @@ def main():
         print("=" * 60)
         print("Summary")
         print("=" * 60)
-        print(f"  Wall time:   {old['wall_time']:.2f}s -> {new['wall_time']:.2f}s "
+        print(f"  Wall time:     {old['wall_time']:.2f}s -> {new['wall_time']:.2f}s "
               f"({new['wall_time'] / old['wall_time']:.2f}x)")
-        print(f"  Peak mem:    {old['peak_mb']:.1f} MB -> {new['peak_mb']:.1f} MB "
-              f"(saved {old['peak_mb'] - new['peak_mb']:.1f} MB)")
-        print(f"  Overhead:    {old['overhead_mb']:.1f} MB -> {new['overhead_mb']:.1f} MB")
+        print(f"  Parent heap:   {old['heap_mb']:.1f} MB -> {new['heap_mb']:.1f} MB "
+              f"(saved {old['heap_mb'] - new['heap_mb']:.1f} MB)")
+        print(f"  SharedMemory:  {old['shm_mb']:.1f} MB -> {new['shm_mb']:.1f} MB")
+        print(f"  Total memory:  {old['total_mb']:.1f} MB -> {new['total_mb']:.1f} MB "
+              f"(saved {old['total_mb'] - new['total_mb']:.1f} MB)")
         print()
 
 
