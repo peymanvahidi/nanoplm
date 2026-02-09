@@ -44,14 +44,14 @@ def pretrain():
     help="Validation FASTA path"
 )
 @click.option(
-    "--train-hdf5",
+    "--train-data-dir",
     type=str,
-    help="Directory of pre-tokenized training HDF5 shards (used when --lazy-dataset is False)"
+    help="Directory of pre-tokenized training binary shards (used when --lazy-dataset is False)"
 )
 @click.option(
-    "--val-hdf5",
+    "--val-data-dir",
     type=str,
-    help="Directory of pre-tokenized validation HDF5 shards (used when --lazy-dataset is False)"
+    help="Directory of pre-tokenized validation binary shards (used when --lazy-dataset is False)"
 )
 @click.option(
     "--load-all-in-memory",
@@ -287,8 +287,8 @@ def run(
     # dataset/output
     train_fasta: str,
     val_fasta: str,
-    train_hdf5: str,
-    val_hdf5: str,
+    train_data_dir: str,
+    val_data_dir: str,
     load_all_in_memory: bool,
     ckp_dir: str,
     # training hp
@@ -336,8 +336,8 @@ def run(
     cfg = PretrainingConfig(
         train_fasta=train_fasta,
         val_fasta=val_fasta,
-        train_hdf5=train_hdf5,
-        val_hdf5=val_hdf5,
+        train_data_dir=train_data_dir,
+        val_data_dir=val_data_dir,
         load_all_in_memory=load_all_in_memory,
         ckp_dir=ckp_dir,
         max_length=max_length,
@@ -520,14 +520,14 @@ def get_yaml(output: Optional[str], force: bool):
         "  # Dataset loading strategy:\n"
         "  # - lazy_dataset: True  => tokenize on-the-fly from FASTA\n"
         "  #                          Slower iteration, no preprocessing needed\n"
-        "  # - lazy_dataset: False => load pre-tokenized HDF5 shards\n"
+        "  # - lazy_dataset: False => load pre-tokenized binary shards\n"
         "  #                          Faster iteration, requires preprocessing\n"
         "  # Important: To have the shards, you need to set pretrain_config.enable to True in the params.yaml file\n"
         "  # and run 'nanoplm data from-yaml' to create shards\n"
-        "  # or your need to run 'nanoplm data save-pretrain-dataset' using your desired FASTA file as input to create shards\n"
+        "  # or you need to run 'nanoplm data save-pretrain-dataset' using your desired FASTA file as input to create shards\n"
         "  lazy_dataset: False\n"
-        "  train_hdf5: \"output/data/pretrain_shards/train_hdf5\"\n"
-        "  val_hdf5: \"output/data/pretrain_shards/val_hdf5\"\n"
+        "  train_data_dir: \"output/data/pretrain_shards/train\"\n"
+        "  val_data_dir: \"output/data/pretrain_shards/val\"\n"
         "  load_all_in_memory: False\n"
         "\n"
         "  optimizer: \"adamw\" # adamw, stable_adamw\n"

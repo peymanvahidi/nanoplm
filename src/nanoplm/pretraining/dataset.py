@@ -1,6 +1,5 @@
 import os
 import torch
-import h5py
 import bisect
 import numpy as np
 from math import ceil
@@ -10,17 +9,16 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import shared_memory
+from concurrent.futures import ProcessPoolExecutor
 
 from nanoplm.utils import logger, create_dirs
 
 
 class SaveShardedFastaMLMDataset:
-    """Utility class to tokenize FASTA sequences and save them as HDF5 shards.
+    """Utility class to tokenize FASTA sequences and save them as flat binary shards.
 
     This class handles the preprocessing step: reading FASTA, tokenizing sequences,
-    and saving them to HDF5 files for fast loading during training.
+    and saving them to binary files (.bin + .idx) for fast loading during training.
 
     This is NOT a Dataset - it's a preprocessing utility that creates shards.
     """
@@ -40,7 +38,7 @@ class SaveShardedFastaMLMDataset:
             fasta_path: Path to input FASTA file
             tokenizer: Tokenizer to use for encoding sequences
             max_length: Maximum sequence length
-            output_dir: Directory to save HDF5 shards
+            output_dir: Directory to save binary shards
             samples_per_shard: Number of sequences per shard file
             max_workers: Number of parallel workers (-1 = all CPUs)
             force: If True, overwrite existing shards
@@ -81,25 +79,27 @@ class SaveShardedFastaMLMDataset:
         )
 
     def create_shards(self) -> List[Path]:
-        """Create HDF5 shards from FASTA sequences.
+        """Create binary shards from FASTA sequences.
 
         Returns:
-            List of paths to created shard files
+            List of paths to created shard .bin files
         """
         # Check if shards already exist
         shards_exist = (
-            self.output_dir.exists() and len(list(self.output_dir.glob("*.h5"))) > 0
+            self.output_dir.exists() and len(list(self.output_dir.glob("*.bin"))) > 0
         )
 
         if shards_exist and not self.force:
             raise FileExistsError(
-                f"HDF5 shards already exist in {self.output_dir}. "
+                f"Binary shards already exist in {self.output_dir}. "
                 f"Set force=True to overwrite them."
             )
 
         if shards_exist and self.force:
             logger.warning(f"Overwriting existing shards in {self.output_dir}")
-            for shard in self.output_dir.glob("*.h5"):
+            for shard in self.output_dir.glob("*.bin"):
+                shard.unlink()
+            for shard in self.output_dir.glob("*.idx.npy"):
                 shard.unlink()
 
         # Create output directory
@@ -138,90 +138,77 @@ class SaveShardedFastaMLMDataset:
             shard_paths = list(executor.map(process_shard, args))
 
         logger.info(
-            f"Successfully tokenized {total_seqs:,} sequences and saved to {len(shard_paths)} HDF5 shards in {self.output_dir}"
+            f"Successfully tokenized {total_seqs:,} sequences and saved to {len(shard_paths)} binary shards in {self.output_dir}"
         )
 
         return [Path(p) for p in shard_paths]
 
 
 class LoadShardedFastaMLMDataset(Dataset):
-    """Dataset for loading pre-tokenized sequences from HDF5 shards.
+    """Dataset for loading pre-tokenized sequences from flat binary shards via memmap.
 
-    Supports two modes:
-    - streaming (default)
-    - load_all_in_memory: read all shards into memory (dict) at init
+    Each shard consists of:
+    - shard_NNNN.bin: concatenated uint8 tokens (all sequences back-to-back)
+    - shard_NNNN.idx: numpy .npy file containing int32 array of sequence lengths
+
+    Uses np.memmap for zero-copy reads; forked DataLoader workers share physical
+    pages via OS page cache automatically.
     """
 
-    def __init__(self, hdf5_dir: str, load_all_in_memory: bool = False) -> None:
+    def __init__(self, data_dir: str, load_all_in_memory: bool = False) -> None:
         """
         Args:
-            hdf5_dir: Directory containing HDF5 shard files (*.h5)
-            load_all_in_memory: Whether to load all shards into memory (default: False)
+            data_dir: Directory containing binary shard files (*.bin + *.idx)
+            load_all_in_memory: Accepted for API compatibility but ignored
+                (memmap is already the optimal strategy)
         """
-        self.hdf5_dir = Path(hdf5_dir)
-        self._in_memory = bool(load_all_in_memory)
+        self.data_dir = Path(data_dir)
 
         # Validate directory exists
-        if not self.hdf5_dir.exists():
-            raise FileNotFoundError(f"HDF5 directory not found: {self.hdf5_dir}")
+        if not self.data_dir.exists():
+            raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
 
-        if not self.hdf5_dir.is_dir():
-            raise ValueError(f"Path is not a directory: {self.hdf5_dir}")
+        if not self.data_dir.is_dir():
+            raise ValueError(f"Path is not a directory: {self.data_dir}")
 
-        # Find all shard files
-        self.shard_paths = sorted(self.hdf5_dir.glob("*.h5"))
+        # Find all shard .bin files
+        bin_paths = sorted(self.data_dir.glob("*.bin"))
 
-        if len(self.shard_paths) == 0:
+        if len(bin_paths) == 0:
             raise FileNotFoundError(
-                f"No HDF5 shard files (*.h5) found in {self.hdf5_dir}"
+                f"No binary shard files (*.bin) found in {self.data_dir}"
             )
 
-        logger.info(f"Found {len(self.shard_paths)} HDF5 shards in {self.hdf5_dir}")
+        logger.info(f"Found {len(bin_paths)} binary shards in {self.data_dir}")
 
-        # Read shard lengths without keeping files open
-        self.lengths = []
-        for path in self.shard_paths:
-            with h5py.File(path, "r") as f:
-                self.lengths.append(len(f["input_ids"]))
+        # Load index files and create memmaps
+        self._mmaps: List[np.memmap] = []
+        self._offsets: List[np.ndarray] = []  # per-shard cumulative offsets
+        self._sizes: List[np.ndarray] = []  # per-shard sequence lengths
+        self.lengths: List[int] = []
+
+        for bin_path in bin_paths:
+            idx_path = bin_path.with_name(bin_path.stem + ".idx.npy")
+            if not idx_path.exists():
+                raise FileNotFoundError(
+                    f"Index file not found for shard: {idx_path}"
+                )
+
+            sizes = np.load(idx_path)  # int32 array of sequence lengths
+            offsets = np.concatenate([[0], np.cumsum(sizes)])
+
+            mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
+
+            self._mmaps.append(mmap)
+            self._offsets.append(offsets)
+            self._sizes.append(sizes)
+            self.lengths.append(len(sizes))
+
         self.cum_lengths = np.cumsum(self.lengths)
 
         logger.info(
-            f"Loaded {int(self.cum_lengths[-1]):,} pre-tokenized sequences from {len(self.shard_paths)} shards"
+            f"Loaded {int(self.cum_lengths[-1]):,} pre-tokenized sequences from {len(bin_paths)} shards"
         )
-
-        if self._in_memory:
-            self._load_shards_in_shared_memory()
-
-    def _load_shards_in_shared_memory(self):
-        """Load shards into SharedMemory to avoid multiple copies."""
-        logger.info("Loading all shards into SharedMemory (parallel)...")
-        self._shm_input_ids: List[shared_memory.SharedMemory] = []
-        self._shm_attention_masks: List[shared_memory.SharedMemory] = []
-        self._shard_shapes: List[tuple] = []
-
-        num_shards = len(self.shard_paths)
-        try:
-            max_workers = max(1, min((os.cpu_count() or 1) // 2, num_shards))
-        except Exception:
-            max_workers = 1
-
-        futures_data = [None] * num_shards
-        with ProcessPoolExecutor(max_workers=max_workers) as exe:
-            futures = {exe.submit(_read_shard_for_worker_shm, str(p)): idx for idx, p in enumerate(self.shard_paths)}
-            for fut in tqdm(as_completed(futures), total=len(futures), desc="Loading shards", leave=False):
-                idx = futures[fut]
-                futures_data[idx] = fut.result()
-
-        # Attach to SharedMemory blocks created by workers (no data copy needed)
-        for shm_in_name, shm_mask_name, shape in futures_data:
-            shm_in = shared_memory.SharedMemory(name=shm_in_name, create=False)
-            shm_mask = shared_memory.SharedMemory(name=shm_mask_name, create=False)
-
-            self._shm_input_ids.append(shm_in)
-            self._shm_attention_masks.append(shm_mask)
-            self._shard_shapes.append(shape)
-
-        logger.info("SharedMemory shards loaded.")
 
     def __len__(self) -> int:
         return int(self.cum_lengths[-1])
@@ -234,19 +221,12 @@ class LoadShardedFastaMLMDataset(Dataset):
 
         shard_idx, local_idx = self._get_shard(idx)
 
-        # In-memory fast path
-        if self._in_memory:
-            shape = self._shard_shapes[shard_idx]
-            inputs_shm = np.ndarray(shape, dtype=np.uint8, buffer=self._shm_input_ids[shard_idx].buf)
-            masks_shm = np.ndarray(shape, dtype=np.uint8, buffer=self._shm_attention_masks[shard_idx].buf)
+        offsets = self._offsets[shard_idx]
+        start = int(offsets[local_idx])
+        end = int(offsets[local_idx + 1])
 
-            input_ids = torch.tensor(inputs_shm[local_idx], dtype=torch.uint8)
-            attention_mask = torch.tensor(masks_shm[local_idx], dtype=torch.uint8)
-            return {"input_ids": input_ids, "attention_mask": attention_mask}
-
-        # Streaming path: open file on-demand
-        with h5py.File(self.shard_paths[shard_idx], "r") as f:
-            input_ids = torch.tensor(f["input_ids"][local_idx], dtype=torch.uint8)
+        raw = self._mmaps[shard_idx][start:end]
+        input_ids = torch.tensor(np.array(raw), dtype=torch.long)
 
         # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding (pad_token_id=0)
         attention_mask = (input_ids != 0).to(torch.uint8)
@@ -264,12 +244,11 @@ class LoadShardedFastaMLMDataset(Dataset):
         return shard_idx, idx
 
     def cleanup(self):
-        """Release all SharedMemory blocks."""
-        if self._in_memory:
-            for shm in self._shm_input_ids + self._shm_attention_masks:
-                shm.close()
-                shm.unlink()
-                
+        """Release memmap objects (public API, kept for compatibility)."""
+        for mmap in self._mmaps:
+            del mmap
+        self._mmaps = []
+
 
 class LazyFastaMLMDataset(Dataset):
     """FASTA dataset that tokenizes sequences lazily for MLM pretraining.
@@ -336,8 +315,6 @@ class LazyFastaMLMDataset(Dataset):
         finally:
             index.close()
 
-        # sequence = self.tokenizer.preprocess(sequence)
-
         encoding = self.tokenizer(
             sequence,
             add_special_tokens=True,
@@ -361,8 +338,10 @@ def process_shard(args):
     # Each process must open its own index
     index = SeqIO.index_db(db_path, [fasta_path], "fasta")
 
-    shard_path = Path(output_dir) / f"shard_{shard_idx:04d}.h5"
-    input_ids_list = []
+    bin_path = Path(output_dir) / f"shard_{shard_idx:04d}.bin"
+    idx_path = Path(output_dir) / f"shard_{shard_idx:04d}.idx.npy"
+
+    token_arrays = []
 
     for key in tqdm(shard_keys, desc=f"Tokenizing shard {shard_idx}", leave=False):
         record = index[key]
@@ -377,52 +356,17 @@ def process_shard(args):
             return_tensors="pt",
         )
 
-        input_ids_list.append(encoding["input_ids"].squeeze(0))
+        token_arrays.append(encoding["input_ids"].squeeze(0).numpy().astype(np.uint8))
 
-    # Write results
-    with h5py.File(shard_path, "w") as h5f:
-        total = len(input_ids_list)
-        h5f.create_dataset(
-            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.uint8)
-        )
+    # Build sizes array (int32)
+    sizes = np.array([len(a) for a in token_arrays], dtype=np.int32)
 
-        for i in tqdm(range(total), desc=f"Writing Shard {shard_idx}", leave=False):
-            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.uint8)
+    # Concatenate all tokens and write .bin
+    all_tokens = np.concatenate(token_arrays)
+    all_tokens.tofile(str(bin_path))
+
+    # Save sizes as .npy (the .idx file)
+    np.save(str(idx_path), sizes)
 
     index.close()
-    return str(shard_path)
-
-
-def _read_shard_for_worker_shm(path_str: str):
-    """Read a shard directly into SharedMemory, return metadata only.
-
-    Allocates SharedMemory in the worker process and populates it from HDF5,
-    avoiding pickle serialization of large numpy arrays across the process boundary.
-    Returns only lightweight metadata (names + shape, ~200 bytes).
-    """
-    path = Path(path_str)
-    with h5py.File(path, "r") as f:
-        n = len(f["input_ids"])
-        shard_arrays = [np.array(f["input_ids"][i], dtype=np.uint8) for i in range(n)]
-        max_len = max(a.shape[0] for a in shard_arrays)
-
-    shape = (n, max_len)
-    nbytes = n * max_len  # uint8: 1 byte per element
-
-    shm_in = shared_memory.SharedMemory(create=True, size=nbytes)
-    shm_mask = shared_memory.SharedMemory(create=True, size=nbytes)
-
-    inputs = np.ndarray(shape, dtype=np.uint8, buffer=shm_in.buf)
-    masks = np.ndarray(shape, dtype=np.uint8, buffer=shm_mask.buf)
-    inputs[:] = 0
-    masks[:] = 0
-
-    for i, arr in enumerate(shard_arrays):
-        inputs[i, :len(arr)] = arr
-        masks[i, :len(arr)] = 1
-
-    shm_in_name, shm_mask_name = shm_in.name, shm_mask.name
-    shm_in.close()
-    shm_mask.close()
-
-    return shm_in_name, shm_mask_name, shape
+    return str(bin_path)

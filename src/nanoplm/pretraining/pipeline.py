@@ -35,8 +35,8 @@ class PretrainingConfig:
     batch_size: int = 32
     num_epochs: int = 10
     lazy_dataset: bool = False
-    train_hdf5: str = "output/data/split/train_hdf5"
-    val_hdf5: str = "output/data/split/val_hdf5"
+    train_data_dir: str = "output/data/split/train_shards"
+    val_data_dir: str = "output/data/split/val_shards"
     load_all_in_memory: bool = False
     warmup_ratio: float = 0.05
     optimizer: str = "adamw"
@@ -188,24 +188,24 @@ def run_pretraining(
             tokenizer=tokenizer,
         )
     else:
-        if pretrain_config.train_hdf5 is None or pretrain_config.val_hdf5 is None:
-            raise ValueError("Train and validation HDF5 directories are required when lazy-dataset mode is disabled")
-        if not Path(pretrain_config.train_hdf5).exists():
-            raise FileNotFoundError(f"Train HDF5 directory not found: {pretrain_config.train_hdf5}")
-        if not Path(pretrain_config.val_hdf5).exists():
-            raise FileNotFoundError(f"Validation HDF5 directory not found: {pretrain_config.val_hdf5}")
+        if pretrain_config.train_data_dir is None or pretrain_config.val_data_dir is None:
+            raise ValueError("Train and validation data directories are required when lazy-dataset mode is disabled")
+        if not Path(pretrain_config.train_data_dir).exists():
+            raise FileNotFoundError(f"Train data directory not found: {pretrain_config.train_data_dir}")
+        if not Path(pretrain_config.val_data_dir).exists():
+            raise FileNotFoundError(f"Validation data directory not found: {pretrain_config.val_data_dir}")
 
-        # Load pre-tokenized HDF5 shards
-        logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
-        logger.info(f"Expected train shards: {pretrain_config.train_hdf5}")
-        logger.info(f"Expected val shards: {pretrain_config.val_hdf5}")
+        # Load pre-tokenized binary shards
+        logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized binary shards")
+        logger.info(f"Expected train shards: {pretrain_config.train_data_dir}")
+        logger.info(f"Expected val shards: {pretrain_config.val_data_dir}")
 
         try:
-            train_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.train_hdf5, load_all_in_memory=pretrain_config.load_all_in_memory)
-            val_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.val_hdf5, load_all_in_memory=pretrain_config.load_all_in_memory)
+            train_ds = LoadShardedFastaMLMDataset(data_dir=pretrain_config.train_data_dir, load_all_in_memory=pretrain_config.load_all_in_memory)
+            val_ds = LoadShardedFastaMLMDataset(data_dir=pretrain_config.val_data_dir, load_all_in_memory=pretrain_config.load_all_in_memory)
         except FileNotFoundError as e:
             logger.error(
-                f"HDF5 shards not found! You need to create them first.\n"
+                f"Binary shards not found! You need to create them first.\n"
                 f"Run: nanoplm data from-yaml --pretrain <your_data_config.yaml>\n"
                 f"Or set lazy_dataset=True in your pretrain.yaml to use on-the-fly tokenization.\n"
                 f"Error: {e}"
