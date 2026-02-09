@@ -4,7 +4,7 @@ import bisect
 import numpy as np
 from math import ceil
 from Bio import SeqIO
-from typing import List, Dict
+from typing import List, Dict, Optional
 from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import Dataset
@@ -149,18 +149,28 @@ class LoadShardedFastaMLMDataset(Dataset):
 
     Each shard consists of:
     - shard_NNNN.bin: concatenated uint8 tokens (all sequences back-to-back)
-    - shard_NNNN.idx: numpy .npy file containing int32 array of sequence lengths
+    - shard_NNNN.idx.npy: numpy .npy file containing int32 array of sequence lengths
 
-    Uses np.memmap for zero-copy reads; forked DataLoader workers share physical
-    pages via OS page cache automatically.
+    Uses np.memmap for zero-copy reads. Memmaps are created lazily so that
+    spawn-based DataLoader workers (macOS default) only pickle lightweight
+    metadata (paths + offsets), not the mapped data itself.
     """
 
     def __init__(self, data_dir: str, load_all_in_memory: bool = False) -> None:
         """
         Args:
-            data_dir: Directory containing binary shard files (*.bin + *.idx)
+            data_dir: Directory containing binary shard files (*.bin + *.idx.npy)
             load_all_in_memory: Accepted for API compatibility but ignored
                 (memmap is already the optimal strategy)
+        """
+        self._init_dataset(str(data_dir), log=True)
+
+    def _init_dataset(self, data_dir: str, log: bool = False) -> None:
+        """Shared init logic (called from __init__ and __setstate__).
+
+        Args:
+            data_dir: Path to the shard directory.
+            log: Whether to emit log messages (suppressed in DataLoader workers).
         """
         self.data_dir = Path(data_dir)
 
@@ -171,44 +181,65 @@ class LoadShardedFastaMLMDataset(Dataset):
         if not self.data_dir.is_dir():
             raise ValueError(f"Path is not a directory: {self.data_dir}")
 
-        # Find all shard .bin files
-        bin_paths = sorted(self.data_dir.glob("*.bin"))
+        # Find all shard .bin files — store paths as strings for safe pickling
+        self._bin_paths: List[str] = [
+            str(p) for p in sorted(self.data_dir.glob("*.bin"))
+        ]
 
-        if len(bin_paths) == 0:
+        if len(self._bin_paths) == 0:
             raise FileNotFoundError(
                 f"No binary shard files (*.bin) found in {self.data_dir}"
             )
 
-        logger.info(f"Found {len(bin_paths)} binary shards in {self.data_dir}")
+        if log:
+            logger.info(f"Found {len(self._bin_paths)} binary shards in {self.data_dir}")
 
-        # Load index files and create memmaps
-        self._mmaps: List[np.memmap] = []
-        self._offsets: List[np.ndarray] = []  # per-shard cumulative offsets
-        self._sizes: List[np.ndarray] = []  # per-shard sequence lengths
+        # Load index files (small arrays, always kept in memory)
+        self._offsets: List[np.ndarray] = []  # per-shard cumulative byte offsets
         self.lengths: List[int] = []
 
-        for bin_path in bin_paths:
+        for bin_path_str in self._bin_paths:
+            bin_path = Path(bin_path_str)
             idx_path = bin_path.with_name(bin_path.stem + ".idx.npy")
             if not idx_path.exists():
                 raise FileNotFoundError(
                     f"Index file not found for shard: {idx_path}"
                 )
 
-            sizes = np.load(idx_path)  # int32 array of sequence lengths
+            sizes = np.load(str(idx_path))  # int32 array of sequence lengths
             offsets = np.concatenate([[0], np.cumsum(sizes)])
 
-            mmap = np.memmap(bin_path, dtype=np.uint8, mode="r")
-
-            self._mmaps.append(mmap)
             self._offsets.append(offsets)
-            self._sizes.append(sizes)
             self.lengths.append(len(sizes))
 
         self.cum_lengths = np.cumsum(self.lengths)
 
-        logger.info(
-            f"Loaded {int(self.cum_lengths[-1]):,} pre-tokenized sequences from {len(bin_paths)} shards"
-        )
+        # Memmaps created lazily per-process (not here)
+        self._mmaps: Optional[List[np.memmap]] = None
+
+        if log:
+            logger.info(
+                f"Loaded {int(self.cum_lengths[-1]):,} pre-tokenized sequences from {len(self._bin_paths)} shards"
+            )
+
+    # -- Pickle support for spawn-based DataLoader workers (macOS default) --
+    # Without this, pickling serializes the entire memmap data to each worker.
+    # With this, only the directory path is pickled; memmaps are re-created lazily.
+
+    def __getstate__(self) -> str:
+        return str(self.data_dir)
+
+    def __setstate__(self, state: str) -> None:
+        self._init_dataset(state, log=False)
+
+    # -- Lazy memmap creation --
+
+    def _ensure_mmaps(self) -> None:
+        """Create memmap objects on first access (once per process)."""
+        if self._mmaps is None:
+            self._mmaps = [
+                np.memmap(p, dtype=np.uint8, mode="r") for p in self._bin_paths
+            ]
 
     def __len__(self) -> int:
         return int(self.cum_lengths[-1])
@@ -219,6 +250,8 @@ class LoadShardedFastaMLMDataset(Dataset):
                 f"Index {idx} out of bounds for dataset of size {len(self)}"
             )
 
+        self._ensure_mmaps()
+
         shard_idx, local_idx = self._get_shard(idx)
 
         offsets = self._offsets[shard_idx]
@@ -226,7 +259,7 @@ class LoadShardedFastaMLMDataset(Dataset):
         end = int(offsets[local_idx + 1])
 
         raw = self._mmaps[shard_idx][start:end]
-        input_ids = torch.tensor(np.array(raw), dtype=torch.long)
+        input_ids = torch.from_numpy(raw.copy())  # single copy, stays uint8
 
         # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding (pad_token_id=0)
         attention_mask = (input_ids != 0).to(torch.uint8)
@@ -245,9 +278,10 @@ class LoadShardedFastaMLMDataset(Dataset):
 
     def cleanup(self):
         """Release memmap objects (public API, kept for compatibility)."""
-        for mmap in self._mmaps:
-            del mmap
-        self._mmaps = []
+        if self._mmaps is not None:
+            for mmap in self._mmaps:
+                del mmap
+            self._mmaps = None
 
 
 class LazyFastaMLMDataset(Dataset):
