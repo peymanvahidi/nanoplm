@@ -16,7 +16,7 @@ from nanoplm.data.filterer import Filterer, FilterError
 from nanoplm.data.splitor import Splitor, SplitError
 from nanoplm.data.dataset import SaveKDDataset, shard_h5_file
 from nanoplm.models.teacher import ProtT5
-from nanoplm.pretraining.dataset import SaveShardedFastaMLMDataset
+from nanoplm.pretraining.dataset import ShardWriter
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 from nanoplm.utils import create_dirs
@@ -558,7 +558,7 @@ def save_pretrain_dataset(
     tokenizer = ProtModernBertTokenizer()
 
     click.echo("Creating binary shards for pretraining")
-    saver = SaveShardedFastaMLMDataset(
+    saver = ShardWriter(
         fasta_path=str(input_path),
         tokenizer=tokenizer,
         max_length=max_seq_len,
@@ -990,7 +990,7 @@ def from_yaml(
         tokenizer = ProtModernBertTokenizer()
 
         click.echo("Creating binary shards for training dataset...")
-        train_saver = SaveShardedFastaMLMDataset(
+        train_saver = ShardWriter(
             fasta_path=str(train_fasta),
             tokenizer=tokenizer,
             max_length=max_seq_len,
@@ -1002,7 +1002,7 @@ def from_yaml(
         train_shards = train_saver.create_shards()
 
         click.echo("Creating binary shards for validation dataset...")
-        val_saver = SaveShardedFastaMLMDataset(
+        val_saver = ShardWriter(
             fasta_path=str(val_fasta),
             tokenizer=tokenizer,
             max_length=max_seq_len,

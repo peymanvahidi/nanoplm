@@ -6,15 +6,15 @@ import numpy as np
 from pathlib import Path
 
 from nanoplm.pretraining.dataset import (
-    LazyFastaMLMDataset,
-    SaveShardedFastaMLMDataset,
-    LoadShardedFastaMLMDataset,
+    LazyFastaDataset,
+    ShardWriter,
+    ShardedDataset,
 )
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 
-class TestLazyFastaMLMDataset:
-    """Test suite for LazyFastaMLMDataset."""
+class TestLazyFastaDataset:
+    """Test suite for LazyFastaDataset."""
 
     @pytest.fixture
     def sample_fasta_content(self):
@@ -43,7 +43,7 @@ MAIGT
 
     def test_dataset_creation(self, temp_fasta_file, tokenizer):
         """Test basic dataset creation and properties."""
-        dataset = LazyFastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=128,
@@ -54,7 +54,7 @@ MAIGT
 
     def test_dataset_getitem(self, temp_fasta_file, tokenizer):
         """Test accessing individual sequences."""
-        dataset = LazyFastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=128,
@@ -69,7 +69,7 @@ MAIGT
 
     def test_dataset_out_of_bounds(self, temp_fasta_file, tokenizer):
         """Test error handling for out-of-bounds access."""
-        dataset = LazyFastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=128,
@@ -92,7 +92,7 @@ MAIGT
 
         try:
             with pytest.raises(ValueError, match="FASTA file is empty"):
-                LazyFastaMLMDataset(
+                LazyFastaDataset(
                     fasta_path=empty_path,
                     tokenizer=tokenizer,
                     max_length=128,
@@ -132,7 +132,7 @@ MAIGTMAIGTMAIGT
     def test_create_and_load_shards(self, temp_fasta_file, tokenizer):
         """Test creating binary shards then loading them."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            saver = SaveShardedFastaMLMDataset(
+            saver = ShardWriter(
                 fasta_path=temp_fasta_file,
                 tokenizer=tokenizer,
                 max_length=128,
@@ -152,7 +152,7 @@ MAIGTMAIGTMAIGT
                 assert idx_file.exists(), f"Idx file should exist: {idx_file}"
 
             # Load the shards
-            dataset = LoadShardedFastaMLMDataset(data_dir=tmpdir)
+            dataset = ShardedDataset(data_dir=tmpdir)
             assert len(dataset) == 3
 
             # Access each sample
@@ -166,7 +166,7 @@ MAIGTMAIGTMAIGT
     def test_force_overwrite(self, temp_fasta_file, tokenizer):
         """Test force overwrite of existing shards."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            saver = SaveShardedFastaMLMDataset(
+            saver = ShardWriter(
                 fasta_path=temp_fasta_file,
                 tokenizer=tokenizer,
                 max_length=128,
@@ -178,7 +178,7 @@ MAIGTMAIGTMAIGT
 
             # Without force, should raise
             with pytest.raises(FileExistsError):
-                saver2 = SaveShardedFastaMLMDataset(
+                saver2 = ShardWriter(
                     fasta_path=temp_fasta_file,
                     tokenizer=tokenizer,
                     max_length=128,
@@ -190,7 +190,7 @@ MAIGTMAIGTMAIGT
                 saver2.create_shards()
 
             # With force, should succeed
-            saver3 = SaveShardedFastaMLMDataset(
+            saver3 = ShardWriter(
                 fasta_path=temp_fasta_file,
                 tokenizer=tokenizer,
                 max_length=128,
@@ -204,18 +204,18 @@ MAIGTMAIGTMAIGT
     def test_missing_directory(self):
         """Test loading from non-existent directory."""
         with pytest.raises(FileNotFoundError):
-            LoadShardedFastaMLMDataset(data_dir="/nonexistent/path")
+            ShardedDataset(data_dir="/nonexistent/path")
 
     def test_empty_directory(self):
         """Test loading from empty directory."""
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(FileNotFoundError, match="No binary shard files"):
-                LoadShardedFastaMLMDataset(data_dir=tmpdir)
+                ShardedDataset(data_dir=tmpdir)
 
     def test_out_of_bounds(self, temp_fasta_file, tokenizer):
         """Test out-of-bounds access on loaded shards."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            saver = SaveShardedFastaMLMDataset(
+            saver = ShardWriter(
                 fasta_path=temp_fasta_file,
                 tokenizer=tokenizer,
                 max_length=128,
@@ -224,7 +224,7 @@ MAIGTMAIGTMAIGT
                 max_workers=1,
             )
             saver.create_shards()
-            dataset = LoadShardedFastaMLMDataset(data_dir=tmpdir)
+            dataset = ShardedDataset(data_dir=tmpdir)
 
             with pytest.raises(IndexError):
                 dataset[-1]
@@ -234,14 +234,14 @@ MAIGTMAIGTMAIGT
 
     def test_consistency_with_lazy_dataset(self, temp_fasta_file, tokenizer):
         """Test that binary shards produce the same tokens as lazy dataset."""
-        lazy_ds = LazyFastaMLMDataset(
+        lazy_ds = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=128,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            saver = SaveShardedFastaMLMDataset(
+            saver = ShardWriter(
                 fasta_path=temp_fasta_file,
                 tokenizer=tokenizer,
                 max_length=128,
@@ -250,7 +250,7 @@ MAIGTMAIGTMAIGT
                 max_workers=1,
             )
             saver.create_shards()
-            shard_ds = LoadShardedFastaMLMDataset(data_dir=tmpdir)
+            shard_ds = ShardedDataset(data_dir=tmpdir)
 
             assert len(lazy_ds) == len(shard_ds), "Datasets should have same length"
 

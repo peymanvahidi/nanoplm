@@ -14,7 +14,7 @@ from concurrent.futures import ProcessPoolExecutor
 from nanoplm.utils import logger, create_dirs
 
 
-class SaveShardedFastaMLMDataset:
+class ShardWriter:
     """Utility class to tokenize FASTA sequences and save them as flat binary shards.
 
     This class handles the preprocessing step: reading FASTA, tokenizing sequences,
@@ -144,7 +144,7 @@ class SaveShardedFastaMLMDataset:
         return [Path(p) for p in shard_paths]
 
 
-class LoadShardedFastaMLMDataset(Dataset):
+class ShardedDataset(Dataset):
     """Dataset for loading pre-tokenized sequences from flat binary shards via memmap.
 
     Each shard consists of:
@@ -284,7 +284,7 @@ class LoadShardedFastaMLMDataset(Dataset):
             self._mmaps = None
 
 
-class LazyFastaMLMDataset(Dataset):
+class LazyFastaDataset(Dataset):
     """FASTA dataset that tokenizes sequences lazily for MLM pretraining.
 
     Uses an on-disk index for random access and defers padding to the collator.

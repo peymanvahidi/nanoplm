@@ -18,8 +18,8 @@ from nanoplm.pretraining.models.modern_bert import (
     ProtModernBertTokenizer,
 )
 from nanoplm.pretraining.dataset import (
-    LazyFastaMLMDataset,
-    LoadShardedFastaMLMDataset,
+    LazyFastaDataset,
+    ShardedDataset,
 )
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.utils.logger import logger
@@ -180,7 +180,7 @@ def run_pretraining(
             raise FileNotFoundError(f"Validation FASTA file not found: {pretrain_config.val_fasta}")
 
         # Use lazy loading: tokenize on-the-fly from FASTA
-        logger.info("Using LazyFastaMLMDataset for on-the-fly tokenization")
+        logger.info("Using LazyFastaDataset for on-the-fly tokenization")
         train_ds, val_ds = _create_lazy_datasets(
             train_fasta=pretrain_config.train_fasta,
             val_fasta=pretrain_config.val_fasta,
@@ -196,13 +196,13 @@ def run_pretraining(
             raise FileNotFoundError(f"Validation data directory not found: {pretrain_config.val_data_dir}")
 
         # Load pre-tokenized binary shards
-        logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized binary shards")
+        logger.info("Using ShardedDataset for pre-tokenized binary shards")
         logger.info(f"Expected train shards: {pretrain_config.train_data_dir}")
         logger.info(f"Expected val shards: {pretrain_config.val_data_dir}")
 
         try:
-            train_ds = LoadShardedFastaMLMDataset(data_dir=pretrain_config.train_data_dir, load_all_in_memory=pretrain_config.load_all_in_memory)
-            val_ds = LoadShardedFastaMLMDataset(data_dir=pretrain_config.val_data_dir, load_all_in_memory=pretrain_config.load_all_in_memory)
+            train_ds = ShardedDataset(data_dir=pretrain_config.train_data_dir, load_all_in_memory=pretrain_config.load_all_in_memory)
+            val_ds = ShardedDataset(data_dir=pretrain_config.val_data_dir, load_all_in_memory=pretrain_config.load_all_in_memory)
         except FileNotFoundError as e:
             logger.error(
                 f"Binary shards not found! You need to create them first.\n"
@@ -384,13 +384,13 @@ def _create_lazy_datasets(
     tokenizer: ProtModernBertTokenizer,
 ) -> Tuple[Dataset, Optional[Dataset]]:
 
-    train_ds = LazyFastaMLMDataset(
+    train_ds = LazyFastaDataset(
         fasta_path=train_fasta,
         tokenizer=tokenizer,
         max_length=max_length,
     )
 
-    val_ds = LazyFastaMLMDataset(
+    val_ds = LazyFastaDataset(
         fasta_path=val_fasta,
         tokenizer=tokenizer,
         max_length=max_length,

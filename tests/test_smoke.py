@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM
-from nanoplm.pretraining.dataset import LazyFastaMLMDataset
+from nanoplm.pretraining.dataset import LazyFastaDataset
 from transformers import DataCollatorForLanguageModeling
 
 
@@ -85,7 +85,7 @@ MVLSPA
 
             try:
                 tokenizer = ProtModernBertTokenizer()
-                dataset = LazyFastaMLMDataset(
+                dataset = LazyFastaDataset(
                     fasta_path=temp_path,
                     tokenizer=tokenizer,
                     max_length=32
@@ -208,7 +208,7 @@ MVLSPA
             try:
                 # Create components
                 tokenizer = ProtModernBertTokenizer()
-                dataset = LazyFastaMLMDataset(
+                dataset = LazyFastaDataset(
                     fasta_path=temp_path,
                     tokenizer=tokenizer,
                     max_length=16
