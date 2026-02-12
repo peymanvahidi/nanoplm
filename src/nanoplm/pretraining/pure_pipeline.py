@@ -23,9 +23,8 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
-from nanoplm.data.validation import ValidationError, validate_pretrain_dataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from nanoplm.pretraining.dataset import LoadShardedFastaMLMDataset
+from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
@@ -276,45 +275,37 @@ def run_pure_pretraining(
     device = torch.device(get_device())
 
     dataset_dir = Path(pretrain_config.dataset_dir)
-    logger.info(f"Validating pretraining dataset at {dataset_dir}...")
-    try:
-        validation = validate_pretrain_dataset(dataset_dir)
-        logger.info(
-            "Dataset validated: "
-            f"{validation['manifest']['train_sequences']:,} train, "
-            f"{validation['manifest']['val_sequences']:,} val sequences"
-        )
-    except (ValidationError, FileNotFoundError):
-        raise
 
     manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
 
-    train_hdf5_dir = dataset_dir / manifest.train_dir
-    val_hdf5_dir = dataset_dir / manifest.val_dir
+    train_shard_dir = dataset_dir / manifest.train_dir
+    val_shard_dir = dataset_dir / manifest.val_dir
     train_sequences = manifest.train_sequences
 
     logger.info(f"Loaded config from manifest: {dataset_dir}")
-    logger.info(f"  train_hdf5: {train_hdf5_dir}")
-    logger.info(f"  val_hdf5: {val_hdf5_dir}")
+    logger.info(f"  train_shards: {train_shard_dir}")
+    logger.info(f"  val_shards: {val_shard_dir}")
     logger.info(f"  max_length: {manifest.max_seq_len}")
     logger.info(f"  train_sequences: {manifest.train_sequences}")
     logger.info(f"  val_sequences: {manifest.val_sequences}")
 
-    if not train_hdf5_dir.exists():
-        raise FileNotFoundError(f"Train HDF5 directory not found: {train_hdf5_dir}")
-    if not val_hdf5_dir.exists():
-        raise FileNotFoundError(f"Validation HDF5 directory not found: {val_hdf5_dir}")
+    if not train_shard_dir.exists():
+        raise FileNotFoundError(f"Train shard directory not found: {train_shard_dir}")
+    if not val_shard_dir.exists():
+        raise FileNotFoundError(f"Validation shard directory not found: {val_shard_dir}")
 
-    logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
-    train_ds = LoadShardedFastaMLMDataset(
-        hdf5_dir=str(train_hdf5_dir),
-        load_all_in_memory=pretrain_config.load_all_in_memory,
-    )
-    val_ds = LoadShardedFastaMLMDataset(
-        hdf5_dir=str(val_hdf5_dir),
-        load_all_in_memory=pretrain_config.load_all_in_memory,
-    )
+    logger.info("Using ShardedDataset for pre-tokenized binary shards")
+    try:
+        train_ds = ShardedDataset(data_dir=str(train_shard_dir))
+        val_ds = ShardedDataset(data_dir=str(val_shard_dir))
+    except FileNotFoundError as e:
+        logger.error(
+            f"Binary shards not found! You need to create them first.\n"
+            f"Run: nanoplm data from-yaml with pipeline_mode: 'pretrain'\n"
+            f"Error: {e}"
+        )
+        raise
 
     collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
