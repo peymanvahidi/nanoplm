@@ -60,3 +60,6 @@ htmlcov/
 .pytest_cache/
 
 scripts/
+
+# Planning directory (local only)
+.planning/

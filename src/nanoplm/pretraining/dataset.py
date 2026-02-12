@@ -12,6 +12,7 @@ from transformers import PreTrainedTokenizer
 from concurrent.futures import ProcessPoolExecutor
 
 from nanoplm.utils import logger, create_dirs
+from nanoplm.data.file_pool import ThreadSafeFileHandlePool, detect_file_limits
 
 
 class ShardWriter:
@@ -174,6 +175,14 @@ class ShardedDataset(Dataset):
         """
         self.data_dir = Path(data_dir)
 
+        # Auto-detect file limits if not specified
+        if max_open_files is None:
+            max_open_files = detect_file_limits(num_workers=1)
+        self.max_open_files = max_open_files
+
+        # File handle pool (created per-worker or on first access)
+        self._worker_pool: Optional[ThreadSafeFileHandlePool] = None
+
         # Validate directory exists
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
@@ -283,6 +292,9 @@ class ShardedDataset(Dataset):
                 del mmap
             self._mmaps = None
 
+    def _get_worker_pool(self) -> ThreadSafeFileHandlePool:
+        """
+        Get or create the file handle pool for this worker.
 
 class LazyFastaDataset(Dataset):
     """FASTA dataset that tokenizes sequences lazily for MLM pretraining.
@@ -290,53 +302,85 @@ class LazyFastaDataset(Dataset):
     Uses an on-disk index for random access and defers padding to the collator.
     """
 
-    def __init__(
-        self,
-        fasta_path: str,
-        tokenizer: PreTrainedTokenizer,
-        max_length: int,
-    ) -> None:
-        self.fasta_path = str(fasta_path)
-        self.tokenizer = tokenizer
-        self.max_length = int(max_length)
+        Returns:
+            ThreadSafeFileHandlePool: The file handle pool for this worker
+        """
+        if self._worker_pool is None:
+            self._worker_pool = ThreadSafeFileHandlePool(max_open_files=self.max_open_files)
+            logger.debug(f"Created file handle pool with max_open_files={self.max_open_files}")
+        return self._worker_pool
 
-        # Validate that the FASTA file exists and is readable
-        fasta_path_obj = Path(self.fasta_path)
-        if not fasta_path_obj.exists():
-            raise FileNotFoundError(f"FASTA file not found: {self.fasta_path}")
+    def __getstate__(self):
+        """
+        Prepare state for pickling (DataLoader multiprocessing).
 
-        if not fasta_path_obj.is_file():
-            raise ValueError(f"Path is not a file: {self.fasta_path}")
+        File handles cannot be pickled, so we clear the worker pool.
+        It will be recreated per-worker via worker_init_fn.
+        """
+        state = self.__dict__.copy()
+        state['_worker_pool'] = None  # Don't pickle file handles
+        return state
 
-        if not os.access(self.fasta_path, os.R_OK):
-            raise PermissionError(f"FASTA file is not readable: {self.fasta_path}")
+    def __setstate__(self, state):
+        """
+        Restore state after unpickling.
 
-        # Check if the file has any content
-        if fasta_path_obj.stat().st_size == 0:
-            raise ValueError(f"FASTA file is empty: {self.fasta_path}")
+        The worker pool will be recreated on first access in each worker.
+        """
+        self.__dict__.update(state)
+        # Pool will be created via _get_worker_pool() or worker_init_fn
 
-        # Create or open a persistent SQLite-backed index for random access.
-        # This avoids storing all sequences in RAM.
-        self._db_path = f"{self.fasta_path}.idx"
+    def read_batch_vectorized(self, indices: List[int]) -> Dict[str, List[torch.Tensor]]:
+        """
+        Read multiple samples efficiently using vectorized HDF5 reads.
 
-        temp_index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
-        self._keys: List[str] = list(temp_index.keys())
-        temp_index.close()
+        For consecutive indices within the same shard, uses hyperslab selection
+        (slice) for efficient batch reads. For non-consecutive or cross-shard
+        access, falls back to grouped individual reads.
 
-        if len(self._keys) == 0:
-            raise ValueError(f"No sequences found in FASTA: {self.fasta_path}")
+        Args:
+            indices: List of global sample indices to read
 
-        logger.info(
-            f"Loaded FASTA: {self.fasta_path} with {len(self._keys):,} sequences (max_length={self.max_length})."
-        )
+        Returns:
+            Dict with keys:
+                - 'input_ids': List of tensors (one per sample)
+                - 'attention_mask': List of tensors (one per sample)
 
-    def __len__(self) -> int:
-        return len(self._keys)
+        Example:
+            >>> dataset = LoadShardedFastaMLMDataset("data/shards")
+            >>> batch = dataset.read_batch_vectorized([0, 1, 2, 3])
+            >>> print(len(batch['input_ids']))  # 4
+        """
+        if self._in_memory:
+            # For in-memory mode, just use regular indexing
+            return {
+                'input_ids': [self[i]['input_ids'] for i in indices],
+                'attention_mask': [self[i]['attention_mask'] for i in indices],
+            }
 
-    def __getitem__(self, idx: int) -> Dict[str, List[int]]:
-        if idx < 0 or idx >= len(self._keys):
-            raise IndexError(
-                f"Index {idx} out of bounds for dataset of size {len(self)}"
+        # Group indices by shard
+        shard_groups = {}
+        for idx in indices:
+            shard_idx, local_idx = self._get_shard(idx)
+            if shard_idx not in shard_groups:
+                shard_groups[shard_idx] = []
+            shard_groups[shard_idx].append((idx, local_idx))
+
+        # Read from each shard
+        results = {}
+        pool = self._get_worker_pool()
+
+        for shard_idx, idx_pairs in shard_groups.items():
+            # Sort by local index to check for consecutive access
+            idx_pairs.sort(key=lambda x: x[1])
+            local_indices = [local_idx for _, local_idx in idx_pairs]
+
+            file_handle = pool.get_file(self.shard_paths[shard_idx])
+
+            # Check if indices are consecutive
+            is_consecutive = all(
+                local_indices[i] + 1 == local_indices[i + 1]
+                for i in range(len(local_indices) - 1)
             )
 
         key = self._keys[idx]
@@ -358,11 +402,10 @@ class LazyFastaDataset(Dataset):
             return_tensors="pt",
         )
 
+        # Return results in original order
         return {
-            "input_ids": encoding["input_ids"].squeeze(0),  # Remove batch dimension
-            "attention_mask": encoding["attention_mask"].squeeze(
-                0
-            ),  # Remove batch dimension
+            'input_ids': [results[idx]['input_ids'] for idx in indices],
+            'attention_mask': [results[idx]['attention_mask'] for idx in indices],
         }
 
 
