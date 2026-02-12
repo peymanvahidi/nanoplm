@@ -9,12 +9,9 @@ The existing HF-based ``ProtModernBertMLM`` in ``model.py`` is left
 completely untouched.
 """
 
-from dataclasses import dataclass
-
 from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertConfig,
     ModernBertForMaskedLM,
-    ModernBertSwiGLUMLP,
 )
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
@@ -32,6 +29,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             intermediate_size=config.intermediate_size,
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
+            mlp_activation=config.mlp_activation,
             max_position_embeddings=1024,  # hardcoded (matches HF wrapper)
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
@@ -46,9 +44,3 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
         )
 
         super().__init__(mb_config)
-
-        # Apply SwiGLU activation to MLP layers if specified
-        # (matches the monkey-patching in ProtModernBertMLM)
-        if config.mlp_activation.lower() == "swiglu":
-            for layer in self.model.layers:
-                layer.mlp = ModernBertSwiGLUMLP(mb_config)
