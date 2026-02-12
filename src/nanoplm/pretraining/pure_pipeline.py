@@ -212,11 +212,21 @@ def _hf_get_warmup_steps(num_training_steps: int, warmup_value: float) -> int:
     return math.ceil(num_training_steps * warmup_value)
 
 
+def _dist_barrier(local_rank: int) -> None:
+    """Distributed barrier that avoids NCCL device warning."""
+    if not dist.is_initialized():
+        return
+    if dist.get_backend() == "nccl":
+        dist.barrier(device_ids=[local_rank])
+    else:
+        dist.barrier()
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
+@torch.inference_mode()
 def _evaluate(
     model: torch.nn.Module,
     eval_loader: DataLoader,
@@ -229,7 +239,10 @@ def _evaluate(
     total_samples = 0
 
     for batch in eval_loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {
+            k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+            for k, v in batch.items()
+        }
         amp_ctx = (
             torch.autocast(device_type=device.type, dtype=amp_dtype)
             if amp_dtype is not None
@@ -461,15 +474,22 @@ def run_pure_pretraining(
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None
 
     # ---- DDP setup -------------------------------------------------------
-    local_rank = 0
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if pretrain_config.multi_gpu:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
         if not dist.is_initialized():
-            dist.init_process_group(backend=backend)
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        device = torch.device(f"cuda:{local_rank}")
+            if backend == "nccl":
+                dist.init_process_group(backend=backend, device_id=local_rank)
+            else:
+                dist.init_process_group(backend=backend)
         model.to(device)
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        if torch.cuda.is_available():
+            model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+        else:
+            model = DDP(model, find_unused_parameters=False)
         train_sampler = DistributedSampler(
             train_ds, shuffle=True, seed=pretrain_config.seed
         )
@@ -625,7 +645,10 @@ def run_pure_pretraining(
         for micro_step, batch in enumerate(train_loader):
             if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                 continue
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {
+                k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
+                for k, v in batch.items()
+            }
 
             # count tokens in this micro-batch
             if _raw_tok_count == 0:
@@ -754,28 +777,22 @@ def run_pure_pretraining(
                             f"[step {global_step}] eval_loss={eval_loss:.4f}"
                         )
                     model.train()
-                    if pretrain_config.multi_gpu and dist.is_initialized():
-                        dist.barrier()
 
                 # --- checkpoint ---
                 if global_step % save_steps == 0:
-                    if pretrain_config.multi_gpu and dist.is_initialized():
-                        dist.barrier()
                     if is_main:
                         _save_checkpoint(
                             model, optimizer, scheduler,
                             global_step, epoch, output_dir,
                             logging_steps, eval_steps, save_steps,
                         )
-                    if pretrain_config.multi_gpu and dist.is_initialized():
-                        dist.barrier()
 
         if resume_micro_step > 0 and epoch == resume_epoch:
             resume_micro_step = 0
 
     # ---- final save & cleanup --------------------------------------------
     if pretrain_config.multi_gpu and dist.is_initialized():
-        dist.barrier()
+        _dist_barrier(local_rank)
     if is_main:
         _save_checkpoint(
             model, optimizer, scheduler,
@@ -790,6 +807,6 @@ def run_pure_pretraining(
             except Exception as exc:
                 logger.warning(f"W&B finalize failed. Error: {exc}")
     if pretrain_config.multi_gpu and dist.is_initialized():
-        dist.barrier()
+        _dist_barrier(local_rank)
 
     logger.info("Pure-torch pretraining complete.")
