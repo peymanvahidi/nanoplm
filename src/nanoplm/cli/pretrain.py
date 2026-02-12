@@ -54,12 +54,6 @@ def pretrain():
     help="Path to dataset directory containing .data_manifest (from nanoplm data from-yaml)"
 )
 @click.option(
-    "--load-all-in-memory",
-    is_flag=True,
-    default=False,
-    help="Load all dataset in memory"
-)
-@click.option(
     "--ckp-dir",
     type=str,
     default="output/pretraining",
@@ -290,7 +284,6 @@ def pretrain():
 def run(
     # dataset/output
     dataset_dir: str,
-    load_all_in_memory: bool,
     ckp_dir: str,
     # training hp
     batch_size: int,
@@ -337,7 +330,6 @@ def run(
     # Build config from CLI arguments
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
-        load_all_in_memory=load_all_in_memory,
         ckp_dir=ckp_dir,
         batch_size=batch_size,
         num_epochs=num_epochs,
@@ -541,7 +533,6 @@ def get_yaml(output: Optional[str], force: bool):
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
-        "  # The manifest provides: max_length and HDF5 shard paths\n"
         "  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.\n"
         "  dataset_dir: \"output/data/pretrain_data\"\n"
         "\n"
@@ -549,10 +540,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
         "\n"
         "  # Hyperparameters\n"
-        "  # max_length: 512  # If not set, uses value from manifest\n"
         "  batch_size: 32\n"
         "  num_epochs: 10\n"
-        "  load_all_in_memory: True\n # Set to False if you don't have enough RAM\n"
         "\n"
         "  optimizer: \"adamw\"  # adamw, stable_adamw\n"
         "  adam_beta1: 0.9\n"
@@ -643,7 +632,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'load_all_in_memory', 'bf16', 'tf32']:
+    for bool_key in ['multi_gpu', 'bf16', 'tf32']:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):

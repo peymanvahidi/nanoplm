@@ -17,7 +17,7 @@ from nanoplm.data.splitor import Splitor, SplitError
 from nanoplm.data.manifest import PretrainManifest, DistillationManifest, write_manifest
 from nanoplm.distillation.dataset import SaveKDDataset, shard_h5_file
 from nanoplm.distillation.models.teacher import ProtT5
-from nanoplm.pretraining.dataset import SaveShardedFastaMLMDataset
+from nanoplm.pretraining.dataset import ShardWriter
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 from nanoplm.utils import create_dirs
@@ -506,7 +506,7 @@ def save_kd_dataset(
     "-o",
     required=True,
     type=click.Path(exists=False),
-    help="Output HDF5 directory path where the processed dataset will be saved.",
+    help="Output directory path where the processed binary shards will be saved.",
 )
 @click.option(
     "--max-seq-len",
@@ -524,7 +524,7 @@ def save_kd_dataset(
     "--samples-per-shard",
     default=10000,
     type=int,
-    help="Number of samples to save per hdf5 file shard",
+    help="Number of samples to save per binary shard",
 )
 @click.option(
     "--force",
@@ -552,28 +552,27 @@ def save_pretrain_dataset(
         raise click.ClickException("max_workers must be either -1 (use all available cores) or at least 1")
 
     input_path = Path(input)
-    hdf5_output_dir = Path(output)
-    create_dirs(hdf5_output_dir)
+    output_dir = Path(output)
+    create_dirs(output_dir)
 
     tokenizer = ProtModernBertTokenizer()
 
-    click.echo("Creating HDF5 shards for pretraining ")
-    saver = SaveShardedFastaMLMDataset(
+    click.echo("Creating binary shards for pretraining")
+    saver = ShardWriter(
         fasta_path=str(input_path),
         tokenizer=tokenizer,
         max_length=max_seq_len,
-        output_dir=str(hdf5_output_dir),
+        output_dir=str(output_dir),
         samples_per_shard=samples_per_shard,
         max_workers=max_workers,
         force=force,
     )
     shards = saver.create_shards()
 
-
     click.echo(
-                "Pretraining shard generation complete:\n"
-                f"  shards: {len(shards)} -> {hdf5_output_dir}\n"
-            )
+        "Pretraining shard generation complete:\n"
+        f"  shards: {len(shards)} -> {output_dir}\n"
+    )
 
 @data.command("shard")
 @click.option(
@@ -993,10 +992,10 @@ def from_yaml(
 
         # Use output_dir with train/ and val/ subdirectories
         output_dir = _resolve_path(pretrain_config.get("output_dir", "output/data/pretrain_shards"), cwd)
-        train_hdf5_dir = output_dir / "train"
-        val_hdf5_dir = output_dir / "val"
-        create_dirs(train_hdf5_dir)
-        create_dirs(val_hdf5_dir)
+        train_data_dir = output_dir / "train"
+        val_data_dir = output_dir / "val"
+        create_dirs(train_data_dir)
+        create_dirs(val_data_dir)
 
         max_seq_len = data_params.get("max_seq_len")
         samples_per_shard = pretrain_config.get("samples_per_shard")
@@ -1005,12 +1004,12 @@ def from_yaml(
 
         tokenizer = ProtModernBertTokenizer()
 
-        click.echo("Creating HDF5 shards for training dataset...")
-        train_saver = SaveShardedFastaMLMDataset(
+        click.echo("Creating binary shards for training dataset...")
+        train_saver = ShardWriter(
             fasta_path=str(train_fasta),
             tokenizer=tokenizer,
             max_length=max_seq_len,
-            output_dir=str(train_hdf5_dir),
+            output_dir=str(train_data_dir),
             samples_per_shard=samples_per_shard,
             max_workers=max_workers,
             force=force,
@@ -1018,12 +1017,12 @@ def from_yaml(
         train_shards = train_saver.create_shards()
         train_sequences = len(train_saver._keys)
 
-        click.echo("Creating HDF5 shards for validation dataset...")
-        val_saver = SaveShardedFastaMLMDataset(
+        click.echo("Creating binary shards for validation dataset...")
+        val_saver = ShardWriter(
             fasta_path=str(val_fasta),
             tokenizer=tokenizer,
             max_length=max_seq_len,
-            output_dir=str(val_hdf5_dir),
+            output_dir=str(val_data_dir),
             samples_per_shard=samples_per_shard,
             max_workers=max_workers,
             force=force,
@@ -1049,8 +1048,8 @@ def from_yaml(
 
         click.echo(
             "Pretraining shard generation complete:\n"
-            f"  Train shards: {len(train_shards)} ({train_sequences} sequences) -> {train_hdf5_dir}\n"
-            f"  Val shards:   {len(val_shards)} ({val_sequences} sequences) -> {val_hdf5_dir}\n"
+            f"  Train shards: {len(train_shards)} ({train_sequences} sequences) -> {train_data_dir}\n"
+            f"  Val shards:   {len(val_shards)} ({val_sequences} sequences) -> {val_data_dir}\n"
             f"  Manifest: {manifest_path}"
         )
     elif pipeline_mode == "distillation":

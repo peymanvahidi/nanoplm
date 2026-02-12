@@ -10,20 +10,15 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 from pathlib import Path
 
-from torch.utils.data import Dataset
 from transformers import (
     Trainer,
     TrainingArguments,
 )
 
-from nanoplm.pretraining.models.modern_bert import (
-    ProtModernBertMLM,
-    ProtModernBertTokenizer,
-)
-from nanoplm.pretraining.dataset import LoadShardedFastaMLMDataset, get_pretraining_worker_init_fn
+from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
+from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
-from nanoplm.data.validation import validate_pretrain_dataset, ValidationError
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
@@ -90,9 +85,6 @@ class PretrainingConfig:
 
     # Checkpoint and output
     ckp_dir: str = "output/pretraining"
-
-    # Dataset config (can be overridden by manifest)
-    load_all_in_memory: bool = True
 
     # Training hyperparameters
     batch_size: int = 32
@@ -319,19 +311,6 @@ def run_pretraining(
     # Read manifest and resolve paths
     dataset_dir = Path(pretrain_config.dataset_dir)
 
-    # Validate dataset before starting training
-    logger.info(f"Validating pretraining dataset at {dataset_dir}...")
-    try:
-        validation_result = validate_pretrain_dataset(dataset_dir)
-        logger.info(f"Dataset validated: {validation_result['manifest']['train_sequences']:,} train, "
-                    f"{validation_result['manifest']['val_sequences']:,} val sequences")
-    except ValidationError as e:
-        logger.error(f"Dataset validation failed: {e}")
-        raise
-    except FileNotFoundError as e:
-        logger.error(f"Dataset not found: {e}")
-        raise
-
     manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(
         manifest=manifest,
@@ -340,39 +319,33 @@ def run_pretraining(
 
     # Get data from manifest
     max_length = manifest.max_seq_len
-    train_hdf5_dir = dataset_dir / manifest.train_dir
-    val_hdf5_dir = dataset_dir / manifest.val_dir
+    train_shard_dir = dataset_dir / manifest.train_dir
+    val_shard_dir = dataset_dir / manifest.val_dir
     train_sequences = manifest.train_sequences
     val_sequences = manifest.val_sequences
 
     logger.info(f"Loaded config from manifest: {dataset_dir}")
-    logger.info(f"  train_hdf5: {train_hdf5_dir}")
-    logger.info(f"  val_hdf5: {val_hdf5_dir}")
+    logger.info(f"  train_shards: {train_shard_dir}")
+    logger.info(f"  val_shards: {val_shard_dir}")
     logger.info(f"  max_length: {max_length}")
     logger.info(f"  train_sequences: {train_sequences}")
     logger.info(f"  val_sequences: {val_sequences}")
 
     # Validate paths exist
-    if not train_hdf5_dir.exists():
-        raise FileNotFoundError(f"Train HDF5 directory not found: {train_hdf5_dir}")
-    if not val_hdf5_dir.exists():
-        raise FileNotFoundError(f"Validation HDF5 directory not found: {val_hdf5_dir}")
+    if not train_shard_dir.exists():
+        raise FileNotFoundError(f"Train shard directory not found: {train_shard_dir}")
+    if not val_shard_dir.exists():
+        raise FileNotFoundError(f"Validation shard directory not found: {val_shard_dir}")
 
-    # Load pre-tokenized HDF5 shards
-    logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
+    # Load pre-tokenized binary shards
+    logger.info("Using ShardedDataset for pre-tokenized binary shards")
 
     try:
-        train_ds = LoadShardedFastaMLMDataset(
-            hdf5_dir=str(train_hdf5_dir),
-            load_all_in_memory=pretrain_config.load_all_in_memory
-        )
-        val_ds = LoadShardedFastaMLMDataset(
-            hdf5_dir=str(val_hdf5_dir),
-            load_all_in_memory=pretrain_config.load_all_in_memory
-        )
+        train_ds = ShardedDataset(data_dir=str(train_shard_dir))
+        val_ds = ShardedDataset(data_dir=str(val_shard_dir))
     except FileNotFoundError as e:
         logger.error(
-            f"HDF5 shards not found! You need to create them first.\n"
+            f"Binary shards not found! You need to create them first.\n"
             f"Run: nanoplm data from-yaml with pipeline_mode: 'pretrain'\n"
             f"Error: {e}"
         )
