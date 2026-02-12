@@ -15,7 +15,7 @@ from transformers import (
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
@@ -250,34 +250,17 @@ def run_pretraining(
     tokenizer = model.tokenizer
     model.to(device)
 
-    # Read manifest and resolve paths
+    # Validate dataset: manifest + shard files
     dataset_dir = Path(pretrain_config.dataset_dir)
+    validation_result = validate_pretrain_dataset(dataset_dir)
+    manifest = validation_result['manifest']
 
-    manifest = read_manifest(dataset_dir)
-    validate_manifest_for_pipeline(
-        manifest=manifest,
-        expected_mode="pretrain"
-    )
-
-    # Get data from manifest
+    # Get data from typed manifest
     max_length = manifest.max_seq_len
     train_shard_dir = dataset_dir / manifest.train_dir
     val_shard_dir = dataset_dir / manifest.val_dir
     train_sequences = manifest.train_sequences
     val_sequences = manifest.val_sequences
-
-    logger.info(f"Loaded config from manifest: {dataset_dir}")
-    logger.info(f"  train_shards: {train_shard_dir}")
-    logger.info(f"  val_shards: {val_shard_dir}")
-    logger.info(f"  max_length: {max_length}")
-    logger.info(f"  train_sequences: {train_sequences}")
-    logger.info(f"  val_sequences: {val_sequences}")
-
-    # Validate paths exist
-    if not train_shard_dir.exists():
-        raise FileNotFoundError(f"Train shard directory not found: {train_shard_dir}")
-    if not val_shard_dir.exists():
-        raise FileNotFoundError(f"Validation shard directory not found: {val_shard_dir}")
 
     # Load pre-tokenized binary shards
     logger.info("Using ShardedDataset for pre-tokenized binary shards")

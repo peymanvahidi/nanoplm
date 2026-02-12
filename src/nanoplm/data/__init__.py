@@ -16,8 +16,8 @@ from nanoplm.data.file_pool import (
     detect_file_limits
 )
 from nanoplm.data.validation import (
-    validate_dataset_manifest,
-    validate_shard_files,
+    validate_hdf5_shards,
+    validate_pretrain_shards,
     validate_pretrain_dataset,
     validate_distillation_dataset,
     ValidationError,
@@ -40,8 +40,8 @@ __all__ = [
     "ThreadSafeFileHandlePool",
     "detect_file_limits",
     "worker_init_fn_factory",
-    "validate_dataset_manifest",
-    "validate_shard_files",
+    "validate_hdf5_shards",
+    "validate_pretrain_shards",
     "validate_pretrain_dataset",
     "validate_distillation_dataset",
     "ValidationError",
