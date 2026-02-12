@@ -78,7 +78,7 @@ def pretrain():
 )
 @click.option(
     "--optimizer",
-    type=click.Choice(["adamw", "stable_adamw"], case_sensitive=False),
+    type=click.Choice(["adamw", "stable_adamw", "muon"], case_sensitive=False),
     default="adamw",
     help="Optimizer to use"
 )
@@ -490,7 +490,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  batch_size: 32\n"
         "  num_epochs: 10\n"
         "\n"
-        "  optimizer: \"adamw\"  # adamw, stable_adamw\n"
+        "  optimizer: \"adamw\"  # adamw, stable_adamw, muon\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"

@@ -184,7 +184,7 @@ pretraining:
   val_hdf5: "output/data/pretrain_shards/val_hdf5"
   load_all_in_memory: False
 
-  optimizer: "adamw" # adamw, stable_adamw
+  optimizer: "adamw" # adamw, stable_adamw, muon
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
