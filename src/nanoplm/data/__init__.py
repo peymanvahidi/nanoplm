@@ -1,14 +1,48 @@
-from nanoplm.data.dataset import LoadKDDataset, LoadKDDatasetOptimized, SaveKDDataset, KDDatasetOnTheFly
 from nanoplm.data.filterer import Filterer, FilterError
 from nanoplm.data.splitor import Splitor, SplitError
+from nanoplm.data.manifest import (
+    DataManifest,
+    DataManifestBase,
+    PretrainManifest,
+    DistillationManifest,
+    MANIFEST_FILENAME,
+    write_manifest,
+    read_manifest,
+    validate_manifest_for_pipeline,
+    get_dataset_paths,
+)
+from nanoplm.data.file_pool import (
+    ThreadSafeFileHandlePool,
+    detect_file_limits
+)
+from nanoplm.data.validation import (
+    validate_dataset_manifest,
+    validate_shard_files,
+    validate_pretrain_dataset,
+    validate_distillation_dataset,
+    ValidationError,
+)
 
 __all__ = [
-    "LoadKDDataset", 
-    "LoadKDDatasetOptimized",
-    "SaveKDDataset",
-    "KDDatasetOnTheFly",
     "Filterer",
     "FilterError",
     "Splitor",
     "SplitError",
+    "DataManifest",
+    "DataManifestBase",
+    "PretrainManifest",
+    "DistillationManifest",
+    "MANIFEST_FILENAME",
+    "write_manifest",
+    "read_manifest",
+    "validate_manifest_for_pipeline",
+    "get_dataset_paths",
+    "ThreadSafeFileHandlePool",
+    "detect_file_limits",
+    "worker_init_fn_factory",
+    "validate_dataset_manifest",
+    "validate_shard_files",
+    "validate_pretrain_dataset",
+    "validate_distillation_dataset",
+    "ValidationError",
 ]

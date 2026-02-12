@@ -1,8 +1,9 @@
 from transformers import PreTrainedTokenizer
 
+
 class ProtXTokenizer(PreTrainedTokenizer):
     def __init__(self, vocab=None, unk_token="<unk>", pad_token="<pad>", eos_token="</s>"):
-        
+
         # Define vocabulary mapping amino acids & special tokens
         self.vocab = {
             "A": 3, "L": 4, "G": 5, "V": 6, "S": 7, "R": 8, "E": 9, "D": 10,
@@ -13,8 +14,8 @@ class ProtXTokenizer(PreTrainedTokenizer):
 
         # Initialize parent class properly
         super().__init__(
-            unk_token=unk_token, 
-            pad_token=pad_token, 
+            unk_token=unk_token,
+            pad_token=pad_token,
             eos_token=eos_token
         )
 
@@ -22,7 +23,7 @@ class ProtXTokenizer(PreTrainedTokenizer):
         self.unk_token_id = self.vocab.get(unk_token)
         self.pad_token_id = self.vocab.get(pad_token)
         self.eos_token_id = self.vocab.get(eos_token)
-        
+
         self.model_input_names = ["input_ids", "attention_mask"]
 
     @property
@@ -30,14 +31,14 @@ class ProtXTokenizer(PreTrainedTokenizer):
         return len(self.vocab)
 
     def get_vocab(self):
-        return self.vocab 
+        return self.vocab
 
     def _tokenize(self, text):
-        return list(text)  
-    
+        return list(text)
+
     def _convert_token_to_id(self, token):
-        return self.vocab.get(token, self.unk_token_id)  
-    
+        return self.vocab.get(token, self.unk_token_id)
+
     def _convert_id_to_token(self, index):
         if index in self.added_tokens_decoder:
             return self.added_tokens_decoder[index].content
@@ -51,7 +52,7 @@ class ProtXTokenizer(PreTrainedTokenizer):
             if token_ids_0 and token_ids_0[-1] == self.eos_token_id:
                 return token_ids_0
             return token_ids_0 + [self.eos_token_id]
-        
+
         # For sequence pairs, add EOS to each sequence and concatenate
         if token_ids_0 and token_ids_0[-1] != self.eos_token_id:
             token_ids_0 = token_ids_0 + [self.eos_token_id]
@@ -69,11 +70,11 @@ class ProtXTokenizer(PreTrainedTokenizer):
                 token_ids_1=token_ids_1,
                 already_has_special_tokens=True
             )
-            
+
         if token_ids_1 is None:
             # Mark only the EOS token as special
             return [0] * len(token_ids_0) + [1]
-        
+
         # For sequence pairs
         return [0] * len(token_ids_0) + [1] + [0] * len(token_ids_1) + [1]
 
@@ -84,7 +85,7 @@ class ProtXTokenizer(PreTrainedTokenizer):
         if token_ids_1 is None:
             # For single sequences, all tokens have type 0
             return [0] * (len(token_ids_0) + 1)  # +1 for the EOS token
-        
+
         # For sequence pairs, first sequence is type 0, second is type 1
         return [0] * (len(token_ids_0) + 1) + [1] * (len(token_ids_1) + 1)
 
@@ -94,13 +95,13 @@ class ProtXTokenizer(PreTrainedTokenizer):
         """
         import os
         import json
-        
+
         if filename_prefix is not None:
             vocab_file = os.path.join(save_directory, f"{filename_prefix}-vocab.json")
         else:
             vocab_file = os.path.join(save_directory, "vocab.json")
-        
+
         with open(vocab_file, "w", encoding="utf-8") as f:
             json.dump(self.vocab, f, ensure_ascii=False, indent=2)
-        
+
         return (vocab_file,)

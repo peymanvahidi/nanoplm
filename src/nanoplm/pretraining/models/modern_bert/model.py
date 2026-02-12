@@ -1,7 +1,29 @@
 from dataclasses import dataclass
 
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers import ModernBertConfig, ModernBertForMaskedLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
+
+
+class SwiGLU(nn.Module):
+    def forward(self, x, gate):
+        return F.silu(gate) * x
+
+
+class ModernBertMLPSwiGLU(nn.Module):
+    """Replacement MLP that applies SwiGLU to each ModernBERT layer."""
+
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.Wi = nn.Linear(config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias)
+        self.drop = nn.Dropout(config.mlp_dropout)
+        self.act = SwiGLU()
+        self.Wo = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+
+    def forward(self, hidden_states):
+        x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
+        return self.Wo(self.drop(self.act(x, gate)))
 
 @dataclass
 class ProtModernBertMLMConfig:
@@ -52,3 +74,8 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         # "ForMaskedLM", so it falls back to None → ForCausalLMLoss (which
         # shifts labels left by 1 — wrong for MLM). Override it here.
         self.loss_type = "ForMaskedLM"
+
+        # Apply SwiGLU activation to MLP layers if specified
+        if config.mlp_activation.lower() == "swiglu":
+            for layer in self.model.layers:
+                layer.mlp = ModernBertMLPSwiGLU(self.config)
