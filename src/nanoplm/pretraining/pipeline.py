@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import torch
 import wandb
 from datetime import datetime
@@ -17,27 +18,28 @@ from nanoplm.pretraining.models.modern_bert import (
     ProtModernBertMLM,
     ProtModernBertTokenizer,
 )
-from nanoplm.pretraining.dataset import (
-    LazyFastaMLMDataset,
-    LoadShardedFastaMLMDataset,
-)
+from nanoplm.pretraining.dataset import LoadShardedFastaMLMDataset, get_pretraining_worker_init_fn
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
+from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.validation import validate_pretrain_dataset, ValidationError
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
 
 @dataclass
 class PretrainingConfig:
-    train_fasta: Union[str, Path]
-    val_fasta: Union[str, Path]
+    # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
+    dataset_dir: Union[str, Path]
+
+    # Checkpoint and output
     ckp_dir: str = "output/pretraining"
-    max_length: int = 1024
+
+    # Dataset config (can be overridden by manifest)
+    load_all_in_memory: bool = True
+
+    # Training hyperparameters
     batch_size: int = 32
     num_epochs: int = 10
-    lazy_dataset: bool = False
-    train_hdf5: str = "output/data/split/train_hdf5"
-    val_hdf5: str = "output/data/split/val_hdf5"
-    load_all_in_memory: bool = False
     warmup_ratio: float = 0.05
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
@@ -46,16 +48,28 @@ class PretrainingConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 1
+
+    # Mixed precision
+    bf16: bool = True
+    tf32: bool = True
+
+    # MLM settings
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
     random_token_prob: float = 0.1
     keep_probability: float = 0.1
-    logging_steps_percentage: float = 0.01
-    eval_steps_percentage: float = 0.025
-    save_steps_percentage: float = 0.1
+
+    # Logging/checkpointing
+    logging_steps: int = 10
+    eval_steps: int = 50
+    save_steps: int = 100
     seed: int = 42
+
+    # Data loading
     num_workers: Union[int, str] = "auto"
     prefetch_factor: int = 2
+
+    # Distributed training
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
     project_name: str = "nanoplm-pretraining"
@@ -68,15 +82,64 @@ class ResumeConfig:
     extra_epochs: Optional[int] = None
 
 
+def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
+    """Archive checkpoints with steps greater than resume_step.
+
+    When resuming from a checkpoint, any checkpoints with higher step numbers
+    are moved to an archived subdirectory to prevent conflicts while preserving
+    the data for potential future analysis.
+
+    Args:
+        run_dir: The run directory containing checkpoints
+        resume_step: The step number being resumed from
+    """
+    checkpoints_to_archive = []
+
+    for ckpt_dir in run_dir.glob("checkpoint-*"):
+        try:
+            step = int(ckpt_dir.name.split("-")[1])
+            if step > resume_step:
+                checkpoints_to_archive.append((step, ckpt_dir))
+        except (IndexError, ValueError):
+            continue
+
+    if checkpoints_to_archive:
+        checkpoints_to_archive.sort()
+
+        # Create archive directory with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_dir = run_dir / f"archived_{timestamp}"
+        archive_dir.mkdir(exist_ok=True)
+
+        logger.warning(
+            f"Found {len(checkpoints_to_archive)} checkpoint(s) with steps > {resume_step}. "
+            f"Moving to archive: {[s for s, _ in checkpoints_to_archive]}"
+        )
+
+        for step, ckpt_path in checkpoints_to_archive:
+            dest = archive_dir / ckpt_path.name
+            logger.info(f"Archiving checkpoint-{step} to {archive_dir.name}/")
+            shutil.move(str(ckpt_path), str(dest))
+
+        logger.info(f"Archived checkpoints moved to: {archive_dir}")
+
+
 def _prepare_run_and_steps(
     pretrain_config: "PretrainingConfig",
     resume_config: Optional["ResumeConfig"],
-    train_ds: Dataset,
+    train_samples: int,
     global_batch_size: int,
-) -> Tuple[str, str, int, int, int, int]:
+) -> Tuple[str, str, str, int, int, int, int, Optional[int]]:
     """Prepare run naming/dirs and compute epochs & step intervals.
 
-    Returns a tuple: (run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps)
+    Args:
+        pretrain_config: Pretraining configuration
+        resume_config: Resume configuration (if resuming)
+        train_samples: Number of training samples (from manifest)
+        global_batch_size: Global batch size for training
+
+    Returns a tuple: (run_name, wandb_run_name, output_dir, num_epochs,
+                      logging_steps, eval_steps, save_steps, resume_step)
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
@@ -84,8 +147,36 @@ def _prepare_run_and_steps(
     if resume_config and resume_config.is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
         original_run_name = checkpoint_path.parent.name
-        run_name = f"{original_run_name}-resume"
+        run_name = original_run_name  # Continue in same directory
         run_root = ckp_root / run_name
+
+        # Track resume counter for W&B run naming
+        counter_file = run_root / ".resume_counter"
+        if counter_file.exists():
+            try:
+                resume_counter = int(counter_file.read_text().strip()) + 1
+            except (ValueError, FileNotFoundError):
+                resume_counter = 1
+        else:
+            resume_counter = 1
+
+        # Save updated counter
+        counter_file.write_text(str(resume_counter), encoding="utf-8")
+
+        # Create W&B run name with counter
+        wandb_run_name = f"{run_name}-re{resume_counter}"
+        logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
+
+        # Archive any future checkpoints to prevent conflicts
+        resume_step = None
+        try:
+            resume_step = int(checkpoint_path.name.split("-")[1])
+            _archive_future_checkpoints(run_root, resume_step)
+        except (IndexError, ValueError) as e:
+            logger.warning(
+                f"Could not extract step number from checkpoint path: {checkpoint_path.name}. "
+                f"Skipping future checkpoint archival. Error: {e}"
+            )
     else:
         base_stamp = datetime.now().strftime("%d%m%H%M")
         base_name = f"run-{base_stamp}"
@@ -97,6 +188,8 @@ def _prepare_run_and_steps(
                 suffix += 1
         run_name = candidate
         run_root = ckp_root / run_name
+        wandb_run_name = run_name  # Same as directory name for new runs
+        resume_step = None
 
     create_dirs(str(run_root))
     output_dir = str(run_root)
@@ -127,37 +220,32 @@ def _prepare_run_and_steps(
                     f"Resuming with preserved intervals: save_steps={save_steps}, eval_steps={eval_steps}"
                 )
             except Exception:
-                total_steps = num_epochs * len(train_ds) // global_batch_size
-                logging_steps = max(
-                    1, int(total_steps * pretrain_config.logging_steps_percentage)
-                )
-                eval_steps = max(
-                    1, int(total_steps * pretrain_config.eval_steps_percentage)
-                )
-                save_steps = max(
-                    1, int(total_steps * pretrain_config.save_steps_percentage)
-                )
+                # Use ceiling division to ensure at least 1 step per epoch
+                steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
+                total_steps = num_epochs * steps_per_epoch
+                # Use direct step counts from config (clamped to valid range)
+                logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
+                eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
+                save_steps = max(1, min(total_steps, pretrain_config.save_steps))
         else:
-            total_steps = num_epochs * len(train_ds) // global_batch_size
-            logging_steps = max(
-                1, int(total_steps * pretrain_config.logging_steps_percentage)
-            )
-            eval_steps = max(
-                1, int(total_steps * pretrain_config.eval_steps_percentage)
-            )
-            save_steps = max(
-                1, int(total_steps * pretrain_config.save_steps_percentage)
-            )
+            # Use ceiling division to ensure at least 1 step per epoch
+            steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
+            total_steps = num_epochs * steps_per_epoch
+            # Use direct step counts from config (clamped to valid range)
+            logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
+            eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
+            save_steps = max(1, min(total_steps, pretrain_config.save_steps))
     else:
         num_epochs = pretrain_config.num_epochs
-        total_steps = num_epochs * len(train_ds) // global_batch_size
-        logging_steps = max(
-            1, int(total_steps * pretrain_config.logging_steps_percentage)
-        )
-        eval_steps = max(1, int(total_steps * pretrain_config.eval_steps_percentage))
-        save_steps = max(1, int(total_steps * pretrain_config.save_steps_percentage))
+        # Use ceiling division to ensure at least 1 step per epoch
+        steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
+        total_steps = num_epochs * steps_per_epoch
+        # Use direct step counts from config (clamped to valid range)
+        logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
+        eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
+        save_steps = max(1, min(total_steps, pretrain_config.save_steps))
 
-    return run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps
+    return run_name, wandb_run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps, resume_step
 
 
 def run_pretraining(
@@ -171,46 +259,67 @@ def run_pretraining(
     tokenizer = model.tokenizer
     model.to(device)
 
-    if pretrain_config.lazy_dataset:
-        if pretrain_config.train_fasta is None or pretrain_config.val_fasta is None:
-            raise ValueError("Train and validation FASTA files are required when lazy-dataset mode is enabled")
-        if not Path(pretrain_config.train_fasta).exists():
-            raise FileNotFoundError(f"Train FASTA file not found: {pretrain_config.train_fasta}")
-        if not Path(pretrain_config.val_fasta).exists():
-            raise FileNotFoundError(f"Validation FASTA file not found: {pretrain_config.val_fasta}")
+    # Read manifest and resolve paths
+    dataset_dir = Path(pretrain_config.dataset_dir)
 
-        # Use lazy loading: tokenize on-the-fly from FASTA
-        logger.info("Using LazyFastaMLMDataset for on-the-fly tokenization")
-        train_ds, val_ds = _create_lazy_datasets(
-            train_fasta=pretrain_config.train_fasta,
-            val_fasta=pretrain_config.val_fasta,
-            max_length=pretrain_config.max_length,
-            tokenizer=tokenizer,
+    # Validate dataset before starting training
+    logger.info(f"Validating pretraining dataset at {dataset_dir}...")
+    try:
+        validation_result = validate_pretrain_dataset(dataset_dir)
+        logger.info(f"Dataset validated: {validation_result['manifest']['train_sequences']:,} train, "
+                    f"{validation_result['manifest']['val_sequences']:,} val sequences")
+    except ValidationError as e:
+        logger.error(f"Dataset validation failed: {e}")
+        raise
+    except FileNotFoundError as e:
+        logger.error(f"Dataset not found: {e}")
+        raise
+
+    manifest = read_manifest(dataset_dir)
+    validate_manifest_for_pipeline(
+        manifest=manifest,
+        expected_mode="pretrain"
+    )
+
+    # Get data from manifest
+    max_length = manifest.max_seq_len
+    train_hdf5_dir = dataset_dir / manifest.train_dir
+    val_hdf5_dir = dataset_dir / manifest.val_dir
+    train_sequences = manifest.train_sequences
+    val_sequences = manifest.val_sequences
+
+    logger.info(f"Loaded config from manifest: {dataset_dir}")
+    logger.info(f"  train_hdf5: {train_hdf5_dir}")
+    logger.info(f"  val_hdf5: {val_hdf5_dir}")
+    logger.info(f"  max_length: {max_length}")
+    logger.info(f"  train_sequences: {train_sequences}")
+    logger.info(f"  val_sequences: {val_sequences}")
+
+    # Validate paths exist
+    if not train_hdf5_dir.exists():
+        raise FileNotFoundError(f"Train HDF5 directory not found: {train_hdf5_dir}")
+    if not val_hdf5_dir.exists():
+        raise FileNotFoundError(f"Validation HDF5 directory not found: {val_hdf5_dir}")
+
+    # Load pre-tokenized HDF5 shards
+    logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
+
+    try:
+        train_ds = LoadShardedFastaMLMDataset(
+            hdf5_dir=str(train_hdf5_dir),
+            load_all_in_memory=pretrain_config.load_all_in_memory
         )
-    else:
-        if pretrain_config.train_hdf5 is None or pretrain_config.val_hdf5 is None:
-            raise ValueError("Train and validation HDF5 directories are required when lazy-dataset mode is disabled")
-        if not Path(pretrain_config.train_hdf5).exists():
-            raise FileNotFoundError(f"Train HDF5 directory not found: {pretrain_config.train_hdf5}")
-        if not Path(pretrain_config.val_hdf5).exists():
-            raise FileNotFoundError(f"Validation HDF5 directory not found: {pretrain_config.val_hdf5}")
-
-        # Load pre-tokenized HDF5 shards
-        logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
-        logger.info(f"Expected train shards: {pretrain_config.train_hdf5}")
-        logger.info(f"Expected val shards: {pretrain_config.val_hdf5}")
-
-        try:
-            train_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.train_hdf5, load_all_in_memory=pretrain_config.load_all_in_memory)
-            val_ds = LoadShardedFastaMLMDataset(hdf5_dir=pretrain_config.val_hdf5, load_all_in_memory=pretrain_config.load_all_in_memory)
-        except FileNotFoundError as e:
-            logger.error(
-                f"HDF5 shards not found! You need to create them first.\n"
-                f"Run: nanoplm data from-yaml --pretrain <your_data_config.yaml>\n"
-                f"Or set lazy_dataset=True in your pretrain.yaml to use on-the-fly tokenization.\n"
-                f"Error: {e}"
-            )
-            raise
+        val_ds = LoadShardedFastaMLMDataset(
+            hdf5_dir=str(val_hdf5_dir),
+            load_all_in_memory=pretrain_config.load_all_in_memory
+        )
+    except FileNotFoundError as e:
+        logger.error(
+            f"HDF5 shards not found! You need to create them first.\n"
+            f"Run: nanoplm data from-yaml with pipeline_mode: 'pretrain'\n"
+            f"Error: {e}"
+        )
+        raise
 
     collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
@@ -243,18 +352,25 @@ def run_pretraining(
     )
 
     # Prepare run info and step intervals in a single place
-    run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps = (
-        _prepare_run_and_steps(
-            pretrain_config=pretrain_config,
-            resume_config=resume_config,
-            train_ds=train_ds,
-            global_batch_size=global_batch_size,
-        )
+    (
+        run_name,
+        wandb_run_name,
+        output_dir,
+        num_epochs,
+        logging_steps,
+        eval_steps,
+        save_steps,
+        resume_step,
+    ) = _prepare_run_and_steps(
+        pretrain_config=pretrain_config,
+        resume_config=resume_config,
+        train_samples=train_sequences,
+        global_batch_size=global_batch_size,
     )
 
     # Configure Weights & Biases via environment variables so HF Trainer attaches correctly
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name
-    os.environ["WANDB_NAME"] = run_name
+    os.environ["WANDB_NAME"] = wandb_run_name
 
     num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
 
@@ -275,8 +391,11 @@ def run_pretraining(
         "save_strategy": "steps",
         "save_steps": save_steps,
         "seed": pretrain_config.seed,
+        "bf16": pretrain_config.bf16 and device == "cuda" and torch.cuda.is_bf16_supported(),
+        "fp16": pretrain_config.bf16 and ((device == "cuda" and not torch.cuda.is_bf16_supported()) or device == "mps"),
+        "tf32": pretrain_config.tf32 and device == "cuda",
         "report_to": "wandb",
-        "run_name": run_name,
+        "run_name": wandb_run_name,
         "dataloader_pin_memory": True if device == "cuda" else False,
         "dataloader_num_workers": num_workers,
         "dataloader_persistent_workers": False,
@@ -323,6 +442,27 @@ def run_pretraining(
             trainer.train(resume_from_checkpoint=resume_config.checkpoint_dir)
         else:
             trainer.train()
+
+        # Add W&B metadata for resume tracking
+        if resume_config and resume_config.is_resume and wandb.run is not None:
+            try:
+                if resume_step is not None:
+                    wandb.config.update(
+                        {
+                            "resumed_from_step": resume_step,
+                            "resume_timestamp": datetime.now().isoformat(),
+                        },
+                        allow_val_change=True,
+                    )
+                    # Add tag to mark this as a resumed run
+                    current_tags = list(wandb.run.tags) if wandb.run.tags else []
+                    if f"resumed-from-{resume_step}" not in current_tags:
+                        wandb.run.tags = current_tags + [f"resumed-from-{resume_step}"]
+                    logger.info(
+                        f"Added W&B metadata: resumed from step {resume_step}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to add W&B resume metadata: {e}")
 
         # Capture and save W&B run ID for future resumes (if W&B is active)
         if wandb.run is not None:
@@ -376,24 +516,3 @@ def _get_num_workers(user_value: Union[int, str], world_size: int) -> int:
         raise ValueError(
             f"Invalid num_workers value: {user_value}. Must be a non-negative integer"
         )
-
-def _create_lazy_datasets(
-    train_fasta: Union[str, Path],
-    val_fasta: Union[str, Path],
-    max_length: int,
-    tokenizer: ProtModernBertTokenizer,
-) -> Tuple[Dataset, Optional[Dataset]]:
-
-    train_ds = LazyFastaMLMDataset(
-        fasta_path=train_fasta,
-        tokenizer=tokenizer,
-        max_length=max_length,
-    )
-
-    val_ds = LazyFastaMLMDataset(
-        fasta_path=val_fasta,
-        tokenizer=tokenizer,
-        max_length=max_length,
-    )
-
-    return train_ds, val_ds
