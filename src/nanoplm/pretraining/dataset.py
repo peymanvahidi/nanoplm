@@ -12,7 +12,6 @@ from transformers import PreTrainedTokenizer
 from concurrent.futures import ProcessPoolExecutor
 
 from nanoplm.utils import logger, create_dirs
-from nanoplm.data.file_pool import ThreadSafeFileHandlePool, detect_file_limits
 
 
 class ShardWriter:
@@ -157,12 +156,10 @@ class ShardedDataset(Dataset):
     metadata (paths + offsets), not the mapped data itself.
     """
 
-    def __init__(self, data_dir: str, load_all_in_memory: bool = False) -> None:
+    def __init__(self, data_dir: str) -> None:
         """
         Args:
             data_dir: Directory containing binary shard files (*.bin + *.idx.npy)
-            load_all_in_memory: Accepted for API compatibility but ignored
-                (memmap is already the optimal strategy)
         """
         self._init_dataset(str(data_dir), log=True)
 
@@ -174,14 +171,6 @@ class ShardedDataset(Dataset):
             log: Whether to emit log messages (suppressed in DataLoader workers).
         """
         self.data_dir = Path(data_dir)
-
-        # Auto-detect file limits if not specified
-        if max_open_files is None:
-            max_open_files = detect_file_limits(num_workers=1)
-        self.max_open_files = max_open_files
-
-        # File handle pool (created per-worker or on first access)
-        self._worker_pool: Optional[ThreadSafeFileHandlePool] = None
 
         # Validate directory exists
         if not self.data_dir.exists():
@@ -291,122 +280,6 @@ class ShardedDataset(Dataset):
             for mmap in self._mmaps:
                 del mmap
             self._mmaps = None
-
-    def _get_worker_pool(self) -> ThreadSafeFileHandlePool:
-        """
-        Get or create the file handle pool for this worker.
-
-class LazyFastaDataset(Dataset):
-    """FASTA dataset that tokenizes sequences lazily for MLM pretraining.
-
-    Uses an on-disk index for random access and defers padding to the collator.
-    """
-
-        Returns:
-            ThreadSafeFileHandlePool: The file handle pool for this worker
-        """
-        if self._worker_pool is None:
-            self._worker_pool = ThreadSafeFileHandlePool(max_open_files=self.max_open_files)
-            logger.debug(f"Created file handle pool with max_open_files={self.max_open_files}")
-        return self._worker_pool
-
-    def __getstate__(self):
-        """
-        Prepare state for pickling (DataLoader multiprocessing).
-
-        File handles cannot be pickled, so we clear the worker pool.
-        It will be recreated per-worker via worker_init_fn.
-        """
-        state = self.__dict__.copy()
-        state['_worker_pool'] = None  # Don't pickle file handles
-        return state
-
-    def __setstate__(self, state):
-        """
-        Restore state after unpickling.
-
-        The worker pool will be recreated on first access in each worker.
-        """
-        self.__dict__.update(state)
-        # Pool will be created via _get_worker_pool() or worker_init_fn
-
-    def read_batch_vectorized(self, indices: List[int]) -> Dict[str, List[torch.Tensor]]:
-        """
-        Read multiple samples efficiently using vectorized HDF5 reads.
-
-        For consecutive indices within the same shard, uses hyperslab selection
-        (slice) for efficient batch reads. For non-consecutive or cross-shard
-        access, falls back to grouped individual reads.
-
-        Args:
-            indices: List of global sample indices to read
-
-        Returns:
-            Dict with keys:
-                - 'input_ids': List of tensors (one per sample)
-                - 'attention_mask': List of tensors (one per sample)
-
-        Example:
-            >>> dataset = LoadShardedFastaMLMDataset("data/shards")
-            >>> batch = dataset.read_batch_vectorized([0, 1, 2, 3])
-            >>> print(len(batch['input_ids']))  # 4
-        """
-        if self._in_memory:
-            # For in-memory mode, just use regular indexing
-            return {
-                'input_ids': [self[i]['input_ids'] for i in indices],
-                'attention_mask': [self[i]['attention_mask'] for i in indices],
-            }
-
-        # Group indices by shard
-        shard_groups = {}
-        for idx in indices:
-            shard_idx, local_idx = self._get_shard(idx)
-            if shard_idx not in shard_groups:
-                shard_groups[shard_idx] = []
-            shard_groups[shard_idx].append((idx, local_idx))
-
-        # Read from each shard
-        results = {}
-        pool = self._get_worker_pool()
-
-        for shard_idx, idx_pairs in shard_groups.items():
-            # Sort by local index to check for consecutive access
-            idx_pairs.sort(key=lambda x: x[1])
-            local_indices = [local_idx for _, local_idx in idx_pairs]
-
-            file_handle = pool.get_file(self.shard_paths[shard_idx])
-
-            # Check if indices are consecutive
-            is_consecutive = all(
-                local_indices[i] + 1 == local_indices[i + 1]
-                for i in range(len(local_indices) - 1)
-            )
-
-        key = self._keys[idx]
-
-        # Create index on-demand to avoid multiprocessing pickle issues
-        index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
-        try:
-            record = index[key]
-            sequence = str(record.seq)
-        finally:
-            index.close()
-
-        encoding = self.tokenizer(
-            sequence,
-            add_special_tokens=True,
-            padding=False,  # defer padding to the collator for dynamic padding
-            max_length=self.max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        # Return results in original order
-        return {
-            'input_ids': [results[idx]['input_ids'] for idx in indices],
-            'attention_mask': [results[idx]['attention_mask'] for idx in indices],
-        }
 
 
 def process_shard(args):

@@ -14,8 +14,9 @@ from nanoplm.data.extractor import Extractor, ExtractionError
 from nanoplm.data.shuffler import FastaShuffler, ShufflingError
 from nanoplm.data.filterer import Filterer, FilterError
 from nanoplm.data.splitor import Splitor, SplitError
-from nanoplm.data.dataset import SaveKDDataset, shard_h5_file
-from nanoplm.models.teacher import ProtT5
+from nanoplm.data.manifest import PretrainManifest, DistillationManifest, write_manifest
+from nanoplm.distillation.dataset import SaveKDDataset, shard_h5_file
+from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.pretraining.dataset import ShardWriter
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
@@ -991,10 +992,10 @@ def from_yaml(
 
         # Use output_dir with train/ and val/ subdirectories
         output_dir = _resolve_path(pretrain_config.get("output_dir", "output/data/pretrain_shards"), cwd)
-        train_hdf5_dir = output_dir / "train"
-        val_hdf5_dir = output_dir / "val"
-        create_dirs(train_hdf5_dir)
-        create_dirs(val_hdf5_dir)
+        train_data_dir = output_dir / "train"
+        val_data_dir = output_dir / "val"
+        create_dirs(train_data_dir)
+        create_dirs(val_data_dir)
 
         max_seq_len = data_params.get("max_seq_len")
         samples_per_shard = pretrain_config.get("samples_per_shard")
@@ -1047,8 +1048,8 @@ def from_yaml(
 
         click.echo(
             "Pretraining shard generation complete:\n"
-            f"  Train shards: {len(train_shards)} ({train_sequences} sequences) -> {train_hdf5_dir}\n"
-            f"  Val shards:   {len(val_shards)} ({val_sequences} sequences) -> {val_hdf5_dir}\n"
+            f"  Train shards: {len(train_shards)} ({train_sequences} sequences) -> {train_data_dir}\n"
+            f"  Val shards:   {len(val_shards)} ({val_sequences} sequences) -> {val_data_dir}\n"
             f"  Manifest: {manifest_path}"
         )
     elif pipeline_mode == "distillation":
