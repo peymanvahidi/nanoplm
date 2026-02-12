@@ -256,24 +256,35 @@ def validate_shard_files(
             # Try to open and validate contents
             try:
                 with h5py.File(shard_path, 'r') as f:
-                    # Check for required dataset
-                    if 'input_ids' not in f:
-                        raise ValidationError(
-                            f"Shard missing 'input_ids' dataset: {shard_path}\n\n"
-                            f"This shard file is incomplete or corrupted.\n"
-                            f"Delete the shard and regenerate:\n"
-                            f"  rm {shard_path}\n"
-                            f"  nanoplm data from-yaml"
-                        )
+                    keys = list(f.keys())
 
-                    # Check dataset is not empty
-                    # For HDF5 files with group structure (distillation), check key count
-                    # For direct dataset (pretraining), check dataset length
-                    if isinstance(f['input_ids'], h5py.Group):
-                        # Group-based structure (distillation dataset)
-                        num_samples = len(f.keys())
+                    # Determine structure: group-based (distillation) or flat (pretraining)
+                    # Group-based: top-level keys are numeric sample indices ('0', '1', ...)
+                    # Flat: top-level keys are dataset names ('input_ids', 'attention_mask', ...)
+                    is_grouped = len(keys) > 0 and keys[0].isdigit()
+
+                    if is_grouped:
+                        # Validate first group has required datasets
+                        first_group = f[keys[0]]
+                        if 'input_ids' not in first_group:
+                            raise ValidationError(
+                                f"Shard group missing 'input_ids' dataset: {shard_path}\n\n"
+                                f"This shard file is incomplete or corrupted.\n"
+                                f"Delete the shard and regenerate:\n"
+                                f"  rm {shard_path}\n"
+                                f"  nanoplm data from-yaml"
+                            )
+                        num_samples = len(keys)
                     else:
-                        # Direct dataset (pretraining dataset)
+                        # Flat structure: check for top-level 'input_ids'
+                        if 'input_ids' not in f:
+                            raise ValidationError(
+                                f"Shard missing 'input_ids' dataset: {shard_path}\n\n"
+                                f"This shard file is incomplete or corrupted.\n"
+                                f"Delete the shard and regenerate:\n"
+                                f"  rm {shard_path}\n"
+                                f"  nanoplm data from-yaml"
+                            )
                         num_samples = len(f['input_ids'])
 
                     if num_samples == 0:

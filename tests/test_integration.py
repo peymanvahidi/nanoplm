@@ -9,7 +9,7 @@ from unittest.mock import patch, MagicMock
 from click.testing import CliRunner
 from transformers import DataCollatorForLanguageModeling
 
-from nanoplm.pretraining.dataset import FastaMLMDataset
+from nanoplm.pretraining.dataset import LazyFastaDataset
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig, run_pretraining
@@ -66,7 +66,7 @@ MAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGT
     def test_full_pipeline_forward_pass(self, temp_fasta_file, tokenizer, small_model):
         """Test complete forward pass through dataset -> collator -> model."""
         # Create dataset
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=64
@@ -104,7 +104,7 @@ MAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGT
     def test_modernbert_unpadding_mechanism(self, temp_fasta_file, tokenizer, small_model):
         """Test that ModernBERT's unpadding mechanism works correctly."""
         # Create dataset with different sequence lengths
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=64
@@ -138,7 +138,7 @@ MAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGT
     def test_batch_training_step(self, temp_fasta_file, tokenizer, small_model):
         """Test a complete training step simulation."""
         # Create dataset and collator
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=64
@@ -173,7 +173,7 @@ MAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGT
 
     def test_different_batch_sizes(self, temp_fasta_file, tokenizer, small_model):
         """Test model handles different batch sizes correctly."""
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=64
@@ -202,7 +202,7 @@ MAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGT
 
     def test_gradient_accumulation_simulation(self, temp_fasta_file, tokenizer, small_model):
         """Test gradient accumulation simulation."""
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=64
@@ -253,7 +253,7 @@ MAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGTMAIGT
         """Test memory efficiency of the pipeline."""
         import gc
 
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=64
@@ -342,7 +342,7 @@ MVLSPA
 
     def test_modernbert_attention_mask_handling(self, temp_fasta_file, tokenizer, tiny_model):
         """Test that attention masks are handled correctly by ModernBERT."""
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=32
@@ -374,7 +374,7 @@ MVLSPA
 
     def test_modernbert_position_ids(self, temp_fasta_file, tokenizer, tiny_model):
         """Test position_ids handling."""
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=32

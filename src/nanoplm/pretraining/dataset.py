@@ -1,6 +1,5 @@
 import os
 import torch
-import h5py
 import bisect
 import numpy as np
 from math import ceil
@@ -10,17 +9,16 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 from nanoplm.utils import logger, create_dirs
-from nanoplm.data.file_pool import ThreadSafeFileHandlePool, detect_file_limits
 
 
-class SaveShardedFastaMLMDataset:
-    """Utility class to tokenize FASTA sequences and save them as HDF5 shards.
+class ShardWriter:
+    """Utility class to tokenize FASTA sequences and save them as flat binary shards.
 
     This class handles the preprocessing step: reading FASTA, tokenizing sequences,
-    and saving them to HDF5 files for fast loading during training.
+    and saving them to binary files (.bin + .idx) for fast loading during training.
 
     This is NOT a Dataset - it's a preprocessing utility that creates shards.
     """
@@ -40,7 +38,7 @@ class SaveShardedFastaMLMDataset:
             fasta_path: Path to input FASTA file
             tokenizer: Tokenizer to use for encoding sequences
             max_length: Maximum sequence length
-            output_dir: Directory to save HDF5 shards
+            output_dir: Directory to save binary shards
             samples_per_shard: Number of sequences per shard file
             max_workers: Number of parallel workers (-1 = all CPUs)
             force: If True, overwrite existing shards
@@ -81,25 +79,27 @@ class SaveShardedFastaMLMDataset:
         )
 
     def create_shards(self) -> List[Path]:
-        """Create HDF5 shards from FASTA sequences.
+        """Create binary shards from FASTA sequences.
 
         Returns:
-            List of paths to created shard files
+            List of paths to created shard .bin files
         """
         # Check if shards already exist
         shards_exist = (
-            self.output_dir.exists() and len(list(self.output_dir.glob("*.h5"))) > 0
+            self.output_dir.exists() and len(list(self.output_dir.glob("*.bin"))) > 0
         )
 
         if shards_exist and not self.force:
             raise FileExistsError(
-                f"HDF5 shards already exist in {self.output_dir}. "
+                f"Binary shards already exist in {self.output_dir}. "
                 f"Set force=True to overwrite them."
             )
 
         if shards_exist and self.force:
             logger.warning(f"Overwriting existing shards in {self.output_dir}")
-            for shard in self.output_dir.glob("*.h5"):
+            for shard in self.output_dir.glob("*.bin"):
+                shard.unlink()
+            for shard in self.output_dir.glob("*.idx.npy"):
                 shard.unlink()
 
         # Create output directory
@@ -138,142 +138,106 @@ class SaveShardedFastaMLMDataset:
             shard_paths = list(executor.map(process_shard, args))
 
         logger.info(
-            f"Successfully tokenized {total_seqs:,} sequences and saved to {len(shard_paths)} HDF5 shards in {self.output_dir}"
+            f"Successfully tokenized {total_seqs:,} sequences and saved to {len(shard_paths)} binary shards in {self.output_dir}"
         )
 
         return [Path(p) for p in shard_paths]
 
 
-class LoadShardedFastaMLMDataset(Dataset):
-    """Dataset for loading pre-tokenized sequences from HDF5 shards.
+class ShardedDataset(Dataset):
+    """Dataset for loading pre-tokenized sequences from flat binary shards via memmap.
 
-    Supports two modes:
-    - streaming (default): Uses LRU file handle pool for efficient file access
-    - load_all_in_memory: read all shards into memory (dict) at init
+    Each shard consists of:
+    - shard_NNNN.bin: concatenated uint8 tokens (all sequences back-to-back)
+    - shard_NNNN.idx.npy: numpy .npy file containing int32 array of sequence lengths
+
+    Uses np.memmap for zero-copy reads. Memmaps are created lazily so that
+    spawn-based DataLoader workers (macOS default) only pickle lightweight
+    metadata (paths + offsets), not the mapped data itself.
     """
 
-    def __init__(
-        self,
-        hdf5_dir: str,
-        load_all_in_memory: bool = False,
-        max_open_files: Optional[int] = None,
-    ) -> None:
+    def __init__(self, data_dir: str) -> None:
         """
         Args:
-            hdf5_dir: Directory containing HDF5 shard files (*.h5)
-            load_all_in_memory: Whether to load all shards into memory (default: False)
-            max_open_files: Maximum number of file handles to keep open (auto-detected if None)
+            data_dir: Directory containing binary shard files (*.bin + *.idx.npy)
         """
-        self.hdf5_dir = Path(hdf5_dir)
-        self._in_memory = bool(load_all_in_memory)
+        self._init_dataset(str(data_dir), log=True)
 
-        # Auto-detect file limits if not specified
-        if max_open_files is None:
-            max_open_files = detect_file_limits(num_workers=1)
-        self.max_open_files = max_open_files
+    def _init_dataset(self, data_dir: str, log: bool = False) -> None:
+        """Shared init logic (called from __init__ and __setstate__).
 
-        # File handle pool (created per-worker or on first access)
-        self._worker_pool: Optional[ThreadSafeFileHandlePool] = None
+        Args:
+            data_dir: Path to the shard directory.
+            log: Whether to emit log messages (suppressed in DataLoader workers).
+        """
+        self.data_dir = Path(data_dir)
 
         # Validate directory exists
-        if not self.hdf5_dir.exists():
-            raise FileNotFoundError(f"HDF5 directory not found: {self.hdf5_dir}")
+        if not self.data_dir.exists():
+            raise FileNotFoundError(f"Data directory not found: {self.data_dir}")
 
-        if not self.hdf5_dir.is_dir():
-            raise ValueError(f"Path is not a directory: {self.hdf5_dir}")
+        if not self.data_dir.is_dir():
+            raise ValueError(f"Path is not a directory: {self.data_dir}")
 
-        # Find all shard files
-        self.shard_paths = sorted(self.hdf5_dir.glob("*.h5"))
+        # Find all shard .bin files — store paths as strings for safe pickling
+        self._bin_paths: List[str] = [
+            str(p) for p in sorted(self.data_dir.glob("*.bin"))
+        ]
 
-        if len(self.shard_paths) == 0:
+        if len(self._bin_paths) == 0:
             raise FileNotFoundError(
-                f"No HDF5 shard files (*.h5) found in {self.hdf5_dir}"
+                f"No binary shard files (*.bin) found in {self.data_dir}"
             )
 
-        logger.info(f"Found {len(self.shard_paths)} HDF5 shards in {self.hdf5_dir}")
+        if log:
+            logger.info(f"Found {len(self._bin_paths)} binary shards in {self.data_dir}")
 
-        # Read shard lengths without keeping files open
-        self.lengths = []
-        for path in self.shard_paths:
-            with h5py.File(path, "r") as f:
-                n = len(f["input_ids"])
-            self.lengths.append(n)
+        # Load index files (small arrays, always kept in memory)
+        self._offsets: List[np.ndarray] = []  # per-shard cumulative byte offsets
+        self.lengths: List[int] = []
+
+        for bin_path_str in self._bin_paths:
+            bin_path = Path(bin_path_str)
+            idx_path = bin_path.with_name(bin_path.stem + ".idx.npy")
+            if not idx_path.exists():
+                raise FileNotFoundError(
+                    f"Index file not found for shard: {idx_path}"
+                )
+
+            sizes = np.load(str(idx_path))  # int32 array of sequence lengths
+            offsets = np.concatenate([[0], np.cumsum(sizes)])
+
+            self._offsets.append(offsets)
+            self.lengths.append(len(sizes))
 
         self.cum_lengths = np.cumsum(self.lengths)
 
-        logger.info(
-            f"Loaded {int(self.cum_lengths[-1]):,} pre-tokenized sequences from {len(self.shard_paths)} shards"
-        )
+        # Memmaps created lazily per-process (not here)
+        self._mmaps: Optional[List[np.memmap]] = None
 
-        # In-memory option: load all shard data into Python lists
-        if self._in_memory:
-            logger.info("Loading all shards into memory (parallel)...")
-            num_shards = len(self.shard_paths)
-            # Decide number of workers: use up to half of CPUs but not more than shards
-            try:
-                max_workers = max(1, min((os.cpu_count() or 1) // 2, num_shards))
-            except Exception:
-                max_workers = 1
+        if log:
+            logger.info(
+                f"Loaded {int(self.cum_lengths[-1]):,} pre-tokenized sequences from {len(self._bin_paths)} shards"
+            )
 
-            # Prepare result container
-            self._in_memory_shards = [None] * num_shards
+    # -- Pickle support for spawn-based DataLoader workers (macOS default) --
+    # Without this, pickling serializes the entire memmap data to each worker.
+    # With this, only the directory path is pickled; memmaps are re-created lazily.
 
-            # Use ProcessPoolExecutor to let each worker open its own HDF5 file
-            try:
-                with ProcessPoolExecutor(max_workers=max_workers) as exe:
-                    futures = {
-                        exe.submit(_read_shard_for_worker, str(p)): idx
-                        for idx, p in enumerate(self.shard_paths)
-                    }
-                    for fut in tqdm(
-                        as_completed(futures),
-                        total=len(futures),
-                        desc="Loading shards",
-                        leave=False,
-                    ):
-                        idx = futures[fut]
-                        try:
-                            _, data = fut.result()
-                            self._in_memory_shards[idx] = data
-                        except Exception:
-                            # If any worker fails, fall back to sequential loading
-                            logger.warning(
-                                "Parallel shard loading failed; falling back to sequential load."
-                            )
-                            raise
+    def __getstate__(self) -> str:
+        return str(self.data_dir)
 
-                # Verify none are None
-                for i, entry in enumerate(self._in_memory_shards):
-                    if entry is None:
-                        raise RuntimeError(f"Shard {i} not loaded correctly")
+    def __setstate__(self, state: str) -> None:
+        self._init_dataset(state, log=False)
 
-                # Build flat index for O(1) global access
-                self._build_flat_index()
+    # -- Lazy memmap creation --
 
-            except Exception:
-                # Fallback: sequential load with safe bulk reads
-                logger.info("Falling back to sequential shard loading...")
-                self._in_memory_shards = []
-                for i, path in enumerate(self.shard_paths, start=1):
-                    if i % 10 == 0 or i == num_shards:
-                        logger.info(f"Loading shard {i}/{num_shards}...")
-                    with h5py.File(path, "r") as f:
-                        n = len(f["input_ids"])
-                        inputs = [None] * n
-                        masks = [None] * n
-                        for j in range(n):
-                            # Store tokens as uint8 to minimize memory; ids are cast to torch.long at training time.
-                            arr = np.array(f["input_ids"][j], dtype=np.uint8)
-                            inputs[j] = arr
-                            # Derive attention_mask on-the-fly as uint8 as well (1 for non-padding, 0 for padding).
-                            masks[j] = (arr != 0).astype(np.uint8)
-                        self._in_memory_shards.append((inputs, masks))
-
-                # Build flat index for O(1) global access after sequential fallback
-                self._build_flat_index()
-
-        else:
-            logger.info("Using streaming mode.")
+    def _ensure_mmaps(self) -> None:
+        """Create memmap objects on first access (once per process)."""
+        if self._mmaps is None:
+            self._mmaps = [
+                np.memmap(p, dtype=np.uint8, mode="r") for p in self._bin_paths
+            ]
 
     def __len__(self) -> int:
         return int(self.cum_lengths[-1])
@@ -284,26 +248,16 @@ class LoadShardedFastaMLMDataset(Dataset):
                 f"Index {idx} out of bounds for dataset of size {len(self)}"
             )
 
+        self._ensure_mmaps()
+
         shard_idx, local_idx = self._get_shard(idx)
 
-        # In-memory fast path
-        if self._in_memory:
-            # If flat indexing exists, use it for true O(1) access
-            if hasattr(self, "_flat_inputs") and hasattr(self, "_flat_masks"):
-                # We have both the inputs and masks in memory, so we can return them directly
-                input_ids = torch.tensor(self._flat_inputs[idx], dtype=torch.uint8)
-                attention_mask = torch.tensor(self._flat_masks[idx], dtype=torch.uint8)
-                return {"input_ids": input_ids, "attention_mask": attention_mask}
+        offsets = self._offsets[shard_idx]
+        start = int(offsets[local_idx])
+        end = int(offsets[local_idx + 1])
 
-            inputs, masks = self._in_memory_shards[shard_idx]
-            input_ids = torch.tensor(inputs[local_idx], dtype=torch.uint8)
-            attention_mask = torch.tensor(masks[local_idx], dtype=torch.uint8)
-            return {"input_ids": input_ids, "attention_mask": attention_mask}
-
-        # Streaming path: use LRU file pool for efficient access
-        pool = self._get_worker_pool()
-        file_handle = pool.get_file(self.shard_paths[shard_idx])
-        input_ids = torch.tensor(file_handle["input_ids"][local_idx], dtype=torch.uint8)
+        raw = self._mmaps[shard_idx][start:end]
+        input_ids = torch.from_numpy(raw.copy())  # single copy, stays uint8
 
         # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding (pad_token_id=0)
         attention_mask = (input_ids != 0).to(torch.uint8)
@@ -320,132 +274,12 @@ class LoadShardedFastaMLMDataset(Dataset):
             idx -= self.cum_lengths[shard_idx - 1]
         return shard_idx, idx
 
-    def _build_flat_index(self) -> None:
-        """Build flat input/mask lists from self._in_memory_shards for O(1) global indexing."""
-        self._flat_inputs = []
-        self._flat_masks = []
-        for inputs, masks in self._in_memory_shards:
-            self._flat_inputs.extend(inputs)
-            self._flat_masks.extend(masks)
-        logger.info(f"Flat indexing enabled: {len(self._flat_inputs):,} samples")
-
-    def _get_worker_pool(self) -> ThreadSafeFileHandlePool:
-        """
-        Get or create the file handle pool for this worker.
-
-        Lazily creates the pool on first access. This handles both single-process
-        (num_workers=0) and multi-process cases. For multi-process, per-worker
-        pools are created via worker_init_fn.
-
-        Returns:
-            ThreadSafeFileHandlePool: The file handle pool for this worker
-        """
-        if self._worker_pool is None:
-            self._worker_pool = ThreadSafeFileHandlePool(max_open_files=self.max_open_files)
-            logger.debug(f"Created file handle pool with max_open_files={self.max_open_files}")
-        return self._worker_pool
-
-    def __getstate__(self):
-        """
-        Prepare state for pickling (DataLoader multiprocessing).
-
-        File handles cannot be pickled, so we clear the worker pool.
-        It will be recreated per-worker via worker_init_fn.
-        """
-        state = self.__dict__.copy()
-        state['_worker_pool'] = None  # Don't pickle file handles
-        return state
-
-    def __setstate__(self, state):
-        """
-        Restore state after unpickling.
-
-        The worker pool will be recreated on first access in each worker.
-        """
-        self.__dict__.update(state)
-        # Pool will be created via _get_worker_pool() or worker_init_fn
-
-    def read_batch_vectorized(self, indices: List[int]) -> Dict[str, List[torch.Tensor]]:
-        """
-        Read multiple samples efficiently using vectorized HDF5 reads.
-
-        For consecutive indices within the same shard, uses hyperslab selection
-        (slice) for efficient batch reads. For non-consecutive or cross-shard
-        access, falls back to grouped individual reads.
-
-        Args:
-            indices: List of global sample indices to read
-
-        Returns:
-            Dict with keys:
-                - 'input_ids': List of tensors (one per sample)
-                - 'attention_mask': List of tensors (one per sample)
-
-        Example:
-            >>> dataset = LoadShardedFastaMLMDataset("data/shards")
-            >>> batch = dataset.read_batch_vectorized([0, 1, 2, 3])
-            >>> print(len(batch['input_ids']))  # 4
-        """
-        if self._in_memory:
-            # For in-memory mode, just use regular indexing
-            return {
-                'input_ids': [self[i]['input_ids'] for i in indices],
-                'attention_mask': [self[i]['attention_mask'] for i in indices],
-            }
-
-        # Group indices by shard
-        shard_groups = {}
-        for idx in indices:
-            shard_idx, local_idx = self._get_shard(idx)
-            if shard_idx not in shard_groups:
-                shard_groups[shard_idx] = []
-            shard_groups[shard_idx].append((idx, local_idx))
-
-        # Read from each shard
-        results = {}
-        pool = self._get_worker_pool()
-
-        for shard_idx, idx_pairs in shard_groups.items():
-            # Sort by local index to check for consecutive access
-            idx_pairs.sort(key=lambda x: x[1])
-            local_indices = [local_idx for _, local_idx in idx_pairs]
-
-            file_handle = pool.get_file(self.shard_paths[shard_idx])
-
-            # Check if indices are consecutive
-            is_consecutive = all(
-                local_indices[i] + 1 == local_indices[i + 1]
-                for i in range(len(local_indices) - 1)
-            )
-
-            if is_consecutive and len(local_indices) > 1:
-                # Efficient slice read for consecutive indices
-                start = local_indices[0]
-                end = local_indices[-1] + 1
-                batch_data = file_handle['input_ids'][start:end]
-
-                for i, (global_idx, _) in enumerate(idx_pairs):
-                    input_ids = torch.tensor(batch_data[i], dtype=torch.uint8)
-                    attention_mask = (input_ids != 0).to(torch.uint8)
-                    results[global_idx] = {
-                        'input_ids': input_ids,
-                        'attention_mask': attention_mask,
-                    }
-            else:
-                # Individual reads for non-consecutive indices
-                for global_idx, local_idx in idx_pairs:
-                    input_ids = torch.tensor(file_handle['input_ids'][local_idx], dtype=torch.uint8)
-                    attention_mask = (input_ids != 0).to(torch.uint8)
-                    results[global_idx] = {
-                        'input_ids': input_ids,
-                        'attention_mask': attention_mask,
-                    }
-
-        # Return results in original order
-        return {
-            'input_ids': [results[idx]['input_ids'] for idx in indices],
-            'attention_mask': [results[idx]['attention_mask'] for idx in indices],
-        }
+    def cleanup(self):
+        """Release memmap objects (public API, kept for compatibility)."""
+        if self._mmaps is not None:
+            for mmap in self._mmaps:
+                del mmap
+            self._mmaps = None
 
 
 def process_shard(args):
@@ -454,8 +288,10 @@ def process_shard(args):
     # Each process must open its own index
     index = SeqIO.index_db(db_path, [fasta_path], "fasta")
 
-    shard_path = Path(output_dir) / f"shard_{shard_idx:04d}.h5"
-    input_ids_list = []
+    bin_path = Path(output_dir) / f"shard_{shard_idx:04d}.bin"
+    idx_path = Path(output_dir) / f"shard_{shard_idx:04d}.idx.npy"
+
+    token_arrays = []
 
     for key in tqdm(shard_keys, desc=f"Tokenizing shard {shard_idx}", leave=False):
         record = index[key]
@@ -470,156 +306,17 @@ def process_shard(args):
             return_tensors="pt",
         )
 
-        input_ids_list.append(encoding["input_ids"].squeeze(0))
+        token_arrays.append(encoding["input_ids"].squeeze(0).numpy().astype(np.uint8))
 
-    # Write results
-    with h5py.File(shard_path, "w") as h5f:
-        total = len(input_ids_list)
-        h5f.create_dataset(
-            "input_ids", (total,), dtype=h5py.special_dtype(vlen=np.uint8)
-        )
+    # Build sizes array (int32)
+    sizes = np.array([len(a) for a in token_arrays], dtype=np.int32)
 
-        for i in tqdm(range(total), desc=f"Writing Shard {shard_idx}", leave=False):
-            h5f["input_ids"][i] = np.array(input_ids_list[i], dtype=np.uint8)
+    # Concatenate all tokens and write .bin
+    all_tokens = np.concatenate(token_arrays)
+    all_tokens.tofile(str(bin_path))
+
+    # Save sizes as .npy (the .idx file)
+    np.save(str(idx_path), sizes)
 
     index.close()
-    return str(shard_path)
-
-def _read_shard_for_worker(path_str: str):
-    """Helper for parallel shard loading in separate processes.
-
-    Returns a tuple (indexable_path_str, (inputs_list, masks_list)).
-    """
-
-    path = Path(path_str)
-    inputs = []
-    masks = []
-    with h5py.File(path, "r") as f:
-        n = len(f["input_ids"])
-        # Bulk read each variable-length element into a numpy array and derive attention masks
-        for i in range(n):
-            # Store tokens as uint8 to minimize memory; ids are cast to torch.long at training time.
-            arr = np.array(f["input_ids"][i], dtype=np.uint8)
-            inputs.append(arr)
-            # Derive attention_mask on-the-fly as uint8 (1 for non-padding, 0 for padding).
-            masks.append((arr != 0).astype(np.uint8))
-
-    return path_str, (inputs, masks)
-
-
-def _pretraining_worker_init_fn(worker_id):
-    """
-    Worker initialization function for PyTorch DataLoader.
-
-    Initializes per-worker state for multi-process data loading, including:
-    - Creating separate file handle pools for each worker
-    - Seeding RNGs for reproducibility
-
-    This is a module-level function (not a closure) to support pickling.
-
-    Args:
-        worker_id: Worker ID assigned by DataLoader
-    """
-    import torch.utils.data as data_utils
-
-    worker_info = data_utils.get_worker_info()
-    if worker_info is None:
-        # Single-process loading (num_workers=0)
-        return
-
-    # Create per-worker file handle pool
-    worker_dataset = worker_info.dataset
-    worker_dataset._worker_pool = ThreadSafeFileHandlePool(
-        max_open_files=worker_dataset.max_open_files
-    )
-
-    # Seed RNGs for reproducibility
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
-
-    logger.debug(
-        f"Worker {worker_id} initialized with seed {worker_seed}, "
-        f"max_open_files={worker_dataset.max_open_files}"
-    )
-
-
-def get_pretraining_worker_init_fn(dataset=None):
-    """
-    Get worker initialization function for PyTorch DataLoader.
-
-    Returns the module-level worker initialization function that can be pickled
-    for multi-process data loading.
-
-    Args:
-        dataset: Unused, kept for backward compatibility
-
-    Returns:
-        Callable: Function to pass to DataLoader's worker_init_fn parameter
-
-    Example:
-        >>> from torch.utils.data import DataLoader
-        >>> dataset = LoadShardedFastaMLMDataset("data/shards")
-        >>> loader = DataLoader(
-        ...     dataset,
-        ...     num_workers=4,
-        ...     worker_init_fn=get_pretraining_worker_init_fn()
-        ... )
-    """
-    return _pretraining_worker_init_fn
-
-
-def benchmark_read_modes(dataset, n_samples: int = 100, n_iterations: int = 3):
-    """
-    Compare sequential vs vectorized read performance.
-
-    Benchmarks the performance difference between using individual __getitem__
-    calls and the vectorized read_batch_vectorized method. Useful for evaluating
-    whether vectorized reads provide speedup for your specific access patterns.
-
-    Args:
-        dataset: LoadShardedFastaMLMDataset instance
-        n_samples: Number of samples to read per iteration
-        n_iterations: Number of benchmark iterations
-
-    Returns:
-        dict: Performance statistics including:
-            - sequential_avg: Average time for sequential reads (seconds)
-            - vectorized_avg: Average time for vectorized reads (seconds)
-            - speedup: Speedup ratio (sequential / vectorized)
-
-    Example:
-        >>> dataset = LoadShardedFastaMLMDataset("data/shards")
-        >>> stats = benchmark_read_modes(dataset, n_samples=100, n_iterations=3)
-        >>> print(f"Speedup: {stats['speedup']:.2f}x")
-
-    Note:
-        Speedup depends on access patterns. Consecutive indices within the same
-        shard benefit most from vectorized reads (2-3x speedup). Random access
-        may show less improvement due to overhead.
-    """
-    import time
-
-    # Sequential reads
-    seq_times = []
-    for _ in range(n_iterations):
-        start = time.perf_counter()
-        for i in range(n_samples):
-            _ = dataset[i]
-        seq_times.append(time.perf_counter() - start)
-
-    # Vectorized reads (consecutive indices)
-    vec_times = []
-    for _ in range(n_iterations):
-        start = time.perf_counter()
-        _ = dataset.read_batch_vectorized(list(range(n_samples)))
-        vec_times.append(time.perf_counter() - start)
-
-    seq_avg = sum(seq_times) / len(seq_times)
-    vec_avg = sum(vec_times) / len(vec_times)
-
-    return {
-        'sequential_avg': seq_avg,
-        'vectorized_avg': vec_avg,
-        'speedup': seq_avg / (vec_avg + 1e-9)
-    }
+    return str(bin_path)

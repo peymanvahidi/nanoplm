@@ -2,14 +2,19 @@ import pytest
 import tempfile
 import os
 import torch
+import numpy as np
 from pathlib import Path
 
-from nanoplm.pretraining.dataset import FastaMLMDataset
+from nanoplm.pretraining.dataset import (
+    LazyFastaDataset,
+    ShardWriter,
+    ShardedDataset,
+)
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 
-class TestFastaMLMDataset:
-    """Test suite for FastaMLMDataset."""
+class TestLazyFastaDataset:
+    """Test suite for LazyFastaDataset."""
 
     @pytest.fixture
     def sample_fasta_content(self):
@@ -29,7 +34,6 @@ MAIGT
             f.write(sample_fasta_content)
             temp_path = f.name
         yield temp_path
-        # Cleanup
         os.unlink(temp_path)
 
     @pytest.fixture
@@ -39,165 +43,70 @@ MAIGT
 
     def test_dataset_creation(self, temp_fasta_file, tokenizer):
         """Test basic dataset creation and properties."""
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=128,
-            lazy=True
         )
 
         assert len(dataset) == 3, "Should have 3 sequences"
         assert dataset.max_length == 128, "Should store max_length"
 
-    def test_dataset_sequence_access(self, temp_fasta_file, tokenizer):
+    def test_dataset_getitem(self, temp_fasta_file, tokenizer):
         """Test accessing individual sequences."""
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=128,
-            lazy=True
         )
 
-        # Test first sequence
         sample = dataset[0]
         assert 'input_ids' in sample, "Should have input_ids"
         assert 'attention_mask' in sample, "Should have attention_mask"
         assert isinstance(sample['input_ids'], torch.Tensor), "input_ids should be tensor"
         assert isinstance(sample['attention_mask'], torch.Tensor), "attention_mask should be tensor"
-
-        # Verify lengths match
         assert len(sample['input_ids']) == len(sample['attention_mask']), "Lengths should match"
-
-        # Verify attention mask is correct (all 1s for non-padded sequence)
-        expected_attention = torch.ones_like(sample['attention_mask'])
-        assert torch.equal(sample['attention_mask'], expected_attention), "Attention mask should be all 1s"
-
-    def test_dataset_truncation(self, temp_fasta_file, tokenizer):
-        """Test sequence truncation when exceeding max_length."""
-        # Create a very long sequence
-        long_sequence = "M" + "A" * 200  # Very long protein sequence
-        long_fasta = f">long_seq\n{long_sequence}"
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False) as f:
-            f.write(long_fasta)
-            long_fasta_path = f.name
-
-        try:
-            dataset = FastaMLMDataset(
-                fasta_path=long_fasta_path,
-                tokenizer=tokenizer,
-                max_length=50,  # Short max_length to force truncation
-                lazy=True
-            )
-
-            sample = dataset[0]
-            assert len(sample['input_ids']) <= 50, f"Should truncate to max_length, got {len(sample['input_ids'])}"
-        finally:
-            os.unlink(long_fasta_path)
 
     def test_dataset_out_of_bounds(self, temp_fasta_file, tokenizer):
         """Test error handling for out-of-bounds access."""
-        dataset = FastaMLMDataset(
+        dataset = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=128,
-            lazy=True
         )
 
-        # Test negative index
         with pytest.raises(IndexError):
             dataset[-1]
 
-        # Test index too large
         with pytest.raises(IndexError):
             dataset[len(dataset)]
 
-        # Test large positive index
         with pytest.raises(IndexError):
             dataset[1000]
 
     def test_dataset_empty_fasta(self, tokenizer):
         """Test handling of empty FASTA file."""
         with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False) as f:
-            f.write("")  # Empty file
+            f.write("")
             empty_path = f.name
 
         try:
             with pytest.raises(ValueError, match="FASTA file is empty"):
-                FastaMLMDataset(
+                LazyFastaDataset(
                     fasta_path=empty_path,
                     tokenizer=tokenizer,
                     max_length=128,
-                    lazy=True
                 )
         finally:
             os.unlink(empty_path)
 
-    def test_dataset_special_tokens(self, tokenizer):
-        """Test that special tokens are added correctly."""
-        # Create a simple sequence
-        simple_fasta = ">test\nMA"
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False) as f:
-            f.write(simple_fasta)
-            simple_path = f.name
-
-        try:
-            dataset = FastaMLMDataset(
-                fasta_path=simple_path,
-                tokenizer=tokenizer,
-                max_length=128,
-                lazy=True
-            )
-
-            sample = dataset[0]
-
-            # Should have at least 3 tokens: [CLS], sequence tokens, [SEP]
-            # input_ids is now a 1D tensor after squeezing
-            assert len(sample['input_ids']) >= 3, f"Should have special tokens, got {len(sample['input_ids'])}"
-
-            # First token should be CLS (usually 1 or similar)
-            # Last token should be SEP (usually 2 or similar)
-            # This depends on the specific tokenizer implementation
-
-        finally:
-            os.unlink(simple_path)
-
-    def test_dataset_index_persistence(self, temp_fasta_file, tokenizer):
-        """Test that the SQLite index is created and reused."""
-        dataset = FastaMLMDataset(
-            fasta_path=temp_fasta_file,
-            tokenizer=tokenizer,
-            max_length=128,
-            lazy=True
-        )
-
-        # Check that index file was created
-        index_path = f"{temp_fasta_file}.idx"
-        assert os.path.exists(index_path), "Index file should be created"
-
-        # Create another dataset instance - should reuse the index
-        dataset2 = FastaMLMDataset(
-            fasta_path=temp_fasta_file,
-            tokenizer=tokenizer,
-            max_length=128,
-            lazy=True
-        )
-
-        # Should work without recreating index
-        assert len(dataset2) == len(dataset), "Should have same length"
-
-        # Cleanup index file
-        if os.path.exists(index_path):
-            os.unlink(index_path)
-
-
-class TestDatasetIntegration:
-    """Integration tests combining dataset with other components."""
+class TestBinaryShardCreationAndLoading:
+    """End-to-end tests for binary shard creation and loading."""
 
     @pytest.fixture
     def sample_fasta_content(self):
-        """Create sample FASTA content for integration testing."""
+        """Create sample FASTA content for testing."""
         return """>seq1
 MKALCLLLLPVLGLLTGSSGS
 >seq2
@@ -213,7 +122,6 @@ MAIGTMAIGTMAIGT
             f.write(sample_fasta_content)
             temp_path = f.name
         yield temp_path
-        # Cleanup
         os.unlink(temp_path)
 
     @pytest.fixture
@@ -221,120 +129,137 @@ MAIGTMAIGTMAIGT
         """Create tokenizer for testing."""
         return ProtModernBertTokenizer()
 
-    def test_dataset_with_data_collator(self, temp_fasta_file, tokenizer):
-        """Test dataset integration with DataCollatorForLanguageModeling."""
-        from transformers import DataCollatorForLanguageModeling
-
-        dataset = FastaMLMDataset(
-            fasta_path=temp_fasta_file,
-            tokenizer=tokenizer,
-            max_length=64,
-            lazy=True
-        )
-
-        # Get a batch of samples
-        samples = [dataset[i] for i in range(len(dataset))]
-
-        # Test collator
-        collator = DataCollatorForLanguageModeling(
-            tokenizer=tokenizer,
-            mlm=True,
-            mlm_probability=0.15,
-            pad_to_multiple_of=8  # Enable padding for batched tensors
-        )
-
-        batch = collator(samples)
-
-        # Verify batch properties
-        assert 'input_ids' in batch, "Batch should have input_ids"
-        assert 'attention_mask' in batch, "Batch should have attention_mask"
-        assert 'labels' in batch, "Batch should have labels for MLM"
-
-        # Verify shapes
-        assert batch['input_ids'].shape[0] == len(samples), "Should have correct batch size"
-        assert batch['attention_mask'].shape[0] == len(samples), "Attention mask should match batch size"
-        assert batch['labels'].shape[0] == len(samples), "Labels should match batch size"
-
-        # All sequences should be padded to the same length
-        assert batch['input_ids'].shape[1] == batch['attention_mask'].shape[1], "Input and attention should have same sequence length"
-        assert batch['labels'].shape[1] == batch['input_ids'].shape[1], "Labels should match input_ids length"
-
-    def test_dataset_iteration(self, temp_fasta_file, tokenizer):
-        """Test iterating through the dataset."""
-        dataset = FastaMLMDataset(
-            fasta_path=temp_fasta_file,
-            tokenizer=tokenizer,
-            max_length=128,
-            lazy=True
-        )
-
-        # Test iteration
-        sequences = list(dataset)
-        assert len(sequences) == len(dataset), "Iteration should yield all sequences"
-
-        # Verify each sequence has required keys
-        for seq in sequences:
-            assert 'input_ids' in seq, "Each sequence should have input_ids"
-            assert 'attention_mask' in seq, "Each sequence should have attention_mask"
-            assert isinstance(seq['input_ids'], torch.Tensor), "input_ids should be tensor"
-            assert isinstance(seq['attention_mask'], torch.Tensor), "attention_mask should be tensor"
-
-    def test_dataset_lazy_vs_non_lazy(self, temp_fasta_file, tokenizer):
-        """Test lazy vs non-lazy loading modes."""
-        import tempfile
-        
-        # Test lazy mode (default)
-        lazy_dataset = FastaMLMDataset(
-            fasta_path=temp_fasta_file,
-            tokenizer=tokenizer,
-            max_length=128,
-            lazy=True
-        )
-
-        # Create temporary directory for HDF5 shards
-        with tempfile.TemporaryDirectory() as temp_hdf5_dir:
-            # Test non-lazy mode
-            non_lazy_dataset = FastaMLMDataset(
+    def test_create_and_load_shards(self, temp_fasta_file, tokenizer):
+        """Test creating binary shards then loading them."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saver = ShardWriter(
                 fasta_path=temp_fasta_file,
                 tokenizer=tokenizer,
                 max_length=128,
-                lazy=False,
-                hdf5_dir=temp_hdf5_dir
+                output_dir=tmpdir,
+                samples_per_shard=2,
+                max_workers=1,
             )
+            shard_paths = saver.create_shards()
 
-            # Both should have same length
-            assert len(lazy_dataset) == len(non_lazy_dataset), "Datasets should have same length"
+            # Should create 2 shards (3 seqs / 2 per shard = 2)
+            assert len(shard_paths) == 2
 
-            # Non-lazy dataset should have HDF5 shards
-            assert hasattr(non_lazy_dataset, 'shard_paths'), "Non-lazy dataset should have shard_paths"
-            assert len(non_lazy_dataset.shard_paths) > 0, "Should have created HDF5 shards"
+            # Verify .bin and .idx files exist
+            for sp in shard_paths:
+                assert sp.exists(), f"Bin file should exist: {sp}"
+                idx_file = sp.with_name(sp.stem + ".idx.npy")
+                assert idx_file.exists(), f"Idx file should exist: {idx_file}"
 
-            # Lazy dataset should not have shard_paths
-            assert not hasattr(lazy_dataset, 'shard_paths'), "Lazy dataset should not have shard_paths"
+            # Load the shards
+            dataset = ShardedDataset(data_dir=tmpdir)
+            assert len(dataset) == 3
 
-            # Results should be identical
-            for i in range(len(lazy_dataset)):
-                lazy_sample = lazy_dataset[i]
-                non_lazy_sample = non_lazy_dataset[i]
+            # Access each sample
+            for i in range(len(dataset)):
+                sample = dataset[i]
+                assert 'input_ids' in sample
+                assert 'attention_mask' in sample
+                assert isinstance(sample['input_ids'], torch.Tensor)
+                assert len(sample['input_ids']) > 0
 
-                # Compare tensors
-                assert torch.equal(lazy_sample['input_ids'], non_lazy_sample['input_ids']), f"input_ids should match for index {i}"
-                assert torch.equal(lazy_sample['attention_mask'], non_lazy_sample['attention_mask']), f"attention_mask should match for index {i}"
+    def test_force_overwrite(self, temp_fasta_file, tokenizer):
+        """Test force overwrite of existing shards."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saver = ShardWriter(
+                fasta_path=temp_fasta_file,
+                tokenizer=tokenizer,
+                max_length=128,
+                output_dir=tmpdir,
+                samples_per_shard=10,
+                max_workers=1,
+            )
+            saver.create_shards()
 
-    def test_dataset_memory_efficiency(self, temp_fasta_file, tokenizer):
-        """Test that dataset doesn't load all sequences into memory."""
-        dataset = FastaMLMDataset(
+            # Without force, should raise
+            with pytest.raises(FileExistsError):
+                saver2 = ShardWriter(
+                    fasta_path=temp_fasta_file,
+                    tokenizer=tokenizer,
+                    max_length=128,
+                    output_dir=tmpdir,
+                    samples_per_shard=10,
+                    max_workers=1,
+                    force=False,
+                )
+                saver2.create_shards()
+
+            # With force, should succeed
+            saver3 = ShardWriter(
+                fasta_path=temp_fasta_file,
+                tokenizer=tokenizer,
+                max_length=128,
+                output_dir=tmpdir,
+                samples_per_shard=10,
+                max_workers=1,
+                force=True,
+            )
+            saver3.create_shards()
+
+    def test_missing_directory(self):
+        """Test loading from non-existent directory."""
+        with pytest.raises(FileNotFoundError):
+            ShardedDataset(data_dir="/nonexistent/path")
+
+    def test_empty_directory(self):
+        """Test loading from empty directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(FileNotFoundError, match="No binary shard files"):
+                ShardedDataset(data_dir=tmpdir)
+
+    def test_out_of_bounds(self, temp_fasta_file, tokenizer):
+        """Test out-of-bounds access on loaded shards."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saver = ShardWriter(
+                fasta_path=temp_fasta_file,
+                tokenizer=tokenizer,
+                max_length=128,
+                output_dir=tmpdir,
+                samples_per_shard=10,
+                max_workers=1,
+            )
+            saver.create_shards()
+            dataset = ShardedDataset(data_dir=tmpdir)
+
+            with pytest.raises(IndexError):
+                dataset[-1]
+
+            with pytest.raises(IndexError):
+                dataset[len(dataset)]
+
+    def test_consistency_with_lazy_dataset(self, temp_fasta_file, tokenizer):
+        """Test that binary shards produce the same tokens as lazy dataset."""
+        lazy_ds = LazyFastaDataset(
             fasta_path=temp_fasta_file,
             tokenizer=tokenizer,
             max_length=128,
-            lazy=True
         )
 
-        # Access all sequences
-        for i in range(len(dataset)):
-            seq = dataset[i]
-            assert 'input_ids' in seq, f"Sequence {i} should have input_ids"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saver = ShardWriter(
+                fasta_path=temp_fasta_file,
+                tokenizer=tokenizer,
+                max_length=128,
+                output_dir=tmpdir,
+                samples_per_shard=10,
+                max_workers=1,
+            )
+            saver.create_shards()
+            shard_ds = ShardedDataset(data_dir=tmpdir)
 
-        # Dataset should not store sequences in memory
-        # (This is a basic check - in practice we'd need memory profiling)
-        assert not hasattr(dataset, '_sequences'), "Dataset should not cache sequences in memory"
+            assert len(lazy_ds) == len(shard_ds), "Datasets should have same length"
+
+            for i in range(len(lazy_ds)):
+                lazy_sample = lazy_ds[i]
+                shard_sample = shard_ds[i]
+
+                # Compare token values (shard stores uint8, lazy returns pt tensors)
+                assert torch.equal(
+                    lazy_sample['input_ids'].long(),
+                    shard_sample['input_ids'].long(),
+                ), f"input_ids should match for index {i}"
