@@ -1,7 +1,12 @@
-from nanoplm.distillation.pipeline import DistillationPipeline
-from nanoplm.distillation.pipeline_builder import DistillationPipelineBuilder
+from nanoplm.distillation.pipeline import (
+    DistillationConfig,
+    ResumeConfig,
+    run_distillation,
+)
 
 __all__ = [
-    "DistillationPipeline",
-    "DistillationPipelineBuilder"
+    "DistillationConfig",
+    "StudentModelConfig",
+    "ResumeConfig",
+    "run_distillation",
 ]
