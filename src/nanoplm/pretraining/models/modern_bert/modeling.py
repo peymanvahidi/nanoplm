@@ -281,6 +281,26 @@ class ModernBertMLP(nn.Module):
         return self.Wo(self.drop(self.act(input) * gate))
 
 
+class ModernBertSwiGLUMLP(nn.Module):
+    """SwiGLU MLP variant: Wi → chunk → silu(gate) * x → dropout → Wo.
+
+    Matches the ``ModernBertMLPSwiGLU`` monkey-patch in the HF-based
+    ``model.py`` so that the pure-torch pipeline produces identical
+    forward-pass results.
+    """
+
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.config = config
+        self.Wi = nn.Linear(config.hidden_size, int(config.intermediate_size) * 2, bias=config.mlp_bias)
+        self.drop = nn.Dropout(config.mlp_dropout)
+        self.Wo = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
+        return self.Wo(self.drop(F.silu(gate) * x))
+
+
 # ---------------------------------------------------------------------------
 # Attention
 # ---------------------------------------------------------------------------

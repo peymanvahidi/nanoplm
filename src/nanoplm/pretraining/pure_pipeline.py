@@ -11,15 +11,17 @@ Usage via CLI:  ``nanoplm pretrain from-yaml pretrain.yaml --pure-torch``
 import os
 import json
 import math
+import re
 import random
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 import wandb
-from datetime import datetime
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 from pathlib import Path
 
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
@@ -28,21 +30,20 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import LambdaLR
 
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.dataset import (
-    LazyFastaMLMDataset,
     LoadShardedFastaMLMDataset,
 )
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 
-# Reuse helpers from the existing pipeline (configs, run naming, workers, lazy ds)
+# Reuse helpers from the existing pipeline (configs, run naming, workers)
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
     ResumeConfig,
     _prepare_run_and_steps,
     _get_num_workers,
-    _create_lazy_datasets,
 )
+from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.validation import validate_pretrain_dataset, ValidationError
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
@@ -63,35 +64,68 @@ def _set_seed(seed: int) -> None:
 # Optimizer (matches HF Trainer's AdamW parameter grouping)
 # ---------------------------------------------------------------------------
 
-_NO_DECAY_PATTERNS = {"bias", "LayerNorm", "layernorm", "layer_norm", "norm"}
-
-
 def _create_optimizer(
     model: torch.nn.Module,
     cfg: PretrainingConfig,
 ) -> torch.optim.Optimizer:
-    """Create AdamW with HF-compatible weight-decay grouping."""
+    """Create optimizer with HF-compatible parameter grouping."""
+    raw_model = model.module if isinstance(model, DDP) else model
     decay_params = []
     no_decay_params = []
 
-    for name, param in model.named_parameters():
+    # HF Trainer equivalent:
+    # get_parameter_names(model, [nn.LayerNorm], forbidden_name_patterns)
+    forbidden_name_patterns = [
+        r"bias",
+        r"layernorm",
+        r"rmsnorm",
+        r"(?:^|\.)norm(?:$|\.)",
+        r"_norm(?:$|\.)",
+    ]
+    decay_parameter_names = set(
+        _get_parameter_names(
+            raw_model,
+            forbidden_layer_types=[nn.LayerNorm],
+            forbidden_layer_names=forbidden_name_patterns,
+        )
+    )
+
+    for name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
-        if any(nd in name for nd in _NO_DECAY_PATTERNS):
-            no_decay_params.append(param)
-        else:
+        if name in decay_parameter_names:
             decay_params.append(param)
+        else:
+            no_decay_params.append(param)
 
     groups = [
         {"params": decay_params, "weight_decay": cfg.weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    return torch.optim.AdamW(
-        groups,
-        lr=float(cfg.learning_rate),
-        betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
-        eps=float(cfg.adam_epsilon),
+    optimizer_name = str(cfg.optimizer).lower()
+    common_kwargs = {
+        "params": groups,
+        "lr": float(cfg.learning_rate),
+        "betas": (float(cfg.adam_beta1), float(cfg.adam_beta2)),
+        "eps": float(cfg.adam_epsilon),
+    }
+
+    if optimizer_name == "adamw":
+        return torch.optim.AdamW(**common_kwargs)
+
+    if optimizer_name == "stable_adamw":
+        stable_adamw = getattr(torch.optim, "StableAdamW", None)
+        if stable_adamw is None:
+            logger.warning(
+                "torch.optim.StableAdamW is unavailable in this environment; "
+                "falling back to AdamW in pure-torch pipeline."
+            )
+            return torch.optim.AdamW(**common_kwargs)
+        return stable_adamw(**common_kwargs)
+
+    raise ValueError(
+        f"Invalid optimizer: {cfg.optimizer}. Currently supported: [adamw, stable_adamw]"
     )
 
 
@@ -104,6 +138,7 @@ def _create_scheduler(
     warmup_steps: int,
     total_steps: int,
 ) -> LambdaLR:
+    # Mirrors transformers.optimization._get_linear_schedule_with_warmup_lr_lambda
     def lr_lambda(current_step: int) -> float:
         if current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
@@ -116,6 +151,67 @@ def _create_scheduler(
     return LambdaLR(optimizer, lr_lambda)
 
 
+def _get_parameter_names(
+    model: torch.nn.Module,
+    forbidden_layer_types: list[type[torch.nn.Module]],
+    forbidden_layer_names: Optional[list[str]] = None,
+) -> list[str]:
+    """
+    Local copy of HF trainer_pt_utils.get_parameter_names.
+
+    Returns names of parameters not inside forbidden layer types and not matching
+    forbidden name patterns.
+    """
+    forbidden_layer_patterns = (
+        [re.compile(pattern) for pattern in forbidden_layer_names]
+        if forbidden_layer_names is not None
+        else []
+    )
+
+    result: list[str] = []
+    for name, child in model.named_children():
+        child_params = _get_parameter_names(
+            child,
+            forbidden_layer_types=forbidden_layer_types,
+            forbidden_layer_names=forbidden_layer_names,
+        )
+        result += [
+            f"{name}.{n}"
+            for n in child_params
+            if not isinstance(child, tuple(forbidden_layer_types))
+            and not any(pattern.search(f"{name}.{n}".lower()) for pattern in forbidden_layer_patterns)
+        ]
+
+    # Parameters defined directly on this module (not in any child module)
+    result += [
+        k
+        for k in model._parameters
+        if not any(pattern.search(k.lower()) for pattern in forbidden_layer_patterns)
+    ]
+
+    return result
+
+
+def _hf_num_update_steps_per_epoch(
+    train_loader_len: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Match HF Trainer update-step counting (ceil over micro-steps)."""
+    if train_loader_len <= 0:
+        return 1
+    steps = train_loader_len // gradient_accumulation_steps
+    if train_loader_len % gradient_accumulation_steps != 0:
+        steps += 1
+    return max(1, steps)
+
+
+def _hf_get_warmup_steps(num_training_steps: int, warmup_value: float) -> int:
+    """Mirror transformers.TrainingArguments.get_warmup_steps."""
+    if warmup_value >= 1:
+        return int(warmup_value)
+    return math.ceil(num_training_steps * warmup_value)
+
+
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -126,6 +222,7 @@ def _evaluate(
     eval_loader: DataLoader,
     device: torch.device,
     distributed: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> float:
     model.eval()
     total_loss = 0.0
@@ -133,11 +230,17 @@ def _evaluate(
 
     for batch in eval_loader:
         batch = {k: v.to(device) for k, v in batch.items()}
-        out = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["labels"],
+        amp_ctx = (
+            torch.autocast(device_type=device.type, dtype=amp_dtype)
+            if amp_dtype is not None
+            else nullcontext()
         )
+        with amp_ctx:
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"],
+            )
         loss = out["loss"] if isinstance(out, dict) else out.loss
         bs = batch["input_ids"].size(0)
         total_loss += loss.item() * bs
@@ -249,46 +352,60 @@ def run_pure_pretraining(
     tokenizer = model.tokenizer
     device = torch.device(get_device())
 
-    # ---- datasets (same logic as HF pipeline) ---------------------------
-    if pretrain_config.lazy_dataset:
-        if pretrain_config.train_fasta is None or pretrain_config.val_fasta is None:
-            raise ValueError("Train and validation FASTA files are required when lazy-dataset mode is enabled")
-        if not Path(pretrain_config.train_fasta).exists():
-            raise FileNotFoundError(f"Train FASTA file not found: {pretrain_config.train_fasta}")
-        if not Path(pretrain_config.val_fasta).exists():
-            raise FileNotFoundError(f"Validation FASTA file not found: {pretrain_config.val_fasta}")
+    # ---- datasets (same manifest-driven logic as HF pipeline) -----------
+    dataset_dir = Path(pretrain_config.dataset_dir)
 
-        logger.info("Using LazyFastaMLMDataset for on-the-fly tokenization")
-        train_ds, val_ds = _create_lazy_datasets(
-            train_fasta=pretrain_config.train_fasta,
-            val_fasta=pretrain_config.val_fasta,
-            max_length=pretrain_config.max_length,
-            tokenizer=tokenizer,
+    logger.info(f"Validating pretraining dataset at {dataset_dir}...")
+    try:
+        validation_result = validate_pretrain_dataset(dataset_dir)
+        logger.info(
+            f"Dataset validated: {validation_result['manifest']['train_sequences']:,} train, "
+            f"{validation_result['manifest']['val_sequences']:,} val sequences"
         )
-    else:
-        if pretrain_config.train_hdf5 is None or pretrain_config.val_hdf5 is None:
-            raise ValueError("Train and validation HDF5 directories are required when lazy-dataset mode is disabled")
-        if not Path(pretrain_config.train_hdf5).exists():
-            raise FileNotFoundError(f"Train HDF5 directory not found: {pretrain_config.train_hdf5}")
-        if not Path(pretrain_config.val_hdf5).exists():
-            raise FileNotFoundError(f"Validation HDF5 directory not found: {pretrain_config.val_hdf5}")
+    except ValidationError as e:
+        logger.error(f"Dataset validation failed: {e}")
+        raise
+    except FileNotFoundError as e:
+        logger.error(f"Dataset not found: {e}")
+        raise
 
-        logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
-        try:
-            train_ds = LoadShardedFastaMLMDataset(
-                hdf5_dir=pretrain_config.train_hdf5,
-                load_all_in_memory=pretrain_config.load_all_in_memory,
-            )
-            val_ds = LoadShardedFastaMLMDataset(
-                hdf5_dir=pretrain_config.val_hdf5,
-                load_all_in_memory=pretrain_config.load_all_in_memory,
-            )
-        except FileNotFoundError as e:
-            logger.error(
-                f"HDF5 shards not found! Create them first with "
-                f"'nanoplm data from-yaml' or set lazy_dataset=True.\nError: {e}"
-            )
-            raise
+    manifest = read_manifest(dataset_dir)
+    validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
+
+    train_hdf5_dir = dataset_dir / manifest.train_dir
+    val_hdf5_dir = dataset_dir / manifest.val_dir
+    train_sequences = manifest.train_sequences
+    val_sequences = manifest.val_sequences
+
+    logger.info(f"Loaded config from manifest: {dataset_dir}")
+    logger.info(f"  train_hdf5: {train_hdf5_dir}")
+    logger.info(f"  val_hdf5: {val_hdf5_dir}")
+    logger.info(f"  max_length: {manifest.max_seq_len}")
+    logger.info(f"  train_sequences: {train_sequences}")
+    logger.info(f"  val_sequences: {val_sequences}")
+
+    if not train_hdf5_dir.exists():
+        raise FileNotFoundError(f"Train HDF5 directory not found: {train_hdf5_dir}")
+    if not val_hdf5_dir.exists():
+        raise FileNotFoundError(f"Validation HDF5 directory not found: {val_hdf5_dir}")
+
+    logger.info("Using LoadShardedFastaMLMDataset for pre-tokenized HDF5 shards")
+    try:
+        train_ds = LoadShardedFastaMLMDataset(
+            hdf5_dir=str(train_hdf5_dir),
+            load_all_in_memory=pretrain_config.load_all_in_memory,
+        )
+        val_ds = LoadShardedFastaMLMDataset(
+            hdf5_dir=str(val_hdf5_dir),
+            load_all_in_memory=pretrain_config.load_all_in_memory,
+        )
+    except FileNotFoundError as e:
+        logger.error(
+            f"HDF5 shards not found! You need to create them first.\n"
+            f"Run: nanoplm data from-yaml with pipeline_mode: 'pretrain'\n"
+            f"Error: {e}"
+        )
+        raise
 
     # ---- collator --------------------------------------------------------
     collator = ProtDataCollatorForLM(
@@ -322,13 +439,20 @@ def run_pure_pretraining(
     )
 
     # ---- run naming & step intervals (reuse existing helper) -------------
-    run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps = (
-        _prepare_run_and_steps(
-            pretrain_config=pretrain_config,
-            resume_config=resume_config,
-            train_ds=train_ds,
-            global_batch_size=global_batch_size,
-        )
+    (
+        _run_name,
+        wandb_run_name,
+        output_dir,
+        num_epochs,
+        logging_steps,
+        eval_steps,
+        save_steps,
+        _resume_step,
+    ) = _prepare_run_and_steps(
+        pretrain_config=pretrain_config,
+        resume_config=resume_config,
+        train_samples=train_sequences,
+        global_batch_size=global_batch_size,
     )
 
     num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
@@ -385,10 +509,16 @@ def run_pure_pretraining(
     # ---- optimizer & scheduler -------------------------------------------
     optimizer = _create_optimizer(model, pretrain_config)
 
-    # Use floor division for steps_per_epoch to match HF Trainer
-    steps_per_epoch = max(1, len(train_loader) // pretrain_config.gradient_accumulation_steps)
+    # Match HF Trainer: ceil update steps across micro-batches.
+    steps_per_epoch = _hf_num_update_steps_per_epoch(
+        train_loader_len=len(train_loader),
+        gradient_accumulation_steps=pretrain_config.gradient_accumulation_steps,
+    )
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = max(1, int(total_steps * pretrain_config.warmup_ratio))
+    warmup_steps = _hf_get_warmup_steps(
+        num_training_steps=total_steps,
+        warmup_value=float(pretrain_config.warmup_ratio),
+    )
     scheduler = _create_scheduler(optimizer, warmup_steps, total_steps)
 
     # ---- resume ----------------------------------------------------------
@@ -421,7 +551,7 @@ def run_pure_pretraining(
         try:
             wandb.init(
                 project=pretrain_config.project_name,
-                name=run_name,
+                name=wandb_run_name,
                 config={
                     "pretrain": pretrain_config.__dict__,
                     "total_steps": total_steps,
@@ -441,13 +571,50 @@ def run_pure_pretraining(
     )
 
     global_step = start_step
-    torch.set_float32_matmul_precision('high')
+
+    # ---- mixed precision + tf32 (match HF TrainingArguments behavior) ----
+    use_bf16 = (
+        pretrain_config.bf16
+        and device.type == "cuda"
+        and torch.cuda.is_bf16_supported()
+    )
+    use_fp16 = (
+        pretrain_config.bf16
+        and (
+            (device.type == "cuda" and not torch.cuda.is_bf16_supported())
+            or device.type == "mps"
+        )
+    )
+    amp_dtype: Optional[torch.dtype] = None
+    if use_bf16:
+        amp_dtype = torch.bfloat16
+    elif use_fp16:
+        amp_dtype = torch.float16
+
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = bool(pretrain_config.tf32)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = bool(pretrain_config.tf32)
+
+    scaler = (
+        torch.amp.GradScaler(enabled=(device.type == "cuda" and use_fp16))
+        if torch.cuda.is_available()
+        else None
+    )
+
+    logger.info(
+        f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
+        f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}"
+    )
+
     model.train()
 
     # tokens/sec tracking
     _tok_count = 0              # non-padding tokens processed since last log
     _raw_tok_count = 0          # raw tokens processed since last log
     _tok_t0: Optional[float] = None  # wall-clock at first micro-step after last log
+    window_loss = 0.0
+    window_step_count = 0
 
     for epoch in range(start_epoch, num_epochs):
         if hasattr(train_sampler, "set_epoch"):
@@ -466,14 +633,23 @@ def run_pure_pretraining(
             _tok_count += int(batch["attention_mask"].sum().item())
             _raw_tok_count += int(batch["attention_mask"].numel())
 
-            out = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
+            amp_ctx = (
+                torch.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_dtype is not None
+                else nullcontext()
             )
+            with amp_ctx:
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
+                )
             loss = out["loss"] if isinstance(out, dict) else out.loss
             loss = loss / pretrain_config.gradient_accumulation_steps
-            loss.backward()
+            if scaler is not None and scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             accum_loss += loss.item()
 
             is_accum_boundary = (micro_step + 1) % pretrain_config.gradient_accumulation_steps == 0
@@ -481,11 +657,26 @@ def run_pure_pretraining(
 
             if is_accum_boundary or is_last_step:
                 # grad_norm before clipping (matches HF Trainer)
+                if scaler is not None and scaler.is_enabled():
+                    scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
-                optimizer.step()
-                scheduler.step()
+                optimizer_step_was_skipped = False
+                if scaler is not None and scaler.is_enabled():
+                    old_scale = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    new_scale = scaler.get_scale()
+                    optimizer_step_was_skipped = new_scale < old_scale
+                else:
+                    optimizer.step()
+                # Match HF: log LR before scheduler update, and skip scheduler step on overflow.
+                learning_rate = optimizer.param_groups[0]["lr"]
+                if not optimizer_step_was_skipped:
+                    scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
+                window_loss += accum_loss
+                window_step_count += 1
 
                 # --- tokens/sec (every step) ---
                 _tok_t1 = time.perf_counter()
@@ -511,38 +702,47 @@ def run_pure_pretraining(
                 _raw_tok_count = 0
                 _tok_t0 = None
 
-                if is_main:
-                    lr = scheduler.get_last_lr()[0]
+                # Match HF Trainer default logging cadence (logging_first_step=False):
+                # log strictly on logging_steps boundaries.
+                should_log = (global_step % logging_steps == 0)
+                if is_main and should_log:
+                    loss_to_log = window_loss / max(1, window_step_count)
+                    log_payload = {
+                        "train/loss": loss_to_log,
+                        "train/grad_norm": grad_norm,
+                        "train/learning_rate": learning_rate,
+                        "train/epoch": epoch + (micro_step + 1) / len(train_loader),
+                        "train/tokens_per_sec": tokens_per_sec,
+                        "train/raw_tokens_per_sec": raw_tokens_per_sec,
+                    }
                     if wandb_enabled and wandb.run is not None:
                         try:
-                            wandb.log(
-                                {
-                                    "train/loss": accum_loss,
-                                    "train/grad_norm": grad_norm,
-                                    "train/learning_rate": lr,
-                                    "train/epoch": epoch + (micro_step + 1) / len(train_loader),
-                                    "train/global_step": global_step,
-                                    "train/tokens_per_sec": tokens_per_sec,
-                                    "train/raw_tokens_per_sec": raw_tokens_per_sec,
-                                },
-                                step=global_step,
-                            )
+                            wandb.log(log_payload, step=global_step)
                         except Exception as exc:
                             wandb_enabled = False
                             logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
                     logger.info(
                         f"[step {global_step}/{total_steps}] "
-                        f"loss={accum_loss:.4f}  lr={lr:.2e}  "
+                        f"loss={loss_to_log:.4f}  lr={learning_rate:.2e}  "
                         f"grad_norm={grad_norm:.4f}  "
                         f"tok/s={tokens_per_sec:,.0f}  "
                         f"raw_tok/s={raw_tokens_per_sec:,.0f}"
                     )
+                if should_log:
+                    window_loss = 0.0
+                    window_step_count = 0
 
                 accum_loss = 0.0
 
                 # --- evaluation ---
                 if global_step % eval_steps == 0:
-                    eval_loss = _evaluate(model, eval_loader, device, distributed=pretrain_config.multi_gpu)
+                    eval_loss = _evaluate(
+                        model,
+                        eval_loader,
+                        device,
+                        distributed=pretrain_config.multi_gpu,
+                        amp_dtype=amp_dtype,
+                    )
                     if is_main:
                         if wandb_enabled and wandb.run is not None:
                             try:

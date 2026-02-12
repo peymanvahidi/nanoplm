@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertConfig,
     ModernBertForMaskedLM,
+    ModernBertSwiGLUMLP,
 )
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
@@ -45,3 +46,9 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
         )
 
         super().__init__(mb_config)
+
+        # Apply SwiGLU activation to MLP layers if specified
+        # (matches the monkey-patching in ProtModernBertMLM)
+        if config.mlp_activation.lower() == "swiglu":
+            for layer in self.model.layers:
+                layer.mlp = ModernBertSwiGLUMLP(mb_config)
