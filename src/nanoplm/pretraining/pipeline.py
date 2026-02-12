@@ -30,7 +30,7 @@ class PretrainingConfig:
     ckp_dir: str = "output/pretraining"
 
     # Training hyperparameters
-    batch_size: int = 32
+    micro_batch_size: int = 32
     num_epochs: int = 10
     warmup_ratio: float = 0.05
     optimizer: str = "adamw"
@@ -40,10 +40,8 @@ class PretrainingConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
     # Target effective batch size in tokens per optimizer step.
-    # gradient_accumulation_steps is inferred from this value.
+    # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_size: int = 2 ** 20
-    # Kept for backwards compatibility; overwritten by inferred value.
-    gradient_accumulation_steps: int = 1
 
     # Mixed precision
     bf16: bool = True
@@ -329,12 +327,12 @@ def run_pretraining(
         )
 
     world_tokens_per_micro_step = (
-        pretrain_config.batch_size * max_length * effective_world_size
+        pretrain_config.micro_batch_size * max_length * effective_world_size
     )
     if world_tokens_per_micro_step <= 0:
         raise ValueError(
             f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check batch_size, max_seq_len, and world_size."
+            "Check micro_batch_size, max_seq_len, and world_size."
         )
 
     inferred_grad_accum_steps = max(
@@ -346,18 +344,9 @@ def run_pretraining(
     )
     global_batch_size_samples = (
         inferred_grad_accum_steps
-        * pretrain_config.batch_size
+        * pretrain_config.micro_batch_size
         * effective_world_size
     )
-
-    if pretrain_config.gradient_accumulation_steps != inferred_grad_accum_steps:
-        logger.info(
-            "Overriding gradient_accumulation_steps from "
-            f"{pretrain_config.gradient_accumulation_steps} to "
-            f"{inferred_grad_accum_steps} based on global_batch_size="
-            f"{pretrain_config.global_batch_size:,} tokens."
-        )
-    pretrain_config.gradient_accumulation_steps = inferred_grad_accum_steps
 
     logger.info(
         "Batch setup: "
@@ -392,9 +381,9 @@ def run_pretraining(
 
     training_dict = {
         "output_dir": output_dir,
-        "per_device_train_batch_size": pretrain_config.batch_size,
-        "per_device_eval_batch_size": pretrain_config.batch_size,
-        "gradient_accumulation_steps": pretrain_config.gradient_accumulation_steps,
+        "per_device_train_batch_size": pretrain_config.micro_batch_size,
+        "per_device_eval_batch_size": pretrain_config.micro_batch_size,
+        "gradient_accumulation_steps": inferred_grad_accum_steps,
         "num_train_epochs": num_epochs,
         "learning_rate": pretrain_config.learning_rate,
         "weight_decay": pretrain_config.weight_decay,

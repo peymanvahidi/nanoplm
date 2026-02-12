@@ -168,7 +168,7 @@ pretraining:
 
   # Hyperparameters
   max_length: 512
-  batch_size: 32
+  micro_batch_size: 32
   num_epochs: 10
 
   # Dataset loading strategy:

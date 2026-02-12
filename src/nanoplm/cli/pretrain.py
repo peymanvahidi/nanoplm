@@ -47,10 +47,10 @@ def pretrain():
 )
 # Training hyperparameters
 @click.option(
-    "--batch-size",
+    "--micro-batch-size",
     type=int,
     default=32,
-    help="Per-device batch size"
+    help="Per-device micro-batch size (samples per GPU per forward pass)",
 )
 @click.option(
     "--num-epochs",
@@ -80,7 +80,7 @@ def pretrain():
     "--global-batch-size",
     type=int,
     default=2 ** 20,
-    help="Target global batch size in tokens per optimizer step",
+    help="Target tokens per optimizer step (grad_accum inferred automatically)",
 )
 @click.option(
     "--optimizer",
@@ -266,7 +266,7 @@ def run(
     dataset_dir: str,
     ckp_dir: str,
     # training hp
-    batch_size: int,
+    micro_batch_size: int,
     num_epochs: int,
     learning_rate: float,
     weight_decay: float,
@@ -310,7 +310,7 @@ def run(
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
-        batch_size=batch_size,
+        micro_batch_size=micro_batch_size,
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
@@ -487,7 +487,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
         "\n"
         "  # Hyperparameters\n"
-        "  batch_size: 32\n"
+        "  #   micro_batch_size: samples per GPU per forward pass (limited by GPU memory)\n"
+        "  #   global_batch_size: total tokens per optimizer step across all GPUs\n"
+        "  #   gradient_accumulation_steps is inferred automatically:\n"
+        "  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))\n"
+        "  micro_batch_size: 32\n"
+        "  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
         "  num_epochs: 10\n"
         "\n"
         "  optimizer: \"adamw\"  # adamw, stable_adamw\n"
@@ -497,7 +502,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  learning_rate: 1e-3  # Maximum learning rate in warmup phase\n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
-        "  global_batch_size: 1048576  # target tokens/optimizer-step (2^20), grad_accum inferred automatically\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
@@ -552,7 +556,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if "gradient_accumulation_steps" in present_keys:
         raise ValueError(
             "gradient_accumulation_steps is inferred automatically from "
-            "global_batch_size, batch_size, max_seq_len, and world_size. "
+            "global_batch_size, micro_batch_size, max_seq_len, and world_size. "
             "Remove gradient_accumulation_steps from your pretraining config."
         )
 
