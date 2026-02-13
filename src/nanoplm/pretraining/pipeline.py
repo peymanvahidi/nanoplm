@@ -95,6 +95,7 @@ def _build_muon_optimizer(
         adamw_params=adamw_params,
         muon_learning_rate=pretrain_config.muon_learning_rate,
         muon_weight_decay=pretrain_config.muon_weight_decay,
+        muon_cautious_weight_decay=pretrain_config.muon_cautious_weight_decay,
         muon_momentum=pretrain_config.muon_momentum,
         muon_nesterov=pretrain_config.muon_nesterov,
         muon_eps=pretrain_config.muon_eps,
@@ -196,10 +197,11 @@ class PretrainingConfig:
     adam_epsilon: float = 1e-8
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
-    # Muon-specific hyperparameters (used only when optimizer == "muon").
+    # Muon-specific hyperparameters (used only when optimizer == "muon" or "normuon").
     # Plain learning_rate/weight_decay/adam_* are used for the AdamW sub-optimizer.
     muon_learning_rate: float = 2e-2
     muon_weight_decay: float = 0.1
+    muon_cautious_weight_decay: bool = True
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_eps: float = 1e-7

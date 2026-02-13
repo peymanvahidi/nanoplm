@@ -17,6 +17,7 @@ class MuonAdamW(torch.optim.Optimizer):
         adamw_params: list[torch.nn.Parameter],
         muon_learning_rate: float,
         muon_weight_decay: float,
+        muon_cautious_weight_decay: bool,
         muon_momentum: float,
         muon_nesterov: bool,
         muon_eps: float,
@@ -51,6 +52,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 nesterov=bool(muon_nesterov),
                 adjust_lr="rms_norm",
                 use_triton=True,
+                cautious_wd=bool(muon_cautious_weight_decay),
             )
         else:
             self.muon = DionMuon(
@@ -62,7 +64,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 epsilon=float(muon_eps),
                 nesterov=bool(muon_nesterov),
                 adjust_lr=None,
-                use_triton=False,
+                use_triton=True,
+                cautious_wd=bool(muon_cautious_weight_decay),
             )
         self.adamw = torch.optim.AdamW(
             adamw_params,

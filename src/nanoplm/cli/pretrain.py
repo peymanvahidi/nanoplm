@@ -168,30 +168,35 @@ def pretrain():
     "--muon-learning-rate",
     type=float,
     default=2e-2,
-    help="Muon LR (used only when optimizer=muon; learning-rate remains AdamW LR)",
+    help="Muon LR (used only when optimizer=muon or normuon; learning-rate remains AdamW LR)",
 )
 @click.option(
     "--muon-weight-decay",
     type=float,
     default=0.1,
-    help="Muon weight decay (used only when optimizer=muon)",
+    help="Muon weight decay (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-cautious-weight-decay/--no-muon-cautious-weight-decay",
+    default=True,
+    help="Enable cautious weight decay in Muon/NorMuon (used only when optimizer=muon or normuon)",
 )
 @click.option(
     "--muon-momentum",
     type=float,
     default=0.95,
-    help="Muon momentum (used only when optimizer=muon)",
+    help="Muon momentum (used only when optimizer=muon or normuon)",
 )
 @click.option(
     "--muon-nesterov/--no-muon-nesterov",
     default=True,
-    help="Enable Nesterov in Muon (used only when optimizer=muon)",
+    help="Enable Nesterov in Muon (used only when optimizer=muon or normuon)",
 )
 @click.option(
     "--muon-eps",
     type=float,
     default=1e-7,
-    help="Muon epsilon (used only when optimizer=muon)",
+    help="Muon epsilon (used only when optimizer=muon or normuon)",
 )
 @click.option(
     "--mlm-probability",
@@ -371,6 +376,7 @@ def run(
     adam_epsilon: float,
     muon_learning_rate: float,
     muon_weight_decay: float,
+    muon_cautious_weight_decay: bool,
     muon_momentum: float,
     muon_nesterov: bool,
     muon_eps: float,
@@ -421,6 +427,7 @@ def run(
         adam_epsilon=adam_epsilon,
         muon_learning_rate=muon_learning_rate,
         muon_weight_decay=muon_weight_decay,
+        muon_cautious_weight_decay=muon_cautious_weight_decay,
         muon_momentum=muon_momentum,
         muon_nesterov=muon_nesterov,
         muon_eps=muon_eps,
@@ -635,16 +642,17 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_epochs: 10\n"
         "\n"
         "  optimizer: \"adamw\"  # adamw, stable_adamw, muon, normuon\n"
-        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon)\n"
+        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 1e-3  # AdamW LR (Muon uses muon_learning_rate)\n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
-        "  # Muon hyperparameters (used only when optimizer: muon)\n"
+        "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
         "  muon_learning_rate: 2e-2\n"
         "  muon_weight_decay: 0.1\n"
+        "  muon_cautious_weight_decay: true\n"
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
@@ -749,7 +757,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'bf16', 'tf32', 'muon_nesterov']:
+    for bool_key in ['multi_gpu', 'bf16', 'tf32', 'muon_nesterov', 'muon_cautious_weight_decay']:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):

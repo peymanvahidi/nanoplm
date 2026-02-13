@@ -186,6 +186,7 @@ pretraining:
   # Muon hyperparameters (used only when optimizer: muon)
   muon_learning_rate: 2e-2
   muon_weight_decay: 0.1
+  muon_cautious_weight_decay: true
   muon_momentum: 0.95
   muon_nesterov: true
   muon_eps: 1e-7
