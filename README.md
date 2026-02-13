@@ -41,7 +41,7 @@ pip install nanoplm
 nanoplm data get-yaml
 ```
 
->You'll get [this](#data-preparation-yaml) params.yaml and dvc.yaml files. Just edit the params.yaml if you want.
+>You'll get [params.yaml](#data-preparation-yaml) and a dvc.yaml files. Just edit the params.yaml if you want.
 
 > We're using DVC under the hood, so you can track your data version.
 
@@ -57,31 +57,31 @@ nanoplm data from-yaml
 Like: `nanoplm data from-yaml <path/to/params.yaml>`
 
 
-Or if you want to prepare your data for Knowledge distillation also use the `--distillation` flag.
-This way two extra stages for calculating teacher embeddings for train and val files would also happen.
-
-```bash
-nanoplm data from-yaml --distillation
-```
-
 📊 Now your data is ready! Let's start the training.
 
-### 3. Get a pretrain YAML file
+### 3. Get a pretrain or distillation YAML file
 
 ```bash
 nanoplm pretrain get-yaml
 ```
 
-> This writes [this](#pretraining-yaml) pretraining YAML to your current directory. Prefer a different folder?
-Use: `nanoplm pretrain get-yaml <output/dir>`
+> This writes [pretraining YAML file](#pretraining-yaml) to your current directory.
 
-### 4. Start your pretraining
+```bash
+nanoplm distill get-yaml
+```
+
+> This writes [distillation YAML file](#distill-yaml) to your current directory.
+
+### 4. Start your pretraining or distillation
 
 ```bash
 nanoplm pretrain from-yaml
 ```
-
-> By default, this uses `pretrain.yaml` in your current directory. You can optionally specify a different path argument (relative or absolute) if needed.
+or
+```bash
+nanoplm distill from-yaml
+```
 
 ---
 
@@ -89,34 +89,39 @@ nanoplm pretrain from-yaml
 
 ```yaml
 data_params:
+  # Pipeline mode: 'pretrain', 'distillation', or 'none'
+  # - 'pretrain': Generate HDF5 shards for MLM pretraining
+  # - 'distillation': Generate teacher embeddings for knowledge distillation
+  # - 'none': Only run data preparation (download, filter, split)
+  pipeline_mode: "pretrain"
+
   seqs_num: 20000
   min_seq_len: 20
   max_seq_len: 512
   val_ratio: 0.1
-
   device: "auto"
-  
-  shuffle_backend: "biopython" # or "seqkit" (faster, but you need to install it)
+
+  shuffle_backend: "biopython"  # or "seqkit" (faster, requires installation)
   shuffle: true
   shuffle_seed: 24
-
-  # If you want to skip some sequences
   filter_skip_n: 0
 
-  # These are only needed for KNOWLEDGE DISTILLATION, no need to change them if you want to do pretraining only
+# Pretrain config (used when pipeline_mode: 'pretrain')
+# A .data_manifest file will be created in output_dir for use by pretrain pipeline
+pretrain_config:
+  output_dir: "output/data/pretrain_data"  # Will contain train/ and val/ subdirs
+  samples_per_shard: 2000
+  max_workers: 2  # -1 to use all available CPUs
+  force: false
+
+# Distillation config (used when pipeline_mode: 'distillation')
+# A .data_manifest file will be created in output_dir for use by distill pipeline
+distillation_config:
+  output_dir: "output/data/distillation_data"  # Will contain train/ and val/ subdirs
+  on_the_fly: false  # If true, skip embedding generation (embeddings computed during training)
+  samples_per_shard: 2000  # -1 for single file (no sharding)
   teacher_model: "prott5"
   embed_calc_batch_size: 4
-  train_shards: 5
-  val_shards: 2
-
-# If you want to generate pretraining shards, set enable to True
-pretrain_config:
-  enable: True
-  train_hdf5: "output/data/pretrain_shards/train_hdf5"
-  val_hdf5: "output/data/pretrain_shards/val_hdf5"
-  samples_per_shard: 10000
-  max_workers: 2  # -1 to use all available CPUs
-  force: False
 
 # Data directories
 data_dirs:
@@ -128,21 +133,20 @@ data_dirs:
   # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"
   compressed_fasta: "output/data/raw/uniref50.fasta.gz"
   extracted_fasta: "output/data/raw/uniref50.fasta"
-
   shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"
-
   filtered_fasta: "output/data/filter/uniref50_filtered.fasta"
   splitted_fasta_dir: "output/data/split"
-
-  # These dirs are only used for KNOWLEDGE DISTILLATION, no need to change them if you want to do pretraining only
-  kd_train_dir: "output/data/kd_dataset/train"
-  kd_val_dir: "output/data/kd_dataset/val"
 ```
 
 ## Pretraining YAML
 
 ```yaml
 # Pretraining configuration for nanoPLM
+#
+# IMPORTANT: Before running pretraining, ensure you have prepared your data with:
+#   1. Set pipeline_mode: 'pretrain' in params.yaml
+#   2. Run: nanoplm data from-yaml
+# This will generate the HDF5 shards and a .data_manifest file.
 
 model:
   hidden_size: 1024
@@ -152,16 +156,15 @@ model:
   vocab_size: 32
   mlp_activation: "swiglu"
   mlp_dropout: 0.0
-  mlp_bias: False
-  attention_bias: False
+  mlp_bias: false
+  attention_bias: false
   attention_dropout: 0.0
   classifier_activation: "gelu"
 
 pretraining:
-  # Dataset
-  # Note: these paths are RELATIVE to where you RUN the command NOT the YAML file.
-  train_fasta: "output/data/split/train.fasta"
-  val_fasta: "output/data/split/val.fasta"
+  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
+  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.
+  dataset_dir: "output/data/pretrain_data"
 
   # Output model path
   ckp_dir: "output/pretraining_checkpoints"
@@ -171,25 +174,11 @@ pretraining:
   micro_batch_size: 32
   num_epochs: 10
 
-  # Dataset loading strategy:
-  # - lazy_dataset: True  => tokenize on-the-fly from FASTA
-  #                          Slower iteration, no preprocessing needed
-  # - lazy_dataset: False => load pre-tokenized HDF5 shards
-  #                          Faster iteration, requires preprocessing
-  # Important: To have the shards, you need to set pretrain_config.enable to True in the params.yaml file
-  # and run 'nanoplm data from-yaml' to create shards
-  # or your need to run 'nanoplm data save-pretrain-dataset' using your desired FASTA file as input to create shards
-  lazy_dataset: False
-  train_hdf5: "output/data/pretrain_shards/train_hdf5"
-  val_hdf5: "output/data/pretrain_shards/val_hdf5"
-  load_all_in_memory: False
-
-  optimizer: "adamw" # adamw, stable_adamw
+  optimizer: "adamw"  # adamw, stable_adamw
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
-  learning_rate: 1e-3
- # This is the maximum learning in the warmup phase 
+  learning_rate: 1e-3  # Maximum learning rate in warmup phase
   warmup_ratio: 0.05
   weight_decay: 0.0
   global_batch_size: 1048576 # target tokens/optimizer-step (2^20), grad_accum inferred automatically
@@ -197,22 +186,119 @@ pretraining:
   mask_replace_prob: 0.8
   random_token_prob: 0.1
   keep_probability: 0.1
-  logging_steps_percentage: 0.01 # 100 logging in total 
-  eval_steps_percentage: 0.025 # 40 evaluations in total 
-  save_steps_percentage: 0.1 # 10 saves in total 
+  logging_steps: 10
+  eval_steps: 50
+  save_steps: 100
   seed: 42
   num_workers: "auto"
   prefetch_factor: 2
-  multi_gpu: False
-  world_size: 1 # Use "auto" if you want to use all available GPUs
+
+  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)
+  # When bf16 is true, automatically selects the best precision for your hardware:
+  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32
+  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback
+  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)
+  #   - CPU: fp32 (no mixed precision)
+  bf16: true
+  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)
+             # Provides 3x faster fp32 matmuls with negligible precision loss
+
+  multi_gpu: false
+  world_size: 1  # Use "auto" if you want to use all available GPUs
   project_name: "nanoplm-pretraining"
 
 resume:
   # Set is_resume: true to resume training from a checkpoint
   # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir
   # extra_epochs: adds to 'pretraining.num_epochs' to define total epochs.
-  is_resume: False
+  is_resume: false
   checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
+  extra_epochs: 0
+```
+
+## Distill YAML
+
+```yaml
+# Distillation configuration for nanoPLM
+#
+# IMPORTANT: Before running distillation, ensure you have prepared your data with:
+#   1. Set pipeline_mode: 'distillation' in params.yaml
+#   2. Set distillation_config.on_the_fly in params.yaml:
+#      - false (default): Pre-compute teacher embeddings during data preparation
+#      - true: Generate teacher embeddings on-the-fly during training
+#   3. Run: nanoplm data from-yaml
+# This will generate a .data_manifest file with the appropriate configuration.
+
+model:
+  hidden_size: 1024
+  intermediate_size: 2048
+  num_hidden_layers: 16
+  num_attention_heads: 16
+  mlp_activation: "swiglu"
+  mlp_dropout: 0.0
+  mlp_bias: false
+  attention_bias: false
+  attention_dropout: 0.0
+  classifier_activation: "gelu"
+  projection_layer: true  # Set to false if student hidden_size matches teacher (1024)
+
+distillation:
+
+  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
+  # The manifest automatically provides:
+  #   - max_seq_len, max_seqs_num, val_ratio
+  #   - on_the_fly mode and dataset paths (FASTA or H5)
+  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.
+  dataset_dir: "output/data/distillation_data"
+
+  # Output checkpoint path
+  ckp_dir: "output/distillation_checkpoints"
+
+  # Training hyperparameters
+  num_epochs: 10
+  batch_size: 32
+  learning_rate: 1e-3
+  gradient_accumulation_steps: 1
+  warmup_ratio: 0.05
+
+  # LR scheduler
+  lr_scheduler: "cosine"  # cosine, linear, polynomial, constant
+  lr_scheduler_kwargs: {}
+
+  # Data loader optimization
+  max_open_files: 5
+  chunk_size: 32
+  prefetch_batches: 2
+  use_threading: true
+  num_workers: 4
+
+  # Checkpointing
+  project_name: "nanoplm-distillation"
+  logging_steps: 10
+  eval_steps: 50
+  save_steps: 100
+
+  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)
+  # When bf16 is true, automatically selects the best precision for your hardware:
+  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32
+  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback
+  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)
+  #   - CPU: fp32 (no mixed precision)
+  bf16: true
+  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)
+             # Provides 3x faster fp32 matmuls with negligible precision loss
+
+  # Distributed training
+  multi_gpu: false
+  world_size: 1
+  seed: 42
+
+resume:
+  # Set is_resume: true to resume training from a checkpoint
+  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir
+  # extra_epochs: adds to 'distillation.num_epochs' to define total epochs.
+  is_resume: false
+  checkpoint_dir: "output/distillation/run-1/checkpoint-1"
   extra_epochs: 0
 ```
 
