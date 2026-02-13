@@ -32,7 +32,7 @@ from nanoplm.pretraining.pipeline import (
     _get_num_workers,
     _prepare_run_and_steps,
 )
-from nanoplm.utils.common import create_dirs, get_device
+from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
 
 
@@ -125,15 +125,6 @@ def _get_warmup_steps(total_steps: int, warmup_value: float) -> int:
     if warmup_value >= 1:
         return int(warmup_value)
     return math.ceil(total_steps * warmup_value)
-
-
-def _resolve_world_size(cfg: PretrainingConfig) -> int:
-    if not cfg.multi_gpu:
-        return 1
-    if cfg.world_size == "auto":
-        env_world_size = os.environ.get("WORLD_SIZE")
-        return int(env_world_size) if env_world_size else max(torch.cuda.device_count(), 1)
-    return int(cfg.world_size) if cfg.world_size else 1
 
 
 def _dist_barrier(local_rank: int) -> None:
@@ -317,7 +308,7 @@ def run_pure_pretraining(
 
     create_dirs(pretrain_config.ckp_dir)
 
-    effective_world_size = _resolve_world_size(pretrain_config)
+    effective_world_size = resolve_world_size(pretrain_config.multi_gpu, pretrain_config.world_size)
 
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
     global_batch_size_samples = pretrain_config.global_batch_size_samples

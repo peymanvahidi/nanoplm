@@ -20,7 +20,7 @@ from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
-from nanoplm.utils.common import get_device, create_dirs
+from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
 
 
 class TokenTrackingTrainer(Trainer):
@@ -348,19 +348,7 @@ def run_pretraining(
 
     create_dirs(pretrain_config.ckp_dir)
 
-    # Determine effective world size
-    if pretrain_config.multi_gpu:
-        if pretrain_config.world_size == "auto":
-            env_ws = os.environ.get("WORLD_SIZE")
-            effective_world_size = (
-                int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
-            )
-        else:
-            effective_world_size = (
-                int(pretrain_config.world_size) if pretrain_config.world_size else 1
-            )
-    else:
-        effective_world_size = 1
+    effective_world_size = resolve_world_size(pretrain_config.multi_gpu, pretrain_config.world_size)
 
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
     global_batch_size_samples = pretrain_config.global_batch_size_samples
