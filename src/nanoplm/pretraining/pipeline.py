@@ -1,7 +1,10 @@
 import os
+import json
+import time
 import math
 import shutil
 import torch
+import torch.distributed as dist
 import wandb
 from datetime import datetime
 from dataclasses import dataclass
@@ -19,6 +22,61 @@ from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
+
+
+class TokenTrackingTrainer(Trainer):
+    """Trainer subclass that injects tokens/sec into wandb logs."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._step_tok_count = 0
+        self._step_raw_tok_count = 0
+        self._step_t0 = time.perf_counter()
+        self._last_tokens_per_sec = 0.0
+        self._last_raw_tokens_per_sec = 0.0
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        if "attention_mask" in inputs:
+            self._step_tok_count += int(inputs["attention_mask"].sum().item())
+            self._step_raw_tok_count += int(inputs["attention_mask"].numel())
+        elif "input_ids" in inputs:
+            self._step_raw_tok_count += int(inputs["input_ids"].numel())
+
+        loss = super().training_step(model, inputs, num_items_in_batch)
+
+        t1 = time.perf_counter()
+        elapsed = t1 - self._step_t0
+        tok_count = float(self._step_tok_count)
+        raw_tok_count = float(self._step_raw_tok_count)
+        tok_elapsed = float(elapsed)
+        if dist.is_available() and dist.is_initialized():
+            if "attention_mask" in inputs:
+                device = inputs["attention_mask"].device
+            elif "input_ids" in inputs:
+                device = inputs["input_ids"].device
+            else:
+                device = loss.device
+            tok_tensor = torch.tensor(tok_count, device=device)
+            raw_tok_tensor = torch.tensor(raw_tok_count, device=device)
+            time_tensor = torch.tensor(tok_elapsed, device=device)
+            dist.all_reduce(tok_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(raw_tok_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(time_tensor, op=dist.ReduceOp.MAX)
+            tok_count = tok_tensor.item()
+            raw_tok_count = raw_tok_tensor.item()
+            tok_elapsed = time_tensor.item()
+        self._last_tokens_per_sec = tok_count / max(tok_elapsed, 1e-9)
+        self._last_raw_tokens_per_sec = raw_tok_count / max(tok_elapsed, 1e-9)
+
+        self._step_tok_count = 0
+        self._step_raw_tok_count = 0
+        self._step_t0 = t1
+        return loss
+
+    def log(self, logs, start_time=None, **kwargs):
+        logs["tokens_per_sec"] = self._last_tokens_per_sec
+        logs["raw_tokens_per_sec"] = self._last_raw_tokens_per_sec
+        super().log(logs, start_time=start_time, **kwargs)
 
 
 @dataclass
@@ -410,7 +468,7 @@ def run_pretraining(
 
     args = TrainingArguments(**training_dict)
 
-    trainer = Trainer(
+    trainer = TokenTrackingTrainer(
         model=model,
         args=args,
         data_collator=collator,

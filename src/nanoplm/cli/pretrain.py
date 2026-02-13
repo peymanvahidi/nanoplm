@@ -4,6 +4,9 @@ nanoPLM CLI - Pretraining subcommands for MLM pretraining
 """
 
 import click
+import random
+import numpy as np
+import torch
 from typing import Optional, Dict, Any, Union
 from pathlib import Path
 
@@ -12,9 +15,20 @@ from nanoplm.pretraining.pipeline import (
     ResumeConfig,
     run_pretraining,
 )
+from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
+from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
+
+
+def _set_seed_for_init(seed: int) -> None:
+    """Set seed before model creation so both pipelines start with identical weights."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 @click.group(name="pretrain")
@@ -261,6 +275,12 @@ def pretrain():
     default="gelu",
     help="Classifier activation",
 )
+@click.option(
+    "--pure-torch",
+    is_flag=True,
+    default=False,
+    help="Use custom pure-torch model and training loop instead of HF Trainer",
+)
 def run(
     # dataset/output
     dataset_dir: str,
@@ -303,6 +323,7 @@ def run(
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
+    pure_torch: bool,
 ):
     """Run MLM pretraining with ModernBERT backbone."""
 
@@ -351,14 +372,23 @@ def run(
         classifier_activation=classifier_activation,
     )
 
-    model = ProtModernBertMLM(model_cfg)
+    if pure_torch:
+        logger.info("Using pure-torch model and training loop")
+        _set_seed_for_init(seed)
+        model = PureProtModernBertMLM(model_cfg)
+    else:
+        _set_seed_for_init(seed)
+        model = ProtModernBertMLM(model_cfg)
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    run_pretraining(model=model, pretrain_config=cfg)
+    if pure_torch:
+        run_pure_pretraining(model=model, pretrain_config=cfg)
+    else:
+        run_pretraining(model=model, pretrain_config=cfg)
 
 
 @pretrain.command("from-yaml")
@@ -371,7 +401,13 @@ def run(
     default="pretrain.yaml",
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
-def from_yaml(config: str):
+@click.option(
+    "--pure-torch",
+    is_flag=True,
+    default=False,
+    help="Use custom pure-torch model and training loop instead of HF Trainer",
+)
+def from_yaml(config: str, pure_torch: bool):
     """Run pretraining from a YAML file with training and model parameters.
 
     Expected YAML structure:
@@ -398,23 +434,40 @@ def from_yaml(config: str):
     model_dict = raw.get("model")
     resume_dict = raw.get("resume")
 
+    # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
+    if not pure_torch:
+        pure_torch = bool(raw.get("pure_torch", False))
+
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
 
-    model = ProtModernBertMLM(config=model_config)
+    if pure_torch:
+        logger.info("Using pure-torch model and training loop")
+        _set_seed_for_init(pretrain_config.seed)
+        model = PureProtModernBertMLM(config=model_config)
+    else:
+        _set_seed_for_init(pretrain_config.seed)
+        model = ProtModernBertMLM(config=model_config)
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
-        
-    run_pretraining(
-        model=model,
-        pretrain_config=pretrain_config,
-        resume_config=resume_config if resume_config.is_resume else None,
-    )
+
+    if pure_torch:
+        run_pure_pretraining(
+            model=model,
+            pretrain_config=pretrain_config,
+            resume_config=resume_config if resume_config.is_resume else None,
+        )
+    else:
+        run_pretraining(
+            model=model,
+            pretrain_config=pretrain_config,
+            resume_config=resume_config if resume_config.is_resume else None,
+        )
 
 
 @pretrain.command("get-yaml")
@@ -534,6 +587,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
+        "\n"
+        "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
+        "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
+        "# pure_torch: false\n"
     )
 
     # If forcing, remove existing file first
