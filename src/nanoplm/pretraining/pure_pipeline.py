@@ -26,11 +26,11 @@ from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.pipeline import (
-    PretrainingConfig,
-    ResumeConfig,
-    _get_num_workers,
-    _prepare_run_and_steps,
+from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig
+from nanoplm.pretraining.utils import (
+    compute_batch_setup,
+    get_num_workers,
+    prepare_run_and_steps,
 )
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
@@ -310,31 +310,10 @@ def run_pure_pretraining(
 
     effective_world_size = resolve_world_size(pretrain_config.multi_gpu, pretrain_config.world_size)
 
-    inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
-    global_batch_size_samples = pretrain_config.global_batch_size_samples
-    achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
+    batch = compute_batch_setup(pretrain_config, manifest.max_seq_len, effective_world_size)
 
-    if (
-        inferred_grad_accum_steps is None
-        or global_batch_size_samples is None
-        or achieved_global_batch_tokens is None
-    ):
-        raise ValueError(
-            "Batch setup is missing on PretrainingConfig. "
-            "Run pretraining through nanoplm CLI so inferred batch fields are populated."
-        )
-
-    world_tokens_per_micro_step = achieved_global_batch_tokens // max(
-        1, inferred_grad_accum_steps
-    )
-
-    logger.info(
-        "Batch setup: "
-        f"target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
-        f"micro_step_tokens={world_tokens_per_micro_step:,}, "
-        f"grad_accum_steps={inferred_grad_accum_steps}, "
-        f"effective_global_batch_size={achieved_global_batch_tokens:,} tokens"
-    )
+    inferred_grad_accum_steps = batch.grad_accum_steps
+    global_batch_size_samples = batch.global_batch_size_samples
 
     (
         _run_name,
@@ -345,14 +324,14 @@ def run_pure_pretraining(
         eval_steps,
         save_steps,
         _resume_step,
-    ) = _prepare_run_and_steps(
+    ) = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
         global_batch_size_samples=global_batch_size_samples,
     )
 
-    num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
     pin_memory = device.type == "cuda"
     persistent_workers = num_workers > 0
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None

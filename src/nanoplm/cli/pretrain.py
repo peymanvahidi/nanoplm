@@ -5,7 +5,6 @@ nanoPLM CLI - Pretraining subcommands for MLM pretraining
 
 import click
 import random
-import math
 import numpy as np
 import torch
 from typing import Optional, Dict, Any, Union
@@ -19,8 +18,7 @@ from nanoplm.pretraining.pipeline import (
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.data.validation import validate_pretrain_dataset
-from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available, resolve_world_size
+from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
 @click.group(name="pretrain")
@@ -349,9 +347,7 @@ def run(
         world_size=world_size,
         project_name=project_name,
     )
-    
-    _populate_batch_setup(cfg)
-    
+
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -434,7 +430,6 @@ def from_yaml(config: str, pure_torch: bool):
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
-    _populate_batch_setup(pretrain_config)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
 
@@ -734,35 +729,3 @@ def _set_seed_for_init(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def _populate_batch_setup(cfg: PretrainingConfig) -> None:
-    dataset_dir = Path(cfg.dataset_dir)
-    validation_result = validate_pretrain_dataset(dataset_dir)
-    manifest = validation_result["manifest"]
-
-    effective_world_size = resolve_world_size(cfg.multi_gpu, cfg.world_size)
-    if cfg.global_batch_size <= 0:
-        raise ValueError(f"global_batch_size must be > 0, got {cfg.global_batch_size}")
-
-    world_tokens_per_micro_step = (
-        cfg.micro_batch_size * manifest.max_seq_len * effective_world_size
-    )
-    if world_tokens_per_micro_step <= 0:
-        raise ValueError(
-            f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check micro_batch_size, max_seq_len, and world_size."
-        )
-
-    inferred_grad_accum_steps = max(
-        1,
-        math.ceil(cfg.global_batch_size / world_tokens_per_micro_step),
-    )
-    achieved_global_batch_tokens = inferred_grad_accum_steps * world_tokens_per_micro_step
-    global_batch_size_samples = (
-        inferred_grad_accum_steps * cfg.micro_batch_size * effective_world_size
-    )
-
-    cfg.inferred_grad_accum_steps = inferred_grad_accum_steps
-    cfg.global_batch_size_samples = global_batch_size_samples
-    cfg.achieved_global_batch_tokens = achieved_global_batch_tokens
