@@ -1,6 +1,10 @@
 import os
+import json
+import time
+import math
 import shutil
 import torch
+import torch.distributed as dist
 import wandb
 from datetime import datetime
 from dataclasses import dataclass
@@ -15,7 +19,7 @@ from transformers import (
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
 
@@ -155,6 +159,59 @@ def _build_muon_optimizer(
         adam_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
         adam_epsilon=pretrain_config.adam_epsilon,
     )
+class TokenTrackingTrainer(Trainer):
+    """Trainer subclass that injects tokens/sec into wandb logs."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._step_tok_count = 0
+        self._step_raw_tok_count = 0
+        self._step_t0 = time.perf_counter()
+        self._last_tokens_per_sec = 0.0
+        self._last_raw_tokens_per_sec = 0.0
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        if "attention_mask" in inputs:
+            self._step_tok_count += int(inputs["attention_mask"].sum().item())
+            self._step_raw_tok_count += int(inputs["attention_mask"].numel())
+        elif "input_ids" in inputs:
+            self._step_raw_tok_count += int(inputs["input_ids"].numel())
+
+        loss = super().training_step(model, inputs, num_items_in_batch)
+
+        t1 = time.perf_counter()
+        elapsed = t1 - self._step_t0
+        tok_count = float(self._step_tok_count)
+        raw_tok_count = float(self._step_raw_tok_count)
+        tok_elapsed = float(elapsed)
+        if dist.is_available() and dist.is_initialized():
+            if "attention_mask" in inputs:
+                device = inputs["attention_mask"].device
+            elif "input_ids" in inputs:
+                device = inputs["input_ids"].device
+            else:
+                device = loss.device
+            tok_tensor = torch.tensor(tok_count, device=device)
+            raw_tok_tensor = torch.tensor(raw_tok_count, device=device)
+            time_tensor = torch.tensor(tok_elapsed, device=device)
+            dist.all_reduce(tok_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(raw_tok_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(time_tensor, op=dist.ReduceOp.MAX)
+            tok_count = tok_tensor.item()
+            raw_tok_count = raw_tok_tensor.item()
+            tok_elapsed = time_tensor.item()
+        self._last_tokens_per_sec = tok_count / max(tok_elapsed, 1e-9)
+        self._last_raw_tokens_per_sec = raw_tok_count / max(tok_elapsed, 1e-9)
+
+        self._step_tok_count = 0
+        self._step_raw_tok_count = 0
+        self._step_t0 = t1
+        return loss
+
+    def log(self, logs, start_time=None, **kwargs):
+        logs["tokens_per_sec"] = self._last_tokens_per_sec
+        logs["raw_tokens_per_sec"] = self._last_raw_tokens_per_sec
+        super().log(logs, start_time=start_time, **kwargs)
 
 
 @dataclass
@@ -166,7 +223,7 @@ class PretrainingConfig:
     ckp_dir: str = "output/pretraining"
 
     # Training hyperparameters
-    batch_size: int = 32
+    micro_batch_size: int = 32
     num_epochs: int = 10
     warmup_ratio: float = 0.05
     optimizer: str = "adamw"
@@ -175,7 +232,9 @@ class PretrainingConfig:
     adam_epsilon: float = 1e-8
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
-    gradient_accumulation_steps: int = 1
+    # Target effective batch size in tokens per optimizer step.
+    # gradient_accumulation_steps is inferred from this value at runtime.
+    global_batch_size: int = 2 ** 20
 
     # Mixed precision
     bf16: bool = True
@@ -256,7 +315,7 @@ def _prepare_run_and_steps(
     pretrain_config: "PretrainingConfig",
     resume_config: Optional["ResumeConfig"],
     train_samples: int,
-    global_batch_size: int,
+    global_batch_size_samples: int,
 ) -> Tuple[str, str, str, int, int, int, int, Optional[int]]:
     """Prepare run naming/dirs and compute epochs & step intervals.
 
@@ -264,7 +323,7 @@ def _prepare_run_and_steps(
         pretrain_config: Pretraining configuration
         resume_config: Resume configuration (if resuming)
         train_samples: Number of training samples (from manifest)
-        global_batch_size: Global batch size for training
+        global_batch_size_samples: Effective samples per optimizer step
 
     Returns a tuple: (run_name, wandb_run_name, output_dir, num_epochs,
                       logging_steps, eval_steps, save_steps, resume_step)
@@ -349,7 +408,7 @@ def _prepare_run_and_steps(
                 )
             except Exception:
                 # Use ceiling division to ensure at least 1 step per epoch
-                steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
+                steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
                 total_steps = num_epochs * steps_per_epoch
                 # Use direct step counts from config (clamped to valid range)
                 logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
@@ -357,7 +416,7 @@ def _prepare_run_and_steps(
                 save_steps = max(1, min(total_steps, pretrain_config.save_steps))
         else:
             # Use ceiling division to ensure at least 1 step per epoch
-            steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
+            steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
             total_steps = num_epochs * steps_per_epoch
             # Use direct step counts from config (clamped to valid range)
             logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
@@ -366,7 +425,7 @@ def _prepare_run_and_steps(
     else:
         num_epochs = pretrain_config.num_epochs
         # Use ceiling division to ensure at least 1 step per epoch
-        steps_per_epoch = (train_samples + global_batch_size - 1) // global_batch_size
+        steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
         total_steps = num_epochs * steps_per_epoch
         # Use direct step counts from config (clamped to valid range)
         logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
@@ -387,34 +446,17 @@ def run_pretraining(
     tokenizer = model.tokenizer
     model.to(device)
 
-    # Read manifest and resolve paths
+    # Validate dataset: manifest + shard files
     dataset_dir = Path(pretrain_config.dataset_dir)
+    validation_result = validate_pretrain_dataset(dataset_dir)
+    manifest = validation_result['manifest']
 
-    manifest = read_manifest(dataset_dir)
-    validate_manifest_for_pipeline(
-        manifest=manifest,
-        expected_mode="pretrain"
-    )
-
-    # Get data from manifest
+    # Get data from typed manifest
     max_length = manifest.max_seq_len
     train_shard_dir = dataset_dir / manifest.train_dir
     val_shard_dir = dataset_dir / manifest.val_dir
     train_sequences = manifest.train_sequences
     val_sequences = manifest.val_sequences
-
-    logger.info(f"Loaded config from manifest: {dataset_dir}")
-    logger.info(f"  train_shards: {train_shard_dir}")
-    logger.info(f"  val_shards: {val_shard_dir}")
-    logger.info(f"  max_length: {max_length}")
-    logger.info(f"  train_sequences: {train_sequences}")
-    logger.info(f"  val_sequences: {val_sequences}")
-
-    # Validate paths exist
-    if not train_shard_dir.exists():
-        raise FileNotFoundError(f"Train shard directory not found: {train_shard_dir}")
-    if not val_shard_dir.exists():
-        raise FileNotFoundError(f"Validation shard directory not found: {val_shard_dir}")
 
     # Load pre-tokenized binary shards
     logger.info("Using ShardedDataset for pre-tokenized binary shards")
@@ -454,10 +496,40 @@ def run_pretraining(
     else:
         effective_world_size = 1
 
-    global_batch_size = (
-        pretrain_config.gradient_accumulation_steps
-        * pretrain_config.batch_size
+    # Infer grad accumulation from target global batch size in tokens.
+    if pretrain_config.global_batch_size <= 0:
+        raise ValueError(
+            f"global_batch_size must be > 0, got {pretrain_config.global_batch_size}"
+        )
+
+    world_tokens_per_micro_step = (
+        pretrain_config.micro_batch_size * max_length * effective_world_size
+    )
+    if world_tokens_per_micro_step <= 0:
+        raise ValueError(
+            f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
+            "Check micro_batch_size, max_seq_len, and world_size."
+        )
+
+    inferred_grad_accum_steps = max(
+        1,
+        math.ceil(pretrain_config.global_batch_size / world_tokens_per_micro_step),
+    )
+    achieved_global_batch_tokens = (
+        inferred_grad_accum_steps * world_tokens_per_micro_step
+    )
+    global_batch_size_samples = (
+        inferred_grad_accum_steps
+        * pretrain_config.micro_batch_size
         * effective_world_size
+    )
+
+    logger.info(
+        "Batch setup: "
+        f"target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
+        f"micro_step_tokens={world_tokens_per_micro_step:,}, "
+        f"grad_accum_steps={inferred_grad_accum_steps}, "
+        f"effective_global_batch_size={achieved_global_batch_tokens:,} tokens"
     )
 
     # Prepare run info and step intervals in a single place
@@ -474,7 +546,7 @@ def run_pretraining(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
-        global_batch_size=global_batch_size,
+        global_batch_size_samples=global_batch_size_samples,
     )
 
     # Configure Weights & Biases via environment variables so HF Trainer attaches correctly
@@ -485,9 +557,9 @@ def run_pretraining(
 
     training_dict = {
         "output_dir": output_dir,
-        "per_device_train_batch_size": pretrain_config.batch_size,
-        "per_device_eval_batch_size": pretrain_config.batch_size,
-        "gradient_accumulation_steps": pretrain_config.gradient_accumulation_steps,
+        "per_device_train_batch_size": pretrain_config.micro_batch_size,
+        "per_device_eval_batch_size": pretrain_config.micro_batch_size,
+        "gradient_accumulation_steps": inferred_grad_accum_steps,
         "num_train_epochs": num_epochs,
         "learning_rate": pretrain_config.learning_rate,
         "weight_decay": pretrain_config.weight_decay,
@@ -540,7 +612,7 @@ def run_pretraining(
 
     args = TrainingArguments(**training_dict)
 
-    trainer = Trainer(
+    trainer = TokenTrackingTrainer(
         model=model,
         args=args,
         data_collator=collator,

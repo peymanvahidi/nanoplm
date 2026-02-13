@@ -4,6 +4,9 @@ nanoPLM CLI - Pretraining subcommands for MLM pretraining
 """
 
 import click
+import random
+import numpy as np
+import torch
 from typing import Optional, Dict, Any, Union
 from pathlib import Path
 
@@ -12,9 +15,20 @@ from nanoplm.pretraining.pipeline import (
     ResumeConfig,
     run_pretraining,
 )
+from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
+from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
+
+
+def _set_seed_for_init(seed: int) -> None:
+    """Set seed before model creation so both pipelines start with identical weights."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 @click.group(name="pretrain")
@@ -47,10 +61,10 @@ def pretrain():
 )
 # Training hyperparameters
 @click.option(
-    "--batch-size",
+    "--micro-batch-size",
     type=int,
     default=32,
-    help="Per-device batch size"
+    help="Per-device micro-batch size (samples per GPU per forward pass)",
 )
 @click.option(
     "--num-epochs",
@@ -75,6 +89,12 @@ def pretrain():
     type=float,
     default=0.05,
     help="Warmup ratio"
+)
+@click.option(
+    "--global-batch-size",
+    type=int,
+    default=2 ** 20,
+    help="Target tokens per optimizer step (grad_accum inferred automatically)",
 )
 @click.option(
     "--optimizer",
@@ -105,12 +125,6 @@ def pretrain():
     type=float,
     default=0.3,
     help="MLM probability"
-)
-@click.option(
-    "--gradient-accumulation-steps",
-    type=int,
-    default=1,
-    help="Gradient accumulation steps",
 )
 @click.option(
     "--logging-steps",
@@ -261,22 +275,28 @@ def pretrain():
     default="gelu",
     help="Classifier activation",
 )
+@click.option(
+    "--pure-torch",
+    is_flag=True,
+    default=False,
+    help="Use custom pure-torch model and training loop instead of HF Trainer",
+)
 def run(
     # dataset/output
     dataset_dir: str,
     ckp_dir: str,
     # training hp
-    batch_size: int,
+    micro_batch_size: int,
     num_epochs: int,
     learning_rate: float,
     weight_decay: float,
     warmup_ratio: float,
+    global_batch_size: int,
     optimizer: str,
     adam_beta1: float,
     adam_beta2: float,
     adam_epsilon: float,
     mlm_probability: float,
-    gradient_accumulation_steps: int,
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
@@ -303,6 +323,7 @@ def run(
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
+    pure_torch: bool,
 ):
     """Run MLM pretraining with ModernBERT backbone."""
 
@@ -310,17 +331,17 @@ def run(
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
-        batch_size=batch_size,
+        micro_batch_size=micro_batch_size,
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
+        global_batch_size=global_batch_size,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
         adam_epsilon=adam_epsilon,
         mlm_probability=mlm_probability,
-        gradient_accumulation_steps=gradient_accumulation_steps,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
         keep_probability=keep_probability,
@@ -351,14 +372,23 @@ def run(
         classifier_activation=classifier_activation,
     )
 
-    model = ProtModernBertMLM(model_cfg)
+    if pure_torch:
+        logger.info("Using pure-torch model and training loop")
+        _set_seed_for_init(seed)
+        model = PureProtModernBertMLM(model_cfg)
+    else:
+        _set_seed_for_init(seed)
+        model = ProtModernBertMLM(model_cfg)
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    run_pretraining(model=model, pretrain_config=cfg)
+    if pure_torch:
+        run_pure_pretraining(model=model, pretrain_config=cfg)
+    else:
+        run_pretraining(model=model, pretrain_config=cfg)
 
 
 @pretrain.command("from-yaml")
@@ -371,7 +401,13 @@ def run(
     default="pretrain.yaml",
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
-def from_yaml(config: str):
+@click.option(
+    "--pure-torch",
+    is_flag=True,
+    default=False,
+    help="Use custom pure-torch model and training loop instead of HF Trainer",
+)
+def from_yaml(config: str, pure_torch: bool):
     """Run pretraining from a YAML file with training and model parameters.
 
     Expected YAML structure:
@@ -398,23 +434,40 @@ def from_yaml(config: str):
     model_dict = raw.get("model")
     resume_dict = raw.get("resume")
 
+    # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
+    if not pure_torch:
+        pure_torch = bool(raw.get("pure_torch", False))
+
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
 
-    model = ProtModernBertMLM(config=model_config)
+    if pure_torch:
+        logger.info("Using pure-torch model and training loop")
+        _set_seed_for_init(pretrain_config.seed)
+        model = PureProtModernBertMLM(config=model_config)
+    else:
+        _set_seed_for_init(pretrain_config.seed)
+        model = ProtModernBertMLM(config=model_config)
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
-        
-    run_pretraining(
-        model=model,
-        pretrain_config=pretrain_config,
-        resume_config=resume_config if resume_config.is_resume else None,
-    )
+
+    if pure_torch:
+        run_pure_pretraining(
+            model=model,
+            pretrain_config=pretrain_config,
+            resume_config=resume_config if resume_config.is_resume else None,
+        )
+    else:
+        run_pretraining(
+            model=model,
+            pretrain_config=pretrain_config,
+            resume_config=resume_config if resume_config.is_resume else None,
+        )
 
 
 @pretrain.command("get-yaml")
@@ -463,7 +516,7 @@ def get_yaml(output: Optional[str], force: bool):
         "# IMPORTANT: Before running pretraining, ensure you have prepared your data with:\n"
         "#   1. Set pipeline_mode: 'pretrain' in params.yaml\n"
         "#   2. Run: nanoplm data from-yaml\n"
-        "# This will generate the HDF5 shards and a .data_manifest file.\n"
+        "# This will generate binary shards and a .data_manifest file.\n"
         "\n"
         "model:\n"
         "  hidden_size: 1024\n"
@@ -487,7 +540,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
         "\n"
         "  # Hyperparameters\n"
-        "  batch_size: 32\n"
+        "  #   micro_batch_size: samples per GPU per forward pass (limited by GPU memory)\n"
+        "  #   global_batch_size: total tokens per optimizer step across all GPUs\n"
+        "  #   gradient_accumulation_steps is inferred automatically:\n"
+        "  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))\n"
+        "  micro_batch_size: 32\n"
+        "  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
         "  num_epochs: 10\n"
         "\n"
         "  optimizer: \"adamw\"  # adamw, stable_adamw, muon\n"
@@ -497,7 +555,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  learning_rate: 1e-3  # Maximum learning rate in warmup phase\n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
-        "  gradient_accumulation_steps: 1\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
@@ -530,6 +587,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
+        "\n"
+        "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
+        "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
+        "# pure_torch: false\n"
     )
 
     # If forcing, remove existing file first
@@ -548,6 +609,13 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
 
     extra = []
     kwargs: Dict[str, Any] = {}
+
+    if "gradient_accumulation_steps" in present_keys:
+        raise ValueError(
+            "gradient_accumulation_steps is inferred automatically from "
+            "global_batch_size, micro_batch_size, max_seq_len, and world_size. "
+            "Remove gradient_accumulation_steps from your pretraining config."
+        )
 
     # Required key
     if 'dataset_dir' not in config or not config['dataset_dir']:

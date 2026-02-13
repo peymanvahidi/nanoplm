@@ -3,13 +3,25 @@ Pre-flight validation for dataset manifests and shard files.
 
 Provides comprehensive validation checks before training to catch data issues
 early with clear, actionable error messages.
+
+Manifest parsing and field validation is delegated to ``manifest.py``
+(via ``read_manifest``).  This module adds **shard-level** validation
+and provides convenience wrappers for each pipeline mode.
+
+Two shard formats are supported:
+- **Binary shards** (.bin + .idx.npy): Used by pretraining (flat memmap files)
+- **HDF5 shards** (.h5): Used by distillation pre-computed mode
 """
 
 from pathlib import Path
-from typing import Union, List, Optional, Dict
-import yaml
+from typing import Union, List, Optional
+import numpy as np
 import h5py
 
+from nanoplm.data.manifest import (
+    read_manifest,
+    validate_manifest_for_pipeline,
+)
 from nanoplm.utils import logger
 
 
@@ -23,158 +35,7 @@ class ValidationError(Exception):
     pass
 
 
-def validate_dataset_manifest(
-    manifest_path: Union[str, Path],
-    expected_mode: Optional[str] = None
-) -> dict:
-    """
-    Validate dataset manifest file and return parsed contents.
-
-    Checks that manifest file exists, is properly formatted, and contains
-    all required fields based on the pipeline mode (pretrain or distillation).
-
-    Args:
-        manifest_path: Path to .data_manifest file
-        expected_mode: Expected pipeline_mode ("pretrain" or "distillation").
-                      If provided, validates that manifest matches this mode.
-
-    Returns:
-        dict: Parsed and validated manifest
-
-    Raises:
-        FileNotFoundError: If manifest file doesn't exist
-        ValidationError: If manifest is malformed or missing required fields
-
-    Example:
-        >>> manifest = validate_dataset_manifest(
-        ...     "output/data/pretrain_shards/.data_manifest",
-        ...     expected_mode="pretrain"
-        ... )
-        >>> print(f"Max seq len: {manifest['max_seq_len']}")
-    """
-    manifest_path = Path(manifest_path)
-
-    # Check manifest exists
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"Dataset manifest not found: {manifest_path}\n\n"
-            f"The manifest file is missing. This file is created by 'nanoplm data from-yaml'.\n"
-            f"To create your dataset, run:\n"
-            f"  nanoplm data from-yaml\n\n"
-            f"Make sure you have a params.yaml file configured with your dataset settings."
-        )
-
-    # Parse YAML
-    try:
-        with open(manifest_path, 'r', encoding='utf-8') as f:
-            manifest = yaml.safe_load(f)
-    except yaml.YAMLError as e:
-        raise ValidationError(
-            f"Failed to parse manifest file {manifest_path}:\n{e}\n\n"
-            f"The manifest file appears to be corrupted.\n"
-            f"Try regenerating it by running: nanoplm data from-yaml"
-        )
-    except Exception as e:
-        raise ValidationError(f"Error reading manifest file {manifest_path}: {e}")
-
-    if manifest is None:
-        raise ValidationError(
-            f"Manifest file is empty: {manifest_path}\n\n"
-            f"The manifest file exists but contains no data.\n"
-            f"Regenerate it by running: nanoplm data from-yaml"
-        )
-
-    # Validate common required fields
-    common_required = ['pipeline_mode', 'train_dir', 'val_dir', 'max_seq_len']
-    missing_common = [f for f in common_required if f not in manifest]
-    if missing_common:
-        raise ValidationError(
-            f"Manifest missing required fields: {missing_common}\n"
-            f"File: {manifest_path}\n\n"
-            f"The manifest may be corrupted or created by an older version.\n"
-            f"Regenerate it by running: nanoplm data from-yaml"
-        )
-
-    pipeline_mode = manifest['pipeline_mode']
-
-    # Validate pipeline_mode value
-    if pipeline_mode not in ['pretrain', 'distillation']:
-        raise ValidationError(
-            f"Invalid pipeline_mode '{pipeline_mode}' in manifest.\n"
-            f"Expected 'pretrain' or 'distillation'.\n"
-            f"File: {manifest_path}"
-        )
-
-    # Check expected mode if provided
-    if expected_mode is not None and pipeline_mode != expected_mode:
-        raise ValidationError(
-            f"Dataset was prepared for '{pipeline_mode}' pipeline, "
-            f"but '{expected_mode}' was expected.\n\n"
-            f"Please use a dataset prepared with pipeline_mode: '{expected_mode}' in params.yaml.\n"
-            f"To create the correct dataset, update params.yaml and run:\n"
-            f"  nanoplm data from-yaml"
-        )
-
-    # Validate mode-specific fields
-    if pipeline_mode == 'pretrain':
-        if 'samples_per_shard' not in manifest or manifest['samples_per_shard'] <= 0:
-            raise ValidationError(
-                f"Pretraining manifest must have samples_per_shard > 0.\n"
-                f"Found: {manifest.get('samples_per_shard')}\n"
-                f"File: {manifest_path}"
-            )
-
-    elif pipeline_mode == 'distillation':
-        # Check for teacher_model
-        if 'teacher_model' not in manifest or not manifest['teacher_model']:
-            raise ValidationError(
-                f"Distillation manifest must specify teacher_model.\n"
-                f"File: {manifest_path}\n\n"
-                f"Update params.yaml with distillation_config.teacher_model and regenerate."
-            )
-
-        # Validate based on on_the_fly mode
-        on_the_fly = manifest.get('on_the_fly', False)
-
-        if on_the_fly:
-            # On-the-fly mode: must have FASTA paths
-            required_fasta = ['train_fasta', 'val_fasta']
-            missing_fasta = [f for f in required_fasta if not manifest.get(f)]
-            if missing_fasta:
-                raise ValidationError(
-                    f"On-the-fly distillation mode requires {missing_fasta}.\n"
-                    f"File: {manifest_path}\n\n"
-                    f"The manifest indicates on_the_fly mode but is missing FASTA paths."
-                )
-        else:
-            # Pre-computed mode: must have shard info
-            if not manifest.get('sharded'):
-                raise ValidationError(
-                    f"Pre-computed distillation mode requires sharded=True.\n"
-                    f"File: {manifest_path}"
-                )
-            if not manifest.get('samples_per_shard') or manifest['samples_per_shard'] <= 0:
-                raise ValidationError(
-                    f"Pre-computed distillation mode requires samples_per_shard > 0.\n"
-                    f"Found: {manifest.get('samples_per_shard')}\n"
-                    f"File: {manifest_path}"
-                )
-            required_h5 = ['train_h5_prefix', 'val_h5_prefix']
-            missing_h5 = [f for f in required_h5 if not manifest.get(f)]
-            if missing_h5:
-                raise ValidationError(
-                    f"Pre-computed distillation mode requires {missing_h5}.\n"
-                    f"File: {manifest_path}"
-                )
-
-    logger.info(f"✓ Manifest validation passed: {manifest_path.name}")
-    logger.info(f"  Pipeline mode: {pipeline_mode}")
-    logger.info(f"  Max seq len: {manifest['max_seq_len']}")
-
-    return manifest
-
-
-def validate_shard_files(
+def validate_hdf5_shards(
     shard_dir: Union[str, Path],
     expected_count: Optional[int] = None,
     check_contents: bool = True
@@ -197,7 +58,7 @@ def validate_shard_files(
         ValidationError: If shards are missing, corrupt, or empty
 
     Example:
-        >>> shard_paths = validate_shard_files(
+        >>> shard_paths = validate_hdf5_shards(
         ...     "output/data/pretrain_shards/train",
         ...     expected_count=10,
         ...     check_contents=True
@@ -318,25 +179,142 @@ def validate_shard_files(
     return shard_files
 
 
+def validate_pretrain_shards(
+    shard_dir: Union[str, Path],
+    expected_count: Optional[int] = None,
+    check_contents: bool = True,
+) -> List[Path]:
+    """
+    Validate binary pretrain shard files (.bin + .idx.npy) in a directory.
+
+    Each shard consists of a pair:
+    - ``shard_NNNN.bin``: concatenated uint8 tokens
+    - ``shard_NNNN.idx.npy``: int32 array of per-sequence lengths
+
+    Args:
+        shard_dir: Directory containing binary shard files
+        expected_count: Expected number of shard pairs (optional)
+        check_contents: Whether to validate file contents (index readability,
+            non-empty, lengths consistent with .bin size)
+
+    Returns:
+        List[Path]: Sorted list of validated ``.bin`` shard paths
+
+    Raises:
+        ValidationError: If shards are missing, unpaired, corrupt, or empty
+    """
+    shard_dir = Path(shard_dir)
+
+    if not shard_dir.exists():
+        raise ValidationError(
+            f"Shard directory does not exist: {shard_dir}\n\n"
+            f"The data preparation may have failed or the path is incorrect.\n"
+            f"Run: nanoplm data from-yaml"
+        )
+
+    if not shard_dir.is_dir():
+        raise ValidationError(
+            f"Path is not a directory: {shard_dir}\n\n"
+            f"Expected a directory containing binary shard files (.bin + .idx.npy)."
+        )
+
+    bin_files = sorted(shard_dir.glob("*.bin"))
+
+    if not bin_files:
+        raise ValidationError(
+            f"No binary shard files (*.bin) found in: {shard_dir}\n\n"
+            f"The directory exists but contains no shard files.\n"
+            f"Data preparation may have failed. Check logs and re-run:\n"
+            f"  nanoplm data from-yaml"
+        )
+
+    if expected_count is not None and len(bin_files) != expected_count:
+        raise ValidationError(
+            f"Expected {expected_count} shard files but found {len(bin_files)} in: {shard_dir}\n\n"
+            f"Found files:\n" + "\n".join(f"  - {f.name}" for f in bin_files[:5]) +
+            (f"\n  ... and {len(bin_files) - 5} more" if len(bin_files) > 5 else "") + "\n\n"
+            f"Some shard files may be missing. Re-run data preparation:\n"
+            f"  nanoplm data from-yaml"
+        )
+
+    # Check every .bin has a matching .idx.npy
+    for bin_path in bin_files:
+        idx_path = bin_path.with_name(bin_path.stem + ".idx.npy")
+        if not idx_path.exists():
+            raise ValidationError(
+                f"Index file missing for shard: {bin_path.name}\n\n"
+                f"Expected: {idx_path.name}\n"
+                f"The shard pair is incomplete. Re-run data preparation:\n"
+                f"  nanoplm data from-yaml"
+            )
+
+    if check_contents:
+        logger.info(f"Validating {len(bin_files)} binary shards in {shard_dir.name}...")
+
+        for bin_path in bin_files:
+            idx_path = bin_path.with_name(bin_path.stem + ".idx.npy")
+
+            try:
+                sizes = np.load(str(idx_path))
+            except Exception as e:
+                raise ValidationError(
+                    f"Cannot read index file {idx_path.name}: {e}\n\n"
+                    f"The file may be corrupted. Delete and regenerate:\n"
+                    f"  rm {bin_path} {idx_path}\n"
+                    f"  nanoplm data from-yaml"
+                )
+
+            if sizes.ndim != 1:
+                raise ValidationError(
+                    f"Index file has unexpected shape {sizes.shape}: {idx_path.name}\n\n"
+                    f"Expected a 1-D array of sequence lengths."
+                )
+
+            num_sequences = len(sizes)
+            if num_sequences == 0:
+                raise ValidationError(
+                    f"Shard is empty (0 sequences): {bin_path.name}\n\n"
+                    f"Delete and regenerate:\n"
+                    f"  rm {bin_path} {idx_path}\n"
+                    f"  nanoplm data from-yaml"
+                )
+
+            expected_bytes = int(sizes.sum())
+            actual_bytes = bin_path.stat().st_size
+            if actual_bytes != expected_bytes:
+                raise ValidationError(
+                    f"Size mismatch in shard {bin_path.name}: "
+                    f"index says {expected_bytes} bytes but .bin is {actual_bytes} bytes.\n\n"
+                    f"The shard may be corrupted or partially written. Delete and regenerate:\n"
+                    f"  rm {bin_path} {idx_path}\n"
+                    f"  nanoplm data from-yaml"
+                )
+
+        logger.info(f"✓ All {len(bin_files)} binary shards validated successfully")
+
+    return bin_files
+
+
 def validate_pretrain_dataset(dataset_dir: Union[str, Path]) -> dict:
     """
-    Validate complete pretraining dataset (manifest + shards).
+    Validate complete pretraining dataset (manifest + binary shards).
 
-    Convenience function that validates both the manifest and shard files
-    for a pretraining dataset.
+    Reads and validates the manifest via ``read_manifest`` (typed dataclass),
+    checks pipeline mode, then validates binary shard files (.bin + .idx.npy).
 
     Args:
         dataset_dir: Root directory containing .data_manifest and train/val subdirs
 
     Returns:
         dict: Validation results including:
-            - manifest: Parsed manifest dict
-            - train_shards: List of validated training shard paths
-            - val_shards: List of validated validation shard paths
+            - manifest: PretrainManifest dataclass
+            - train_shards: List of validated training shard paths (.bin)
+            - val_shards: List of validated validation shard paths (.bin)
 
     Raises:
         FileNotFoundError: If manifest or directories missing
-        ValidationError: If validation fails
+        ValidationError: If shard validation fails
+        ValueError: If manifest is malformed or wrong pipeline mode
 
     Example:
         >>> result = validate_pretrain_dataset("output/data/pretrain_shards")
@@ -347,27 +325,27 @@ def validate_pretrain_dataset(dataset_dir: Union[str, Path]) -> dict:
 
     logger.info(f"Validating pretraining dataset: {dataset_dir}")
 
-    # Validate manifest
-    manifest_path = dataset_dir / ".data_manifest"
-    manifest = validate_dataset_manifest(manifest_path, expected_mode="pretrain")
+    # Read and validate manifest (typed dataclass with __post_init__ validation)
+    manifest = read_manifest(dataset_dir)
+    validate_manifest_for_pipeline(manifest, expected_mode="pretrain")
 
-    # Get shard directories
-    train_dir = dataset_dir / manifest['train_dir']
-    val_dir = dataset_dir / manifest['val_dir']
+    # Get shard directories from typed manifest
+    train_dir = dataset_dir / manifest.train_dir
+    val_dir = dataset_dir / manifest.val_dir
 
-    # Validate train shards
+    # Validate train shards (binary format: .bin + .idx.npy)
     logger.info("Validating training shards...")
-    train_shards = validate_shard_files(train_dir, check_contents=True)
+    train_shards = validate_pretrain_shards(train_dir, check_contents=True)
 
     # Validate validation shards
     logger.info("Validating validation shards...")
-    val_shards = validate_shard_files(val_dir, check_contents=True)
+    val_shards = validate_pretrain_shards(val_dir, check_contents=True)
 
     logger.info(f"✓ Pretraining dataset validation complete")
     logger.info(f"  Train shards: {len(train_shards)}")
     logger.info(f"  Val shards: {len(val_shards)}")
-    logger.info(f"  Train sequences: {manifest.get('train_sequences', 'unknown')}")
-    logger.info(f"  Val sequences: {manifest.get('val_sequences', 'unknown')}")
+    logger.info(f"  Train sequences: {manifest.train_sequences}")
+    logger.info(f"  Val sequences: {manifest.val_sequences}")
 
     return {
         'manifest': manifest,
@@ -380,15 +358,15 @@ def validate_distillation_dataset(dataset_dir: Union[str, Path]) -> dict:
     """
     Validate complete distillation dataset (manifest + data files).
 
-    Handles both on-the-fly mode (FASTA files) and pre-computed mode (HDF5 shards).
-    Convenience function that validates both the manifest and data files.
+    Reads and validates the manifest via ``read_manifest`` (typed dataclass),
+    checks pipeline mode, then validates data files (FASTA or HDF5 shards).
 
     Args:
         dataset_dir: Root directory containing .data_manifest and data files
 
     Returns:
         dict: Validation results including:
-            - manifest: Parsed manifest dict
+            - manifest: DistillationManifest dataclass
             - mode: 'on_the_fly' or 'pre_computed'
             - train_path: Path to training data (FASTA or shard directory)
             - val_path: Path to validation data (FASTA or shard directory)
@@ -398,7 +376,8 @@ def validate_distillation_dataset(dataset_dir: Union[str, Path]) -> dict:
 
     Raises:
         FileNotFoundError: If manifest or data files missing
-        ValidationError: If validation fails
+        ValidationError: If shard validation fails
+        ValueError: If manifest is malformed or wrong pipeline mode
 
     Example:
         >>> result = validate_distillation_dataset("output/data/kd_dataset")
@@ -410,18 +389,18 @@ def validate_distillation_dataset(dataset_dir: Union[str, Path]) -> dict:
 
     logger.info(f"Validating distillation dataset: {dataset_dir}")
 
-    # Validate manifest
-    manifest_path = dataset_dir / ".data_manifest"
-    manifest = validate_dataset_manifest(manifest_path, expected_mode="distillation")
+    # Read and validate manifest (typed dataclass with __post_init__ validation)
+    manifest = read_manifest(dataset_dir)
+    validate_manifest_for_pipeline(manifest, expected_mode="distillation")
 
-    on_the_fly = manifest.get('on_the_fly', False)
+    on_the_fly = manifest.on_the_fly
 
     if on_the_fly:
         # On-the-fly mode: validate FASTA files exist
         logger.info("On-the-fly mode: validating FASTA files...")
 
-        train_fasta = dataset_dir / manifest['train_fasta']
-        val_fasta = dataset_dir / manifest['val_fasta']
+        train_fasta = dataset_dir / manifest.train_fasta
+        val_fasta = dataset_dir / manifest.val_fasta
 
         if not train_fasta.exists():
             raise FileNotFoundError(
@@ -452,22 +431,22 @@ def validate_distillation_dataset(dataset_dir: Union[str, Path]) -> dict:
         # Pre-computed mode: validate HDF5 shards
         logger.info("Pre-computed mode: validating HDF5 shards...")
 
-        train_dir = dataset_dir / manifest['train_dir']
-        val_dir = dataset_dir / manifest['val_dir']
+        train_dir = dataset_dir / manifest.train_dir
+        val_dir = dataset_dir / manifest.val_dir
 
         # Validate train shards
         logger.info("Validating training shards...")
-        train_shards = validate_shard_files(train_dir, check_contents=True)
+        train_shards = validate_hdf5_shards(train_dir, check_contents=True)
 
         # Validate validation shards
         logger.info("Validating validation shards...")
-        val_shards = validate_shard_files(val_dir, check_contents=True)
+        val_shards = validate_hdf5_shards(val_dir, check_contents=True)
 
         logger.info(f"✓ Distillation dataset validation complete (pre-computed mode)")
         logger.info(f"  Train shards: {len(train_shards)}")
         logger.info(f"  Val shards: {len(val_shards)}")
-        logger.info(f"  Train sequences: {manifest.get('train_sequences', 'unknown')}")
-        logger.info(f"  Val sequences: {manifest.get('val_sequences', 'unknown')}")
+        logger.info(f"  Train sequences: {manifest.train_sequences}")
+        logger.info(f"  Val sequences: {manifest.val_sequences}")
 
         return {
             'manifest': manifest,
