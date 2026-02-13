@@ -176,12 +176,20 @@ pretraining:
 
 
   optimizer: "adamw" # adamw, stable_adamw, muon
+  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon)
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
-  learning_rate: 1e-3  # Maximum learning rate in warmup phase
+  learning_rate: 1e-3  # AdamW LR (Muon uses muon_learning_rate)
   warmup_ratio: 0.05
   weight_decay: 0.0
+  # Muon hyperparameters (used only when optimizer: muon)
+  muon_learning_rate: 2e-2
+  muon_weight_decay: 0.1
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_eps: 1e-7
+  muon_ns_steps: 5
   global_batch_size: 1048576 # target tokens/optimizer-step (2^20), grad_accum inferred automatically
   mlm_probability: 0.3
   mask_replace_prob: 0.8
