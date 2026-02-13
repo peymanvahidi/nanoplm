@@ -28,7 +28,7 @@ from nanoplm.distillation.dataset import (
     KDDatasetOnTheFly,
     LoadKDDataset,
 )
-from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline, get_dataset_paths
+from nanoplm.data.manifest import get_dataset_paths
 from nanoplm.data.validation import validate_distillation_dataset, ValidationError
 from nanoplm.utils import get_device, logger, create_dirs
 
@@ -264,11 +264,11 @@ def _resolve_config_from_manifest(distill_config: DistillationConfig) -> Distill
 
     dataset_dir = Path(distill_config.dataset_dir)
 
-    # Validate dataset before starting training
+    # Validate dataset before starting training (reads + validates manifest and data files)
     logger.info(f"Validating distillation dataset at {dataset_dir}...")
     try:
         validation_result = validate_distillation_dataset(dataset_dir)
-        if validation_result['manifest'].get('on_the_fly'):
+        if validation_result['mode'] == 'on_the_fly':
             logger.info("On-the-fly mode: FASTA files validated")
         else:
             logger.info(f"Pre-computed mode: {len(validation_result.get('train_shards', []))} train shards, "
@@ -280,8 +280,8 @@ def _resolve_config_from_manifest(distill_config: DistillationConfig) -> Distill
         logger.error(f"Dataset not found: {e}")
         raise
 
-    manifest = read_manifest(dataset_dir)
-    validate_manifest_for_pipeline(manifest, "distillation")
+    # Use the typed manifest from validation (already read + validated)
+    manifest = validation_result['manifest']
 
     # Check if manifest specifies on_the_fly mode
     manifest_on_the_fly = manifest.on_the_fly if manifest.on_the_fly is not None else False
