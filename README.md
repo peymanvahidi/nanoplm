@@ -175,7 +175,7 @@ pretraining:
   num_epochs: 10
 
 
-  optimizer: "adamw" # adamw, stable_adamw, muon
+  optimizer: "adamw" # adamw, stable_adamw, muon, normuon
   # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon)
   adam_beta1: 0.9
   adam_beta2: 0.999
@@ -189,7 +189,6 @@ pretraining:
   muon_momentum: 0.95
   muon_nesterov: true
   muon_eps: 1e-7
-  muon_ns_steps: 5
   global_batch_size: 1048576 # target tokens/optimizer-step (2^20), grad_accum inferred automatically
   mlm_probability: 0.3
   mask_replace_prob: 0.8

@@ -125,7 +125,6 @@ def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> Muo
         muon_momentum=cfg.muon_momentum,
         muon_nesterov=cfg.muon_nesterov,
         muon_eps=cfg.muon_eps,
-        muon_ns_steps=cfg.muon_ns_steps,
         adamw_learning_rate=cfg.learning_rate,
         adamw_weight_decay=cfg.weight_decay,
         adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
@@ -135,12 +134,7 @@ def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> Muo
 
 def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.optim.Optimizer:
     name = str(cfg.optimizer).lower()
-    if name == "muon":
-        if not hasattr(torch.optim, "Muon"):
-            raise ValueError(
-                "torch.optim.Muon is not available in this environment. "
-                "Upgrade PyTorch or choose optimizer='adamw'."
-            )
+    if name in {"muon", "normuon"}:
         return _build_muon_optimizer(model, cfg)
 
     raw_model = _unwrap_model(model)
@@ -174,7 +168,7 @@ def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.o
             return torch.optim.AdamW(**kwargs)
         return stable_adamw(**kwargs)
 
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon]")
+    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon]")
 
 
 def _create_scheduler(

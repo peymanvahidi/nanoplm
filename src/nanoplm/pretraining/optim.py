@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
+from dion import Muon as DionMuon
+from dion import NorMuon as DionNorMuon
 
 
 class MuonAdamW(torch.optim.Optimizer):
@@ -17,11 +20,11 @@ class MuonAdamW(torch.optim.Optimizer):
         muon_momentum: float,
         muon_nesterov: bool,
         muon_eps: float,
-        muon_ns_steps: int,
         adamw_learning_rate: float,
         adamw_weight_decay: float,
         adamw_betas: tuple[float, float],
         adamw_epsilon: float,
+        use_normuon: bool = False,
     ) -> None:
         if not muon_params:
             raise ValueError("Muon optimizer requires at least one matrix parameter.")
@@ -31,15 +34,36 @@ class MuonAdamW(torch.optim.Optimizer):
         all_params = list(muon_params) + list(adamw_params)
         super().__init__(all_params, defaults={})
 
-        self.muon = torch.optim.Muon(
-            muon_params,
-            lr=float(muon_learning_rate),
-            weight_decay=float(muon_weight_decay),
-            momentum=float(muon_momentum),
-            nesterov=bool(muon_nesterov),
-            eps=float(muon_eps),
-            ns_steps=int(muon_ns_steps),
-        )
+        distributed_mesh = None
+        if dist.is_available() and dist.is_initialized():
+            distributed_mesh = dist.group.WORLD
+
+        if use_normuon:
+            # Keep NorMuon-specific knobs fixed to Dion defaults for minimal integration.
+            self.muon = DionNorMuon(
+                [dict(params=muon_params)],
+                distributed_mesh=distributed_mesh,
+                lr=float(muon_learning_rate),
+                mu=float(muon_momentum),
+                muon_beta2=0.95,
+                weight_decay=float(muon_weight_decay),
+                epsilon=float(muon_eps),
+                nesterov=bool(muon_nesterov),
+                adjust_lr="rms_norm",
+                use_triton=True,
+            )
+        else:
+            self.muon = DionMuon(
+                [dict(params=muon_params)],
+                distributed_mesh=distributed_mesh,
+                lr=float(muon_learning_rate),
+                mu=float(muon_momentum),
+                weight_decay=float(muon_weight_decay),
+                epsilon=float(muon_eps),
+                nesterov=bool(muon_nesterov),
+                adjust_lr=None,
+                use_triton=False,
+            )
         self.adamw = torch.optim.AdamW(
             adamw_params,
             lr=float(adamw_learning_rate),

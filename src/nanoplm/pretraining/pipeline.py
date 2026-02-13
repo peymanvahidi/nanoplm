@@ -98,7 +98,7 @@ def _build_muon_optimizer(
         muon_momentum=pretrain_config.muon_momentum,
         muon_nesterov=pretrain_config.muon_nesterov,
         muon_eps=pretrain_config.muon_eps,
-        muon_ns_steps=pretrain_config.muon_ns_steps,
+        use_normuon=str(pretrain_config.optimizer).lower() == "normuon",
         adamw_learning_rate=pretrain_config.learning_rate,
         adamw_weight_decay=pretrain_config.weight_decay,
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
@@ -203,7 +203,6 @@ class PretrainingConfig:
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_eps: float = 1e-7
-    muon_ns_steps: int = 5
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_size: int = 2 ** 20
@@ -557,17 +556,12 @@ def run_pretraining(
         training_dict["optim"] = "adamw_torch"
     elif optimizer_name == "stable_adamw":
         training_dict["optim"] = "stable_adamw"
-    elif optimizer_name == "muon":
-        if not hasattr(torch.optim, "Muon"):
-            raise ValueError(
-                "torch.optim.Muon is not available in this environment. "
-                "Upgrade PyTorch or choose optimizer='adamw'."
-            )
+    elif optimizer_name in {"muon", "normuon"}:
         custom_optimizer = _build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
             f"Invalid optimizer: {pretrain_config.optimizer}. "
-            f"Currently supported: [adamw, stable_adamw, muon]"
+            f"Currently supported: [adamw, stable_adamw, muon, normuon]"
         )
 
     if pretrain_config.multi_gpu:

@@ -142,7 +142,7 @@ def pretrain():
 )
 @click.option(
     "--optimizer",
-    type=click.Choice(["adamw", "stable_adamw", "muon"], case_sensitive=False),
+    type=click.Choice(["adamw", "stable_adamw", "muon", "normuon"], case_sensitive=False),
     default="adamw",
     help="Optimizer to use"
 )
@@ -192,12 +192,6 @@ def pretrain():
     type=float,
     default=1e-7,
     help="Muon epsilon (used only when optimizer=muon)",
-)
-@click.option(
-    "--muon-ns-steps",
-    type=int,
-    default=5,
-    help="Muon Newton-Schulz steps (used only when optimizer=muon)",
 )
 @click.option(
     "--mlm-probability",
@@ -380,7 +374,6 @@ def run(
     muon_momentum: float,
     muon_nesterov: bool,
     muon_eps: float,
-    muon_ns_steps: int,
     mlm_probability: float,
     logging_steps: int,
     eval_steps: int,
@@ -431,7 +424,6 @@ def run(
         muon_momentum=muon_momentum,
         muon_nesterov=muon_nesterov,
         muon_eps=muon_eps,
-        muon_ns_steps=muon_ns_steps,
         mlm_probability=mlm_probability,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
@@ -642,7 +634,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
         "  num_epochs: 10\n"
         "\n"
-        "  optimizer: \"adamw\"  # adamw, stable_adamw, muon\n"
+        "  optimizer: \"adamw\"  # adamw, stable_adamw, muon, normuon\n"
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon)\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
@@ -656,7 +648,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
-        "  muon_ns_steps: 5\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
@@ -756,14 +747,6 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 kwargs[field] = float(kwargs[field])
             except ValueError as exc:
                 raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
-
-    if isinstance(kwargs.get("muon_ns_steps"), str):
-        try:
-            kwargs["muon_ns_steps"] = int(kwargs["muon_ns_steps"])
-        except ValueError as exc:
-            raise ValueError(
-                f"Invalid muon_ns_steps value: {kwargs['muon_ns_steps']}. Must be an integer."
-            ) from exc
 
     # Handle boolean values
     for bool_key in ['multi_gpu', 'bf16', 'tf32', 'muon_nesterov']:
