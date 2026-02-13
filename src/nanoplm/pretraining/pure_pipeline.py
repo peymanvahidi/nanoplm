@@ -26,6 +26,7 @@ from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
+from nanoplm.pretraining.optim import MuonAdamW
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
     ResumeConfig,
@@ -66,7 +67,82 @@ def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
     return True
 
 
+def _is_embedding_or_unembedding_param(name: str) -> bool:
+    lname = name.lower()
+    if "embeddings.tok_embeddings" in lname:
+        return True
+    if lname.endswith("decoder.weight") or lname.endswith("decoder.bias"):
+        return True
+    return (
+        "embedding" in lname
+        or "lm_head" in lname
+        or "unembedding" in lname
+    )
+
+
+def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> MuonAdamW:
+    raw_model = _unwrap_model(model)
+
+    muon_params: list[torch.nn.Parameter] = []
+    adamw_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in seen:
+            continue
+        seen.add(id(param))
+
+        # Muon is for hidden-layer matrices only.
+        if param.ndim == 1:
+            adamw_params.append(param)
+            continue
+        if _is_embedding_or_unembedding_param(name):
+            adamw_params.append(param)
+            continue
+        if param.ndim == 2:
+            muon_params.append(param)
+            continue
+        adamw_params.append(param)
+
+    if not muon_params:
+        raise ValueError(
+            "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
+        )
+
+    logger.info(
+        "Muon grouping: "
+        f"muon_params={len(muon_params)} tensors, "
+        f"adamw_params={len(adamw_params)} tensors"
+    )
+
+    return MuonAdamW(
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+        muon_learning_rate=cfg.muon_learning_rate,
+        muon_weight_decay=cfg.muon_weight_decay,
+        muon_momentum=cfg.muon_momentum,
+        muon_nesterov=cfg.muon_nesterov,
+        muon_eps=cfg.muon_eps,
+        muon_ns_steps=cfg.muon_ns_steps,
+        adamw_learning_rate=cfg.learning_rate,
+        adamw_weight_decay=cfg.weight_decay,
+        adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
+        adamw_epsilon=cfg.adam_epsilon,
+    )
+
+
 def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.optim.Optimizer:
+    name = str(cfg.optimizer).lower()
+    if name == "muon":
+        if not hasattr(torch.optim, "Muon"):
+            raise ValueError(
+                "torch.optim.Muon is not available in this environment. "
+                "Upgrade PyTorch or choose optimizer='adamw'."
+            )
+        return _build_muon_optimizer(model, cfg)
+
     raw_model = _unwrap_model(model)
     decay, no_decay = [], []
 
@@ -89,7 +165,6 @@ def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.o
         "eps": float(cfg.adam_epsilon),
     }
 
-    name = str(cfg.optimizer).lower()
     if name == "adamw":
         return torch.optim.AdamW(**kwargs)
     if name == "stable_adamw":
@@ -99,7 +174,7 @@ def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.o
             return torch.optim.AdamW(**kwargs)
         return stable_adamw(**kwargs)
 
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw]")
+    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon]")
 
 
 def _create_scheduler(
@@ -581,7 +656,12 @@ def run_pure_pretraining(
             else:
                 optimizer.step()
 
-            learning_rate = optimizer.param_groups[0]["lr"]
+            if isinstance(optimizer, MuonAdamW):
+                learning_rate = optimizer.adamw.param_groups[0]["lr"]
+                muon_lr = optimizer.muon.param_groups[0]["lr"]
+            else:
+                learning_rate = optimizer.param_groups[0]["lr"]
+                muon_lr = None
             if not optimizer_step_skipped:
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -628,6 +708,8 @@ def run_pure_pretraining(
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/raw_tokens_per_sec": raw_tokens_per_sec,
                 }
+                if muon_lr is not None:
+                    payload["train/muon_lr"] = muon_lr
                 if wandb_enabled and wandb.run is not None:
                     try:
                         wandb.log(payload)

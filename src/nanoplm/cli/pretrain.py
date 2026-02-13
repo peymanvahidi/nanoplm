@@ -165,6 +165,41 @@ def pretrain():
     help="Adam epsilon"
 )
 @click.option(
+    "--muon-learning-rate",
+    type=float,
+    default=2e-2,
+    help="Muon LR (used only when optimizer=muon; learning-rate remains AdamW LR)",
+)
+@click.option(
+    "--muon-weight-decay",
+    type=float,
+    default=0.1,
+    help="Muon weight decay (used only when optimizer=muon)",
+)
+@click.option(
+    "--muon-momentum",
+    type=float,
+    default=0.95,
+    help="Muon momentum (used only when optimizer=muon)",
+)
+@click.option(
+    "--muon-nesterov/--no-muon-nesterov",
+    default=True,
+    help="Enable Nesterov in Muon (used only when optimizer=muon)",
+)
+@click.option(
+    "--muon-eps",
+    type=float,
+    default=1e-7,
+    help="Muon epsilon (used only when optimizer=muon)",
+)
+@click.option(
+    "--muon-ns-steps",
+    type=int,
+    default=5,
+    help="Muon Newton-Schulz steps (used only when optimizer=muon)",
+)
+@click.option(
     "--mlm-probability",
     type=float,
     default=0.3,
@@ -340,6 +375,12 @@ def run(
     adam_beta1: float,
     adam_beta2: float,
     adam_epsilon: float,
+    muon_learning_rate: float,
+    muon_weight_decay: float,
+    muon_momentum: float,
+    muon_nesterov: bool,
+    muon_eps: float,
+    muon_ns_steps: int,
     mlm_probability: float,
     logging_steps: int,
     eval_steps: int,
@@ -385,6 +426,12 @@ def run(
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
         adam_epsilon=adam_epsilon,
+        muon_learning_rate=muon_learning_rate,
+        muon_weight_decay=muon_weight_decay,
+        muon_momentum=muon_momentum,
+        muon_nesterov=muon_nesterov,
+        muon_eps=muon_eps,
+        muon_ns_steps=muon_ns_steps,
         mlm_probability=mlm_probability,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
@@ -596,12 +643,20 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_epochs: 10\n"
         "\n"
         "  optimizer: \"adamw\"  # adamw, stable_adamw, muon\n"
+        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon)\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-3  # Maximum learning rate in warmup phase\n"
+        "  learning_rate: 1e-3  # AdamW LR (Muon uses muon_learning_rate)\n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
+        "  # Muon hyperparameters (used only when optimizer: muon)\n"
+        "  muon_learning_rate: 2e-2\n"
+        "  muon_weight_decay: 0.1\n"
+        "  muon_momentum: 0.95\n"
+        "  muon_nesterov: true\n"
+        "  muon_eps: 1e-7\n"
+        "  muon_ns_steps: 5\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
@@ -682,15 +737,36 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             f"Unexpected training configuration keys: {', '.join(sorted(extra))}"
         )
 
-    # Explicitly convert learning_rate to float if it's a string (handles scientific notation)
-    if isinstance(kwargs.get('learning_rate'), str):
+    # Explicitly convert float-like fields if they are strings (handles scientific notation).
+    float_fields = [
+        "learning_rate",
+        "weight_decay",
+        "adam_beta1",
+        "adam_beta2",
+        "adam_epsilon",
+        "muon_learning_rate",
+        "muon_weight_decay",
+        "muon_momentum",
+        "muon_eps",
+        "warmup_ratio",
+    ]
+    for field in float_fields:
+        if isinstance(kwargs.get(field), str):
+            try:
+                kwargs[field] = float(kwargs[field])
+            except ValueError as exc:
+                raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
+
+    if isinstance(kwargs.get("muon_ns_steps"), str):
         try:
-            kwargs['learning_rate'] = float(kwargs['learning_rate'])
-        except ValueError:
-            raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
+            kwargs["muon_ns_steps"] = int(kwargs["muon_ns_steps"])
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid muon_ns_steps value: {kwargs['muon_ns_steps']}. Must be an integer."
+            ) from exc
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'bf16', 'tf32']:
+    for bool_key in ['multi_gpu', 'bf16', 'tf32', 'muon_nesterov']:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):
