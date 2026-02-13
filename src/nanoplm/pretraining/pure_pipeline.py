@@ -143,10 +143,10 @@ def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.o
     raw_model = _unwrap_model(model)
     decay, no_decay = [], []
 
-    for name, param in raw_model.named_parameters():
+    for p_name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
-        if _use_weight_decay(name, param):
+        if _use_weight_decay(p_name, param):
             decay.append(param)
         else:
             no_decay.append(param)
