@@ -171,18 +171,6 @@ pretraining:
   batch_size: 32
   num_epochs: 10
 
-  # Dataset loading strategy:
-  # - lazy_dataset: True  => tokenize on-the-fly from FASTA
-  #                          Slower iteration, no preprocessing needed
-  # - lazy_dataset: False => load pre-tokenized HDF5 shards
-  #                          Faster iteration, requires preprocessing
-  # Important: To have the shards, you need to set pretrain_config.enable to True in the params.yaml file
-  # and run 'nanoplm data from-yaml' to create shards
-  # or your need to run 'nanoplm data save-pretrain-dataset' using your desired FASTA file as input to create shards
-  lazy_dataset: False
-  train_hdf5: "output/data/pretrain_shards/train_hdf5"
-  val_hdf5: "output/data/pretrain_shards/val_hdf5"
-  load_all_in_memory: False
 
   optimizer: "adamw" # adamw, stable_adamw, muon
   adam_beta1: 0.9
