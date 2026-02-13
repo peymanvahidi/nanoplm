@@ -47,10 +47,10 @@ def pretrain():
 )
 # Training hyperparameters
 @click.option(
-    "--batch-size",
+    "--micro-batch-size",
     type=int,
     default=32,
-    help="Per-device batch size"
+    help="Per-device micro-batch size (samples per GPU per forward pass)",
 )
 @click.option(
     "--num-epochs",
@@ -75,6 +75,12 @@ def pretrain():
     type=float,
     default=0.05,
     help="Warmup ratio"
+)
+@click.option(
+    "--global-batch-size",
+    type=int,
+    default=2 ** 20,
+    help="Target tokens per optimizer step (grad_accum inferred automatically)",
 )
 @click.option(
     "--optimizer",
@@ -105,12 +111,6 @@ def pretrain():
     type=float,
     default=0.3,
     help="MLM probability"
-)
-@click.option(
-    "--gradient-accumulation-steps",
-    type=int,
-    default=1,
-    help="Gradient accumulation steps",
 )
 @click.option(
     "--logging-steps",
@@ -266,17 +266,17 @@ def run(
     dataset_dir: str,
     ckp_dir: str,
     # training hp
-    batch_size: int,
+    micro_batch_size: int,
     num_epochs: int,
     learning_rate: float,
     weight_decay: float,
     warmup_ratio: float,
+    global_batch_size: int,
     optimizer: str,
     adam_beta1: float,
     adam_beta2: float,
     adam_epsilon: float,
     mlm_probability: float,
-    gradient_accumulation_steps: int,
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
@@ -310,17 +310,17 @@ def run(
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
-        batch_size=batch_size,
+        micro_batch_size=micro_batch_size,
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         warmup_ratio=warmup_ratio,
+        global_batch_size=global_batch_size,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
         adam_epsilon=adam_epsilon,
         mlm_probability=mlm_probability,
-        gradient_accumulation_steps=gradient_accumulation_steps,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
         keep_probability=keep_probability,
@@ -463,7 +463,7 @@ def get_yaml(output: Optional[str], force: bool):
         "# IMPORTANT: Before running pretraining, ensure you have prepared your data with:\n"
         "#   1. Set pipeline_mode: 'pretrain' in params.yaml\n"
         "#   2. Run: nanoplm data from-yaml\n"
-        "# This will generate the HDF5 shards and a .data_manifest file.\n"
+        "# This will generate binary shards and a .data_manifest file.\n"
         "\n"
         "model:\n"
         "  hidden_size: 1024\n"
@@ -487,7 +487,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
         "\n"
         "  # Hyperparameters\n"
-        "  batch_size: 32\n"
+        "  #   micro_batch_size: samples per GPU per forward pass (limited by GPU memory)\n"
+        "  #   global_batch_size: total tokens per optimizer step across all GPUs\n"
+        "  #   gradient_accumulation_steps is inferred automatically:\n"
+        "  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))\n"
+        "  micro_batch_size: 32\n"
+        "  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
         "  num_epochs: 10\n"
         "\n"
         "  optimizer: \"adamw\"  # adamw, stable_adamw\n"
@@ -497,7 +502,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  learning_rate: 1e-3  # Maximum learning rate in warmup phase\n"
         "  warmup_ratio: 0.05\n"
         "  weight_decay: 0.0\n"
-        "  gradient_accumulation_steps: 1\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
@@ -548,6 +552,13 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
 
     extra = []
     kwargs: Dict[str, Any] = {}
+
+    if "gradient_accumulation_steps" in present_keys:
+        raise ValueError(
+            "gradient_accumulation_steps is inferred automatically from "
+            "global_batch_size, micro_batch_size, max_seq_len, and world_size. "
+            "Remove gradient_accumulation_steps from your pretraining config."
+        )
 
     # Required key
     if 'dataset_dir' not in config or not config['dataset_dir']:

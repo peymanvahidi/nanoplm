@@ -170,7 +170,8 @@ pretraining:
   ckp_dir: "output/pretraining_checkpoints"
 
   # Hyperparameters
-  batch_size: 32
+  max_length: 512
+  micro_batch_size: 32
   num_epochs: 10
 
   optimizer: "adamw"  # adamw, stable_adamw
@@ -180,7 +181,7 @@ pretraining:
   learning_rate: 1e-3  # Maximum learning rate in warmup phase
   warmup_ratio: 0.05
   weight_decay: 0.0
-  gradient_accumulation_steps: 1
+  global_batch_size: 1048576 # target tokens/optimizer-step (2^20), grad_accum inferred automatically
   mlm_probability: 0.3
   mask_replace_prob: 0.8
   random_token_prob: 0.1
