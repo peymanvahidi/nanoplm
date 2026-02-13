@@ -318,10 +318,31 @@ def run_pure_pretraining(
     create_dirs(pretrain_config.ckp_dir)
 
     effective_world_size = _resolve_world_size(pretrain_config)
-    global_batch_size = (
-        pretrain_config.gradient_accumulation_steps
-        * pretrain_config.batch_size
-        * effective_world_size
+
+    inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
+    global_batch_size_samples = pretrain_config.global_batch_size_samples
+    achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
+
+    if (
+        inferred_grad_accum_steps is None
+        or global_batch_size_samples is None
+        or achieved_global_batch_tokens is None
+    ):
+        raise ValueError(
+            "Batch setup is missing on PretrainingConfig. "
+            "Run pretraining through nanoplm CLI so inferred batch fields are populated."
+        )
+
+    world_tokens_per_micro_step = achieved_global_batch_tokens // max(
+        1, inferred_grad_accum_steps
+    )
+
+    logger.info(
+        "Batch setup: "
+        f"target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
+        f"micro_step_tokens={world_tokens_per_micro_step:,}, "
+        f"grad_accum_steps={inferred_grad_accum_steps}, "
+        f"effective_global_batch_size={achieved_global_batch_tokens:,} tokens"
     )
 
     (
@@ -337,7 +358,7 @@ def run_pure_pretraining(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
-        global_batch_size=global_batch_size,
+        global_batch_size_samples=global_batch_size_samples,
     )
 
     num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
@@ -377,7 +398,7 @@ def run_pure_pretraining(
     train_loader = DataLoader(
         train_ds,
         sampler=train_sampler,
-        batch_size=pretrain_config.batch_size,
+        batch_size=pretrain_config.micro_batch_size,
         collate_fn=collator,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -388,7 +409,7 @@ def run_pure_pretraining(
     eval_loader = DataLoader(
         val_ds,
         sampler=eval_sampler,
-        batch_size=pretrain_config.batch_size,
+        batch_size=pretrain_config.micro_batch_size,
         collate_fn=collator,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -401,7 +422,7 @@ def run_pure_pretraining(
 
     steps_per_epoch = _num_update_steps_per_epoch(
         train_loader_len=len(train_loader),
-        grad_accum=pretrain_config.gradient_accumulation_steps,
+        grad_accum=inferred_grad_accum_steps,
     )
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = _get_warmup_steps(total_steps, float(pretrain_config.warmup_ratio))
@@ -424,7 +445,7 @@ def run_pure_pretraining(
     resume_epoch = start_epoch
     if resume_config and resume_config.is_resume:
         steps_done = max(0, start_step - start_epoch * steps_per_epoch)
-        resume_micro_step = steps_done * pretrain_config.gradient_accumulation_steps
+        resume_micro_step = steps_done * inferred_grad_accum_steps
         if resume_micro_step >= len(train_loader):
             resume_micro_step = 0
             start_epoch = min(start_epoch + 1, num_epochs)
@@ -484,7 +505,7 @@ def run_pure_pretraining(
     logger.info(
         "Starting pure-torch training: "
         f"epochs={num_epochs}, total_steps={total_steps}, warmup_steps={warmup_steps}, "
-        f"grad_accum={pretrain_config.gradient_accumulation_steps}"
+        f"grad_accum={inferred_grad_accum_steps}"
     )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
@@ -531,7 +552,7 @@ def run_pure_pretraining(
                 )
 
             loss = out["loss"] if isinstance(out, dict) else out.loss
-            loss = loss / pretrain_config.gradient_accumulation_steps
+            loss = loss / inferred_grad_accum_steps
 
             if scaler is not None and scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -540,7 +561,7 @@ def run_pure_pretraining(
 
             accum_loss += loss.item()
 
-            grad_accum = pretrain_config.gradient_accumulation_steps
+            grad_accum = inferred_grad_accum_steps
             is_boundary = (micro_step + 1) % grad_accum == 0
             is_last_micro = micro_step + 1 == len(train_loader)
 

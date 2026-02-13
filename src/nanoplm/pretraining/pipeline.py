@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import math
 import shutil
 import torch
 import torch.distributed as dist
@@ -235,6 +234,9 @@ class PretrainingConfig:
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_size: int = 2 ** 20
+    inferred_grad_accum_steps: Optional[int] = None
+    global_batch_size_samples: Optional[int] = None
+    achieved_global_batch_tokens: Optional[int] = None
 
     # Mixed precision
     bf16: bool = True
@@ -452,7 +454,6 @@ def run_pretraining(
     manifest = validation_result['manifest']
 
     # Get data from typed manifest
-    max_length = manifest.max_seq_len
     train_shard_dir = dataset_dir / manifest.train_dir
     val_shard_dir = dataset_dir / manifest.val_dir
     train_sequences = manifest.train_sequences
@@ -496,32 +497,22 @@ def run_pretraining(
     else:
         effective_world_size = 1
 
-    # Infer grad accumulation from target global batch size in tokens.
-    if pretrain_config.global_batch_size <= 0:
+    inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
+    global_batch_size_samples = pretrain_config.global_batch_size_samples
+    achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
+
+    if (
+        inferred_grad_accum_steps is None
+        or global_batch_size_samples is None
+        or achieved_global_batch_tokens is None
+    ):
         raise ValueError(
-            f"global_batch_size must be > 0, got {pretrain_config.global_batch_size}"
+            "Batch setup is missing on PretrainingConfig. "
+            "Run pretraining through nanoplm CLI so inferred batch fields are populated."
         )
 
-    world_tokens_per_micro_step = (
-        pretrain_config.micro_batch_size * max_length * effective_world_size
-    )
-    if world_tokens_per_micro_step <= 0:
-        raise ValueError(
-            f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check micro_batch_size, max_seq_len, and world_size."
-        )
-
-    inferred_grad_accum_steps = max(
-        1,
-        math.ceil(pretrain_config.global_batch_size / world_tokens_per_micro_step),
-    )
-    achieved_global_batch_tokens = (
-        inferred_grad_accum_steps * world_tokens_per_micro_step
-    )
-    global_batch_size_samples = (
-        inferred_grad_accum_steps
-        * pretrain_config.micro_batch_size
-        * effective_world_size
+    world_tokens_per_micro_step = achieved_global_batch_tokens // max(
+        1, inferred_grad_accum_steps
     )
 
     logger.info(
