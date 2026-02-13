@@ -182,6 +182,11 @@ def pretrain():
     help="Enable cautious weight decay in Muon/NorMuon (used only when optimizer=muon or normuon)",
 )
 @click.option(
+    "--muon-use-polar-express/--no-muon-use-polar-express",
+    default=False,
+    help="Use Polar Express orthogonalization for Muon/NorMuon (used only when optimizer=muon or normuon)",
+)
+@click.option(
     "--muon-momentum",
     type=float,
     default=0.95,
@@ -377,6 +382,7 @@ def run(
     muon_learning_rate: float,
     muon_weight_decay: float,
     muon_cautious_weight_decay: bool,
+    muon_use_polar_express: bool,
     muon_momentum: float,
     muon_nesterov: bool,
     muon_eps: float,
@@ -428,6 +434,7 @@ def run(
         muon_learning_rate=muon_learning_rate,
         muon_weight_decay=muon_weight_decay,
         muon_cautious_weight_decay=muon_cautious_weight_decay,
+        muon_use_polar_express=muon_use_polar_express,
         muon_momentum=muon_momentum,
         muon_nesterov=muon_nesterov,
         muon_eps=muon_eps,
@@ -653,6 +660,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_learning_rate: 2e-2\n"
         "  muon_weight_decay: 0.1\n"
         "  muon_cautious_weight_decay: true\n"
+        "  muon_use_polar_express: false\n"
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
@@ -757,7 +765,14 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'bf16', 'tf32', 'muon_nesterov', 'muon_cautious_weight_decay']:
+    for bool_key in [
+        'multi_gpu',
+        'bf16',
+        'tf32',
+        'muon_nesterov',
+        'muon_cautious_weight_decay',
+        'muon_use_polar_express',
+    ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):

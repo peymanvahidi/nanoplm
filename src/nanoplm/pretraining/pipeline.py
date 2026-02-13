@@ -96,6 +96,7 @@ def _build_muon_optimizer(
         muon_learning_rate=pretrain_config.muon_learning_rate,
         muon_weight_decay=pretrain_config.muon_weight_decay,
         muon_cautious_weight_decay=pretrain_config.muon_cautious_weight_decay,
+        muon_use_polar_express=pretrain_config.muon_use_polar_express,
         muon_momentum=pretrain_config.muon_momentum,
         muon_nesterov=pretrain_config.muon_nesterov,
         muon_eps=pretrain_config.muon_eps,
@@ -202,6 +203,7 @@ class PretrainingConfig:
     muon_learning_rate: float = 2e-2
     muon_weight_decay: float = 0.1
     muon_cautious_weight_decay: bool = True
+    muon_use_polar_express: bool = False
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_eps: float = 1e-7

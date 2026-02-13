@@ -123,6 +123,7 @@ def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> Muo
         muon_learning_rate=cfg.muon_learning_rate,
         muon_weight_decay=cfg.muon_weight_decay,
         muon_cautious_weight_decay=cfg.muon_cautious_weight_decay,
+        muon_use_polar_express=cfg.muon_use_polar_express,
         muon_momentum=cfg.muon_momentum,
         muon_nesterov=cfg.muon_nesterov,
         muon_eps=cfg.muon_eps,
