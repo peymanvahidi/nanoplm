@@ -156,9 +156,23 @@ class TokenTrackingTrainer(Trainer):
         return loss
 
     def log(self, logs, start_time=None, **kwargs):
-        if isinstance(self.optimizer, MuonAdamW):
-            logs["learning_rate"] = self.optimizer.adamw.param_groups[0]["lr"]
-            logs["muon_lr"] = self.optimizer.muon.param_groups[0]["lr"]
+        optimizer = self.optimizer
+        seen: set[int] = set()
+        while optimizer is not None and not isinstance(optimizer, MuonAdamW):
+            opt_id = id(optimizer)
+            if opt_id in seen:
+                break
+            seen.add(opt_id)
+            inner = getattr(optimizer, "optimizer", None)
+            if inner is None or inner is optimizer:
+                break
+            optimizer = inner
+
+        if isinstance(optimizer, MuonAdamW):
+            adamw_lr = optimizer.adamw.param_groups[0]["lr"]
+            muon_lr = optimizer.muon.param_groups[0]["lr"]
+            logs["learning_rate"] = adamw_lr
+            logs["muon_lr"] = muon_lr
         logs["tokens_per_sec"] = self._last_tokens_per_sec
         logs["raw_tokens_per_sec"] = self._last_raw_tokens_per_sec
         super().log(logs, start_time=start_time, **kwargs)

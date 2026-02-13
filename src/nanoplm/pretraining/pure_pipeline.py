@@ -716,9 +716,10 @@ def run_pure_pretraining(
                     except Exception as exc:
                         wandb_enabled = False
                         logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
+                muon_lr_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
                 logger.info(
                     f"[step {global_step}/{total_steps}] "
-                    f"loss={loss_to_log:.4f} lr={learning_rate:.2e} "
+                    f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
                     f"grad_norm={grad_norm:.4f} tok/s={tokens_per_sec:,.0f} "
                     f"raw_tok/s={raw_tokens_per_sec:,.0f}"
                 )
