@@ -79,6 +79,31 @@ def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
     return True
 
 
+# H100 SXM peak BF16 tensor-core throughput (TFLOPS).
+H100_PEAK_TFLOPS = 989.4
+
+
+def _estimate_model_flops_per_token(
+    num_layers: int,
+    hidden_size: int,
+    intermediate_size: int,
+    seq_len: int,
+    vocab_size: int,
+) -> int:
+    """Estimate FLOPs per token for a single forward pass.
+
+    Uses the standard transformer FLOPs counting:
+      Attention (per layer): 8*h^2 + 4*s*h  (QKV + output projections + attn logits/ctx)
+      SwiGLU MLP (per layer): 6*h*I           (gate + up + down projections)
+      Embedding/unembedding:  2*V*h
+
+    Training FLOPs = 3 * forward FLOPs (forward + ~2x backward).
+    """
+    per_layer = 8 * hidden_size**2 + 4 * seq_len * hidden_size + 6 * hidden_size * intermediate_size
+    forward_flops = num_layers * per_layer + 2 * vocab_size * hidden_size
+    return 3 * forward_flops  # training = 3x forward
+
+
 def _is_embedding_or_unembedding_param(name: str) -> bool:
     lname = name.lower()
     if "embeddings.tok_embeddings" in lname:
@@ -646,6 +671,22 @@ def run_pure_pretraining(
         else None
     )
 
+    # Pre-compute FLOPs-per-token for MFU estimation.
+    _raw_model = _unwrap_model(model)
+    _mb_cfg = _raw_model.config if hasattr(_raw_model, "config") else _raw_model._orig_mod.config
+    _flops_per_token = _estimate_model_flops_per_token(
+        num_layers=_mb_cfg.num_hidden_layers,
+        hidden_size=_mb_cfg.hidden_size,
+        intermediate_size=_mb_cfg.intermediate_size,
+        seq_len=manifest.max_seq_len,
+        vocab_size=_mb_cfg.vocab_size,
+    )
+    _peak_flops_per_gpu = H100_PEAK_TFLOPS * 1e12  # convert to FLOPS
+    logger.info(
+        f"MFU estimation: {_flops_per_token:,} training FLOPs/token, "
+        f"H100 peak = {H100_PEAK_TFLOPS} TFLOPS"
+    )
+
     logger.info(
         "Starting pure-torch training: "
         f"epochs={num_epochs}, total_steps={total_steps}, warmup_steps={warmup_steps}, "
@@ -770,6 +811,11 @@ def run_pure_pretraining(
             tokens_per_sec = tok / max(elapsed, 1e-9)
             raw_tokens_per_sec = raw_tok / max(elapsed, 1e-9)
 
+            # MFU: (achieved FLOPs/s per GPU) / (H100 peak FLOPs/s)
+            achieved_flops_per_sec = raw_tokens_per_sec * _flops_per_token
+            per_gpu_flops = achieved_flops_per_sec / max(effective_world_size, 1)
+            mfu = per_gpu_flops / _peak_flops_per_gpu
+
             token_count = 0
             raw_token_count = 0
             token_t0 = None
@@ -799,7 +845,8 @@ def run_pure_pretraining(
                     f"[step {global_step}/{total_steps}] "
                     f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
                     f"grad_norm={grad_norm:.4f} tok/s={tokens_per_sec:,.0f} "
-                    f"raw_tok/s={raw_tokens_per_sec:,.0f}"
+                    f"raw_tok/s={raw_tokens_per_sec:,.0f} "
+                    f"mfu={mfu:.2%}"
                 )
 
             # Tame the garbage collector: after the first optimizer step
