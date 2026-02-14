@@ -772,6 +772,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'muon_nesterov',
         'muon_cautious_weight_decay',
         'muon_use_polar_express',
+        'use_packing',
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
@@ -779,6 +780,13 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 continue
             elif isinstance(value, str):
                 kwargs[bool_key] = value.lower() == 'true'
+
+    # Handle optional int fields (may come as string from CLI overrides)
+    for int_key in ['target_packed_rows']:
+        if int_key in kwargs:
+            value = kwargs[int_key]
+            if isinstance(value, str):
+                kwargs[int_key] = int(value)
 
     return PretrainingConfig(**kwargs)
 

@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
-from nanoplm.pretraining.collator import ProtDataCollatorForLM
+from nanoplm.pretraining.collator import PackingCollator, ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import MuonAdamW
@@ -46,6 +46,11 @@ from nanoplm.pretraining.pipeline import (
 )
 from nanoplm.utils.common import create_dirs, get_device
 from nanoplm.utils.logger import logger
+
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 def _set_seed(seed: int) -> None:
@@ -455,13 +460,39 @@ def run_pure_pretraining(
         )
         raise
 
-    collator = ProtDataCollatorForLM(
-        tokenizer=tokenizer,
-        mlm_probability=pretrain_config.mlm_probability,
-        mask_token_probability=pretrain_config.mask_replace_prob,
-        random_token_probability=pretrain_config.random_token_prob,
-        keep_probability=pretrain_config.keep_probability,
-    )
+    use_packing = bool(getattr(pretrain_config, "use_packing", False))
+    target_rows = getattr(pretrain_config, "target_packed_rows", None)
+    if target_rows is not None:
+        target_rows = int(target_rows)
+    use_static_packing = use_packing and target_rows is not None
+
+    if use_packing:
+        collator = PackingCollator(
+            tokenizer=tokenizer,
+            max_seq_len=manifest.max_seq_len,
+            mlm_probability=pretrain_config.mlm_probability,
+            mask_token_probability=pretrain_config.mask_replace_prob,
+            random_token_probability=pretrain_config.random_token_prob,
+            keep_probability=pretrain_config.keep_probability,
+            target_rows=target_rows,
+            batch_size=pretrain_config.micro_batch_size if target_rows else None,
+        )
+        if use_static_packing:
+            logger.info(
+                f"Sequence packing ENABLED (static shapes, "
+                f"target_rows={target_rows}, "
+                f"flat_size={target_rows * manifest.max_seq_len:,})"
+            )
+        else:
+            logger.info("Sequence packing ENABLED (PackingCollator, dynamic shapes)")
+    else:
+        collator = ProtDataCollatorForLM(
+            tokenizer=tokenizer,
+            mlm_probability=pretrain_config.mlm_probability,
+            mask_token_probability=pretrain_config.mask_replace_prob,
+            random_token_probability=pretrain_config.random_token_prob,
+            keep_probability=pretrain_config.keep_probability,
+        )
 
     create_dirs(pretrain_config.ckp_dir)
 
@@ -565,11 +596,28 @@ def run_pure_pretraining(
 
     # Compile model for faster training. Keep orig_model for checkpointing/eval
     # (eval inputs may change shape, which would cause recompilation).
-    # dynamic=True because varlen flash-attention produces variable-length
-    # unpadded tensors per batch.
     orig_model = model
-    model = torch.compile(model, dynamic=True)
-    logger.info("Model compiled with torch.compile(dynamic=True)")
+    if use_static_packing:
+        # Static shapes: collator pre-flattens and pads to fixed sizes,
+        # so no data-dependent ops inside the compiled graph.
+        model = torch.compile(model, dynamic=False)
+        logger.info("Model compiled with torch.compile(dynamic=False)")
+    else:
+        # dynamic=True because varlen flash-attention produces variable-length
+        # unpadded tensors per batch.
+        model = torch.compile(model, dynamic=True)
+        logger.info("Model compiled with torch.compile(dynamic=True)")
+
+    # Eval always uses a standard padding collator (no packing) so that
+    # _evaluate() sees 2-D batches with attention_mask regardless of the
+    # training collator configuration.
+    eval_collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=pretrain_config.mlm_probability,
+        mask_token_probability=pretrain_config.mask_replace_prob,
+        random_token_probability=pretrain_config.random_token_prob,
+        keep_probability=pretrain_config.keep_probability,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -580,18 +628,18 @@ def run_pure_pretraining(
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        drop_last=False,
+        drop_last=use_static_packing,  # static shapes require fixed batch size
     )
     eval_loader = DataLoader(
         val_ds,
         sampler=eval_sampler,
         batch_size=pretrain_config.micro_batch_size,
-        collate_fn=collator,
+        collate_fn=eval_collator,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        drop_last=False,
+        drop_last=False,  # eval always processes all samples
     )
 
     optimizer = _create_optimizer(model, pretrain_config, distributed_mesh=fsdp_mesh)
@@ -730,8 +778,16 @@ def run_pure_pretraining(
 
             if raw_token_count == 0:
                 token_t0 = time.perf_counter()
-            token_count += int(batch["attention_mask"].sum().item())
-            raw_token_count += int(batch["attention_mask"].numel())
+
+            # Token counting: for the static path there is no attention_mask,
+            # so count real tokens from cu_seqlens[-1] and total from tensor size.
+            if "attention_mask" in batch:
+                token_count += int(batch["attention_mask"].sum().item())
+                raw_token_count += int(batch["attention_mask"].numel())
+            else:
+                # Static packed path: cu_seqlens[-1] = total real tokens.
+                token_count += int(batch["cu_seqlens"][-1].item())
+                raw_token_count += int(batch["input_ids"].numel())
 
             amp_ctx = (
                 torch.autocast(device_type=device.type, dtype=amp_dtype)
@@ -739,11 +795,18 @@ def run_pure_pretraining(
                 else nullcontext()
             )
             with amp_ctx:
-                out = model(
+                fwd_kwargs = dict(
                     input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                 )
+                if "attention_mask" in batch:
+                    fwd_kwargs["attention_mask"] = batch["attention_mask"]
+                if "cu_seqlens" in batch:
+                    fwd_kwargs["cu_seqlens"] = batch["cu_seqlens"]
+                    fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
+                if "position_ids" in batch:
+                    fwd_kwargs["position_ids"] = batch["position_ids"]
+                out = model(**fwd_kwargs)
 
             loss = out["loss"] if isinstance(out, dict) else out.loss
             loss = loss / inferred_grad_accum_steps
@@ -846,7 +909,7 @@ def run_pure_pretraining(
                     f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
                     f"grad_norm={grad_norm:.4f} tok/s={tokens_per_sec:,.0f} "
                     f"raw_tok/s={raw_tokens_per_sec:,.0f} "
-                    f"mfu={mfu:.2%}"
+                    f"h100_mfu={mfu:.2%}"
                 )
 
             # Tame the garbage collector: after the first optimizer step

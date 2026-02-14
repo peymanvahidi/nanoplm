@@ -333,7 +333,7 @@ class ModernBertAttention(nn.Module):
         x: torch.Tensor,
         cos_sin: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor,
-        max_seqlen: torch.Tensor,
+        max_seqlen: int | torch.Tensor,
         window_size: tuple[int, int],
     ) -> torch.Tensor:
         total = x.shape[0]  # (total_tokens, hidden)
@@ -343,9 +343,10 @@ class ModernBertAttention(nn.Module):
         cos, sin = cos_sin
         q, k = _apply_rope(q, k, cos, sin)
 
-        # .item() here is fine — flash_attn is an opaque C extension and
-        # already sits at a graph boundary for torch.compile.
-        max_s = max_seqlen.item()
+        # When max_seqlen is already a plain int (static-shape mode) skip .item()
+        # to avoid a graph break.  For tensor values (dynamic mode) .item() is
+        # fine — flash_attn is an opaque C extension at a graph boundary.
+        max_s = max_seqlen if isinstance(max_seqlen, int) else max_seqlen.item()
         kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
@@ -632,7 +633,36 @@ class ModernBertForMaskedLM(nn.Module):
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> dict[str, Optional[torch.Tensor]]:
+        # ---- static packed path (pre-flattened by collator) ---------------
+        # When both cu_seqlens and position_ids are provided and input_ids is
+        # already 1-D (flat), the collator has done all unpadding / position-id
+        # computation.  No data-dependent ops here → dynamic=False safe.
+        if cu_seqlens is not None and position_ids is not None and input_ids.dim() == 1:
+            x = self.model(
+                input_ids,
+                _cu_seqlens=cu_seqlens,
+                _max_seqlen=max_seqlen,  # pass int directly — no tensor
+                _position_ids=position_ids,
+            )
+            # x: (F, hidden) where F is fixed flat length
+
+            if labels is not None:
+                logits = self.decoder(self.head(x))
+                loss = F.cross_entropy(
+                    logits.float(),
+                    labels,
+                    ignore_index=self.sparse_pred_ignore_index,
+                )
+            else:
+                logits = self.decoder(self.head(x))
+                loss = None
+
+            return {"loss": loss, "logits": logits}
+
         use_varlen = (
             _HAS_FLASH_VARLEN
             and input_ids.is_cuda
@@ -642,7 +672,20 @@ class ModernBertForMaskedLM(nn.Module):
         # ---- varlen (flash-attention) path --------------------------------
         if use_varlen:
             batch, seq_len = input_ids.shape
-            indices, cu_seqlens, max_seqlen = _unpad_input(attention_mask)
+            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+
+            if cu_seqlens is not None:
+                # Packed path: cu_seqlens provided by the packing collator.
+                # max_seqlen may be an int or a tensor; keep consistent.
+                if isinstance(max_seqlen, int):
+                    max_seqlen_t = torch.tensor(max_seqlen, dtype=torch.int32)
+                else:
+                    max_seqlen_t = max_seqlen
+            else:
+                # Unpacked path: derive cu_seqlens from attention_mask.
+                _indices, cu_seqlens, max_seqlen_t = _unpad_input(attention_mask)
+                indices = _indices
+
             flat_ids = input_ids.view(-1)[indices]  # (total_tokens,)
             position_ids = _position_ids_from_cu_seqlens(
                 cu_seqlens, flat_ids.shape[0], flat_ids.device
@@ -651,7 +694,7 @@ class ModernBertForMaskedLM(nn.Module):
             x = self.model(
                 flat_ids,
                 _cu_seqlens=cu_seqlens,
-                _max_seqlen=max_seqlen,
+                _max_seqlen=max_seqlen_t,
                 _position_ids=position_ids,
             )
             # x: (total_tokens, hidden) — flat, no padding
