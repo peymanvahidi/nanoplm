@@ -264,6 +264,19 @@ def pretrain():
     help="DataLoader prefetch factor"
 )
 @click.option(
+    "--use-packing/--no-packing",
+    default=False,
+    help="Enable sequence packing to eliminate padding waste (requires flash attention)"
+)
+@click.option(
+    "--target-packed-rows",
+    type=int,
+    default=None,
+    help="Fixed row count for static-shape compilation (enables dynamic=False). "
+         "Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. "
+         "Omit to use dynamic=True."
+)
+@click.option(
     "--bf16/--no-bf16",
     default=True,
     help="Enable mixed precision training (bf16 if supported, fp16 fallback)"
@@ -396,6 +409,8 @@ def run(
     keep_probability: float,
     num_workers: Union[int, str],
     prefetch_factor: int,
+    use_packing: bool,
+    target_packed_rows: Optional[int],
     bf16: bool,
     tf32: bool,
     multi_gpu: bool,
@@ -448,6 +463,8 @@ def run(
         seed=seed,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
+        use_packing=use_packing,
+        target_packed_rows=target_packed_rows,
         bf16=bf16,
         tf32=tf32,
         multi_gpu=multi_gpu,

@@ -460,10 +460,8 @@ def run_pure_pretraining(
         )
         raise
 
-    use_packing = bool(getattr(pretrain_config, "use_packing", False))
-    target_rows = getattr(pretrain_config, "target_packed_rows", None)
-    if target_rows is not None:
-        target_rows = int(target_rows)
+    use_packing = bool(pretrain_config.use_packing)
+    target_rows = pretrain_config.target_packed_rows
     use_static_packing = use_packing and target_rows is not None
 
     if use_packing:
