@@ -4,9 +4,13 @@ This is the same outer behavior as the HF Trainer pipeline (datasets, run naming
 checkpoint layout, resume mechanics), but the training loop is plain torch.
 """
 
+import gc
 import json
 import math
 import os
+
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import random
 import time
 from contextlib import nullcontext
@@ -17,7 +21,14 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+)
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -46,7 +57,8 @@ def _set_seed(seed: int) -> None:
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return model.module if isinstance(model, DDP) else model
+    # FSDP2 modifies the model in-place; no wrapper to strip.
+    return model
 
 
 def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -80,7 +92,11 @@ def _is_embedding_or_unembedding_param(name: str) -> bool:
     )
 
 
-def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> MuonAdamW:
+def _build_muon_optimizer(
+    model: torch.nn.Module,
+    cfg: PretrainingConfig,
+    distributed_mesh=None,
+) -> MuonAdamW:
     raw_model = _unwrap_model(model)
 
     muon_params: list[torch.nn.Parameter] = []
@@ -132,13 +148,18 @@ def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> Muo
         adamw_weight_decay=cfg.weight_decay,
         adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
         adamw_epsilon=cfg.adam_epsilon,
+        distributed_mesh=distributed_mesh,
     )
 
 
-def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.optim.Optimizer:
+def _create_optimizer(
+    model: torch.nn.Module,
+    cfg: PretrainingConfig,
+    distributed_mesh=None,
+) -> torch.optim.Optimizer:
     name = str(cfg.optimizer).lower()
     if name in {"muon", "normuon"}:
-        return _build_muon_optimizer(model, cfg)
+        return _build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
     raw_model = _unwrap_model(model)
     decay, no_decay = [], []
@@ -257,6 +278,17 @@ def _evaluate(
     return total_loss / max(1, total_samples)
 
 
+def _to_full_tensors(obj):
+    """Recursively convert DTensors to plain tensors (collective operation)."""
+    if isinstance(obj, DTensor):
+        return obj.full_tensor()
+    if isinstance(obj, dict):
+        return {k: _to_full_tensors(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_full_tensors(v) for v in obj]
+    return obj
+
+
 def _save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -267,13 +299,27 @@ def _save_checkpoint(
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
+    distributed: bool = False,
+    is_main: bool = True,
 ) -> None:
     checkpoint_dir = Path(output_dir) / f"checkpoint-{global_step}"
-    create_dirs(str(checkpoint_dir))
 
-    raw_model = _unwrap_model(model)
-    torch.save(raw_model.state_dict(), checkpoint_dir / "pytorch_model.bin")
-    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+    if distributed:
+        # Collective: gather full model & optimizer state dicts.
+        model_sd = get_model_state_dict(
+            model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+        )
+        opt_sd = _to_full_tensors(optimizer.state_dict())
+    else:
+        model_sd = _unwrap_model(model).state_dict()
+        opt_sd = optimizer.state_dict()
+
+    if not is_main:
+        return
+
+    create_dirs(str(checkpoint_dir))
+    torch.save(model_sd, checkpoint_dir / "pytorch_model.bin")
+    torch.save(opt_sd, checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
     torch.save(
         {
@@ -307,13 +353,18 @@ def _load_checkpoint(
     scheduler: LambdaLR,
     checkpoint_dir: str,
     device: torch.device,
+    distributed: bool = False,
 ) -> Tuple[int, int]:
     ckp = Path(checkpoint_dir)
 
-    raw_model = _unwrap_model(model)
-    raw_model.load_state_dict(
-        torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
-    )
+    model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
+    if distributed:
+        set_model_state_dict(
+            model, model_sd, options=StateDictOptions(full_state_dict=True)
+        )
+    else:
+        _unwrap_model(model).load_state_dict(model_sd)
+
     optimizer.load_state_dict(
         torch.load(ckp / "optimizer.pt", map_location=device, weights_only=True)
     )
@@ -454,11 +505,31 @@ def run_pure_pretraining(
 
     model.to(device)
 
+    # -- Precision detection (needed before FSDP for MixedPrecisionPolicy) --
+    use_bf16 = (
+        pretrain_config.bf16
+        and device.type == "cuda"
+        and torch.cuda.is_bf16_supported()
+    )
+    use_fp16 = (
+        pretrain_config.bf16
+        and ((device.type == "cuda" and not torch.cuda.is_bf16_supported()) or device.type == "mps")
+    )
+
+    fsdp_mesh = None
     if distributed:
-        if torch.cuda.is_available():
-            model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-        else:
-            model = DDP(model, find_unused_parameters=False)
+        # Apply FSDP2 per transformer layer, then at the root.
+        fsdp_kwargs: dict = {}
+        if use_bf16:
+            fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+            )
+        fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
         eval_sampler = DistributedSampler(val_ds, shuffle=False)
         is_main = dist.get_rank() == 0
@@ -466,6 +537,14 @@ def run_pure_pretraining(
         train_sampler = RandomSampler(train_ds)
         eval_sampler = SequentialSampler(val_ds)
         is_main = True
+
+    # Compile model for faster training. Keep orig_model for checkpointing/eval
+    # (eval inputs may change shape, which would cause recompilation).
+    # dynamic=True because varlen flash-attention produces variable-length
+    # unpadded tensors per batch.
+    orig_model = model
+    model = torch.compile(model, dynamic=True)
+    logger.info("Model compiled with torch.compile(dynamic=True)")
 
     train_loader = DataLoader(
         train_ds,
@@ -490,7 +569,7 @@ def run_pure_pretraining(
         drop_last=False,
     )
 
-    optimizer = _create_optimizer(model, pretrain_config)
+    optimizer = _create_optimizer(model, pretrain_config, distributed_mesh=fsdp_mesh)
 
     steps_per_epoch = _num_update_steps_per_epoch(
         train_loader_len=len(train_loader),
@@ -510,6 +589,7 @@ def run_pure_pretraining(
             scheduler=scheduler,
             checkpoint_dir=resume_config.checkpoint_dir,
             device=device,
+            distributed=distributed,
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
@@ -547,18 +627,10 @@ def run_pure_pretraining(
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
 
-    use_bf16 = (
-        pretrain_config.bf16
-        and device.type == "cuda"
-        and torch.cuda.is_bf16_supported()
-    )
-    use_fp16 = (
-        pretrain_config.bf16
-        and ((device.type == "cuda" and not torch.cuda.is_bf16_supported()) or device.type == "mps")
-    )
-
+    # When FSDP handles bf16 via MixedPrecisionPolicy, autocast is not needed.
+    # Keep autocast only for non-distributed bf16 or fp16 paths.
     amp_dtype: Optional[torch.dtype] = None
-    if use_bf16:
+    if use_bf16 and not distributed:
         amp_dtype = torch.bfloat16
     elif use_fp16:
         amp_dtype = torch.float16
@@ -595,6 +667,7 @@ def run_pure_pretraining(
     token_count = 0
     raw_token_count = 0
     token_t0: Optional[float] = None
+    first_step_of_run = True
 
     for epoch in range(start_epoch, num_epochs):
         if hasattr(train_sampler, "set_epoch"):
@@ -605,6 +678,14 @@ def run_pure_pretraining(
                 continue
 
             batch = _move_batch_to_device(batch, device)
+
+            # FSDP2: only reduce-scatter gradients at accumulation boundaries.
+            if distributed:
+                _is_sync_step = (
+                    (micro_step + 1) % inferred_grad_accum_steps == 0
+                    or micro_step + 1 == len(train_loader)
+                )
+                model.set_requires_gradient_sync(_is_sync_step)
 
             if raw_token_count == 0:
                 token_t0 = time.perf_counter()
@@ -721,13 +802,25 @@ def run_pure_pretraining(
                     f"raw_tok/s={raw_tokens_per_sec:,.0f}"
                 )
 
+            # Tame the garbage collector: after the first optimizer step
+            # (which triggers torch.compile warmup), collect garbage from
+            # setup, freeze surviving objects, and disable automatic GC.
+            # This avoids ~500ms GC pauses during training.
+            if first_step_of_run:
+                first_step_of_run = False
+                gc.collect()
+                gc.freeze()
+                gc.disable()
+            elif global_step % 5000 == 0:
+                gc.collect()  # periodic manual collect for very long runs
+
             if should_log:
                 window_loss = 0.0
                 window_steps = 0
 
             if global_step % eval_steps == 0:
                 eval_loss = _evaluate(
-                    model=model,
+                    model=orig_model,
                     eval_loader=eval_loader,
                     device=device,
                     distributed=distributed,
@@ -748,7 +841,7 @@ def run_pure_pretraining(
                     logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
                 model.train()
 
-            if global_step % save_steps == 0 and is_main:
+            if global_step % save_steps == 0:
                 _save_checkpoint(
                     model=model,
                     optimizer=optimizer,
@@ -759,6 +852,8 @@ def run_pure_pretraining(
                     logging_steps=logging_steps,
                     eval_steps=eval_steps,
                     save_steps=save_steps,
+                    distributed=distributed,
+                    is_main=is_main,
                 )
 
         if resume_micro_step > 0 and epoch == resume_epoch:
@@ -767,18 +862,20 @@ def run_pure_pretraining(
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
+    _save_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        global_step=global_step,
+        epoch=num_epochs,
+        output_dir=output_dir,
+        logging_steps=logging_steps,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+        distributed=distributed,
+        is_main=is_main,
+    )
     if is_main:
-        _save_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            global_step=global_step,
-            epoch=num_epochs,
-            output_dir=output_dir,
-            logging_steps=logging_steps,
-            eval_steps=eval_steps,
-            save_steps=save_steps,
-        )
         if wandb_enabled and wandb.run is not None:
             try:
                 (Path(output_dir) / "wandb_run_id.txt").write_text(wandb.run.id, encoding="utf-8")

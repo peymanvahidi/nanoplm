@@ -163,17 +163,17 @@ def _sliding_attention_mask(
 
 def _unpad_input(
     attention_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Derive unpadding metadata from a (batch, seq_len) attention mask.
 
     Returns:
         indices:    (total_tokens,) – flat indices of non-padding positions.
         cu_seqlens: (batch + 1,)    – cumulative sequence lengths (int32).
-        max_seqlen: int             – longest sequence in the batch.
+        max_seqlen: 0-D int32 tensor – longest sequence in the batch.
     """
     seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
-    max_seqlen: int = seqlens.max().item()
+    max_seqlen = seqlens.max()  # keep as tensor to avoid torch.compile graph break
     cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
     return indices, cu_seqlens, max_seqlen
 
@@ -333,7 +333,7 @@ class ModernBertAttention(nn.Module):
         x: torch.Tensor,
         cos_sin: tuple[torch.Tensor, torch.Tensor],
         cu_seqlens: torch.Tensor,
-        max_seqlen: int,
+        max_seqlen: torch.Tensor,
         window_size: tuple[int, int],
     ) -> torch.Tensor:
         total = x.shape[0]  # (total_tokens, hidden)
@@ -343,11 +343,14 @@ class ModernBertAttention(nn.Module):
         cos, sin = cos_sin
         q, k = _apply_rope(q, k, cos, sin)
 
+        # .item() here is fine — flash_attn is an opaque C extension and
+        # already sits at a graph boundary for torch.compile.
+        max_s = max_seqlen.item()
         kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
             softmax_scale=self.scale,
             window_size=window_size,
         )
@@ -456,20 +459,17 @@ class ModernBertModel(nn.Module):
     ) -> torch.Tensor:
         # ---- varlen (flash-attention) path --------------------------------
         if _cu_seqlens is not None:
-            if _max_seqlen > self.config.max_position_embeddings:
-                raise ValueError(
-                    f"Sequence length {_max_seqlen} exceeds "
-                    f"max_position_embeddings={self.config.max_position_embeddings}"
-                )
             device = input_ids.device
             x = self.embeddings(input_ids)  # (total_tokens, hidden)
 
-            # Pre-compute RoPE tables for max_seqlen, then index by position
+            # Pre-compute RoPE tables up to max_position_embeddings (fixed size
+            # avoids graph breaks / recompilation) and index by _position_ids.
+            rope_len = self.config.max_position_embeddings
             cos_f, sin_f = self.rotary_emb(
-                _max_seqlen, device, x.dtype, "full_attention"
+                rope_len, device, x.dtype, "full_attention"
             )
             cos_s, sin_s = self.rotary_emb(
-                _max_seqlen, device, x.dtype, "sliding_attention"
+                rope_len, device, x.dtype, "sliding_attention"
             )
             rope = {
                 "full_attention": (

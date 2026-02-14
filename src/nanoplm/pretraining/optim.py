@@ -61,6 +61,7 @@ class MuonAdamW(torch.optim.Optimizer):
         adamw_betas: tuple[float, float],
         adamw_epsilon: float,
         use_normuon: bool = False,
+        distributed_mesh=None,
     ) -> None:
         if not muon_params:
             raise ValueError("Muon optimizer requires at least one matrix parameter.")
@@ -70,8 +71,7 @@ class MuonAdamW(torch.optim.Optimizer):
         all_params = list(muon_params) + list(adamw_params)
         super().__init__(all_params, defaults={})
 
-        distributed_mesh = None
-        if dist.is_available() and dist.is_initialized():
+        if distributed_mesh is None and dist.is_available() and dist.is_initialized():
             distributed_mesh = dist.group.WORLD
 
         ns_func = _polar_express_paper if muon_use_polar_express else None
