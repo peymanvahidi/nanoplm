@@ -18,7 +18,8 @@ from transformers import (
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from nanoplm.pretraining.optim import MuonAdamW
+from dion import Muon as DionMuon, NorMuon as DionNorMuon
+from nanoplm.pretraining.optim import build_optimizer
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
@@ -52,7 +53,7 @@ def _is_embedding_or_unembedding_param(name: str) -> bool:
 def _build_muon_optimizer(
     model: torch.nn.Module,
     pretrain_config: "PretrainingConfig",
-) -> MuonAdamW:
+):
     raw_model = _unwrap_model(model)
 
     muon_params: list[torch.nn.Parameter] = []
@@ -90,7 +91,7 @@ def _build_muon_optimizer(
         f"adamw_params={len(adamw_params)} tensors"
     )
 
-    return MuonAdamW(
+    return build_optimizer(
         muon_params=muon_params,
         adamw_params=adamw_params,
         muon_learning_rate=pretrain_config.muon_learning_rate,
@@ -160,7 +161,7 @@ class TokenTrackingTrainer(Trainer):
     def log(self, logs, start_time=None, **kwargs):
         optimizer = self.optimizer
         seen: set[int] = set()
-        while optimizer is not None and not isinstance(optimizer, MuonAdamW):
+        while optimizer is not None and not isinstance(optimizer, (DionMuon, DionNorMuon)):
             opt_id = id(optimizer)
             if opt_id in seen:
                 break
@@ -170,9 +171,10 @@ class TokenTrackingTrainer(Trainer):
                 break
             optimizer = inner
 
-        if isinstance(optimizer, MuonAdamW):
-            adamw_lr = optimizer.adamw.param_groups[0]["lr"]
-            muon_lr = optimizer.muon.param_groups[0]["lr"]
+        if isinstance(optimizer, (DionMuon, DionNorMuon)):
+            # param_groups[0] = muon, param_groups[1] = adamw
+            muon_lr = optimizer.param_groups[0]["lr"]
+            adamw_lr = optimizer.param_groups[1]["lr"]
             logs["learning_rate"] = adamw_lr
             logs["muon_lr"] = muon_lr
         logs["tokens_per_sec"] = self._last_tokens_per_sec

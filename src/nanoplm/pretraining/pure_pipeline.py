@@ -37,7 +37,8 @@ from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import PackingCollator, ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.optim import MuonAdamW
+from dion import Muon as DionMuon, NorMuon as DionNorMuon
+from nanoplm.pretraining.optim import build_optimizer
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
     ResumeConfig,
@@ -125,11 +126,7 @@ def _is_embedding_or_unembedding_param(name: str) -> bool:
     )
 
 
-def _build_muon_optimizer(
-    model: torch.nn.Module,
-    cfg: PretrainingConfig,
-    distributed_mesh=None,
-) -> MuonAdamW:
+def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig):
     raw_model = _unwrap_model(model)
 
     muon_params: list[torch.nn.Parameter] = []
@@ -166,7 +163,7 @@ def _build_muon_optimizer(
         f"adamw_params={len(adamw_params)} tensors"
     )
 
-    return MuonAdamW(
+    return build_optimizer(
         muon_params=muon_params,
         adamw_params=adamw_params,
         muon_learning_rate=cfg.muon_learning_rate,
@@ -857,9 +854,10 @@ def run_pure_pretraining(
             else:
                 optimizer.step()
 
-            if isinstance(optimizer, MuonAdamW):
-                learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                muon_lr = optimizer.muon.param_groups[0]["lr"]
+            if isinstance(optimizer, (DionMuon, DionNorMuon)):
+                # param_groups[0] = muon, param_groups[1] = adamw
+                muon_lr = optimizer.param_groups[0]["lr"]
+                learning_rate = optimizer.param_groups[1]["lr"]
             else:
                 learning_rate = optimizer.param_groups[0]["lr"]
                 muon_lr = None
