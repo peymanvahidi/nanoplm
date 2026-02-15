@@ -17,7 +17,8 @@ from transformers import (
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
+from dion import Muon as DionMuon, NorMuon as DionNorMuon
+from nanoplm.pretraining.optim import build_optimizer
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
@@ -26,6 +27,90 @@ from nanoplm.pretraining.utils import (
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
+
+
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def _is_embedding_or_unembedding_param(name: str) -> bool:
+    lname = name.lower()
+
+    # HF ModernBERT naming:
+    # - token embedding matrix: model.embeddings.tok_embeddings.weight
+    # - MLM output head: decoder.weight / decoder.bias
+    #   (decoder.weight is tied to token embeddings by default and may not appear
+    #   as a distinct named parameter).
+    if "embeddings.tok_embeddings" in lname:
+        return True
+    if lname.endswith("decoder.weight") or lname.endswith("decoder.bias"):
+        return True
+
+    # Fallbacks for other architectures.
+    return (
+        "embedding" in lname
+        or "lm_head" in lname
+        or "unembedding" in lname
+    )
+
+
+def _build_muon_optimizer(
+    model: torch.nn.Module,
+    pretrain_config: "PretrainingConfig",
+):
+    raw_model = _unwrap_model(model)
+
+    muon_params: list[torch.nn.Parameter] = []
+    adamw_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in seen:
+            continue
+        seen.add(id(param))
+
+        if param.ndim == 1:
+            adamw_params.append(param)
+            continue
+        if _is_embedding_or_unembedding_param(name):
+            adamw_params.append(param)
+            continue
+        if param.ndim == 2:
+            muon_params.append(param)
+            continue
+
+        # Muon is intended for hidden-layer matrices; route everything else to AdamW.
+        adamw_params.append(param)
+
+    if not muon_params:
+        raise ValueError(
+            "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
+        )
+
+    logger.info(
+        "Muon grouping: "
+        f"muon_params={len(muon_params)} tensors, "
+        f"adamw_params={len(adamw_params)} tensors"
+    )
+
+    return build_optimizer(
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+        muon_learning_rate=pretrain_config.muon_learning_rate,
+        muon_weight_decay=pretrain_config.muon_weight_decay,
+        muon_cautious_weight_decay=pretrain_config.muon_cautious_weight_decay,
+        muon_use_polar_express=pretrain_config.muon_use_polar_express,
+        muon_momentum=pretrain_config.muon_momentum,
+        muon_nesterov=pretrain_config.muon_nesterov,
+        muon_eps=pretrain_config.muon_eps,
+        use_normuon=str(pretrain_config.optimizer).lower() == "normuon",
+        adamw_learning_rate=pretrain_config.adam_learning_rate,
+        adamw_weight_decay=pretrain_config.adam_weight_decay,
+        adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
+        adamw_epsilon=pretrain_config.adam_epsilon,
+    )
 
 
 class TokenTrackingTrainer(Trainer):
@@ -78,9 +163,12 @@ class TokenTrackingTrainer(Trainer):
         return loss
 
     def log(self, logs, start_time=None, **kwargs):
+        if logs is None:
+            logs = {}
+
         optimizer = self.optimizer
         seen: set[int] = set()
-        while optimizer is not None and not is_muon_optimizer(optimizer):
+        while optimizer is not None and not isinstance(optimizer, (DionMuon, DionNorMuon)):
             opt_id = id(optimizer)
             if opt_id in seen:
                 break
@@ -90,11 +178,12 @@ class TokenTrackingTrainer(Trainer):
                 break
             optimizer = inner
 
-        if is_muon_optimizer(optimizer):
+        if isinstance(optimizer, (DionMuon, DionNorMuon)):
             # param_groups[0] = muon, param_groups[1] = adamw
             muon_lr = optimizer.param_groups[0]["lr"]
             adamw_lr = optimizer.param_groups[1]["lr"]
             logs["learning_rate"] = adamw_lr
+            logs["adamw_lr"] = adamw_lr
             logs["muon_lr"] = muon_lr
         logs["tokens_per_sec"] = self._last_tokens_per_sec
         logs["raw_tokens_per_sec"] = self._last_raw_tokens_per_sec
@@ -151,6 +240,16 @@ class PretrainingConfig:
     # Data loading
     num_workers: Union[int, str] = "auto"
     prefetch_factor: int = 2
+
+    # Sequence packing (packs multiple sequences per row to eliminate padding waste).
+    # Requires flash attention (varlen path).  Falls back to padding if disabled.
+    use_packing: bool = False
+    # When set, enables static-shape compilation (dynamic=False).
+    # The collator pre-flattens packed batches to a fixed size
+    # (target_packed_rows × max_seq_len) so torch.compile sees no shape
+    # changes.  Set to ceil(micro_batch_size × avg_len / max_seq_len) + margin.
+    # If unset (None), uses dynamic=True compilation.
+    target_packed_rows: Optional[int] = None
 
     # Distributed training
     multi_gpu: bool = False
@@ -280,7 +379,7 @@ def run_pretraining(
     elif optimizer_name == "stable_adamw":
         training_dict["optim"] = "stable_adamw"
     elif optimizer_name in {"muon", "normuon"}:
-        custom_optimizer = build_muon_optimizer(model, pretrain_config)
+        custom_optimizer = _build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
             f"Invalid optimizer: {pretrain_config.optimizer}. "

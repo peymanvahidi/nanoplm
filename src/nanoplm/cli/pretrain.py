@@ -224,6 +224,19 @@ def pretrain():
     help="DataLoader prefetch factor"
 )
 @click.option(
+    "--use-packing/--no-packing",
+    default=False,
+    help="Enable sequence packing to eliminate padding waste (requires flash attention)"
+)
+@click.option(
+    "--target-packed-rows",
+    type=int,
+    default=None,
+    help="Fixed row count for static-shape compilation (enables dynamic=False). "
+         "Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. "
+         "Omit to use dynamic=True."
+)
+@click.option(
     "--bf16/--no-bf16",
     default=True,
     help="Enable mixed precision training (bf16 if supported, fp16 fallback)"
@@ -356,6 +369,8 @@ def run(
     keep_probability: float,
     num_workers: Union[int, str],
     prefetch_factor: int,
+    use_packing: bool,
+    target_packed_rows: Optional[int],
     bf16: bool,
     tf32: bool,
     multi_gpu: bool,
@@ -410,6 +425,8 @@ def run(
         seed=seed,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
+        use_packing=use_packing,
+        target_packed_rows=target_packed_rows,
         bf16=bf16,
         tf32=tf32,
         multi_gpu=multi_gpu,
@@ -609,7 +626,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_epochs: 10\n"
         "  warmup_ratio: 0.05\n"
         "\n"
-        "  optimizer: \"adamw\"  # adamw, stable_adamw, muon, normuon\n"
+        "  optimizer: \"normuon\"  # adamw, stable_adamw, muon, normuon\n"
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
         "  adam_learning_rate: 1e-3\n"
         "  adam_weight_decay: 0.0\n"
@@ -617,8 +634,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
-        "  muon_learning_rate: 2e-2\n"
-        "  muon_weight_decay: 0.1\n"
+        "  muon_learning_rate: 1e-3\n"
+        "  muon_weight_decay: 0.01\n"
         "  muon_cautious_weight_decay: true\n"
         "  muon_use_polar_express: false\n"
         "  muon_momentum: 0.95\n"
@@ -629,12 +646,18 @@ def get_yaml(output: Optional[str], force: bool):
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
         "  keep_probability: 0.1\n"
-        "  logging_steps: 10\n"
-        "  eval_steps: 50\n"
-        "  save_steps: 100\n"
+        "  logging_steps: 1\n"
+        "  eval_steps: 250\n"
+        "  save_steps: 5000\n"
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
+        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
+        "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch\n"
+        "  use_packing: false\n"
+        "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
+        "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
+        "  target_packed_rows: null\n"
         "\n"
         "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
         "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
@@ -674,8 +697,40 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
         raise ValueError("Pretraining configuration is required but not found in YAML")
 
+    normalized_config = dict(config)
+    legacy_aliases = {
+        "learning_rate": "adam_learning_rate",
+        "weight_decay": "adam_weight_decay",
+    }
+    for legacy_key, canonical_key in legacy_aliases.items():
+        if legacy_key not in normalized_config:
+            continue
+
+        legacy_value = normalized_config.get(legacy_key)
+        canonical_value = normalized_config.get(canonical_key)
+
+        if canonical_value is not None and legacy_value is not None:
+            same_value = legacy_value == canonical_value
+            if not same_value:
+                try:
+                    same_value = float(legacy_value) == float(canonical_value)
+                except (TypeError, ValueError):
+                    same_value = False
+            if not same_value:
+                logger.warning(
+                    f"Both '{legacy_key}' and '{canonical_key}' are set with different values. "
+                    f"Using '{canonical_key}' and ignoring '{legacy_key}'."
+                )
+        elif canonical_value is None and legacy_value is not None:
+            normalized_config[canonical_key] = legacy_value
+            logger.warning(
+                f"Deprecated key '{legacy_key}' detected; please use '{canonical_key}' instead."
+            )
+
+        normalized_config.pop(legacy_key, None)
+
     expected_keys = set(PretrainingConfig.__annotations__.keys())
-    present_keys = set(config.keys())
+    present_keys = set(normalized_config.keys())
 
     extra = []
     kwargs: Dict[str, Any] = {}
@@ -688,7 +743,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         )
 
     # Required key
-    if 'dataset_dir' not in config or not config['dataset_dir']:
+    if 'dataset_dir' not in normalized_config or not normalized_config['dataset_dir']:
         raise ValueError("dataset_dir is required in pretraining configuration")
 
     # Classify provided keys in one pass
@@ -696,7 +751,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = config.get(key)
+        value = normalized_config.get(key)
         if value is not None:
             kwargs[key] = value
 
@@ -733,6 +788,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'muon_nesterov',
         'muon_cautious_weight_decay',
         'muon_use_polar_express',
+        'use_packing',
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
@@ -740,6 +796,13 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 continue
             elif isinstance(value, str):
                 kwargs[bool_key] = value.lower() == 'true'
+
+    # Handle optional int fields (may come as string from CLI overrides)
+    for int_key in ['target_packed_rows']:
+        if int_key in kwargs:
+            value = kwargs[int_key]
+            if isinstance(value, str):
+                kwargs[int_key] = int(value)
 
     return PretrainingConfig(**kwargs)
 

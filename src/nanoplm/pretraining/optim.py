@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import torch
 import torch.distributed as dist
 
 from nanoplm.utils.logger import logger
@@ -80,7 +79,6 @@ def build_muon_optimizer(
         adamw_epsilon=pretrain_config.adam_epsilon,
     )
 
-
 polar_express_coeffs = [
     (8.28721201814563, -23.595886519098837, 17.300387312530933),
     (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
@@ -96,6 +94,8 @@ polar_express_coeffs = [
     (a / 1.01, b / 1.01**3, c / 1.01**5) for (a, b, c) in polar_express_coeffs[:-1]
 ] + [polar_express_coeffs[-1]]
 
+
+import torch
 
 @torch.compile(dynamic=False, fullgraph=True)
 def _polar_express_paper(G: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor:
@@ -130,6 +130,7 @@ def build_optimizer(
     adamw_betas: tuple[float, float],
     adamw_epsilon: float,
     use_normuon: bool = False,
+    distributed_mesh=None,
 ):
     """Build a single Dion Muon/NorMuon optimizer that handles both muon and adamw param groups."""
     if not muon_params:
@@ -137,9 +138,9 @@ def build_optimizer(
     if not adamw_params:
         raise ValueError("Muon optimizer requires at least one AdamW parameter.")
 
-    distributed_mesh = None
-    if dist.is_available() and dist.is_initialized():
-        distributed_mesh = dist.group.WORLD
+    if distributed_mesh is None:
+        if dist.is_available() and dist.is_initialized():
+            distributed_mesh = dist.group.WORLD
 
     ns_func = _polar_express_paper if muon_use_polar_express else None
 
