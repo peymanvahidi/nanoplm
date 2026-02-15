@@ -46,6 +46,11 @@ dependencies = [
     "ipython>=8.3.0",
 ]
 
+[project.optional-dependencies]
+cuda = [
+    "dion @ git+https://github.com/microsoft/dion.git",
+]
+
 [project.scripts]
 nanoplm = "nanoplm.cli:cli"
 nanoplm-data = "nanoplm.cli.data:data"

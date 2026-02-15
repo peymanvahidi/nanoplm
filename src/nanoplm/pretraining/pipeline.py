@@ -1,5 +1,6 @@
 import os
 import time
+import shutil
 import torch
 import torch.distributed as dist
 import wandb
@@ -16,6 +17,7 @@ from transformers import (
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
+from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
@@ -76,6 +78,24 @@ class TokenTrackingTrainer(Trainer):
         return loss
 
     def log(self, logs, start_time=None, **kwargs):
+        optimizer = self.optimizer
+        seen: set[int] = set()
+        while optimizer is not None and not is_muon_optimizer(optimizer):
+            opt_id = id(optimizer)
+            if opt_id in seen:
+                break
+            seen.add(opt_id)
+            inner = getattr(optimizer, "optimizer", None)
+            if inner is None or inner is optimizer:
+                break
+            optimizer = inner
+
+        if is_muon_optimizer(optimizer):
+            # param_groups[0] = muon, param_groups[1] = adamw
+            muon_lr = optimizer.param_groups[0]["lr"]
+            adamw_lr = optimizer.param_groups[1]["lr"]
+            logs["learning_rate"] = adamw_lr
+            logs["muon_lr"] = muon_lr
         logs["tokens_per_sec"] = self._last_tokens_per_sec
         logs["raw_tokens_per_sec"] = self._last_raw_tokens_per_sec
         super().log(logs, start_time=start_time, **kwargs)
@@ -97,8 +117,17 @@ class PretrainingConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
-    learning_rate: float = 1e-3
-    weight_decay: float = 0.0
+    adam_learning_rate: float = 1e-3
+    adam_weight_decay: float = 0.0
+    # Muon-specific hyperparameters (used only when optimizer == "muon" or "normuon").
+    # adam_* fields are used for the AdamW sub-optimizer.
+    muon_learning_rate: float = 2e-2
+    muon_weight_decay: float = 0.1
+    muon_cautious_weight_decay: bool = True
+    muon_use_polar_express: bool = False
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_eps: float = 1e-7
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_size: int = 2 ** 20
@@ -218,8 +247,8 @@ def run_pretraining(
         "per_device_eval_batch_size": pretrain_config.micro_batch_size,
         "gradient_accumulation_steps": inferred_grad_accum_steps,
         "num_train_epochs": num_epochs,
-        "learning_rate": pretrain_config.learning_rate,
-        "weight_decay": pretrain_config.weight_decay,
+        "learning_rate": pretrain_config.adam_learning_rate,
+        "weight_decay": pretrain_config.adam_weight_decay,
         "warmup_ratio": pretrain_config.warmup_ratio,
         "logging_strategy": "steps",
         "logging_steps": logging_steps,
@@ -245,13 +274,17 @@ def run_pretraining(
 
     # Configure optimizer through TrainingArguments
     optimizer_name = pretrain_config.optimizer.lower()
+    custom_optimizer = None
     if optimizer_name == "adamw":
         training_dict["optim"] = "adamw_torch"
     elif optimizer_name == "stable_adamw":
         training_dict["optim"] = "stable_adamw"
+    elif optimizer_name in {"muon", "normuon"}:
+        custom_optimizer = build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
-            f"Invalid optimizer: {pretrain_config.optimizer}. Currently supported: [adamw, stable_adamw]"
+            f"Invalid optimizer: {pretrain_config.optimizer}. "
+            f"Currently supported: [adamw, stable_adamw, muon, normuon]"
         )
 
     if pretrain_config.multi_gpu:
@@ -267,6 +300,8 @@ def run_pretraining(
         train_dataset=train_ds,
         eval_dataset=val_ds,
         processing_class=tokenizer,
+        # When provided, custom optimizer/scheduler override TrainingArguments.optim.
+        optimizers=(custom_optimizer, None),
     )
 
     logger.info("Starting Trainer")

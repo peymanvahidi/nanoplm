@@ -26,6 +26,7 @@ from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
+from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
 from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
@@ -67,29 +68,32 @@ def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
 
 
 def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.optim.Optimizer:
+    name = str(cfg.optimizer).lower()
+    if name in {"muon", "normuon"}:
+        return build_muon_optimizer(model, cfg)
+
     raw_model = _unwrap_model(model)
     decay, no_decay = [], []
 
-    for name, param in raw_model.named_parameters():
+    for p_name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
-        if _use_weight_decay(name, param):
+        if _use_weight_decay(p_name, param):
             decay.append(param)
         else:
             no_decay.append(param)
 
     groups = [
-        {"params": decay, "weight_decay": float(cfg.weight_decay)},
+        {"params": decay, "weight_decay": float(cfg.adam_weight_decay)},
         {"params": no_decay, "weight_decay": 0.0},
     ]
     kwargs = {
         "params": groups,
-        "lr": float(cfg.learning_rate),
+        "lr": float(cfg.adam_learning_rate),
         "betas": (float(cfg.adam_beta1), float(cfg.adam_beta2)),
         "eps": float(cfg.adam_epsilon),
     }
 
-    name = str(cfg.optimizer).lower()
     if name == "adamw":
         return torch.optim.AdamW(**kwargs)
     if name == "stable_adamw":
@@ -99,7 +103,7 @@ def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.o
             return torch.optim.AdamW(**kwargs)
         return stable_adamw(**kwargs)
 
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw]")
+    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon]")
 
 
 def _create_scheduler(
@@ -551,7 +555,13 @@ def run_pure_pretraining(
             else:
                 optimizer.step()
 
-            learning_rate = optimizer.param_groups[0]["lr"]
+            if is_muon_optimizer(optimizer):
+                # param_groups[0] = muon, param_groups[1] = adamw
+                muon_lr = optimizer.param_groups[0]["lr"]
+                learning_rate = optimizer.param_groups[1]["lr"]
+            else:
+                learning_rate = optimizer.param_groups[0]["lr"]
+                muon_lr = None
             if not optimizer_step_skipped:
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
@@ -598,15 +608,18 @@ def run_pure_pretraining(
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/raw_tokens_per_sec": raw_tokens_per_sec,
                 }
+                if muon_lr is not None:
+                    payload["train/muon_lr"] = muon_lr
                 if wandb_enabled and wandb.run is not None:
                     try:
                         wandb.log(payload)
                     except Exception as exc:
                         wandb_enabled = False
                         logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
+                muon_lr_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
                 logger.info(
                     f"[step {global_step}/{total_steps}] "
-                    f"loss={loss_to_log:.4f} lr={learning_rate:.2e} "
+                    f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
                     f"grad_norm={grad_norm:.4f} tok/s={tokens_per_sec:,.0f} "
                     f"raw_tok/s={raw_tokens_per_sec:,.0f}"
                 )

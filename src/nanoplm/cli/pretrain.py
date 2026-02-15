@@ -5,6 +5,8 @@ nanoPLM CLI - Pretraining subcommands for MLM pretraining
 
 import click
 import random
+import math
+import os
 import numpy as np
 import torch
 from typing import Optional, Dict, Any, Union
@@ -20,6 +22,18 @@ from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, Prot
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
+
+def _check_muon_available(optimizer: str) -> None:
+    """Abort early when a Muon variant is requested but ``dion`` is not installed."""
+    if optimizer.lower() in {"muon", "normuon"}:
+        try:
+            import dion  # noqa: F401
+        except ImportError:
+            raise click.ClickException(
+                f"Optimizer '{optimizer}' requires the 'dion' package which is not installed.\n"
+                "Install it with:  pip install nanoplm[cuda]"
+            )
+
 
 @click.group(name="pretrain")
 @click.help_option(
@@ -63,22 +77,22 @@ def pretrain():
     help="Number of epochs"
 )
 @click.option(
-    "--learning-rate",
+    "--adam-learning-rate",
     type=float,
     default=1e-3,
-    help="Maximum Learning rate in the warmup"
+    help="AdamW learning rate (Muon uses --muon-learning-rate)"
 )
 @click.option(
-    "--weight-decay",
+    "--adam-weight-decay",
     type=float,
     default=0.0,
-    help="Weight decay"
+    help="AdamW weight decay (Muon uses --muon-weight-decay)"
 )
 @click.option(
-    "--warmup-ratio",
+    "--adam-warmup-ratio",
     type=float,
     default=0.05,
-    help="Warmup ratio"
+    help="AdamW warmup ratio"
 )
 @click.option(
     "--global-batch-size",
@@ -88,7 +102,7 @@ def pretrain():
 )
 @click.option(
     "--optimizer",
-    type=click.Choice(["adamw", "stable_adamw"], case_sensitive=False),
+    type=click.Choice(["adamw", "stable_adamw", "muon", "normuon"], case_sensitive=False),
     default="adamw",
     help="Optimizer to use"
 )
@@ -109,6 +123,45 @@ def pretrain():
     type=float,
     default=1e-8,
     help="Adam epsilon"
+)
+@click.option(
+    "--muon-learning-rate",
+    type=float,
+    default=2e-2,
+    help="Muon LR (used only when optimizer=muon or normuon; learning-rate remains AdamW LR)",
+)
+@click.option(
+    "--muon-weight-decay",
+    type=float,
+    default=0.1,
+    help="Muon weight decay (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-cautious-weight-decay/--no-muon-cautious-weight-decay",
+    default=True,
+    help="Enable cautious weight decay in Muon/NorMuon (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-use-polar-express/--no-muon-use-polar-express",
+    default=False,
+    help="Use Polar Express orthogonalization for Muon/NorMuon (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-momentum",
+    type=float,
+    default=0.95,
+    help="Muon momentum (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-nesterov/--no-muon-nesterov",
+    default=True,
+    help="Enable Nesterov in Muon (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muon-eps",
+    type=float,
+    default=1e-7,
+    help="Muon epsilon (used only when optimizer=muon or normuon)",
 )
 @click.option(
     "--mlm-probability",
@@ -278,14 +331,21 @@ def run(
     # training hp
     micro_batch_size: int,
     num_epochs: int,
-    learning_rate: float,
-    weight_decay: float,
+    adam_learning_rate: float,
+    adam_weight_decay: float,
     warmup_ratio: float,
     global_batch_size: int,
     optimizer: str,
     adam_beta1: float,
     adam_beta2: float,
     adam_epsilon: float,
+    muon_learning_rate: float,
+    muon_weight_decay: float,
+    muon_cautious_weight_decay: bool,
+    muon_use_polar_express: bool,
+    muon_momentum: float,
+    muon_nesterov: bool,
+    muon_eps: float,
     mlm_probability: float,
     logging_steps: int,
     eval_steps: int,
@@ -317,20 +377,29 @@ def run(
 ):
     """Run MLM pretraining with ModernBERT backbone."""
 
+    _check_muon_available(optimizer)
+
     # Build config from CLI arguments
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
         micro_batch_size=micro_batch_size,
         num_epochs=num_epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
+        adam_learning_rate=adam_learning_rate,
+        adam_weight_decay=adam_weight_decay,
         warmup_ratio=warmup_ratio,
         global_batch_size=global_batch_size,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
         adam_epsilon=adam_epsilon,
+        muon_learning_rate=muon_learning_rate,
+        muon_weight_decay=muon_weight_decay,
+        muon_cautious_weight_decay=muon_cautious_weight_decay,
+        muon_use_polar_express=muon_use_polar_express,
+        muon_momentum=muon_momentum,
+        muon_nesterov=muon_nesterov,
+        muon_eps=muon_eps,
         mlm_probability=mlm_probability,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
@@ -430,6 +499,7 @@ def from_yaml(config: str, pure_torch: bool):
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
+    _check_muon_available(pretrain_config.optimizer)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
 
@@ -537,14 +607,24 @@ def get_yaml(output: Optional[str], force: bool):
         "  micro_batch_size: 32\n"
         "  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
         "  num_epochs: 10\n"
+        "  warmup_ratio: 0.05\n"
         "\n"
-        "  optimizer: \"adamw\"  # adamw, stable_adamw\n"
+        "  optimizer: \"adamw\"  # adamw, stable_adamw, muon, normuon\n"
+        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
+        "  adam_learning_rate: 1e-3\n"
+        "  adam_weight_decay: 0.0\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-3  # Maximum learning rate in warmup phase\n"
-        "  warmup_ratio: 0.05\n"
-        "  weight_decay: 0.0\n"
+        "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
+        "  muon_learning_rate: 2e-2\n"
+        "  muon_weight_decay: 0.1\n"
+        "  muon_cautious_weight_decay: true\n"
+        "  muon_use_polar_express: false\n"
+        "  muon_momentum: 0.95\n"
+        "  muon_nesterov: true\n"
+        "  muon_eps: 1e-7\n"
+        "\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
@@ -625,15 +705,35 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             f"Unexpected training configuration keys: {', '.join(sorted(extra))}"
         )
 
-    # Explicitly convert learning_rate to float if it's a string (handles scientific notation)
-    if isinstance(kwargs.get('learning_rate'), str):
-        try:
-            kwargs['learning_rate'] = float(kwargs['learning_rate'])
-        except ValueError:
-            raise ValueError(f"Invalid learning_rate value: {kwargs['learning_rate']}. Must be a number.")
+    # Explicitly convert float-like fields if they are strings (handles scientific notation).
+    float_fields = [
+        "adam_learning_rate",
+        "adam_weight_decay",
+        "adam_beta1",
+        "adam_beta2",
+        "adam_epsilon",
+        "muon_learning_rate",
+        "muon_weight_decay",
+        "muon_momentum",
+        "muon_eps",
+        "warmup_ratio",
+    ]
+    for field in float_fields:
+        if isinstance(kwargs.get(field), str):
+            try:
+                kwargs[field] = float(kwargs[field])
+            except ValueError as exc:
+                raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
 
     # Handle boolean values
-    for bool_key in ['multi_gpu', 'bf16', 'tf32']:
+    for bool_key in [
+        'multi_gpu',
+        'bf16',
+        'tf32',
+        'muon_nesterov',
+        'muon_cautious_weight_decay',
+        'muon_use_polar_express',
+    ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):
