@@ -274,6 +274,13 @@ class ShardedDataset(Dataset):
             idx -= self.cum_lengths[shard_idx - 1]
         return shard_idx, idx
 
+    def get_all_sequence_lengths(self) -> np.ndarray:
+        """Return a flat int32 array of the length of every sequence in the dataset."""
+        all_lengths = []
+        for offsets in self._offsets:
+            all_lengths.append(np.diff(offsets).astype(np.int32))
+        return np.concatenate(all_lengths)
+
     def cleanup(self):
         """Release memmap objects (public API, kept for compatibility)."""
         if self._mmaps is not None:

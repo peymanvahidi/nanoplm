@@ -465,10 +465,11 @@ def run_pure_pretraining(
         raise
 
     use_packing = bool(pretrain_config.use_packing)
-    target_rows = pretrain_config.target_packed_rows
-    use_static_packing = use_packing and target_rows is not None
 
     if use_packing:
+        _pad_to = pretrain_config.micro_batch_size * manifest.max_seq_len
+        _min_seq_len = int(train_ds.get_all_sequence_lengths().min())
+        _max_batch_seqs = _pad_to // _min_seq_len + 1
         collator = PackingCollator(
             tokenizer=tokenizer,
             max_seq_len=manifest.max_seq_len,
@@ -476,17 +477,13 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
-            target_rows=target_rows,
-            batch_size=pretrain_config.micro_batch_size if target_rows else None,
+            pad_to=_pad_to,
+            max_batch_sequences=_max_batch_seqs,
         )
-        if use_static_packing:
-            logger.info(
-                f"Sequence packing ENABLED (static shapes, "
-                f"target_rows={target_rows}, "
-                f"flat_size={target_rows * manifest.max_seq_len:,})"
-            )
-        else:
-            logger.info("Sequence packing ENABLED (PackingCollator, dynamic shapes)")
+        logger.info(
+            f"Sequence packing ENABLED (static size F={_pad_to:,}, "
+            f"cu_len={collator.cu_len:,}, dynamic=False)"
+        )
     else:
         collator = ProtDataCollatorForLM(
             tokenizer=tokenizer,
@@ -603,25 +600,43 @@ def run_pure_pretraining(
                         list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i]))
                     )
 
-        train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
         eval_sampler = DistributedSampler(val_ds, shuffle=False)
         is_main = dist.get_rank() == 0
     else:
-        train_sampler = RandomSampler(train_ds)
         eval_sampler = SequentialSampler(val_ds)
         is_main = True
+
+    # Build train sampler / batch_sampler.
+    train_batch_sampler = None
+    train_sampler = None
+    if use_packing:
+        from nanoplm.pretraining.sampler import LengthBucketedBatchSampler
+
+        _max_tokens = pretrain_config.micro_batch_size * manifest.max_seq_len
+        train_batch_sampler = LengthBucketedBatchSampler(
+            dataset=train_ds,
+            batch_size=_max_batch_seqs,  # cap sequences to fit fixed cu_seqlens
+            max_tokens=_max_tokens,
+            mega_batch_multiplier=pretrain_config.mega_batch_multiplier,
+            shuffle=True,
+            seed=pretrain_config.seed,
+            drop_last=False,
+            num_replicas=effective_world_size if distributed else None,
+            rank=dist.get_rank() if distributed else None,
+        )
+    elif distributed:
+        train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
+    else:
+        train_sampler = RandomSampler(train_ds)
 
     # Compile model for faster training. Keep orig_model for checkpointing/eval
     # (eval inputs may change shape, which would cause recompilation).
     orig_model = model
-    if use_static_packing:
-        # Static shapes: collator pre-flattens and pads to fixed sizes,
-        # so no data-dependent ops inside the compiled graph.
+    if use_packing:
+        # Static shapes: collator pads to fixed sizes, enabling dynamic=False.
         model = torch.compile(model, dynamic=False)
         logger.info("Model compiled with torch.compile(dynamic=False)")
     else:
-        # dynamic=True because varlen flash-attention produces variable-length
-        # unpadded tensors per batch.
         model = torch.compile(model, dynamic=True)
         logger.info("Model compiled with torch.compile(dynamic=True)")
 
@@ -636,17 +651,28 @@ def run_pure_pretraining(
         keep_probability=pretrain_config.keep_probability,
     )
 
-    train_loader = DataLoader(
-        train_ds,
-        sampler=train_sampler,
-        batch_size=pretrain_config.micro_batch_size,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-        drop_last=use_static_packing,  # static shapes require fixed batch size
-    )
+    if train_batch_sampler is not None:
+        train_loader = DataLoader(
+            train_ds,
+            batch_sampler=train_batch_sampler,
+            collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            sampler=train_sampler,
+            batch_size=pretrain_config.micro_batch_size,
+            collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+            drop_last=False,
+        )
     eval_loader = DataLoader(
         val_ds,
         sampler=eval_sampler,
@@ -776,9 +802,11 @@ def run_pure_pretraining(
     token_t0: Optional[float] = None
     first_step_of_run = True
 
+    _epoch_setter = train_batch_sampler if train_batch_sampler is not None else train_sampler
+
     for epoch in range(start_epoch, num_epochs):
-        if hasattr(train_sampler, "set_epoch"):
-            train_sampler.set_epoch(epoch)
+        if _epoch_setter is not None and hasattr(_epoch_setter, "set_epoch"):
+            _epoch_setter.set_epoch(epoch)
 
         for micro_step, batch in enumerate(train_loader):
             if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
@@ -800,14 +828,16 @@ def run_pure_pretraining(
             if raw_token_count == 0:
                 token_t0 = time.perf_counter()
 
-            # Token counting: for the static path there is no attention_mask,
-            # so count real tokens from cu_seqlens[-1] and total from tensor size.
-            if "attention_mask" in batch:
+            # Token counting: use num_valid_tokens from collator when available
+            # (static packed path), otherwise derive from attention_mask.
+            if "num_valid_tokens" in batch:
+                token_count += int(batch["num_valid_tokens"])
+                raw_token_count += int(batch["input_ids"].numel())
+            elif "attention_mask" in batch:
                 token_count += int(batch["attention_mask"].sum().item())
                 raw_token_count += int(batch["attention_mask"].numel())
             else:
-                # Static packed path: cu_seqlens[-1] = total real tokens.
-                token_count += int(batch["cu_seqlens"][-1].item())
+                token_count += int(batch["input_ids"].numel())
                 raw_token_count += int(batch["input_ids"].numel())
 
             amp_ctx = (
@@ -916,6 +946,9 @@ def run_pure_pretraining(
                     "train/epoch": epoch + (micro_step + 1) / len(train_loader),
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/raw_tokens_per_sec": raw_tokens_per_sec,
+                    "train/step_real_tokens": int(tok),
+                    "train/step_raw_tokens": int(raw_tok),
+                    "train/packing_waste_pct": (1.0 - tok / max(raw_tok, 1)) * 100,
                 }
                 if muon_lr is not None:
                     payload["train/muon_lr"] = muon_lr
@@ -925,12 +958,14 @@ def run_pure_pretraining(
                     except Exception as exc:
                         wandb_enabled = False
                         logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
+                waste_pct = (1.0 - tok / max(raw_tok, 1)) * 100
                 muon_lr_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
                 logger.info(
                     f"[step {global_step}/{total_steps}] "
                     f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
                     f"grad_norm={grad_norm:.4f} tok/s={tokens_per_sec:,.0f} "
                     f"raw_tok/s={raw_tokens_per_sec:,.0f} "
+                    f"step_tokens={int(tok):,} waste={waste_pct:.1f}% "
                     f"h100_mfu={mfu:.2%}"
                 )
 

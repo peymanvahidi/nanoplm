@@ -5,12 +5,13 @@ from __future__ import annotations
 import math
 from typing import Optional
 
+from sympy import false
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch import attention as te_attention
-from transformer_engine.common.recipe import DelayedScaling, Format
+from transformer_engine.common.recipe import DelayedScaling, Format,NVFP4BlockScaling,Float8CurrentScaling,Float8BlockScaling
 
 from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertConfig,
@@ -19,13 +20,11 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 )
 
 USE_FP8 = True
-SWA_EVERY_N_LAYER = 3
+FULL_ATTN_EVERY_N_LAYER = 3
 
 # FP8 recipe: delayed scaling with HYBRID format (E4M3 forward, E5M2 backward).
 # amax_history_len=16 is a reasonable default for stability; increase for smoother scaling.
-FP8_RECIPE = DelayedScaling(
-    
-)
+FP8_RECIPE = Float8CurrentScaling()
 
 # TE requires window_size=(-1, -1) for full attention, not None.
 _FULL_ATTN_WINDOW: tuple[int, int] = (-1, -1)
@@ -50,10 +49,10 @@ class TEModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
 
-        if SWA_EVERY_N_LAYER == 0:
+        if FULL_ATTN_EVERY_N_LAYER == 0:
             self.is_full_attention = True
         else:
-            self.is_full_attention = layer_idx % SWA_EVERY_N_LAYER == 0
+            self.is_full_attention = layer_idx % FULL_ATTN_EVERY_N_LAYER == 0
 
         # TE requires (-1, -1) for full attention (not None).
         self.window_size: tuple[int, int] = (
@@ -200,12 +199,12 @@ class TEModernBertModel(nn.Module):
 class TEModernBertPredictionHead(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.dense = te.Linear(
+        self.dense = nn.Linear(
             config.hidden_size,
             config.hidden_size,
             bias=config.classifier_bias,
         )
-        self.norm = te.LayerNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps)
         self.act = _get_activation(config.classifier_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

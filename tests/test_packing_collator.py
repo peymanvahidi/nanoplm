@@ -58,21 +58,21 @@ class TestPackingStructure:
     """Verify that packing produces correct shapes and cu_seqlens."""
 
     def test_basic_packing(self, tokenizer, collator):
-        """Multiple short sequences should be packed into fewer rows."""
+        """Multiple short sequences should be packed into a flat 1-D tensor."""
         seqs = ["MKAL", "GVSA", "PQNF"]
         examples = _tokenize_list(tokenizer, seqs)
         batch = collator(examples)
 
         assert "input_ids" in batch
-        assert "attention_mask" in batch
         assert "labels" in batch
         assert "cu_seqlens" in batch
         assert "max_seqlen" in batch
+        assert "position_ids" in batch
 
-        R, W = batch["input_ids"].shape
-        assert W == 64, f"Row width should equal max_seq_len=64, got {W}"
-        # 3 tiny seqs (each ~5 tokens) easily fit in 1 row of width 64
-        assert R <= len(seqs), f"Expected packing into ≤{len(seqs)} rows, got {R}"
+        # Dynamic mode: flat 1-D output with no padding
+        assert batch["input_ids"].dim() == 1
+        total_input_tokens = sum(len(ex["input_ids"]) for ex in examples)
+        assert batch["input_ids"].shape[0] == total_input_tokens
 
     def test_cu_seqlens_consistency(self, tokenizer, collator):
         """cu_seqlens should have len = num_sequences + 1, and its last value
@@ -87,9 +87,9 @@ class TestPackingStructure:
             f"cu_seqlens should have {len(seqs)+1} entries, got {len(cu)}"
         )
 
-        total_real_tokens = int(batch["attention_mask"].sum().item())
+        total_real_tokens = batch["input_ids"].shape[0]
         assert cu[-1].item() == total_real_tokens, (
-            f"cu_seqlens[-1]={cu[-1].item()} != attention_mask sum={total_real_tokens}"
+            f"cu_seqlens[-1]={cu[-1].item()} != total tokens={total_real_tokens}"
         )
 
     def test_seq_lengths_match_cu_seqlens(self, tokenizer, collator):
@@ -122,24 +122,24 @@ class TestPackingStructure:
         assert batch["max_seqlen"] == longest
 
     def test_no_token_loss(self, tokenizer, collator):
-        """Total non-padding tokens should equal sum of all input sequence lengths."""
+        """Total tokens should equal sum of all input sequence lengths (no waste)."""
         seqs = ["MKAL", "GVSARLPQNFYMHWC", "PQ", "ACDEFG", "HIKLMNPQRSTVWY"]
         examples = _tokenize_list(tokenizer, seqs)
         batch = collator(examples)
 
         total_input_tokens = sum(len(ex["input_ids"]) for ex in examples)
-        total_packed_tokens = int(batch["attention_mask"].sum().item())
+        total_packed_tokens = batch["input_ids"].shape[0]
         assert total_packed_tokens == total_input_tokens, (
             f"Token count mismatch: input={total_input_tokens}, packed={total_packed_tokens}"
         )
 
     def test_single_sequence(self, tokenizer, collator):
-        """A single sequence should produce 1 row, cu_seqlens length 2."""
+        """A single sequence should produce cu_seqlens length 2."""
         seqs = ["MKALCLLLL"]
         examples = _tokenize_list(tokenizer, seqs)
         batch = collator(examples)
 
-        assert batch["input_ids"].shape[0] == 1
+        assert batch["input_ids"].dim() == 1
         assert len(batch["cu_seqlens"]) == 2
 
     def test_sequence_longer_than_max_seq_len(self, tokenizer):
@@ -150,19 +150,18 @@ class TestPackingStructure:
         examples = _tokenize_list(tokenizer, seqs)
         batch = col(examples)
 
-        assert batch["input_ids"].shape[1] == 10
-        total_tokens = int(batch["attention_mask"].sum().item())
+        total_tokens = batch["input_ids"].shape[0]
         assert total_tokens <= 10
 
-    def test_packing_reduces_rows(self, tokenizer):
-        """With 10 short sequences and max_seq_len=64, rows should be much fewer than 10."""
+    def test_packing_reduces_tokens(self, tokenizer):
+        """With 10 short sequences, flat output should have no padding waste."""
         col = PackingCollator(tokenizer=tokenizer, max_seq_len=64, mlm_probability=0.0)
-        seqs = ["MKAL"] * 10  # each ~5 tokens → ~50 tokens, fits in 1 row
+        seqs = ["MKAL"] * 10  # each ~5 tokens → ~50 tokens total
         examples = _tokenize_list(tokenizer, seqs)
         batch = col(examples)
 
-        R = batch["input_ids"].shape[0]
-        assert R < 10, f"Expected packing to reduce rows below 10, got {R}"
+        total_input = sum(len(ex["input_ids"]) for ex in examples)
+        assert batch["input_ids"].shape[0] == total_input, "Flat output should have zero waste"
         assert len(batch["cu_seqlens"]) == 11  # 10 sequences + 1
 
 
@@ -210,16 +209,14 @@ class TestPositionIds:
 class TestPackingMLM:
     """Verify MLM masking respects packing constraints."""
 
-    def test_padding_not_masked(self, tokenizer, masking_collator):
-        """Padding positions should never be masked (labels == -100)."""
+    def test_no_padding_in_flat_output(self, tokenizer, masking_collator):
+        """Flat output should contain no padding — only real tokens."""
         seqs = ["MKAL", "GV"]
         examples = _tokenize_list(tokenizer, seqs)
         batch = masking_collator(examples)
 
-        pad_mask = batch["attention_mask"] == 0
-        if pad_mask.any():
-            labels_at_pad = batch["labels"][pad_mask]
-            assert (labels_at_pad == -100).all(), "Padding positions should have label -100"
+        total_input = sum(len(ex["input_ids"]) for ex in examples)
+        assert batch["input_ids"].shape[0] == total_input, "Flat output should have no padding"
 
     def test_special_tokens_not_masked(self, tokenizer, masking_collator):
         """EOS tokens should never be corrupted."""
@@ -228,21 +225,15 @@ class TestPackingMLM:
         batch = masking_collator(examples)
 
         eos_id = tokenizer.eos_token_id
-        # In the original inputs, find where EOS was. After masking, labels
-        # at EOS positions should be -100 (not selected for prediction).
-        # The input_ids at EOS positions should remain EOS (not corrupted).
-        for row in range(batch["input_ids"].shape[0]):
-            attn = batch["attention_mask"][row].bool()
-            ids = batch["input_ids"][row][attn]
-            labels = batch["labels"][row][attn]
-            # EOS tokens in original would be at the same positions in packed rows
-            # The special_tokens_mask should have prevented masking them
-            eos_positions = ids == eos_id
-            if eos_positions.any():
-                # labels at EOS should be -100 (excluded from MLM)
-                assert (labels[eos_positions] == -100).all(), (
-                    "EOS positions should have label -100 (not selected for masking)"
-                )
+        ids = batch["input_ids"]
+        labels = batch["labels"]
+        # Flat output: all tokens are real, check EOS positions directly
+        eos_positions = ids == eos_id
+        if eos_positions.any():
+            # labels at EOS should be -100 (excluded from MLM)
+            assert (labels[eos_positions] == -100).all(), (
+                "EOS positions should have label -100 (not selected for masking)"
+            )
 
     def test_some_tokens_masked(self, tokenizer, masking_collator):
         """With mlm_probability=0.3, some non-special tokens should be masked."""
@@ -270,18 +261,17 @@ class TestPackingEdgeCases:
         batch = collator(examples)
 
         total_input = sum(len(ex["input_ids"]) for ex in examples)
-        total_packed = int(batch["attention_mask"].sum().item())
-        assert total_packed == total_input
+        assert batch["input_ids"].shape[0] == total_input
 
-    def test_empty_attention_mask_positions(self, tokenizer, collator):
-        """Trailing pad positions should be pad_token_id and attention_mask=0."""
-        seqs = ["MK"]  # very short — lots of trailing padding
+    def test_flat_output_no_padding(self, tokenizer, collator):
+        """Flat 1-D output should have no padding tokens."""
+        seqs = ["MK"]  # very short
         examples = _tokenize_list(tokenizer, seqs)
         batch = collator(examples)
 
-        pad_positions = batch["attention_mask"][0] == 0
-        if pad_positions.any():
-            assert (batch["input_ids"][0][pad_positions] == tokenizer.pad_token_id).all()
+        total_input = sum(len(ex["input_ids"]) for ex in examples)
+        assert batch["input_ids"].shape[0] == total_input
+        assert batch["input_ids"].dim() == 1
 
     def test_dtype_correctness(self, tokenizer, collator):
         """Check that output tensor dtypes are correct."""
@@ -290,9 +280,9 @@ class TestPackingEdgeCases:
         batch = collator(examples)
 
         assert batch["input_ids"].dtype == torch.long
-        assert batch["attention_mask"].dtype == torch.long
         assert batch["labels"].dtype == torch.long
         assert batch["cu_seqlens"].dtype == torch.int32
+        assert batch["position_ids"].dtype == torch.int32
         assert isinstance(batch["max_seqlen"], int)
 
 
@@ -321,22 +311,18 @@ class TestPackingIntegration:
         assert pos_ids.max().item() < batch["max_seqlen"]
 
     def test_packing_utilization(self, tokenizer):
-        """Packing should achieve much better utilization than padding."""
+        """Flat packing should achieve 100% utilization (zero waste)."""
         max_seq_len = 64
         col = PackingCollator(
             tokenizer=tokenizer, max_seq_len=max_seq_len, mlm_probability=0.0
         )
-        # 20 short sequences: without packing = 20 rows × 64 = 1280 slots
+        # 20 short sequences
         seqs = ["MKAL"] * 20
         examples = _tokenize_list(tokenizer, seqs)
         batch = col(examples)
 
-        total_tokens = int(batch["attention_mask"].sum().item())
-        total_slots = batch["input_ids"].numel()
-        utilization = total_tokens / total_slots
-
-        assert utilization > 0.5, (
-            f"Packing utilization should be > 50%, got {utilization:.1%}"
+        total_input = sum(len(ex["input_ids"]) for ex in examples)
+        total_output = batch["input_ids"].shape[0]
+        assert total_output == total_input, (
+            f"Flat output should have zero waste: input={total_input}, output={total_output}"
         )
-        # Without packing, utilization would be ~5/64 ≈ 8%
-        # With packing, should be much higher

@@ -270,14 +270,6 @@ def pretrain():
     help="Enable sequence packing to eliminate padding waste (requires flash attention)"
 )
 @click.option(
-    "--target-packed-rows",
-    type=int,
-    default=None,
-    help="Fixed row count for static-shape compilation (enables dynamic=False). "
-         "Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. "
-         "Omit to use dynamic=True."
-)
-@click.option(
     "--bf16/--no-bf16",
     default=True,
     help="Enable mixed precision training (bf16 if supported, fp16 fallback)"
@@ -417,7 +409,6 @@ def run(
     num_workers: Union[int, str],
     prefetch_factor: int,
     use_packing: bool,
-    target_packed_rows: Optional[int],
     bf16: bool,
     tf32: bool,
     multi_gpu: bool,
@@ -472,7 +463,6 @@ def run(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
-        target_packed_rows=target_packed_rows,
         bf16=bf16,
         tf32=tf32,
         multi_gpu=multi_gpu,
@@ -728,9 +718,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
         "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te\n"
         "  use_packing: false\n"
-        "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
-        "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
-        "  target_packed_rows: null\n"
         "\n"
         "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
         "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
@@ -840,13 +827,6 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 continue
             elif isinstance(value, str):
                 kwargs[bool_key] = value.lower() == 'true'
-
-    # Handle optional int fields (may come as string from CLI overrides)
-    for int_key in ['target_packed_rows']:
-        if int_key in kwargs:
-            value = kwargs[int_key]
-            if isinstance(value, str):
-                kwargs[int_key] = int(value)
 
     return PretrainingConfig(**kwargs)
 

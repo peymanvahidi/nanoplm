@@ -239,12 +239,9 @@ class PretrainingConfig:
     # Sequence packing (packs multiple sequences per row to eliminate padding waste).
     # Requires flash attention (varlen path).  Falls back to padding if disabled.
     use_packing: bool = False
-    # When set, enables static-shape compilation (dynamic=False).
-    # The collator pre-flattens packed batches to a fixed size
-    # (target_packed_rows × max_seq_len) so torch.compile sees no shape
-    # changes.  Set to ceil(micro_batch_size × avg_len / max_seq_len) + margin.
-    # If unset (None), uses dynamic=True compilation.
-    target_packed_rows: Optional[int] = None
+    # Length-bucketed batch sampling: groups similar-length sequences
+    # for tighter packing.  Higher values = better packing, less randomness.
+    mega_batch_multiplier: int = 100
 
     # Distributed training
     multi_gpu: bool = False

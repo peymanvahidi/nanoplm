@@ -150,40 +150,29 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
 class PackingCollator:
     """Sequence-packing MLM collator for varlen flash attention.
 
-    Packs multiple protein sequences into fixed-length rows to eliminate padding
-    waste. Each packed row contains several sequences back-to-back; the collator
-    emits ``cu_seqlens`` and ``max_seqlen`` so the model can pass them directly
-    to ``flash_attn_varlen_func`` without re-deriving sequence boundaries from
-    ``attention_mask``.
+    Packs multiple protein sequences into flat 1-D tensors to eliminate padding
+    waste. Each batch contains several sequences back-to-back; the collator
+    emits ``cu_seqlens``, ``position_ids``, and ``max_seqlen`` so the model can
+    pass them directly to ``flash_attn_varlen_func`` without re-deriving
+    sequence boundaries from ``attention_mask``.
 
     Algorithm (first-fit-decreasing):
         1. Sort incoming examples by length (descending).
         2. Greedily assign each sequence to the first row that has room.
         3. Apply MLM masking on the packed result.
+        4. Flatten to 1-D, stripping all padding.
 
-    **Static-shape mode** (``target_rows`` is set):
-
-    When ``target_rows`` is provided the collator produces *flat* 1-D tensors
-    padded to a fixed size ``F = target_rows × max_seq_len`` so that
-    ``torch.compile(model, dynamic=False)`` never sees shape changes.
-    Dynamic operations (``torch.nonzero``, position-id computation) are done
-    here in the collator — outside the compiled graph.
-
-    Static output dict:
-        ``input_ids``    – (F,)           flat token IDs (real then padding)
-        ``labels``       – (F,)           MLM targets (-100 for pad / unmasked)
-        ``position_ids`` – (F,)           per-token positions (reset per seq)
-        ``cu_seqlens``   – (CU_LEN,)      fixed-length cumulative seq lengths
-        ``max_seqlen``   – int            = max_seq_len (constant)
-
-    **Dynamic mode** (``target_rows`` is ``None``, default):
+    When ``pad_to`` is set, output tensors are padded to a fixed size
+    ``F = pad_to`` and ``cu_seqlens`` is padded to a fixed length, enabling
+    ``torch.compile(dynamic=False)``.
 
     Output dict:
-        ``input_ids``      – (num_rows, max_seq_len)
-        ``attention_mask`` – (num_rows, max_seq_len)
-        ``labels``         – (num_rows, max_seq_len)
-        ``cu_seqlens``     – (num_sequences + 1,)
-        ``max_seqlen``     – int
+        ``input_ids``        – (T,) or (F,)  flat token IDs
+        ``labels``           – (T,) or (F,)  MLM targets (-100 for pad/unmasked)
+        ``position_ids``     – (T,) or (F,)  per-token positions (reset per seq)
+        ``cu_seqlens``       – variable or fixed length
+        ``max_seqlen``       – int
+        ``num_valid_tokens`` – int    = T (total real tokens)
     """
 
     def __init__(
@@ -195,13 +184,27 @@ class PackingCollator:
         random_token_probability: float = 0.10,
         keep_probability: float = 0.10,
         *,
-        target_rows: Optional[int] = None,
-        batch_size: Optional[int] = None,
+        pad_to: Optional[int] = None,
+        max_batch_sequences: Optional[int] = None,
         extra_excluded_token_ids: Optional[Iterable[int]] = None,
     ):
         self.tokenizer = tokenizer
         self.max_seq_len = int(max_seq_len)
         self.mlm_probability = mlm_probability
+        self.pad_to = pad_to
+        if pad_to is not None:
+            self.F = pad_to
+            # Fixed cu_seqlens length: real seqs + 1 (leading 0) + padding seqs.
+            # Padding tokens (F - T) are split into chunks ≤ max_seq_len.
+            if max_batch_sequences is None:
+                raise ValueError(
+                    "max_batch_sequences must be provided when pad_to is set."
+                )
+            micro_batch_size = pad_to // max_seq_len
+            self.cu_len = max_batch_sequences + 1 + micro_batch_size
+        else:
+            self.F = None
+            self.cu_len = None
 
         # Normalise mask/random/keep proportions
         total = mask_token_probability + random_token_probability + keep_probability
@@ -213,22 +216,6 @@ class PackingCollator:
             raise ValueError("Tokenizer must define a mask_token_id for MLM.")
 
         self.pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
-
-        # Static-shape mode: pre-flatten and pad to fixed sizes so the compiled
-        # model graph has no data-dependent shapes.
-        self.target_rows = target_rows
-        if target_rows is not None:
-            self.F = target_rows * self.max_seq_len  # fixed flat length
-            # Fixed cu_seqlens length: N (= batch_size) real sequences + 1
-            # leading zero + up to target_rows padding sequences (each ≤ max_seq_len).
-            # We pad cu_seqlens to this fixed length with the final value (F).
-            if batch_size is None:
-                raise ValueError(
-                    "batch_size must be provided when target_rows is set "
-                    "(needed to fix cu_seqlens length)."
-                )
-            self.batch_size = batch_size
-            self.cu_len = batch_size + 1 + target_rows  # fixed cu_seqlens length
 
         # Build random-replacement pool (same logic as ProtDataCollatorForLM)
         vocab_ids = list(self.tokenizer.get_vocab().values())
@@ -392,52 +379,50 @@ class PackingCollator:
 
         input_ids_2d, labels_2d = self._apply_mlm(input_ids_2d, attention_mask_2d)
 
-        # ---- dynamic mode (default): return 2-D tensors ------------------
-        if self.target_rows is None:
-            return {
-                "input_ids": input_ids_2d,
-                "attention_mask": attention_mask_2d,
-                "labels": labels_2d,
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
-            }
-
-        # ---- static-shape mode: pre-flatten + pad to fixed sizes ---------
+        # Flatten to 1-D (zero waste): strip all padding from the 2-D packed
+        # rows and emit flat tensors with cu_seqlens + position_ids — the model
+        # takes the varlen flash-attention path directly.
         from nanoplm.pretraining.models.modern_bert.modeling import (
             _position_ids_from_cu_seqlens,
         )
 
-        # 1. Extract real tokens contiguously (outside compiled graph).
         real_mask = attention_mask_2d.flatten().bool()
-        flat_ids = input_ids_2d.flatten()[real_mask]       # (T,)
-        flat_labels = labels_2d.flatten()[real_mask]        # (T,)
-        T = flat_ids.shape[0]  # total real tokens
+        flat_ids = input_ids_2d.flatten()[real_mask]    # (T,)
+        flat_labels = labels_2d.flatten()[real_mask]     # (T,)
+        T = flat_ids.shape[0]
 
-        # 2. Position IDs for real tokens.
-        position_ids_real = _position_ids_from_cu_seqlens(
+        position_ids = _position_ids_from_cu_seqlens(
             cu_seqlens, T, cu_seqlens.device
         )
 
-        # 3. Pad to fixed size F.
+        if self.pad_to is None:
+            return {
+                "input_ids": flat_ids,          # (T,)
+                "labels": flat_labels,           # (T,)
+                "position_ids": position_ids,    # (T,)
+                "cu_seqlens": cu_seqlens,        # (num_seqs + 1,)
+                "max_seqlen": max_seqlen,        # int
+                "num_valid_tokens": T,           # real token count
+            }
+
+        # ---- static-size mode: pad to fixed F for dynamic=False compile ----
         F = self.F
+        W = self.max_seq_len
+
         padded_ids = torch.full((F,), self.pad_token_id, dtype=torch.long)
         padded_labels = torch.full((F,), -100, dtype=torch.long)
         padded_pos = torch.zeros(F, dtype=torch.int32)
         padded_ids[:T] = flat_ids
         padded_labels[:T] = flat_labels
-        padded_pos[:T] = position_ids_real
+        padded_pos[:T] = position_ids
 
-        # 4. Build fixed-length cu_seqlens.
-        #    - First N+1 entries: real sequence boundaries (N = len(examples))
-        #    - Then: padding "sequences" of ≤ max_seq_len each (so max_seqlen
-        #      stays ≤ max_seq_len and flash attention tiles optimally).
-        #    - Remaining slots filled with F (zero-length sequences).
-        W = self.max_seq_len
+        # Build fixed-length cu_seqlens: real entries, then padding "sequences"
+        # of ≤ max_seq_len each (so max_seqlen stays ≤ max_seq_len and flash
+        # attention tiles optimally), then fill remaining slots with F.
         padded_cu = torch.full((self.cu_len,), F, dtype=torch.int32)
-        N_real = len(cu_seqlens)  # N_seqs + 1
+        N_real = len(cu_seqlens)
         padded_cu[:N_real] = cu_seqlens
 
-        # Fill padding sequences: split (F - T) padding tokens into chunks ≤ W.
         pad_tokens = F - T
         pos = T
         idx = N_real
@@ -447,7 +432,6 @@ class PackingCollator:
             padded_cu[idx] = pos
             pad_tokens -= chunk
             idx += 1
-        # Remaining entries in padded_cu are already F (zero-length).
 
         return {
             "input_ids": padded_ids,        # (F,) fixed
@@ -455,4 +439,5 @@ class PackingCollator:
             "position_ids": padded_pos,      # (F,) fixed
             "cu_seqlens": padded_cu,         # (cu_len,) fixed
             "max_seqlen": W,                 # constant = max_seq_len
+            "num_valid_tokens": T,           # real token count
         }
