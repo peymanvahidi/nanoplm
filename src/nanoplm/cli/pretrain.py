@@ -18,8 +18,9 @@ from nanoplm.pretraining.pipeline import (
     run_pretraining,
 )
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
+from nanoplm.pretraining.te_pipeline import run_te_pretraining
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
-from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
+from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM, TEProtModernBertMLM
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
@@ -377,6 +378,12 @@ def pretrain():
     default=False,
     help="Use custom pure-torch model and training loop instead of HF Trainer",
 )
+@click.option(
+    "--pure-te",
+    is_flag=True,
+    default=False,
+    help="Use Transformer Engine model and training loop instead of HF Trainer",
+)
 def run(
     # dataset/output
     dataset_dir: str,
@@ -429,6 +436,7 @@ def run(
     attention_dropout: float,
     classifier_activation: str,
     pure_torch: bool,
+    pure_te: bool,
 ):
     """Run MLM pretraining with ModernBERT backbone."""
 
@@ -488,12 +496,17 @@ def run(
         classifier_activation=classifier_activation,
     )
 
-    if pure_torch:
+    if pure_torch and pure_te:
+        raise click.ClickException("--pure-torch and --pure-te are mutually exclusive.")
+
+    _set_seed_for_init(seed)
+    if pure_te:
+        logger.info("Using Transformer Engine model and training loop")
+        model = TEProtModernBertMLM(model_cfg)
+    elif pure_torch:
         logger.info("Using pure-torch model and training loop")
-        _set_seed_for_init(seed)
         model = PureProtModernBertMLM(model_cfg)
     else:
-        _set_seed_for_init(seed)
         model = ProtModernBertMLM(model_cfg)
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
@@ -501,7 +514,9 @@ def run(
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    if pure_torch:
+    if pure_te:
+        run_te_pretraining(model=model, pretrain_config=cfg)
+    elif pure_torch:
         run_pure_pretraining(model=model, pretrain_config=cfg)
     else:
         run_pretraining(model=model, pretrain_config=cfg)
@@ -523,7 +538,13 @@ def run(
     default=False,
     help="Use custom pure-torch model and training loop instead of HF Trainer",
 )
-def from_yaml(config: str, pure_torch: bool):
+@click.option(
+    "--pure-te",
+    is_flag=True,
+    default=False,
+    help="Use Transformer Engine model and training loop instead of HF Trainer",
+)
+def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     """Run pretraining from a YAML file with training and model parameters.
 
     Expected YAML structure:
@@ -553,6 +574,11 @@ def from_yaml(config: str, pure_torch: bool):
     # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
     if not pure_torch:
         pure_torch = bool(raw.get("pure_torch", False))
+    if not pure_te:
+        pure_te = bool(raw.get("pure_te", False))
+
+    if pure_torch and pure_te:
+        raise click.ClickException("pure_torch and pure_te cannot both be true.")
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
@@ -560,12 +586,14 @@ def from_yaml(config: str, pure_torch: bool):
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
 
-    if pure_torch:
+    _set_seed_for_init(pretrain_config.seed)
+    if pure_te:
+        logger.info("Using Transformer Engine model and training loop")
+        model = TEProtModernBertMLM(config=model_config)
+    elif pure_torch:
         logger.info("Using pure-torch model and training loop")
-        _set_seed_for_init(pretrain_config.seed)
         model = PureProtModernBertMLM(config=model_config)
     else:
-        _set_seed_for_init(pretrain_config.seed)
         model = ProtModernBertMLM(config=model_config)
 
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
@@ -573,7 +601,13 @@ def from_yaml(config: str, pure_torch: bool):
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    if pure_torch:
+    if pure_te:
+        run_te_pretraining(
+            model=model,
+            pretrain_config=pretrain_config,
+            resume_config=resume_config if resume_config.is_resume else None,
+        )
+    elif pure_torch:
         run_pure_pretraining(
             model=model,
             pretrain_config=pretrain_config,
@@ -692,7 +726,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
         "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
-        "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch\n"
+        "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te\n"
         "  use_packing: false\n"
         "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
         "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
@@ -723,6 +757,9 @@ def get_yaml(output: Optional[str], force: bool):
         "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
         "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
         "# pure_torch: false\n"
+        "# Set pure_te: true to use Transformer Engine model and training loop.\n"
+        "# CLI equivalent: --pure-te (mutually exclusive with pure_torch)\n"
+        "# pure_te: false\n"
     )
 
     # If forcing, remove existing file first

@@ -3,9 +3,11 @@ from nanoplm.pretraining.pipeline import (
     run_pretraining,
 )
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
+from nanoplm.pretraining.te_pipeline import run_te_pretraining
 
 __all__ = [
     "PretrainingConfig",
     "run_pretraining",
     "run_pure_pretraining",
+    "run_te_pretraining",
 ]
