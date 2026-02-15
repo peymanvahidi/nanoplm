@@ -21,16 +21,6 @@ from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBert
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
-
-def _set_seed_for_init(seed: int) -> None:
-    """Set seed before model creation so both pipelines start with identical weights."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 @click.group(name="pretrain")
 @click.help_option(
     "--help",
@@ -357,7 +347,7 @@ def run(
         world_size=world_size,
         project_name=project_name,
     )
-    
+
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -731,3 +721,11 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             )
 
     return ResumeConfig(**kwargs)
+
+def _set_seed_for_init(seed: int) -> None:
+    """Set seed before model creation so both pipelines start with identical weights."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)

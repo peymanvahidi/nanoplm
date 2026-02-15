@@ -26,13 +26,13 @@ from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.pipeline import (
-    PretrainingConfig,
-    ResumeConfig,
-    _get_num_workers,
-    _prepare_run_and_steps,
+from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig
+from nanoplm.pretraining.utils import (
+    compute_batch_setup,
+    get_num_workers,
+    prepare_run_and_steps,
 )
-from nanoplm.utils.common import create_dirs, get_device
+from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
 
 
@@ -125,15 +125,6 @@ def _get_warmup_steps(total_steps: int, warmup_value: float) -> int:
     if warmup_value >= 1:
         return int(warmup_value)
     return math.ceil(total_steps * warmup_value)
-
-
-def _resolve_world_size(cfg: PretrainingConfig) -> int:
-    if not cfg.multi_gpu:
-        return 1
-    if cfg.world_size == "auto":
-        env_world_size = os.environ.get("WORLD_SIZE")
-        return int(env_world_size) if env_world_size else max(torch.cuda.device_count(), 1)
-    return int(cfg.world_size) if cfg.world_size else 1
 
 
 def _dist_barrier(local_rank: int) -> None:
@@ -317,12 +308,12 @@ def run_pure_pretraining(
 
     create_dirs(pretrain_config.ckp_dir)
 
-    effective_world_size = _resolve_world_size(pretrain_config)
-    global_batch_size = (
-        pretrain_config.gradient_accumulation_steps
-        * pretrain_config.batch_size
-        * effective_world_size
-    )
+    effective_world_size = resolve_world_size(pretrain_config.multi_gpu, pretrain_config.world_size)
+
+    batch = compute_batch_setup(pretrain_config, manifest.max_seq_len, effective_world_size)
+
+    inferred_grad_accum_steps = batch.grad_accum_steps
+    global_batch_size_samples = batch.global_batch_size_samples
 
     (
         _run_name,
@@ -333,14 +324,14 @@ def run_pure_pretraining(
         eval_steps,
         save_steps,
         _resume_step,
-    ) = _prepare_run_and_steps(
+    ) = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
-        global_batch_size=global_batch_size,
+        global_batch_size_samples=global_batch_size_samples,
     )
 
-    num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
     pin_memory = device.type == "cuda"
     persistent_workers = num_workers > 0
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None
@@ -377,7 +368,7 @@ def run_pure_pretraining(
     train_loader = DataLoader(
         train_ds,
         sampler=train_sampler,
-        batch_size=pretrain_config.batch_size,
+        batch_size=pretrain_config.micro_batch_size,
         collate_fn=collator,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -388,7 +379,7 @@ def run_pure_pretraining(
     eval_loader = DataLoader(
         val_ds,
         sampler=eval_sampler,
-        batch_size=pretrain_config.batch_size,
+        batch_size=pretrain_config.micro_batch_size,
         collate_fn=collator,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -401,7 +392,7 @@ def run_pure_pretraining(
 
     steps_per_epoch = _num_update_steps_per_epoch(
         train_loader_len=len(train_loader),
-        grad_accum=pretrain_config.gradient_accumulation_steps,
+        grad_accum=inferred_grad_accum_steps,
     )
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = _get_warmup_steps(total_steps, float(pretrain_config.warmup_ratio))
@@ -424,7 +415,7 @@ def run_pure_pretraining(
     resume_epoch = start_epoch
     if resume_config and resume_config.is_resume:
         steps_done = max(0, start_step - start_epoch * steps_per_epoch)
-        resume_micro_step = steps_done * pretrain_config.gradient_accumulation_steps
+        resume_micro_step = steps_done * inferred_grad_accum_steps
         if resume_micro_step >= len(train_loader):
             resume_micro_step = 0
             start_epoch = min(start_epoch + 1, num_epochs)
@@ -484,7 +475,7 @@ def run_pure_pretraining(
     logger.info(
         "Starting pure-torch training: "
         f"epochs={num_epochs}, total_steps={total_steps}, warmup_steps={warmup_steps}, "
-        f"grad_accum={pretrain_config.gradient_accumulation_steps}"
+        f"grad_accum={inferred_grad_accum_steps}"
     )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
@@ -531,7 +522,7 @@ def run_pure_pretraining(
                 )
 
             loss = out["loss"] if isinstance(out, dict) else out.loss
-            loss = loss / pretrain_config.gradient_accumulation_steps
+            loss = loss / inferred_grad_accum_steps
 
             if scaler is not None and scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -540,7 +531,7 @@ def run_pure_pretraining(
 
             accum_loss += loss.item()
 
-            grad_accum = pretrain_config.gradient_accumulation_steps
+            grad_accum = inferred_grad_accum_steps
             is_boundary = (micro_step + 1) % grad_accum == 0
             is_last_micro = micro_step + 1 == len(train_loader)
 
