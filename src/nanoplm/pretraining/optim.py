@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import torch
 import torch.distributed as dist
 
+from nanoplm.utils.logger import logger
 
 def is_muon_optimizer(optimizer) -> bool:
     """Return True if *optimizer* is a Dion Muon or NorMuon instance."""
@@ -13,6 +15,70 @@ def is_muon_optimizer(optimizer) -> bool:
         return isinstance(optimizer, (DionMuon, DionNorMuon))
     except ImportError:
         return False
+
+def build_muon_optimizer(
+    model: torch.nn.Module,
+    pretrain_config,
+):
+    """Partition model params into Muon (2D) and AdamW (1D/embedding) groups
+    and build a Dion Muon/NorMuon optimizer.
+
+    ``pretrain_config`` is expected to carry the standard Muon/AdamW hyper-
+    parameter attributes (duck-typed so both pipeline flavours can call this).
+    """
+    raw_model = model.module if hasattr(model, "module") else model
+
+    muon_params: list[torch.nn.Parameter] = []
+    adamw_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in seen:
+            continue
+        seen.add(id(param))
+
+        if param.ndim == 1:
+            adamw_params.append(param)
+            continue
+        if _is_embedding_or_unembedding_param(name):
+            adamw_params.append(param)
+            continue
+        if param.ndim == 2:
+            muon_params.append(param)
+            continue
+
+        # Muon is intended for hidden-layer matrices; route everything else to AdamW.
+        adamw_params.append(param)
+
+    if not muon_params:
+        raise ValueError(
+            "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
+        )
+
+    logger.info(
+        "Muon grouping: "
+        f"muon_params={len(muon_params)} tensors, "
+        f"adamw_params={len(adamw_params)} tensors"
+    )
+
+    return build_optimizer(
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+        muon_learning_rate=pretrain_config.muon_learning_rate,
+        muon_weight_decay=pretrain_config.muon_weight_decay,
+        muon_cautious_weight_decay=pretrain_config.muon_cautious_weight_decay,
+        muon_use_polar_express=pretrain_config.muon_use_polar_express,
+        muon_momentum=pretrain_config.muon_momentum,
+        muon_nesterov=pretrain_config.muon_nesterov,
+        muon_eps=pretrain_config.muon_eps,
+        use_normuon=str(pretrain_config.optimizer).lower() == "normuon",
+        adamw_learning_rate=pretrain_config.adam_learning_rate,
+        adamw_weight_decay=pretrain_config.adam_weight_decay,
+        adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
+        adamw_epsilon=pretrain_config.adam_epsilon,
+    )
 
 
 polar_express_coeffs = [
@@ -30,8 +96,6 @@ polar_express_coeffs = [
     (a / 1.01, b / 1.01**3, c / 1.01**5) for (a, b, c) in polar_express_coeffs[:-1]
 ] + [polar_express_coeffs[-1]]
 
-
-import torch
 
 @torch.compile(dynamic=False, fullgraph=True)
 def _polar_express_paper(G: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor:
@@ -114,3 +178,24 @@ def build_optimizer(
         kwargs["adjust_lr"] = None
 
     return Cls(param_groups, **kwargs)
+
+
+def _is_embedding_or_unembedding_param(name: str) -> bool:
+    lname = name.lower()
+
+    # HF ModernBERT naming:
+    # - token embedding matrix: model.embeddings.tok_embeddings.weight
+    # - MLM output head: decoder.weight / decoder.bias
+    #   (decoder.weight is tied to token embeddings by default and may not appear
+    #   as a distinct named parameter).
+    if "embeddings.tok_embeddings" in lname:
+        return True
+    if lname.endswith("decoder.weight") or lname.endswith("decoder.bias"):
+        return True
+
+    # Fallbacks for other architectures.
+    return (
+        "embedding" in lname
+        or "lm_head" in lname
+        or "unembedding" in lname
+    )

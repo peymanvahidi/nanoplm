@@ -26,7 +26,7 @@ from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.optim import build_optimizer, is_muon_optimizer
+from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
 from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
@@ -67,78 +67,10 @@ def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
     return True
 
 
-def _is_embedding_or_unembedding_param(name: str) -> bool:
-    lname = name.lower()
-    if "embeddings.tok_embeddings" in lname:
-        return True
-    if lname.endswith("decoder.weight") or lname.endswith("decoder.bias"):
-        return True
-    return (
-        "embedding" in lname
-        or "lm_head" in lname
-        or "unembedding" in lname
-    )
-
-
-def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig):
-    raw_model = _unwrap_model(model)
-
-    muon_params: list[torch.nn.Parameter] = []
-    adamw_params: list[torch.nn.Parameter] = []
-    seen: set[int] = set()
-
-    for name, param in raw_model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if id(param) in seen:
-            continue
-        seen.add(id(param))
-
-        # Muon is for hidden-layer matrices only.
-        if param.ndim == 1:
-            adamw_params.append(param)
-            continue
-        if _is_embedding_or_unembedding_param(name):
-            adamw_params.append(param)
-            continue
-        if param.ndim == 2:
-            muon_params.append(param)
-            continue
-        adamw_params.append(param)
-
-    if not muon_params:
-        raise ValueError(
-            "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
-        )
-
-    logger.info(
-        "Muon grouping: "
-        f"muon_params={len(muon_params)} tensors, "
-        f"adamw_params={len(adamw_params)} tensors"
-    )
-
-    return build_optimizer(
-        muon_params=muon_params,
-        adamw_params=adamw_params,
-        muon_learning_rate=cfg.muon_learning_rate,
-        muon_weight_decay=cfg.muon_weight_decay,
-        muon_cautious_weight_decay=cfg.muon_cautious_weight_decay,
-        muon_use_polar_express=cfg.muon_use_polar_express,
-        muon_momentum=cfg.muon_momentum,
-        muon_nesterov=cfg.muon_nesterov,
-        muon_eps=cfg.muon_eps,
-        use_normuon=str(cfg.optimizer).lower() == "normuon",
-        adamw_learning_rate=cfg.adam_learning_rate,
-        adamw_weight_decay=cfg.adam_weight_decay,
-        adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
-        adamw_epsilon=cfg.adam_epsilon,
-    )
-
-
 def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.optim.Optimizer:
     name = str(cfg.optimizer).lower()
     if name in {"muon", "normuon"}:
-        return _build_muon_optimizer(model, cfg)
+        return build_muon_optimizer(model, cfg)
 
     raw_model = _unwrap_model(model)
     decay, no_decay = [], []
