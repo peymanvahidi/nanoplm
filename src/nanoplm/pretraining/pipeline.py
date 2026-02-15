@@ -26,7 +26,7 @@ from nanoplm.pretraining.utils import (
 )
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
-from nanoplm.utils.common import get_device, create_dirs
+from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -379,7 +379,7 @@ def run_pretraining(
     elif optimizer_name == "stable_adamw":
         training_dict["optim"] = "stable_adamw"
     elif optimizer_name in {"muon", "normuon"}:
-        custom_optimizer = build_muon_optimizer(model, pretrain_config)
+        custom_optimizer = _build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
             f"Invalid optimizer: {pretrain_config.optimizer}. "
