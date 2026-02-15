@@ -58,6 +58,7 @@ def build_optimizer(
     adamw_betas: tuple[float, float],
     adamw_epsilon: float,
     use_normuon: bool = False,
+    distributed_mesh=None,
 ):
     """Build a single Dion Muon/NorMuon optimizer that handles both muon and adamw param groups."""
     if not muon_params:
@@ -65,9 +66,9 @@ def build_optimizer(
     if not adamw_params:
         raise ValueError("Muon optimizer requires at least one AdamW parameter.")
 
-    distributed_mesh = None
-    if dist.is_available() and dist.is_initialized():
-        distributed_mesh = dist.group.WORLD
+    if distributed_mesh is None:
+        if dist.is_available() and dist.is_initialized():
+            distributed_mesh = dist.group.WORLD
 
     ns_func = _polar_express_paper if muon_use_polar_express else None
 

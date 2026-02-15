@@ -126,7 +126,11 @@ def _is_embedding_or_unembedding_param(name: str) -> bool:
     )
 
 
-def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig):
+def _build_muon_optimizer(
+    model: torch.nn.Module,
+    cfg: PretrainingConfig,
+    distributed_mesh=None,
+):
     raw_model = _unwrap_model(model)
 
     muon_params: list[torch.nn.Parameter] = []
