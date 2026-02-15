@@ -26,8 +26,7 @@ from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from dion import Muon as DionMuon, NorMuon as DionNorMuon
-from nanoplm.pretraining.optim import build_optimizer
+from nanoplm.pretraining.optim import build_optimizer, is_muon_optimizer
 from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
@@ -129,8 +128,8 @@ def _build_muon_optimizer(model: torch.nn.Module, cfg: PretrainingConfig):
         muon_nesterov=cfg.muon_nesterov,
         muon_eps=cfg.muon_eps,
         use_normuon=str(cfg.optimizer).lower() == "normuon",
-        adamw_learning_rate=cfg.learning_rate,
-        adamw_weight_decay=cfg.weight_decay,
+        adamw_learning_rate=cfg.adam_learning_rate,
+        adamw_weight_decay=cfg.adam_weight_decay,
         adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
         adamw_epsilon=cfg.adam_epsilon,
     )
@@ -153,12 +152,12 @@ def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.o
             no_decay.append(param)
 
     groups = [
-        {"params": decay, "weight_decay": float(cfg.weight_decay)},
+        {"params": decay, "weight_decay": float(cfg.adam_weight_decay)},
         {"params": no_decay, "weight_decay": 0.0},
     ]
     kwargs = {
         "params": groups,
-        "lr": float(cfg.learning_rate),
+        "lr": float(cfg.adam_learning_rate),
         "betas": (float(cfg.adam_beta1), float(cfg.adam_beta2)),
         "eps": float(cfg.adam_epsilon),
     }
@@ -624,7 +623,7 @@ def run_pure_pretraining(
             else:
                 optimizer.step()
 
-            if isinstance(optimizer, (DionMuon, DionNorMuon)):
+            if is_muon_optimizer(optimizer):
                 # param_groups[0] = muon, param_groups[1] = adamw
                 muon_lr = optimizer.param_groups[0]["lr"]
                 learning_rate = optimizer.param_groups[1]["lr"]

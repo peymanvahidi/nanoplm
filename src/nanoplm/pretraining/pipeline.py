@@ -17,8 +17,7 @@ from transformers import (
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from dion import Muon as DionMuon, NorMuon as DionNorMuon
-from nanoplm.pretraining.optim import build_optimizer
+from nanoplm.pretraining.optim import build_optimizer, is_muon_optimizer
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
@@ -106,8 +105,8 @@ def _build_muon_optimizer(
         muon_nesterov=pretrain_config.muon_nesterov,
         muon_eps=pretrain_config.muon_eps,
         use_normuon=str(pretrain_config.optimizer).lower() == "normuon",
-        adamw_learning_rate=pretrain_config.learning_rate,
-        adamw_weight_decay=pretrain_config.weight_decay,
+        adamw_learning_rate=pretrain_config.adam_learning_rate,
+        adamw_weight_decay=pretrain_config.adam_weight_decay,
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
         adamw_epsilon=pretrain_config.adam_epsilon,
     )
@@ -165,7 +164,7 @@ class TokenTrackingTrainer(Trainer):
     def log(self, logs, start_time=None, **kwargs):
         optimizer = self.optimizer
         seen: set[int] = set()
-        while optimizer is not None and not isinstance(optimizer, (DionMuon, DionNorMuon)):
+        while optimizer is not None and not is_muon_optimizer(optimizer):
             opt_id = id(optimizer)
             if opt_id in seen:
                 break
@@ -175,7 +174,7 @@ class TokenTrackingTrainer(Trainer):
                 break
             optimizer = inner
 
-        if isinstance(optimizer, (DionMuon, DionNorMuon)):
+        if is_muon_optimizer(optimizer):
             # param_groups[0] = muon, param_groups[1] = adamw
             muon_lr = optimizer.param_groups[0]["lr"]
             adamw_lr = optimizer.param_groups[1]["lr"]
@@ -202,10 +201,10 @@ class PretrainingConfig:
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
-    learning_rate: float = 1e-3
-    weight_decay: float = 0.0
+    adam_learning_rate: float = 1e-3
+    adam_weight_decay: float = 0.0
     # Muon-specific hyperparameters (used only when optimizer == "muon" or "normuon").
-    # Plain learning_rate/weight_decay/adam_* are used for the AdamW sub-optimizer.
+    # adam_* fields are used for the AdamW sub-optimizer.
     muon_learning_rate: float = 2e-2
     muon_weight_decay: float = 0.1
     muon_cautious_weight_decay: bool = True
@@ -216,9 +215,6 @@ class PretrainingConfig:
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_size: int = 2 ** 20
-    inferred_grad_accum_steps: Optional[int] = None
-    global_batch_size_samples: Optional[int] = None
-    achieved_global_batch_tokens: Optional[int] = None
 
     # Mixed precision
     bf16: bool = True
@@ -335,8 +331,8 @@ def run_pretraining(
         "per_device_eval_batch_size": pretrain_config.micro_batch_size,
         "gradient_accumulation_steps": inferred_grad_accum_steps,
         "num_train_epochs": num_epochs,
-        "learning_rate": pretrain_config.learning_rate,
-        "weight_decay": pretrain_config.weight_decay,
+        "learning_rate": pretrain_config.adam_learning_rate,
+        "weight_decay": pretrain_config.adam_weight_decay,
         "warmup_ratio": pretrain_config.warmup_ratio,
         "logging_strategy": "steps",
         "logging_steps": logging_steps,

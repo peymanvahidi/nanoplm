@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 import torch.distributed as dist
-from dion import Muon as DionMuon
-from dion import NorMuon as DionNorMuon
+
+
+def is_muon_optimizer(optimizer) -> bool:
+    """Return True if *optimizer* is a Dion Muon or NorMuon instance."""
+    try:
+        from dion import Muon as DionMuon
+        from dion import NorMuon as DionNorMuon
+        return isinstance(optimizer, (DionMuon, DionNorMuon))
+    except ImportError:
+        return False
 
 
 polar_express_coeffs = [
@@ -83,6 +91,9 @@ def build_optimizer(
             epsilon=float(adamw_epsilon),
         ),
     ]
+
+    from dion import Muon as DionMuon
+    from dion import NorMuon as DionNorMuon
 
     Cls = DionNorMuon if use_normuon else DionMuon
     kwargs = dict(
