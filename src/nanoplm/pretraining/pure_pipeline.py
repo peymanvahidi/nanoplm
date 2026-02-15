@@ -87,6 +87,9 @@ def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
 # H100 SXM peak BF16 tensor-core throughput (TFLOPS).
 H100_PEAK_TFLOPS = 989.4
 
+# https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
+N_PREFETCH_LAYERS_FSDP2 = 2
+
 
 def _estimate_model_flops_per_token(
     num_layers: int,
@@ -584,6 +587,21 @@ def run_pure_pretraining(
             fully_shard(layer, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
         fully_shard(model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
 
+        # FSDP2 Explicit Prefetching
+        if N_PREFETCH_LAYERS_FSDP2 > 1:
+            layers = model.model.layers
+            for i, layer in enumerate(layers):
+                # Forward prefetch next layers
+                if i + 1 < len(layers):
+                    layer.set_modules_to_forward_prefetch(
+                        layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2]
+                    )
+                # Backward prefetch previous layers
+                if i - 1 >= 0:
+                    layer.set_modules_to_backward_prefetch(
+                        list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i]))
+                    )
+
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
         eval_sampler = DistributedSampler(val_ds, shuffle=False)
         is_main = dist.get_rank() == 0
@@ -763,6 +781,9 @@ def run_pure_pretraining(
         for micro_step, batch in enumerate(train_loader):
             if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                 continue
+
+            if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
+                model.unshard()
 
             batch = _move_batch_to_device(batch, device)
 
