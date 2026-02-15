@@ -24,57 +24,6 @@ from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
-
-def _set_seed_for_init(seed: int) -> None:
-    """Set seed before model creation so both pipelines start with identical weights."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _resolve_effective_world_size(cfg: PretrainingConfig) -> int:
-    if not cfg.multi_gpu:
-        return 1
-    if cfg.world_size == "auto":
-        env_ws = os.environ.get("WORLD_SIZE")
-        return int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
-    return int(cfg.world_size) if cfg.world_size else 1
-
-
-def _populate_batch_setup(cfg: PretrainingConfig) -> None:
-    dataset_dir = Path(cfg.dataset_dir)
-    validation_result = validate_pretrain_dataset(dataset_dir)
-    manifest = validation_result["manifest"]
-
-    effective_world_size = _resolve_effective_world_size(cfg)
-    if cfg.global_batch_size <= 0:
-        raise ValueError(f"global_batch_size must be > 0, got {cfg.global_batch_size}")
-
-    world_tokens_per_micro_step = (
-        cfg.micro_batch_size * manifest.max_seq_len * effective_world_size
-    )
-    if world_tokens_per_micro_step <= 0:
-        raise ValueError(
-            f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check micro_batch_size, max_seq_len, and world_size."
-        )
-
-    inferred_grad_accum_steps = max(
-        1,
-        math.ceil(cfg.global_batch_size / world_tokens_per_micro_step),
-    )
-    achieved_global_batch_tokens = inferred_grad_accum_steps * world_tokens_per_micro_step
-    global_batch_size_samples = (
-        inferred_grad_accum_steps * cfg.micro_batch_size * effective_world_size
-    )
-
-    cfg.inferred_grad_accum_steps = inferred_grad_accum_steps
-    cfg.global_batch_size_samples = global_batch_size_samples
-    cfg.achieved_global_batch_tokens = achieved_global_batch_tokens
-
-
 @click.group(name="pretrain")
 @click.help_option(
     "--help",
@@ -454,9 +403,7 @@ def run(
         world_size=world_size,
         project_name=project_name,
     )
-    
-    _populate_batch_setup(cfg)
-    
+
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -860,3 +807,11 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             )
 
     return ResumeConfig(**kwargs)
+
+def _set_seed_for_init(seed: int) -> None:
+    """Set seed before model creation so both pipelines start with identical weights."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
