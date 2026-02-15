@@ -633,9 +633,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
-        "  warmup_ratio: 0.05\n"
-        "  weight_decay: 0.0\n"
         "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
@@ -700,8 +697,40 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
         raise ValueError("Pretraining configuration is required but not found in YAML")
 
+    normalized_config = dict(config)
+    legacy_aliases = {
+        "learning_rate": "adam_learning_rate",
+        "weight_decay": "adam_weight_decay",
+    }
+    for legacy_key, canonical_key in legacy_aliases.items():
+        if legacy_key not in normalized_config:
+            continue
+
+        legacy_value = normalized_config.get(legacy_key)
+        canonical_value = normalized_config.get(canonical_key)
+
+        if canonical_value is not None and legacy_value is not None:
+            same_value = legacy_value == canonical_value
+            if not same_value:
+                try:
+                    same_value = float(legacy_value) == float(canonical_value)
+                except (TypeError, ValueError):
+                    same_value = False
+            if not same_value:
+                logger.warning(
+                    f"Both '{legacy_key}' and '{canonical_key}' are set with different values. "
+                    f"Using '{canonical_key}' and ignoring '{legacy_key}'."
+                )
+        elif canonical_value is None and legacy_value is not None:
+            normalized_config[canonical_key] = legacy_value
+            logger.warning(
+                f"Deprecated key '{legacy_key}' detected; please use '{canonical_key}' instead."
+            )
+
+        normalized_config.pop(legacy_key, None)
+
     expected_keys = set(PretrainingConfig.__annotations__.keys())
-    present_keys = set(config.keys())
+    present_keys = set(normalized_config.keys())
 
     extra = []
     kwargs: Dict[str, Any] = {}
@@ -714,7 +743,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         )
 
     # Required key
-    if 'dataset_dir' not in config or not config['dataset_dir']:
+    if 'dataset_dir' not in normalized_config or not normalized_config['dataset_dir']:
         raise ValueError("dataset_dir is required in pretraining configuration")
 
     # Classify provided keys in one pass
@@ -722,7 +751,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = config.get(key)
+        value = normalized_config.get(key)
         if value is not None:
             kwargs[key] = value
 

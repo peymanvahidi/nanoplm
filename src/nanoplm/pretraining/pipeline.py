@@ -19,6 +19,11 @@ from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from dion import Muon as DionMuon, NorMuon as DionNorMuon
 from nanoplm.pretraining.optim import build_optimizer
+from nanoplm.pretraining.utils import (
+    compute_batch_setup,
+    get_num_workers,
+    prepare_run_and_steps,
+)
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
@@ -101,8 +106,8 @@ def _build_muon_optimizer(
         muon_nesterov=pretrain_config.muon_nesterov,
         muon_eps=pretrain_config.muon_eps,
         use_normuon=str(pretrain_config.optimizer).lower() == "normuon",
-        adamw_learning_rate=pretrain_config.learning_rate,
-        adamw_weight_decay=pretrain_config.weight_decay,
+        adamw_learning_rate=pretrain_config.adam_learning_rate,
+        adamw_weight_decay=pretrain_config.adam_weight_decay,
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
         adamw_epsilon=pretrain_config.adam_epsilon,
     )
@@ -158,6 +163,9 @@ class TokenTrackingTrainer(Trainer):
         return loss
 
     def log(self, logs, start_time=None, **kwargs):
+        if logs is None:
+            logs = {}
+
         optimizer = self.optimizer
         seen: set[int] = set()
         while optimizer is not None and not isinstance(optimizer, (DionMuon, DionNorMuon)):
@@ -175,6 +183,7 @@ class TokenTrackingTrainer(Trainer):
             muon_lr = optimizer.param_groups[0]["lr"]
             adamw_lr = optimizer.param_groups[1]["lr"]
             logs["learning_rate"] = adamw_lr
+            logs["adamw_lr"] = adamw_lr
             logs["muon_lr"] = muon_lr
         logs["tokens_per_sec"] = self._last_tokens_per_sec
         logs["raw_tokens_per_sec"] = self._last_raw_tokens_per_sec

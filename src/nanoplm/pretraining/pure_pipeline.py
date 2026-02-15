@@ -42,8 +42,11 @@ from nanoplm.pretraining.optim import build_optimizer
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
     ResumeConfig,
-    _get_num_workers,
-    _prepare_run_and_steps,
+)
+from nanoplm.pretraining.utils import (
+    compute_batch_setup,
+    get_num_workers,
+    prepare_run_and_steps,
 )
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
@@ -178,8 +181,8 @@ def _build_muon_optimizer(
         muon_nesterov=cfg.muon_nesterov,
         muon_eps=cfg.muon_eps,
         use_normuon=str(cfg.optimizer).lower() == "normuon",
-        adamw_learning_rate=cfg.learning_rate,
-        adamw_weight_decay=cfg.weight_decay,
+        adamw_learning_rate=cfg.adam_learning_rate,
+        adamw_weight_decay=cfg.adam_weight_decay,
         adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
         adamw_epsilon=cfg.adam_epsilon,
         distributed_mesh=distributed_mesh,
@@ -882,9 +885,11 @@ def run_pure_pretraining(
                     "train/loss": loss_to_log,
                     "train/grad_norm": grad_norm,
                     "train/learning_rate": learning_rate,
+                    "train/adamw_lr": learning_rate,
                     "train/epoch": epoch + (micro_step + 1) / len(train_loader),
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/raw_tokens_per_sec": raw_tokens_per_sec,
+                    "train/h100_mfu": mfu,
                 }
                 if muon_lr is not None:
                     payload["train/muon_lr"] = muon_lr
