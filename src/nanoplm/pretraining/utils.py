@@ -221,7 +221,7 @@ def prepare_run_and_steps(
     if resume_config and resume_config.is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
 
-        if resume_config.extra_epochs > 0:
+        if resume_config.extra_epochs:
             num_epochs = pretrain_config.num_epochs + int(resume_config.extra_epochs)
         else:
             num_epochs = pretrain_config.num_epochs
