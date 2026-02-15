@@ -32,7 +32,6 @@ dependencies = [
     "accelerate>=1.7.0",
     "biopython>=1.85",
     "click>=8.1.8",
-    "dion @ git+https://github.com/microsoft/dion.git",
     "dvc>=3.59.1",
     "h5py>=3.13.0",
     "pyyaml>=6.0.2",
@@ -45,6 +44,11 @@ dependencies = [
     "wandb>=0.19.11",
     "certifi>=2024.7.4",
     "ipython>=8.3.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "dion @ git+https://github.com/microsoft/dion.git",
 ]
 
 [project.scripts]

@@ -45,7 +45,7 @@ from nanoplm.pretraining.pipeline import (
     _get_num_workers,
     _prepare_run_and_steps,
 )
-from nanoplm.utils.common import create_dirs, get_device
+from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
 
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
@@ -207,12 +207,12 @@ def _create_optimizer(
             no_decay.append(param)
 
     groups = [
-        {"params": decay, "weight_decay": float(cfg.weight_decay)},
+        {"params": decay, "weight_decay": float(cfg.adam_weight_decay)},
         {"params": no_decay, "weight_decay": 0.0},
     ]
     kwargs = {
         "params": groups,
-        "lr": float(cfg.learning_rate),
+        "lr": float(cfg.adam_learning_rate),
         "betas": (float(cfg.adam_beta1), float(cfg.adam_beta2)),
         "eps": float(cfg.adam_epsilon),
     }
@@ -252,15 +252,6 @@ def _get_warmup_steps(total_steps: int, warmup_value: float) -> int:
     if warmup_value >= 1:
         return int(warmup_value)
     return math.ceil(total_steps * warmup_value)
-
-
-def _resolve_world_size(cfg: PretrainingConfig) -> int:
-    if not cfg.multi_gpu:
-        return 1
-    if cfg.world_size == "auto":
-        env_world_size = os.environ.get("WORLD_SIZE")
-        return int(env_world_size) if env_world_size else max(torch.cuda.device_count(), 1)
-    return int(cfg.world_size) if cfg.world_size else 1
 
 
 def _dist_barrier(local_rank: int) -> None:
@@ -498,33 +489,12 @@ def run_pure_pretraining(
 
     create_dirs(pretrain_config.ckp_dir)
 
-    effective_world_size = _resolve_world_size(pretrain_config)
+    effective_world_size = resolve_world_size(pretrain_config.multi_gpu, pretrain_config.world_size)
 
-    inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
-    global_batch_size_samples = pretrain_config.global_batch_size_samples
-    achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
+    batch = compute_batch_setup(pretrain_config, manifest.max_seq_len, effective_world_size)
 
-    if (
-        inferred_grad_accum_steps is None
-        or global_batch_size_samples is None
-        or achieved_global_batch_tokens is None
-    ):
-        raise ValueError(
-            "Batch setup is missing on PretrainingConfig. "
-            "Run pretraining through nanoplm CLI so inferred batch fields are populated."
-        )
-
-    world_tokens_per_micro_step = achieved_global_batch_tokens // max(
-        1, inferred_grad_accum_steps
-    )
-
-    logger.info(
-        "Batch setup: "
-        f"target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
-        f"micro_step_tokens={world_tokens_per_micro_step:,}, "
-        f"grad_accum_steps={inferred_grad_accum_steps}, "
-        f"effective_global_batch_size={achieved_global_batch_tokens:,} tokens"
-    )
+    inferred_grad_accum_steps = batch.grad_accum_steps
+    global_batch_size_samples = batch.global_batch_size_samples
 
     (
         _run_name,
@@ -535,14 +505,14 @@ def run_pure_pretraining(
         eval_steps,
         save_steps,
         _resume_step,
-    ) = _prepare_run_and_steps(
+    ) = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
         global_batch_size_samples=global_batch_size_samples,
     )
 
-    num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
     pin_memory = device.type == "cuda"
     persistent_workers = num_workers > 0
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None

@@ -20,59 +20,19 @@ from nanoplm.pretraining.pipeline import (
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
-
-def _set_seed_for_init(seed: int) -> None:
-    """Set seed before model creation so both pipelines start with identical weights."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _resolve_effective_world_size(cfg: PretrainingConfig) -> int:
-    if not cfg.multi_gpu:
-        return 1
-    if cfg.world_size == "auto":
-        env_ws = os.environ.get("WORLD_SIZE")
-        return int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
-    return int(cfg.world_size) if cfg.world_size else 1
-
-
-def _populate_batch_setup(cfg: PretrainingConfig) -> None:
-    dataset_dir = Path(cfg.dataset_dir)
-    validation_result = validate_pretrain_dataset(dataset_dir)
-    manifest = validation_result["manifest"]
-
-    effective_world_size = _resolve_effective_world_size(cfg)
-    if cfg.global_batch_size <= 0:
-        raise ValueError(f"global_batch_size must be > 0, got {cfg.global_batch_size}")
-
-    world_tokens_per_micro_step = (
-        cfg.micro_batch_size * manifest.max_seq_len * effective_world_size
-    )
-    if world_tokens_per_micro_step <= 0:
-        raise ValueError(
-            f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check micro_batch_size, max_seq_len, and world_size."
-        )
-
-    inferred_grad_accum_steps = max(
-        1,
-        math.ceil(cfg.global_batch_size / world_tokens_per_micro_step),
-    )
-    achieved_global_batch_tokens = inferred_grad_accum_steps * world_tokens_per_micro_step
-    global_batch_size_samples = (
-        inferred_grad_accum_steps * cfg.micro_batch_size * effective_world_size
-    )
-
-    cfg.inferred_grad_accum_steps = inferred_grad_accum_steps
-    cfg.global_batch_size_samples = global_batch_size_samples
-    cfg.achieved_global_batch_tokens = achieved_global_batch_tokens
+def _check_muon_available(optimizer: str) -> None:
+    """Abort early when a Muon variant is requested but ``dion`` is not installed."""
+    if optimizer.lower() in {"muon", "normuon"}:
+        try:
+            import dion  # noqa: F401
+        except ImportError:
+            raise click.ClickException(
+                f"Optimizer '{optimizer}' requires the 'dion' package which is not installed.\n"
+                "Install it with:  pip install nanoplm[cuda]"
+            )
 
 
 @click.group(name="pretrain")
@@ -117,22 +77,22 @@ def pretrain():
     help="Number of epochs"
 )
 @click.option(
-    "--learning-rate",
+    "--adam-learning-rate",
     type=float,
     default=1e-3,
-    help="Maximum Learning rate in the warmup"
+    help="AdamW learning rate (Muon uses --muon-learning-rate)"
 )
 @click.option(
-    "--weight-decay",
+    "--adam-weight-decay",
     type=float,
     default=0.0,
-    help="Weight decay"
+    help="AdamW weight decay (Muon uses --muon-weight-decay)"
 )
 @click.option(
-    "--warmup-ratio",
+    "--adam-warmup-ratio",
     type=float,
     default=0.05,
-    help="Warmup ratio"
+    help="AdamW warmup ratio"
 )
 @click.option(
     "--global-batch-size",
@@ -384,8 +344,8 @@ def run(
     # training hp
     micro_batch_size: int,
     num_epochs: int,
-    learning_rate: float,
-    weight_decay: float,
+    adam_learning_rate: float,
+    adam_weight_decay: float,
     warmup_ratio: float,
     global_batch_size: int,
     optimizer: str,
@@ -432,14 +392,16 @@ def run(
 ):
     """Run MLM pretraining with ModernBERT backbone."""
 
+    _check_muon_available(optimizer)
+
     # Build config from CLI arguments
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
         micro_batch_size=micro_batch_size,
         num_epochs=num_epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
+        adam_learning_rate=adam_learning_rate,
+        adam_weight_decay=adam_weight_decay,
         warmup_ratio=warmup_ratio,
         global_batch_size=global_batch_size,
         optimizer=optimizer,
@@ -471,9 +433,7 @@ def run(
         world_size=world_size,
         project_name=project_name,
     )
-    
-    _populate_batch_setup(cfg)
-    
+
     model_cfg = ProtModernBertMLMConfig(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -556,7 +516,7 @@ def from_yaml(config: str, pure_torch: bool):
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
-    _populate_batch_setup(pretrain_config)
+    _check_muon_available(pretrain_config.optimizer)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
 
@@ -664,9 +624,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  micro_batch_size: 32\n"
         "  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
         "  num_epochs: 10\n"
+        "  warmup_ratio: 0.05\n"
         "\n"
         "  optimizer: \"normuon\"  # adamw, stable_adamw, muon, normuon\n"
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
+        "  adam_learning_rate: 1e-3\n"
+        "  adam_weight_decay: 0.0\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
@@ -681,6 +644,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
+        "\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
@@ -769,8 +733,8 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
 
     # Explicitly convert float-like fields if they are strings (handles scientific notation).
     float_fields = [
-        "learning_rate",
-        "weight_decay",
+        "adam_learning_rate",
+        "adam_weight_decay",
         "adam_beta1",
         "adam_beta2",
         "adam_epsilon",
@@ -891,3 +855,11 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             )
 
     return ResumeConfig(**kwargs)
+
+def _set_seed_for_init(seed: int) -> None:
+    """Set seed before model creation so both pipelines start with identical weights."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
