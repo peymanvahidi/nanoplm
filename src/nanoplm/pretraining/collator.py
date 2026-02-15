@@ -194,14 +194,13 @@ class PackingCollator:
         self.pad_to = pad_to
         if pad_to is not None:
             self.F = pad_to
-            # Fixed cu_seqlens length: real seqs + 1 (leading 0) + padding seqs.
-            # Padding tokens (F - T) are split into chunks ≤ max_seq_len.
-            if max_batch_sequences is None:
-                raise ValueError(
-                    "max_batch_sequences must be provided when pad_to is set."
-                )
-            micro_batch_size = pad_to // max_seq_len
-            self.cu_len = max_batch_sequences + 1 + micro_batch_size
+            if max_batch_sequences is not None:
+                # Fixed cu_seqlens length for torch.compile(dynamic=False).
+                micro_batch_size = pad_to // max_seq_len
+                self.cu_len = max_batch_sequences + 1 + micro_batch_size
+            else:
+                # Pad flat tensors only; cu_seqlens stays variable.
+                self.cu_len = None
         else:
             self.F = None
             self.cu_len = None
@@ -416,28 +415,33 @@ class PackingCollator:
         padded_labels[:T] = flat_labels
         padded_pos[:T] = position_ids
 
-        # Build fixed-length cu_seqlens: real entries, then padding "sequences"
-        # of ≤ max_seq_len each (so max_seqlen stays ≤ max_seq_len and flash
-        # attention tiles optimally), then fill remaining slots with F.
-        padded_cu = torch.full((self.cu_len,), F, dtype=torch.int32)
-        N_real = len(cu_seqlens)
-        padded_cu[:N_real] = cu_seqlens
-
+        # Add padding "sequences" of ≤ max_seq_len each so max_seqlen stays
+        # ≤ max_seq_len and flash attention tiles optimally.
         pad_tokens = F - T
-        pos = T
-        idx = N_real
-        while pad_tokens > 0 and idx < self.cu_len:
+        pad_entries = []
+        p = T
+        while pad_tokens > 0:
             chunk = min(W, pad_tokens)
-            pos += chunk
-            padded_cu[idx] = pos
+            p += chunk
+            pad_entries.append(p)
             pad_tokens -= chunk
-            idx += 1
+
+        padded_cu = torch.cat([
+            cu_seqlens,
+            torch.tensor(pad_entries, dtype=torch.int32),
+        ]) if pad_entries else cu_seqlens
+
+        if self.cu_len is not None:
+            # Fixed cu_seqlens length for torch.compile(dynamic=False).
+            final_cu = torch.full((self.cu_len,), F, dtype=torch.int32)
+            final_cu[:len(padded_cu)] = padded_cu
+            padded_cu = final_cu
 
         return {
             "input_ids": padded_ids,        # (F,) fixed
             "labels": padded_labels,         # (F,) fixed
             "position_ids": padded_pos,      # (F,) fixed
-            "cu_seqlens": padded_cu,         # (cu_len,) fixed
+            "cu_seqlens": padded_cu,         # fixed or variable
             "max_seqlen": W,                 # constant = max_seq_len
             "num_valid_tokens": T,           # real token count
         }

@@ -90,6 +90,9 @@ def run_te_pretraining(
     use_packing = bool(pretrain_config.use_packing)
 
     if use_packing:
+        _pad_to = pretrain_config.micro_batch_size * manifest.max_seq_len
+        _min_seq_len = int(train_ds.get_all_sequence_lengths().min())
+        _max_batch_seqs = _pad_to // _min_seq_len + 1
         collator = PackingCollator(
             tokenizer=tokenizer,
             max_seq_len=manifest.max_seq_len,
@@ -97,8 +100,10 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            pad_to=_pad_to,
+            # No max_batch_sequences: cu_seqlens stays variable (no torch.compile for TE).
         )
-        logger.info("Sequence packing ENABLED (flat 1-D output, zero waste)")
+        logger.info(f"Sequence packing ENABLED (static size F={_pad_to:,})")
     else:
         collator = ProtDataCollatorForLM(
             tokenizer=tokenizer,
@@ -227,7 +232,7 @@ def run_te_pretraining(
         _max_tokens = pretrain_config.micro_batch_size * manifest.max_seq_len
         train_batch_sampler = LengthBucketedBatchSampler(
             dataset=train_ds,
-            batch_size=_max_tokens,  # cap high — token budget is the real limit
+            batch_size=_max_batch_seqs,  # cap sequences to fit cu_seqlens
             max_tokens=_max_tokens,
             mega_batch_multiplier=pretrain_config.mega_batch_multiplier,
             shuffle=True,

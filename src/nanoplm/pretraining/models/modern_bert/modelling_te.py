@@ -18,13 +18,13 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     _get_activation,
     _unpad_input,
 )
-
+USE_FP_ATTN=False
 USE_FP8 = True
 FULL_ATTN_EVERY_N_LAYER = 3
 
 # FP8 recipe: delayed scaling with HYBRID format (E4M3 forward, E5M2 backward).
 # amax_history_len=16 is a reasonable default for stability; increase for smoother scaling.
-FP8_RECIPE = Float8CurrentScaling()
+FP8_RECIPE = DelayedScaling(fp8_mha=USE_FP_ATTN)
 
 # TE requires window_size=(-1, -1) for full attention, not None.
 _FULL_ATTN_WINDOW: tuple[int, int] = (-1, -1)
