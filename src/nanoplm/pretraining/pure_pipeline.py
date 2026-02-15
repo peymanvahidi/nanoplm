@@ -538,11 +538,11 @@ def run_pure_pretraining(
     optimizer.zero_grad(set_to_none=True)
 
     global_step = start_step
-    accum_loss = 0.0
-    window_loss = 0.0
+    accum_loss = torch.tensor(0.0, device=device)
+    window_loss = torch.tensor(0.0, device=device)
     window_steps = 0
 
-    token_count = 0
+    token_count = torch.zeros(1, device=device, dtype=torch.long)
     raw_token_count = 0
     token_t0: Optional[float] = None
 
@@ -561,7 +561,7 @@ def run_pure_pretraining(
 
             if raw_token_count == 0:
                 token_t0 = time.perf_counter()
-            token_count += int(batch["attention_mask"].sum().item())
+            token_count += batch["attention_mask"].sum()
             raw_token_count += int(batch["attention_mask"].numel())
 
             amp_ctx = (
@@ -585,7 +585,7 @@ def run_pure_pretraining(
                 else:
                     loss.backward()
 
-            accum_loss += loss.item()
+            accum_loss += loss.detach()
 
             grad_accum = inferred_grad_accum_steps
             is_boundary = (micro_step + 1) % grad_accum == 0
@@ -597,7 +597,7 @@ def run_pure_pretraining(
             with torch.profiler.record_function("optimizer_step"):
                 if scaler is not None and scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 optimizer_step_skipped = False
                 if scaler is not None and scaler.is_enabled():
@@ -625,64 +625,65 @@ def run_pure_pretraining(
                 prof.step()
             window_loss += accum_loss
             window_steps += 1
-            accum_loss = 0.0
-
-            t1 = time.perf_counter()
-            if token_t0 is None:
-                token_t0 = t1
-            elapsed = t1 - token_t0
-            tok = float(token_count)
-            raw_tok = float(raw_token_count)
-
-            if distributed and dist.is_initialized():
-                tok_tensor = torch.tensor(tok, device=device)
-                raw_tok_tensor = torch.tensor(raw_tok, device=device)
-                elapsed_tensor = torch.tensor(float(elapsed), device=device)
-                dist.all_reduce(tok_tensor, op=dist.ReduceOp.SUM)
-                dist.all_reduce(raw_tok_tensor, op=dist.ReduceOp.SUM)
-                dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
-                tok = tok_tensor.item()
-                raw_tok = raw_tok_tensor.item()
-                elapsed = elapsed_tensor.item()
-
-            tokens_per_sec = tok / max(elapsed, 1e-9)
-            raw_tokens_per_sec = raw_tok / max(elapsed, 1e-9)
-
-            token_count = 0
-            raw_token_count = 0
-            token_t0 = None
+            accum_loss = torch.tensor(0.0, device=device)
 
             should_log = global_step % logging_steps == 0
-            if should_log and is_main:
-                loss_to_log = window_loss / max(1, window_steps)
-                payload = {
-                    "train/global_step": global_step,
-                    "train/loss": loss_to_log,
-                    "train/grad_norm": grad_norm,
-                    "train/learning_rate": learning_rate,
-                    "train/epoch": epoch + (micro_step + 1) / len(train_loader),
-                    "train/tokens_per_sec": tokens_per_sec,
-                    "train/raw_tokens_per_sec": raw_tokens_per_sec,
-                }
-                if muon_lr is not None:
-                    payload["train/muon_lr"] = muon_lr
-                if wandb_enabled and wandb.run is not None:
-                    try:
-                        wandb.log(payload)
-                    except Exception as exc:
-                        wandb_enabled = False
-                        logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
-                muon_lr_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
-                logger.info(
-                    f"[step {global_step}/{total_steps}] "
-                    f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
-                    f"grad_norm={grad_norm:.4f} tok/s={tokens_per_sec:,.0f} "
-                    f"raw_tok/s={raw_tokens_per_sec:,.0f}"
-                )
-
             if should_log:
-                window_loss = 0.0
+                t1 = time.perf_counter()
+                if token_t0 is None:
+                    token_t0 = t1
+                elapsed = t1 - token_t0
+
+                tok = token_count.clone()
+                raw_tok = torch.tensor(float(raw_token_count), device=device)
+
+                if distributed and dist.is_initialized():
+                    elapsed_tensor = torch.tensor(float(elapsed), device=device)
+                    dist.all_reduce(tok, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(raw_tok, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+                    elapsed = elapsed_tensor.item()
+
+                # Single sync point: materialize all values at once
+                tok_val = tok.item()
+                raw_tok_val = raw_tok.item()
+                tokens_per_sec = tok_val / max(elapsed, 1e-9)
+                raw_tokens_per_sec = raw_tok_val / max(elapsed, 1e-9)
+
+                if is_main:
+                    loss_to_log = (window_loss / max(1, window_steps)).item()
+                    grad_norm_val = grad_norm.item()
+                    payload = {
+                        "train/global_step": global_step,
+                        "train/loss": loss_to_log,
+                        "train/grad_norm": grad_norm_val,
+                        "train/learning_rate": learning_rate,
+                        "train/epoch": epoch + (micro_step + 1) / len(train_loader),
+                        "train/tokens_per_sec": tokens_per_sec,
+                        "train/raw_tokens_per_sec": raw_tokens_per_sec,
+                    }
+                    if muon_lr is not None:
+                        payload["train/muon_lr"] = muon_lr
+                    if wandb_enabled and wandb.run is not None:
+                        try:
+                            wandb.log(payload)
+                        except Exception as exc:
+                            wandb_enabled = False
+                            logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
+                    muon_lr_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
+                    logger.info(
+                        f"[step {global_step}/{total_steps}] "
+                        f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
+                        f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,.0f} "
+                        f"raw_tok/s={raw_tokens_per_sec:,.0f}"
+                    )
+
+                # Reset accumulators (all ranks)
+                window_loss = torch.tensor(0.0, device=device)
                 window_steps = 0
+                token_count = torch.zeros(1, device=device, dtype=torch.long)
+                raw_token_count = 0
+                token_t0 = None
 
             if global_step % eval_steps == 0:
                 eval_loss = _evaluate(
