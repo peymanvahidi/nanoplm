@@ -27,7 +27,7 @@ from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
-from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig
+from nanoplm.pretraining.pipeline import PretrainingConfig, ProfilerConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
@@ -138,6 +138,53 @@ def _dist_barrier(local_rank: int) -> None:
         dist.barrier(device_ids=[local_rank])
     else:
         dist.barrier()
+
+
+def _create_profiler(
+    profiler_config: Optional[ProfilerConfig],
+    output_dir: str,
+    is_main: bool,
+):
+    """Return a torch.profiler.profile context manager or nullcontext.
+
+    Only profiles on rank 0. Traces are exported as Chrome JSON files
+    viewable in https://ui.perfetto.dev/.
+    """
+    if (
+        profiler_config is None
+        or not profiler_config.enable_profiler
+        or not is_main
+    ):
+        return nullcontext()
+
+    from torch.profiler import ProfilerActivity, schedule
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    sort_key = "cuda_time_total" if torch.cuda.is_available() else "cpu_time_total"
+
+    trace_dir = Path(output_dir) / "profiler_traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+
+    def _trace_handler(prof):
+        step = prof.step_num
+        trace_path = trace_dir / f"trace_step_{step}.json"
+        prof.export_chrome_trace(str(trace_path))
+        logger.info(f"Profiler trace saved -> {trace_path}")
+        logger.info(
+            prof.key_averages().table(sort_by=sort_key, row_limit=20)
+        )
+
+    return torch.profiler.profile(
+        activities=activities,
+        schedule=schedule(skip_first=10, wait=5, warmup=2, active=3, repeat=1),
+        on_trace_ready=_trace_handler,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    )
 
 
 @torch.inference_mode()
@@ -264,6 +311,7 @@ def run_pure_pretraining(
     model: PureProtModernBertMLM,
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig] = None,
+    profiler_config: Optional[ProfilerConfig] = None,
 ) -> None:
     _set_seed(pretrain_config.seed)
     tokenizer = model.tokenizer
@@ -498,6 +546,9 @@ def run_pure_pretraining(
     raw_token_count = 0
     token_t0: Optional[float] = None
 
+    profiler_ctx = _create_profiler(profiler_config, output_dir, is_main)
+    prof = profiler_ctx.__enter__()
+
     for epoch in range(start_epoch, num_epochs):
         if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
@@ -518,7 +569,7 @@ def run_pure_pretraining(
                 if amp_dtype is not None
                 else nullcontext()
             )
-            with amp_ctx:
+            with torch.profiler.record_function("forward"), amp_ctx:
                 out = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -528,10 +579,11 @@ def run_pure_pretraining(
             loss = out["loss"] if isinstance(out, dict) else out.loss
             loss = loss / inferred_grad_accum_steps
 
-            if scaler is not None and scaler.is_enabled():
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            with torch.profiler.record_function("backward"):
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
             accum_loss += loss.item()
 
@@ -542,18 +594,19 @@ def run_pure_pretraining(
             if not (is_boundary or is_last_micro):
                 continue
 
-            if scaler is not None and scaler.is_enabled():
-                scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
+            with torch.profiler.record_function("optimizer_step"):
+                if scaler is not None and scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()
 
-            optimizer_step_skipped = False
-            if scaler is not None and scaler.is_enabled():
-                old_scale = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer_step_skipped = scaler.get_scale() < old_scale
-            else:
-                optimizer.step()
+                optimizer_step_skipped = False
+                if scaler is not None and scaler.is_enabled():
+                    old_scale = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer_step_skipped = scaler.get_scale() < old_scale
+                else:
+                    optimizer.step()
 
             if is_muon_optimizer(optimizer):
                 # param_groups[0] = muon, param_groups[1] = adamw
@@ -567,6 +620,9 @@ def run_pure_pretraining(
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
+
+            if prof is not None:
+                prof.step()
             window_loss += accum_loss
             window_steps += 1
             accum_loss = 0.0
@@ -666,6 +722,8 @@ def run_pure_pretraining(
 
         if resume_micro_step > 0 and epoch == resume_epoch:
             resume_micro_step = 0
+
+    profiler_ctx.__exit__(None, None, None)
 
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)

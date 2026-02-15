@@ -165,6 +165,11 @@ class ResumeConfig:
     extra_epochs: Optional[int] = None
 
 
+@dataclass
+class ProfilerConfig:
+    enable_profiler: bool = False
+
+
 def run_pretraining(
     model: ProtModernBertMLM,
     pretrain_config: PretrainingConfig,

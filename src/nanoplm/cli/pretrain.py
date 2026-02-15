@@ -14,6 +14,7 @@ from pathlib import Path
 
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
+    ProfilerConfig,
     ResumeConfig,
     run_pretraining,
 )
@@ -492,6 +493,7 @@ def from_yaml(config: str, pure_torch: bool):
     pretrain_dict = raw.get("pretraining")
     model_dict = raw.get("model")
     resume_dict = raw.get("resume")
+    profiler_dict = raw.get("profiler")
 
     # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
     if not pure_torch:
@@ -502,6 +504,7 @@ def from_yaml(config: str, pure_torch: bool):
     _check_muon_available(pretrain_config.optimizer)
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
+    profiler_config = _load_profiler_config(profiler_dict)
 
     if pure_torch:
         logger.info("Using pure-torch model and training loop")
@@ -521,6 +524,7 @@ def from_yaml(config: str, pure_torch: bool):
             model=model,
             pretrain_config=pretrain_config,
             resume_config=resume_config if resume_config.is_resume else None,
+            profiler_config=profiler_config,
         )
     else:
         run_pretraining(
@@ -657,6 +661,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
+        "\n"
+        "# Profiler (pure-torch only, view traces in https://ui.perfetto.dev/)\n"
+        "# profiler:\n"
+        "#   enable_profiler: false\n"
         "\n"
         "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
         "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
@@ -821,6 +829,33 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             )
 
     return ResumeConfig(**kwargs)
+
+def _load_profiler_config(config: Optional[Dict[str, Any]]) -> ProfilerConfig:
+    if config is None:
+        return ProfilerConfig()
+
+    expected_keys = set(ProfilerConfig.__annotations__.keys())
+    present_keys = set(config.keys())
+
+    extra = [k for k in present_keys if k not in expected_keys]
+    if extra:
+        raise ValueError(
+            f"Unexpected profiler configuration keys: {', '.join(sorted(extra))}"
+        )
+
+    kwargs: Dict[str, Any] = {}
+    for key in present_keys:
+        value = config.get(key)
+        if value is not None:
+            kwargs[key] = value
+
+    # Handle boolean values
+    if "enable_profiler" in kwargs:
+        value = kwargs["enable_profiler"]
+        if isinstance(value, str):
+            kwargs["enable_profiler"] = value.lower() == "true"
+
+    return ProfilerConfig(**kwargs)
 
 def _set_seed_for_init(seed: int) -> None:
     """Set seed before model creation so both pipelines start with identical weights."""
