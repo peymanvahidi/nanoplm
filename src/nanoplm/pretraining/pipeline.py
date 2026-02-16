@@ -219,6 +219,7 @@ class PretrainingConfig:
     # Mixed precision
     bf16: bool = True
     tf32: bool = True
+    fp8: bool = False
 
     # MLM settings
     mlm_probability: float = 0.3

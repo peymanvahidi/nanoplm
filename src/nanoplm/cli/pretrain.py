@@ -280,6 +280,11 @@ def pretrain():
     help="Enable TF32 mode on Ampere+ GPUs for faster fp32 matmuls"
 )
 @click.option(
+    "--fp8/--no-fp8",
+    default=False,
+    help="Enable FP8 Linear matmuls in pure-torch/TE paths (CUDA only, best on H100+)",
+)
+@click.option(
     "--multi-gpu",
     is_flag=True,
     default=False,
@@ -411,6 +416,7 @@ def run(
     use_packing: bool,
     bf16: bool,
     tf32: bool,
+    fp8: bool,
     multi_gpu: bool,
     world_size: str,
     project_name: str,
@@ -465,6 +471,7 @@ def run(
         use_packing=use_packing,
         bf16=bf16,
         tf32=tf32,
+        fp8=fp8,
         multi_gpu=multi_gpu,
         world_size=world_size,
         project_name=project_name,
@@ -728,6 +735,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  bf16: true\n"
         "  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)\n"
         "             # Provides 3x faster fp32 matmuls with negligible precision loss\n"
+        "  fp8: true  # Enable FP8 Linear matmuls in pure_torch/pure_te paths (CUDA, best on H100+)\n"
         "\n"
         "  multi_gpu: false\n"
         "  world_size: 1  # Use \"auto\" if you want to use all available GPUs\n"
@@ -816,6 +824,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'multi_gpu',
         'bf16',
         'tf32',
+        'fp8',
         'muon_nesterov',
         'muon_cautious_weight_decay',
         'muon_use_polar_express',

@@ -129,8 +129,20 @@ class LengthBucketedBatchSampler(Sampler[List[int]]):
                 rng.shuffle(mb_batches)
             all_batches.extend(mb_batches)
 
-        # Distributed partitioning: round-robin across ranks.
+        # Distributed partitioning: ensure identical batch counts per rank.
+        # Without this, ranks can differ by 1 mini-batch, which desyncs
+        # optimizer/scheduler steps under gradient accumulation.
         if self.num_replicas is not None and self.num_replicas > 1:
+            total = len(all_batches)
+            if self.drop_last:
+                total = (total // self.num_replicas) * self.num_replicas
+                all_batches = all_batches[:total]
+            else:
+                remainder = total % self.num_replicas
+                if remainder != 0 and total > 0:
+                    pad = self.num_replicas - remainder
+                    all_batches.extend(all_batches[:pad])
+
             all_batches = all_batches[self.rank :: self.num_replicas]
 
         return all_batches

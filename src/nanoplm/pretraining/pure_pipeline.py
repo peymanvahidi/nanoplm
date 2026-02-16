@@ -36,6 +36,11 @@ from torch.utils.data.distributed import DistributedSampler
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import PackingCollator, ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
+from nanoplm.pretraining.fp8 import (
+    Float8Linear,
+    Float8LinearConfig,
+    convert_to_float8_training,
+)
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from dion import Muon as DionMuon, NorMuon as DionNorMuon
 from nanoplm.pretraining.optim import build_optimizer
@@ -86,7 +91,7 @@ def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
 
 
 # H100 SXM peak BF16 tensor-core throughput (TFLOPS).
-H100_PEAK_TFLOPS = 989.4
+H100_PEAK_TFLOPS = 835.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
 N_PREFETCH_LAYERS_FSDP2 = 2
@@ -248,6 +253,32 @@ def _num_update_steps_per_epoch(train_loader_len: int, grad_accum: int) -> int:
     return max(1, math.ceil(train_loader_len / max(1, grad_accum)))
 
 
+def _sync_train_loader_len(
+    train_loader_len: int,
+    distributed: bool,
+    device: torch.device,
+) -> int:
+    """Ensure all ranks see the same number of micro-batches per epoch."""
+    if not (distributed and dist.is_initialized()):
+        return train_loader_len
+
+    min_len = torch.tensor(train_loader_len, device=device, dtype=torch.int64)
+    max_len = torch.tensor(train_loader_len, device=device, dtype=torch.int64)
+    dist.all_reduce(min_len, op=dist.ReduceOp.MIN)
+    dist.all_reduce(max_len, op=dist.ReduceOp.MAX)
+
+    min_v = int(min_len.item())
+    max_v = int(max_len.item())
+    if min_v != max_v:
+        raise RuntimeError(
+            "Mismatched train loader lengths across ranks "
+            f"(min={min_v}, max={max_v}). "
+            "This desynchronizes optimizer/scheduler steps in distributed training."
+        )
+
+    return max_v
+
+
 def _get_warmup_steps(total_steps: int, warmup_value: float) -> int:
     if warmup_value >= 1:
         return int(warmup_value)
@@ -270,6 +301,20 @@ def _dist_barrier(local_rank: int) -> None:
         dist.barrier(device_ids=[local_rank])
     else:
         dist.barrier()
+
+
+def _compile_inner_layers_for_fsdp(
+    model: torch.nn.Module,
+    *,
+    dynamic: bool,
+) -> None:
+    """Compile transformer layers before FSDP wrapping.
+
+    PyTorch generally performs better when compile targets are the model blocks
+    instead of distributed wrappers.
+    """
+    for i, layer in enumerate(model.model.layers):
+        model.model.layers[i] = torch.compile(layer, dynamic=dynamic)
 
 
 @torch.inference_mode()
@@ -435,6 +480,15 @@ def run_pure_pretraining(
 
     manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
+    if manifest.max_seq_len <= 0:
+        raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")
+
+    model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
+    if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
+        raise ValueError(
+            f"Dataset max_seq_len ({manifest.max_seq_len}) exceeds model "
+            f"max_position_embeddings ({model_max_pos})."
+        )
 
     train_shard_dir = dataset_dir / manifest.train_dir
     val_shard_dir = dataset_dir / manifest.val_dir
@@ -558,7 +612,37 @@ def run_pure_pretraining(
             else:
                 dist.init_process_group(backend=backend)
 
+    if pretrain_config.fp8:
+        if device.type != "cuda":
+            raise ValueError("fp8=True requires CUDA.")
+
+        # FP8 tensor-core path requires 16-aligned Linear dimensions.
+        def _fp8_module_filter(mod: torch.nn.Module, _fqn: str) -> bool:
+            if not isinstance(mod, torch.nn.Linear):
+                return False
+            return mod.in_features % 16 == 0 and mod.out_features % 16 == 0
+
+        fp8_config = Float8LinearConfig.from_recipe_name("tensorwise")
+        convert_to_float8_training(model, config=fp8_config, module_filter_fn=_fp8_module_filter)
+        num_fp8_layers = sum(1 for m in model.modules() if isinstance(m, Float8Linear))
+        num_linear_layers = sum(1 for m in model.modules() if isinstance(m, torch.nn.Linear))
+        num_skipped = max(0, num_linear_layers - num_fp8_layers)
+        logger.info(
+            "FP8 enabled (tensorwise): "
+            f"converted={num_fp8_layers} linear layers, "
+            f"skipped={num_skipped} (non-16-aligned dims)"
+        )
+
     model.to(device)
+
+    compile_dynamic = not use_packing
+    if distributed:
+        # Compile inner model blocks (not FSDP wrappers).
+        _compile_inner_layers_for_fsdp(model, dynamic=compile_dynamic)
+        logger.info(
+            "Compiled inner transformer layers with torch.compile("
+            f"dynamic={compile_dynamic}) before FSDP2 wrapping"
+        )
 
     # -- Precision detection (needed before FSDP for MixedPrecisionPolicy) --
     use_bf16 = (
@@ -632,7 +716,12 @@ def run_pure_pretraining(
     # Compile model for faster training. Keep orig_model for checkpointing/eval
     # (eval inputs may change shape, which would cause recompilation).
     orig_model = model
-    if use_packing:
+    if distributed:
+        logger.info(
+            "Skipping root model torch.compile under FSDP2 "
+            "(using pre-wrapped compiled inner layers)"
+        )
+    elif use_packing:
         # Static shapes: collator pads to fixed sizes, enabling dynamic=False.
         model = torch.compile(model, dynamic=False)
         logger.info("Model compiled with torch.compile(dynamic=False)")
@@ -687,8 +776,13 @@ def run_pure_pretraining(
 
     optimizer = _create_optimizer(model, pretrain_config, distributed_mesh=fsdp_mesh)
 
-    steps_per_epoch = _num_update_steps_per_epoch(
+    synced_train_loader_len = _sync_train_loader_len(
         train_loader_len=len(train_loader),
+        distributed=distributed,
+        device=device,
+    )
+    steps_per_epoch = _num_update_steps_per_epoch(
+        train_loader_len=synced_train_loader_len,
         grad_accum=inferred_grad_accum_steps,
     )
     total_steps = num_epochs * steps_per_epoch
@@ -786,7 +880,8 @@ def run_pure_pretraining(
     )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
-        f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}"
+        f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, "
+        f"fp8={pretrain_config.fp8}"
     )
 
     model.train()

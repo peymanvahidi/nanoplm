@@ -43,7 +43,10 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
             mlp_activation=config.mlp_activation,
-            max_position_embeddings=1024,  # hardcoded (matches HF wrapper)
+            # Keep this comfortably above common dataset max_seq_len values.
+            # Position embeddings are RoPE frequencies (not learned tables), so a
+            # larger cap avoids runtime index asserts with minimal overhead.
+            max_position_embeddings=8192,
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
             attention_bias=config.attention_bias,
@@ -72,7 +75,8 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
             mlp_activation=config.mlp_activation,
-            max_position_embeddings=1024,  # hardcoded (matches HF wrapper)
+            # Keep this comfortably above common dataset max_seq_len values.
+            max_position_embeddings=8192,
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
             attention_bias=config.attention_bias,

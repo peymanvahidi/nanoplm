@@ -22,7 +22,7 @@ from torch.utils.data.distributed import DistributedSampler
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import PackingCollator, ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
-from nanoplm.pretraining.models.modern_bert.modelling_te import USE_FP8, FP8_RECIPE
+from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
 from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig, _get_num_workers, _prepare_run_and_steps
 from nanoplm.pretraining.pure_pipeline import (
@@ -40,6 +40,7 @@ from nanoplm.pretraining.pure_pipeline import (
     _resolve_world_size,
     _save_checkpoint,
     _set_seed,
+    _sync_train_loader_len,
 )
 from nanoplm.utils.common import create_dirs, get_device
 from nanoplm.utils.logger import logger
@@ -58,6 +59,15 @@ def run_te_pretraining(
 
     manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
+    if manifest.max_seq_len <= 0:
+        raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")
+
+    model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
+    if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
+        raise ValueError(
+            f"Dataset max_seq_len ({manifest.max_seq_len}) exceeds model "
+            f"max_position_embeddings ({model_max_pos})."
+        )
 
     train_shard_dir = dataset_dir / manifest.train_dir
     val_shard_dir = dataset_dir / manifest.val_dir
@@ -295,8 +305,13 @@ def run_te_pretraining(
 
     optimizer = _create_optimizer(model, pretrain_config, distributed_mesh=fsdp_mesh)
 
-    steps_per_epoch = _num_update_steps_per_epoch(
+    synced_train_loader_len = _sync_train_loader_len(
         train_loader_len=len(train_loader),
+        distributed=distributed,
+        device=device,
+    )
+    steps_per_epoch = _num_update_steps_per_epoch(
+        train_loader_len=synced_train_loader_len,
         grad_accum=inferred_grad_accum_steps,
     )
     total_steps = num_epochs * steps_per_epoch
@@ -391,12 +406,12 @@ def run_te_pretraining(
     )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
-        f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, fp8={USE_FP8}"
+        f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, fp8={pretrain_config.fp8}"
     )
 
-    fp8_enabled = bool(USE_FP8 and device.type == "cuda")
-    if USE_FP8 and device.type != "cuda":
-        logger.warning("USE_FP8=True but device is not CUDA. FP8 autocast will be disabled.")
+    fp8_enabled = bool(pretrain_config.fp8 and device.type == "cuda")
+    if pretrain_config.fp8 and device.type != "cuda":
+        logger.warning("fp8=True but device is not CUDA. FP8 autocast will be disabled.")
     # For multi-GPU: pass the process group so TE reduces FP8 amax tensors across all ranks,
     # keeping scaling factors in sync (avoids divergent quantization between data-parallel replicas).
     fp8_group = dist.group.WORLD if (fp8_enabled and distributed and dist.is_initialized()) else None
