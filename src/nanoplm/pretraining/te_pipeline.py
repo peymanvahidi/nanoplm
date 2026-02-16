@@ -4,6 +4,7 @@
 
 import gc
 import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from contextlib import nullcontext
 from pathlib import Path
