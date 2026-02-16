@@ -9,7 +9,6 @@ import json
 import math
 import os
 
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import random
 import time
@@ -460,7 +459,10 @@ def run_pure_pretraining(
 
     num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
     pin_memory = device.type == "cuda"
-    persistent_workers = num_workers > 0
+    # Disable persistent workers when packing: TokenPackingDataset + persistent_workers
+    # can cause hangs near epoch boundaries (set_epoch doesn't reach workers, worker
+    # queue non-determinism). Workers restart each epoch, fixing the stall.
+    persistent_workers = num_workers > 0 and not use_packing
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None
 
     # ---- Distributed init ----
@@ -585,6 +587,18 @@ def run_pure_pretraining(
     optimizer = _create_optimizer(model, pretrain_config, distributed_mesh=fsdp_mesh)
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
+    # With TokenPackingDataset + DistributedSampler, greedy packing can yield different batch
+    # counts per rank, causing desync and deadlock. Cap iteration at a safe minimum.
+    if use_packing and distributed:
+        _total_tokens = train_ds.dataset.total_tokens
+        _tokens_per_rank = _total_tokens // effective_world_size
+        _min_safe_batches = max(1, _tokens_per_rank // train_ds.max_tokens_per_batch)
+        if _min_safe_batches < synced_len:
+            logger.info(
+                f"Capping micro-batches per epoch to {_min_safe_batches} (from {synced_len}) "
+                "to prevent distributed deadlock with variable packing"
+            )
+            synced_len = _min_safe_batches
     steps_per_epoch = max(1, math.ceil(synced_len / max(1, inferred_grad_accum_steps)))
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = _get_warmup_steps(total_steps, float(pretrain_config.warmup_ratio))
@@ -600,7 +614,7 @@ def run_pure_pretraining(
         resume_epoch = start_epoch
         steps_done = max(0, start_step - start_epoch * steps_per_epoch)
         resume_micro_step = steps_done * inferred_grad_accum_steps
-        if resume_micro_step >= len(train_loader):
+        if resume_micro_step >= synced_len:
             resume_micro_step = 0
             start_epoch = min(start_epoch + 1, num_epochs)
             resume_epoch = start_epoch
@@ -680,6 +694,8 @@ def run_pure_pretraining(
             epoch_setter.set_epoch(epoch)
 
         for micro_step, batch in enumerate(train_loader):
+            if micro_step >= synced_len:
+                break
             if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                 continue
 
@@ -690,7 +706,7 @@ def run_pure_pretraining(
 
             # FSDP2: only reduce-scatter gradients at accumulation boundaries
             if distributed:
-                sync = (micro_step + 1) % inferred_grad_accum_steps == 0 or micro_step + 1 == len(train_loader)
+                sync = (micro_step + 1) % inferred_grad_accum_steps == 0 or micro_step + 1 == synced_len
                 model.set_requires_gradient_sync(sync)
 
             if raw_token_count == 0:
@@ -733,9 +749,14 @@ def run_pure_pretraining(
 
             # Skip to next micro-step if not at accumulation boundary
             is_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
-            is_last = micro_step + 1 == len(train_loader)
+            is_last = micro_step + 1 == synced_len
             if not (is_boundary or is_last):
                 continue
+
+            # accum_loss = sum(Li/grad_accum). For partial last step of epoch, true mean = sum(Li)/n_micro.
+            # Scale so reported loss = true mean: accum_loss * grad_accum / n_micro
+            n_micro = (micro_step + 1) % inferred_grad_accum_steps or inferred_grad_accum_steps
+            accum_loss *= inferred_grad_accum_steps / n_micro
 
             # Optimizer step
             if scaler is not None and scaler.is_enabled():
@@ -805,7 +826,7 @@ def run_pure_pretraining(
                     "train/loss": avg_loss,
                     "train/grad_norm": grad_norm,
                     "train/learning_rate": learning_rate,
-                    "train/epoch": epoch + (micro_step + 1) / len(train_loader),
+                    "train/epoch": epoch + (micro_step + 1) / synced_len,
                     "train/tokens_per_sec": tps,
                     "train/raw_tokens_per_sec": raw_tps,
                     "train/step_real_tokens": int(tok),

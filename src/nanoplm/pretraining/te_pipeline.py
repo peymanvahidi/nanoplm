@@ -1,6 +1,6 @@
 """Transformer Engine pretraining pipeline."""
 
-from __future__ import annotations
+
 
 import gc
 import os
@@ -176,7 +176,9 @@ def run_te_pretraining(
 
     num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
     pin_memory = device.type == "cuda"
-    persistent_workers = num_workers > 0
+    # Disable persistent workers when packing: TokenPackingDataset + persistent_workers
+    # can cause hangs near epoch boundaries (set_epoch doesn't reach workers).
+    persistent_workers = num_workers > 0 and not use_packing
     prefetch_factor = pretrain_config.prefetch_factor if num_workers > 0 else None
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -361,6 +363,19 @@ def run_te_pretraining(
         distributed=distributed,
         device=device,
     )
+    # With TokenPackingDataset + DistributedSampler, greedy packing can yield different batch
+    # counts per rank, causing desync and deadlock. Cap iteration at a safe minimum so all
+    # ranks process the same number of batches.
+    if use_packing and distributed:
+        _total_tokens = train_ds.dataset.total_tokens
+        _tokens_per_rank = _total_tokens // effective_world_size
+        _min_safe_batches = max(1, _tokens_per_rank // train_ds.max_tokens_per_batch)
+        if _min_safe_batches < synced_train_loader_len:
+            logger.info(
+                f"Capping micro-batches per epoch to {_min_safe_batches} (from {synced_train_loader_len}) "
+                "to prevent distributed deadlock with variable packing"
+            )
+            synced_train_loader_len = _min_safe_batches
     steps_per_epoch = _num_update_steps_per_epoch(
         train_loader_len=synced_train_loader_len,
         grad_accum=inferred_grad_accum_steps,
@@ -388,7 +403,7 @@ def run_te_pretraining(
     if resume_config and resume_config.is_resume:
         steps_done = max(0, start_step - start_epoch * steps_per_epoch)
         resume_micro_step = steps_done * inferred_grad_accum_steps
-        if resume_micro_step >= len(train_loader):
+        if resume_micro_step >= synced_train_loader_len:
             resume_micro_step = 0
             start_epoch = min(start_epoch + 1, num_epochs)
             resume_epoch = start_epoch
@@ -480,13 +495,20 @@ def run_te_pretraining(
     token_t0: Optional[float] = None
     first_step_of_run = True
 
-    _epoch_setter = train_batch_sampler if train_batch_sampler is not None else train_sampler
+    # When packing, TokenPackingDataset holds the DistributedSampler; call set_epoch on it.
+    # When not packing, the sampler is train_sampler or train_batch_sampler.
+    _epoch_setter = (
+        train_ds if use_packing else (train_batch_sampler if train_batch_sampler is not None else train_sampler)
+    )
 
     for epoch in range(start_epoch, num_epochs):
         if _epoch_setter is not None and hasattr(_epoch_setter, "set_epoch"):
             _epoch_setter.set_epoch(epoch)
 
         for micro_step, batch in enumerate(train_loader):
+            # Cap iteration to prevent desync when TokenPackingDataset yields different counts per rank
+            if micro_step >= synced_train_loader_len:
+                break
             if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                 continue
 
@@ -499,7 +521,7 @@ def run_te_pretraining(
             if distributed:
                 _is_sync_step = (
                     (micro_step + 1) % inferred_grad_accum_steps == 0
-                    or micro_step + 1 == len(train_loader)
+                    or micro_step + 1 == synced_train_loader_len
                 )
                 model.set_requires_gradient_sync(_is_sync_step)
 
@@ -548,9 +570,14 @@ def run_te_pretraining(
 
             grad_accum = inferred_grad_accum_steps
             is_boundary = (micro_step + 1) % grad_accum == 0
-            is_last_micro = micro_step + 1 == len(train_loader)
+            is_last_micro = micro_step + 1 == synced_train_loader_len
             if not (is_boundary or is_last_micro):
                 continue
+
+            # accum_loss = sum(Li/grad_accum). For partial last step, true mean = sum(Li)/n_micro.
+            # Scale so reported loss = true mean: accum_loss * grad_accum / n_micro
+            n_micro = (micro_step + 1) % grad_accum or grad_accum
+            accum_loss *= grad_accum / n_micro
 
             if scaler is not None and scaler.is_enabled():
                 scaler.unscale_(optimizer)
@@ -618,7 +645,7 @@ def run_te_pretraining(
                     "train/loss": loss_to_log,
                     "train/grad_norm": grad_norm,
                     "train/learning_rate": learning_rate,
-                    "train/epoch": epoch + (micro_step + 1) / len(train_loader),
+                    "train/epoch": epoch + (micro_step + 1) / synced_train_loader_len,
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/raw_tokens_per_sec": raw_tokens_per_sec,
                     "train/step_real_tokens": int(tok),
