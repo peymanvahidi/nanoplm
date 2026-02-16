@@ -205,7 +205,7 @@ class TEModernBertModel(nn.Module):
 class TEModernBertPredictionHead(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.dense = te.Linear(
+        self.dense = nn.Linear(
             config.hidden_size,
             config.hidden_size,
             bias=config.classifier_bias,
@@ -213,8 +213,8 @@ class TEModernBertPredictionHead(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.act = _get_activation(config.classifier_activation)
 
-    def forward(self, x: torch.Tensor, is_first_microbatch: Optional[bool] = None) -> torch.Tensor:
-        return self.norm(self.act(self.dense(x, is_first_microbatch=is_first_microbatch)))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.act(self.dense(x)))
 
 
 class TEModernBertForMaskedLM(nn.Module):

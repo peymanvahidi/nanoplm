@@ -240,6 +240,10 @@ class PretrainingConfig:
     # Sequence packing (packs multiple sequences per row to eliminate padding waste).
     # Requires flash attention (varlen path).  Falls back to padding if disabled.
     use_packing: bool = False
+    # Batch sampler type when packing is enabled:
+    #   "length_bucketed" – mega-batch + token-budget with length bucketing (default).
+    #   "token_budget"    – simpler single-pass global-sort + token-budget sampler.
+    batch_sampler_type: str = "token_budget"
     # Length-bucketed batch sampling: groups similar-length sequences
     # for tighter packing.  Higher values = better packing, less randomness.
     mega_batch_multiplier: int = 100

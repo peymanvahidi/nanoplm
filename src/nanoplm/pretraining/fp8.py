@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 EPS = 1e-12
+_ALIGN = 16
 
 
 @torch.no_grad()
@@ -30,18 +31,43 @@ def _to_col_major(x: torch.Tensor) -> torch.Tensor:
     return x.t().contiguous().t()
 
 
+def _pad16(x: torch.Tensor) -> torch.Tensor:
+    """Zero-pad a 2D tensor so both dims are multiples of 16.
+
+    Padding is done in the original dtype *before* FP8 conversion so that
+    ``torch.nn.functional.pad`` always operates on a supported type.
+    """
+    m, n = x.shape
+    pm = (-m) % _ALIGN
+    pn = (-n) % _ALIGN
+    if pm == 0 and pn == 0:
+        return x
+    return torch.nn.functional.pad(x, (0, pn, 0, pm))
+
+
 @torch._dynamo.allow_in_graph
 class _Float8Matmul(torch.autograd.Function):
-    """FP8 matmul autograd for Linear forward/backward GEMMs."""
+    """FP8 matmul autograd for Linear forward/backward GEMMs.
+
+    All operands are padded to multiples of 16 before ``_scaled_mm`` because
+    that kernel requires 16-byte aligned dimensions.  The padding is applied
+    *before* FP8 quantisation (zero-pad in the source dtype) so that
+    ``F.pad`` never sees an FP8 tensor.
+    """
 
     @staticmethod
     def forward(ctx, input_2d: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         ctx.save_for_backward(input_2d, weight)
+        M, K = input_2d.shape
+        N = weight.shape[0]
 
-        input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
-        weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        inp_p = _pad16(input_2d)
+        w_p = _pad16(weight)
 
-        return torch._scaled_mm(
+        input_fp8, input_inv = _to_fp8(inp_p, torch.float8_e4m3fn)
+        weight_fp8, weight_inv = _to_fp8(w_p, torch.float8_e4m3fn)
+
+        out = torch._scaled_mm(
             input_fp8,
             weight_fp8.t(),
             scale_a=input_inv,
@@ -49,13 +75,19 @@ class _Float8Matmul(torch.autograd.Function):
             out_dtype=input_2d.dtype,
             use_fast_accum=True,
         )
+        return out[:M, :N]
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         input_2d, weight = ctx.saved_tensors
+        M, K = input_2d.shape
+        N = weight.shape[0]
 
-        go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)
-        w_fp8, w_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        # --- grad_input = grad_output @ weight ---
+        go_p = _pad16(grad_output)
+        w_p = _pad16(weight)
+        go_fp8, go_inv = _to_fp8(go_p, torch.float8_e5m2)
+        w_fp8, w_inv = _to_fp8(w_p, torch.float8_e4m3fn)
         w_col = _to_col_major(w_fp8)
         grad_input = torch._scaled_mm(
             go_fp8,
@@ -64,10 +96,13 @@ class _Float8Matmul(torch.autograd.Function):
             scale_b=w_inv,
             out_dtype=grad_output.dtype,
             use_fast_accum=False,
-        )
+        )[:M, :K]
 
-        go_fp8_2, go_inv_2 = _to_fp8(grad_output, torch.float8_e5m2)
-        in_fp8, in_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
+        # --- grad_weight = grad_output^T @ input_2d ---
+        go_p2 = _pad16(grad_output)
+        in_p = _pad16(input_2d)
+        go_fp8_2, go_inv_2 = _to_fp8(go_p2, torch.float8_e5m2)
+        in_fp8, in_inv = _to_fp8(in_p, torch.float8_e4m3fn)
         go_t = go_fp8_2.t().contiguous()
         in_col = _to_col_major(in_fp8)
         grad_weight = torch._scaled_mm(
@@ -77,7 +112,7 @@ class _Float8Matmul(torch.autograd.Function):
             scale_b=in_inv,
             out_dtype=grad_output.dtype,
             use_fast_accum=False,
-        )
+        )[:N, :K]
 
         return grad_input, grad_weight
 
