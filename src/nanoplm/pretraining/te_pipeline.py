@@ -481,6 +481,8 @@ def run_te_pretraining(
                 if "cu_seqlens" in batch:
                     fwd_kwargs["cu_seqlens"] = batch["cu_seqlens"]
                     fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
+                if fp8_enabled and inferred_grad_accum_steps > 1:
+                    fwd_kwargs["is_first_microbatch"] = (micro_step % inferred_grad_accum_steps == 0)
                 out = model(**fwd_kwargs)
 
             loss = out["loss"] if isinstance(out, dict) else out.loss

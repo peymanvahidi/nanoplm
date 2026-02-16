@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch import attention as te_attention
-from transformer_engine.common.recipe import DelayedScaling, Format,NVFP4BlockScaling,Float8CurrentScaling,Float8BlockScaling
+from transformer_engine.common.recipe import DelayedScaling, Format,NVFP4BlockScaling,Float8CurrentScaling,Float8BlockScaling,MXFP8BlockScaling
 
 from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertConfig,
@@ -24,7 +24,7 @@ FULL_ATTN_EVERY_N_LAYER = 3
 
 # FP8 recipe: delayed scaling with HYBRID format (E4M3 forward, E5M2 backward).
 # amax_history_len=16 is a reasonable default for stability; increase for smoother scaling.
-FP8_RECIPE = DelayedScaling(fp8_mha=USE_FP_ATTN)
+FP8_RECIPE = DelayedScaling()
 
 # TE requires window_size=(-1, -1) for full attention, not None.
 _FULL_ATTN_WINDOW: tuple[int, int] = (-1, -1)
@@ -38,7 +38,7 @@ class TEModernBertEmbeddings(nn.Module):
             config.hidden_size,
             padding_idx=config.pad_token_id,
         )
-        self.norm = te.LayerNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = te.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.drop = nn.Dropout(config.embedding_dropout)
 
     def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
@@ -79,7 +79,7 @@ class TEModernBertEncoderLayer(nn.Module):
             attention_dropout=config.attention_dropout,
             layernorm_epsilon=config.norm_eps,
             bias=config.attention_bias,
-            normalization="LayerNorm",
+            normalization="RMSNorm",
             input_layernorm=layer_idx != 0,  # layer 0: embedding already normed
             attn_mask_type="padding",         # required for qkv_format=thd
             window_size=self.window_size,
@@ -89,6 +89,7 @@ class TEModernBertEncoderLayer(nn.Module):
             return_bias=False,
             init_method=_init,
             output_layer_init_method=_output_init,
+            qk_norm_type=None,
         )
 
         # Fused LayerNorm + FC1 + SwiGLU + FC2.
@@ -97,7 +98,7 @@ class TEModernBertEncoderLayer(nn.Module):
             ffn_hidden_size=config.intermediate_size,
             eps=config.norm_eps,
             bias=config.mlp_bias,
-            normalization="LayerNorm",
+            normalization="RMSNorm",
             activation="swiglu",
             init_method=_init,
             output_layer_init_method=_output_init,
@@ -109,6 +110,7 @@ class TEModernBertEncoderLayer(nn.Module):
         rotary_pos_emb: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        is_first_microbatch: Optional[bool] = None,
     ) -> torch.Tensor:
         # x: (total_tokens, hidden) — flat thd layout
         attn_out = self.attn(
@@ -120,12 +122,14 @@ class TEModernBertEncoderLayer(nn.Module):
             max_seqlen_kv=max_seqlen,
             attn_mask_type="padding",
             window_size=self.window_size,
+            checkpoint_core_attention = True,
+            is_first_microbatch=is_first_microbatch,
         )
         if isinstance(attn_out, tuple):
             attn_out = attn_out[0]
         x = x + attn_out
 
-        mlp_out = self.mlp(x)
+        mlp_out = self.mlp(x, is_first_microbatch=is_first_microbatch)
         if isinstance(mlp_out, tuple):
             mlp_out = mlp_out[0]
         return x + mlp_out
@@ -139,7 +143,7 @@ class TEModernBertModel(nn.Module):
         self.layers = nn.ModuleList(
             [TEModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
-        self.final_norm = te.LayerNorm(config.hidden_size, eps=config.norm_eps)
+        self.final_norm = te.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self._rope_full_emb = te_attention.RotaryPositionEmbedding(
             config.head_dim, rotary_base=config.global_rope_theta
         )
@@ -163,12 +167,14 @@ class TEModernBertModel(nn.Module):
         input_ids: torch.LongTensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
+        is_first_microbatch: Optional[bool] = None,
     ) -> torch.Tensor:
         """Always runs in thd (flat/varlen) mode.
 
         input_ids: (total_tokens,) — already unpadded by TEModernBertForMaskedLM.
         cu_seqlens: cumulative sequence lengths (batch+1,) int32.
         max_seqlen: length of the longest sequence in the batch.
+        is_first_microbatch: for FP8 weight caching in gradient accumulation.
         """
         x = self.embeddings(input_ids)  # (total_tokens, hidden)
 
@@ -187,7 +193,7 @@ class TEModernBertModel(nn.Module):
 
         for layer in self.layers:
             rope = rope_full_freqs if layer.is_full_attention else rope_sliding_freqs
-            x = layer(x, rotary_pos_emb=rope, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+            x = layer(x, rotary_pos_emb=rope, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, is_first_microbatch=is_first_microbatch)
 
         # Trim padding before final norm and return.
         if pad > 0:
@@ -199,16 +205,16 @@ class TEModernBertModel(nn.Module):
 class TEModernBertPredictionHead(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.dense = nn.Linear(
+        self.dense = te.Linear(
             config.hidden_size,
             config.hidden_size,
             bias=config.classifier_bias,
         )
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps)
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.act = _get_activation(config.classifier_activation)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.act(self.dense(x)))
+    def forward(self, x: torch.Tensor, is_first_microbatch: Optional[bool] = None) -> torch.Tensor:
+        return self.norm(self.act(self.dense(x, is_first_microbatch=is_first_microbatch)))
 
 
 class TEModernBertForMaskedLM(nn.Module):
@@ -235,7 +241,7 @@ class TEModernBertForMaskedLM(nn.Module):
         nn.init.normal_(self.model.embeddings.tok_embeddings.weight, mean=0.0, std=embedding_std)
 
         for module in self.modules():
-            if module.__class__.__name__ in {"LayerNorm"}:
+            if module.__class__.__name__ in {"RMSNorm"}:
                 if getattr(module, "weight", None) is not None:
                     nn.init.ones_(module.weight)
                 if getattr(module, "bias", None) is not None:
@@ -263,6 +269,7 @@ class TEModernBertForMaskedLM(nn.Module):
         labels: Optional[torch.LongTensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        is_first_microbatch: Optional[bool] = None,
     ) -> dict[str, Optional[torch.Tensor]]:
         # Always unpad to flat (total_tokens,) before the encoder.
         indices = None  # set when we need to index into flattened input_ids/labels
@@ -290,7 +297,7 @@ class TEModernBertForMaskedLM(nn.Module):
             flat_ids = input_ids.view(-1)
             cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device=input_ids.device)
             max_seqlen = input_ids.shape[-1]
-        x = self.model(flat_ids, cu_seqlens=cu_seqlens, max_seqlen=int(max_seqlen))
+        x = self.model(flat_ids, cu_seqlens=cu_seqlens, max_seqlen=int(max_seqlen), is_first_microbatch=is_first_microbatch)
 
         if self.sparse_prediction and labels is not None:
             flat_labels = labels.view(-1)[indices] if indices is not None else labels.view(-1)
