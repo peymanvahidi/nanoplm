@@ -4,6 +4,7 @@ This is the same outer behavior as the HF Trainer pipeline (datasets, run naming
 checkpoint layout, resume mechanics), but the training loop is plain torch.
 """
 
+import gc
 import json
 import math
 import os
@@ -17,17 +18,24 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+)
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
-from nanoplm.pretraining.collator import ProtDataCollatorForLM
+from nanoplm.pretraining.collator import PackingCollator, ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
-from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig
+from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
@@ -46,7 +54,8 @@ def _set_seed(seed: int) -> None:
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return model.module if isinstance(model, DDP) else model
+    # FSDP2 modifies the model in-place; no wrapper to strip.
+    return model
 
 
 def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -67,10 +76,42 @@ def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
     return True
 
 
-def _create_optimizer(model: torch.nn.Module, cfg: PretrainingConfig) -> torch.optim.Optimizer:
+# H100 SXM peak BF16 tensor-core throughput (TFLOPS).
+H100_PEAK_TFLOPS = 989.4
+
+# https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
+N_PREFETCH_LAYERS_FSDP2 = 2
+
+
+def _estimate_model_flops_per_token(
+    num_layers: int,
+    hidden_size: int,
+    intermediate_size: int,
+    seq_len: int,
+    vocab_size: int,
+) -> int:
+    """Estimate FLOPs per token for a single forward pass.
+
+    Uses the standard transformer FLOPs counting:
+      Attention (per layer): 8*h^2 + 4*s*h  (QKV + output projections + attn logits/ctx)
+      SwiGLU MLP (per layer): 6*h*I           (gate + up + down projections)
+      Embedding/unembedding:  2*V*h
+
+    Training FLOPs = 3 * forward FLOPs (forward + ~2x backward).
+    """
+    per_layer = 8 * hidden_size**2 + 4 * seq_len * hidden_size + 6 * hidden_size * intermediate_size
+    forward_flops = num_layers * per_layer + 2 * vocab_size * hidden_size
+    return 3 * forward_flops  # training = 3x forward
+
+
+def _create_optimizer(
+    model: torch.nn.Module,
+    cfg: PretrainingConfig,
+    distributed_mesh=None,
+) -> torch.optim.Optimizer:
     name = str(cfg.optimizer).lower()
     if name in {"muon", "normuon"}:
-        return build_muon_optimizer(model, cfg)
+        return build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
     raw_model = _unwrap_model(model)
     decay, no_decay = [], []
@@ -180,6 +221,17 @@ def _evaluate(
     return total_loss / max(1, total_samples)
 
 
+def _to_full_tensors(obj):
+    """Recursively convert DTensors to plain tensors (collective operation)."""
+    if isinstance(obj, DTensor):
+        return obj.full_tensor()
+    if isinstance(obj, dict):
+        return {k: _to_full_tensors(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_full_tensors(v) for v in obj]
+    return obj
+
+
 def _save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -190,13 +242,27 @@ def _save_checkpoint(
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
+    distributed: bool = False,
+    is_main: bool = True,
 ) -> None:
     checkpoint_dir = Path(output_dir) / f"checkpoint-{global_step}"
-    create_dirs(str(checkpoint_dir))
 
-    raw_model = _unwrap_model(model)
-    torch.save(raw_model.state_dict(), checkpoint_dir / "pytorch_model.bin")
-    torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer.pt")
+    if distributed:
+        # Collective: gather full model & optimizer state dicts.
+        model_sd = get_model_state_dict(
+            model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+        )
+        opt_sd = _to_full_tensors(optimizer.state_dict())
+    else:
+        model_sd = _unwrap_model(model).state_dict()
+        opt_sd = optimizer.state_dict()
+
+    if not is_main:
+        return
+
+    create_dirs(str(checkpoint_dir))
+    torch.save(model_sd, checkpoint_dir / "pytorch_model.bin")
+    torch.save(opt_sd, checkpoint_dir / "optimizer.pt")
     torch.save(scheduler.state_dict(), checkpoint_dir / "scheduler.pt")
     torch.save(
         {
@@ -230,13 +296,18 @@ def _load_checkpoint(
     scheduler: LambdaLR,
     checkpoint_dir: str,
     device: torch.device,
+    distributed: bool = False,
 ) -> Tuple[int, int]:
     ckp = Path(checkpoint_dir)
 
-    raw_model = _unwrap_model(model)
-    raw_model.load_state_dict(
-        torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
-    )
+    model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
+    if distributed:
+        set_model_state_dict(
+            model, model_sd, options=StateDictOptions(full_state_dict=True)
+        )
+    else:
+        _unwrap_model(model).load_state_dict(model_sd)
+
     optimizer.load_state_dict(
         torch.load(ckp / "optimizer.pt", map_location=device, weights_only=True)
     )
@@ -263,8 +334,22 @@ def _load_checkpoint(
 def run_pure_pretraining(
     model: PureProtModernBertMLM,
     pretrain_config: PretrainingConfig,
+    pure_torch_config: Optional[PureTorchConfig] = None,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
+    if pure_torch_config is None:
+        pure_torch_config = PureTorchConfig()
+
+    # Set allocator config (respect existing user settings)
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+    # Enable reduced-precision for training performance
+    if pretrain_config.bf16 or pretrain_config.tf32:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     _set_seed(pretrain_config.seed)
     tokenizer = model.tokenizer
     device = torch.device(get_device())
@@ -302,13 +387,37 @@ def run_pure_pretraining(
         )
         raise
 
-    collator = ProtDataCollatorForLM(
-        tokenizer=tokenizer,
-        mlm_probability=pretrain_config.mlm_probability,
-        mask_token_probability=pretrain_config.mask_replace_prob,
-        random_token_probability=pretrain_config.random_token_prob,
-        keep_probability=pretrain_config.keep_probability,
-    )
+    use_packing = bool(pure_torch_config.use_packing)
+    target_rows = pure_torch_config.target_packed_rows
+    use_static_packing = use_packing and target_rows is not None
+
+    if use_packing:
+        collator = PackingCollator(
+            tokenizer=tokenizer,
+            max_seq_len=manifest.max_seq_len,
+            mlm_probability=pretrain_config.mlm_probability,
+            mask_token_probability=pretrain_config.mask_replace_prob,
+            random_token_probability=pretrain_config.random_token_prob,
+            keep_probability=pretrain_config.keep_probability,
+            target_rows=target_rows,
+            batch_size=pretrain_config.micro_batch_size if target_rows else None,
+        )
+        if use_static_packing:
+            logger.info(
+                f"Sequence packing ENABLED (static shapes, "
+                f"target_rows={target_rows}, "
+                f"flat_size={target_rows * manifest.max_seq_len:,})"
+            )
+        else:
+            logger.info("Sequence packing ENABLED (PackingCollator, dynamic shapes)")
+    else:
+        collator = ProtDataCollatorForLM(
+            tokenizer=tokenizer,
+            mlm_probability=pretrain_config.mlm_probability,
+            mask_token_probability=pretrain_config.mask_replace_prob,
+            random_token_probability=pretrain_config.random_token_prob,
+            keep_probability=pretrain_config.keep_probability,
+        )
 
     create_dirs(pretrain_config.ckp_dir)
 
@@ -350,17 +459,52 @@ def run_pure_pretraining(
             device = torch.device(f"cuda:{local_rank}")
         if not dist.is_initialized():
             if backend == "nccl":
-                dist.init_process_group(backend=backend, device_id=local_rank)
+                dist.init_process_group(backend=backend, device_id=device)
             else:
                 dist.init_process_group(backend=backend)
 
     model.to(device)
 
+    # -- Precision detection (needed before FSDP for MixedPrecisionPolicy) --
+    use_bf16 = (
+        pretrain_config.bf16
+        and device.type == "cuda"
+        and torch.cuda.is_bf16_supported()
+    )
+    use_fp16 = (
+        pretrain_config.bf16
+        and ((device.type == "cuda" and not torch.cuda.is_bf16_supported()) or device.type == "mps")
+    )
+
+    fsdp_mesh = None
     if distributed:
-        if torch.cuda.is_available():
-            model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
-        else:
-            model = DDP(model, find_unused_parameters=False)
+        # Apply FSDP2 per transformer layer, then at the root.
+        fsdp_kwargs: dict = {}
+        if use_bf16:
+            fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+            )
+        fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+
+        # FSDP2 Explicit Prefetching
+        if N_PREFETCH_LAYERS_FSDP2 > 1:
+            layers = model.model.layers
+            for i, layer in enumerate(layers):
+                # Forward prefetch next layers
+                if i + 1 < len(layers):
+                    layer.set_modules_to_forward_prefetch(
+                        layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2]
+                    )
+                # Backward prefetch previous layers
+                if i - 1 >= 0:
+                    layer.set_modules_to_backward_prefetch(
+                        list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i]))
+                    )
+
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
         eval_sampler = DistributedSampler(val_ds, shuffle=False)
         is_main = dist.get_rank() == 0
@@ -368,6 +512,34 @@ def run_pure_pretraining(
         train_sampler = RandomSampler(train_ds)
         eval_sampler = SequentialSampler(val_ds)
         is_main = True
+
+    # Compile model for faster training. Keep orig_model for checkpointing/eval
+    # (eval inputs may change shape, which would cause recompilation).
+    orig_model = model
+    if pure_torch_config.use_compile:
+        if use_static_packing:
+            # Static shapes: collator pre-flattens and pads to fixed sizes,
+            # so no data-dependent ops inside the compiled graph.
+            model = torch.compile(model, dynamic=False)
+            logger.info("Model compiled with torch.compile(dynamic=False)")
+        else:
+            # dynamic=True because varlen flash-attention produces variable-length
+            # unpadded tensors per batch.
+            model = torch.compile(model, dynamic=True)
+            logger.info("Model compiled with torch.compile(dynamic=True)")
+    else:
+        logger.info("torch.compile disabled")
+
+    # Eval always uses a standard padding collator (no packing) so that
+    # _evaluate() sees 2-D batches with attention_mask regardless of the
+    # training collator configuration.
+    eval_collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=pretrain_config.mlm_probability,
+        mask_token_probability=pretrain_config.mask_replace_prob,
+        random_token_probability=pretrain_config.random_token_prob,
+        keep_probability=pretrain_config.keep_probability,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -378,21 +550,21 @@ def run_pure_pretraining(
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        drop_last=False,
+        drop_last=use_static_packing,  # static shapes require fixed batch size
     )
     eval_loader = DataLoader(
         val_ds,
         sampler=eval_sampler,
         batch_size=pretrain_config.micro_batch_size,
-        collate_fn=collator,
+        collate_fn=eval_collator,
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        drop_last=False,
+        drop_last=False,  # eval always processes all samples
     )
 
-    optimizer = _create_optimizer(model, pretrain_config)
+    optimizer = _create_optimizer(model, pretrain_config, distributed_mesh=fsdp_mesh)
 
     steps_per_epoch = _num_update_steps_per_epoch(
         train_loader_len=len(train_loader),
@@ -412,6 +584,7 @@ def run_pure_pretraining(
             scheduler=scheduler,
             checkpoint_dir=resume_config.checkpoint_dir,
             device=device,
+            distributed=distributed,
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
@@ -449,18 +622,10 @@ def run_pure_pretraining(
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
 
-    use_bf16 = (
-        pretrain_config.bf16
-        and device.type == "cuda"
-        and torch.cuda.is_bf16_supported()
-    )
-    use_fp16 = (
-        pretrain_config.bf16
-        and ((device.type == "cuda" and not torch.cuda.is_bf16_supported()) or device.type == "mps")
-    )
-
+    # When FSDP handles bf16 via MixedPrecisionPolicy, autocast is not needed.
+    # Keep autocast only for non-distributed bf16 or fp16 paths.
     amp_dtype: Optional[torch.dtype] = None
-    if use_bf16:
+    if use_bf16 and not distributed:
         amp_dtype = torch.bfloat16
     elif use_fp16:
         amp_dtype = torch.float16
@@ -474,6 +639,22 @@ def run_pure_pretraining(
         torch.amp.GradScaler(enabled=(device.type == "cuda" and use_fp16))
         if torch.cuda.is_available()
         else None
+    )
+
+    # Pre-compute FLOPs-per-token for MFU estimation.
+    _raw_model = _unwrap_model(model)
+    _mb_cfg = _raw_model.config if hasattr(_raw_model, "config") else _raw_model._orig_mod.config
+    _flops_per_token = _estimate_model_flops_per_token(
+        num_layers=_mb_cfg.num_hidden_layers,
+        hidden_size=_mb_cfg.hidden_size,
+        intermediate_size=_mb_cfg.intermediate_size,
+        seq_len=manifest.max_seq_len,
+        vocab_size=_mb_cfg.vocab_size,
+    )
+    _peak_flops_per_gpu = H100_PEAK_TFLOPS * 1e12  # convert to FLOPS
+    logger.info(
+        f"MFU estimation: {_flops_per_token:,} training FLOPs/token, "
+        f"H100 peak = {H100_PEAK_TFLOPS} TFLOPS"
     )
 
     logger.info(
@@ -497,6 +678,7 @@ def run_pure_pretraining(
     token_count = 0
     raw_token_count = 0
     token_t0: Optional[float] = None
+    first_step_of_run = True
 
     for epoch in range(start_epoch, num_epochs):
         if hasattr(train_sampler, "set_epoch"):
@@ -506,12 +688,31 @@ def run_pure_pretraining(
             if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                 continue
 
+            if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
+                model.unshard()
+
             batch = _move_batch_to_device(batch, device)
+
+            # FSDP2: only reduce-scatter gradients at accumulation boundaries.
+            if distributed:
+                _is_sync_step = (
+                    (micro_step + 1) % inferred_grad_accum_steps == 0
+                    or micro_step + 1 == len(train_loader)
+                )
+                model.set_requires_gradient_sync(_is_sync_step)
 
             if raw_token_count == 0:
                 token_t0 = time.perf_counter()
-            token_count += int(batch["attention_mask"].sum().item())
-            raw_token_count += int(batch["attention_mask"].numel())
+
+            # Token counting: for the static path there is no attention_mask,
+            # so count real tokens from cu_seqlens[-1] and total from tensor size.
+            if "attention_mask" in batch:
+                token_count += int(batch["attention_mask"].sum().item())
+                raw_token_count += int(batch["attention_mask"].numel())
+            else:
+                # Static packed path: cu_seqlens[-1] = total real tokens.
+                token_count += int(batch["cu_seqlens"][-1].item())
+                raw_token_count += int(batch["input_ids"].numel())
 
             amp_ctx = (
                 torch.autocast(device_type=device.type, dtype=amp_dtype)
@@ -519,11 +720,18 @@ def run_pure_pretraining(
                 else nullcontext()
             )
             with amp_ctx:
-                out = model(
+                fwd_kwargs = dict(
                     input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                 )
+                if "attention_mask" in batch:
+                    fwd_kwargs["attention_mask"] = batch["attention_mask"]
+                if "cu_seqlens" in batch:
+                    fwd_kwargs["cu_seqlens"] = batch["cu_seqlens"]
+                    fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
+                if "position_ids" in batch:
+                    fwd_kwargs["position_ids"] = batch["position_ids"]
+                out = model(**fwd_kwargs)
 
             loss = out["loss"] if isinstance(out, dict) else out.loss
             loss = loss / inferred_grad_accum_steps
@@ -592,6 +800,11 @@ def run_pure_pretraining(
             tokens_per_sec = tok / max(elapsed, 1e-9)
             raw_tokens_per_sec = raw_tok / max(elapsed, 1e-9)
 
+            # MFU: (achieved FLOPs/s per GPU) / (H100 peak FLOPs/s)
+            achieved_flops_per_sec = raw_tokens_per_sec * _flops_per_token
+            per_gpu_flops = achieved_flops_per_sec / max(effective_world_size, 1)
+            mfu = per_gpu_flops / _peak_flops_per_gpu
+
             token_count = 0
             raw_token_count = 0
             token_t0 = None
@@ -604,9 +817,11 @@ def run_pure_pretraining(
                     "train/loss": loss_to_log,
                     "train/grad_norm": grad_norm,
                     "train/learning_rate": learning_rate,
+                    "train/adamw_lr": learning_rate,
                     "train/epoch": epoch + (micro_step + 1) / len(train_loader),
                     "train/tokens_per_sec": tokens_per_sec,
                     "train/raw_tokens_per_sec": raw_tokens_per_sec,
+                    "train/h100_mfu": mfu,
                 }
                 if muon_lr is not None:
                     payload["train/muon_lr"] = muon_lr
@@ -621,8 +836,21 @@ def run_pure_pretraining(
                     f"[step {global_step}/{total_steps}] "
                     f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
                     f"grad_norm={grad_norm:.4f} tok/s={tokens_per_sec:,.0f} "
-                    f"raw_tok/s={raw_tokens_per_sec:,.0f}"
+                    f"raw_tok/s={raw_tokens_per_sec:,.0f} "
+                    f"h100_mfu={mfu:.2%}"
                 )
+
+            # Tame the garbage collector: after the first optimizer step
+            # (which triggers torch.compile warmup), collect garbage from
+            # setup, freeze surviving objects, and disable automatic GC.
+            # This avoids ~500ms GC pauses during training.
+            if first_step_of_run:
+                first_step_of_run = False
+                gc.collect()
+                gc.freeze()
+                gc.disable()
+            elif global_step % 5000 == 0:
+                gc.collect()  # periodic manual collect for very long runs
 
             if should_log:
                 window_loss = 0.0
@@ -630,7 +858,7 @@ def run_pure_pretraining(
 
             if global_step % eval_steps == 0:
                 eval_loss = _evaluate(
-                    model=model,
+                    model=orig_model,
                     eval_loader=eval_loader,
                     device=device,
                     distributed=distributed,
@@ -651,7 +879,7 @@ def run_pure_pretraining(
                     logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
                 model.train()
 
-            if global_step % save_steps == 0 and is_main:
+            if global_step % save_steps == 0:
                 _save_checkpoint(
                     model=model,
                     optimizer=optimizer,
@@ -662,6 +890,8 @@ def run_pure_pretraining(
                     logging_steps=logging_steps,
                     eval_steps=eval_steps,
                     save_steps=save_steps,
+                    distributed=distributed,
+                    is_main=is_main,
                 )
 
         if resume_micro_step > 0 and epoch == resume_epoch:
@@ -670,18 +900,20 @@ def run_pure_pretraining(
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
+    _save_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        global_step=global_step,
+        epoch=num_epochs,
+        output_dir=output_dir,
+        logging_steps=logging_steps,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+        distributed=distributed,
+        is_main=is_main,
+    )
     if is_main:
-        _save_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            global_step=global_step,
-            epoch=num_epochs,
-            output_dir=output_dir,
-            logging_steps=logging_steps,
-            eval_steps=eval_steps,
-            save_steps=save_steps,
-        )
         if wandb_enabled and wandb.run is not None:
             try:
                 (Path(output_dir) / "wandb_run_id.txt").write_text(wandb.run.id, encoding="utf-8")

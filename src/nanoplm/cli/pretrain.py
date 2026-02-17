@@ -12,11 +12,8 @@ import torch
 from typing import Optional, Dict, Any, Union
 from pathlib import Path
 
-from nanoplm.pretraining.pipeline import (
-    PretrainingConfig,
-    ResumeConfig,
-    run_pretraining,
-)
+from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
+from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
@@ -224,6 +221,24 @@ def pretrain():
     help="DataLoader prefetch factor"
 )
 @click.option(
+    "--compile/--no-compile",
+    default=True,
+    help="Enable torch.compile for faster training (disable for debugging or unsupported hardware)"
+)
+@click.option(
+    "--use-packing/--no-packing",
+    default=False,
+    help="Enable sequence packing to eliminate padding waste (requires flash attention)"
+)
+@click.option(
+    "--target-packed-rows",
+    type=int,
+    default=None,
+    help="Fixed row count for static-shape compilation (enables dynamic=False). "
+         "Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. "
+         "Omit to use dynamic=True."
+)
+@click.option(
     "--bf16/--no-bf16",
     default=True,
     help="Enable mixed precision training (bf16 if supported, fp16 fallback)"
@@ -356,6 +371,9 @@ def run(
     keep_probability: float,
     num_workers: Union[int, str],
     prefetch_factor: int,
+    compile: bool,
+    use_packing: bool,
+    target_packed_rows: Optional[int],
     bf16: bool,
     tf32: bool,
     multi_gpu: bool,
@@ -373,6 +391,7 @@ def run(
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
+    max_position_embeddings: int,
     pure_torch: bool,
 ):
     """Run MLM pretraining with ModernBERT backbone."""
@@ -429,6 +448,7 @@ def run(
         attention_bias=attention_bias,
         attention_dropout=attention_dropout,
         classifier_activation=classifier_activation,
+        max_position_embeddings=max_position_embeddings,
     )
 
     if pure_torch:
@@ -445,7 +465,12 @@ def run(
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     if pure_torch:
-        run_pure_pretraining(model=model, pretrain_config=cfg)
+        pt_cfg = PureTorchConfig(
+            use_compile=compile,
+            use_packing=use_packing,
+            target_packed_rows=target_packed_rows,
+        )
+        run_pure_pretraining(model=model, pretrain_config=cfg, pure_torch_config=pt_cfg)
     else:
         run_pretraining(model=model, pretrain_config=cfg)
 
@@ -460,19 +485,15 @@ def run(
     default="pretrain.yaml",
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
-@click.option(
-    "--pure-torch",
-    is_flag=True,
-    default=False,
-    help="Use custom pure-torch model and training loop instead of HF Trainer",
-)
-def from_yaml(config: str, pure_torch: bool):
-    """Run pretraining from a YAML file with training and model parameters.
+def from_yaml(config: str):
+    f"""Run pretraining from a YAML file with training and model parameters.
 
-    Expected YAML structure:
-    pretraining: {...}
-    model: {...}
-    resume: {...}
+    Expected YAML structure::
+
+        model: {...}
+        pretraining: {...}
+        pure_torch: {...}
+        resume: {...}
 
     If resume.is_resume is True, training will resume from the given
     checkpoint using the hyperparameters in the 'pretraining' block.
@@ -493,9 +514,8 @@ def from_yaml(config: str, pure_torch: bool):
     model_dict = raw.get("model")
     resume_dict = raw.get("resume")
 
-    # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
-    if not pure_torch:
-        pure_torch = bool(raw.get("pure_torch", False))
+    # Resolve pure_torch section
+    pure_torch, pure_torch_config = _resolve_pure_torch_config(raw)
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
@@ -520,6 +540,7 @@ def from_yaml(config: str, pure_torch: bool):
         run_pure_pretraining(
             model=model,
             pretrain_config=pretrain_config,
+            pure_torch_config=pure_torch_config,
             resume_config=resume_config if resume_config.is_resume else None,
         )
     else:
@@ -590,6 +611,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
+        "  max_position_embeddings: 1024 # needs to be at least as long as max seq length\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
@@ -609,7 +631,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_epochs: 10\n"
         "  warmup_ratio: 0.05\n"
         "\n"
-        "  optimizer: \"adamw\"  # adamw, stable_adamw, muon, normuon\n"
+        "  optimizer: \"adamw\"  # adamw, stable_adamw, muon, normuon (muon and normouon only supported with CUDA)\n"
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
         "  adam_learning_rate: 1e-3\n"
         "  adam_weight_decay: 0.0\n"
@@ -617,8 +639,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
-        "  muon_learning_rate: 2e-2\n"
-        "  muon_weight_decay: 0.1\n"
+        "  muon_learning_rate: 1e-3\n"
+        "  muon_weight_decay: 0.01\n"
         "  muon_cautious_weight_decay: true\n"
         "  muon_use_polar_express: false\n"
         "  muon_momentum: 0.95\n"
@@ -629,9 +651,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
         "  keep_probability: 0.1\n"
-        "  logging_steps: 10\n"
-        "  eval_steps: 50\n"
-        "  save_steps: 100\n"
+        "  logging_steps: 1\n"
+        "  eval_steps: 250\n"
+        "  save_steps: 5000\n"
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
@@ -650,6 +672,19 @@ def get_yaml(output: Optional[str], force: bool):
         "  world_size: 1  # Use \"auto\" if you want to use all available GPUs\n"
         "  project_name: \"nanoplm-pretraining\"\n"
         "\n"
+        "# Pure-torch training loop settings (alternative to HF Trainer).\n"
+        "pure_torch:\n"
+        "  enabled: false\n"
+        "  # torch.compile: compile the model for faster training. Disable for debugging,\n"
+        "  # unsupported hardware (e.g. Apple Silicon), or to avoid warmup overhead.\n"
+        "  use_compile: true\n"
+        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
+        "  # padding waste and increase GPU utilization. Requires flash attention.\n"
+        "  use_packing: false\n"
+        "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
+        "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
+        "  target_packed_rows: null\n"
+        "\n"
         "resume:\n"
         "  # Set is_resume: true to resume training from a checkpoint\n"
         "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
@@ -657,10 +692,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
-        "\n"
-        "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
-        "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
-        "# pure_torch: false\n"
     )
 
     # If forcing, remove existing file first
@@ -670,12 +701,82 @@ def get_yaml(output: Optional[str], force: bool):
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
+def _resolve_pure_torch_config(raw: Dict[str, Any]) -> tuple:
+    """Resolve pure_torch configuration from YAML.
+
+    Expected YAML format::
+
+        pure_torch:
+          enabled: true
+          use_compile: true
+          use_packing: false
+          target_packed_rows: null
+
+    Returns ``(enabled, PureTorchConfig)``.
+    """
+    _PURE_TORCH_SUB_KEYS = ("use_compile", "use_packing", "target_packed_rows")
+
+    pure_torch_raw = raw.get("pure_torch")
+    pt_kwargs: Dict[str, Any] = {}
+
+    if isinstance(pure_torch_raw, dict):
+        enabled = bool(pure_torch_raw.get("enabled", False))
+        for key in _PURE_TORCH_SUB_KEYS:
+            if key in pure_torch_raw:
+                pt_kwargs[key] = pure_torch_raw[key]
+    else:
+        enabled = False
+
+    # Coerce types
+    for bool_key in ("use_compile", "use_packing"):
+        if bool_key in pt_kwargs and isinstance(pt_kwargs[bool_key], str):
+            pt_kwargs[bool_key] = pt_kwargs[bool_key].lower() == "true"
+    if "target_packed_rows" in pt_kwargs:
+        val = pt_kwargs["target_packed_rows"]
+        if isinstance(val, str):
+            pt_kwargs["target_packed_rows"] = int(val)
+
+    return enabled, PureTorchConfig(**pt_kwargs)
+
+
 def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
         raise ValueError("Pretraining configuration is required but not found in YAML")
 
+    normalized_config = dict(config)
+    legacy_aliases = {
+        "learning_rate": "adam_learning_rate",
+        "weight_decay": "adam_weight_decay",
+    }
+    for legacy_key, canonical_key in legacy_aliases.items():
+        if legacy_key not in normalized_config:
+            continue
+
+        legacy_value = normalized_config.get(legacy_key)
+        canonical_value = normalized_config.get(canonical_key)
+
+        if canonical_value is not None and legacy_value is not None:
+            same_value = legacy_value == canonical_value
+            if not same_value:
+                try:
+                    same_value = float(legacy_value) == float(canonical_value)
+                except (TypeError, ValueError):
+                    same_value = False
+            if not same_value:
+                logger.warning(
+                    f"Both '{legacy_key}' and '{canonical_key}' are set with different values. "
+                    f"Using '{canonical_key}' and ignoring '{legacy_key}'."
+                )
+        elif canonical_value is None and legacy_value is not None:
+            normalized_config[canonical_key] = legacy_value
+            logger.warning(
+                f"Deprecated key '{legacy_key}' detected; please use '{canonical_key}' instead."
+            )
+
+        normalized_config.pop(legacy_key, None)
+
     expected_keys = set(PretrainingConfig.__annotations__.keys())
-    present_keys = set(config.keys())
+    present_keys = set(normalized_config.keys())
 
     extra = []
     kwargs: Dict[str, Any] = {}
@@ -688,7 +789,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         )
 
     # Required key
-    if 'dataset_dir' not in config or not config['dataset_dir']:
+    if 'dataset_dir' not in normalized_config or not normalized_config['dataset_dir']:
         raise ValueError("dataset_dir is required in pretraining configuration")
 
     # Classify provided keys in one pass
@@ -696,7 +797,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = config.get(key)
+        value = normalized_config.get(key)
         if value is not None:
             kwargs[key] = value
 

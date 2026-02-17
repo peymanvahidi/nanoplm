@@ -17,6 +17,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_HAS_FLASH_VARLEN = False
+_flash_varlen_fn = None
+_FLASH_HAS_DROPOUT = False
+
+try:
+    # FA3 (Hopper / Blackwell)
+    from flash_attn_interface import flash_attn_varlen_func as _flash_varlen_fn
+    _HAS_FLASH_VARLEN = True
+    _FLASH_HAS_DROPOUT = False  # FA3 removed dropout_p
+except ImportError:
+    try:
+        # FA2 (Ampere+, RTX 30xx/40xx/50xx)
+        from flash_attn import flash_attn_varlen_func as _flash_varlen_fn
+        _HAS_FLASH_VARLEN = True
+        _FLASH_HAS_DROPOUT = True  # FA2 supports dropout_p
+    except ImportError:
+        pass
+
 
 @dataclass
 class ModernBertConfig:
@@ -138,6 +156,58 @@ def _sliding_attention_mask(
     return mask
 
 
+# ---------------------------------------------------------------------------
+# Unpadding helpers for flash_attn_varlen_func
+# ---------------------------------------------------------------------------
+
+
+def _unpad_input(
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Derive unpadding metadata from a (batch, seq_len) attention mask.
+
+    Returns:
+        indices:    (total_tokens,) – flat indices of non-padding positions.
+        cu_seqlens: (batch + 1,)    – cumulative sequence lengths (int32).
+        max_seqlen: 0-D int32 tensor – longest sequence in the batch.
+    """
+    seqlens = attention_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen = seqlens.max()  # keep as tensor to avoid torch.compile graph break
+    cu_seqlens = F.pad(torch.cumsum(seqlens, dim=0, dtype=torch.int32), (1, 0))
+    return indices, cu_seqlens, max_seqlen
+
+
+def _pad_output(
+    hidden: torch.Tensor,
+    indices: torch.Tensor,
+    batch: int,
+    seqlen: int,
+) -> torch.Tensor:
+    """Scatter a flat (total_tokens, …) tensor back to (batch, seqlen, …)."""
+    out = torch.zeros(
+        (batch * seqlen, *hidden.shape[1:]),
+        device=hidden.device,
+        dtype=hidden.dtype,
+    )
+    out[indices] = hidden
+    return out.view(batch, seqlen, *hidden.shape[1:])
+
+
+def _position_ids_from_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    total: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Convert cu_seqlens to per-token position IDs (reset to 0 per sequence).
+
+    Example: cu_seqlens=[0,3,5,9] → [0,1,2, 0,1, 0,1,2,3]
+    """
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    offsets = cu_seqlens[:-1].repeat_interleave(seq_lens)
+    return torch.arange(total, device=device, dtype=torch.int32) - offsets
+
+
 class ModernBertEmbeddings(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
@@ -256,12 +326,59 @@ class ModernBertAttention(nn.Module):
             else nn.Identity()
         )
 
+    # -- varlen (flash-attention) path -----------------------------------------
+
+    def _forward_varlen(
+        self,
+        x: torch.Tensor,
+        cos_sin: tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | torch.Tensor,
+        window_size: tuple[int, int],
+    ) -> torch.Tensor:
+        total = x.shape[0]  # (total_tokens, hidden)
+        qkv = self.Wqkv(x).view(total, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=1)  # each: (total, H, D)
+
+        cos, sin = cos_sin
+        q, k = _apply_rope(q, k, cos, sin)
+
+        # When max_seqlen is already a plain int (static-shape mode) skip .item()
+        # to avoid a graph break.  For tensor values (dynamic mode) .item() is
+        # fine — flash_attn is an opaque C extension at a graph boundary.
+        max_s = max_seqlen if isinstance(max_seqlen, int) else max_seqlen.item()
+        kwargs = dict(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_s,
+            max_seqlen_k=max_s,
+            softmax_scale=self.scale,
+            window_size=window_size,
+        )
+        if _FLASH_HAS_DROPOUT:
+            kwargs["dropout_p"] = self.dropout if self.training else 0.0
+
+        y = _flash_varlen_fn(q, k, v, **kwargs)
+        if isinstance(y, tuple):
+            y = y[0]
+
+        y = y.contiguous().view(total, -1)  # (total, hidden)
+        return self.out_drop(self.Wo(y))
+
+    # -- SDPA (fallback) path --------------------------------------------------
+
     def forward(
         self,
         x: torch.Tensor,
         cos_sin: tuple[torch.Tensor, torch.Tensor],
-        attn_mask: Optional[torch.Tensor],
+        attn_mask: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        window_size: Optional[tuple[int, int]] = None,
     ) -> torch.Tensor:
+        if cu_seqlens is not None:
+            return self._forward_varlen(x, cos_sin, cu_seqlens, max_seqlen, window_size)
+
         bsz, seq_len, _ = x.shape
         qkv = self.Wqkv(x).view(bsz, seq_len, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
@@ -304,10 +421,20 @@ class ModernBertEncoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor],
-        cos_sin: tuple[torch.Tensor, torch.Tensor],
+        attn_mask: Optional[torch.Tensor] = None,
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        window_size: Optional[tuple[int, int]] = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), cos_sin=cos_sin, attn_mask=attn_mask)
+        x = x + self.attn(
+            self.attn_norm(x),
+            cos_sin=cos_sin,
+            attn_mask=attn_mask,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            window_size=window_size,
+        )
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -327,7 +454,55 @@ class ModernBertModel(nn.Module):
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
+        _cu_seqlens: Optional[torch.Tensor] = None,
+        _max_seqlen: Optional[int] = None,
+        _position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # ---- varlen (flash-attention) path --------------------------------
+        if _cu_seqlens is not None:
+            device = input_ids.device
+            x = self.embeddings(input_ids)  # (total_tokens, hidden)
+
+            # Pre-compute RoPE tables up to max_position_embeddings (fixed size
+            # avoids graph breaks / recompilation) and index by _position_ids.
+            rope_len = self.config.max_position_embeddings
+            cos_f, sin_f = self.rotary_emb(
+                rope_len, device, x.dtype, "full_attention"
+            )
+            cos_s, sin_s = self.rotary_emb(
+                rope_len, device, x.dtype, "sliding_attention"
+            )
+            rope = {
+                "full_attention": (
+                    cos_f[0, _position_ids],
+                    sin_f[0, _position_ids],
+                ),
+                "sliding_attention": (
+                    cos_s[0, _position_ids],
+                    sin_s[0, _position_ids],
+                ),
+            }
+            windows = {
+                "full_attention": (-1, -1),
+                "sliding_attention": (
+                    self.config.sliding_window,
+                    self.config.sliding_window,
+                ),
+            }
+
+            for layer in self.layers:
+                lt = layer.attention_type
+                x = layer(
+                    x,
+                    cos_sin=rope[lt],
+                    cu_seqlens=_cu_seqlens,
+                    max_seqlen=_max_seqlen,
+                    window_size=windows[lt],
+                )
+
+            return self.final_norm(x)
+
+        # ---- SDPA (fallback) path -----------------------------------------
         _, seq_len = input_ids.shape
         if seq_len > self.config.max_position_embeddings:
             raise ValueError(
@@ -458,7 +633,98 @@ class ModernBertForMaskedLM(nn.Module):
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> dict[str, Optional[torch.Tensor]]:
+        # ---- static packed path (pre-flattened by collator) ---------------
+        # When both cu_seqlens and position_ids are provided and input_ids is
+        # already 1-D (flat), the collator has done all unpadding / position-id
+        # computation.  No data-dependent ops here → dynamic=False safe.
+        if cu_seqlens is not None and position_ids is not None and input_ids.dim() == 1:
+            if not _HAS_FLASH_VARLEN:
+                raise RuntimeError(
+                    "Sequence packing requires flash attention (flash_attn or "
+                    "flash_attn_interface)."
+                )
+            x = self.model(
+                input_ids,
+                _cu_seqlens=cu_seqlens,
+                _max_seqlen=max_seqlen,  # pass int directly — no tensor
+                _position_ids=position_ids,
+            )
+            # x: (F, hidden) where F is fixed flat length
+
+            if labels is not None:
+                logits = self.decoder(self.head(x))
+                loss = F.cross_entropy(
+                    logits.float(),
+                    labels,
+                    ignore_index=self.sparse_pred_ignore_index,
+                )
+            else:
+                logits = self.decoder(self.head(x))
+                loss = None
+
+            return {"loss": loss, "logits": logits}
+
+        use_varlen = (
+            _HAS_FLASH_VARLEN
+            and input_ids.is_cuda
+            and attention_mask is not None
+        )
+
+        # ---- varlen (flash-attention) path --------------------------------
+        if use_varlen:
+            batch, seq_len = input_ids.shape
+            indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+
+            if cu_seqlens is not None:
+                # Packed path: cu_seqlens provided by the packing collator.
+                # max_seqlen may be an int or a tensor; keep consistent.
+                if isinstance(max_seqlen, int):
+                    max_seqlen_t = torch.tensor(max_seqlen, dtype=torch.int32)
+                else:
+                    max_seqlen_t = max_seqlen
+            else:
+                # Unpacked path: derive cu_seqlens from attention_mask.
+                _indices, cu_seqlens, max_seqlen_t = _unpad_input(attention_mask)
+                indices = _indices
+
+            flat_ids = input_ids.view(-1)[indices]  # (total_tokens,)
+            position_ids = _position_ids_from_cu_seqlens(
+                cu_seqlens, flat_ids.shape[0], flat_ids.device
+            )
+
+            x = self.model(
+                flat_ids,
+                _cu_seqlens=cu_seqlens,
+                _max_seqlen=max_seqlen_t,
+                _position_ids=position_ids,
+            )
+            # x: (total_tokens, hidden) — flat, no padding
+
+            if self.sparse_prediction and labels is not None:
+                flat_labels = labels.view(-1)[indices]
+                keep = flat_labels != self.sparse_pred_ignore_index
+                logits = self.decoder(self.head(x[keep]))
+                loss = F.cross_entropy(logits.float(), flat_labels[keep])
+            elif labels is not None:
+                flat_labels = labels.view(-1)[indices]
+                logits = self.decoder(self.head(x))
+                loss = F.cross_entropy(
+                    logits.float(),
+                    flat_labels,
+                    ignore_index=self.sparse_pred_ignore_index,
+                )
+            else:
+                logits = self.decoder(self.head(x))
+                logits = _pad_output(logits, indices, batch, seq_len)
+                loss = None
+
+            return {"loss": loss, "logits": logits}
+
+        # ---- SDPA (fallback) path -----------------------------------------
         x = self.model(input_ids=input_ids, attention_mask=attention_mask)
 
         if self.sparse_prediction and labels is not None:
