@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import torch
 import torch.distributed as dist
 
 from nanoplm.utils.logger import logger
@@ -18,6 +19,7 @@ def is_muon_optimizer(optimizer) -> bool:
 def build_muon_optimizer(
     model: torch.nn.Module,
     pretrain_config,
+    distributed_mesh=None,
 ):
     """Partition model params into Muon (2D) and AdamW (1D/embedding) groups
     and build a Dion Muon/NorMuon optimizer.
@@ -77,6 +79,7 @@ def build_muon_optimizer(
         adamw_weight_decay=pretrain_config.adam_weight_decay,
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
         adamw_epsilon=pretrain_config.adam_epsilon,
+        distributed_mesh=distributed_mesh,
     )
 
 polar_express_coeffs = [

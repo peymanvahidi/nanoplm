@@ -17,7 +17,7 @@ from transformers import (
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from nanoplm.pretraining.optim import build_optimizer, is_muon_optimizer
+from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
@@ -26,90 +26,6 @@ from nanoplm.pretraining.utils import (
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
-
-
-def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    return model.module if hasattr(model, "module") else model
-
-
-def _is_embedding_or_unembedding_param(name: str) -> bool:
-    lname = name.lower()
-
-    # HF ModernBERT naming:
-    # - token embedding matrix: model.embeddings.tok_embeddings.weight
-    # - MLM output head: decoder.weight / decoder.bias
-    #   (decoder.weight is tied to token embeddings by default and may not appear
-    #   as a distinct named parameter).
-    if "embeddings.tok_embeddings" in lname:
-        return True
-    if lname.endswith("decoder.weight") or lname.endswith("decoder.bias"):
-        return True
-
-    # Fallbacks for other architectures.
-    return (
-        "embedding" in lname
-        or "lm_head" in lname
-        or "unembedding" in lname
-    )
-
-
-def _build_muon_optimizer(
-    model: torch.nn.Module,
-    pretrain_config: "PretrainingConfig",
-):
-    raw_model = _unwrap_model(model)
-
-    muon_params: list[torch.nn.Parameter] = []
-    adamw_params: list[torch.nn.Parameter] = []
-    seen: set[int] = set()
-
-    for name, param in raw_model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if id(param) in seen:
-            continue
-        seen.add(id(param))
-
-        if param.ndim == 1:
-            adamw_params.append(param)
-            continue
-        if _is_embedding_or_unembedding_param(name):
-            adamw_params.append(param)
-            continue
-        if param.ndim == 2:
-            muon_params.append(param)
-            continue
-
-        # Muon is intended for hidden-layer matrices; route everything else to AdamW.
-        adamw_params.append(param)
-
-    if not muon_params:
-        raise ValueError(
-            "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
-        )
-
-    logger.info(
-        "Muon grouping: "
-        f"muon_params={len(muon_params)} tensors, "
-        f"adamw_params={len(adamw_params)} tensors"
-    )
-
-    return build_optimizer(
-        muon_params=muon_params,
-        adamw_params=adamw_params,
-        muon_learning_rate=pretrain_config.muon_learning_rate,
-        muon_weight_decay=pretrain_config.muon_weight_decay,
-        muon_cautious_weight_decay=pretrain_config.muon_cautious_weight_decay,
-        muon_use_polar_express=pretrain_config.muon_use_polar_express,
-        muon_momentum=pretrain_config.muon_momentum,
-        muon_nesterov=pretrain_config.muon_nesterov,
-        muon_eps=pretrain_config.muon_eps,
-        use_normuon=str(pretrain_config.optimizer).lower() == "normuon",
-        adamw_learning_rate=pretrain_config.adam_learning_rate,
-        adamw_weight_decay=pretrain_config.adam_weight_decay,
-        adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
-        adamw_epsilon=pretrain_config.adam_epsilon,
-    )
 
 
 class TokenTrackingTrainer(Trainer):
@@ -378,7 +294,7 @@ def run_pretraining(
     elif optimizer_name == "stable_adamw":
         training_dict["optim"] = "stable_adamw"
     elif optimizer_name in {"muon", "normuon"}:
-        custom_optimizer = _build_muon_optimizer(model, pretrain_config)
+        custom_optimizer = build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
             f"Invalid optimizer: {pretrain_config.optimizer}. "
