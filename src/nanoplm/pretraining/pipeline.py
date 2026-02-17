@@ -19,8 +19,9 @@ from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from dion import Muon as DionMuon, NorMuon as DionNorMuon
+from torch.optim.lr_scheduler import LambdaLR
+
 from nanoplm.pretraining.optim import build_optimizer
-from nanoplm.pretraining.pure_pipeline import _create_scheduler
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
@@ -108,6 +109,19 @@ def _build_muon_optimizer(
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
         adamw_epsilon=pretrain_config.adam_epsilon,
     )
+
+
+def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, min_lr: float) -> LambdaLR:
+    min_lr_ratio = min_lr / learning_rate if learning_rate > 0 else 0.0
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = (step - warmup_steps) / decay_steps
+        return max(min_lr_ratio, 1.0 - (1.0 - min_lr_ratio) * progress)
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 class TokenTrackingTrainer(Trainer):
