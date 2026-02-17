@@ -33,7 +33,7 @@ pip install nanoplm
 Remember for CUDA, you should install some other dependencies as well.
 ```bash
 pip install "nanoplm[cuda]"
-
+```
 ---
 
 ## 🤖 Zero‑to‑model in 4 commands
