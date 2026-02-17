@@ -222,17 +222,24 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
     raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon]")
 
 
-def _create_scheduler(optimizer, warmup_steps: int, total_steps: int) -> LambdaLR:
+def _create_scheduler(
+    optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    learning_rate: float,
+    min_lr: float,
+) -> LambdaLR:
+    min_lr_ratio = min_lr / learning_rate if learning_rate > 0 else 0.0
+
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
-        return max(0.0, (total_steps - step) / max(1, total_steps - warmup_steps))
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = (step - warmup_steps) / decay_steps
+        # Linear decay from 1.0 to min_lr_ratio
+        return max(min_lr_ratio, 1.0 - (1.0 - min_lr_ratio) * progress)
 
     return LambdaLR(optimizer, lr_lambda)
-
-
-def _get_warmup_steps(total_steps: int, warmup_value: float) -> int:
-    return int(warmup_value) if warmup_value >= 1 else math.ceil(total_steps * warmup_value)
 
 
 def _resolve_world_size(cfg: PretrainingConfig) -> int:
@@ -603,8 +610,11 @@ def run_pure_pretraining(
             synced_len = _min_safe_batches
     steps_per_epoch = max(1, math.ceil(synced_len / max(1, inferred_grad_accum_steps)))
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = _get_warmup_steps(total_steps, float(pretrain_config.warmup_ratio))
-    scheduler = _create_scheduler(optimizer, warmup_steps, total_steps)
+    warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+    scheduler = _create_scheduler(
+        optimizer, warmup_steps, total_steps,
+        pretrain_config.learning_rate, pretrain_config.min_lr,
+    )
 
     # ---- Resume ----
     start_step, start_epoch = 0, 0

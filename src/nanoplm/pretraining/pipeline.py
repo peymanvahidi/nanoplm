@@ -20,6 +20,7 @@ from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from dion import Muon as DionMuon, NorMuon as DionNorMuon
 from nanoplm.pretraining.optim import build_optimizer
+from nanoplm.pretraining.pure_pipeline import _create_scheduler
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
@@ -193,7 +194,8 @@ class PretrainingConfig:
     # Training hyperparameters
     micro_batch_size: int = 32
     num_epochs: int = 10
-    warmup_ratio: float = 0.05
+    warmup_steps: int = 350
+    min_lr: float = 1e-5
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
@@ -537,6 +539,10 @@ def run_pretraining(
         global_batch_size_samples=global_batch_size_samples,
     )
 
+    steps_per_epoch = (train_sequences + global_batch_size_samples - 1) // global_batch_size_samples
+    total_steps = num_epochs * steps_per_epoch
+    warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+
     # Configure Weights & Biases via environment variables so HF Trainer attaches correctly
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name
     os.environ["WANDB_NAME"] = wandb_run_name
@@ -551,7 +557,6 @@ def run_pretraining(
         "num_train_epochs": num_epochs,
         "learning_rate": pretrain_config.learning_rate,
         "weight_decay": pretrain_config.weight_decay,
-        "warmup_ratio": pretrain_config.warmup_ratio,
         "logging_strategy": "steps",
         "logging_steps": logging_steps,
         "logging_dir": Path(output_dir) / "logs",
@@ -574,20 +579,41 @@ def run_pretraining(
         training_dict["dataloader_prefetch_factor"] = pretrain_config.prefetch_factor
         training_dict["dataloader_persistent_workers"] = True
 
-    # Configure optimizer through TrainingArguments
+    # Build optimizer and scheduler (warmup_steps + min_lr) for all optimizer types
     optimizer_name = pretrain_config.optimizer.lower()
-    custom_optimizer = None
+    raw_model = _unwrap_model(model)
     if optimizer_name == "adamw":
-        training_dict["optim"] = "adamw_torch"
+        optimizer = torch.optim.AdamW(
+            raw_model.parameters(),
+            lr=pretrain_config.learning_rate,
+            weight_decay=pretrain_config.weight_decay,
+            betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
+            eps=pretrain_config.adam_epsilon,
+        )
     elif optimizer_name == "stable_adamw":
-        training_dict["optim"] = "stable_adamw"
+        stable_cls = getattr(torch.optim, "StableAdamW", None)
+        if stable_cls is None:
+            logger.warning("StableAdamW unavailable; falling back to AdamW.")
+            stable_cls = torch.optim.AdamW
+        optimizer = stable_cls(
+            raw_model.parameters(),
+            lr=pretrain_config.learning_rate,
+            weight_decay=pretrain_config.weight_decay,
+            betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
+            eps=pretrain_config.adam_epsilon,
+        )
     elif optimizer_name in {"muon", "normuon"}:
-        custom_optimizer = _build_muon_optimizer(model, pretrain_config)
+        optimizer = _build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
             f"Invalid optimizer: {pretrain_config.optimizer}. "
             f"Currently supported: [adamw, stable_adamw, muon, normuon]"
         )
+
+    scheduler = _create_scheduler(
+        optimizer, warmup_steps, total_steps,
+        pretrain_config.learning_rate, pretrain_config.min_lr,
+    )
 
     if pretrain_config.multi_gpu:
         training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
@@ -602,8 +628,7 @@ def run_pretraining(
         train_dataset=train_ds,
         eval_dataset=val_ds,
         processing_class=tokenizer,
-        # When provided, custom optimizer/scheduler override TrainingArguments.optim.
-        optimizers=(custom_optimizer, None),
+        optimizers=(optimizer, scheduler),
     )
 
     logger.info("Starting Trainer")

@@ -34,7 +34,6 @@ from nanoplm.pretraining.pure_pipeline import (
     _dist_barrier,
     _estimate_model_flops_per_token,
     _evaluate,
-    _get_warmup_steps,
     _load_checkpoint,
     _move_batch_to_device,
     _num_update_steps_per_epoch,
@@ -468,8 +467,11 @@ def run_te_pretraining(
         grad_accum=inferred_grad_accum_steps,
     )
     total_steps = num_epochs * steps_per_epoch
-    warmup_steps = _get_warmup_steps(total_steps, float(pretrain_config.warmup_ratio))
-    scheduler = _create_scheduler(optimizer, warmup_steps, total_steps)
+    warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+    scheduler = _create_scheduler(
+        optimizer, warmup_steps, total_steps,
+        pretrain_config.learning_rate, pretrain_config.min_lr,
+    )
 
     start_step = 0
     start_epoch = 0

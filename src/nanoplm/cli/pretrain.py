@@ -130,10 +130,16 @@ def pretrain():
     help="Weight decay"
 )
 @click.option(
-    "--warmup-ratio",
+    "--warmup-steps",
+    type=int,
+    default=350,
+    help="Number of warmup steps"
+)
+@click.option(
+    "--min-lr",
     type=float,
-    default=0.05,
-    help="Warmup ratio"
+    default=1e-5,
+    help="Minimum learning rate (LR decays to this after warmup)"
 )
 @click.option(
     "--global-batch-size",
@@ -390,7 +396,8 @@ def run(
     num_epochs: int,
     learning_rate: float,
     weight_decay: float,
-    warmup_ratio: float,
+    warmup_steps: int,
+    min_lr: float,
     global_batch_size: int,
     optimizer: str,
     adam_beta1: float,
@@ -445,7 +452,8 @@ def run(
         num_epochs=num_epochs,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
+        min_lr=min_lr,
         global_batch_size=global_batch_size,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
@@ -702,7 +710,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
-        "  warmup_ratio: 0.05\n"
+        "  warmup_steps: 350\n"
+        "  min_lr: 1e-5\n"
         "  weight_decay: 0.0\n"
         "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
         "  muon_learning_rate: 1e-3\n"
@@ -810,7 +819,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_weight_decay",
         "muon_momentum",
         "muon_eps",
-        "warmup_ratio",
+        "min_lr",
     ]
     for field in float_fields:
         if isinstance(kwargs.get(field), str):
@@ -818,6 +827,13 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 kwargs[field] = float(kwargs[field])
             except ValueError as exc:
                 raise ValueError(f"Invalid {field} value: {kwargs[field]}. Must be a number.") from exc
+
+    # Ensure warmup_steps is int (YAML may load as int or float).
+    if "warmup_steps" in kwargs and kwargs["warmup_steps"] is not None:
+        try:
+            kwargs["warmup_steps"] = int(kwargs["warmup_steps"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid warmup_steps value: {kwargs['warmup_steps']}. Must be an integer.") from exc
 
     # Handle boolean values
     for bool_key in [
