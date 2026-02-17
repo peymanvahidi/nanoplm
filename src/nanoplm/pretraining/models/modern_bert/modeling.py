@@ -642,6 +642,11 @@ class ModernBertForMaskedLM(nn.Module):
         # already 1-D (flat), the collator has done all unpadding / position-id
         # computation.  No data-dependent ops here → dynamic=False safe.
         if cu_seqlens is not None and position_ids is not None and input_ids.dim() == 1:
+            if not _HAS_FLASH_VARLEN:
+                raise RuntimeError(
+                    "Sequence packing requires flash attention (flash_attn or "
+                    "flash_attn_interface)."
+                )
             x = self.model(
                 input_ids,
                 _cu_seqlens=cu_seqlens,
