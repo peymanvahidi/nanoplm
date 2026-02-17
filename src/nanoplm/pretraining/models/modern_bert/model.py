@@ -38,6 +38,7 @@ class ProtModernBertMLMConfig:
     attention_bias: bool = False
     attention_dropout: float = 0.0
     classifier_activation: str = "gelu"
+    max_position_embeddings: int = 1024
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
 
@@ -53,7 +54,7 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             intermediate_size=config.intermediate_size,
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
-            max_position_embeddings=1024, # this is hardcoded
+            max_position_embeddings=config.max_position_embeddings, 
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
             attention_bias=config.attention_bias,

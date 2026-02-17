@@ -388,6 +388,7 @@ def run(
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
+    max_position_embeddings: int,
     pure_torch: bool,
 ):
     """Run MLM pretraining with ModernBERT backbone."""
@@ -446,6 +447,7 @@ def run(
         attention_bias=attention_bias,
         attention_dropout=attention_dropout,
         classifier_activation=classifier_activation,
+        max_position_embeddings=max_position_embeddings,
     )
 
     if pure_torch:
@@ -607,6 +609,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
+        "  max_position_embeddings: 1024 # needs to be at least as long as max seq length\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"

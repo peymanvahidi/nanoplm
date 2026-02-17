@@ -30,7 +30,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
             mlp_activation=config.mlp_activation,
-            max_position_embeddings=1024,  # hardcoded (matches HF wrapper)
+            max_position_embeddings=config.max_position_embeddings,  # hardcoded (matches HF wrapper)
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
             attention_bias=config.attention_bias,
