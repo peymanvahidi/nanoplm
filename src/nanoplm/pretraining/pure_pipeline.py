@@ -8,9 +8,6 @@ import gc
 import json
 import math
 import os
-
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-
 import random
 import time
 from contextlib import nullcontext
@@ -49,11 +46,6 @@ from nanoplm.pretraining.utils import (
 )
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
-
-torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 
 
 def _set_seed(seed: int) -> None:
@@ -347,6 +339,16 @@ def run_pure_pretraining(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
+    # Set allocator config (respect existing user settings)
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+    # Enable reduced-precision for training performance
+    if pretrain_config.bf16 or pretrain_config.tf32:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     _set_seed(pretrain_config.seed)
     tokenizer = model.tokenizer
     device = torch.device(get_device())
