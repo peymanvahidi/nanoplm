@@ -12,12 +12,8 @@ import torch
 from typing import Optional, Dict, Any, Union
 from pathlib import Path
 
-from nanoplm.pretraining.pipeline import (
-    PretrainingConfig,
-    PureTorchConfig,
-    ResumeConfig,
-    run_pretraining,
-)
+from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
+from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM

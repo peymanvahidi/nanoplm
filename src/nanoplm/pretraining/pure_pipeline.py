@@ -35,11 +35,7 @@ from nanoplm.pretraining.collator import PackingCollator, ProtDataCollatorForLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
-from nanoplm.pretraining.pipeline import (
-    PretrainingConfig,
-    PureTorchConfig,
-    ResumeConfig,
-)
+from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,

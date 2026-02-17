@@ -15,7 +15,7 @@ from nanoplm.utils.common import create_dirs
 from nanoplm.utils.logger import logger
 
 if TYPE_CHECKING:
-    from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig
+    from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 
 
 @dataclass
