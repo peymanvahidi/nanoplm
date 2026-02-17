@@ -17,8 +17,7 @@ from transformers import (
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from dion import Muon as DionMuon, NorMuon as DionNorMuon
-from nanoplm.pretraining.optim import build_optimizer
+from nanoplm.pretraining.optim import build_optimizer, is_muon_optimizer
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
@@ -168,7 +167,7 @@ class TokenTrackingTrainer(Trainer):
 
         optimizer = self.optimizer
         seen: set[int] = set()
-        while optimizer is not None and not isinstance(optimizer, (DionMuon, DionNorMuon)):
+        while optimizer is not None and not is_muon_optimizer(optimizer):
             opt_id = id(optimizer)
             if opt_id in seen:
                 break
@@ -178,7 +177,7 @@ class TokenTrackingTrainer(Trainer):
                 break
             optimizer = inner
 
-        if isinstance(optimizer, (DionMuon, DionNorMuon)):
+        if is_muon_optimizer(optimizer):
             # param_groups[0] = muon, param_groups[1] = adamw
             muon_lr = optimizer.param_groups[0]["lr"]
             adamw_lr = optimizer.param_groups[1]["lr"]
