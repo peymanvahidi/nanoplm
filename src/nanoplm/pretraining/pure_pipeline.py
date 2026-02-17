@@ -372,7 +372,49 @@ def _load_checkpoint(model, optimizer, scheduler, checkpoint_dir, device, distri
     else:
         model.load_state_dict(model_sd)
 
-    optimizer.load_state_dict(torch.load(ckp / "optimizer.pt", map_location=device, weights_only=True))
+    opt_sd = torch.load(ckp / "optimizer.pt", map_location=device, weights_only=True)
+
+    # When resuming under FSDP2, the checkpoint contains full (unsharded) optimizer
+    # state tensors but the live parameters are sharded across ranks. We must slice
+    # each optimizer buffer to match the corresponding parameter's local shard shape.
+    if distributed and dist.is_initialized():
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+
+        # Build map: param index -> local parameter tensor
+        param_by_idx: dict[int, torch.nn.Parameter] = {}
+        all_params = list(optimizer.param_groups[0]["params"]) + list(optimizer.param_groups[1]["params"])
+        for idx, p in enumerate(all_params):
+            param_by_idx[idx] = p
+
+        for param_idx, state_dict_entry in opt_sd.get("state", {}).items():
+            local_param = param_by_idx.get(param_idx)
+            if local_param is None:
+                continue
+            # Get local shape (after FSDP sharding)
+            local_shape = local_param.shape if not isinstance(local_param, DTensor) else local_param._local_tensor.shape
+            for key, val in state_dict_entry.items():
+                if not isinstance(val, torch.Tensor):
+                    continue
+                # If shapes already match, skip
+                if val.shape == local_shape:
+                    continue
+                # Shard along dim 0 (FSDP default sharding dimension)
+                if val.ndim >= 1 and val.shape[0] == local_shape[0] * world:
+                    chunk_size = val.shape[0] // world
+                    state_dict_entry[key] = val.narrow(0, rank * chunk_size, chunk_size).contiguous()
+                elif val.ndim >= 1 and val.shape[0] != local_shape[0]:
+                    # Non-standard sharding; try simple chunk
+                    chunks = val.chunk(world, dim=0)
+                    if chunks[rank].shape[0] == local_shape[0]:
+                        state_dict_entry[key] = chunks[rank].contiguous()
+                    else:
+                        logger.warning(
+                            f"Optimizer state param {param_idx} key '{key}': "
+                            f"shape {val.shape} cannot be sharded to match local {local_shape}"
+                        )
+
+    optimizer.load_state_dict(opt_sd)
     scheduler.load_state_dict(torch.load(ckp / "scheduler.pt", map_location=device, weights_only=True))
 
     rng_path = ckp / "rng_state.pth"
