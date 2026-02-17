@@ -829,6 +829,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'muon_cautious_weight_decay',
         'muon_use_polar_express',
         'use_packing',
+        'profiler_enabled',
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]

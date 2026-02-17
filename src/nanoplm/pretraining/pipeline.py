@@ -248,6 +248,13 @@ class PretrainingConfig:
     # for tighter packing.  Higher values = better packing, less randomness.
     mega_batch_multiplier: int = 100
 
+    # Profiling (TE pipeline only). When enabled on rank 0:
+    # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.
+    # - Otherwise: uses PyTorch profiler and exports a Chrome trace (chrome://tracing) to ckp_dir.
+    profiler_enabled: bool = False
+    profiler_start_step: int = 10
+    profiler_end_step: int = 15
+
     # Distributed training
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
