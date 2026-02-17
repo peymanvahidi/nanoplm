@@ -733,7 +733,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  prefetch_factor: 2\n"
         "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
         "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te\n"
-        "  use_packing: false\n"
+        "  use_packing: true\n"
         "\n"
         "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
         "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
