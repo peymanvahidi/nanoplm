@@ -14,6 +14,7 @@ from pathlib import Path
 
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
+    PureTorchConfig,
     ResumeConfig,
     run_pretraining,
 )
@@ -224,6 +225,11 @@ def pretrain():
     help="DataLoader prefetch factor"
 )
 @click.option(
+    "--compile/--no-compile",
+    default=True,
+    help="Enable torch.compile for faster training (disable for debugging or unsupported hardware)"
+)
+@click.option(
     "--use-packing/--no-packing",
     default=False,
     help="Enable sequence packing to eliminate padding waste (requires flash attention)"
@@ -369,6 +375,7 @@ def run(
     keep_probability: float,
     num_workers: Union[int, str],
     prefetch_factor: int,
+    compile: bool,
     use_packing: bool,
     target_packed_rows: Optional[int],
     bf16: bool,
@@ -426,8 +433,6 @@ def run(
         seed=seed,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
-        use_packing=use_packing,
-        target_packed_rows=target_packed_rows,
         bf16=bf16,
         tf32=tf32,
         multi_gpu=multi_gpu,
@@ -464,7 +469,12 @@ def run(
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     if pure_torch:
-        run_pure_pretraining(model=model, pretrain_config=cfg)
+        pt_cfg = PureTorchConfig(
+            use_compile=compile,
+            use_packing=use_packing,
+            target_packed_rows=target_packed_rows,
+        )
+        run_pure_pretraining(model=model, pretrain_config=cfg, pure_torch_config=pt_cfg)
     else:
         run_pretraining(model=model, pretrain_config=cfg)
 
@@ -479,19 +489,15 @@ def run(
     default="pretrain.yaml",
     type=click.Path(exists=True, dir_okay=False, readable=True),
 )
-@click.option(
-    "--pure-torch",
-    is_flag=True,
-    default=False,
-    help="Use custom pure-torch model and training loop instead of HF Trainer",
-)
-def from_yaml(config: str, pure_torch: bool):
-    """Run pretraining from a YAML file with training and model parameters.
+def from_yaml(config: str):
+    f"""Run pretraining from a YAML file with training and model parameters.
 
-    Expected YAML structure:
-    pretraining: {...}
-    model: {...}
-    resume: {...}
+    Expected YAML structure::
+
+        model: {...}
+        pretraining: {...}
+        pure_torch: {...}
+        resume: {...}
 
     If resume.is_resume is True, training will resume from the given
     checkpoint using the hyperparameters in the 'pretraining' block.
@@ -512,9 +518,8 @@ def from_yaml(config: str, pure_torch: bool):
     model_dict = raw.get("model")
     resume_dict = raw.get("resume")
 
-    # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
-    if not pure_torch:
-        pure_torch = bool(raw.get("pure_torch", False))
+    # Resolve pure_torch section
+    pure_torch, pure_torch_config = _resolve_pure_torch_config(raw)
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
@@ -539,6 +544,7 @@ def from_yaml(config: str, pure_torch: bool):
         run_pure_pretraining(
             model=model,
             pretrain_config=pretrain_config,
+            pure_torch_config=pure_torch_config,
             resume_config=resume_config if resume_config.is_resume else None,
         )
     else:
@@ -629,7 +635,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_epochs: 10\n"
         "  warmup_ratio: 0.05\n"
         "\n"
-        "  optimizer: \"normuon\"  # adamw, stable_adamw, muon, normuon\n"
+        "  optimizer: \"adamw\"  # adamw, stable_adamw, muon, normuon (muon and normouon only supported with CUDA)\n"
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
         "  adam_learning_rate: 1e-3\n"
         "  adam_weight_decay: 0.0\n"
@@ -655,12 +661,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
-        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
-        "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch\n"
-        "  use_packing: false\n"
-        "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
-        "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
-        "  target_packed_rows: null\n"
         "\n"
         "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
         "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
@@ -676,6 +676,19 @@ def get_yaml(output: Optional[str], force: bool):
         "  world_size: 1  # Use \"auto\" if you want to use all available GPUs\n"
         "  project_name: \"nanoplm-pretraining\"\n"
         "\n"
+        "# Pure-torch training loop settings (alternative to HF Trainer).\n"
+        "pure_torch:\n"
+        "  enabled: false\n"
+        "  # torch.compile: compile the model for faster training. Disable for debugging,\n"
+        "  # unsupported hardware (e.g. Apple Silicon), or to avoid warmup overhead.\n"
+        "  use_compile: true\n"
+        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
+        "  # padding waste and increase GPU utilization. Requires flash attention.\n"
+        "  use_packing: false\n"
+        "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
+        "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
+        "  target_packed_rows: null\n"
+        "\n"
         "resume:\n"
         "  # Set is_resume: true to resume training from a checkpoint\n"
         "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
@@ -683,10 +696,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
-        "\n"
-        "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
-        "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
-        "# pure_torch: false\n"
     )
 
     # If forcing, remove existing file first
@@ -695,6 +704,44 @@ def get_yaml(output: Optional[str], force: bool):
 
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
+
+def _resolve_pure_torch_config(raw: Dict[str, Any]) -> tuple:
+    """Resolve pure_torch configuration from YAML.
+
+    Expected YAML format::
+
+        pure_torch:
+          enabled: true
+          use_compile: true
+          use_packing: false
+          target_packed_rows: null
+
+    Returns ``(enabled, PureTorchConfig)``.
+    """
+    _PURE_TORCH_SUB_KEYS = ("use_compile", "use_packing", "target_packed_rows")
+
+    pure_torch_raw = raw.get("pure_torch")
+    pt_kwargs: Dict[str, Any] = {}
+
+    if isinstance(pure_torch_raw, dict):
+        enabled = bool(pure_torch_raw.get("enabled", False))
+        for key in _PURE_TORCH_SUB_KEYS:
+            if key in pure_torch_raw:
+                pt_kwargs[key] = pure_torch_raw[key]
+    else:
+        enabled = False
+
+    # Coerce types
+    for bool_key in ("use_compile", "use_packing"):
+        if bool_key in pt_kwargs and isinstance(pt_kwargs[bool_key], str):
+            pt_kwargs[bool_key] = pt_kwargs[bool_key].lower() == "true"
+    if "target_packed_rows" in pt_kwargs:
+        val = pt_kwargs["target_packed_rows"]
+        if isinstance(val, str):
+            pt_kwargs["target_packed_rows"] = int(val)
+
+    return enabled, PureTorchConfig(**pt_kwargs)
+
 
 def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
@@ -791,7 +838,6 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'muon_nesterov',
         'muon_cautious_weight_decay',
         'muon_use_polar_express',
-        'use_packing',
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
@@ -799,13 +845,6 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 continue
             elif isinstance(value, str):
                 kwargs[bool_key] = value.lower() == 'true'
-
-    # Handle optional int fields (may come as string from CLI overrides)
-    for int_key in ['target_packed_rows']:
-        if int_key in kwargs:
-            value = kwargs[int_key]
-            if isinstance(value, str):
-                kwargs[int_key] = int(value)
 
     return PretrainingConfig(**kwargs)
 

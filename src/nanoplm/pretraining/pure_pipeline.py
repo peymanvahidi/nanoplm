@@ -37,6 +37,7 @@ from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBert
 from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
+    PureTorchConfig,
     ResumeConfig,
 )
 from nanoplm.pretraining.utils import (
@@ -337,8 +338,12 @@ def _load_checkpoint(
 def run_pure_pretraining(
     model: PureProtModernBertMLM,
     pretrain_config: PretrainingConfig,
+    pure_torch_config: Optional[PureTorchConfig] = None,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
+    if pure_torch_config is None:
+        pure_torch_config = PureTorchConfig()
+
     # Set allocator config (respect existing user settings)
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
@@ -386,8 +391,8 @@ def run_pure_pretraining(
         )
         raise
 
-    use_packing = bool(pretrain_config.use_packing)
-    target_rows = pretrain_config.target_packed_rows
+    use_packing = bool(pure_torch_config.use_packing)
+    target_rows = pure_torch_config.target_packed_rows
     use_static_packing = use_packing and target_rows is not None
 
     if use_packing:
@@ -515,16 +520,19 @@ def run_pure_pretraining(
     # Compile model for faster training. Keep orig_model for checkpointing/eval
     # (eval inputs may change shape, which would cause recompilation).
     orig_model = model
-    if use_static_packing:
-        # Static shapes: collator pre-flattens and pads to fixed sizes,
-        # so no data-dependent ops inside the compiled graph.
-        model = torch.compile(model, dynamic=False)
-        logger.info("Model compiled with torch.compile(dynamic=False)")
+    if pure_torch_config.use_compile:
+        if use_static_packing:
+            # Static shapes: collator pre-flattens and pads to fixed sizes,
+            # so no data-dependent ops inside the compiled graph.
+            model = torch.compile(model, dynamic=False)
+            logger.info("Model compiled with torch.compile(dynamic=False)")
+        else:
+            # dynamic=True because varlen flash-attention produces variable-length
+            # unpadded tensors per batch.
+            model = torch.compile(model, dynamic=True)
+            logger.info("Model compiled with torch.compile(dynamic=True)")
     else:
-        # dynamic=True because varlen flash-attention produces variable-length
-        # unpadded tensors per batch.
-        model = torch.compile(model, dynamic=True)
-        logger.info("Model compiled with torch.compile(dynamic=True)")
+        logger.info("torch.compile disabled")
 
     # Eval always uses a standard padding collator (no packing) so that
     # _evaluate() sees 2-D batches with attention_mask regardless of the
