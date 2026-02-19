@@ -330,7 +330,7 @@ def run_te_pretraining(
         train_ds = TokenPackingDataset(
             train_ds,
             max_tokens_per_batch=tokens_per_micro,
-            drop_last=False,
+            drop_last=True,
             split_samples=False,
             sampler=_inner_sampler,
         )
