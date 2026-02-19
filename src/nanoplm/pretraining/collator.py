@@ -167,6 +167,9 @@ class DataCollatorWithFlattening:
 
     collator: DataCollatorForLanguageModeling
     return_position_ids: bool = False
+    fixed_tokens_per_batch: int | None = None
+    seq_count_buckets: list[int] | None = None
+    max_seqlen_buckets: list[int] | None = None
     pad_to_multiple_of: int | None = None
     pad_sequences_to_be_divisible_by: int | None = None
     separator_id: int | None = None
@@ -180,6 +183,24 @@ class DataCollatorWithFlattening:
             raise ValueError(
                 "pad_sequences_to_be_divisible_by and pad_to_multiple_of cannot be used together"
             )
+        if self.fixed_tokens_per_batch is not None:
+            self.fixed_tokens_per_batch = int(self.fixed_tokens_per_batch)
+            if self.fixed_tokens_per_batch <= 0:
+                raise ValueError("fixed_tokens_per_batch must be > 0")
+            if self.pad_to_multiple_of is not None:
+                raise ValueError(
+                    "fixed_tokens_per_batch and pad_to_multiple_of cannot be used together"
+                )
+        if self.seq_count_buckets is not None:
+            buckets = sorted({int(x) for x in self.seq_count_buckets if int(x) > 0})
+            if not buckets:
+                raise ValueError("seq_count_buckets must contain at least one positive value")
+            self.seq_count_buckets = buckets
+        if self.max_seqlen_buckets is not None:
+            buckets = sorted({int(x) for x in self.max_seqlen_buckets if int(x) > 0})
+            if not buckets:
+                raise ValueError("max_seqlen_buckets must contain at least one positive value")
+            self.max_seqlen_buckets = buckets
 
     def __call__(self, features, return_tensors=None):
         """Process a batch of variable-length sequences for Flash Attention with MLM.
@@ -232,11 +253,36 @@ class DataCollatorWithFlattening:
         if self.return_position_ids:
              # position_ids [0..len-1] for each sequence, concatenated
              # We can generate this easily
-             position_ids_list = [torch.arange(slen, device=flat_input_ids.device) for slen in seq_lengths]
+             position_ids_list = [
+                 torch.arange(int(slen.item()), device=flat_input_ids.device)
+                 for slen in seq_lengths
+             ]
              packed_batch["position_ids"] = torch.cat(position_ids_list)
 
-        if self.pad_to_multiple_of is not None:
-             packed_batch = self._pad_batch_to_multiple_of(packed_batch)
+        if self.fixed_tokens_per_batch is not None:
+            packed_batch = self._pad_batch_to_fixed_tokens(packed_batch)
+        elif self.pad_to_multiple_of is not None:
+            packed_batch = self._pad_batch_to_multiple_of(packed_batch)
+
+        if self.max_seqlen_buckets is not None:
+            packed_batch["max_seqlen"] = _bucket_ceiling(
+                int(packed_batch["max_seqlen"]),
+                self.max_seqlen_buckets,
+                name="max_seqlen",
+            )
+
+        if self.seq_count_buckets is not None and "cu_seqlens" in packed_batch:
+            num_seq = int(packed_batch["cu_seqlens"].numel() - 1)
+            bucketed_num_seq = _bucket_ceiling(
+                num_seq,
+                self.seq_count_buckets,
+                name="num_sequences",
+            )
+            target_cu_entries = bucketed_num_seq + 1
+            packed_batch["cu_seqlens"] = _pad_cu_seqlens_entries(
+                packed_batch["cu_seqlens"],
+                target_entries=target_cu_entries,
+            )
 
         return packed_batch
 
@@ -254,6 +300,68 @@ class DataCollatorWithFlattening:
             token_pad=pad_token_id,
             label_pad=-100,
         )
+
+    def _pad_batch_to_fixed_tokens(self, batch):
+        """Pad batch to exactly fixed_tokens_per_batch with a trailing dummy sequence."""
+        pad_token_id = self.collator.tokenizer.pad_token_id
+        if not isinstance(pad_token_id, int):
+            pad_token_id = 0
+
+        assert self.fixed_tokens_per_batch is not None
+        return _pt_pad_to_fixed_tokens(
+            batch,
+            fixed_tokens=self.fixed_tokens_per_batch,
+            token_pad=pad_token_id,
+            label_pad=-100,
+        )
+
+
+def build_power_of_two_buckets(max_value: int, min_power_of_two: int = 32) -> list[int]:
+    """Build ascending bucket edges with powers-of-two plus an exact max_value tail."""
+    max_value = int(max_value)
+    min_power_of_two = int(min_power_of_two)
+    if max_value <= 0:
+        raise ValueError("max_value must be > 0")
+    if min_power_of_two <= 0:
+        raise ValueError("min_power_of_two must be > 0")
+
+    buckets: list[int] = []
+    bucket = 1
+    while bucket < min_power_of_two:
+        bucket <<= 1
+    while bucket < max_value:
+        buckets.append(bucket)
+        bucket <<= 1
+    if not buckets or buckets[-1] != max_value:
+        buckets.append(max_value)
+    return buckets
+
+
+def _bucket_ceiling(value: int, buckets: list[int], name: str) -> int:
+    """Return first bucket >= value or raise if out of range."""
+    for bucket in buckets:
+        if value <= bucket:
+            return bucket
+    raise ValueError(
+        f"{name}={value} exceeds configured bucket max={buckets[-1]}. "
+        "Increase bucket ranges."
+    )
+
+
+def _pad_cu_seqlens_entries(cu_seqlens: torch.Tensor, target_entries: int) -> torch.Tensor:
+    """Right-pad cu_seqlens with repeated terminal value to target length."""
+    target_entries = int(target_entries)
+    if target_entries <= 0:
+        raise ValueError("target_entries must be > 0")
+    if cu_seqlens.numel() > target_entries:
+        raise ValueError(
+            f"cu_seqlens has {cu_seqlens.numel()} entries, target_entries={target_entries}"
+        )
+    if cu_seqlens.numel() == target_entries:
+        return cu_seqlens
+    pad_n = target_entries - cu_seqlens.numel()
+    pad = cu_seqlens[-1].repeat(pad_n)
+    return torch.cat([cu_seqlens, pad], dim=0)
 
 
 def _pt_pad_to_multiple_of(batch: Dict[str, Any], pad_to_multiple_of: int, token_pad: int, label_pad: int):
@@ -298,4 +406,60 @@ def _pt_pad_to_multiple_of(batch: Dict[str, Any], pad_to_multiple_of: int, token
             [batch["position_ids"], torch.arange(remainder, dtype=batch["position_ids"].dtype, device=device)], dim=0
         )
         
+    return batch
+
+
+def _pt_pad_to_fixed_tokens(
+    batch: Dict[str, Any],
+    fixed_tokens: int,
+    token_pad: int,
+    label_pad: int,
+):
+    """Pad a flattened batch to exactly fixed_tokens."""
+    fixed_tokens = int(fixed_tokens)
+    if fixed_tokens <= 0:
+        raise ValueError("fixed_tokens must be > 0")
+
+    total_tokens = batch["input_ids"].numel()
+    if total_tokens > fixed_tokens:
+        raise ValueError(
+            f"Packed batch has {total_tokens} tokens but fixed_tokens={fixed_tokens}. "
+            "Reduce packing size or enable sample splitting."
+        )
+    remainder = fixed_tokens - total_tokens
+    if remainder == 0:
+        return batch
+
+    device = batch["input_ids"].device
+    batch["input_ids"] = torch.cat(
+        [
+            batch["input_ids"],
+            torch.full((remainder,), token_pad, dtype=batch["input_ids"].dtype, device=device),
+        ],
+        dim=0,
+    )
+
+    if "labels" in batch:
+        batch["labels"] = torch.cat(
+            [
+                batch["labels"],
+                torch.full((remainder,), label_pad, dtype=batch["labels"].dtype, device=device),
+            ],
+            dim=0,
+        )
+
+    if "cu_seqlens" in batch:
+        current_cu = batch["cu_seqlens"]
+        new_end = current_cu[-1] + remainder
+        batch["cu_seqlens"] = torch.cat([current_cu, new_end.unsqueeze(0)])
+
+    if "position_ids" in batch:
+        batch["position_ids"] = torch.cat(
+            [
+                batch["position_ids"],
+                torch.arange(remainder, dtype=batch["position_ids"].dtype, device=device),
+            ],
+            dim=0,
+        )
+
     return batch

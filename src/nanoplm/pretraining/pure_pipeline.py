@@ -35,7 +35,11 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
-from nanoplm.pretraining.collator import DataCollatorWithFlattening, ProtDataCollatorForLM
+from nanoplm.pretraining.collator import (
+    DataCollatorWithFlattening,
+    ProtDataCollatorForLM,
+    build_power_of_two_buckets,
+)
 from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.fp8 import (
     Float8Linear,
@@ -83,6 +87,44 @@ def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
         k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
         for k, v in batch.items()
     }
+
+
+def _format_vram_for_log(
+    *,
+    device: torch.device,
+    distributed: bool,
+    reset_peak: bool = False,
+) -> str:
+    """Return CUDA VRAM usage string; aggregate max across ranks when distributed."""
+    if device.type != "cuda":
+        return "vram=n/a"
+
+    alloc_mb = torch.cuda.memory_allocated(device) / (1024**2)
+    reserved_mb = torch.cuda.memory_reserved(device) / (1024**2)
+    peak_alloc_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
+    peak_reserved_mb = torch.cuda.max_memory_reserved(device) / (1024**2)
+
+    if distributed and dist.is_initialized():
+        stats = torch.tensor(
+            [alloc_mb, reserved_mb, peak_alloc_mb, peak_reserved_mb],
+            dtype=torch.float32,
+            device=device,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.MAX)
+        alloc_mb, reserved_mb, peak_alloc_mb, peak_reserved_mb = (
+            float(stats[0].item()),
+            float(stats[1].item()),
+            float(stats[2].item()),
+            float(stats[3].item()),
+        )
+
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats(device)
+
+    return (
+        f"vram={alloc_mb:,.0f}/{reserved_mb:,.0f}MB "
+        f"peak={peak_alloc_mb:,.0f}/{peak_reserved_mb:,.0f}MB"
+    )
 
 
 def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
@@ -490,6 +532,7 @@ def run_pure_pretraining(
     val_ds = ShardedDataset(data_dir=str(val_shard_dir))
 
     use_packing = bool(pretrain_config.use_packing)
+    use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
 
     # ---- Batch sizing ----
     create_dirs(pretrain_config.ckp_dir)
@@ -544,7 +587,6 @@ def run_pure_pretraining(
     eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
 
     # ---- Collator / Sampler / Packing ----
-    train_batch_sampler = None
     train_sampler = None
 
     if use_packing:
@@ -565,10 +607,39 @@ def run_pure_pretraining(
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
         )
-        collator = DataCollatorWithFlattening(
-            collator=inner_collator, pad_to_multiple_of=8, return_position_ids=True,
-        )
-        logger.info(f"Sequence packing ENABLED (TokenPackingDataset + DataCollatorWithFlattening, target={tokens_per_micro:,} tokens)")
+        if use_static_inp_size:
+            min_tokens_per_seq = max(
+                1,
+                int(manifest.min_seq_len) + int(tokenizer.num_special_tokens_to_add(pair=False)),
+            )
+            # +1 leaves room for an optional trailing dummy sequence used for fixed-token padding.
+            max_sequences_per_batch = max(1, tokens_per_micro // min_tokens_per_seq + 1)
+            seq_count_buckets = build_power_of_two_buckets(max_sequences_per_batch, min_power_of_two=32)
+            max_seqlen_buckets = build_power_of_two_buckets(int(manifest.max_seq_len), min_power_of_two=32)
+            collator = DataCollatorWithFlattening(
+                collator=inner_collator,
+                return_position_ids=True,
+                fixed_tokens_per_batch=tokens_per_micro,
+                seq_count_buckets=seq_count_buckets,
+                max_seqlen_buckets=max_seqlen_buckets,
+            )
+            logger.info(
+                "Sequence packing ENABLED (static input size + bucketed metadata), "
+                f"target={tokens_per_micro:,} tokens, "
+                f"min_tokens_per_seq={min_tokens_per_seq}, "
+                f"seq_count_buckets={seq_count_buckets}, "
+                f"max_seqlen_buckets={max_seqlen_buckets}"
+            )
+        else:
+            collator = DataCollatorWithFlattening(
+                collator=inner_collator,
+                pad_to_multiple_of=8,
+                return_position_ids=True,
+            )
+            logger.info(
+                "Sequence packing ENABLED (dynamic metadata), "
+                f"target={tokens_per_micro:,} tokens"
+            )
     else:
         collator = ProtDataCollatorForLM(
             tokenizer=tokenizer,
@@ -592,10 +663,14 @@ def run_pure_pretraining(
     # ---- Model to device + compile + FSDP ----
     model.to(device)
 
-    compile_dynamic = bool(use_packing)
+    compile_dynamic_inner = bool(use_packing and not use_static_inp_size)
+    compile_dynamic_root = not bool(use_packing and use_static_inp_size)
     if distributed:
-        _compile_inner_layers_for_fsdp(model, dynamic=compile_dynamic)
-        logger.info(f"Compiled inner transformer layers with torch.compile(dynamic={compile_dynamic}) before FSDP2 wrapping")
+        _compile_inner_layers_for_fsdp(model, dynamic=compile_dynamic_inner)
+        logger.info(
+            "Compiled inner transformer layers with "
+            f"torch.compile(dynamic={compile_dynamic_inner}) before FSDP2 wrapping"
+        )
 
     # Precision detection (needed before FSDP MixedPrecisionPolicy)
     use_bf16 = pretrain_config.bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
@@ -627,8 +702,8 @@ def run_pure_pretraining(
     if distributed:
         logger.info("Skipping root model torch.compile under FSDP2 (using pre-wrapped compiled inner layers)")
     else:
-        model = torch.compile(model, dynamic=True)
-        logger.info(f"Model compiled with torch.compile(dynamic=True)")
+        model = torch.compile(model, dynamic=compile_dynamic_root)
+        logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic_root})")
 
     # ---- DataLoaders ----
     eval_collator = ProtDataCollatorForLM(
@@ -753,7 +828,7 @@ def run_pure_pretraining(
     token_t0: Optional[float] = None
     first_step_of_run = True
 
-    epoch_setter = train_ds if use_packing else (train_batch_sampler or train_sampler)
+    epoch_setter = train_ds if use_packing else train_sampler
 
     for epoch in range(start_epoch, num_epochs):
         if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
@@ -875,6 +950,13 @@ def run_pure_pretraining(
 
             # ---- Logging ----
             should_log = global_step % logging_steps == 0
+            vram_log = ""
+            if should_log:
+                vram_log = _format_vram_for_log(
+                    device=device,
+                    distributed=distributed,
+                    reset_peak=True,
+                )
             if should_log and is_main:
                 avg_loss = window_loss / max(1, window_steps)
                 waste = (1.0 - tok / max(raw_tok, 1)) * 100
@@ -885,7 +967,7 @@ def run_pure_pretraining(
                     f"grad_norm={grad_norm:.4f} tok/s={tps:,.0f} "
                     f"raw_tok/s={raw_tps:,.0f} "
                     f"step_tokens={int(tok):,} waste={waste:.1f}% "
-                    f"h100_mfu={mfu:.2%}"
+                    f"h100_mfu={mfu:.2%} {vram_log}"
                 )
                 payload = {
                     "train/global_step": global_step,

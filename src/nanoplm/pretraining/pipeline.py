@@ -256,13 +256,10 @@ class PretrainingConfig:
     # Sequence packing (packs multiple sequences per row to eliminate padding waste).
     # Requires flash attention (varlen path).  Falls back to padding if disabled.
     use_packing: bool = False
-    # Batch sampler type when packing is enabled:
-    #   "length_bucketed" – mega-batch + token-budget with length bucketing (default).
-    #   "token_budget"    – simpler single-pass global-sort + token-budget sampler.
-    batch_sampler_type: str = "token_budget"
-    # Length-bucketed batch sampling: groups similar-length sequences
-    # for tighter packing.  Higher values = better packing, less randomness.
-    mega_batch_multiplier: int = 100
+    # When packing is enabled, force fixed flat token count and bucketed attention metadata
+    # (cu_seqlens/max_seqlen). This enables static-shape execution for torch.compile
+    # (dynamic=False) and improves CUDA graph capture reuse.
+    use_static_inp_size: bool = False
 
     # Profiling (TE pipeline only). When enabled on rank 0:
     # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.

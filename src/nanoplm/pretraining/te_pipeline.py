@@ -21,7 +21,11 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
-from nanoplm.pretraining.collator import DataCollatorWithFlattening, ProtDataCollatorForLM
+from nanoplm.pretraining.collator import (
+    DataCollatorWithFlattening,
+    ProtDataCollatorForLM,
+    build_power_of_two_buckets,
+)
 from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
@@ -34,6 +38,7 @@ from nanoplm.pretraining.pure_pipeline import (
     _dist_barrier,
     _estimate_model_flops_per_token,
     _evaluate,
+    _format_vram_for_log,
     _load_checkpoint,
     _move_batch_to_device,
     _num_update_steps_per_epoch,
@@ -184,36 +189,20 @@ def run_te_pretraining(
         raise
 
     use_packing = bool(pretrain_config.use_packing)
-
-    if use_packing:
-        _pad_to = pretrain_config.micro_batch_size * manifest.max_seq_len
-        
-        # Sampler handled by train_ds (TokenPackingDataset) via wrapper later
-        
-        # We need this purely for collator instantiation here?
-        # No, we can just instantiate collator like in pure_pipeline.py
-        # But wait, te_pipeline follows pure_pipeline logic closely?
-        
-        inner_collator = ProtDataCollatorForLM(
-            tokenizer=tokenizer,
-            mlm_probability=pretrain_config.mlm_probability,
-            mask_token_probability=pretrain_config.mask_replace_prob,
-            random_token_probability=pretrain_config.random_token_prob,
-            keep_probability=pretrain_config.keep_probability,
+    use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
+    pack_tokens_per_micro = None
+    min_tokens_per_seq = None
+    seq_count_buckets = None
+    max_seqlen_buckets = None
+    if use_static_inp_size:
+        pack_tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
+        min_tokens_per_seq = max(
+            1,
+            int(manifest.min_seq_len) + int(tokenizer.num_special_tokens_to_add(pair=False)),
         )
-        collator = DataCollatorWithFlattening(
-            collator=inner_collator,
-            pad_to_multiple_of=8,
-        )
-        logger.info(f"Sequence packing ENABLED (TokenPackingDataset + DataCollatorWithFlattening, target={_pad_to:,} tokens)")
-    else:
-        collator = ProtDataCollatorForLM(
-            tokenizer=tokenizer,
-            mlm_probability=pretrain_config.mlm_probability,
-            mask_token_probability=pretrain_config.mask_replace_prob,
-            random_token_probability=pretrain_config.random_token_prob,
-            keep_probability=pretrain_config.keep_probability,
-        )
+        max_sequences_per_batch = max(1, pack_tokens_per_micro // min_tokens_per_seq + 1)
+        seq_count_buckets = build_power_of_two_buckets(max_sequences_per_batch, min_power_of_two=32)
+        max_seqlen_buckets = build_power_of_two_buckets(int(manifest.max_seq_len), min_power_of_two=32)
 
     create_dirs(pretrain_config.ckp_dir)
 
@@ -327,12 +316,11 @@ def run_te_pretraining(
         eval_sampler = SequentialSampler(val_ds)
         is_main = True
 
-    # Build train sampler / batch_sampler.
-    train_batch_sampler = None
+    # Build train sampler.
     train_sampler = None
     if use_packing:
-        _pad_to = pretrain_config.micro_batch_size * manifest.max_seq_len
-         # For packing, we use a sampler on the *underlying* dataset to handle shuffling and distributed sharding.
+        tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
+        # For packing, we use a sampler on the *underlying* dataset to handle shuffling and distributed sharding.
         if distributed:
             _inner_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
         else:
@@ -341,7 +329,7 @@ def run_te_pretraining(
         # Wrap dataset for packing
         train_ds = TokenPackingDataset(
             train_ds,
-            max_tokens_per_batch=_pad_to,
+            max_tokens_per_batch=tokens_per_micro,
             drop_last=False,
             split_samples=False,
             sampler=_inner_sampler,
@@ -354,12 +342,33 @@ def run_te_pretraining(
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
         )
-        # Configure collator to flatten and pad if necessary
-        collator = DataCollatorWithFlattening(
-            collator=inner_collator,
-            pad_to_multiple_of=16, # Transformer Engine FP8 alignment
-        )
-        logger.info(f"Sequence packing ENABLED (TokenPackingDataset + DataCollatorWithFlattening, target={_pad_to:,} tokens)")
+        if use_static_inp_size:
+            assert tokens_per_micro == pack_tokens_per_micro
+            assert min_tokens_per_seq is not None
+            assert seq_count_buckets is not None
+            assert max_seqlen_buckets is not None
+            collator = DataCollatorWithFlattening(
+                collator=inner_collator,
+                fixed_tokens_per_batch=tokens_per_micro,
+                seq_count_buckets=seq_count_buckets,
+                max_seqlen_buckets=max_seqlen_buckets,
+            )
+            logger.info(
+                "Sequence packing ENABLED (static input size + bucketed metadata), "
+                f"target={tokens_per_micro:,} tokens, "
+                f"min_tokens_per_seq={min_tokens_per_seq}, "
+                f"seq_count_buckets={seq_count_buckets}, "
+                f"max_seqlen_buckets={max_seqlen_buckets}"
+            )
+        else:
+            collator = DataCollatorWithFlattening(
+                collator=inner_collator,
+                pad_to_multiple_of=16,
+            )
+            logger.info(
+                "Sequence packing ENABLED (dynamic metadata), "
+                f"target={tokens_per_micro:,} tokens"
+            )
         train_sampler = None
         
     elif distributed:
@@ -408,16 +417,6 @@ def run_te_pretraining(
         # Trainer expects exact length for steps per epoch.
         # We can relax this strictness or correct the estimate.
         # For now, let's just create the loader.
-    elif train_batch_sampler is not None:
-        train_loader = DataLoader(
-            train_ds,
-            batch_sampler=train_batch_sampler,
-            collate_fn=collator,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor,
-        )
     else:
         train_loader = DataLoader(
             train_ds,
@@ -585,10 +584,7 @@ def run_te_pretraining(
     first_step_of_run = True
 
     # When packing, TokenPackingDataset holds the DistributedSampler; call set_epoch on it.
-    # When not packing, the sampler is train_sampler or train_batch_sampler.
-    _epoch_setter = (
-        train_ds if use_packing else (train_batch_sampler if train_batch_sampler is not None else train_sampler)
-    )
+    _epoch_setter = train_ds if use_packing else train_sampler
 
     profiler_ctx, profiler_step_cb = _make_te_profiler(pretrain_config, output_dir, is_main)
 
@@ -731,6 +727,13 @@ def run_te_pretraining(
                 token_t0 = None
 
                 should_log = global_step % logging_steps == 0
+                vram_log = ""
+                if should_log:
+                    vram_log = _format_vram_for_log(
+                        device=device,
+                        distributed=distributed,
+                        reset_peak=True,
+                    )
                 if should_log and is_main:
                     loss_to_log = window_loss / max(1, window_steps)
                     grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
@@ -762,7 +765,7 @@ def run_te_pretraining(
                         f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,.0f} "
                         f"raw_tok/s={raw_tokens_per_sec:,.0f} "
                         f"step_tokens={int(tok):,} waste={waste_pct:.1f}% "
-                        f"h100_mfu={mfu:.2%}"
+                        f"h100_mfu={mfu:.2%} {vram_log}"
                     )
 
                 if first_step_of_run:

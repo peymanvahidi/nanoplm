@@ -277,6 +277,11 @@ def pretrain():
     help="Enable sequence packing to eliminate padding waste (requires flash attention)"
 )
 @click.option(
+    "--use-static-inp-size/--no-use-static-inp-size",
+    default=False,
+    help="When packing is enabled, use fixed flat token size + bucketed cu_seqlens/max_seqlen for static-shape execution",
+)
+@click.option(
     "--bf16/--no-bf16",
     default=True,
     help="Enable mixed precision training (bf16 if supported, fp16 fallback)"
@@ -437,6 +442,7 @@ def run(
     num_workers: Union[int, str],
     prefetch_factor: int,
     use_packing: bool,
+    use_static_inp_size: bool,
     bf16: bool,
     tf32: bool,
     fp8: bool,
@@ -496,6 +502,7 @@ def run(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
+        use_static_inp_size=use_static_inp_size,
         bf16=bf16,
         tf32=tf32,
         fp8=fp8,
@@ -760,6 +767,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
         "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te\n"
         "  use_packing: true\n"
+        "  # Experimental throughput optimization: with packing, enables static input sizes which enables the use of torch.compile(dynamic=False) and cudagraphs\n"
+        "  use_static_inp_size: false \n"
         "\n"
         "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
         "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
@@ -871,6 +880,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'muon_cautious_weight_decay',
         'muon_use_polar_express',
         'use_packing',
+        'use_static_inp_size',
         'profiler_enabled',
     ]:
         if bool_key in kwargs:
