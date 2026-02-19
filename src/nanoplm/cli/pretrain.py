@@ -7,6 +7,7 @@ import click
 import random
 import math
 import os
+from dataclasses import MISSING, fields
 import numpy as np
 import torch
 from typing import Optional, Dict, Any, Union
@@ -376,6 +377,16 @@ def pretrain():
     help="Classifier activation",
 )
 @click.option(
+    "--use-resid-lambdas/--no-use-resid-lambdas",
+    default=False,
+    help="Enable per-layer residual scaling (resid_lambdas)",
+)
+@click.option(
+    "--use-x0-lambdas/--no-use-x0-lambdas",
+    default=False,
+    help="Enable per-layer x0 shortcut scaling (x0_lambdas)",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -439,6 +450,8 @@ def run(
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
+    use_resid_lambdas: bool,
+    use_x0_lambdas: bool,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -499,6 +512,8 @@ def run(
         attention_bias=attention_bias,
         attention_dropout=attention_dropout,
         classifier_activation=classifier_activation,
+        use_resid_lambdas=use_resid_lambdas,
+        use_x0_lambdas=use_x0_lambdas,
     )
 
     if pure_torch and pure_te:
@@ -686,6 +701,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
+        "  use_resid_lambdas: false  # scales residual stream per layer\n"
+        "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
@@ -860,10 +877,10 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     if config is None:
         raise ValueError("Model configuration is required but not found in YAML")
 
-    expected_keys = set(ProtModernBertMLMConfig.__annotations__.keys())
+    model_fields = {f.name: f for f in fields(ProtModernBertMLMConfig)}
+    expected_keys = set(model_fields.keys())
     present_keys = set(config.keys())
 
-    missing = []
     extra = []
     kwargs: Dict[str, Any] = {}
 
@@ -872,27 +889,35 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = config.get(key)
-        if value is None:
-            missing.append(key)
-            continue
-        kwargs[key] = value
-
-    # Any expected-but-absent keys are also missing
-    for key in expected_keys:
-        if key not in present_keys:
-            missing.append(key)
-
-    if missing:
-        raise ValueError(
-            f"Missing required model configuration keys: {', '.join(sorted(missing))}"
-        )
+        kwargs[key] = config.get(key)
     if extra:
         raise ValueError(
             f"Unexpected model configuration keys: {', '.join(sorted(extra))}"
         )
 
-    return ProtModernBertMLMConfig(**kwargs)
+    missing_required = []
+    normalized_kwargs: Dict[str, Any] = {}
+    for key, f in model_fields.items():
+        if key in kwargs and kwargs[key] is not None:
+            value = kwargs[key]
+        elif f.default is not MISSING:
+            value = f.default
+        elif f.default_factory is not MISSING:  # type: ignore[attr-defined]
+            value = f.default_factory()  # type: ignore[misc]
+        else:
+            missing_required.append(key)
+            continue
+
+        if f.type is bool and isinstance(value, str):
+            value = value.lower() == "true"
+        normalized_kwargs[key] = value
+
+    if missing_required:
+        raise ValueError(
+            f"Missing required model configuration keys: {', '.join(sorted(missing_required))}"
+        )
+
+    return ProtModernBertMLMConfig(**normalized_kwargs)
 
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     if config is None:

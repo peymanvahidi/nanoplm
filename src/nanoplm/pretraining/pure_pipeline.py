@@ -150,12 +150,20 @@ def _compile_inner_layers_for_fsdp(model: torch.nn.Module, *, dynamic: bool) -> 
 
 def _build_muon_optimizer(model, cfg, distributed_mesh=None):
     muon_params, adamw_params = [], []
+    resid_params, x0_params = [], []
     seen: set[int] = set()
 
     for name, param in model.named_parameters():
         if not param.requires_grad or id(param) in seen:
             continue
         seen.add(id(param))
+        lname = name.lower()
+        if lname.endswith("resid_lambdas") or ".resid_lambdas" in lname:
+            resid_params.append(param)
+            continue
+        if lname.endswith("x0_lambdas") or ".x0_lambdas" in lname:
+            x0_params.append(param)
+            continue
         if param.ndim == 1 or _is_embedding_or_unembedding_param(name):
             adamw_params.append(param)
         elif param.ndim == 2:
@@ -168,11 +176,15 @@ def _build_muon_optimizer(model, cfg, distributed_mesh=None):
 
     logger.info(
         f"Muon grouping: muon_params={len(muon_params)} tensors, "
-        f"adamw_params={len(adamw_params)} tensors"
+        f"adamw_params={len(adamw_params)} tensors, "
+        f"resid_scalar_params={len(resid_params)} tensors, "
+        f"x0_scalar_params={len(x0_params)} tensors"
     )
     return build_optimizer(
         muon_params=muon_params,
         adamw_params=adamw_params,
+        resid_params=resid_params,
+        x0_params=x0_params,
         muon_learning_rate=cfg.muon_learning_rate,
         muon_weight_decay=cfg.muon_weight_decay,
         muon_cautious_weight_decay=cfg.muon_cautious_weight_decay,

@@ -143,6 +143,14 @@ class TEModernBertModel(nn.Module):
         self.layers = nn.ModuleList(
             [TEModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
+        if config.use_resid_lambdas:
+            self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
+        else:
+            self.register_parameter("resid_lambdas", None)
+        if config.use_x0_lambdas:
+            self.x0_lambdas = nn.Parameter(torch.zeros(config.num_hidden_layers))
+        else:
+            self.register_parameter("x0_lambdas", None)
         self.final_norm = te.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self._rope_full_emb = te_attention.RotaryPositionEmbedding(
             config.head_dim, rotary_base=config.global_rope_theta
@@ -188,10 +196,15 @@ class TEModernBertModel(nn.Module):
                 cu_seqlens,
                 cu_seqlens[-1:] + pad,
             ])
+        x0 = x if self.x0_lambdas is not None else None
 
         rope_full_freqs, rope_sliding_freqs = self._get_rope_freqs(max_seqlen)
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            if self.resid_lambdas is not None:
+                x = self.resid_lambdas[i] * x
+            if self.x0_lambdas is not None:
+                x = x + self.x0_lambdas[i] * x0
             rope = rope_full_freqs if layer.is_full_attention else rope_sliding_freqs
             x = layer(x, rotary_pos_emb=rope, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, is_first_microbatch=is_first_microbatch)
 
@@ -255,6 +268,10 @@ class TEModernBertForMaskedLM(nn.Module):
         nn.init.normal_(self.decoder.weight, mean=0.0, std=decoder_std)
         if self.decoder.bias is not None:
             nn.init.zeros_(self.decoder.bias)
+        if self.model.resid_lambdas is not None:
+            self.model.resid_lambdas.fill_(self.config.resid_lambda_init)
+        if self.model.x0_lambdas is not None:
+            self.model.x0_lambdas.fill_(self.config.x0_lambda_init)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embeddings.tok_embeddings

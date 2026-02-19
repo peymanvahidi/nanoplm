@@ -70,6 +70,10 @@ class ModernBertConfig:
     tie_word_embeddings: bool = True
     global_rope_theta: float = 160_000.0
     local_rope_theta: float = 10_000.0
+    use_resid_lambdas: bool = False
+    use_x0_lambdas: bool = False
+    resid_lambda_init: float = 1.0
+    x0_lambda_init: float = 0.1
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -447,6 +451,14 @@ class ModernBertModel(nn.Module):
         self.layers = nn.ModuleList(
             [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
+        if config.use_resid_lambdas:
+            self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
+        else:
+            self.register_parameter("resid_lambdas", None)
+        if config.use_x0_lambdas:
+            self.x0_lambdas = nn.Parameter(torch.zeros(config.num_hidden_layers))
+        else:
+            self.register_parameter("x0_lambdas", None)
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
         self.rotary_emb = ModernBertRotaryEmbedding(config)
 
@@ -462,6 +474,7 @@ class ModernBertModel(nn.Module):
         if _cu_seqlens is not None:
             device = input_ids.device
             x = self.embeddings(input_ids)  # (total_tokens, hidden)
+            x0 = x if self.x0_lambdas is not None else None
 
             # Pre-compute RoPE tables up to max_position_embeddings (fixed size
             # avoids graph breaks / recompilation) and index by _position_ids.
@@ -490,7 +503,11 @@ class ModernBertModel(nn.Module):
                 ),
             }
 
-            for layer in self.layers:
+            for i, layer in enumerate(self.layers):
+                if self.resid_lambdas is not None:
+                    x = self.resid_lambdas[i] * x
+                if self.x0_lambdas is not None:
+                    x = x + self.x0_lambdas[i] * x0
                 lt = layer.attention_type
                 x = layer(
                     x,
@@ -511,6 +528,7 @@ class ModernBertModel(nn.Module):
         device = input_ids.device
 
         x = self.embeddings(input_ids)
+        x0 = x if self.x0_lambdas is not None else None
 
         attn_masks = {
             "full_attention": _full_attention_mask(attention_mask),
@@ -537,7 +555,11 @@ class ModernBertModel(nn.Module):
             ),
         }
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            if self.resid_lambdas is not None:
+                x = self.resid_lambdas[i] * x
+            if self.x0_lambdas is not None:
+                x = x + self.x0_lambdas[i] * x0
             layer_type = layer.attention_type
             x = layer(x, attn_mask=attn_masks[layer_type], cos_sin=rope[layer_type])
 
@@ -621,6 +643,10 @@ class ModernBertForMaskedLM(nn.Module):
         nn.init.normal_(self.decoder.weight, mean=0.0, std=decoder_std)
         if self.decoder.bias is not None:
             nn.init.zeros_(self.decoder.bias)
+        if self.model.resid_lambdas is not None:
+            self.model.resid_lambdas.fill_(self.config.resid_lambda_init)
+        if self.model.x0_lambdas is not None:
+            self.model.x0_lambdas.fill_(self.config.x0_lambda_init)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embeddings.tok_embeddings

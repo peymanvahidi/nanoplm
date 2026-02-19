@@ -57,14 +57,18 @@ def build_optimizer(
     adamw_weight_decay: float,
     adamw_betas: tuple[float, float],
     adamw_epsilon: float,
+    resid_params: list[torch.nn.Parameter] | None = None,
+    x0_params: list[torch.nn.Parameter] | None = None,
     use_normuon: bool = False,
     distributed_mesh=None,
 ):
     """Build a single Dion Muon/NorMuon optimizer that handles both muon and adamw param groups."""
     if not muon_params:
         raise ValueError("Muon optimizer requires at least one matrix parameter.")
-    if not adamw_params:
-        raise ValueError("Muon optimizer requires at least one AdamW parameter.")
+    resid_params = resid_params or []
+    x0_params = x0_params or []
+    if not (adamw_params or resid_params or x0_params):
+        raise ValueError("Muon optimizer requires at least one AdamW/scalar parameter.")
 
     if distributed_mesh is None:
         if dist.is_available() and dist.is_initialized():
@@ -72,18 +76,50 @@ def build_optimizer(
 
     ns_func = _polar_express_paper if muon_use_polar_express else None
 
-    param_groups = [
-        dict(params=muon_params),
-        dict(
-            params=adamw_params,
-            algorithm="adamw",
-            lr=float(adamw_learning_rate),
-            weight_decay=float(adamw_weight_decay),
-            beta1=adamw_betas[0],
-            beta2=adamw_betas[1],
-            epsilon=float(adamw_epsilon),
-        ),
-    ]
+    # Match nanochat scalar optimizer settings.
+    NANOCHAT_RESID_LR = 0.005  # scalar_lr * 0.01 where scalar_lr=0.5
+    NANOCHAT_X0_LR = 0.5
+    NANOCHAT_RESID_BETAS = (0.8, 0.95)
+    NANOCHAT_X0_BETAS = (0.96, 0.95)
+    NANOCHAT_SCALAR_EPS = 1e-10
+
+    param_groups = [dict(params=muon_params)]
+    if adamw_params:
+        param_groups.append(
+            dict(
+                params=adamw_params,
+                algorithm="adamw",
+                lr=float(adamw_learning_rate),
+                weight_decay=float(adamw_weight_decay),
+                beta1=adamw_betas[0],
+                beta2=adamw_betas[1],
+                epsilon=float(adamw_epsilon),
+            )
+        )
+    if resid_params:
+        param_groups.append(
+            dict(
+                params=resid_params,
+                algorithm="adamw",
+                lr=NANOCHAT_RESID_LR,
+                weight_decay=0.0,
+                beta1=NANOCHAT_RESID_BETAS[0],
+                beta2=NANOCHAT_RESID_BETAS[1],
+                epsilon=NANOCHAT_SCALAR_EPS,
+            )
+        )
+    if x0_params:
+        param_groups.append(
+            dict(
+                params=x0_params,
+                algorithm="adamw",
+                lr=NANOCHAT_X0_LR,
+                weight_decay=0.0,
+                beta1=NANOCHAT_X0_BETAS[0],
+                beta2=NANOCHAT_X0_BETAS[1],
+                epsilon=NANOCHAT_SCALAR_EPS,
+            )
+        )
 
     Cls = DionNorMuon if use_normuon else DionMuon
     kwargs = dict(
