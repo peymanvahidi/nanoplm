@@ -72,6 +72,7 @@ class ModernBertConfig:
     local_rope_theta: float = 10_000.0
     use_resid_lambdas: bool = False
     use_x0_lambdas: bool = False
+    use_qk_norm: bool = False
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
 
@@ -311,6 +312,7 @@ class ModernBertAttention(nn.Module):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
+        self.use_qk_norm = config.use_qk_norm
         self.dropout = config.attention_dropout
         self.scale = self.head_dim ** -0.5
 
@@ -346,6 +348,9 @@ class ModernBertAttention(nn.Module):
 
         cos, sin = cos_sin
         q, k = _apply_rope(q, k, cos, sin)
+        if self.use_qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
 
         # When max_seqlen is already a plain int (static-shape mode) skip .item()
         # to avoid a graph break.  For tensor values (dynamic mode) .item() is
@@ -392,6 +397,9 @@ class ModernBertAttention(nn.Module):
 
         cos, sin = cos_sin
         q, k = _apply_rope(q, k, cos, sin)
+        if self.use_qk_norm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
 
         y = F.scaled_dot_product_attention(
             q,

@@ -387,6 +387,11 @@ def pretrain():
     help="Enable per-layer x0 shortcut scaling (x0_lambdas)",
 )
 @click.option(
+    "--use-qk-norm/--no-use-qk-norm",
+    default=False,
+    help="Enable NanoChat-style RMS QK normalization in attention",
+)
+@click.option(
     "--pure-torch",
     is_flag=True,
     default=False,
@@ -452,6 +457,7 @@ def run(
     classifier_activation: str,
     use_resid_lambdas: bool,
     use_x0_lambdas: bool,
+    use_qk_norm: bool,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -514,6 +520,7 @@ def run(
         classifier_activation=classifier_activation,
         use_resid_lambdas=use_resid_lambdas,
         use_x0_lambdas=use_x0_lambdas,
+        use_qk_norm=use_qk_norm,
     )
 
     if pure_torch and pure_te:
@@ -701,8 +708,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
+        "  # The options below only work on pure-torch and TE pipelines\n"
         "  use_resid_lambdas: false  # scales residual stream per layer\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
+        "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
         "\n"
         "pretraining:\n"
         "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"

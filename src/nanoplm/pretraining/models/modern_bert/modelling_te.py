@@ -89,7 +89,7 @@ class TEModernBertEncoderLayer(nn.Module):
             return_bias=False,
             init_method=_init,
             output_layer_init_method=_output_init,
-            qk_norm_type=None,
+            qk_norm_type="RMSNorm" if config.use_qk_norm else None,
         )
 
         # Fused LayerNorm + FC1 + SwiGLU + FC2.
@@ -122,7 +122,7 @@ class TEModernBertEncoderLayer(nn.Module):
             max_seqlen_kv=max_seqlen,
             attn_mask_type="padding",
             window_size=self.window_size,
-            checkpoint_core_attention = True,
+            checkpoint_core_attention = False,
             is_first_microbatch=is_first_microbatch,
         )
         if isinstance(attn_out, tuple):

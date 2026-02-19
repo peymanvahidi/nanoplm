@@ -59,6 +59,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mask_token_id=self.tokenizer.mask_token_id,
             use_resid_lambdas=config.use_resid_lambdas,
             use_x0_lambdas=config.use_x0_lambdas,
+            use_qk_norm=config.use_qk_norm,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
         )
@@ -93,6 +94,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             mask_token_id=self.tokenizer.mask_token_id,
             use_resid_lambdas=config.use_resid_lambdas,
             use_x0_lambdas=config.use_x0_lambdas,
+            use_qk_norm=config.use_qk_norm,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
         )

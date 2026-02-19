@@ -40,6 +40,7 @@ class ProtModernBertMLMConfig:
     classifier_activation: str = "gelu"
     use_resid_lambdas: bool = False
     use_x0_lambdas: bool = False
+    use_qk_norm: bool = False
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
 
