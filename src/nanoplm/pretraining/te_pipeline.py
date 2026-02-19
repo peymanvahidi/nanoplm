@@ -593,10 +593,39 @@ def run_te_pretraining(
             if _epoch_setter is not None and hasattr(_epoch_setter, "set_epoch"):
                 _epoch_setter.set_epoch(epoch)
 
-            for micro_step, batch in enumerate(train_loader):
-                # Cap iteration to prevent desync when TokenPackingDataset yields different counts per rank
-                if micro_step >= synced_train_loader_len:
+            train_iter = iter(train_loader)
+            for micro_step in range(synced_train_loader_len):
+                has_batch = True
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    has_batch = False
+                    batch = None
+
+                # Token packing can still yield uneven batch counts per rank. If any rank
+                # runs out early, stop this epoch on all ranks to avoid collective deadlock.
+                if distributed and dist.is_initialized():
+                    has_batch_t = torch.tensor(
+                        1 if has_batch else 0,
+                        device=device,
+                        dtype=torch.int32,
+                    )
+                    dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
+                    if int(has_batch_t.item()) == 0:
+                        if is_main and micro_step + 1 < synced_train_loader_len:
+                            logger.warning(
+                                "Ending epoch early at micro_step=%s due to uneven packed batches across ranks "
+                                "(configured=%s).",
+                                micro_step,
+                                synced_train_loader_len,
+                            )
+                        break
+                elif not has_batch:
                     break
+
+                if not has_batch:
+                    break
+
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                     continue
 
@@ -669,7 +698,7 @@ def run_te_pretraining(
 
                 if scaler is not None and scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
 
                 optimizer_step_skipped = False
                 if scaler is not None and scaler.is_enabled():
