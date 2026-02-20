@@ -1,1 +1,0 @@
-NVTE_DEBUG=1 NVTE_DEBUG_LEVEL=0 NVTE_FUSED_ATTN=0 torchrun --nproc-per-node=2 $(which nanoplm) pretrain from-yaml --pure-te 2>&1 | tee -a log.txt   
