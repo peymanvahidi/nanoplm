@@ -271,6 +271,13 @@ def run_te_pretraining(
                 dist.init_process_group(backend=backend)
 
     model.to(device)
+    if model.model.resid_lambdas is not None and model.model.x0_lambdas is not None:
+        model.model._blend_resid_x0 = torch.compile(
+            model.model._blend_resid_x0,
+            dynamic=True,
+            fullgraph=True,
+            mode='max-autotune-no-cudagraphs',
+        )
 
     # -- Precision detection (needed before FSDP for MixedPrecisionPolicy) --
     use_bf16 = (
@@ -390,9 +397,8 @@ def run_te_pretraining(
             keep_probability=pretrain_config.keep_probability,
         )
 
-    # No torch.compile for the TE path: TE's fused kernels (MultiheadAttention,
-    # LayerNormMLP) are already optimized, and FP8 metadata (amax history /
-    # buffer_index) changes each step, causing excessive dynamo recompilation.
+    # Keep orig_model reference for checkpointing/eval.
+    # Do not torch.compile TE modules: TE kernels and FP8 metadata cause graph breaks/recompiles.
     orig_model = model
 
     eval_collator = ProtDataCollatorForLM(

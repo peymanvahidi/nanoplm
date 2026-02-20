@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from sympy import false
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,6 +43,15 @@ FP8_RECIPE = DelayedScaling()
 
 # TE requires window_size=(-1, -1) for full attention, not None.
 _FULL_ATTN_WINDOW: tuple[int, int] = (-1, -1)
+
+
+def _blend_resid_x0(
+    x: torch.Tensor,
+    x0: torch.Tensor,
+    resid_lambda: torch.Tensor,
+    x0_lambda: torch.Tensor,
+) -> torch.Tensor:
+    return resid_lambda * x + x0_lambda * x0
 
 
 class TEModernBertEmbeddings(nn.Module):
@@ -178,6 +186,7 @@ class TEModernBertModel(nn.Module):
         # Lazily cached on first forward (needs CUDA device).
         self._rope_full_freqs: Optional[torch.Tensor] = None
         self._rope_sliding_freqs: Optional[torch.Tensor] = None
+        self._blend_resid_x0 = _blend_resid_x0
 
     def _get_rope_freqs(self, max_seqlen: int):
         """Return cached RoPE frequency tensors, computing on first call."""
@@ -215,11 +224,20 @@ class TEModernBertModel(nn.Module):
         x0 = x if self.x0_lambdas is not None else None
 
         rope_full_freqs, rope_sliding_freqs = self._get_rope_freqs(max_seqlen)
+        use_resid = self.resid_lambdas is not None
+        use_x0 = self.x0_lambdas is not None
 
         for i, layer in enumerate(self.layers):
-            if self.resid_lambdas is not None:
+            if use_resid and use_x0:
+                x = self._blend_resid_x0(
+                    x,
+                    x0,
+                    self.resid_lambdas[i],
+                    self.x0_lambdas[i],
+                )
+            elif use_resid:
                 x = self.resid_lambdas[i] * x
-            if self.x0_lambdas is not None:
+            elif use_x0:
                 x = x + self.x0_lambdas[i] * x0
             rope = rope_full_freqs if layer.is_full_attention else rope_sliding_freqs
             x = layer(x, rotary_pos_emb=rope, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, is_first_microbatch=is_first_microbatch)
