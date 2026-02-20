@@ -64,7 +64,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 # H100 SXM peak BF16 tensor-core throughput (TFLOPS).
-H100_PEAK_TFLOPS = 835.4
+H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
 N_PREFETCH_LAYERS_FSDP2 = 2
@@ -281,17 +281,18 @@ def _create_scheduler(
     warmup_steps: int,
     total_steps: int,
     learning_rate: float,
-    min_lr: float,
+    lr_decay_to_fraction: float,
+    lr_schedule: str = "Linear",
 ) -> LambdaLR:
-    min_lr_ratio = min_lr / learning_rate if learning_rate > 0 else 0.0
-
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         decay_steps = max(1, total_steps - warmup_steps)
-        progress = (step - warmup_steps) / decay_steps
-        # Linear decay from 1.0 to min_lr_ratio
-        return max(min_lr_ratio, 1.0 - (1.0 - min_lr_ratio) * progress)
+        progress = min(1.0, (step - warmup_steps) / decay_steps)
+        if lr_schedule.lower() == "cosin":
+            return lr_decay_to_fraction + 0.5 * (1.0 - lr_decay_to_fraction) * (1.0 + math.cos(math.pi * progress))
+        else:
+            return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
 
     return LambdaLR(optimizer, lr_lambda)
 
@@ -742,7 +743,8 @@ def run_pure_pretraining(
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
-        pretrain_config.learning_rate, pretrain_config.min_lr,
+        pretrain_config.learning_rate, pretrain_config.lr_decay_to_fraction,
+        pretrain_config.lr_schedule,
     )
 
     # ---- Resume ----

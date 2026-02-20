@@ -1,0 +1,91 @@
+schema: '2.0'
+stages:
+  download:
+    cmd: nanoplm data download --url 
+      https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz
+      -o output/data/raw/uniref50.fasta.gz
+    params:
+      params.yaml:
+        data_dirs.compressed_fasta: output/data/raw/uniref50.fasta.gz
+        data_dirs.url: 
+          https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz
+    outs:
+    - path: output/data/raw/uniref50.fasta.gz
+      hash: md5
+      md5: 5245b19456d9a063b13c46602269bc5f
+      size: 93457057
+  extract:
+    cmd: nanoplm data extract -i output/data/raw/uniref50.fasta.gz -o 
+      output/data/raw/uniref50.fasta
+    deps:
+    - path: output/data/raw/uniref50.fasta.gz
+      hash: md5
+      md5: 5245b19456d9a063b13c46602269bc5f
+      size: 93457057
+    params:
+      params.yaml:
+        data_dirs.compressed_fasta: output/data/raw/uniref50.fasta.gz
+        data_dirs.extracted_fasta: output/data/raw/uniref50.fasta
+    outs:
+    - path: output/data/raw/uniref50.fasta
+      hash: md5
+      md5: 6f8f23b53f17ffa237d383699fb8053d
+      size: 287479954
+  shuffle:
+    cmd: nanoplm data shuffle -i output/data/raw/uniref50.fasta -o 
+      output/data/raw/uniref50_shuffled.fasta --backend biopython --seed 24
+    deps:
+    - path: output/data/raw/uniref50.fasta
+      hash: md5
+      md5: 6f8f23b53f17ffa237d383699fb8053d
+      size: 287479954
+    params:
+      params.yaml:
+        data_dirs.shuffled_fasta: output/data/raw/uniref50_shuffled.fasta
+        data_params.shuffle_backend: biopython
+        data_params.shuffle_seed: 24
+    outs:
+    - path: output/data/raw/uniref50_shuffled.fasta
+      hash: md5
+      md5: 46bd299be62cb8a052b577bba792fd2e
+      size: 287479954
+  filter:
+    cmd: nanoplm data filter -i output/data/raw/uniref50_shuffled.fasta -o 
+      output/data/filter/uniref50_filtered.fasta --min-seq-len 20 --max-seq-len 
+      512 --seqs-num 540000 --skip-n 0
+    deps:
+    - path: output/data/raw/uniref50_shuffled.fasta
+      hash: md5
+      md5: 46bd299be62cb8a052b577bba792fd2e
+      size: 287479954
+    params:
+      params.yaml:
+        data_dirs.shuffled_fasta: output/data/raw/uniref50_shuffled.fasta
+        data_params.filter_skip_n: 0
+        data_params.max_seq_len: 512
+        data_params.min_seq_len: 20
+        data_params.seqs_num: 540000
+    outs:
+    - path: output/data/filter/uniref50_filtered.fasta
+      hash: md5
+      md5: cbe1a0b29d05b5d268c0a2720c712d50
+      size: 183638928
+  split:
+    cmd: nanoplm data split -i output/data/filter/uniref50_filtered.fasta -o 
+      output/data/split --val-ratio 0.1
+    deps:
+    - path: output/data/filter/uniref50_filtered.fasta
+      hash: md5
+      md5: cbe1a0b29d05b5d268c0a2720c712d50
+      size: 183638928
+    params:
+      params.yaml:
+        data_dirs.filtered_fasta: output/data/filter/uniref50_filtered.fasta
+        data_dirs.splitted_fasta_dir: output/data/split
+        data_params.val_ratio: 0.1
+    outs:
+    - path: output/data/split
+      hash: md5
+      md5: 55a82ffcea3775eaf37b834c7dbeff6a.dir
+      size: 183638928
+      nfiles: 2

@@ -469,7 +469,8 @@ def run_te_pretraining(
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
-        pretrain_config.learning_rate, pretrain_config.min_lr,
+        pretrain_config.learning_rate, pretrain_config.lr_decay_to_fraction,
+        pretrain_config.lr_schedule,
     )
 
     start_step = 0

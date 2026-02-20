@@ -131,7 +131,7 @@ def pretrain():
 @click.option(
     "--learning-rate",
     type=float,
-    default=1e-3,
+    default=1e-4,
     help="Maximum Learning rate in the warmup"
 )
 @click.option(
@@ -147,10 +147,16 @@ def pretrain():
     help="Number of warmup steps"
 )
 @click.option(
-    "--min-lr",
+    "--lr-decay-to-fraction",
     type=float,
-    default=1e-5,
-    help="Minimum learning rate (LR decays to this after warmup)"
+    default=0.1,
+    help="Fraction of peak learning rate to decay to"
+)
+@click.option(
+    "--lr-schedule",
+    type=click.Choice(["Linear", "cosin"], case_sensitive=False),
+    default="Linear",
+    help="Learning rate schedule to use after warmup"
 )
 @click.option(
     "--global-batch-size",
@@ -185,13 +191,13 @@ def pretrain():
 @click.option(
     "--muon-learning-rate",
     type=float,
-    default=2e-2,
+    default=1e-3,
     help="Muon LR (used only when optimizer=muon or normuon; learning-rate remains AdamW LR)",
 )
 @click.option(
     "--muon-weight-decay",
     type=float,
-    default=0.1,
+    default=0.01,
     help="Muon weight decay (used only when optimizer=muon or normuon)",
 )
 @click.option(
@@ -230,19 +236,19 @@ def pretrain():
 @click.option(
     "--logging-steps",
     type=int,
-    default=10,
+    default=1,
     help="Number of steps between log events"
 )
 @click.option(
     "--eval-steps",
     type=int,
-    default=50,
+    default=250,
     help="Number of steps between evaluations"
 )
 @click.option(
     "--save-steps",
     type=int,
-    default=100,
+    default=5000,
     help="Number of steps between checkpoint saves"
 )
 @click.option(
@@ -428,7 +434,8 @@ def run(
     learning_rate: float,
     weight_decay: float,
     warmup_steps: int,
-    min_lr: float,
+    lr_decay_to_fraction: float,
+    lr_schedule: str,
     global_batch_size: int,
     optimizer: str,
     adam_beta1: float,
@@ -488,7 +495,8 @@ def run(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         warmup_steps=warmup_steps,
-        min_lr=min_lr,
+        lr_decay_to_fraction=lr_decay_to_fraction,
+        lr_schedule=lr_schedule,
         global_batch_size=global_batch_size,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
@@ -754,7 +762,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_epsilon: 1e-8\n"
         "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
         "  warmup_steps: 350\n"
-        "  min_lr: 1e-5\n"
+        "  lr_decay_to_fraction: 0.1\n"
+        "  lr_schedule: \"Linear\" # Linear or Cosine \n" 
         "  weight_decay: 0.0\n"
         "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
         "  muon_learning_rate: 1e-3\n"

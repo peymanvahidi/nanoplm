@@ -1,0 +1,48 @@
+data_params:
+  # Pipeline mode: 'pretrain', 'distillation', or 'none'
+  # - 'pretrain': Generate HDF5 shards for MLM pretraining
+  # - 'distillation': Generate teacher embeddings for knowledge distillation
+  # - 'none': Only run data preparation (download, filter, split)
+  pipeline_mode: "pretrain"
+
+  seqs_num: 540000
+  min_seq_len: 20
+  max_seq_len: 512
+  val_ratio: 0.1
+  device: "auto"
+
+  shuffle_backend: "biopython"  # or "seqkit" (faster, requires installation)
+  shuffle: true
+  shuffle_seed: 24
+  filter_skip_n: 0
+
+# Pretrain config (used when pipeline_mode: 'pretrain')
+# A .data_manifest file will be created in output_dir for use by pretrain pipeline
+pretrain_config:
+  output_dir: "output/data/pretrain_data"  # Will contain train/ and val/ subdirs
+  samples_per_shard: 2000
+  max_workers: -1  # -1 to use all available CPUs
+  force: false
+
+# Distillation config (used when pipeline_mode: 'distillation')
+# A .data_manifest file will be created in output_dir for use by distill pipeline
+distillation_config:
+  output_dir: "output/data/distillation_data"  # Will contain train/ and val/ subdirs
+  on_the_fly: false  # If true, skip embedding generation (embeddings computed during training)
+  samples_per_shard: 2000  # -1 for single file (no sharding)
+  teacher_model: "prott5"
+  embed_calc_batch_size: 4
+
+# Data directories
+data_dirs:
+  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+  # swissprot: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+  # trembl: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz"
+  # uniref50: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
+  # uniref90: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"
+  # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"
+  compressed_fasta: "output/data/raw/uniref50.fasta.gz"
+  extracted_fasta: "output/data/raw/uniref50.fasta"
+  shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"
+  filtered_fasta: "output/data/filter/uniref50_filtered.fasta"
+  splitted_fasta_dir: "output/data/split"

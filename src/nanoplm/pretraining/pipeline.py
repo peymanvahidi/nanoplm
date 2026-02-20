@@ -1,4 +1,5 @@
 import os
+import math
 import json
 import time
 import shutil
@@ -111,15 +112,16 @@ def _build_muon_optimizer(
     )
 
 
-def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, min_lr: float) -> LambdaLR:
-    min_lr_ratio = min_lr / learning_rate if learning_rate > 0 else 0.0
-
+def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, lr_decay_to_fraction: float, lr_schedule: str = "Linear") -> LambdaLR:
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
         decay_steps = max(1, total_steps - warmup_steps)
-        progress = (step - warmup_steps) / decay_steps
-        return max(min_lr_ratio, 1.0 - (1.0 - min_lr_ratio) * progress)
+        progress = min(1.0, (step - warmup_steps) / decay_steps)
+        if lr_schedule.lower() == "cosin":
+            return lr_decay_to_fraction + 0.5 * (1.0 - lr_decay_to_fraction) * (1.0 + math.cos(math.pi * progress))
+        else:
+            return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
 
     return LambdaLR(optimizer, lr_lambda)
 
@@ -209,7 +211,8 @@ class PretrainingConfig:
     micro_batch_size: int = 32
     num_epochs: int = 10
     warmup_steps: int = 350
-    min_lr: float = 1e-5
+    lr_decay_to_fraction: float = 0.01
+    lr_schedule: str = "Linear"
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
@@ -623,7 +626,8 @@ def run_pretraining(
 
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
-        pretrain_config.learning_rate, pretrain_config.min_lr,
+        pretrain_config.learning_rate, pretrain_config.lr_decay_to_fraction,
+        pretrain_config.lr_schedule,
     )
 
     if pretrain_config.multi_gpu:
