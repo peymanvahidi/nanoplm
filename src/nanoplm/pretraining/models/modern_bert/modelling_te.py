@@ -21,15 +21,16 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 )
 
 try:
-    # Match modeling.py's FA3 kernel loading pattern and wire it into TE internals.
-    from kernels import get_kernel
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
+        # Match modeling.py's FA3 kernel loading pattern and wire it into TE internals.
+        from kernels import get_kernel
 
-    _te_fa3 = get_kernel("varunneal/flash-attention-3")
-    _te_fa3 = getattr(_te_fa3, "flash_attn_interface", _te_fa3)
-    te_dpa_backends.flash_attn_func_v3 = _te_fa3.flash_attn_func
-    te_dpa_backends.flash_attn_varlen_func_v3 = _te_fa3.flash_attn_varlen_func
-    te_dpa_backends.fa_utils.fa3_version = te_dpa_backends.PkgVersion("3.0.0")
-    te_dpa_backends.fa_utils.set_flash_attention_3_params()
+        _te_fa3 = get_kernel("varunneal/flash-attention-3")
+        _te_fa3 = getattr(_te_fa3, "flash_attn_interface", _te_fa3)
+        te_dpa_backends.flash_attn_func_v3 = _te_fa3.flash_attn_func
+        te_dpa_backends.flash_attn_varlen_func_v3 = _te_fa3.flash_attn_varlen_func
+        te_dpa_backends.fa_utils.fa3_version = te_dpa_backends.PkgVersion("3.0.0")
+        te_dpa_backends.fa_utils.set_flash_attention_3_params()
 except Exception as exc:
     print(f"FA3 monkey patch failed; using default TE attention backend: {exc}")
 

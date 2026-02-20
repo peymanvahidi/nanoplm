@@ -21,16 +21,24 @@ _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
 
-try:
-    # FA3 (Hopper / Blackwell)
-    from kernels import get_kernel
-    _flash_varlen_fn = get_kernel('varunneal/flash-attention-3').flash_attn_interface.flash_attn_varlen_func
-    _HAS_FLASH_VARLEN = True
-    _FLASH_HAS_DROPOUT = False  # FA3 removed dropout_p
-except ImportError:
+if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
+    try:
+        # FA3 (H100 / sm90)
+        from kernels import get_kernel
+
+        _fa3 = get_kernel("varunneal/flash-attention-3")
+        _fa3 = getattr(_fa3, "flash_attn_interface", _fa3)
+        _flash_varlen_fn = _fa3.flash_attn_varlen_func
+        _HAS_FLASH_VARLEN = True
+        _FLASH_HAS_DROPOUT = False  # FA3 removed dropout_p
+    except ImportError:
+        pass
+
+if not _HAS_FLASH_VARLEN:
     try:
         # FA2 (Ampere+, RTX 30xx/40xx/50xx)
         from flash_attn import flash_attn_varlen_func as _flash_varlen_fn
+
         _HAS_FLASH_VARLEN = True
         _FLASH_HAS_DROPOUT = True  # FA2 supports dropout_p
     except ImportError:
