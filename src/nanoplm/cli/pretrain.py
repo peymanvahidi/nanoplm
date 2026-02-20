@@ -154,7 +154,7 @@ def pretrain():
 )
 @click.option(
     "--lr-schedule",
-    type=click.Choice(["Linear", "cosin"], case_sensitive=False),
+    type=click.Choice(["linear", "cosine"], case_sensitive=False),
     default="Linear",
     help="Learning rate schedule to use after warmup"
 )

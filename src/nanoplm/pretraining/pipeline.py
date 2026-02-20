@@ -118,7 +118,7 @@ def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_r
             return step / max(1, warmup_steps)
         decay_steps = max(1, total_steps - warmup_steps)
         progress = min(1.0, (step - warmup_steps) / decay_steps)
-        if lr_schedule.lower() == "cosin":
+        if lr_schedule.lower() == "cosine":
             return lr_decay_to_fraction + 0.5 * (1.0 - lr_decay_to_fraction) * (1.0 + math.cos(math.pi * progress))
         else:
             return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
