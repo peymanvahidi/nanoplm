@@ -23,7 +23,8 @@ _FLASH_HAS_DROPOUT = False
 
 try:
     # FA3 (Hopper / Blackwell)
-    from flash_attn_interface import flash_attn_varlen_func as _flash_varlen_fn
+    from kernels import get_kernel
+    _flash_varlen_fn = get_kernel('varunneal/flash-attention-3').flash_attn_interface.flash_attn_varlen_func
     _HAS_FLASH_VARLEN = True
     _FLASH_HAS_DROPOUT = False  # FA3 removed dropout_p
 except ImportError:
