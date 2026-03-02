@@ -5,8 +5,7 @@ Finds best launch configs for the kernels currently used by
   - K1 fwd: _fused_rmsnorm_project_fwd_kernel
   - K1 bwd: _fused_rmsnorm_project_bwd_dx_kernel
   - K3 fwd: _fused_pre_map_fwd_kernel
-  - K3 bwd_dx: _fused_pre_map_bwd_dx_kernel
-  - K3 bwd_hpre: _fused_pre_map_bwd_hpre_kernel
+  - K3 bwd_fused: _fused_pre_map_bwd_fused_kernel_n4
   - K4 fwd: _fused_post_res_fwd_kernel_n4
   - K4 bwd_fused: _fused_post_res_bwd_fused_kernel_n4
 
@@ -365,41 +364,14 @@ def main() -> None:
     }
 
     best_cfg, top_trials, failed = _search(
-        name="k3_bwd_dx",
+        name="k3_bwd_fused",
         candidates=k3_candidates,
         launcher_for=lambda cfg: (
-            lambda: k._fused_pre_map_bwd_dx_kernel[grid_sms](
+            lambda: k._fused_pre_map_bwd_fused_kernel_n4[grid_sms](
+                x_streams,
                 h_pre,
                 grad_out_pre,
                 grad_x_streams,
-                T,
-                C,
-                n,
-                BLOCK_T=cfg.block_t,
-                BLOCK_C=cfg.block_c,
-                NUM_SMS=num_sms,
-                num_warps=cfg.num_warps,
-                num_stages=cfg.num_stages,
-            )
-        ),
-        warmup=args.warmup,
-        iters=args.iters,
-        topk=args.topk,
-    )
-    results["k3_bwd_dx"] = {
-        "best": asdict(best_cfg),
-        "top": [{"ms": t.ms, "cfg": asdict(t.cfg)} for t in top_trials],
-        "failed": failed,
-        "total": len(k3_candidates),
-    }
-
-    best_cfg, top_trials, failed = _search(
-        name="k3_bwd_hpre",
-        candidates=k3_candidates,
-        launcher_for=lambda cfg: (
-            lambda: k._fused_pre_map_bwd_hpre_kernel[grid_sms](
-                x_streams,
-                grad_out_pre,
                 grad_hpre,
                 T,
                 C,
@@ -415,7 +387,7 @@ def main() -> None:
         iters=args.iters,
         topk=args.topk,
     )
-    results["k3_bwd_hpre"] = {
+    results["k3_bwd_fused"] = {
         "best": asdict(best_cfg),
         "top": [{"ms": t.ms, "cfg": asdict(t.cfg)} for t in top_trials],
         "failed": failed,
@@ -511,8 +483,7 @@ def main() -> None:
         "k1_fwd",
         "k1_bwd_dx",
         "k3_fwd",
-        "k3_bwd_dx",
-        "k3_bwd_hpre",
+        "k3_bwd_fused",
         "k4_fwd",
         "k4_bwd_fused",
     ]:
@@ -536,4 +507,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

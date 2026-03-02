@@ -724,6 +724,7 @@ def run_te_pretraining(
                 vram_log = ""
                 tokens_per_sec = mfu = tok = raw_tok = 0.0
                 step_tok = step_raw_tok = 0.0
+                real_tokens_per_sec = real_tokens_per_sec_log = 0.0
                 avg_step_ms = 0.0
                 if should_log:
                     # Synchronize and measure only at logging boundaries to amortize sync cost.
@@ -747,8 +748,10 @@ def run_te_pretraining(
                         tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
                     step_tok = tok / max(1, window_steps)
                     step_raw_tok = raw_tok / max(1, window_steps)
+                    real_tokens_per_sec = tok / window_dt
+                    real_tokens_per_sec_log = int(real_tokens_per_sec)
                     mfu = (
-                        _flops_per_token * achieved_global_batch_tokens * window_steps / window_dt
+                        _flops_per_token * real_tokens_per_sec
                     ) / (_peak_flops_per_gpu * max(effective_world_size, 1))
 
                     token_count.zero_()
@@ -771,6 +774,7 @@ def run_te_pretraining(
                         "train/learning_rate": learning_rate,
                         "train/epoch": epoch + (micro_step + 1) / synced_train_loader_len,
                         "train/tokens_per_sec": tokens_per_sec,
+                        "train/real_tokens_per_sec": real_tokens_per_sec,
                         "train/step_real_tokens": step_tok,
                         "train/step_raw_tokens": step_raw_tok,
                         "train/packing_waste_pct": waste_pct,
@@ -789,7 +793,8 @@ def run_te_pretraining(
                     logger.info(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
-                        f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,} "
+                        f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,} real_tok/s={real_tokens_per_sec_log:,} "
+                        f"real_tok/step={step_tok:,.0f} "
                         f"dt={avg_step_ms:.2f}ms waste={waste_pct:.1f}% "
                         f"h100_mfu={mfu:.2%} {vram_log}"
                     )

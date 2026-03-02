@@ -28,7 +28,7 @@ _FLASH_HAS_DROPOUT = False
 USE_ACTIVATION_CHECKPOINTING_CANON = True
 # mHC-lite selective recompute (paper-inspired):
 # checkpoint only mHC pre/post kernels, keep heavy layer function outside.
-USE_ACTIVATION_CHECKPOINTING_MHC = True
+USE_ACTIVATION_CHECKPOINTING_MHC = False
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:
@@ -147,6 +147,8 @@ class ModernBertConfig:
     x0_lambda_init: float = 0.1
     use_repo: bool = False
     repo_after_n_layers: int = 3
+    gradient_checkpointing: bool = False
+    gradient_checkpointing_mode: Literal["layer", "attn", "attn+mlp"] = "layer"
     use_mhc_lite: bool = False
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
@@ -180,7 +182,6 @@ class ModernBertConfig:
                 "resid_lambdas scales the hidden state before each layer, which breaks "
                 "mHC-lite's stability guarantees (doubly-stochastic mixing)."
             )
-
         attn_stride = max(1, int(self.global_attn_every_n_layers))
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.sliding_window = self.local_attention // 2
@@ -886,6 +887,10 @@ class ModernBertEncoderLayer(nn.Module):
         super().__init__()
         self.attention_type = config.layer_types[layer_idx]
         self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
+        self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
+        self.gradient_checkpointing_mode = str(
+            getattr(config, "gradient_checkpointing_mode", "layer")
+        ).strip().lower()
         self.attn_norm = (
             nn.Identity()
             if layer_idx == 0
@@ -927,40 +932,120 @@ class ModernBertEncoderLayer(nn.Module):
         token_mask: Optional[torch.Tensor] = None,
         repo_active: bool = False,
     ) -> torch.Tensor:
-        attn_in = self.attn_norm(x)
-        if self.canon_a is not None:
-            attn_in = self.canon_a(
-                attn_in,
-                position_ids=position_ids,
-                cu_seqlens=cu_seqlens,
-                attention_mask=token_mask,
-            )
-        x = x + self.attn(
-            attn_in,
-            cos_sin=cos_sin,
-            attn_mask=attn_mask,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            window_size=window_size,
-            position_ids=position_ids,
-            token_mask=token_mask,
-            repo_active=repo_active,
+        do_ckpt_attn = (
+            self.gradient_checkpointing
+            and self.training
+            and self.gradient_checkpointing_mode in {"attn", "attn+mlp"}
         )
+        if do_ckpt_attn:
+            _attn_mask = attn_mask
+            _cos_sin = cos_sin
+            _cu_seqlens = cu_seqlens
+            _max_seqlen = max_seqlen
+            _window_size = window_size
+            _position_ids = position_ids
+            _token_mask = token_mask
+            _repo_active = repo_active
+
+            def _attn_branch(
+                x_in: torch.Tensor,
+                *,
+                _layer: "ModernBertEncoderLayer" = self,
+            ) -> torch.Tensor:
+                attn_in = _layer.attn_norm(x_in)
+                if _layer.canon_a is not None:
+                    attn_in = _layer.canon_a(
+                        attn_in,
+                        position_ids=_position_ids,
+                        cu_seqlens=_cu_seqlens,
+                        attention_mask=_token_mask,
+                    )
+                return _layer.attn(
+                    attn_in,
+                    cos_sin=_cos_sin,
+                    attn_mask=_attn_mask,
+                    cu_seqlens=_cu_seqlens,
+                    max_seqlen=_max_seqlen,
+                    window_size=_window_size,
+                    position_ids=_position_ids,
+                    token_mask=_token_mask,
+                    repo_active=_repo_active,
+                )
+
+            try:
+                x = x + _checkpoint(_attn_branch, x, use_reentrant=False)
+            except TypeError:  # older torch checkpoint API
+                x = x + _checkpoint(_attn_branch, x)
+        else:
+            attn_in = self.attn_norm(x)
+            if self.canon_a is not None:
+                attn_in = self.canon_a(
+                    attn_in,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    attention_mask=token_mask,
+                )
+            x = x + self.attn(
+                attn_in,
+                cos_sin=cos_sin,
+                attn_mask=attn_mask,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                window_size=window_size,
+                position_ids=position_ids,
+                token_mask=token_mask,
+                repo_active=repo_active,
+            )
         if self.mlp is not None:
-            mlp_in = self.mlp_norm(x)
-            if self.canon_c is not None:
-                mlp_in = self.canon_c(
+            do_ckpt_mlp = (
+                self.gradient_checkpointing
+                and self.training
+                and self.gradient_checkpointing_mode == "attn+mlp"
+            )
+            if do_ckpt_mlp:
+                _position_ids = position_ids
+                _cu_seqlens = cu_seqlens
+                _token_mask = token_mask
+
+                def _mlp_branch(
+                    x_in: torch.Tensor,
+                    *,
+                    _layer: "ModernBertEncoderLayer" = self,
+                ) -> torch.Tensor:
+                    mlp_in = _layer.mlp_norm(x_in)
+                    if _layer.canon_c is not None:
+                        mlp_in = _layer.canon_c(
+                            mlp_in,
+                            position_ids=_position_ids,
+                            cu_seqlens=_cu_seqlens,
+                            attention_mask=_token_mask,
+                        )
+                    return _layer.mlp(
+                        mlp_in,
+                        position_ids=_position_ids,
+                        cu_seqlens=_cu_seqlens,
+                        attention_mask=_token_mask,
+                    )
+
+                try:
+                    x = x + _checkpoint(_mlp_branch, x, use_reentrant=False)
+                except TypeError:  # older torch checkpoint API
+                    x = x + _checkpoint(_mlp_branch, x)
+            else:
+                mlp_in = self.mlp_norm(x)
+                if self.canon_c is not None:
+                    mlp_in = self.canon_c(
+                        mlp_in,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens,
+                        attention_mask=token_mask,
+                    )
+                x = x + self.mlp(
                     mlp_in,
                     position_ids=position_ids,
                     cu_seqlens=cu_seqlens,
                     attention_mask=token_mask,
                 )
-            x = x + self.mlp(
-                mlp_in,
-                position_ids=position_ids,
-                cu_seqlens=cu_seqlens,
-                attention_mask=token_mask,
-            )
         return x
 
 
@@ -1412,15 +1497,52 @@ class ModernBertModel(nn.Module):
                 if self.x0_lambdas is not None:
                     x = x + self.x0_lambdas[i] * x0
                 lt = layer.attention_type
-                x = layer(
-                    x,
-                    cos_sin=rope[lt],
-                    cu_seqlens=_cu_seqlens,
-                    max_seqlen=_max_seqlen,
-                    window_size=windows[lt],
-                    position_ids=_position_ids,
-                    repo_active=repo_active,
-                )
+                if (
+                    self.config.gradient_checkpointing
+                    and self.training
+                    and str(self.config.gradient_checkpointing_mode).strip().lower() == "layer"
+                ):
+                    cos_sin = rope[lt]
+                    cu_seqlens = _cu_seqlens
+                    max_seqlen = _max_seqlen
+                    window_size = windows[lt]
+                    position_ids = _position_ids
+
+                    def _layer_forward(
+                        x_in: torch.Tensor,
+                        *,
+                        _layer: nn.Module = layer,
+                        _cos_sin=cos_sin,
+                        _cu_seqlens=cu_seqlens,
+                        _max_seqlen=max_seqlen,
+                        _window_size=window_size,
+                        _position_ids=position_ids,
+                        _repo_active: bool = repo_active,
+                    ) -> torch.Tensor:
+                        return _layer(
+                            x_in,
+                            cos_sin=_cos_sin,
+                            cu_seqlens=_cu_seqlens,
+                            max_seqlen=_max_seqlen,
+                            window_size=_window_size,
+                            position_ids=_position_ids,
+                            repo_active=_repo_active,
+                        )
+
+                    try:
+                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                    except TypeError:  # older torch checkpoint API
+                        x = _checkpoint(_layer_forward, x)
+                else:
+                    x = layer(
+                        x,
+                        cos_sin=rope[lt],
+                        cu_seqlens=_cu_seqlens,
+                        max_seqlen=_max_seqlen,
+                        window_size=windows[lt],
+                        position_ids=_position_ids,
+                        repo_active=repo_active,
+                    )
 
             if self.config.use_mhc_lite:
                 x = x[..., 0, :]  # compress: take stream 0
@@ -1473,14 +1595,46 @@ class ModernBertModel(nn.Module):
             if self.x0_lambdas is not None:
                 x = x + self.x0_lambdas[i] * x0
             layer_type = layer.attention_type
-            x = layer(
-                x,
-                attn_mask=attn_masks[layer_type],
-                cos_sin=rope[layer_type],
-                position_ids=None,
-                token_mask=attention_mask,
-                repo_active=repo_active,
-            )
+            if (
+                self.config.gradient_checkpointing
+                and self.training
+                and str(self.config.gradient_checkpointing_mode).strip().lower() == "layer"
+            ):
+                attn_mask = attn_masks[layer_type]
+                cos_sin = rope[layer_type]
+                token_mask = attention_mask
+
+                def _layer_forward(
+                    x_in: torch.Tensor,
+                    *,
+                    _layer: nn.Module = layer,
+                    _attn_mask=attn_mask,
+                    _cos_sin=cos_sin,
+                    _token_mask=token_mask,
+                    _repo_active: bool = repo_active,
+                ) -> torch.Tensor:
+                    return _layer(
+                        x_in,
+                        attn_mask=_attn_mask,
+                        cos_sin=_cos_sin,
+                        position_ids=None,
+                        token_mask=_token_mask,
+                        repo_active=_repo_active,
+                    )
+
+                try:
+                    x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                except TypeError:  # older torch checkpoint API
+                    x = _checkpoint(_layer_forward, x)
+            else:
+                x = layer(
+                    x,
+                    attn_mask=attn_masks[layer_type],
+                    cos_sin=rope[layer_type],
+                    position_ids=None,
+                    token_mask=attention_mask,
+                    repo_active=repo_active,
+                )
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]  # compress: take stream 0

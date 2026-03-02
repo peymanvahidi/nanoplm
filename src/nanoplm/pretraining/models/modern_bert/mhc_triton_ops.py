@@ -431,99 +431,65 @@ def _fused_pre_map_backward_cuda(
     grad_x = torch.empty_like(x_streams)
     grad_h_pre = torch.empty((T, n), device=x_streams.device, dtype=torch.float32)
     if _autotune_enabled():
-        autotuner_dx = k._fused_pre_map_bwd_dx_kernel_autotuned
-        status_dx = _autotune_status_begin(
-            kernel_name="k3_bwd_dx",
-            autotuner=autotuner_dx,
+        autotuner = k._fused_pre_map_bwd_fused_kernel_n4_autotuned
+        status = _autotune_status_begin(
+            kernel_name="k3_bwd_fused",
+            autotuner=autotuner,
             args_by_name={
+                "x_ptr": x_streams,
                 "h_pre_ptr": h_pre,
                 "grad_out_ptr": grad_out,
                 "grad_x_ptr": grad_x,
-                "T": T,
-                "C": C,
-                "n": n,
-            },
-        )
-        autotuner_dx[grid](
-            h_pre,
-            grad_out,
-            grad_x,
-            T,
-            C,
-            n,
-            NUM_SMS=NUM_SMS,
-        )
-        _autotune_status_end(kernel_name="k3_bwd_dx", autotuner=autotuner_dx, state=status_dx)
-
-        autotuner_hpre = k._fused_pre_map_bwd_hpre_kernel_autotuned
-        status_hpre = _autotune_status_begin(
-            kernel_name="k3_bwd_hpre",
-            autotuner=autotuner_hpre,
-            args_by_name={
-                "x_ptr": x_streams,
-                "grad_out_ptr": grad_out,
                 "grad_hp_ptr": grad_h_pre,
                 "T": T,
                 "C": C,
                 "n": n,
             },
         )
-        autotuner_hpre[grid](
+        autotuner[grid](
             x_streams,
+            h_pre,
             grad_out,
+            grad_x,
             grad_h_pre,
             T,
             C,
             n,
             NUM_SMS=NUM_SMS,
         )
-        _autotune_status_end(kernel_name="k3_bwd_hpre", autotuner=autotuner_hpre, state=status_hpre)
+        _autotune_status_end(kernel_name="k3_bwd_fused", autotuner=autotuner, state=status)
     else:
         cc_major, _ = torch.cuda.get_device_capability()
         if cc_major >= 12:
             # Tuned on RTX 5090 (SM120), T=65536/C=1024/n=4.
-            BLOCK_T_DX = 64
-            BLOCK_C_DX = 256
-            nw_dx = 4
-            ns_dx = 4
-            BLOCK_T_HPRE = 32
-            BLOCK_C_HPRE = 128
-            nw_hpre = 8
-            ns_hpre = 4
+            BLOCK_T = 32
+            BLOCK_C = 256
+            nw_f = 8
+            ns_f = 4
+        elif cc_major == 9:
+            BLOCK_T = 64
+            BLOCK_C = 128
+            nw_f = 8
+            ns_f = 3
         else:
-            BLOCK_T_DX = 64
-            BLOCK_C_DX = min(256, k.triton.next_power_of_2(C))
-            nw_dx = nw
-            ns_dx = ns
-            BLOCK_T_HPRE = BLOCK_T_DX
-            BLOCK_C_HPRE = BLOCK_C_DX
-            nw_hpre = nw
-            ns_hpre = ns
-        k._fused_pre_map_bwd_dx_kernel[grid](
+            BLOCK_T = 64
+            BLOCK_C = min(256, k.triton.next_power_of_2(C))
+            nw_f = nw
+            ns_f = ns
+        k._fused_pre_map_bwd_fused_kernel_n4[grid](
+            x_streams,
             h_pre,
             grad_out,
             grad_x,
-            T,
-            C,
-            n,
-            BLOCK_T=BLOCK_T_DX,
-            BLOCK_C=BLOCK_C_DX,
-            NUM_SMS=NUM_SMS,
-            num_warps=nw_dx,
-            num_stages=ns_dx,
-        )
-        k._fused_pre_map_bwd_hpre_kernel[grid](
-            x_streams,
-            grad_out,
             grad_h_pre,
             T,
             C,
             n,
-            BLOCK_T=BLOCK_T_HPRE,
-            BLOCK_C=BLOCK_C_HPRE,
+            BLOCK_T=BLOCK_T,
+            BLOCK_C=BLOCK_C,
             NUM_SMS=NUM_SMS,
-            num_warps=nw_hpre,
-            num_stages=ns_hpre,
+            num_warps=nw_f,
+            num_stages=ns_f,
         )
     return grad_x, grad_h_pre
 

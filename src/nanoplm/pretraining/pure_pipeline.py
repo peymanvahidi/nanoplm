@@ -1223,6 +1223,7 @@ def run_pure_pretraining(
                 vram_log = ""
                 tps = mfu = tok = raw_tok = 0.0
                 step_tok = step_raw_tok = 0.0
+                real_tps = real_tps_log = 0.0
                 avg_step_ms = 0.0
                 if should_log:
                     # Synchronize and measure only at logging boundaries to amortize sync cost.
@@ -1247,8 +1248,10 @@ def run_pure_pretraining(
                         tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
                     step_tok = tok / max(1, window_steps)
                     step_raw_tok = raw_tok / max(1, window_steps)
+                    real_tps = tok / window_dt
+                    real_tps_log = int(real_tps)
                     mfu = (
-                        _flops_per_token * achieved_global_batch_tokens * window_steps / window_dt
+                        _flops_per_token * real_tps
                     ) / (_peak_flops * max(effective_world_size, 1))
 
                     token_count.zero_()
@@ -1268,7 +1271,8 @@ def run_pure_pretraining(
                     logger.info(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
-                        f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} "
+                        f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} real_tok/s={real_tps_log:,} "
+                        f"real_tok/step={step_tok:,.0f} "
                         f"dt={avg_step_ms:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
                         f"h100_mfu={mfu:.2%} {vram_log}"
                     )
@@ -1279,6 +1283,7 @@ def run_pure_pretraining(
                         "train/learning_rate": learning_rate,
                         "train/epoch": epoch + (micro_step + 1) / synced_len,
                         "train/tokens_per_sec": tps,
+                        "train/real_tokens_per_sec": real_tps,
                         "train/step_real_tokens": step_tok,
                         "train/step_raw_tokens": step_raw_tok,
                         "train/packing_waste_pct": waste,

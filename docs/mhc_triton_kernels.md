@@ -29,21 +29,24 @@ Kernel implementations live in:
 
 ## Active Triton kernels
 
-The mHC-lite Triton stack currently uses **7 kernels**:
+The mHC-lite Triton stack currently uses **6 kernels**:
 
 1. `_fused_rmsnorm_project_fwd_kernel`
 2. `_fused_rmsnorm_project_bwd_dx_kernel`
 3. `_fused_pre_map_fwd_kernel`
-4. `_fused_pre_map_bwd_dx_kernel`
-5. `_fused_pre_map_bwd_hpre_kernel`
-6. `_fused_post_res_fwd_kernel_n4`
-7. `_fused_post_res_bwd_fused_kernel_n4`
+4. `_fused_pre_map_bwd_fused_kernel_n4`
+5. `_fused_post_res_fwd_kernel_n4`
+6. `_fused_post_res_bwd_fused_kernel_n4`
 
 Important update:
 - K4 backward is now a **single fused kernel** (`_fused_post_res_bwd_fused_kernel_n4`).
 - The old split K4 backward kernels were removed:
   - `_fused_post_res_bwd_xlo_kernel_n4`
   - `_fused_post_res_bwd_Hhp_kernel`
+
+Important update:
+- K3 backward is now a **single fused kernel**
+  (`_fused_pre_map_bwd_fused_kernel_n4`) to avoid rereading `grad_out`.
 
 ## Launch config logic (what is hardcoded vs heuristic)
 
@@ -64,10 +67,10 @@ Source of truth: launcher code in `src/nanoplm/pretraining/models/modern_bert/mh
   - **SM90 hardcoded path:** `BLOCK_T=128`, `BLOCK_C=128`, `num_warps=8`, `num_stages=4`
   - **heuristic path (other arch):** `BLOCK_T=64`, `BLOCK_C=min(256, next_power_of_2(C))`, `num_stages` from `_get_hw_config()`
 - `fused_pre_map_backward`:
-  - **SM120 (`cc_major >= 12`) hardcoded:**
-    - bwd-dx: `BLOCK_T=64`, `BLOCK_C=256`, `num_warps=4`, `num_stages=4`
-    - bwd-hpre: `BLOCK_T=32`, `BLOCK_C=128`, `num_warps=8`, `num_stages=4`
-  - **other arch:** both bwd kernels use `BLOCK_T=64`, `BLOCK_C=min(256, next_power_of_2(C))`, warps/stages from `_get_hw_config()`
+  - single fused kernel `_fused_pre_map_bwd_fused_kernel_n4` (saves a full reread of `grad_out`)
+  - **SM120 (`cc_major >= 12`) hardcoded (fused):** `BLOCK_T=32`, `BLOCK_C=256`, `num_warps=8`, `num_stages=4`
+  - **SM90 (`cc_major == 9`) hardcoded (fused):** `BLOCK_T=64`, `BLOCK_C=128`, `num_warps=8`, `num_stages=3`
+  - **other arch (fused):** `BLOCK_T=64`, `BLOCK_C=min(256, next_power_of_2(C))`, warps/stages from `_get_hw_config()`
 
 ### K4
 - `fused_post_res` fwd:
@@ -109,7 +112,7 @@ Intended usage:
 
 The runtime mHC custom-op path now supports Triton autotune launch wrappers for:
 - K1 fwd / K1 bwd_dx
-- K3 fwd / K3 bwd_dx / K3 bwd_hpre
+- K3 fwd / K3 bwd_fused
 - K4 fwd / K4 bwd_fused
 
 Each kernel's autotune candidate set is capped at **32 configs max** to keep first-run tuning latency bounded.
@@ -188,8 +191,6 @@ On stream 7, the trace contains the mHC-lite Triton kernels below (total: **142 
 - `_fused_rmsnorm_project_fwd_kernel` (17 calls, ~14.4 ms)
 - `_fused_rmsnorm_project_bwd_dx_kernel` (18 calls, ~32.9 ms)
 - `_fused_pre_map_fwd_kernel` (17 calls, ~17.6 ms)
-- `_fused_pre_map_bwd_dx_kernel` (18 calls, ~20.9 ms)
-- `_fused_pre_map_bwd_hpre_kernel` (18 calls, ~19.5 ms)
 - `_fused_post_res_fwd_kernel_n4` (18 calls, ~36.2 ms)
 - `_fused_post_res_bwd_xlo_kernel_n4` (18 calls, ~37.4 ms)
 - `_fused_post_res_bwd_Hhp_kernel` (18 calls, ~39.6 ms)
@@ -220,8 +221,6 @@ Assumptions:
 | `_fused_rmsnorm_project_fwd_kernel` | 0.847 | 0.752 | 88.8% | 1590.5 |
 | `_fused_rmsnorm_project_bwd_dx_kernel` | 1.825 | 1.503 | 82.3% | 1475.6 |
 | `_fused_pre_map_fwd_kernel` | 1.037 | 0.937 | 90.3% | 1619.0 |
-| `_fused_pre_map_bwd_dx_kernel` | 1.163 | 0.937 | 80.5% | 1442.9 |
-| `_fused_pre_map_bwd_hpre_kernel` | 1.080 | 0.937 | 86.7% | 1553.9 |
 | `_fused_post_res_fwd_kernel_n4` | 2.009 | 1.688 | 84.0% | 1506.1 |
 | `_fused_post_res_bwd_xlo_kernel_n4` | 2.075 | 1.688 | 81.3% | 1457.7 |
 | `_fused_post_res_bwd_Hhp_kernel` | 2.199 | 1.688 | 76.8% | 1375.6 |
@@ -261,8 +260,6 @@ Profiler captured 9 training steps (steps 10-15 per config). 132 SMs, 8 warps, s
 | `rmsnorm_project_fwd` | 1347 | 402 | 459 | 82% | **88%** | 2937 |
 | `rmsnorm_project_bwd_dx` | 2694 | 804 | 1040 | 77% | **77%** | 2591 |
 | `pre_map_fwd` | 1679 | 501 | 723 | 69% | **69%** | 2322 |
-| `pre_map_bwd_dx` | 1679 | 501 | 601 | 83% | **83%** | 2794 |
-| `pre_map_bwd_hpre` | 1679 | 501 | 609 | 82% | **82%** | 2757 |
 | `post_res_fwd_n4` | 3025 | 903 | 1063 | 85% | **85%** | 2846 |
 | `post_res_bwd_xlo_n4` | 3361 | 1003 | 1065 | 94% | **94%** | 3156 |
 | `post_res_bwd_Hhp` | 3025 | 903 | 1089† | 67%→ | **83%** | 2779 |
@@ -283,8 +280,6 @@ The microbenchmark (`tests/mhc_triton_kernels_benchmark.py`, T=2048, C=256) accu
 | `rmsnorm_project_fwd` | 89% | 88% | -1% |
 | `rmsnorm_project_bwd_dx` | 78% | 77% | -1% |
 | `pre_map_fwd` | 69% | 69% | 0% |
-| `pre_map_bwd_dx` | 81% | 83% | +2% |
-| `pre_map_bwd_hpre` | 83% | 82% | -1% |
 | `post_res_fwd_n4` | 84% | 85% | +1% |
 | `post_res_bwd_xlo_n4` | 94% | 94% | 0% |
 | `post_res_bwd_Hhp` | 84% | 83% | -1% |
@@ -301,8 +296,7 @@ Current code has explicit hardcoded paths for both SM90 and SM120 in `mhc_triton
 | K1 bwd (`rmsnorm_project_bwd_dx`) | `BLOCK_T` | 64 | 64 |
 | K1 bwd (`rmsnorm_project_bwd_dx`) | `BLOCK_K`, warps, stages | heuristic (`BLOCK_K=min(128,nC_pow2)`) | `BLOCK_K=128`, `warps=8`, `stages=3` |
 | K3 fwd (`pre_map_fwd`) | `BLOCK_C`, warps, stages | `BLOCK_C=128`, `warps=8`, `stages=4` | `BLOCK_C=64`, `warps=4`, `stages=2` |
-| K3 bwd-dx (`pre_map_bwd_dx`) | `BLOCK_T/BLOCK_C`, warps, stages | heuristic | `64/256`, `warps=4`, `stages=4` |
-| K3 bwd-hpre (`pre_map_bwd_hpre`) | `BLOCK_T/BLOCK_C`, warps, stages | heuristic | `32/128`, `warps=8`, `stages=4` |
+| K3 bwd (`pre_map_bwd_fused_n4`) | `BLOCK_T/BLOCK_C`, warps, stages | `64/128`, `warps=8`, `stages=3` | `32/256`, `warps=8`, `stages=4` |
 | K4 fwd (`post_res_fwd_n4`) | `BLOCK_T/BLOCK_C`, warps, stages | heuristic | `32/128`, `warps=8`, `stages=3` |
 | K4 bwd (`post_res_bwd_fused_n4`) | `BLOCK_T/BLOCK_C`, warps, stages | `32/128`, `stages=2` | `16/256`, `warps=8`, `stages=4` |
 
@@ -325,8 +319,7 @@ This is a quick summary of the follow-up tuning pass done on SM120 (RTX 5090):
 - `k1_fwd`: `BLOCK_T=128`, `BLOCK_K=64`, `warps=4`, `stages=3`
 - `k1_bwd_dx`: `BLOCK_T=64`, `BLOCK_K=128`, `warps=8`, `stages=3`
 - `k3_fwd`: `BLOCK_T=128`, `BLOCK_C=64`, `warps=4`, `stages=2`
-- `k3_bwd_dx`: `BLOCK_T=64`, `BLOCK_C=256`, `warps=4`, `stages=4`
-- `k3_bwd_hpre`: `BLOCK_T=32`, `BLOCK_C=128`, `warps=8`, `stages=4`
+- `k3_bwd_fused`: `BLOCK_T=32`, `BLOCK_C=256`, `warps=8`, `stages=4`
 - `k4_fwd`: `BLOCK_T=32`, `BLOCK_C=128`, `warps=8`, `stages=3`
 - `k4_bwd_fused`: `BLOCK_T=16`, `BLOCK_C=256`, `warps=8`, `stages=4`
 
@@ -337,8 +330,7 @@ This is a quick summary of the follow-up tuning pass done on SM120 (RTX 5090):
 | `_fused_rmsnorm_project_fwd_kernel` | 0.342 | 0.337 | 1.5% | 88.4 | 89.7 |
 | `_fused_rmsnorm_project_bwd_dx_kernel` | 0.783 | 0.747 | 4.6% | 77.2 | 80.9 |
 | `_fused_pre_map_fwd_kernel` | 0.466 | 0.432 | 7.3% | 80.5 | 86.8 |
-| `_fused_pre_map_bwd_dx_kernel` | 0.478 | 0.475 | 0.6% | 78.6 | 79.0 |
-| `_fused_pre_map_bwd_hpre_kernel` | 0.433 | 0.422 | 2.4% | 86.7 | 88.8 |
+| `_fused_pre_map_bwd_fused_kernel_n4` | 0.911 | 0.889 | 2.5% | 82.4 | 84.5 |
 | `_fused_post_res_fwd_kernel_n4` | 0.817 | 0.820 | -0.4% | 82.9 | 82.6 |
 | `_fused_post_res_bwd_fused_kernel_n4` | 4.486 | 1.251 | 72.1% | 23.5 | 84.3 |
 | **TOTAL** | **7.804** | **4.484** | **42.5%** | **48.2** | **83.9** |
@@ -354,8 +346,7 @@ Key result: the SM120 bottleneck was `k4_bwd_fused`; after retuning it moved fro
 | `_fused_rmsnorm_project_fwd_kernel` | K1 forward: RMSNorm(x_flat) + dot with `W_all.weight` | `mhc_triton_kernels.py::_fused_rmsnorm_project_fwd_kernel` | `mhc_triton_ops.py::_fused_rmsnorm_project_cuda` | `modeling.py` (`_forward_triton`) |
 | `_fused_rmsnorm_project_bwd_dx_kernel` | K1 backward: dX for fused RMSNorm+proj | `mhc_triton_kernels.py::_fused_rmsnorm_project_bwd_dx_kernel` | `mhc_triton_ops.py::_fused_rmsnorm_project_bwd_dx_cuda` | autograd via `torch.library.register_autograd` |
 | `_fused_pre_map_fwd_kernel` | K3 forward: `layer_input[t,c] = Σ_j h_pre[t,j] * x[t,j,c]` | `mhc_triton_kernels.py::_fused_pre_map_fwd_kernel` | `mhc_triton_ops.py::_fused_pre_map_cuda` | `modeling.py` (`_forward_triton`) |
-| `_fused_pre_map_bwd_dx_kernel` | K3 backward: dX_streams | `mhc_triton_kernels.py::_fused_pre_map_bwd_dx_kernel` | `mhc_triton_ops.py::_fused_pre_map_backward_cuda` | autograd via `torch.library.register_autograd` |
-| `_fused_pre_map_bwd_hpre_kernel` | K3 backward: d(h_pre) (reduces over C) | `mhc_triton_kernels.py::_fused_pre_map_bwd_hpre_kernel` | `mhc_triton_ops.py::_fused_pre_map_backward_cuda` | autograd via `torch.library.register_autograd` |
+| `_fused_pre_map_bwd_fused_kernel_n4` | K3 backward: fused dX_streams + d(h_pre) | `mhc_triton_kernels.py::_fused_pre_map_bwd_fused_kernel_n4` | `mhc_triton_ops.py::_fused_pre_map_backward_cuda` | autograd via `torch.library.register_autograd` |
 | `_fused_post_res_fwd_kernel_n4` | K4 forward (n=4): `H_merged @ x + h_post * layer_output` | `mhc_triton_kernels.py::_fused_post_res_fwd_kernel_n4` | `mhc_triton_ops.py::_fused_post_res_cuda` | `modeling.py` (`_forward_triton`) |
 | `_fused_post_res_bwd_fused_kernel_n4` | K4 fused backward: dX + d(layer_output) + d(H_merged) + d(h_post) | `mhc_triton_kernels.py::_fused_post_res_bwd_fused_kernel_n4` | `mhc_triton_ops.py::_fused_post_res_backward_cuda` | autograd via `torch.library.register_autograd` |
 

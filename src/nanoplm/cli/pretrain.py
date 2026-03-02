@@ -467,6 +467,20 @@ def pretrain():
     help="First N layers keep standard RoPE; layers after use RePO (only when --use-repo)",
 )
 @click.option(
+    "--gradient-checkpointing/--no-gradient-checkpointing",
+    default=False,
+    help="Enable activation checkpointing (recompute transformer layers in backward to save VRAM).",
+)
+@click.option(
+    "--gradient-checkpointing-mode",
+    type=click.Choice(["layer", "attn", "attn+mlp"], case_sensitive=False),
+    default="layer",
+    show_default=True,
+    help="Checkpoint scope. 'layer' checkpoints the whole transformer layer; "
+         "'attn' checkpoints only the attention residual branch (usually the best tradeoff); "
+         "'attn+mlp' checkpoints both attention and MLP branches.",
+)
+@click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
     default=False,
     help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only). "
@@ -586,6 +600,8 @@ def run(
     canon_layers_kernel_size: Optional[int],
     use_repo: bool,
     repo_after_n_layers: int,
+    gradient_checkpointing: bool,
+    gradient_checkpointing_mode: str,
     use_mhc_lite: bool,
     mhc_n_streams: int,
     mhc_lite_wrapping_level: str,
@@ -684,6 +700,8 @@ def run(
         canon_layers_kernel_size=canon_layers_kernel_size,
         use_repo=use_repo,
         repo_after_n_layers=repo_after_n_layers,
+        gradient_checkpointing=gradient_checkpointing,
+        gradient_checkpointing_mode=gradient_checkpointing_mode.lower(),
         use_mhc_lite=use_mhc_lite,
         mhc_n_streams=mhc_n_streams,
         mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),

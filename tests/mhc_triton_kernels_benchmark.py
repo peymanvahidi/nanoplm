@@ -82,8 +82,11 @@ def _bytes_model(T: int, n: int, C: int, D_out: int) -> dict[str, int]:
         + b(T, fp32)
         + b(T * nC, bf16),
         "_fused_pre_map_fwd_kernel": b(T * n * C, bf16) + b(T * n, fp32) + b(T * C, bf16),
-        "_fused_pre_map_bwd_dx_kernel": b(T * n, fp32) + b(T * C, bf16) + b(T * n * C, bf16),
-        "_fused_pre_map_bwd_hpre_kernel": b(T * n * C, bf16) + b(T * C, bf16) + b(T * n, fp32),
+        "_fused_pre_map_bwd_fused_kernel_n4": b(T * n, fp32)  # h_pre
+        + b(T * C, bf16)  # grad_out
+        + b(T * n * C, bf16)  # x_streams
+        + b(T * n * C, bf16)  # grad_x (write)
+        + b(T * n, fp32),  # grad_h_pre (write)
         "_fused_post_res_fwd_kernel_n4": b(T * n * C, bf16)
         + b(T * C, bf16)
         + b(T * n * n, fp32)
@@ -147,6 +150,11 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--peak-gbps", type=float, default=3350.0, help="Peak DRAM BW for efficiency calc.")
     ap.add_argument("--no-eff", action="store_true", help="Disable BW/efficiency calculations.")
+    ap.add_argument(
+        "--no-autotune",
+        action="store_true",
+        help="Use fixed launch params instead of Triton autotuned wrappers.",
+    )
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -183,6 +191,7 @@ def main() -> None:
 
     bytes_model = _bytes_model(T=T, n=n, C=C, D_out=D_out)
     peak_gbps = None if args.no_eff else args.peak_gbps
+    use_autotune = not args.no_autotune
 
     results: list[KernelResult] = []
 
@@ -191,22 +200,37 @@ def main() -> None:
     inv_rms = torch.empty((T,), device=device, dtype=torch.float32)
     BLOCK_K = min(128, _next_pow2(nC))
     BLOCK_T = 128
-    grid = (triton.cdiv(T, BLOCK_T),)
+    if use_autotune:
+        grid_k1 = lambda META: (triton.cdiv(T, META["BLOCK_T"]),)
+        autotuner = k._fused_rmsnorm_project_fwd_kernel_autotuned
 
-    def run_k1_fwd():
-        k._fused_rmsnorm_project_fwd_kernel[grid](
-            x_flat,
-            W,
-            out_proj,
-            inv_rms,
-            T,
-            nC,
-            D_out,
-            BLOCK_T=BLOCK_T,
-            BLOCK_K=BLOCK_K,
-            num_warps=nw_default,
-            num_stages=ns,
-        )
+        def run_k1_fwd():
+            autotuner[grid_k1](
+                x_flat,
+                W,
+                out_proj,
+                inv_rms,
+                T,
+                nC,
+                D_out,
+            )
+    else:
+        grid = (triton.cdiv(T, BLOCK_T),)
+
+        def run_k1_fwd():
+            k._fused_rmsnorm_project_fwd_kernel[grid](
+                x_flat,
+                W,
+                out_proj,
+                inv_rms,
+                T,
+                nC,
+                D_out,
+                BLOCK_T=BLOCK_T,
+                BLOCK_K=BLOCK_K,
+                num_warps=nw_default,
+                num_stages=ns,
+            )
 
     times = _time_cuda(run_k1_fwd, iters=args.iters, warmup=args.warmup)
     results.append(_summarize("_fused_rmsnorm_project_fwd_kernel", times, bytes_model["_fused_rmsnorm_project_fwd_kernel"], peak_gbps))
@@ -216,24 +240,41 @@ def main() -> None:
 
     BLOCK_T_BWD = 64 if cc_major == 9 else BLOCK_T
     ns_bwd = ns
-    grid_bwd = (triton.cdiv(T, BLOCK_T_BWD),)
+    if use_autotune:
+        grid_k1_bwd = lambda META: (triton.cdiv(T, META["BLOCK_T"]),)
+        autotuner = k._fused_rmsnorm_project_bwd_dx_kernel_autotuned
 
-    def run_k1_bwd_dx():
-        k._fused_rmsnorm_project_bwd_dx_kernel[grid_bwd](
-            x_flat,
-            W,
-            grad_out_proj,
-            out_proj,
-            inv_rms,
-            grad_x_flat,
-            T,
-            nC,
-            D_out,
-            BLOCK_T=BLOCK_T_BWD,
-            BLOCK_K=BLOCK_K,
-            num_warps=nw_default,
-            num_stages=ns_bwd,
-        )
+        def run_k1_bwd_dx():
+            autotuner[grid_k1_bwd](
+                x_flat,
+                W,
+                grad_out_proj,
+                out_proj,
+                inv_rms,
+                grad_x_flat,
+                T,
+                nC,
+                D_out,
+            )
+    else:
+        grid_bwd = (triton.cdiv(T, BLOCK_T_BWD),)
+
+        def run_k1_bwd_dx():
+            k._fused_rmsnorm_project_bwd_dx_kernel[grid_bwd](
+                x_flat,
+                W,
+                grad_out_proj,
+                out_proj,
+                inv_rms,
+                grad_x_flat,
+                T,
+                nC,
+                D_out,
+                BLOCK_T=BLOCK_T_BWD,
+                BLOCK_K=BLOCK_K,
+                num_warps=nw_default,
+                num_stages=ns_bwd,
+            )
 
     times = _time_cuda(run_k1_bwd_dx, iters=args.iters, warmup=args.warmup)
     results.append(_summarize("_fused_rmsnorm_project_bwd_dx_kernel", times, bytes_model["_fused_rmsnorm_project_bwd_dx_kernel"], peak_gbps))
@@ -245,68 +286,95 @@ def main() -> None:
     ns_pre = 3 if cc_major == 9 else ns
     grid_sms = (NUM_SMS,)
 
-    def run_k3_fwd():
-        k._fused_pre_map_fwd_kernel[grid_sms](
-            x_streams,
-            h_pre,
-            out_pre,
-            T,
-            C,
-            n,
-            BLOCK_T=BLOCK_T3,
-            BLOCK_C=BLOCK_C3,
-            NUM_SMS=NUM_SMS,
-            num_warps=nw_default,
-            num_stages=ns_pre,
-        )
+    if use_autotune:
+        autotuner = k._fused_pre_map_fwd_kernel_autotuned
+
+        def run_k3_fwd():
+            autotuner[grid_sms](
+                x_streams,
+                h_pre,
+                out_pre,
+                T,
+                C,
+                n,
+                NUM_SMS=NUM_SMS,
+            )
+    else:
+        def run_k3_fwd():
+            k._fused_pre_map_fwd_kernel[grid_sms](
+                x_streams,
+                h_pre,
+                out_pre,
+                T,
+                C,
+                n,
+                BLOCK_T=BLOCK_T3,
+                BLOCK_C=BLOCK_C3,
+                NUM_SMS=NUM_SMS,
+                num_warps=nw_default,
+                num_stages=ns_pre,
+            )
 
     times = _time_cuda(run_k3_fwd, iters=args.iters, warmup=args.warmup)
     results.append(_summarize("_fused_pre_map_fwd_kernel", times, bytes_model["_fused_pre_map_fwd_kernel"], peak_gbps))
 
-    # ---- K3 bwd_dx ----
-    grad_x_streams = torch.empty_like(x_streams)
-
-    # bwd kernels use original BLOCK_C=256 (fewer live tiles, not register-bound)
+    # ---- K3 bwd_fused (dx + hpre) ----
+    grad_x_streams_fused = torch.empty_like(x_streams)
+    grad_hpre_fused = torch.empty((T, n), device=device, dtype=torch.float32)
     BLOCK_C3_bwd = min(256, _next_pow2(C))
 
-    def run_k3_bwd_dx():
-        k._fused_pre_map_bwd_dx_kernel[grid_sms](
-            h_pre,
-            grad_out_pre,
-            grad_x_streams,
-            T,
-            C,
-            n,
-            BLOCK_T=BLOCK_T3,
-            BLOCK_C=BLOCK_C3_bwd,
-            NUM_SMS=NUM_SMS,
-            num_warps=nw_default,
-            num_stages=ns,
-        )
+    if use_autotune:
+        autotuner = k._fused_pre_map_bwd_fused_kernel_n4_autotuned
 
-    times = _time_cuda(run_k3_bwd_dx, iters=args.iters, warmup=args.warmup)
-    results.append(_summarize("_fused_pre_map_bwd_dx_kernel", times, bytes_model["_fused_pre_map_bwd_dx_kernel"], peak_gbps))
+        def run_k3_bwd_fused():
+            autotuner[grid_sms](
+                x_streams,
+                h_pre,
+                grad_out_pre,
+                grad_x_streams_fused,
+                grad_hpre_fused,
+                T,
+                C,
+                n,
+                NUM_SMS=NUM_SMS,
+            )
+    else:
+        if cc_major >= 12:
+            # Match runtime path in mhc_triton_ops.py for SM120.
+            BLOCK_T3_FUSED = 32
+            BLOCK_C3_FUSED = 256
+            nw3_fused = 8
+            ns3_fused = 4
+        elif cc_major == 9:
+            BLOCK_T3_FUSED = 64
+            BLOCK_C3_FUSED = 128
+            nw3_fused = 8
+            ns3_fused = 3
+        else:
+            BLOCK_T3_FUSED = BLOCK_T3
+            BLOCK_C3_FUSED = BLOCK_C3_bwd
+            nw3_fused = nw_default
+            ns3_fused = ns
 
-    # ---- K3 bwd_hpre ----
-    grad_hpre = torch.empty((T, n), device=device, dtype=torch.float32)
+        def run_k3_bwd_fused():
+            k._fused_pre_map_bwd_fused_kernel_n4[grid_sms](
+                x_streams,
+                h_pre,
+                grad_out_pre,
+                grad_x_streams_fused,
+                grad_hpre_fused,
+                T,
+                C,
+                n,
+                BLOCK_T=BLOCK_T3_FUSED,
+                BLOCK_C=BLOCK_C3_FUSED,
+                NUM_SMS=NUM_SMS,
+                num_warps=nw3_fused,
+                num_stages=ns3_fused,
+            )
 
-    def run_k3_bwd_hpre():
-        k._fused_pre_map_bwd_hpre_kernel[grid_sms](
-            x_streams,
-            grad_out_pre,
-            grad_hpre,
-            T,
-            C,
-            n,
-            BLOCK_T=BLOCK_T3,
-            BLOCK_C=BLOCK_C3_bwd,
-            NUM_SMS=NUM_SMS,
-            num_warps=nw_default,
-            num_stages=ns,
-        )
-
-    times = _time_cuda(run_k3_bwd_hpre, iters=args.iters, warmup=args.warmup)
-    results.append(_summarize("_fused_pre_map_bwd_hpre_kernel", times, bytes_model["_fused_pre_map_bwd_hpre_kernel"], peak_gbps))
+    times = _time_cuda(run_k3_bwd_fused, iters=args.iters, warmup=args.warmup)
+    results.append(_summarize("_fused_pre_map_bwd_fused_kernel_n4", times, bytes_model["_fused_pre_map_bwd_fused_kernel_n4"], peak_gbps))
 
     # ---- K4 fwd: post_res ----
     out_post = torch.empty_like(x_streams)
@@ -314,22 +382,38 @@ def main() -> None:
     BLOCK_C4 = 128 if C >= 128 else _next_pow2(C)
     nw4 = 8 if cc_major >= 9 else nw_default
 
-    def run_k4_fwd():
-        k._fused_post_res_fwd_kernel_n4[grid_sms](
-            x_streams,
-            layer_output,
-            H,
-            h_post,
-            out_post,
-            T,
-            C,
-            n,
-            BLOCK_T=BLOCK_T4,
-            BLOCK_C=BLOCK_C4,
-            NUM_SMS=NUM_SMS,
-            num_warps=nw4,
-            num_stages=ns,
-        )
+    if use_autotune:
+        autotuner = k._fused_post_res_fwd_kernel_n4_autotuned
+
+        def run_k4_fwd():
+            autotuner[grid_sms](
+                x_streams,
+                layer_output,
+                H,
+                h_post,
+                out_post,
+                T,
+                C,
+                n,
+                NUM_SMS=NUM_SMS,
+            )
+    else:
+        def run_k4_fwd():
+            k._fused_post_res_fwd_kernel_n4[grid_sms](
+                x_streams,
+                layer_output,
+                H,
+                h_post,
+                out_post,
+                T,
+                C,
+                n,
+                BLOCK_T=BLOCK_T4,
+                BLOCK_C=BLOCK_C4,
+                NUM_SMS=NUM_SMS,
+                num_warps=nw4,
+                num_stages=ns,
+            )
 
     times = _time_cuda(run_k4_fwd, iters=args.iters, warmup=args.warmup)
     results.append(_summarize("_fused_post_res_fwd_kernel_n4", times, bytes_model["_fused_post_res_fwd_kernel_n4"], peak_gbps))
@@ -340,35 +424,63 @@ def main() -> None:
     grad_H_fused = torch.empty((T, n, n), device=device, dtype=torch.float32)
     grad_hp_fused = torch.empty((T, n), device=device, dtype=torch.float32)
 
-    if cc_major == 9:
-        BLOCK_TF = 32
-        BLOCK_CF = 128
-        ns_fused = 2
-    else:
-        BLOCK_TF = 32
-        BLOCK_CF = min(256, _next_pow2(C))
-        ns_fused = ns
+    if use_autotune:
+        autotuner = k._fused_post_res_bwd_fused_kernel_n4_autotuned
 
-    def run_k4_bwd_fused():
-        k._fused_post_res_bwd_fused_kernel_n4[grid_sms](
-            x_streams,
-            layer_output,
-            H,
-            h_post,
-            grad_out_post,
-            grad_x_fused,
-            grad_lo_fused,
-            grad_H_fused,
-            grad_hp_fused,
-            T,
-            C,
-            n,
-            BLOCK_T=BLOCK_TF,
-            BLOCK_C=BLOCK_CF,
-            NUM_SMS=NUM_SMS,
-            num_warps=nw_default,
-            num_stages=ns_fused,
-        )
+        def run_k4_bwd_fused():
+            autotuner[grid_sms](
+                x_streams,
+                layer_output,
+                H,
+                h_post,
+                grad_out_post,
+                grad_x_fused,
+                grad_lo_fused,
+                grad_H_fused,
+                grad_hp_fused,
+                T,
+                C,
+                n,
+                NUM_SMS=NUM_SMS,
+            )
+    else:
+        if cc_major >= 12:
+            # Match runtime path in mhc_triton_ops.py for SM120 (RTX 5090).
+            BLOCK_TF = 16
+            BLOCK_CF = 256
+            nw_fused = 8
+            ns_fused = 2
+        elif cc_major == 9:
+            BLOCK_TF = 32
+            BLOCK_CF = 128
+            nw_fused = nw_default
+            ns_fused = 2
+        else:
+            BLOCK_TF = 32
+            BLOCK_CF = min(256, _next_pow2(C))
+            nw_fused = nw_default
+            ns_fused = ns
+
+        def run_k4_bwd_fused():
+            k._fused_post_res_bwd_fused_kernel_n4[grid_sms](
+                x_streams,
+                layer_output,
+                H,
+                h_post,
+                grad_out_post,
+                grad_x_fused,
+                grad_lo_fused,
+                grad_H_fused,
+                grad_hp_fused,
+                T,
+                C,
+                n,
+                BLOCK_T=BLOCK_TF,
+                BLOCK_C=BLOCK_CF,
+                NUM_SMS=NUM_SMS,
+                num_warps=nw_fused,
+                num_stages=ns_fused,
+            )
 
     times = _time_cuda(run_k4_bwd_fused, iters=args.iters, warmup=args.warmup)
     results.append(_summarize("_fused_post_res_bwd_fused_kernel_n4", times, bytes_model["_fused_post_res_bwd_fused_kernel_n4"], peak_gbps))
@@ -376,6 +488,7 @@ def main() -> None:
     # ---- Print ----
     print(f"Device: {torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability()} NUM_SMS={NUM_SMS}")
     print(f"Shape: T={T} n={n} C={C} D_out={D_out} iters={args.iters} warmup={args.warmup}")
+    print(f"Launch mode: {'autotuned' if use_autotune else 'fixed'}")
     if peak_gbps is not None:
         print(f"Peak BW assumption: {peak_gbps:.1f} GB/s")
     print()

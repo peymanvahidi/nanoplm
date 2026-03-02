@@ -102,23 +102,17 @@ _AUTOTUNE_K3_FWD_CONFIGS = _autotune_configs_block_c(
     warps=(4, 8),
     stages=(2, 3),
 )
-_AUTOTUNE_K3_BWD_DX_CONFIGS = _autotune_configs_block_c(
-    block_ts=(32, 64, 128, 256),
-    block_cs=(64, 128),
+_AUTOTUNE_K3_BWD_FUSED_CONFIGS = _autotune_configs_block_c(
+    block_ts=(32, 64, 128),
+    block_cs=(64, 128, 256),
     warps=(4, 8),
-    stages=(2, 3),
-)
-_AUTOTUNE_K3_BWD_HPRE_CONFIGS = _autotune_configs_block_c(
-    block_ts=(32, 64, 128, 256),
-    block_cs=(64, 128),
-    warps=(4, 8),
-    stages=(2, 4),
+    stages=(2, 3, 4),
 )
 _AUTOTUNE_K4_FWD_CONFIGS = _autotune_configs_block_c(
     block_ts=(16, 32, 64, 128),
     block_cs=(64, 128),
     warps=(4, 8),
-    stages=(2, 4),
+    stages=(2, 3, 4),
 )
 _AUTOTUNE_K4_BWD_FUSED_CONFIGS = _autotune_configs_block_c(
     block_ts=(16, 32, 64),
@@ -599,61 +593,20 @@ def _fused_pre_map_fwd_kernel(
 
 
 @triton.jit
-def _fused_pre_map_bwd_dx_kernel(
-    h_pre_ptr, grad_out_ptr,
-    grad_x_ptr,
+def _fused_pre_map_bwd_fused_kernel_n4(
+    x_ptr, h_pre_ptr, grad_out_ptr,
+    grad_x_ptr, grad_hp_ptr,
     T, C: tl.constexpr, n: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """Compute ∂L/∂x_streams. No reductions, no atomics."""
-    tl.static_assert(n == 4)
-    pid = tl.program_id(0)
-    num_t_tiles = tl.cdiv(T, BLOCK_T)
-    num_c_tiles = tl.cdiv(C, BLOCK_C)
-    num_tiles = num_t_tiles * num_c_tiles
+    """Fused K3 backward: computes (grad_x_streams, grad_h_pre) in one pass.
 
-    for tile_id in tl.range(pid, num_tiles, NUM_SMS, flatten=True):
-        pid_t = tile_id // num_c_tiles
-        pid_c = tile_id % num_c_tiles
-
-        t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
-        t_mask = t_offs < T
-
-        go_ptr = tl.make_block_ptr(
-            base=grad_out_ptr,
-            shape=(T, C),
-            strides=(C, 1),
-            offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
-            block_shape=(BLOCK_T, BLOCK_C),
-            order=(1, 0),
-        )
-        go = tl.load(go_ptr, boundary_check=(0, 1)).to(tl.float32)
-
-        for j in tl.static_range(4):
-            hp_j = tl.load(h_pre_ptr + t_offs * n + j, mask=t_mask, other=0.0).to(tl.float32)
-            gx = hp_j[:, None] * go
-
-            gx_ptr = tl.make_block_ptr(
-                base=grad_x_ptr + j * C,
-                shape=(T, C),
-                strides=(n * C, 1),
-                offsets=(pid_t * BLOCK_T, pid_c * BLOCK_C),
-                block_shape=(BLOCK_T, BLOCK_C),
-                order=(1, 0),
-            )
-            tl.store(gx_ptr, gx.to(tl.bfloat16), boundary_check=(0, 1))
-
-
-@triton.jit
-def _fused_pre_map_bwd_hpre_kernel(
-    x_ptr, grad_out_ptr,
-    grad_hp_ptr,
-    T, C: tl.constexpr, n: tl.constexpr,
-    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
-    """Compute ∂L/∂h_pre by reducing over ALL of C. No atomics."""
+    Saves a full grad_out (T,C) reread versus a two-pass backward by:
+      - loading grad_out once per C-tile
+      - writing grad_x for all 4 streams
+      - streaming x_j to accumulate grad_h_pre reductions over C
+    """
     tl.static_assert(n == 4)
     pid = tl.program_id(0)
     num_t_tiles = tl.cdiv(T, BLOCK_T)
@@ -661,6 +614,11 @@ def _fused_pre_map_bwd_hpre_kernel(
     for tile_id in tl.range(pid, num_t_tiles, NUM_SMS, flatten=True):
         t_offs = tile_id * BLOCK_T + tl.arange(0, BLOCK_T)
         t_mask = t_offs < T
+
+        hp0 = tl.load(h_pre_ptr + t_offs * n + 0, mask=t_mask, other=0.0).to(tl.float32)
+        hp1 = tl.load(h_pre_ptr + t_offs * n + 1, mask=t_mask, other=0.0).to(tl.float32)
+        hp2 = tl.load(h_pre_ptr + t_offs * n + 2, mask=t_mask, other=0.0).to(tl.float32)
+        hp3 = tl.load(h_pre_ptr + t_offs * n + 3, mask=t_mask, other=0.0).to(tl.float32)
 
         ghp0 = tl.zeros((BLOCK_T,), dtype=tl.float32)
         ghp1 = tl.zeros((BLOCK_T,), dtype=tl.float32)
@@ -678,6 +636,48 @@ def _fused_pre_map_bwd_hpre_kernel(
             )
             go = tl.load(go_ptr, boundary_check=(0, 1)).to(tl.float32)
 
+            gx0 = hp0[:, None] * go
+            gx1 = hp1[:, None] * go
+            gx2 = hp2[:, None] * go
+            gx3 = hp3[:, None] * go
+
+            gx0_ptr = tl.make_block_ptr(
+                base=grad_x_ptr + 0 * C,
+                shape=(T, C),
+                strides=(n * C, 1),
+                offsets=(tile_id * BLOCK_T, c_start),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0),
+            )
+            gx1_ptr = tl.make_block_ptr(
+                base=grad_x_ptr + 1 * C,
+                shape=(T, C),
+                strides=(n * C, 1),
+                offsets=(tile_id * BLOCK_T, c_start),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0),
+            )
+            gx2_ptr = tl.make_block_ptr(
+                base=grad_x_ptr + 2 * C,
+                shape=(T, C),
+                strides=(n * C, 1),
+                offsets=(tile_id * BLOCK_T, c_start),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0),
+            )
+            gx3_ptr = tl.make_block_ptr(
+                base=grad_x_ptr + 3 * C,
+                shape=(T, C),
+                strides=(n * C, 1),
+                offsets=(tile_id * BLOCK_T, c_start),
+                block_shape=(BLOCK_T, BLOCK_C),
+                order=(1, 0),
+            )
+            tl.store(gx0_ptr, gx0.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(gx1_ptr, gx1.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(gx2_ptr, gx2.to(tl.bfloat16), boundary_check=(0, 1))
+            tl.store(gx3_ptr, gx3.to(tl.bfloat16), boundary_check=(0, 1))
+
             x0_ptr = tl.make_block_ptr(
                 base=x_ptr + 0 * C,
                 shape=(T, C),
@@ -686,6 +686,9 @@ def _fused_pre_map_bwd_hpre_kernel(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
+            x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
+            ghp0 += tl.sum(x0 * go, axis=1)
+
             x1_ptr = tl.make_block_ptr(
                 base=x_ptr + 1 * C,
                 shape=(T, C),
@@ -694,6 +697,9 @@ def _fused_pre_map_bwd_hpre_kernel(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
+            x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
+            ghp1 += tl.sum(x1 * go, axis=1)
+
             x2_ptr = tl.make_block_ptr(
                 base=x_ptr + 2 * C,
                 shape=(T, C),
@@ -702,6 +708,9 @@ def _fused_pre_map_bwd_hpre_kernel(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
+            x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
+            ghp2 += tl.sum(x2 * go, axis=1)
+
             x3_ptr = tl.make_block_ptr(
                 base=x_ptr + 3 * C,
                 shape=(T, C),
@@ -710,15 +719,7 @@ def _fused_pre_map_bwd_hpre_kernel(
                 block_shape=(BLOCK_T, BLOCK_C),
                 order=(1, 0),
             )
-
-            x0 = tl.load(x0_ptr, boundary_check=(0, 1)).to(tl.float32)
-            x1 = tl.load(x1_ptr, boundary_check=(0, 1)).to(tl.float32)
-            x2 = tl.load(x2_ptr, boundary_check=(0, 1)).to(tl.float32)
             x3 = tl.load(x3_ptr, boundary_check=(0, 1)).to(tl.float32)
-
-            ghp0 += tl.sum(x0 * go, axis=1)
-            ghp1 += tl.sum(x1 * go, axis=1)
-            ghp2 += tl.sum(x2 * go, axis=1)
             ghp3 += tl.sum(x3 * go, axis=1)
 
         tl.store(grad_hp_ptr + t_offs * n + 0, ghp0, mask=t_mask)
@@ -795,40 +796,20 @@ def _fused_pre_map_fwd_kernel_autotuned(
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_K3_BWD_DX_CONFIGS, key=["T", "C", "n"], cache_results=True)
+@triton.autotune(configs=_AUTOTUNE_K3_BWD_FUSED_CONFIGS, key=["T", "C", "n"], cache_results=True)
 @triton.jit
-def _fused_pre_map_bwd_dx_kernel_autotuned(
-    h_pre_ptr, grad_out_ptr,
-    grad_x_ptr,
+def _fused_pre_map_bwd_fused_kernel_n4_autotuned(
+    x_ptr, h_pre_ptr, grad_out_ptr,
+    grad_x_ptr, grad_hp_ptr,
     T, C: tl.constexpr, n: tl.constexpr,
     BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    _fused_pre_map_bwd_dx_kernel(
+    _fused_pre_map_bwd_fused_kernel_n4(
+        x_ptr,
         h_pre_ptr,
         grad_out_ptr,
         grad_x_ptr,
-        T,
-        C,
-        n,
-        BLOCK_T,
-        BLOCK_C,
-        NUM_SMS,
-    )
-
-
-@triton.autotune(configs=_AUTOTUNE_K3_BWD_HPRE_CONFIGS, key=["T", "C", "n"], cache_results=True)
-@triton.jit
-def _fused_pre_map_bwd_hpre_kernel_autotuned(
-    x_ptr, grad_out_ptr,
-    grad_hp_ptr,
-    T, C: tl.constexpr, n: tl.constexpr,
-    BLOCK_T: tl.constexpr, BLOCK_C: tl.constexpr,
-    NUM_SMS: tl.constexpr,
-):
-    _fused_pre_map_bwd_hpre_kernel(
-        x_ptr,
-        grad_out_ptr,
         grad_hp_ptr,
         T,
         C,
