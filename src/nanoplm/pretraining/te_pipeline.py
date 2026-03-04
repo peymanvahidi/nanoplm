@@ -156,7 +156,9 @@ def run_te_pretraining(
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
     if manifest.max_seq_len <= 0:
         raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")
-
+    # Capture config/manifest for checkpoint serialization.
+    _model_config = getattr(model, \"model_config\", None)
+    _manifest = manifest
     model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
     if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
         raise ValueError(
@@ -847,6 +849,8 @@ def run_te_pretraining(
                         save_steps=save_steps,
                         distributed=distributed,
                         is_main=is_main,
+                        model_config=_model_config,
+                        manifest=_manifest,
                     )
 
             # ---- Epoch boundary cleanup ----
@@ -891,6 +895,8 @@ def run_te_pretraining(
         save_steps=save_steps,
         distributed=distributed,
         is_main=is_main,
+        model_config=_model_config,
+        manifest=_manifest,
     )
     if is_main:
         if wandb_enabled and wandb.run is not None:

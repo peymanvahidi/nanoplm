@@ -8,6 +8,8 @@ import gc
 import json
 import math
 import os
+import yaml
+from dataclasses import asdict
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
@@ -565,6 +567,7 @@ def _save_checkpoint(
     model, optimizer, scheduler, global_step, epoch,
     output_dir, logging_steps, eval_steps, save_steps,
     distributed=False, is_main=True,
+    model_config=None, manifest=None,
 ) -> None:
     ckpt = Path(output_dir) / f"checkpoint-{global_step}"
 
@@ -600,6 +603,19 @@ def _save_checkpoint(
         ), indent=2),
         encoding="utf-8",
     )
+
+    # Save model architecture config and data manifest so checkpoints are
+    # self-contained (inference can reconstruct the model without the
+    # original pretrain.yaml or dataset directory).
+    if model_config is not None:
+        cfg_dict = asdict(model_config) if hasattr(model_config, '__dataclass_fields__') else dict(model_config)
+        with open(ckpt / "model_config.yaml", "w") as f:
+            yaml.dump(cfg_dict, f, default_flow_style=False, sort_keys=False)
+    if manifest is not None:
+        manifest_dict = manifest.to_dict() if hasattr(manifest, 'to_dict') else dict(manifest)
+        with open(ckpt / "data_manifest.yaml", "w") as f:
+            yaml.dump(manifest_dict, f, default_flow_style=False, sort_keys=False)
+
     logger.info(f"Checkpoint saved -> {ckpt}")
 
 
@@ -692,6 +708,11 @@ def run_pure_pretraining(
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
     if manifest.max_seq_len <= 0:
         raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")
+
+    # Capture config/manifest for checkpoint serialization so every saved
+    # checkpoint is self-contained (no external pretrain.yaml needed).
+    _model_config = getattr(model, "model_config", None)
+    _manifest = manifest
 
     model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
     if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
@@ -1329,6 +1350,7 @@ def run_pure_pretraining(
                         model, optimizer, scheduler, global_step, epoch,
                         output_dir, logging_steps, eval_steps, save_steps,
                         distributed, is_main,
+                        model_config=_model_config, manifest=_manifest,
                     )
 
             # ---- Epoch boundary cleanup ----
@@ -1369,6 +1391,7 @@ def run_pure_pretraining(
         model, optimizer, scheduler, global_step, num_epochs,
         output_dir, logging_steps, eval_steps, save_steps,
         distributed, is_main,
+        model_config=_model_config, manifest=_manifest,
     )
 
     if is_main and wandb_enabled and wandb.run is not None:

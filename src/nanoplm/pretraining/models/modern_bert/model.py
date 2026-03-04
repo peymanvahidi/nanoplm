@@ -77,6 +77,8 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             )
 
         self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
 
         self.config = ModernBertConfig(
             vocab_size=config.vocab_size,

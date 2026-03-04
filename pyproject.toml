@@ -30,6 +30,7 @@ classifiers = [
 keywords = ["bioinformatics", "protein-language-model", "large-language-models"]
 dependencies = [
     "accelerate>=1.7.0",
+    "biotrainer @git+https://github.com/sacdallago/biotrainer@main",
     "biopython>=1.85",
     "click>=8.1.8",
     "dion @git+https://github.com/alint77/dion@dev/megabatching",

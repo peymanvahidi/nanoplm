@@ -35,6 +35,8 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
 
     def __init__(self, config: ProtModernBertMLMConfig):
         self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
 
         mb_config = ModernBertConfig(
             vocab_size=config.vocab_size,
@@ -90,6 +92,8 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             )
 
         self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
 
         mb_config = ModernBertConfig(
             vocab_size=config.vocab_size,
