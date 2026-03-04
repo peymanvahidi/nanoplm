@@ -44,6 +44,7 @@ from nanoplm.pretraining.pure_pipeline import (
     _load_checkpoint,
     _move_batch_to_device,
     _num_update_steps_per_epoch,
+    _rebuild_scheduler_for_resume,
     _resolve_world_size,
     _save_checkpoint,
     _set_seed,
@@ -157,7 +158,7 @@ def run_te_pretraining(
     if manifest.max_seq_len <= 0:
         raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")
     # Capture config/manifest for checkpoint serialization.
-    _model_config = getattr(model, \"model_config\", None)
+    _model_config = getattr(model, "model_config", None)
     _manifest = manifest
     model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
     if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
@@ -483,8 +484,22 @@ def run_te_pretraining(
             checkpoint_dir=resume_config.checkpoint_dir,
             device=device,
             distributed=distributed,
+            load_scheduler=False,
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
+
+        # Rebuild the LR scheduler from the checkpoint's saved schedule
+        # params (with any explicit overrides from resume config).
+        scheduler = _rebuild_scheduler_for_resume(
+            optimizer=optimizer,
+            resume_config=resume_config,
+            pretrain_config=pretrain_config,
+            checkpoint_dir=resume_config.checkpoint_dir,
+            start_step=start_step,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            is_main=is_main,
+        )
 
     resume_micro_step = 0
     resume_epoch = start_epoch
@@ -851,6 +866,9 @@ def run_te_pretraining(
                         is_main=is_main,
                         model_config=_model_config,
                         manifest=_manifest,
+                        pretrain_config=pretrain_config,
+                        total_steps=total_steps,
+                        warmup_steps=warmup_steps,
                     )
 
             # ---- Epoch boundary cleanup ----
@@ -897,6 +915,9 @@ def run_te_pretraining(
         is_main=is_main,
         model_config=_model_config,
         manifest=_manifest,
+        pretrain_config=pretrain_config,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
     )
     if is_main:
         if wandb_enabled and wandb.run is not None:

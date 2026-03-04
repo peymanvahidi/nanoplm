@@ -311,6 +311,21 @@ class ResumeConfig:
     is_resume: bool
     checkpoint_dir: str
     extra_epochs: Optional[int] = None
+    # Schedule override options for resumed training.
+    # When set to None (the YAML default), the corresponding value is read
+    # from the checkpoint's saved pretrain_config.yaml so the original
+    # schedule is reconstructed exactly.  Explicit values override.
+    warmup_steps: Optional[int] = None
+    learning_rate: Optional[float] = None
+    muon_learning_rate: Optional[float] = None
+    lr_schedule: Optional[str] = None
+    lr_decay_to_fraction: Optional[float] = None
+    # reset_scheduler: rebuild the LR schedule from step 0 covering only the
+    # remaining training steps (new warmup + decay).  Useful when you want a
+    # fresh learning-rate curve after a long pause.
+    reset_scheduler: bool = False
+    # skip_warmup: jump straight to peak LR on resume (sets warmup_steps=0).
+    skip_warmup: bool = False
 
 
 def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
@@ -435,7 +450,7 @@ def _prepare_run_and_steps(
     if resume_config and resume_config.is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
 
-        if resume_config.extra_epochs > 0:
+        if resume_config.extra_epochs is not None and resume_config.extra_epochs > 0:
             num_epochs = pretrain_config.num_epochs + int(resume_config.extra_epochs)
         else:
             num_epochs = pretrain_config.num_epochs

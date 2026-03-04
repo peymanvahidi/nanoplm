@@ -1181,7 +1181,6 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     expected_keys = set(ResumeConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
-    missing = []
     extra = []
     kwargs: Dict[str, Any] = {}
 
@@ -1190,15 +1189,19 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             extra.append(key)
             continue
         value = config.get(key)
-        if value is None:
-            missing.append(key)
+        # Keep None values for Optional fields — they mean "use default /
+        # inherit from checkpoint".  Only skip None for required fields
+        # (is_resume, checkpoint_dir).
+        if value is None and key in ("is_resume", "checkpoint_dir"):
             continue
         kwargs[key] = value
 
     checkpoint_dir = kwargs.get("checkpoint_dir")
 
+    # Ensure extra_epochs is always present (None-safe).
     if "extra_epochs" in config:
         kwargs["extra_epochs"] = config.get("extra_epochs")
+
     is_resume = kwargs.get("is_resume", False)
 
     if is_resume:
@@ -1212,5 +1215,10 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             raise click.ClickException(
                 f"Checkpoint directory does not exist: {checkpoint_dir}"
             )
+
+    if extra:
+        logger.warning(
+            f"Unknown keys in resume config (ignored): {extra}"
+        )
 
     return ResumeConfig(**kwargs)
