@@ -9,9 +9,18 @@ import math
 import os
 from dataclasses import MISSING, fields
 import numpy as np
-import torch
 from typing import Optional, Dict, Any, Union
 from pathlib import Path
+
+# Inductor Triton compile workers (used by torch.compile) inherit settings from
+# environment variables at process start. Default to safer settings to avoid
+# "No valid triton configs / out of resource" from mix-order persistent
+# reduction kernels at larger hidden sizes. Users can override by exporting
+# these env vars before launching.
+os.environ.setdefault("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "0")
+os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
+
+import torch
 
 from nanoplm.pretraining.pipeline import (
     PretrainingConfig,
@@ -392,6 +401,11 @@ def pretrain():
     help="Use MLP bias"
 )
 @click.option(
+    "--no-mlp-on-first-layer/--mlp-on-first-layer",
+    default=True,
+    help="Disable the MLP branch in encoder layer 0",
+)
+@click.option(
     "--attention-bias",
     is_flag=True,
     default=False,
@@ -412,7 +426,7 @@ def pretrain():
 @click.option(
     "--use-resid-lambdas/--no-use-resid-lambdas",
     default=True,
-    help="Enable per-layer residual scaling (resid_lambdas)",
+    help="Enable per-layer residual scaling (resid_lambdas). Not compatible with --use-mhc-lite.",
 )
 @click.option(
     "--use-x0-lambdas/--no-use-x0-lambdas",
@@ -436,18 +450,10 @@ def pretrain():
     help="Subset of Canon insertion points to enable (A/B/C/D), e.g. 'abcd' or 'ac'",
 )
 @click.option(
-    "--canon-layer-type",
-    type=click.Choice(["causal", "symmetric"], case_sensitive=False),
-    default="causal",
-    help="Canon layer conv type: 'causal' uses fused causal_conv1d CUDA kernel (fast, requires packing); "
-         "'symmetric' uses bidirectional nn.Conv1d (slower, original implementation)",
-)
-@click.option(
     "--canon-layers-kernel-size",
     type=int,
     default=None,
-    help="Canon kernel size. If omitted, defaults to 4 for 'causal' and 5 for 'symmetric'. "
-         "Allowed values: causal -> {2,3,4}, symmetric -> {3,5,7}.",
+    help="Canon kernel size. If omitted, defaults to 5. Allowed values: {3,5,7}.",
 )
 @click.option(
     "--use-repo/--no-use-repo",
@@ -459,6 +465,60 @@ def pretrain():
     type=int,
     default=3,
     help="First N layers keep standard RoPE; layers after use RePO (only when --use-repo)",
+)
+@click.option(
+    "--gradient-checkpointing/--no-gradient-checkpointing",
+    default=False,
+    help="Enable activation checkpointing (recompute transformer layers in backward to save VRAM).",
+)
+@click.option(
+    "--gradient-checkpointing-mode",
+    type=click.Choice(["layer", "attn", "attn+mlp"], case_sensitive=False),
+    default="layer",
+    show_default=True,
+    help="Checkpoint scope. 'layer' checkpoints the whole transformer layer; "
+         "'attn' checkpoints only the attention residual branch (usually the best tradeoff); "
+         "'attn+mlp' checkpoints both attention and MLP branches.",
+)
+@click.option(
+    "--use-mhc-lite/--no-use-mhc-lite",
+    default=False,
+    help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only). "
+         "Not compatible with --use-resid-lambdas.",
+)
+@click.option(
+    "--mhc-n-streams",
+    type=int,
+    default=4,
+    help="Number of residual streams for mHC-lite (uses n! permutation matrices)",
+)
+@click.option(
+    "--mhc-lite-wrapping-level",
+    type=click.Choice(["layer", "sublayers"], case_sensitive=False),
+    default="layer",
+    show_default=True,
+    help="mHC-lite wrapping level (pure-torch only): 'layer' wraps the full transformer layer; "
+         "'sublayers' wraps attention and MLP residual branches separately.",
+)
+@click.option(
+    "--use-compile-max-autotune/--no-use-compile-max-autotune",
+    default=False,
+    help="Pure-torch only: compile with torch.compile(mode='max-autotune-no-cudagraphs'). "
+         "May improve throughput, but increases compile time significantly at run start.",
+)
+@click.option(
+    "--compile-triton-persistent-reductions/--no-compile-triton-persistent-reductions",
+    default=False,
+    help="Pure-torch only: TorchInductor Triton setting. Disable to avoid shared-memory "
+         "resource errors in some fused reduction kernels (e.g. LayerNorm backward at large hidden dims) "
+         "while keeping torch.compile enabled.",
+)
+@click.option(
+    "--compile-triton-mix-order-reduction/--no-compile-triton-mix-order-reduction",
+    default=False,
+    help="Pure-torch only: TorchInductor Triton setting. Mix-order reductions can generate "
+         "persistent reduction kernels that exceed shared memory limits on some shapes. "
+         "Disable to prefer legacy reductions while keeping torch.compile enabled.",
 )
 @click.option(
     "--pure-torch",
@@ -510,6 +570,9 @@ def run(
     prefetch_factor: int,
     use_packing: bool,
     use_static_inp_size: bool,
+    use_compile_max_autotune: bool,
+    compile_triton_persistent_reductions: bool,
+    compile_triton_mix_order_reduction: bool,
     bf16: bool,
     tf32: bool,
     fp8: bool,
@@ -525,6 +588,7 @@ def run(
     mlp_activation: str,
     mlp_dropout: float,
     mlp_bias: bool,
+    no_mlp_on_first_layer: bool,
     attention_bias: bool,
     attention_dropout: float,
     classifier_activation: str,
@@ -533,10 +597,14 @@ def run(
     use_qk_norm: bool,
     use_canon_layers: bool,
     canon_layers_mode: str,
-    canon_layer_type: str,
     canon_layers_kernel_size: Optional[int],
     use_repo: bool,
     repo_after_n_layers: int,
+    gradient_checkpointing: bool,
+    gradient_checkpointing_mode: str,
+    use_mhc_lite: bool,
+    mhc_n_streams: int,
+    mhc_lite_wrapping_level: str,
     pure_torch: bool,
     pure_te: bool,
 ):
@@ -579,6 +647,9 @@ def run(
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
         use_static_inp_size=use_static_inp_size,
+        use_compile_max_autotune=use_compile_max_autotune,
+        compile_triton_persistent_reductions=compile_triton_persistent_reductions,
+        compile_triton_mix_order_reduction=compile_triton_mix_order_reduction,
         bf16=bf16,
         tf32=tf32,
         fp8=fp8,
@@ -594,10 +665,16 @@ def run(
             "use_canon_layers requires --pure-torch. "
             "Canon layers are not implemented in HF/TE paths."
         )
-    if use_canon_layers and not use_packing:
+    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not pure_torch:
         raise click.ClickException(
-            "use_canon_layers requires --use-packing. "
-            "Canon layers are only supported with sequence packing enabled."
+            "mHC-lite is only supported in the pure-torch pipeline. "
+            "Set --pure-torch (or disable mHC-lite settings)."
+        )
+    if use_mhc_lite and use_resid_lambdas:
+        raise click.ClickException(
+            "use_mhc_lite and use_resid_lambdas are mutually exclusive. "
+            "resid_lambdas scales the hidden state before each layer, which breaks "
+            "mHC-lite's doubly-stochastic stability guarantees."
         )
 
     _populate_batch_setup(cfg)
@@ -611,6 +688,7 @@ def run(
         mlp_activation=mlp_activation,
         mlp_dropout=mlp_dropout,
         mlp_bias=mlp_bias,
+        no_mlp_on_first_layer=no_mlp_on_first_layer,
         attention_bias=attention_bias,
         attention_dropout=attention_dropout,
         classifier_activation=classifier_activation,
@@ -619,10 +697,14 @@ def run(
         use_qk_norm=use_qk_norm,
         use_canon_layers=use_canon_layers,
         canon_layers_mode=canon_layers_mode,
-        canon_layer_type=canon_layer_type,
         canon_layers_kernel_size=canon_layers_kernel_size,
         use_repo=use_repo,
         repo_after_n_layers=repo_after_n_layers,
+        gradient_checkpointing=gradient_checkpointing,
+        gradient_checkpointing_mode=gradient_checkpointing_mode.lower(),
+        use_mhc_lite=use_mhc_lite,
+        mhc_n_streams=mhc_n_streams,
+        mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),
     )
 
     _set_seed_for_init(seed)
@@ -715,10 +797,20 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
             "Canon layers are not implemented in HF/TE paths."
         )
-    if model_config.use_canon_layers and not pretrain_config.use_packing:
+    if (
+        model_config.use_mhc_lite
+        or str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower() != "layer"
+    ) and not pure_torch:
         raise click.ClickException(
-            "model.use_canon_layers=true requires use_packing: true. "
-            "Canon layers are only supported with sequence packing enabled."
+            "model.use_mhc_lite=true (or model.mhc_lite_wrapping_level != 'layer') "
+            "requires pure_torch: true (or --pure-torch). "
+            "mHC-lite is not implemented in HF/TE paths."
+        )
+    if model_config.use_mhc_lite and model_config.use_resid_lambdas:
+        raise click.ClickException(
+            "model.use_mhc_lite=true is not compatible with model.use_resid_lambdas=true. "
+            "resid_lambdas scales the hidden state before each layer, which breaks "
+            "mHC-lite's doubly-stochastic stability guarantees."
         )
     _populate_batch_setup(pretrain_config)
 
@@ -791,12 +883,7 @@ def get_yaml(output: Optional[str], force: bool):
     # Ensure target directory exists
     create_dirs(output_path)
 
-    # Prevent accidental overwrite unless forced
-    if output_path.exists() and not force:
-        raise click.ClickException(
-            f"File already exists: {output_path}. Use --force to overwrite."
-        )
-
+    # Define the YAML template
     template = (
         "# Pretraining configuration for nanoPLM\n"
         "#\n"
@@ -814,50 +901,41 @@ def get_yaml(output: Optional[str], force: bool):
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: false\n"
+        "  no_mlp_on_first_layer: true\n"
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
-        "  # The options below only work on pure-torch and TE pipelines\n"
-        "  use_resid_lambdas: true  # scales residual stream per layer\n"
-        "  use_x0_lambdas: true  # blends initial embedding x0 per layer\n"
+        "  # The options below only work on pure-torch and TE pipelines unless noted\n"
+        "  use_resid_lambdas: false  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
+        "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
-        "  use_canon_layers: true  # enables Canon-ABCD local mixing layers (pure_torch only)\n"
+        "  use_canon_layers: false # enables Canon-ABCD local mixing layers (pure_torch only)\n"
         "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
-        "  canon_layer_type: \"causal\"  # 'causal' (fused CUDA kernel, fast) or 'symmetric' (nn.Conv1d, bidirectional)\n"
-        "  canon_layers_kernel_size: 4  # causal: 2/3/4, symmetric: 3/5/7 (defaults: causal=4, symmetric=5)\n"
+        "  canon_layers_kernel_size: 5  # symmetric Canon kernel size (allowed: 3/5/7, default: 5)\n"
         "  use_repo: false  # RePO: learned per-head positions replacing fixed RoPE (pure_torch only)\n"
         "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
+        "  use_mhc_lite: false  # mHC-lite: multi-stream residual with doubly stochastic mixing (pure_torch only)\n"
+        "  mhc_n_streams: 4  # number of residual streams for mHC-lite (n! permutation matrices)\n"
+        "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"
+        "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "\n"
         "pretraining:\n"
-        "  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)\n"
-        "  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.\n"
         "  dataset_dir: \"output/data/pretrain_data\"\n"
-        "\n"
-        "  # Output model path\n"
         "  ckp_dir: \"output/pretraining_checkpoints\"\n"
-        "\n"
-        "  # Hyperparameters\n"
-        "  #   micro_batch_size: samples per GPU per forward pass (limited by GPU memory)\n"
-        "  #   global_batch_size: total tokens per optimizer step across all GPUs\n"
-        "  #   gradient_accumulation_steps is inferred automatically:\n"
-        "  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))\n"
         "  micro_batch_size: 64\n"
-        "  global_batch_size: 256000  # 2^20 ≈ 1M tokens/step (based on PLM best practices)\n"
+        "  global_batch_size: 256000\n"
         "  num_epochs: 10\n"
-        "\n"
-        "  optimizer: \"normuon\"  # adamw, stable_adamw, muon, normuon\n"
-        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
+        "  optimizer: \"normuon\"\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)\n"
-        "  max_grad_norm: .inf  # set to .inf (equivalent to float(\"inf\")) to disable clipping\n"
-        "  warmup_steps: 302  # LR warmup steps\n"
-        "  repo_rope_warmup_steps: 302  # RePO activation delay (pure_torch only); separate from LR warmup\n"
+        "  learning_rate: 1e-4\n"
+        "  max_grad_norm: .inf\n"
+        "  warmup_steps: 302\n"
+        "  repo_rope_warmup_steps: 302\n"
         "  lr_decay_to_fraction: 0.1\n"
-        "  lr_schedule: \"cosine\" # Linear or Cosine \n" 
+        "  lr_schedule: \"cosine\"\n"
         "  weight_decay: 0.0\n"
-        "  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
         "  muon_cautious_weight_decay: true\n"
@@ -875,47 +953,37 @@ def get_yaml(output: Optional[str], force: bool):
         "  seed: 42\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
-        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
-        "  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te\n"
         "  use_packing: true\n"
-        "  # Experimental throughput optimization: with packing, enables static input sizes which enables the use of torch.compile(dynamic=False) and cudagraphs\n"
-        "  use_static_inp_size: true \n"
-        "\n"
-        "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
-        "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
-        "  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32\n"
-        "  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback\n"
-        "  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)\n"
-        "  #   - CPU: fp32 (no mixed precision)\n"
+        "  use_static_inp_size: true\n"
+        "  use_compile_max_autotune: false  # pure_torch only: may improve throughput, but causes long compile/autotune time at run start\n"
+        "  compile_triton_persistent_reductions: false  # pure_torch only: set true if it works on your shapes/GPU and you want the faster persistent reductions\n"
+        "  compile_triton_mix_order_reduction: false  # pure_torch only: set true to enable mix-order reductions (may be faster, but can hit shared-mem limits)\n"
         "  bf16: true\n"
-        "  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)\n"
-        "             # Provides 3x faster fp32 matmuls with negligible precision loss\n"
-        "  fp8: false  # Enable FP8 Linear matmuls in pure_torch/pure_te paths (CUDA, best on H100+)\n"
-        "\n"
+        "  tf32: true\n"
+        "  fp8: false\n"
         "  multi_gpu: true\n"
-        "  world_size: 'auto'  # Use \"auto\" if you want to use all available GPUs\n"
+        "  world_size: 'auto'\n"
         "  project_name: \"nanoplm-pretraining\"\n"
+        "  profiler_enabled: false\n"
+        "  profiler_start_step: 10\n"
+        "  profiler_end_step: 15\n"
         "\n"
         "resume:\n"
-        "  # Set is_resume: true to resume training from a checkpoint\n"
-        "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
-        "  # extra_epochs: adds to 'pretraining.num_epochs' to define total epochs.\n"
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
         "\n"
-        "# Set pure_torch: true to use the custom pure-torch model and training loop\n"
-        "# instead of HF Trainer. CLI equivalent: --pure-torch\n"
         "# pure_torch: false\n"
-        "# Set pure_te: true to use Transformer Engine model and training loop.\n"
-        "# CLI equivalent: --pure-te (mutually exclusive with pure_torch)\n"
         "# pure_te: false\n"
     )
 
-    # If forcing, remove existing file first
-    if output_path.exists() and force:
-        output_path.unlink()
+    # Prevent accidental overwrite unless forced
+    if output_path.exists() and not force:
+        raise click.ClickException(
+            f"File already exists: {output_path}. Use --force to overwrite."
+        )
 
+    # Write the template to the file
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
@@ -1041,11 +1109,32 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     expected_keys = set(model_fields.keys())
     present_keys = set(config.keys())
 
+    if "canon_layer_type" in present_keys:
+        legacy_canon_layer_type = config.get("canon_layer_type")
+        if legacy_canon_layer_type is not None:
+            legacy_value = str(legacy_canon_layer_type).strip().lower()
+            if legacy_value == "causal":
+                raise ValueError(
+                    "model.canon_layer_type='causal' is no longer supported. "
+                    "Causal Canon layers were removed. Delete model.canon_layer_type "
+                    "and use the symmetric Canon layer (kernel sizes: 3/5/7)."
+                )
+            if legacy_value != "symmetric":
+                raise ValueError(
+                    f"model.canon_layer_type={legacy_canon_layer_type!r} is no longer supported. "
+                    "Delete model.canon_layer_type; Canon layers are now symmetric-only."
+                )
+        logger.warning(
+            "Ignoring deprecated model.canon_layer_type; Canon layers are now symmetric-only."
+        )
+
     extra = []
     kwargs: Dict[str, Any] = {}
 
     # Classify provided keys in one pass
     for key in present_keys:
+        if key == "canon_layer_type":
+            continue
         if key not in expected_keys:
             extra.append(key)
             continue
@@ -1077,7 +1166,13 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
             f"Missing required model configuration keys: {', '.join(sorted(missing_required))}"
         )
 
-    return ProtModernBertMLMConfig(**normalized_kwargs)
+    try:
+        return ProtModernBertMLMConfig(**normalized_kwargs)
+    except TypeError:
+        raise
+    except ValueError as exc:
+        # Provide a clearer error for common config incompatibilities.
+        raise ValueError(f"Invalid model configuration: {exc}") from exc
 
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     if config is None:
@@ -1086,7 +1181,6 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     expected_keys = set(ResumeConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
-    missing = []
     extra = []
     kwargs: Dict[str, Any] = {}
 
@@ -1095,15 +1189,19 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             extra.append(key)
             continue
         value = config.get(key)
-        if value is None:
-            missing.append(key)
+        # Keep None values for Optional fields — they mean "use default /
+        # inherit from checkpoint".  Only skip None for required fields
+        # (is_resume, checkpoint_dir).
+        if value is None and key in ("is_resume", "checkpoint_dir"):
             continue
         kwargs[key] = value
 
     checkpoint_dir = kwargs.get("checkpoint_dir")
 
+    # Ensure extra_epochs is always present (None-safe).
     if "extra_epochs" in config:
         kwargs["extra_epochs"] = config.get("extra_epochs")
+
     is_resume = kwargs.get("is_resume", False)
 
     if is_resume:
@@ -1117,5 +1215,10 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             raise click.ClickException(
                 f"Checkpoint directory does not exist: {checkpoint_dir}"
             )
+
+    if extra:
+        logger.warning(
+            f"Unknown keys in resume config (ignored): {extra}"
+        )
 
     return ResumeConfig(**kwargs)

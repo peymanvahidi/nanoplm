@@ -1,0 +1,1 @@
+TORCH_LOGS="recompiles" torchrun --nproc-per-node=2 $(which nanoplm) pretrain from-yaml --pure-torch 2>&1 | tee pretrain.log

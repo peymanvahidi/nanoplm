@@ -72,6 +72,7 @@ class TEModernBertEmbeddings(nn.Module):
 class TEModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
+        self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
 
         if FULL_ATTN_EVERY_N_LAYER == 0:
             self.is_full_attention = True
@@ -117,17 +118,20 @@ class TEModernBertEncoderLayer(nn.Module):
         )
 
         # Fused LayerNorm + FC1 + activation + FC2.
-        te_mlp_activation = "srelu" if config.mlp_activation == "srelu" else "swiglu"
-        self.mlp = te.LayerNormMLP(
-            hidden_size=config.hidden_size,
-            ffn_hidden_size=config.intermediate_size,
-            eps=config.norm_eps,
-            bias=config.mlp_bias,
-            normalization="RMSNorm",
-            activation=te_mlp_activation,
-            init_method=_init,
-            output_layer_init_method=_output_init,
-        )
+        if self.has_mlp:
+            te_mlp_activation = "srelu" if config.mlp_activation == "srelu" else "swiglu"
+            self.mlp = te.LayerNormMLP(
+                hidden_size=config.hidden_size,
+                ffn_hidden_size=config.intermediate_size,
+                eps=config.norm_eps,
+                bias=config.mlp_bias,
+                normalization="RMSNorm",
+                activation=te_mlp_activation,
+                init_method=_init,
+                output_layer_init_method=_output_init,
+            )
+        else:
+            self.mlp = None
 
     def forward(
         self,
@@ -154,6 +158,8 @@ class TEModernBertEncoderLayer(nn.Module):
             attn_out = attn_out[0]
         x = x + attn_out
 
+        if self.mlp is None:
+            return x
         mlp_out = self.mlp(x, is_first_microbatch=is_first_microbatch)
         if isinstance(mlp_out, tuple):
             mlp_out = mlp_out[0]

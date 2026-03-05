@@ -9,20 +9,26 @@ The model is intentionally small and readable:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
+# Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
+from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
-USE_ACTIVATION_CHECKPOINTING_CANON=False
+USE_ACTIVATION_CHECKPOINTING_CANON = True
+# mHC-lite selective recompute (paper-inspired):
+# checkpoint only mHC pre/post kernels, keep heavy layer function outside.
+USE_ACTIVATION_CHECKPOINTING_MHC = False
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:
@@ -77,20 +83,11 @@ def _parse_canon_layers_mode(mode: str) -> frozenset[str]:
 
 
 def _resolve_canon_kernel_size(
-    canon_layer_type: str,
     canon_layers_kernel_size: Optional[int],
 ) -> int:
-    allowed_by_type = {
-        "causal": frozenset({2, 3, 4}),
-        "symmetric": frozenset({3, 5, 7}),
-    }
-    default_by_type = {
-        "causal": 4,
-        "symmetric": 5,
-    }
-    allowed = allowed_by_type[canon_layer_type]
+    allowed = frozenset({3, 5, 7})
     if canon_layers_kernel_size is None:
-        return default_by_type[canon_layer_type]
+        return 5
     if isinstance(canon_layers_kernel_size, bool) or not isinstance(canon_layers_kernel_size, int):
         raise ValueError(
             "canon_layers_kernel_size must be an integer or null/None "
@@ -100,8 +97,7 @@ def _resolve_canon_kernel_size(
         allowed_str = ", ".join(str(v) for v in sorted(allowed))
         raise ValueError(
             "Invalid canon_layers_kernel_size="
-            f"{canon_layers_kernel_size} for canon_layer_type={canon_layer_type!r}. "
-            f"Allowed values: {allowed_str}."
+            f"{canon_layers_kernel_size}. Allowed values: {allowed_str}."
         )
     return canon_layers_kernel_size
 
@@ -132,6 +128,7 @@ class ModernBertConfig:
     embedding_dropout: float = 0.0
     mlp_bias: bool = False
     mlp_dropout: float = 0.0
+    no_mlp_on_first_layer: bool = True
     decoder_bias: bool = True
     classifier_bias: bool = False
     classifier_activation: str = "gelu"
@@ -145,12 +142,17 @@ class ModernBertConfig:
     use_qk_norm: bool = False
     use_canon_layers: bool = False
     canon_layers_mode: str = "abcd"
-    canon_layer_type: str = "causal"
     canon_layers_kernel_size: Optional[int] = None
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
     use_repo: bool = False
     repo_after_n_layers: int = 3
+    gradient_checkpointing: bool = False
+    gradient_checkpointing_mode: Literal["layer", "attn", "attn+mlp"] = "layer"
+    use_mhc_lite: bool = False
+    mhc_n_streams: int = 4
+    mhc_triton_fused: bool = False
+    mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -158,12 +160,28 @@ class ModernBertConfig:
     canon_layer_set: frozenset[str] = field(init=False)
 
     def __post_init__(self) -> None:
+        self.mhc_lite_wrapping_level = str(self.mhc_lite_wrapping_level).strip().lower()  # type: ignore[assignment]
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError(
                 "hidden_size must be divisible by num_attention_heads: "
                 f"{self.hidden_size} vs {self.num_attention_heads}"
             )
-
+        if self.mhc_lite_wrapping_level not in {"layer", "sublayers"}:
+            raise ValueError(
+                "mhc_lite_wrapping_level must be one of {'layer', 'sublayers'}, "
+                f"got {self.mhc_lite_wrapping_level!r}"
+            )
+        if not self.use_mhc_lite and self.mhc_lite_wrapping_level != "layer":
+            raise ValueError(
+                "mhc_lite_wrapping_level != 'layer' requires use_mhc_lite=true "
+                "(to avoid a silent no-op configuration)."
+            )
+        if self.use_mhc_lite and self.use_resid_lambdas:
+            raise ValueError(
+                "use_mhc_lite=true is not compatible with use_resid_lambdas=true. "
+                "resid_lambdas scales the hidden state before each layer, which breaks "
+                "mHC-lite's stability guarantees (doubly-stochastic mixing)."
+            )
         attn_stride = max(1, int(self.global_attn_every_n_layers))
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.sliding_window = self.local_attention // 2
@@ -172,14 +190,7 @@ class ModernBertConfig:
             raise ValueError(
                 f"Unsupported mlp_activation: {self.mlp_activation}. Supported: ['swiglu', 'glu', 'srelu']"
             )
-        self.canon_layer_type = self.canon_layer_type.lower()
-        if self.canon_layer_type not in {"causal", "symmetric"}:
-            raise ValueError(
-                f"Unsupported canon_layer_type: {self.canon_layer_type!r}. "
-                "Supported: ['causal', 'symmetric']"
-            )
         self.canon_layers_kernel_size = _resolve_canon_kernel_size(
-            self.canon_layer_type,
             self.canon_layers_kernel_size,
         )
         self.canon_layer_set = _parse_canon_layers_mode(self.canon_layers_mode)
@@ -377,75 +388,12 @@ def _position_ids_from_cu_seqlens(
     return torch.arange(total, device=device, dtype=torch.int32) - offsets
 
 
-class CausalCanonLayer(nn.Module):
-    """Canon layer using causal (left-only) depthwise convolution.
-
-    Uses the same roll-based approach as ``ModernBertCanonLayer`` but only
-    looks at current + past tokens (offsets 0..K-1), matching the causal
-    conv1d design from the PhysicsLM4 reference.  torch.compile fuses
-    the entire operation into Triton kernels with zero graph breaks.
-    """
-
-    def __init__(self, channels: int, kernel_size: int = 4):
-        super().__init__()
-        self.channels = channels
-        self.kernel_size = kernel_size
-        # Weight: (channels, kernel_size) — depthwise, no bias.
-        # Initialize via PyTorch Conv1d defaults instead of custom init.
-        default_w = nn.Conv1d(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=kernel_size,
-            groups=channels,
-            bias=False,
-        ).weight[:, 0, :].detach()
-        self.weight = nn.Parameter(default_w)
-
-    def _forward_varlen(self, x, cu_seqlens, position_ids=None):
-        T, C = x.shape
-        n_seqs = cu_seqlens.shape[0] - 1
-
-        if position_ids is not None and position_ids.shape[0] == T:
-            seq_start = (position_ids == 0).to(dtype=cu_seqlens.dtype)
-            seq_start = seq_start.clone()
-            seq_start[0] = 1
-            seq_id = torch.cumsum(seq_start, dim=0) - 1
-        else:
-            positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
-            seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
-
-        if self.training and x.requires_grad and USE_ACTIVATION_CHECKPOINTING_CANON:
-            mixed = _checkpoint(
-                _varlen_causal_canon_inner, x, seq_id, self.weight, self.kernel_size,
-                use_reentrant=False,
-            )
-        else:
-            mixed = _varlen_causal_canon_inner(x, seq_id, self.weight, self.kernel_size)
-        return x + mixed
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if cu_seqlens is not None:
-            return self._forward_varlen(x, cu_seqlens=cu_seqlens, position_ids=position_ids)
-        raise ValueError(
-            "CausalCanonLayer requires cu_seqlens (packed path). "
-            "Use canon_layer_type='symmetric' for the SDPA/padded path."
-        )
-
-
 def _make_canon_layer(
     channels: int, config: ModernBertConfig
 ) -> nn.Module:
-    """Factory: returns the right canon layer based on config.canon_layer_type."""
+    """Factory: returns a symmetric (bidirectional) Canon layer."""
     if config.canon_layers_kernel_size is None:
         raise ValueError("canon_layers_kernel_size was not resolved in ModernBertConfig.__post_init__")
-    if config.canon_layer_type == "causal":
-        return CausalCanonLayer(channels, kernel_size=config.canon_layers_kernel_size)
     return ModernBertCanonLayer(channels, kernel_size=config.canon_layers_kernel_size)
 
 
@@ -503,14 +451,7 @@ class ModernBertCanonLayer(nn.Module):
             seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
-
-        if self.training and x.requires_grad and USE_ACTIVATION_CHECKPOINTING_CANON:
-            mixed = _checkpoint(
-                _varlen_canon_inner, x, seq_id, weight, bias, self.radius,
-                use_reentrant=False,
-            )
-        else:
-            mixed = _varlen_canon_inner(x, seq_id, weight, bias, self.radius)
+        mixed = _varlen_canon_inner(x, seq_id, weight, bias, self.radius)
         return x + mixed
 
     def _forward_padded(self, x, attention_mask=None):
@@ -518,7 +459,9 @@ class ModernBertCanonLayer(nn.Module):
         x_acc = x.to(dtype=acc_dtype)
         token_mask = None
         if attention_mask is not None:
-            token_mask = attention_mask.unsqueeze(-1).to(dtype=acc_dtype)
+            # Treat any nonzero as "valid token". This avoids accidental
+            # NaNs if a caller passes an additive mask (e.g. 0 / -inf).
+            token_mask = attention_mask.ne(0).unsqueeze(-1).to(dtype=acc_dtype)
             x_acc = x_acc * token_mask
         mixed = F.conv1d(
             x_acc.transpose(1, 2),
@@ -538,15 +481,56 @@ class ModernBertCanonLayer(nn.Module):
         return out.to(dtype=x.dtype)
 
     def forward(self, x, position_ids=None, cu_seqlens=None, attention_mask=None):
+        # Checkpoint at the module boundary so all Canon insertion sites (A/B/C/D)
+        # and both varlen/padded paths are covered by the same flag.
+        use_ckpt = (
+            USE_ACTIVATION_CHECKPOINTING_CANON
+            and self.training
+            and torch.is_grad_enabled()
+            and x.requires_grad
+        )
+
         if cu_seqlens is not None:
+            if use_ckpt:
+                if position_ids is None:
+                    return _checkpoint(
+                        lambda x_, cu_: self._forward_varlen(
+                            x_, cu_seqlens=cu_, position_ids=None
+                        ),
+                        x,
+                        cu_seqlens,
+                        use_reentrant=False,
+                    )
+                return _checkpoint(
+                    lambda x_, cu_, pos_: self._forward_varlen(
+                        x_, cu_seqlens=cu_, position_ids=pos_
+                    ),
+                    x,
+                    cu_seqlens,
+                    position_ids,
+                    use_reentrant=False,
+                )
             return self._forward_varlen(x, cu_seqlens=cu_seqlens, position_ids=position_ids)
         if x.dim() == 3:
+            if use_ckpt:
+                if attention_mask is None:
+                    return _checkpoint(
+                        lambda x_: self._forward_padded(x_, attention_mask=None),
+                        x,
+                        use_reentrant=False,
+                    )
+                return _checkpoint(
+                    lambda x_, mask_: self._forward_padded(x_, attention_mask=mask_),
+                    x,
+                    attention_mask,
+                    use_reentrant=False,
+                )
             return self._forward_padded(x, attention_mask=attention_mask)
         raise ValueError(f"Expected padded input [B, S, C], got shape={tuple(x.shape)}")
 
 
 def _varlen_canon_inner(x, seq_id, weight, bias, radius):
-    """Depthwise conv with boundary masking (checkpointed to save memory)."""
+    """Depthwise conv with boundary masking for varlen Canon mixing."""
     acc_dtype = _canon_accum_dtype(x)
     x_acc = x.to(dtype=acc_dtype)
     weight_acc = weight.to(dtype=acc_dtype)
@@ -555,29 +539,12 @@ def _varlen_canon_inner(x, seq_id, weight, bias, radius):
     for k, offset in enumerate(range(-radius, radius + 1)):
         rolled_x = torch.roll(x_acc, shifts=-offset, dims=0)
         rolled_id = torch.roll(seq_id, shifts=-offset, dims=0)
-        valid = (rolled_id == seq_id).unsqueeze(-1).to(dtype=acc_dtype)
-        out = out + rolled_x * valid * weight_acc[:, k]
+        # IMPORTANT: avoid `0 * NaN = NaN` propagation across sequence boundaries.
+        valid = (rolled_id == seq_id).unsqueeze(-1)
+        rolled_x = rolled_x.masked_fill(~valid, 0)
+        out = out + rolled_x * weight_acc[:, k]
     if bias_acc is not None:
         out = out + bias_acc
-    return out.to(dtype=x.dtype)
-
-
-def _varlen_causal_canon_inner(x, seq_id, weight, kernel_size):
-    """Causal depthwise conv with boundary masking (checkpointed to save memory).
-
-    Only looks at current and past tokens: offsets 0, 1, ..., K-1.
-    weight[:, 0] is applied to x[t], weight[:, 1] to x[t-1], etc.
-    """
-    acc_dtype = _canon_accum_dtype(x)
-    x_acc = x.to(dtype=acc_dtype)
-    weight_acc = weight.to(dtype=acc_dtype)
-    out = torch.zeros_like(x_acc)
-    for k in range(kernel_size):
-        # k=0 → current token (offset=0), k=1 → one step back, etc.
-        rolled_x = torch.roll(x_acc, shifts=k, dims=0)
-        rolled_id = torch.roll(seq_id, shifts=k, dims=0)
-        valid = (rolled_id == seq_id).unsqueeze(-1).to(dtype=acc_dtype)
-        out = out + rolled_x * valid * weight_acc[:, k]
     return out.to(dtype=x.dtype)
 
 
@@ -919,6 +886,11 @@ class ModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
         self.attention_type = config.layer_types[layer_idx]
+        self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
+        self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
+        self.gradient_checkpointing_mode = str(
+            getattr(config, "gradient_checkpointing_mode", "layer")
+        ).strip().lower()
         self.attn_norm = (
             nn.Identity()
             if layer_idx == 0
@@ -930,18 +902,23 @@ class ModernBertEncoderLayer(nn.Module):
             else None
         )
         self.attn = ModernBertAttention(config, layer_idx=layer_idx)
-        self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
-        self.canon_c = (
-            _make_canon_layer(config.hidden_size, config)
-            if "c" in config.canon_layer_set
-            else None
-        )
-        if config.mlp_activation == "srelu":
-            self.mlp = ModernBertSReluMLP(config)
-        elif config.mlp_activation == "swiglu":
-            self.mlp = ModernBertSwiGLUMLP(config)
+        if self.has_mlp:
+            self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias)
+            self.canon_c = (
+                _make_canon_layer(config.hidden_size, config)
+                if "c" in config.canon_layer_set
+                else None
+            )
+            if config.mlp_activation == "srelu":
+                self.mlp = ModernBertSReluMLP(config)
+            elif config.mlp_activation == "swiglu":
+                self.mlp = ModernBertSwiGLUMLP(config)
+            else:
+                self.mlp = ModernBertMLP(config)
         else:
-            self.mlp = ModernBertMLP(config)
+            self.mlp_norm = nn.Identity()
+            self.canon_c = None
+            self.mlp = None
 
     def forward(
         self,
@@ -955,15 +932,155 @@ class ModernBertEncoderLayer(nn.Module):
         token_mask: Optional[torch.Tensor] = None,
         repo_active: bool = False,
     ) -> torch.Tensor:
-        attn_in = self.attn_norm(x)
-        if self.canon_a is not None:
-            attn_in = self.canon_a(
+        do_ckpt_attn = (
+            self.gradient_checkpointing
+            and self.training
+            and self.gradient_checkpointing_mode in {"attn", "attn+mlp"}
+        )
+        if do_ckpt_attn:
+            _attn_mask = attn_mask
+            _cos_sin = cos_sin
+            _cu_seqlens = cu_seqlens
+            _max_seqlen = max_seqlen
+            _window_size = window_size
+            _position_ids = position_ids
+            _token_mask = token_mask
+            _repo_active = repo_active
+
+            def _attn_branch(
+                x_in: torch.Tensor,
+                *,
+                _layer: "ModernBertEncoderLayer" = self,
+            ) -> torch.Tensor:
+                attn_in = _layer.attn_norm(x_in)
+                if _layer.canon_a is not None:
+                    attn_in = _layer.canon_a(
+                        attn_in,
+                        position_ids=_position_ids,
+                        cu_seqlens=_cu_seqlens,
+                        attention_mask=_token_mask,
+                    )
+                return _layer.attn(
+                    attn_in,
+                    cos_sin=_cos_sin,
+                    attn_mask=_attn_mask,
+                    cu_seqlens=_cu_seqlens,
+                    max_seqlen=_max_seqlen,
+                    window_size=_window_size,
+                    position_ids=_position_ids,
+                    token_mask=_token_mask,
+                    repo_active=_repo_active,
+                )
+
+            try:
+                x = x + _checkpoint(_attn_branch, x, use_reentrant=False)
+            except TypeError:  # older torch checkpoint API
+                x = x + _checkpoint(_attn_branch, x)
+        else:
+            attn_in = self.attn_norm(x)
+            if self.canon_a is not None:
+                attn_in = self.canon_a(
+                    attn_in,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    attention_mask=token_mask,
+                )
+            x = x + self.attn(
+                attn_in,
+                cos_sin=cos_sin,
+                attn_mask=attn_mask,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                window_size=window_size,
+                position_ids=position_ids,
+                token_mask=token_mask,
+                repo_active=repo_active,
+            )
+        if self.mlp is not None:
+            do_ckpt_mlp = (
+                self.gradient_checkpointing
+                and self.training
+                and self.gradient_checkpointing_mode == "attn+mlp"
+            )
+            if do_ckpt_mlp:
+                _position_ids = position_ids
+                _cu_seqlens = cu_seqlens
+                _token_mask = token_mask
+
+                def _mlp_branch(
+                    x_in: torch.Tensor,
+                    *,
+                    _layer: "ModernBertEncoderLayer" = self,
+                ) -> torch.Tensor:
+                    mlp_in = _layer.mlp_norm(x_in)
+                    if _layer.canon_c is not None:
+                        mlp_in = _layer.canon_c(
+                            mlp_in,
+                            position_ids=_position_ids,
+                            cu_seqlens=_cu_seqlens,
+                            attention_mask=_token_mask,
+                        )
+                    return _layer.mlp(
+                        mlp_in,
+                        position_ids=_position_ids,
+                        cu_seqlens=_cu_seqlens,
+                        attention_mask=_token_mask,
+                    )
+
+                try:
+                    x = x + _checkpoint(_mlp_branch, x, use_reentrant=False)
+                except TypeError:  # older torch checkpoint API
+                    x = x + _checkpoint(_mlp_branch, x)
+            else:
+                mlp_in = self.mlp_norm(x)
+                if self.canon_c is not None:
+                    mlp_in = self.canon_c(
+                        mlp_in,
+                        position_ids=position_ids,
+                        cu_seqlens=cu_seqlens,
+                        attention_mask=token_mask,
+                    )
+                x = x + self.mlp(
+                    mlp_in,
+                    position_ids=position_ids,
+                    cu_seqlens=cu_seqlens,
+                    attention_mask=token_mask,
+                )
+        return x
+
+
+class ModernBertAttnResidual(nn.Module):
+    """Attention residual branch: x -> x + attn(attn_norm(x))."""
+
+    def __init__(self, encoder: ModernBertEncoderLayer):
+        super().__init__()
+        # Store encoder without registering as a submodule (MHCLiteSublayersLayer owns it).
+        self.__dict__["_encoder"] = encoder
+        self.attention_type = encoder.attention_type
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        window_size: Optional[tuple[int, int]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+        repo_active: bool = False,
+        **_kwargs,
+    ) -> torch.Tensor:
+        enc: ModernBertEncoderLayer = self.__dict__["_encoder"]
+        attn_in = enc.attn_norm(x)
+        if enc.canon_a is not None:
+            attn_in = enc.canon_a(
                 attn_in,
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
                 attention_mask=token_mask,
             )
-        x = x + self.attn(
+        return x + enc.attn(
             attn_in,
             cos_sin=cos_sin,
             attn_mask=attn_mask,
@@ -974,21 +1091,314 @@ class ModernBertEncoderLayer(nn.Module):
             token_mask=token_mask,
             repo_active=repo_active,
         )
-        mlp_in = self.mlp_norm(x)
-        if self.canon_c is not None:
-            mlp_in = self.canon_c(
+
+
+class ModernBertMLPResidual(nn.Module):
+    """MLP residual branch: x -> x + mlp(mlp_norm(x))."""
+
+    def __init__(self, encoder: ModernBertEncoderLayer):
+        super().__init__()
+        # Store encoder without registering as a submodule (MHCLiteSublayersLayer owns it).
+        self.__dict__["_encoder"] = encoder
+        self.attention_type = encoder.attention_type
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        window_size: Optional[tuple[int, int]] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
+        repo_active: bool = False,
+        **_kwargs,
+    ) -> torch.Tensor:
+        enc: ModernBertEncoderLayer = self.__dict__["_encoder"]
+        if enc.mlp is None:
+            return x
+        mlp_in = enc.mlp_norm(x)
+        if enc.canon_c is not None:
+            mlp_in = enc.canon_c(
                 mlp_in,
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
                 attention_mask=token_mask,
             )
-        x = x + self.mlp(
+        return x + enc.mlp(
             mlp_in,
             position_ids=position_ids,
             cu_seqlens=cu_seqlens,
             attention_mask=token_mask,
         )
-        return x
+
+
+def _build_permutation_matrices(n: int) -> tuple[torch.Tensor, int]:
+    """Pre-compute all n! permutation matrices (flattened) and identity index."""
+    from itertools import permutations
+
+    perms = list(permutations(range(n)))
+    identity_idx = 0  # (0,1,...,n-1) is first in lexicographic order
+    P = torch.zeros(len(perms), n * n)
+    for i, perm in enumerate(perms):
+        for row, col in enumerate(perm):
+            P[i, row * n + col] = 1.0
+    return P, identity_idx
+
+
+class MHCLiteBlock(nn.Module):
+    """mHC-lite: wraps a transformer layer with n residual streams
+    and doubly stochastic mixing via convex combination of permutation matrices.
+
+    Forward: x_streams (..., n, C) -> (..., n, C)
+    x_{l+1} = H^res_l @ x_l + H^post_l * f(H^pre_l @ x_l)
+    where f is the wrapped transformer layer (without residual).
+
+    Optimized I/O: fused projection, merged H_res-h_post application.
+    Optional Triton kernels for further fusion (set triton_fused=True).
+    """
+
+    def __init__(self, n_streams: int, hidden_size: int, layer: nn.Module,
+                 triton_fused: bool = False):
+        super().__init__()
+        self.n = n_streams
+        self.C = hidden_size
+        self.nC = n_streams * hidden_size
+        self.layer = layer
+        n_fact = math.factorial(n_streams)
+        self.n_fact = n_fact
+        self.triton_fused = triton_fused
+
+        self.alpha_pre = nn.Parameter(torch.tensor([0.01]))
+        self.alpha_post = nn.Parameter(torch.tensor([0.01]))
+        self.alpha_res = nn.Parameter(torch.tensor([0.01]))
+
+        # Fused single projection: pre(n) + post(n) + res(n!) outputs
+        total_out = n_streams + n_streams + n_fact
+        self.W_all = nn.Linear(self.nC, total_out, bias=True)
+
+        perm_flat, self._identity_idx = _build_permutation_matrices(n_streams)
+        self.register_buffer("perm_mat", perm_flat)  # (n!, n*n)
+
+    @property
+    def attention_type(self):
+        return self.layer.attention_type
+
+    def _mhc_coeffs_pytorch(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute h_pre/h_post/H_merged (PyTorch path)."""
+        n = self.n
+        dt = x_streams.dtype
+
+        x_flat = x_streams.reshape(*x_streams.shape[:-2], self.nC)
+        x_norm = F.rms_norm(x_flat, (self.nC,))
+
+        all_proj = F.linear(x_norm, self.W_all.weight.to(dt), None)
+        pre_proj, post_proj, res_proj = all_proj.split(
+            [n, n, self.n_fact], dim=-1
+        )
+
+        bias = self.W_all.bias.to(dt)
+        pre_bias = bias[:n]
+        post_bias = bias[n:2 * n]
+        res_bias = bias[2 * n:]
+
+        h_pre = torch.sigmoid(self.alpha_pre.to(dt) * pre_proj + pre_bias)
+        h_post = 2.0 * torch.sigmoid(self.alpha_post.to(dt) * post_proj + post_bias)
+        a_res = F.softmax(self.alpha_res.to(dt) * res_proj + res_bias, dim=-1)
+
+        H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
+        H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+        return h_pre, h_post, H_merged
+
+    def _mhc_pre_map_pytorch(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pre-map bundle: layer_input + coefficients for post-res."""
+        h_pre, h_post, H_merged = self._mhc_coeffs_pytorch(x_streams)
+        layer_input = torch.matmul(h_pre.unsqueeze(-2), x_streams).squeeze(-2)
+        return layer_input, H_merged, h_post
+
+    def _mhc_post_res_pytorch(
+        self,
+        x_streams: torch.Tensor,
+        layer_output: torch.Tensor,
+        H_merged: torch.Tensor,
+        h_post: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            torch.matmul(H_merged, x_streams)
+            + h_post.unsqueeze(-1) * layer_output.unsqueeze(-2)
+        )
+
+    def _forward_pytorch(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Pure PyTorch forward path (always correct, works everywhere)."""
+        use_ckpt = (
+            USE_ACTIVATION_CHECKPOINTING_MHC
+            and self.training
+            and torch.is_grad_enabled()
+            and x_streams.requires_grad
+        )
+
+        if use_ckpt:
+            layer_input, H_merged, h_post = _checkpoint(
+                lambda x_: self._mhc_pre_map_pytorch(x_),
+                x_streams,
+                use_reentrant=False,
+            )
+        else:
+            layer_input, H_merged, h_post = self._mhc_pre_map_pytorch(x_streams)
+        layer_output = self.layer(layer_input, **kwargs)
+
+        if use_ckpt:
+            return _checkpoint(
+                lambda x_, lo_, H_, hp_: self._mhc_post_res_pytorch(x_, lo_, H_, hp_),
+                x_streams,
+                layer_output,
+                H_merged,
+                h_post,
+                use_reentrant=False,
+            )
+        return self._mhc_post_res_pytorch(x_streams, layer_output, H_merged, h_post)
+
+    def _mhc_coeffs_triton(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute h_pre/h_post/H_merged using fused K1 + PyTorch tiny ops."""
+        n = self.n
+        T = x_streams.shape[0]
+        dt = x_streams.dtype
+
+        x_flat = x_streams.reshape(T, self.nC)
+        all_proj, _inv_rms = torch.ops.nanoplm_mhc.fused_rmsnorm_project(
+            x_flat, self.W_all.weight.to(dt)
+        )
+
+        pre_proj, post_proj, res_proj = all_proj.split(
+            [n, n, self.n_fact], dim=-1
+        )
+
+        bias = self.W_all.bias.to(dt)
+        h_pre = torch.sigmoid(self.alpha_pre.to(dt) * pre_proj + bias[:n])
+        h_post = 2.0 * torch.sigmoid(self.alpha_post.to(dt) * post_proj + bias[n:2*n])
+        a_res = F.softmax(self.alpha_res.to(dt) * res_proj + bias[2*n:], dim=-1)
+
+        H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
+        H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
+        return h_pre, h_post, H_merged
+
+    def _mhc_pre_map_triton(
+        self, x_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pre-map bundle for Triton path: layer_input + post-res coefficients."""
+        h_pre, h_post, H_merged = self._mhc_coeffs_triton(x_streams)
+        layer_input = torch.ops.nanoplm_mhc.fused_pre_map(x_streams, h_pre.float())
+        return layer_input, H_merged.float(), h_post.float()
+
+    def _mhc_post_res_triton(
+        self,
+        x_streams: torch.Tensor,
+        layer_output: torch.Tensor,
+        H_merged: torch.Tensor,
+        h_post: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops.nanoplm_mhc.fused_post_res(
+            x_streams, layer_output, H_merged, h_post
+        )
+
+    def _forward_triton(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Triton-fused forward path. Requires (T, n, C) bf16 on CUDA.
+
+        Uses Triton for the memory-heavy stream operations (K3: pre-map,
+        K4: post-res) and PyTorch for the coefficient computation (tiny ops).
+        """
+        use_ckpt = (
+            USE_ACTIVATION_CHECKPOINTING_MHC
+            and self.training
+            and torch.is_grad_enabled()
+            and x_streams.requires_grad
+        )
+        # Eval/inference should avoid autotune warmup latency.
+        autotune_ctx = (
+            nullcontext()
+            if self.training
+            else _mhc_triton_ops.disable_autotune_temporarily()
+        )
+
+        with autotune_ctx:
+            if use_ckpt:
+                layer_input, H_merged, h_post = _checkpoint(
+                    lambda x_: self._mhc_pre_map_triton(x_),
+                    x_streams,
+                    use_reentrant=False,
+                )
+            else:
+                layer_input, H_merged, h_post = self._mhc_pre_map_triton(x_streams)
+
+            # Transformer layer
+            layer_output = self.layer(layer_input, **kwargs)
+
+            # K4: Triton fused post-res (H_merged @ x + h_post * layer_output)
+            if use_ckpt:
+                return _checkpoint(
+                    lambda x_, lo_, H_, hp_: self._mhc_post_res_triton(x_, lo_, H_, hp_),
+                    x_streams,
+                    layer_output,
+                    H_merged,
+                    h_post,
+                    use_reentrant=False,
+                )
+            return self._mhc_post_res_triton(x_streams, layer_output, H_merged, h_post)
+
+    def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        """x_streams: (..., n, C).  Returns (..., n, C)."""
+        # Use Triton path when: triton_fused=True, CUDA, bf16, 2D token dim
+        use_triton = (
+            self.triton_fused
+            and x_streams.is_cuda
+            and x_streams.dtype == torch.bfloat16
+            and x_streams.dim() == 3  # (T, n, C) — no batch dim
+        )
+
+        if use_triton:
+            return self._forward_triton(x_streams, **kwargs)
+        return self._forward_pytorch(x_streams, **kwargs)
+
+
+class MHCLiteSublayersLayer(nn.Module):
+    """Transformer layer with mHC-lite applied to attention and MLP sublayers separately."""
+
+    def __init__(self, config: ModernBertConfig, layer_idx: int):
+        super().__init__()
+        self.enc = ModernBertEncoderLayer(config, layer_idx)
+        self.mhc_attn = MHCLiteBlock(
+            config.mhc_n_streams,
+            config.hidden_size,
+            ModernBertAttnResidual(self.enc),
+            triton_fused=config.mhc_triton_fused,
+        )
+        self.mhc_mlp = (
+            MHCLiteBlock(
+                config.mhc_n_streams,
+                config.hidden_size,
+                ModernBertMLPResidual(self.enc),
+                triton_fused=config.mhc_triton_fused,
+            )
+            if self.enc.mlp is not None
+            else None
+        )
+
+    @property
+    def attention_type(self):
+        return self.enc.attention_type
+
+    def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
+        x_streams = self.mhc_attn(x_streams, **kwargs)
+        if self.mhc_mlp is not None:
+            x_streams = self.mhc_mlp(x_streams, **kwargs)
+        return x_streams
 
 
 class ModernBertModel(nn.Module):
@@ -996,9 +1406,27 @@ class ModernBertModel(nn.Module):
         super().__init__()
         self.config = config
         self.embeddings = ModernBertEmbeddings(config)
-        self.layers = nn.ModuleList(
-            [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
-        )
+        if config.use_mhc_lite:
+            if config.mhc_lite_wrapping_level == "layer":
+                self.layers = nn.ModuleList(
+                    [
+                        MHCLiteBlock(
+                            config.mhc_n_streams,
+                            config.hidden_size,
+                            ModernBertEncoderLayer(config, i),
+                            triton_fused=config.mhc_triton_fused,
+                        )
+                        for i in range(config.num_hidden_layers)
+                    ]
+                )
+            else:
+                self.layers = nn.ModuleList(
+                    [MHCLiteSublayersLayer(config, i) for i in range(config.num_hidden_layers)]
+                )
+        else:
+            self.layers = nn.ModuleList(
+                [ModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            )
         if config.use_resid_lambdas:
             self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
         else:
@@ -1025,6 +1453,9 @@ class ModernBertModel(nn.Module):
         if _cu_seqlens is not None:
             device = input_ids.device
             x = self.embeddings(input_ids)  # (total_tokens, hidden)
+            if self.config.use_mhc_lite:
+                n = self.config.mhc_n_streams
+                x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))  # (T, n, C)
             x0 = x if self.x0_lambdas is not None else None
             if _position_ids is None:
                 _position_ids = _position_ids_from_cu_seqlens(
@@ -1066,16 +1497,55 @@ class ModernBertModel(nn.Module):
                 if self.x0_lambdas is not None:
                     x = x + self.x0_lambdas[i] * x0
                 lt = layer.attention_type
-                x = layer(
-                    x,
-                    cos_sin=rope[lt],
-                    cu_seqlens=_cu_seqlens,
-                    max_seqlen=_max_seqlen,
-                    window_size=windows[lt],
-                    position_ids=_position_ids,
-                    repo_active=repo_active,
-                )
+                if (
+                    self.config.gradient_checkpointing
+                    and self.training
+                    and str(self.config.gradient_checkpointing_mode).strip().lower() == "layer"
+                ):
+                    cos_sin = rope[lt]
+                    cu_seqlens = _cu_seqlens
+                    max_seqlen = _max_seqlen
+                    window_size = windows[lt]
+                    position_ids = _position_ids
 
+                    def _layer_forward(
+                        x_in: torch.Tensor,
+                        *,
+                        _layer: nn.Module = layer,
+                        _cos_sin=cos_sin,
+                        _cu_seqlens=cu_seqlens,
+                        _max_seqlen=max_seqlen,
+                        _window_size=window_size,
+                        _position_ids=position_ids,
+                        _repo_active: bool = repo_active,
+                    ) -> torch.Tensor:
+                        return _layer(
+                            x_in,
+                            cos_sin=_cos_sin,
+                            cu_seqlens=_cu_seqlens,
+                            max_seqlen=_max_seqlen,
+                            window_size=_window_size,
+                            position_ids=_position_ids,
+                            repo_active=_repo_active,
+                        )
+
+                    try:
+                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                    except TypeError:  # older torch checkpoint API
+                        x = _checkpoint(_layer_forward, x)
+                else:
+                    x = layer(
+                        x,
+                        cos_sin=rope[lt],
+                        cu_seqlens=_cu_seqlens,
+                        max_seqlen=_max_seqlen,
+                        window_size=windows[lt],
+                        position_ids=_position_ids,
+                        repo_active=repo_active,
+                    )
+
+            if self.config.use_mhc_lite:
+                x = x[..., 0, :]  # compress: take stream 0
             return self.final_norm(x)
 
         # ---- SDPA (fallback) path -----------------------------------------
@@ -1087,6 +1557,9 @@ class ModernBertModel(nn.Module):
         device = input_ids.device
 
         x = self.embeddings(input_ids)
+        if self.config.use_mhc_lite:
+            n = self.config.mhc_n_streams
+            x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))  # (B, S, n, C)
         x0 = x if self.x0_lambdas is not None else None
 
         attn_masks = {
@@ -1122,15 +1595,49 @@ class ModernBertModel(nn.Module):
             if self.x0_lambdas is not None:
                 x = x + self.x0_lambdas[i] * x0
             layer_type = layer.attention_type
-            x = layer(
-                x,
-                attn_mask=attn_masks[layer_type],
-                cos_sin=rope[layer_type],
-                position_ids=None,
-                token_mask=attention_mask,
-                repo_active=repo_active,
-            )
+            if (
+                self.config.gradient_checkpointing
+                and self.training
+                and str(self.config.gradient_checkpointing_mode).strip().lower() == "layer"
+            ):
+                attn_mask = attn_masks[layer_type]
+                cos_sin = rope[layer_type]
+                token_mask = attention_mask
 
+                def _layer_forward(
+                    x_in: torch.Tensor,
+                    *,
+                    _layer: nn.Module = layer,
+                    _attn_mask=attn_mask,
+                    _cos_sin=cos_sin,
+                    _token_mask=token_mask,
+                    _repo_active: bool = repo_active,
+                ) -> torch.Tensor:
+                    return _layer(
+                        x_in,
+                        attn_mask=_attn_mask,
+                        cos_sin=_cos_sin,
+                        position_ids=None,
+                        token_mask=_token_mask,
+                        repo_active=_repo_active,
+                    )
+
+                try:
+                    x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                except TypeError:  # older torch checkpoint API
+                    x = _checkpoint(_layer_forward, x)
+            else:
+                x = layer(
+                    x,
+                    attn_mask=attn_masks[layer_type],
+                    cos_sin=rope[layer_type],
+                    position_ids=None,
+                    token_mask=attention_mask,
+                    repo_active=repo_active,
+                )
+
+        if self.config.use_mhc_lite:
+            x = x[..., 0, :]  # compress: take stream 0
         return self.final_norm(x)
 
 
@@ -1189,30 +1696,62 @@ class ModernBertForMaskedLM(nn.Module):
                     nn.init.zeros_(module.bias)
 
         for layer in self.model.layers:
-            nn.init.uniform_(layer.attn.Wqkv.weight, -bound, bound)
-            nn.init.zeros_(layer.attn.Wo.weight)
-            nn.init.uniform_(layer.mlp.Wi.weight, -bound, bound)
-            if hasattr(layer.mlp, "Wo"):
-                nn.init.zeros_(layer.mlp.Wo.weight)
+            if isinstance(layer, MHCLiteBlock):
+                enc = layer.layer
+                mhc_blocks = [layer]
+            elif isinstance(layer, MHCLiteSublayersLayer):
+                enc = layer.enc
+                mhc_blocks = [b for b in (layer.mhc_attn, layer.mhc_mlp) if b is not None]
             else:
-                nn.init.zeros_(layer.mlp.Wo_weight)
+                enc = layer
+                mhc_blocks = []
+            nn.init.uniform_(enc.attn.Wqkv.weight, -bound, bound)
+            nn.init.zeros_(enc.attn.Wo.weight)
+            if enc.mlp is not None:
+                nn.init.uniform_(enc.mlp.Wi.weight, -bound, bound)
+                if hasattr(enc.mlp, "Wo"):
+                    nn.init.zeros_(enc.mlp.Wo.weight)
+                else:
+                    nn.init.zeros_(enc.mlp.Wo_weight)
 
-            if layer.attn.Wqkv.bias is not None:
-                nn.init.zeros_(layer.attn.Wqkv.bias)
-            if layer.attn.Wo.bias is not None:
-                nn.init.zeros_(layer.attn.Wo.bias)
-            if layer.mlp.Wi.bias is not None:
-                nn.init.zeros_(layer.mlp.Wi.bias)
-            if hasattr(layer.mlp, "Wo"):
-                if layer.mlp.Wo.bias is not None:
-                    nn.init.zeros_(layer.mlp.Wo.bias)
-            elif layer.mlp.Wo_bias is not None:
-                nn.init.zeros_(layer.mlp.Wo_bias)
+            if enc.attn.Wqkv.bias is not None:
+                nn.init.zeros_(enc.attn.Wqkv.bias)
+            if enc.attn.Wo.bias is not None:
+                nn.init.zeros_(enc.attn.Wo.bias)
+            if enc.mlp is not None:
+                if enc.mlp.Wi.bias is not None:
+                    nn.init.zeros_(enc.mlp.Wi.bias)
+                if hasattr(enc.mlp, "Wo"):
+                    if enc.mlp.Wo.bias is not None:
+                        nn.init.zeros_(enc.mlp.Wo.bias)
+                elif enc.mlp.Wo_bias is not None:
+                    nn.init.zeros_(enc.mlp.Wo_bias)
 
             # RePO: zero-init W_z so positions start at zero (NoPE-like).
             # W_g and W_c keep default Kaiming uniform init.
-            if layer.attn.repo is not None:
-                nn.init.zeros_(layer.attn.repo.W_z.weight)
+            if enc.attn.repo is not None:
+                nn.init.zeros_(enc.attn.repo.W_z.weight)
+
+            # mHC-lite: zero-init fused projection, set biases for identity behavior
+            def _init_mhc_block(block: MHCLiteBlock) -> None:
+                nn.init.zeros_(block.W_all.weight)
+                n_s = block.n
+                bias = block.W_all.bias.data
+                # pre bias: first n values
+                bias[:n_s].fill_(-1.0)
+                bias[0] = 1.0
+                # post bias: next n values
+                bias[n_s:2 * n_s].fill_(-1.0)
+                bias[n_s] = 1.0
+                # res bias: last n! values
+                bias[2 * n_s:].fill_(-8.0)
+                bias[2 * n_s + block._identity_idx] = 0.0
+                block.alpha_pre.fill_(0.01)
+                block.alpha_post.fill_(0.01)
+                block.alpha_res.fill_(0.01)
+
+            for block in mhc_blocks:
+                _init_mhc_block(block)
 
         nn.init.uniform_(self.head.dense.weight, -bound, bound)
         if self.head.dense.bias is not None:

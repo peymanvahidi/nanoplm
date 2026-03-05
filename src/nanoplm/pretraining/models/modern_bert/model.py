@@ -26,6 +26,12 @@ class ModernBertMLPSwiGLU(nn.Module):
         x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
         return self.Wo(self.drop(self.act(x, gate)))
 
+
+class ModernBertNoOpMLP(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states.new_zeros(hidden_states.shape)
+
+
 @dataclass
 class ProtModernBertMLMConfig:
     hidden_size: int
@@ -36,6 +42,7 @@ class ProtModernBertMLMConfig:
     mlp_activation: str = "swiglu"
     mlp_dropout: float = 0.0
     mlp_bias: bool = False
+    no_mlp_on_first_layer: bool = True
     attention_bias: bool = False
     attention_dropout: float = 0.0
     classifier_activation: str = "gelu"
@@ -44,12 +51,17 @@ class ProtModernBertMLMConfig:
     use_qk_norm: bool = False
     use_canon_layers: bool = False
     canon_layers_mode: str = "abcd"
-    canon_layer_type: str = "causal"
     canon_layers_kernel_size: Optional[int] = None
     resid_lambda_init: float = 1.0
     x0_lambda_init: float = 0.1
     use_repo: bool = False
     repo_after_n_layers: int = 3
+    gradient_checkpointing: bool = False
+    gradient_checkpointing_mode: str = "layer"
+    use_mhc_lite: bool = False
+    mhc_n_streams: int = 4
+    mhc_triton_fused: bool = False
+    mhc_lite_wrapping_level: str = "layer"
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
@@ -65,6 +77,8 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             )
 
         self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
 
         self.config = ModernBertConfig(
             vocab_size=config.vocab_size,
@@ -100,3 +114,8 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         if config.mlp_activation.lower() == "swiglu":
             for layer in self.model.layers:
                 layer.mlp = ModernBertMLPSwiGLU(self.config)
+        if config.no_mlp_on_first_layer and len(self.model.layers) > 0:
+            first_layer = self.model.layers[0]
+            if hasattr(first_layer, "mlp_norm"):
+                first_layer.mlp_norm = nn.Identity()
+            first_layer.mlp = ModernBertNoOpMLP()

@@ -8,8 +8,15 @@ import gc
 import json
 import math
 import os
+import yaml
+from dataclasses import asdict
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Default to safer Inductor reduction codegen. Inductor's async compile uses
+# subprocess workers that read these env vars at process start, so setting them
+# here helps ensure stable defaults even when invoked via torchrun.
+os.environ.setdefault("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "0")
+os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
 
 
 import random
@@ -57,6 +64,7 @@ from nanoplm.pretraining.pipeline import (
 )
 from nanoplm.utils.common import create_dirs, get_device
 from nanoplm.utils.logger import logger
+from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
@@ -67,7 +75,7 @@ torch.backends.cudnn.allow_tf32 = True
 H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
-N_PREFETCH_LAYERS_FSDP2 = 1
+N_PREFETCH_LAYERS_FSDP2 = 2
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +329,41 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
             # after first MLP projection, C = 2*ff (gated MLPs only)
             canon_flops += n_layers * 2 * K * 2 * ff
 
-    forward_flops = attn_proj_flops + attn_flops + mlp_flops + head_flops + pred_head_flops + canon_flops
+    # -- mHC-lite FLOPs (multi-stream residual wrapper) --
+    # MHCLiteBlock does *not* run attention/MLP per stream; it merges streams into a
+    # single layer_input, runs the wrapped submodule once, then mixes streams.
+    #
+    # We count the dominant matmuls per MHCLiteBlock:
+    #  - fused coefficient projection: (n*h) -> (2n + n!)  => 2 * (n*h) * (2n + n!)
+    #  - permutation mix: (n!) @ (n*n)                    => 2 * (n!) * n * n
+    #  - pre-map: (1,n) @ (n,h)                           => 2 * n * h
+    #  - post-res: (n,n) @ (n,h)                          => 2 * n * n * h
+    # Elementwise ops (sigmoid/softmax, H_merged arithmetic, h_post scaling) are
+    # ignored elsewhere in this estimator, so we ignore them here too.
+    mhc_flops = 0
+    if getattr(config, "use_mhc_lite", False):
+        n = int(getattr(config, "mhc_n_streams", 4))
+        level = str(getattr(config, "mhc_lite_wrapping_level", "layer")).strip().lower()
+        blocks_per_layer = 2 if level == "sublayers" else 1
+        n_fact = math.factorial(n)
+        total_out = 2 * n + n_fact
+        proj_flops = 2 * (n * h) * total_out
+        perm_mix_flops = 2 * n_fact * n * n
+        pre_map_flops = 2 * n * h
+        post_res_flops = 2 * n * n * h
+        mhc_flops = n_layers * blocks_per_layer * (
+            proj_flops + perm_mix_flops + pre_map_flops + post_res_flops
+        )
+
+    forward_flops = (
+        attn_proj_flops
+        + attn_flops
+        + mlp_flops
+        + head_flops
+        + pred_head_flops
+        + canon_flops
+        + mhc_flops
+    )
     return 3 * forward_flops
 
 
@@ -329,10 +371,6 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
 # torch.compile
 # ---------------------------------------------------------------------------
 
-def _compile_inner_layers_for_fsdp(model: torch.nn.Module, *, dynamic: bool) -> None:
-    """Compile transformer layers individually (before FSDP wrapping)."""
-    for i, layer in enumerate(model.model.layers):
-        model.model.layers[i] = torch.compile(layer, dynamic=dynamic)
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +470,15 @@ def _create_scheduler(
     learning_rate: float,
     lr_decay_to_fraction: float,
     lr_schedule: str = "Linear",
+    last_epoch: int = -1,
 ) -> LambdaLR:
+    """Build a LambdaLR scheduler with warmup + cosine/linear decay.
+
+    Args:
+        last_epoch: If ≥ 0 the scheduler is positioned at that step
+            (useful when reconstructing the schedule on resume).
+            ``initial_lr`` is injected into param groups automatically.
+    """
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
@@ -443,7 +489,14 @@ def _create_scheduler(
         else:
             return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
 
-    return LambdaLR(optimizer, lr_lambda)
+    # When positioning at a non-zero step, LambdaLR requires `initial_lr`
+    # in every param group.  Set it from the current LR (which the caller
+    # has already configured to the desired base value).
+    if last_epoch >= 0:
+        for pg in optimizer.param_groups:
+            pg.setdefault("initial_lr", pg["lr"])
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
 
 
 def _resolve_world_size(cfg: PretrainingConfig) -> int:
@@ -529,6 +582,8 @@ def _save_checkpoint(
     model, optimizer, scheduler, global_step, epoch,
     output_dir, logging_steps, eval_steps, save_steps,
     distributed=False, is_main=True,
+    model_config=None, manifest=None,
+    pretrain_config=None, total_steps=None, warmup_steps=None,
 ) -> None:
     ckpt = Path(output_dir) / f"checkpoint-{global_step}"
 
@@ -557,17 +612,61 @@ def _save_checkpoint(
         },
         ckpt / "rng_state.pth",
     )
+    # Include schedule metadata so resumed runs can reconstruct the exact
+    # LR curve without depending on the current pretrain.yaml.
+    training_state = dict(
+        global_step=global_step, epoch=epoch,
+        logging_steps=logging_steps, eval_steps=eval_steps, save_steps=save_steps,
+    )
+    if total_steps is not None:
+        training_state["total_steps"] = total_steps
+    if warmup_steps is not None:
+        training_state["warmup_steps"] = warmup_steps
     (ckpt / "training_state.json").write_text(
-        json.dumps(dict(
-            global_step=global_step, epoch=epoch,
-            logging_steps=logging_steps, eval_steps=eval_steps, save_steps=save_steps,
-        ), indent=2),
+        json.dumps(training_state, indent=2),
         encoding="utf-8",
     )
+
+    # Save model architecture config and data manifest so checkpoints are
+    # self-contained (inference can reconstruct the model without the
+    # original pretrain.yaml or dataset directory).
+    if model_config is not None:
+        cfg_dict = asdict(model_config) if hasattr(model_config, '__dataclass_fields__') else dict(model_config)
+        with open(ckpt / "model_config.yaml", "w") as f:
+            yaml.dump(cfg_dict, f, default_flow_style=False, sort_keys=False)
+    if manifest is not None:
+        manifest_dict = manifest.to_dict() if hasattr(manifest, 'to_dict') else dict(manifest)
+        with open(ckpt / "data_manifest.yaml", "w") as f:
+            yaml.dump(manifest_dict, f, default_flow_style=False, sort_keys=False)
+
+    # Save full pretraining config so resumed runs can detect config drift
+    # and reconstruct the original LR schedule exactly.
+    if pretrain_config is not None:
+        try:
+            pc_dict = {
+                k: str(v) if isinstance(v, Path) else v
+                for k, v in pretrain_config.__dict__.items()
+            }
+            with open(ckpt / "pretrain_config.yaml", "w") as f:
+                yaml.dump(pc_dict, f, default_flow_style=False, sort_keys=False)
+        except Exception as exc:
+            logger.warning(f"Failed to save pretrain_config.yaml: {exc}")
+
     logger.info(f"Checkpoint saved -> {ckpt}")
 
 
-def _load_checkpoint(model, optimizer, scheduler, checkpoint_dir, device, distributed=False) -> Tuple[int, int]:
+def _load_checkpoint(
+    model, optimizer, scheduler, checkpoint_dir, device,
+    distributed=False, load_scheduler=True,
+) -> Tuple[int, int]:
+    """Restore model, optimizer, (optionally) scheduler, and RNG states.
+
+    Args:
+        load_scheduler: When *False* the scheduler state dict is **not**
+            loaded.  This is used by the resume-override path which
+            rebuilds the scheduler from saved/overridden schedule params
+            instead of relying on the pickled ``lr_lambda``.
+    """
     ckp = Path(checkpoint_dir)
 
     model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
@@ -585,9 +684,12 @@ def _load_checkpoint(model, optimizer, scheduler, checkpoint_dir, device, distri
         rank = dist.get_rank()
         world = dist.get_world_size()
 
-        # Build map: param index -> local parameter tensor
+        # Build map: param index -> local parameter tensor.
+        # Iterate *all* param groups (muon, adamw, resid, x0, …).
         param_by_idx: dict[int, torch.nn.Parameter] = {}
-        all_params = list(optimizer.param_groups[0]["params"]) + list(optimizer.param_groups[1]["params"])
+        all_params: list[torch.nn.Parameter] = []
+        for pg in optimizer.param_groups:
+            all_params.extend(pg["params"])
         for idx, p in enumerate(all_params):
             param_by_idx[idx] = p
 
@@ -619,14 +721,30 @@ def _load_checkpoint(model, optimizer, scheduler, checkpoint_dir, device, distri
                         )
 
     optimizer.load_state_dict(opt_sd)
-    scheduler.load_state_dict(torch.load(ckp / "scheduler.pt", map_location=device, weights_only=True))
+
+    if load_scheduler:
+        sched_path = ckp / "scheduler.pt"
+        if sched_path.exists():
+            scheduler.load_state_dict(
+                torch.load(sched_path, map_location=device, weights_only=True)
+            )
 
     rng_path = ckp / "rng_state.pth"
     if rng_path.exists():
         rng = torch.load(rng_path, map_location="cpu", weights_only=False)
         torch.random.set_rng_state(rng["torch_rng"])
-        if torch.cuda.is_available() and rng["cuda_rng"]:
-            torch.cuda.set_rng_state_all(rng["cuda_rng"])
+        if torch.cuda.is_available() and rng.get("cuda_rng"):
+            saved_cuda_states = rng["cuda_rng"]
+            num_devices = torch.cuda.device_count()
+            if len(saved_cuda_states) == num_devices:
+                torch.cuda.set_rng_state_all(saved_cuda_states)
+            else:
+                logger.warning(
+                    f"CUDA RNG state mismatch: checkpoint has {len(saved_cuda_states)} "
+                    f"device(s), current environment has {num_devices}. "
+                    "Skipping CUDA RNG restore (training is still deterministic "
+                    "within the new world size)."
+                )
         np.random.set_state(rng["numpy_rng"])
         random.setstate(rng["python_rng"])
 
@@ -635,6 +753,149 @@ def _load_checkpoint(model, optimizer, scheduler, checkpoint_dir, device, distri
         state = json.loads(state_path.read_text(encoding="utf-8"))
         return int(state.get("global_step", 0)), int(state.get("epoch", 0))
     return 0, 0
+
+
+def _rebuild_scheduler_for_resume(
+    optimizer,
+    resume_config: "ResumeConfig",
+    pretrain_config: "PretrainingConfig",
+    checkpoint_dir: str,
+    start_step: int,
+    total_steps: int,
+    warmup_steps: int,
+    is_main: bool = True,
+) -> LambdaLR:
+    """Rebuild the LR scheduler for a resumed run.
+
+    The default behaviour reconstructs the *original* LR curve from the
+    checkpoint's saved ``pretrain_config.yaml`` (if present) so that the
+    schedule is bit-exact even if the user has since changed their
+    ``pretrain.yaml``.  Explicit overrides in ``resume_config`` take
+    precedence over the saved values.
+
+    Falls back to the current ``pretrain_config`` if the checkpoint
+    pre-dates this feature (no ``pretrain_config.yaml`` file).
+
+    Returns a :class:`LambdaLR` positioned at *start_step*.
+    """
+    ckp = Path(checkpoint_dir)
+
+    # -- Load saved schedule metadata from checkpoint ----------------------
+    saved_warmup = warmup_steps
+    saved_total = total_steps
+    saved_lr = pretrain_config.learning_rate
+    saved_muon_lr = pretrain_config.muon_learning_rate
+    saved_decay = pretrain_config.lr_decay_to_fraction
+    saved_schedule = pretrain_config.lr_schedule
+
+    state_path = ckp / "training_state.json"
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        saved_warmup = int(state.get("warmup_steps", saved_warmup))
+        saved_total = int(state.get("total_steps", saved_total))
+
+    saved_config_path = ckp / "pretrain_config.yaml"
+    if saved_config_path.exists():
+        with open(saved_config_path) as f:
+            saved_cfg = yaml.safe_load(f) or {}
+        saved_lr = float(saved_cfg.get("learning_rate", saved_lr))
+        saved_muon_lr = float(saved_cfg.get("muon_learning_rate", saved_muon_lr))
+        saved_decay = float(saved_cfg.get("lr_decay_to_fraction", saved_decay))
+        saved_schedule = str(saved_cfg.get("lr_schedule", saved_schedule))
+
+        # Detect config drift and warn (informational only).
+        if is_main:
+            diffs: list[str] = []
+            for key in (
+                "learning_rate", "muon_learning_rate", "warmup_steps",
+                "lr_schedule", "lr_decay_to_fraction",
+            ):
+                ckpt_val = saved_cfg.get(key)
+                yaml_val = getattr(pretrain_config, key, None)
+                if ckpt_val is not None and yaml_val is not None and ckpt_val != yaml_val:
+                    diffs.append(f"  {key}: {ckpt_val} (checkpoint) \u2192 {yaml_val} (current YAML)")
+            if diffs:
+                logger.warning(
+                    "Schedule config drift detected between checkpoint and current YAML:\n"
+                    + "\n".join(diffs)
+                    + "\nUsing checkpoint values as base. "
+                    "Override explicitly via resume.* fields if intended."
+                )
+    else:
+        if is_main:
+            logger.info(
+                "No pretrain_config.yaml in checkpoint (pre-upgrade checkpoint). "
+                "Using current YAML schedule params as base."
+            )
+
+    # -- Apply explicit overrides from resume config -----------------------
+    eff_warmup = saved_warmup
+    eff_total = saved_total
+    eff_lr = saved_lr
+    eff_muon_lr = saved_muon_lr
+    eff_decay = saved_decay
+    eff_schedule = saved_schedule
+
+    if resume_config.extra_epochs is not None and resume_config.extra_epochs > 0:
+        # total_steps was already extended by _prepare_run_and_steps;
+        # use the caller-provided value which accounts for extra epochs.
+        eff_total = total_steps
+
+    if resume_config.warmup_steps is not None:
+        eff_warmup = resume_config.warmup_steps
+    if resume_config.learning_rate is not None:
+        eff_lr = resume_config.learning_rate
+    if resume_config.muon_learning_rate is not None:
+        eff_muon_lr = resume_config.muon_learning_rate
+    if resume_config.lr_schedule is not None:
+        eff_schedule = resume_config.lr_schedule
+    if resume_config.lr_decay_to_fraction is not None:
+        eff_decay = resume_config.lr_decay_to_fraction
+    if resume_config.skip_warmup:
+        eff_warmup = 0
+
+    # -- Override optimizer base LRs before creating scheduler -------------
+    if isinstance(optimizer, (DionMuon, DionNorMuon)):
+        # group[0] = muon, group[1+] = adamw / scalar
+        optimizer.param_groups[0]["lr"] = eff_muon_lr
+        for pg in optimizer.param_groups[1:]:
+            if pg.get("algorithm") == "adamw":
+                pg["lr"] = eff_lr
+    else:
+        for pg in optimizer.param_groups:
+            pg["lr"] = eff_lr
+
+    # -- Build scheduler ---------------------------------------------------
+    if resume_config.reset_scheduler:
+        remaining = max(1, eff_total - start_step)
+        if is_main:
+            logger.info(
+                f"Resetting LR schedule from step 0: remaining_steps={remaining}, "
+                f"warmup={eff_warmup}, schedule={eff_schedule}, "
+                f"base_lr={eff_lr:.2e}, decay_to={eff_decay}"
+            )
+        scheduler = _create_scheduler(
+            optimizer, eff_warmup, remaining,
+            eff_lr, eff_decay, eff_schedule,
+        )
+    else:
+        # Reconstruct the original schedule and position at start_step.
+        # last_epoch=N-1 causes __init__ to call step() once → last_epoch=N.
+        scheduler = _create_scheduler(
+            optimizer, eff_warmup, eff_total,
+            eff_lr, eff_decay, eff_schedule,
+            last_epoch=max(-1, start_step - 1),
+        )
+
+    current_lrs = [pg["lr"] for pg in optimizer.param_groups]
+    if is_main:
+        logger.info(
+            f"Resume schedule built: warmup={eff_warmup}, total={eff_total}, "
+            f"schedule={eff_schedule}, decay_to={eff_decay}, "
+            f"current_lrs={[f'{lr:.2e}' for lr in current_lrs]}"
+        )
+
+    return scheduler
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +917,11 @@ def run_pure_pretraining(
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
     if manifest.max_seq_len <= 0:
         raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")
+
+    # Capture config/manifest for checkpoint serialization so every saved
+    # checkpoint is self-contained (no external pretrain.yaml needed).
+    _model_config = getattr(model, "model_config", None)
+    _manifest = manifest
 
     model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
     if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
@@ -817,14 +1083,7 @@ def run_pure_pretraining(
     # ---- Model to device + compile + FSDP ----
     model.to(device)
 
-    compile_dynamic_inner = bool(use_packing and not use_static_inp_size)
-    compile_dynamic_root = not bool(use_packing and use_static_inp_size)
-    if distributed:
-        _compile_inner_layers_for_fsdp(model, dynamic=compile_dynamic_inner)
-        logger.info(
-            "Compiled inner transformer layers with "
-            f"torch.compile(dynamic={compile_dynamic_inner}) before FSDP2 wrapping"
-        )
+    compile_dynamic = not bool(use_packing and use_static_inp_size)
 
     # Precision detection (needed before FSDP MixedPrecisionPolicy)
     use_bf16 = pretrain_config.bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
@@ -853,11 +1112,55 @@ def run_pure_pretraining(
 
     # Keep orig_model reference for checkpointing/eval (eval changes shapes → recompilation)
     orig_model = model
-    if distributed:
-        logger.info("Skipping root model torch.compile under FSDP2 (using pre-wrapped compiled inner layers)")
+    compile_mode = (
+        "max-autotune-no-cudagraphs"
+        if getattr(pretrain_config, "use_compile_max_autotune", False)
+        else None
+    )
+
+    # ---- TorchInductor knobs (must be set before torch.compile) ----
+    if device.type == "cuda":
+        try:
+            import torch._inductor.config as inductor_config
+
+            # NOTE: Inductor codecache compilation runs in subprocess workers by
+            # default. Those workers read config from environment variables at
+            # import time, so set the env var as well as the in-process config.
+            persistent_reductions = bool(
+                getattr(pretrain_config, "compile_triton_persistent_reductions", False)
+            )
+            mix_order_reduction = bool(
+                getattr(pretrain_config, "compile_triton_mix_order_reduction", False)
+            )
+            os.environ["TORCHINDUCTOR_PERSISTENT_REDUCTIONS"] = (
+                "1" if persistent_reductions else "0"
+            )
+            os.environ["TORCHINDUCTOR_MIX_ORDER_REDUCTION"] = (
+                "1" if mix_order_reduction else "0"
+            )
+            inductor_config.triton.persistent_reductions = persistent_reductions
+            inductor_config.triton.mix_order_reduction = mix_order_reduction
+            logger.info(
+                "TorchInductor: triton.persistent_reductions=%s (env TORCHINDUCTOR_PERSISTENT_REDUCTIONS=%s); "
+                "triton.mix_order_reduction=%s (env TORCHINDUCTOR_MIX_ORDER_REDUCTION=%s)",
+                persistent_reductions,
+                os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTIONS"),
+                mix_order_reduction,
+                os.environ.get("TORCHINDUCTOR_MIX_ORDER_REDUCTION"),
+            )
+        except Exception:
+            logger.exception("Failed to apply TorchInductor config overrides; continuing.")
+
+    if compile_mode is None:
+        model = torch.compile(model, dynamic=compile_dynamic)
+        logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic})")
     else:
-        model = torch.compile(model, dynamic=compile_dynamic_root)
-        logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic_root})")
+        model = torch.compile(model, dynamic=compile_dynamic, mode=compile_mode)
+        logger.info(
+            "Model compiled with torch.compile(dynamic=%s, mode=%s)",
+            compile_dynamic,
+            compile_mode,
+        )
 
     # ---- DataLoaders ----
     eval_collator = ProtDataCollatorForLM(
@@ -893,8 +1196,25 @@ def run_pure_pretraining(
     resume_micro_step, resume_epoch = 0, 0
     if resume_config and resume_config.is_resume:
         logger.info(f"Resuming from checkpoint: {resume_config.checkpoint_dir}")
-        start_step, start_epoch = _load_checkpoint(model, optimizer, scheduler, resume_config.checkpoint_dir, device, distributed)
+        start_step, start_epoch = _load_checkpoint(
+            model, optimizer, scheduler, resume_config.checkpoint_dir,
+            device, distributed, load_scheduler=False,
+        )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
+
+        # Rebuild the LR scheduler from the checkpoint's saved schedule
+        # params (with any explicit overrides from resume config).
+        scheduler = _rebuild_scheduler_for_resume(
+            optimizer=optimizer,
+            resume_config=resume_config,
+            pretrain_config=pretrain_config,
+            checkpoint_dir=resume_config.checkpoint_dir,
+            start_step=start_step,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            is_main=is_main,
+        )
+
         resume_epoch = start_epoch
         steps_done = max(0, start_step - start_epoch * steps_per_epoch)
         resume_micro_step = steps_done * inferred_grad_accum_steps
@@ -920,6 +1240,7 @@ def run_pure_pretraining(
                 wandb.define_metric("time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("train/time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
+                upload_run_source_snapshot()
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
 
@@ -1149,6 +1470,7 @@ def run_pure_pretraining(
                 vram_log = ""
                 tps = mfu = tok = raw_tok = 0.0
                 step_tok = step_raw_tok = 0.0
+                real_tps = real_tps_log = 0.0
                 avg_step_ms = 0.0
                 if should_log:
                     # Synchronize and measure only at logging boundaries to amortize sync cost.
@@ -1173,8 +1495,10 @@ def run_pure_pretraining(
                         tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
                     step_tok = tok / max(1, window_steps)
                     step_raw_tok = raw_tok / max(1, window_steps)
+                    real_tps = tok / window_dt
+                    real_tps_log = int(real_tps)
                     mfu = (
-                        _flops_per_token * achieved_global_batch_tokens * window_steps / window_dt
+                        _flops_per_token * real_tps
                     ) / (_peak_flops * max(effective_world_size, 1))
 
                     token_count.zero_()
@@ -1194,7 +1518,8 @@ def run_pure_pretraining(
                     logger.info(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
-                        f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} "
+                        f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} real_tok/s={real_tps_log:,} "
+                        f"real_tok/step={step_tok:,.0f} "
                         f"dt={avg_step_ms:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
                         f"h100_mfu={mfu:.2%} {vram_log}"
                     )
@@ -1205,6 +1530,7 @@ def run_pure_pretraining(
                         "train/learning_rate": learning_rate,
                         "train/epoch": epoch + (micro_step + 1) / synced_len,
                         "train/tokens_per_sec": tps,
+                        "train/real_tokens_per_sec": real_tps,
                         "train/step_real_tokens": step_tok,
                         "train/step_raw_tokens": step_raw_tok,
                         "train/packing_waste_pct": waste,
@@ -1250,6 +1576,9 @@ def run_pure_pretraining(
                         model, optimizer, scheduler, global_step, epoch,
                         output_dir, logging_steps, eval_steps, save_steps,
                         distributed, is_main,
+                        model_config=_model_config, manifest=_manifest,
+                        pretrain_config=pretrain_config,
+                        total_steps=total_steps, warmup_steps=warmup_steps,
                     )
 
             # ---- Epoch boundary cleanup ----
@@ -1290,6 +1619,9 @@ def run_pure_pretraining(
         model, optimizer, scheduler, global_step, num_epochs,
         output_dir, logging_steps, eval_steps, save_steps,
         distributed, is_main,
+        model_config=_model_config, manifest=_manifest,
+        pretrain_config=pretrain_config,
+        total_steps=total_steps, warmup_steps=warmup_steps,
     )
 
     if is_main and wandb_enabled and wandb.run is not None:

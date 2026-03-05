@@ -13,6 +13,7 @@ from pathlib import Path
 
 from transformers import (
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 
@@ -26,6 +27,7 @@ from nanoplm.pretraining.optim import build_optimizer
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs
+from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -199,6 +201,14 @@ class TokenTrackingTrainer(Trainer):
         super().log(logs, start_time=start_time, **kwargs)
 
 
+class WandbSourceSnapshotCallback(TrainerCallback):
+    """Upload run source snapshot once W&B is active."""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        upload_run_source_snapshot()
+        return control
+
+
 @dataclass
 class PretrainingConfig:
     # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
@@ -268,6 +278,20 @@ class PretrainingConfig:
     # (cu_seqlens/max_seqlen). This enables static-shape execution for torch.compile
     # (dynamic=False) and improves CUDA graph capture reuse.
     use_static_inp_size: bool = True
+    # If enabled, pure-torch compile uses mode='max-autotune-no-cudagraphs'.
+    # This may improve steady-state performance, but increases compile/autotune time
+    # noticeably at the start of a run.
+    use_compile_max_autotune: bool = False
+    # TorchInductor Triton setting. Persistent reductions can exceed per-block shared
+    # memory limits for some fused kernels (e.g. LayerNorm backward at hidden >= 1536),
+    # causing "No valid triton configs / out of resource". Set to False to force
+    # non-persistent reduction kernels while keeping torch.compile enabled.
+    compile_triton_persistent_reductions: bool = False
+    # TorchInductor Triton setting. Mix-order reductions can generate persistent
+    # reduction kernels that exceed shared memory limits on some shapes (notably
+    # layernorm backward fusions at larger hidden sizes). Disable to prefer the
+    # legacy reduction codegen while keeping torch.compile enabled.
+    compile_triton_mix_order_reduction: bool = False
 
     # Profiling (pure_torch / pure_te pipelines). When enabled on rank 0:
     # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.
@@ -287,6 +311,21 @@ class ResumeConfig:
     is_resume: bool
     checkpoint_dir: str
     extra_epochs: Optional[int] = None
+    # Schedule override options for resumed training.
+    # When set to None (the YAML default), the corresponding value is read
+    # from the checkpoint's saved pretrain_config.yaml so the original
+    # schedule is reconstructed exactly.  Explicit values override.
+    warmup_steps: Optional[int] = None
+    learning_rate: Optional[float] = None
+    muon_learning_rate: Optional[float] = None
+    lr_schedule: Optional[str] = None
+    lr_decay_to_fraction: Optional[float] = None
+    # reset_scheduler: rebuild the LR schedule from step 0 covering only the
+    # remaining training steps (new warmup + decay).  Useful when you want a
+    # fresh learning-rate curve after a long pause.
+    reset_scheduler: bool = False
+    # skip_warmup: jump straight to peak LR on resume (sets warmup_steps=0).
+    skip_warmup: bool = False
 
 
 def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
@@ -411,7 +450,7 @@ def _prepare_run_and_steps(
     if resume_config and resume_config.is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
 
-        if resume_config.extra_epochs > 0:
+        if resume_config.extra_epochs is not None and resume_config.extra_epochs > 0:
             num_epochs = pretrain_config.num_epochs + int(resume_config.extra_epochs)
         else:
             num_epochs = pretrain_config.num_epochs
@@ -650,6 +689,7 @@ def run_pretraining(
         eval_dataset=val_ds,
         processing_class=tokenizer,
         optimizers=(optimizer, scheduler),
+        callbacks=[WandbSourceSnapshotCallback()],
     )
 
     logger.info("Starting Trainer")

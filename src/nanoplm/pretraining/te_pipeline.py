@@ -44,6 +44,7 @@ from nanoplm.pretraining.pure_pipeline import (
     _load_checkpoint,
     _move_batch_to_device,
     _num_update_steps_per_epoch,
+    _rebuild_scheduler_for_resume,
     _resolve_world_size,
     _save_checkpoint,
     _set_seed,
@@ -51,6 +52,7 @@ from nanoplm.pretraining.pure_pipeline import (
 )
 from nanoplm.utils.common import create_dirs, get_device
 from nanoplm.utils.logger import logger
+from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 
 def _make_te_profiler(pretrain_config: PretrainingConfig, output_dir: str, is_main: bool):
@@ -155,7 +157,9 @@ def run_te_pretraining(
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
     if manifest.max_seq_len <= 0:
         raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")
-
+    # Capture config/manifest for checkpoint serialization.
+    _model_config = getattr(model, "model_config", None)
+    _manifest = manifest
     model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
     if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
         raise ValueError(
@@ -480,8 +484,22 @@ def run_te_pretraining(
             checkpoint_dir=resume_config.checkpoint_dir,
             device=device,
             distributed=distributed,
+            load_scheduler=False,
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
+
+        # Rebuild the LR scheduler from the checkpoint's saved schedule
+        # params (with any explicit overrides from resume config).
+        scheduler = _rebuild_scheduler_for_resume(
+            optimizer=optimizer,
+            resume_config=resume_config,
+            pretrain_config=pretrain_config,
+            checkpoint_dir=resume_config.checkpoint_dir,
+            start_step=start_step,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            is_main=is_main,
+        )
 
     resume_micro_step = 0
     resume_epoch = start_epoch
@@ -515,6 +533,7 @@ def run_te_pretraining(
                 wandb.define_metric("time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("train/time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
+                upload_run_source_snapshot()
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
 
@@ -722,6 +741,7 @@ def run_te_pretraining(
                 vram_log = ""
                 tokens_per_sec = mfu = tok = raw_tok = 0.0
                 step_tok = step_raw_tok = 0.0
+                real_tokens_per_sec = real_tokens_per_sec_log = 0.0
                 avg_step_ms = 0.0
                 if should_log:
                     # Synchronize and measure only at logging boundaries to amortize sync cost.
@@ -745,8 +765,10 @@ def run_te_pretraining(
                         tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
                     step_tok = tok / max(1, window_steps)
                     step_raw_tok = raw_tok / max(1, window_steps)
+                    real_tokens_per_sec = tok / window_dt
+                    real_tokens_per_sec_log = int(real_tokens_per_sec)
                     mfu = (
-                        _flops_per_token * achieved_global_batch_tokens * window_steps / window_dt
+                        _flops_per_token * real_tokens_per_sec
                     ) / (_peak_flops_per_gpu * max(effective_world_size, 1))
 
                     token_count.zero_()
@@ -769,6 +791,7 @@ def run_te_pretraining(
                         "train/learning_rate": learning_rate,
                         "train/epoch": epoch + (micro_step + 1) / synced_train_loader_len,
                         "train/tokens_per_sec": tokens_per_sec,
+                        "train/real_tokens_per_sec": real_tokens_per_sec,
                         "train/step_real_tokens": step_tok,
                         "train/step_raw_tokens": step_raw_tok,
                         "train/packing_waste_pct": waste_pct,
@@ -787,7 +810,8 @@ def run_te_pretraining(
                     logger.info(
                         f"[step {global_step}/{total_steps}] "
                         f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
-                        f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,} "
+                        f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,} real_tok/s={real_tokens_per_sec_log:,} "
+                        f"real_tok/step={step_tok:,.0f} "
                         f"dt={avg_step_ms:.2f}ms waste={waste_pct:.1f}% "
                         f"h100_mfu={mfu:.2%} {vram_log}"
                     )
@@ -840,6 +864,11 @@ def run_te_pretraining(
                         save_steps=save_steps,
                         distributed=distributed,
                         is_main=is_main,
+                        model_config=_model_config,
+                        manifest=_manifest,
+                        pretrain_config=pretrain_config,
+                        total_steps=total_steps,
+                        warmup_steps=warmup_steps,
                     )
 
             # ---- Epoch boundary cleanup ----
@@ -884,6 +913,11 @@ def run_te_pretraining(
         save_steps=save_steps,
         distributed=distributed,
         is_main=is_main,
+        model_config=_model_config,
+        manifest=_manifest,
+        pretrain_config=pretrain_config,
+        total_steps=total_steps,
+        warmup_steps=warmup_steps,
     )
     if is_main:
         if wandb_enabled and wandb.run is not None:

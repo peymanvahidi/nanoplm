@@ -166,8 +166,7 @@ model:
   use_qk_norm: false  # applies RMS norm to Q/K in attention
   use_canon_layers: true  # enables bidirectional Canon-ABCD (pure_torch only)
   canon_layers_mode: "ac"  # subset of Canon sites (A/B/C/D); "ac" is lighter/faster than full "abcd"
-  canon_layer_type: "causal"  # 'causal' (fused CUDA kernel) or 'symmetric' (nn.Conv1d)
-  canon_layers_kernel_size: 4  # causal: 2/3/4, symmetric: 3/5/7 (defaults: causal=4, symmetric=5)
+  canon_layers_kernel_size: 5  # symmetric Canon kernel size (allowed: 3/5/7, default: 5)
 
 pretraining:
   # Dataset directory (contains .data_manifest from nanoplm data from-yaml)

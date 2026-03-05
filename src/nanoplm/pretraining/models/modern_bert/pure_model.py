@@ -35,6 +35,8 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
 
     def __init__(self, config: ProtModernBertMLMConfig):
         self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
 
         mb_config = ModernBertConfig(
             vocab_size=config.vocab_size,
@@ -49,6 +51,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             max_position_embeddings=8192,
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
+            no_mlp_on_first_layer=config.no_mlp_on_first_layer,
             attention_bias=config.attention_bias,
             attention_dropout=config.attention_dropout,
             classifier_activation=config.classifier_activation,
@@ -62,12 +65,17 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             use_qk_norm=config.use_qk_norm,
             use_canon_layers=config.use_canon_layers,
             canon_layers_mode=config.canon_layers_mode,
-            canon_layer_type=config.canon_layer_type,
             canon_layers_kernel_size=config.canon_layers_kernel_size,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
             use_repo=config.use_repo,
             repo_after_n_layers=config.repo_after_n_layers,
+            gradient_checkpointing=config.gradient_checkpointing,
+            gradient_checkpointing_mode=str(getattr(config, "gradient_checkpointing_mode", "layer")).strip().lower(),
+            use_mhc_lite=config.use_mhc_lite,
+            mhc_n_streams=config.mhc_n_streams,
+            mhc_triton_fused=config.mhc_triton_fused,
+            mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
         )
 
         super().__init__(mb_config)
@@ -84,6 +92,8 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             )
 
         self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
 
         mb_config = ModernBertConfig(
             vocab_size=config.vocab_size,
@@ -96,6 +106,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             max_position_embeddings=8192,
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
+            no_mlp_on_first_layer=config.no_mlp_on_first_layer,
             attention_bias=config.attention_bias,
             attention_dropout=config.attention_dropout,
             classifier_activation=config.classifier_activation,
@@ -109,12 +120,17 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             use_qk_norm=config.use_qk_norm,
             use_canon_layers=config.use_canon_layers,
             canon_layers_mode=config.canon_layers_mode,
-            canon_layer_type=config.canon_layer_type,
             canon_layers_kernel_size=config.canon_layers_kernel_size,
             resid_lambda_init=config.resid_lambda_init,
             x0_lambda_init=config.x0_lambda_init,
             use_repo=config.use_repo,
             repo_after_n_layers=config.repo_after_n_layers,
+            gradient_checkpointing=config.gradient_checkpointing,
+            gradient_checkpointing_mode=str(getattr(config, "gradient_checkpointing_mode", "layer")).strip().lower(),
+            use_mhc_lite=config.use_mhc_lite,
+            mhc_n_streams=config.mhc_n_streams,
+            mhc_triton_fused=config.mhc_triton_fused,
+            mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
         )
 
         super().__init__(mb_config)
