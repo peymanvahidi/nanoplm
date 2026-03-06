@@ -654,6 +654,7 @@ def _save_checkpoint(
     distributed=False, is_main=True,
     model_config=None, manifest=None,
     pretrain_config=None, total_steps=None, warmup_steps=None,
+    dataset_fingerprint=None,
 ) -> None:
     ckpt = Path(output_dir) / f"checkpoint-{global_step}"
 
@@ -692,6 +693,8 @@ def _save_checkpoint(
         training_state["total_steps"] = total_steps
     if warmup_steps is not None:
         training_state["warmup_steps"] = warmup_steps
+    if dataset_fingerprint is not None:
+        training_state["dataset_fingerprint"] = dataset_fingerprint
     (ckpt / "training_state.json").write_text(
         json.dumps(training_state, indent=2),
         encoding="utf-8",
@@ -1039,6 +1042,8 @@ def run_pure_pretraining(
     logger.info("Using ShardedDataset for pre-tokenized binary shards")
     train_ds = ShardedDataset(data_dir=str(train_shard_dir))
     val_ds = ShardedDataset(data_dir=str(val_shard_dir))
+    _dataset_fingerprint = train_ds.fingerprint()
+    logger.info(f"Train dataset fingerprint: {_dataset_fingerprint}")
 
     use_packing = bool(pretrain_config.use_packing)
     use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
@@ -1314,9 +1319,29 @@ def run_pure_pretraining(
             is_main=is_main,
         )
 
+        # Detect dataset change: if the current dataset differs from the
+        # checkpoint's dataset, start from batch 0 instead of fast-forwarding.
+        _ckp_state_path = Path(resume_config.checkpoint_dir) / "training_state.json"
+        _dataset_changed = False
+        if _ckp_state_path.exists():
+            _ckp_state = json.loads(_ckp_state_path.read_text(encoding="utf-8"))
+            _ckp_fp = _ckp_state.get("dataset_fingerprint")
+            if _ckp_fp is not None and _ckp_fp != _dataset_fingerprint:
+                _dataset_changed = True
+                logger.warning(
+                    f"Dataset changed since checkpoint (fingerprint {_ckp_fp} → "
+                    f"{_dataset_fingerprint}). Dataloader will start from batch 0 "
+                    f"instead of fast-forwarding."
+                )
+            elif _ckp_fp is None and is_main:
+                logger.info(
+                    "Checkpoint has no dataset fingerprint (pre-upgrade checkpoint). "
+                    "Assuming same dataset for dataloader positioning."
+                )
+
         resume_epoch = start_epoch
         steps_done = max(0, start_step - start_epoch * steps_per_epoch)
-        resume_micro_step = steps_done * inferred_grad_accum_steps
+        resume_micro_step = steps_done * inferred_grad_accum_steps if not _dataset_changed else 0
         if resume_micro_step >= synced_len:
             resume_micro_step = 0
             start_epoch = min(start_epoch + 1, num_epochs)
@@ -1753,6 +1778,7 @@ def run_pure_pretraining(
                         model_config=_model_config, manifest=_manifest,
                         pretrain_config=pretrain_config,
                         total_steps=total_steps, warmup_steps=warmup_steps,
+                        dataset_fingerprint=_dataset_fingerprint,
                     )
 
             # ---- Epoch boundary cleanup ----
@@ -1797,6 +1823,7 @@ def run_pure_pretraining(
         model_config=_model_config, manifest=_manifest,
         pretrain_config=pretrain_config,
         total_steps=total_steps, warmup_steps=warmup_steps,
+        dataset_fingerprint=_dataset_fingerprint,
     )
 
     if is_main and wandb_enabled and wandb.run is not None:

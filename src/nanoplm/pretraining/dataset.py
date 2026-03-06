@@ -437,6 +437,21 @@ class ShardedDataset(Dataset):
             all_lengths.append(np.diff(offsets).astype(np.int32))
         return np.concatenate(all_lengths)
 
+    def fingerprint(self) -> str:
+        """Return a lightweight hex digest identifying this dataset's content.
+
+        Hashes the number of shards, number of sequences per shard, and all
+        sequence lengths (from the already-loaded index arrays).  This is fast
+        because it only touches metadata already in memory — no data I/O.
+        """
+        import hashlib
+        h = hashlib.sha256()
+        h.update(len(self._bin_paths).to_bytes(4, "little"))
+        for offsets in self._offsets:
+            lengths = np.diff(offsets).astype(np.int32)
+            h.update(lengths.tobytes())
+        return h.hexdigest()[:16]
+
     def cleanup(self):
         """Release memmap objects (public API, kept for compatibility)."""
         if self._mmaps is not None:
