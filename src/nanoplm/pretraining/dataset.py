@@ -329,53 +329,70 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         self.split_samples = split_samples
         self.sampler = sampler
         self._epoch = 0
+        self._cached_len: Optional[int] = None
+
+    def _resolve_sample_lengths(self) -> list[int]:
+        if hasattr(self.dataset, "get_all_sequence_lengths"):
+            lengths = self.dataset.get_all_sequence_lengths()
+            if self.sampler is None:
+                return [int(length) for length in lengths.tolist()]
+            return [int(lengths[idx]) for idx in self.sampler]
+
+        if self.sampler is not None:
+            if not hasattr(self.dataset, "__getitem__"):
+                raise TypeError(
+                    "Underlying dataset must support indexed access or expose "
+                    "'get_all_sequence_lengths' to compute TokenPackingDataset length"
+                )
+            return [int(len(self.dataset[idx]["input_ids"])) for idx in self.sampler]
+
+        if hasattr(self.dataset, "__len__") and hasattr(self.dataset, "__getitem__"):
+            return [int(len(self.dataset[idx]["input_ids"])) for idx in range(len(self.dataset))]
+
+        raise TypeError(
+            "Underlying dataset must support indexed access or expose "
+            "'get_all_sequence_lengths' to compute TokenPackingDataset length"
+        )
+
+    def _count_batches_from_lengths(self, lengths: list[int]) -> int:
+        if not lengths:
+            return 0
+
+        batches = 0
+        current_length = 0
+
+        for sample_length in lengths:
+            if sample_length <= 0:
+                continue
+
+            current_length += sample_length
+
+            if current_length == self.max_tokens_per_batch:
+                batches += 1
+                current_length = 0
+            elif current_length > self.max_tokens_per_batch:
+                if not self.split_samples:
+                    if current_length > sample_length:
+                        batches += 1
+                    current_length = sample_length
+                else:
+                    batches += 1
+                    current_length -= self.max_tokens_per_batch
+                    while current_length >= self.max_tokens_per_batch:
+                        batches += 1
+                        current_length -= self.max_tokens_per_batch
+
+        if not self.drop_last and current_length > 0:
+            batches += 1
+
+        return batches
 
     def __len__(self) -> int:
-        """Return the estimated number of batches in the dataset."""
-        if hasattr(self.dataset, "total_tokens"):
-             total_tokens = self.dataset.total_tokens
-        elif hasattr(self.dataset, "__len__") and hasattr(self.dataset, "__getitem__"):
-             if isinstance(self.dataset, ShardedDataset):
-                 total_tokens = self.dataset.total_tokens
-             else:
-                 # Fallback: estimate using length * mean_seq_len ? No reliability.
-                 # We will return the dataset length which is definitely wrong (too high)
-                 # but prevents "not implemented" errors.
-                 # Ideally we should raise specific warning.
-                 # OR, we assume full packing isn't happening and return len(dataset).
-                 # Raising is safer.
-                 raise TypeError("Underlying dataset must have 'total_tokens' property to estimate length of TokenPackingDataset")
-        else:
-             raise TypeError("Underlying dataset must have 'total_tokens' property to estimate length of TokenPackingDataset")
-
-        # Adjust for sampler (e.g. distributed training)
-        # If we have a sampler, we assume it shards the dataset.
-        if self.sampler is not None:
-            if hasattr(self.sampler, "num_replicas") and self.sampler.num_replicas > 1:
-                total_tokens = total_tokens // self.sampler.num_replicas
-            elif hasattr(self.sampler, "num_samples") and self.sampler.num_samples is not None:
-                # Some samplers might expose num_samples directly
-                # However, for packing, we need tokens, not samples.
-                # If sampler subsamples (like RandomSampler with num_samples), we can't easily know token count.
-                # We'll assume proportional reduction if num_samples < len(dataset).
-                if hasattr(self.dataset, "__len__"):
-                     ratio = self.sampler.num_samples / len(self.dataset)
-                     total_tokens = int(total_tokens * ratio)
-
-        # length is total tokens / max tokens per batch.
-        # Since packing is greedy and not optimal, we will have some fragmentation/waste.
-        # A simple heuristic is to assume 95% packing efficiency.
-        # But to avoid warnings, it's safer to overestimate the number of batches slightly.
-        # Or, we can just return exact theoretical minimum and let DataLoader warn.
-        # The warning is harmless but annoying.
-        # Let's adjust by a factor of 1.1 to account for fragmentation if not splitting samples.
-        factor = 1.0
-        if not self.split_samples:
-             # Without splitting, large samples cause more fragmentation
-             factor = 1.15
-
-        estimated_batches = int(ceil(total_tokens / self.max_tokens_per_batch * factor))
-        return estimated_batches
+        """Return the exact number of batches yielded by the dataset."""
+        if self._cached_len is None:
+            lengths = self._resolve_sample_lengths()
+            self._cached_len = self._count_batches_from_lengths(lengths)
+        return self._cached_len
 
     def __iter__(self):
         """Yield batches of samples, each with a variable number of tokens up to the maximum length.

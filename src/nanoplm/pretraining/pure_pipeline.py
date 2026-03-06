@@ -517,18 +517,23 @@ def _num_update_steps_per_epoch(train_loader_len: int, grad_accum: int) -> int:
 def _sync_train_loader_len(
     train_loader_len: int, distributed: bool, device: torch.device
 ) -> int:
-    """Ensure all ranks see the same number of micro-batches per epoch."""
+    """Return the shared number of micro-batches all ranks can safely execute."""
     if not (distributed and dist.is_initialized()):
         return train_loader_len
     t = torch.tensor(train_loader_len, device=device, dtype=torch.int64)
     mn, mx = t.clone(), t.clone()
     dist.all_reduce(mn, op=dist.ReduceOp.MIN)
     dist.all_reduce(mx, op=dist.ReduceOp.MAX)
-    if int(mn) != int(mx):
-        raise RuntimeError(
-            f"Mismatched train loader lengths across ranks (min={int(mn)}, max={int(mx)})."
+    min_len = int(mn)
+    max_len = int(mx)
+    if min_len != max_len and dist.get_rank() == 0:
+        logger.warning(
+            "Mismatched train loader lengths across ranks (min=%d, max=%d); "
+            "using min length for synchronized micro-step scheduling.",
+            min_len,
+            max_len,
         )
-    return int(mx)
+    return min_len
 
 
 # ---------------------------------------------------------------------------

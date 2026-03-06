@@ -7,6 +7,7 @@ from nanoplm.pretraining.collator import DataCollatorWithFlattening, ProtDataCol
 class MockDataset(Dataset):
     def __init__(self, lengths):
         self.lengths = lengths
+        self.total_tokens = sum(lengths)
         
     def __len__(self):
         return len(self.lengths)
@@ -30,9 +31,30 @@ def test_token_packing_dataset():
     batches = list(packed_ds)
     # Check assertions
     assert len(batches) == 4, f"Expected 4 batches, got {len(batches)}"
+    assert len(packed_ds) == 4, f"Expected __len__ to report 4 batches, got {len(packed_ds)}"
     assert len(batches[0]) == 3, f"Expected batch size 3, got {len(batches[0])}"
     assert len(batches[3]) == 1, f"Expected batch size 1 (remainder), got {len(batches[3])}"
     print("test_token_packing_dataset passed")
+
+
+def test_token_packing_len_matches_iterator_without_split():
+    lengths = [9, 9, 9, 9, 9]
+    ds = MockDataset(lengths)
+    packed_ds = TokenPackingDataset(ds, max_tokens_per_batch=20, drop_last=False, split_samples=False)
+
+    batches = list(packed_ds)
+
+    assert len(packed_ds) == len(batches) == 3
+
+
+def test_token_packing_len_matches_iterator_with_split():
+    lengths = [7, 7, 7]
+    ds = MockDataset(lengths)
+    packed_ds = TokenPackingDataset(ds, max_tokens_per_batch=10, drop_last=False, split_samples=True)
+
+    batches = list(packed_ds)
+
+    assert len(packed_ds) == len(batches) == 3
 
 def test_data_collator_flattening():
     # Mock tokenizer
