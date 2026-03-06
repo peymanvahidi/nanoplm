@@ -1087,13 +1087,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  profiler_enabled: false\n"
         "  profiler_start_step: 10\n"
         "  profiler_end_step: 15\n"
-        "  debug_start_step: null\n"
-        "  debug_end_step: null\n"
-        "  debug_dump_dir: null\n"
-        "  debug_detect_anomaly: false\n"
-        "  debug_dump_batches: true\n"
-        "  debug_dump_snapshot_at_start: true\n"
-        "  debug_abort_on_nonfinite: true\n"
         "\n"
         "\n"
         "resume:\n"
@@ -1216,15 +1209,6 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                     f"Invalid {warmup_key} value: {kwargs[warmup_key]}. Must be an integer."
                 ) from exc
 
-    for debug_step_key in ("debug_start_step", "debug_end_step"):
-        if debug_step_key in kwargs and kwargs[debug_step_key] is not None:
-            try:
-                kwargs[debug_step_key] = int(kwargs[debug_step_key])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Invalid {debug_step_key} value: {kwargs[debug_step_key]}. Must be an integer."
-                ) from exc
-
     # Handle boolean values
     for bool_key in [
         'multi_gpu',
@@ -1240,10 +1224,6 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'compile_triton_persistent_reductions',
         'compile_triton_mix_order_reduction',
         'profiler_enabled',
-        'debug_detect_anomaly',
-        'debug_dump_batches',
-        'debug_dump_snapshot_at_start',
-        'debug_abort_on_nonfinite',
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]

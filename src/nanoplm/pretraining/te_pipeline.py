@@ -41,7 +41,10 @@ from nanoplm.pretraining.pure_pipeline import (
     _dist_barrier,
     _estimate_model_flops_per_token,
     _evaluate,
+    _first_nonfinite_grad,
+    _first_nonfinite_param,
     _format_vram_for_log,
+    _has_nonfinite_params,
     _load_checkpoint,
     _move_batch_to_device,
     _num_update_steps_per_epoch,
@@ -596,6 +599,7 @@ def run_te_pretraining(
     accum_loss = torch.zeros((), device=device)
     window_loss = torch.zeros((), device=device)
     window_steps = 0
+    discard_accumulation = False
 
     token_count = torch.tensor(0, dtype=torch.long, device=device)
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
@@ -646,6 +650,12 @@ def run_te_pretraining(
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
                     continue
 
+                at_accum_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
+                if discard_accumulation:
+                    if at_accum_boundary:
+                        discard_accumulation = False
+                    continue
+
                 batch = _move_batch_to_device(batch, device)
 
                 if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
@@ -690,6 +700,19 @@ def run_te_pretraining(
                     out = model(**fwd_kwargs)
 
                 loss = out["loss"] if isinstance(out, dict) else out.loss
+                if not torch.isfinite(loss.detach()).all():
+                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                    logger.error(
+                        "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d micro_step=%d).",
+                        global_step + 1,
+                        rank,
+                        epoch,
+                        micro_step,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss.zero_()
+                    discard_accumulation = not at_accum_boundary
+                    continue
                 loss = loss / inferred_grad_accum_steps
 
                 if scaler is not None and scaler.is_enabled():
@@ -705,12 +728,34 @@ def run_te_pretraining(
                 # all_reduce exhaustion check above), making
                 # synced_train_loader_len unreachable.  Any partial accumulation
                 # at epoch end is discarded in the epoch-boundary cleanup below.
-                if (micro_step + 1) % inferred_grad_accum_steps != 0:
+                if not at_accum_boundary:
                     continue
 
                 if scaler is not None and scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                try:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_norm=max_grad_norm,
+                        error_if_nonfinite=True,
+                    )
+                except RuntimeError as exc:
+                    if "non-finite" not in str(exc).lower():
+                        raise
+                    bad_grad = _first_nonfinite_grad(model)
+                    bad_name = bad_grad[0] if bad_grad is not None else "<unknown>"
+                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                    logger.error(
+                        "Skipping optimizer step %d due to non-finite gradient in %s on rank %d (epoch=%d micro_step=%d).",
+                        global_step + 1,
+                        bad_name,
+                        rank,
+                        epoch,
+                        micro_step,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss.zero_()
+                    continue
 
                 optimizer_step_skipped = False
                 if scaler is not None and scaler.is_enabled():
@@ -720,6 +765,15 @@ def run_te_pretraining(
                     optimizer_step_skipped = scaler.get_scale() < old_scale
                 else:
                     optimizer.step()
+
+                if _has_nonfinite_params(model):
+                    bad_param = _first_nonfinite_param(model)
+                    bad_name = bad_param[0] if bad_param is not None else "<unknown>"
+                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                    raise RuntimeError(
+                        f"Non-finite parameter detected after optimizer step {global_step + 1} "
+                        f"in {bad_name} on rank {rank} (epoch={epoch} micro_step={micro_step})."
+                    )
 
                 if isinstance(optimizer, (DionMuon, DionNorMuon)):
                     muon_lr = optimizer.param_groups[0]["lr"]
@@ -891,6 +945,7 @@ def run_te_pretraining(
                 )
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
+            discard_accumulation = False
             token_count.zero_()
             raw_token_count.zero_()
             window_loss.zero_()

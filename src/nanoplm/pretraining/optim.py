@@ -119,21 +119,9 @@ polar_express_coeffs = [
 
 import torch
 
-_OPTIMIZER_DEBUG_HOOK = None
-
-
-def set_optimizer_debug_hook(hook) -> None:
-    global _OPTIMIZER_DEBUG_HOOK
-    _OPTIMIZER_DEBUG_HOOK = hook
-
-
-def _emit_optimizer_debug(event: str, tensor: torch.Tensor) -> None:
-    if _OPTIMIZER_DEBUG_HOOK is not None:
-        _OPTIMIZER_DEBUG_HOOK(event, tensor)
-
 
 @torch.compile(dynamic=False, fullgraph=True)
-def _polar_express_paper_compiled(G: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor:
+def _polar_express_paper(G: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor:
     assert G.ndim >= 2
     X = G.bfloat16()  # for speed
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + epsilon)
@@ -148,13 +136,6 @@ def _polar_express_paper_compiled(G: torch.Tensor, epsilon: float = 1e-7) -> tor
             B = b * A + c * (A @ A)
             X = a * X + B @ X
     return X
-
-
-def _polar_express_paper(G: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor:
-    _emit_optimizer_debug("polar_express_input", G)
-    out = _polar_express_paper_compiled(G, epsilon=epsilon)
-    _emit_optimizer_debug("polar_express_output", out)
-    return out
 
 
 def build_optimizer(

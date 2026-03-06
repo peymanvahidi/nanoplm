@@ -8,7 +8,6 @@ import gc
 import json
 import math
 import os
-import pickle
 import yaml
 from dataclasses import asdict
 from dion import Muon,NorMuon
@@ -30,7 +29,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-import dion.normuon as dion_normuon
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -56,7 +54,7 @@ from nanoplm.pretraining.fp8 import (
     convert_to_float8_training,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.optim import build_muon_optimizer, build_optimizer, is_muon_optimizer, set_optimizer_debug_hook
+from nanoplm.pretraining.optim import build_muon_optimizer, build_optimizer, is_muon_optimizer
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
@@ -77,8 +75,6 @@ H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
 N_PREFETCH_LAYERS_FSDP2 = 2
-_NUMERICS_DEBUGGER = None
-_NORMUON_DEBUG_HOOKS_INSTALLED = False
 
 
 # ---------------------------------------------------------------------------
@@ -137,365 +133,48 @@ def _format_vram_for_log(
         f"peak={peak_alloc_mb:,.0f}/{peak_reserved_mb:,.0f}MB"
     )
 
-
-def _tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
-    tensor_detached = tensor.detach()
-    local = tensor_detached.full_tensor() if isinstance(tensor_detached, DTensor) else tensor_detached
-    if local.numel() == 0:
-        return {
-            "shape": list(local.shape),
-            "dtype": str(local.dtype),
-            "device": str(local.device),
-            "numel": 0,
-            "finite": True,
-            "nan_count": 0,
-            "inf_count": 0,
-        }
-
-    local_fp32 = local.float()
-    finite_mask = torch.isfinite(local_fp32)
-    nonfinite_mask = ~finite_mask
-    nonfinite_idx = torch.nonzero(nonfinite_mask, as_tuple=False)
-    summary = {
-        "shape": list(local.shape),
-        "dtype": str(local.dtype),
-        "device": str(local.device),
-        "numel": int(local.numel()),
-        "finite": bool(finite_mask.all().item()),
-        "nan_count": int(torch.isnan(local_fp32).sum().item()),
-        "inf_count": int(torch.isinf(local_fp32).sum().item()),
-        "min": float(local_fp32.amin().item()),
-        "max": float(local_fp32.amax().item()),
-        "mean": float(local_fp32.mean().item()),
-        "std": float(local_fp32.std(unbiased=False).item()),
-        "abs_max": float(local_fp32.abs().amax().item()),
-    }
-    if nonfinite_idx.numel() > 0:
-        summary["first_nonfinite_index"] = nonfinite_idx[0].tolist()
-    return summary
+def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor._local_tensor if isinstance(tensor, DTensor) else tensor
 
 
-def _dump_rng_state(path: Path) -> None:
-    rng = {
-        "torch_rng": torch.random.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-        "numpy_rng": np.random.get_state(),
-        "python_rng": random.getstate(),
-    }
-    with open(path, "wb") as f:
-        pickle.dump(rng, f)
+def _has_nonfinite_tensors(tensors: list[torch.Tensor]) -> bool:
+    local_tensors = []
+    for tensor in tensors:
+        local = _local_tensor(tensor.detach())
+        if local.numel() > 0:
+            local_tensors.append(local)
+    if not local_tensors:
+        return False
+    try:
+        norms = torch._foreach_norm(local_tensors, float("inf"))
+        return not torch.isfinite(torch.stack(list(norms))).all().item()
+    except (RuntimeError, TypeError):
+        for tensor in local_tensors:
+            if not torch.isfinite(tensor).all():
+                return True
+        return False
 
 
-def _save_debug_training_snapshot(
-    *,
-    snapshot_dir: Path,
-    model,
-    optimizer,
-    scheduler,
-    completed_step: int,
-    upcoming_step: int,
-    epoch: int,
-    distributed: bool,
-    is_main: bool,
-) -> None:
-    if distributed:
-        model_sd = get_model_state_dict(
-            model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
-        )
-        opt_sd = _to_full_tensors(optimizer.state_dict())
-    else:
-        model_sd = model.state_dict()
-        opt_sd = optimizer.state_dict()
-
-    if not is_main:
-        return
-
-    create_dirs(str(snapshot_dir))
-    torch.save(model_sd, snapshot_dir / "pytorch_model.bin")
-    torch.save(opt_sd, snapshot_dir / "optimizer.pt")
-    torch.save(scheduler.state_dict(), snapshot_dir / "scheduler.pt")
-    _dump_rng_state(snapshot_dir / "rng_state.pkl")
-    metadata = {
-        "completed_step": completed_step,
-        "upcoming_step": upcoming_step,
-        "epoch": epoch,
-    }
-    (snapshot_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+def _first_nonfinite_grad(model) -> tuple[str, torch.Tensor] | None:
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        grad = _local_tensor(param.grad.detach())
+        if not torch.isfinite(grad).all():
+            return name, grad
+    return None
 
 
-class _NumericsDebugger:
-    def __init__(
-        self,
-        *,
-        cfg: PretrainingConfig,
-        output_dir: str,
-        device: torch.device,
-        distributed: bool,
-        is_main: bool,
-    ) -> None:
-        self.start_step = cfg.debug_start_step
-        self.end_step = cfg.debug_end_step
-        if (self.start_step is None) != (self.end_step is None):
-            raise ValueError("debug_start_step and debug_end_step must either both be set or both be null.")
-        self.enabled = self.start_step is not None and self.end_step is not None
-        self.device = device
-        self.distributed = distributed
-        self.is_main = is_main
-        self.rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-        self.detect_anomaly = bool(cfg.debug_detect_anomaly)
-        self.dump_batches = bool(cfg.debug_dump_batches)
-        self.dump_snapshot_at_start = bool(cfg.debug_dump_snapshot_at_start)
-        self.abort_on_nonfinite = bool(cfg.debug_abort_on_nonfinite)
-        base_dir = cfg.debug_dump_dir or str(Path(output_dir) / "numerics_debug")
-        self.dump_dir = Path(base_dir)
-        self.current_step: Optional[int] = None
-        self._snapshot_saved_for_step: set[int] = set()
-        self._batch_dumped: set[tuple[int, str]] = set()
-        self._event_keys_written: set[tuple[int, str, str]] = set()
-
-        if self.enabled:
-            if self.start_step > self.end_step:
-                raise ValueError(
-                    f"debug_start_step ({self.start_step}) must be <= debug_end_step ({self.end_step})"
-                )
-            create_dirs(str(self.dump_dir))
-            if self.is_main:
-                logger.warning(
-                    "Numerics debug window enabled: steps %d-%d, dump_dir=%s, detect_anomaly=%s",
-                    self.start_step,
-                    self.end_step,
-                    self.dump_dir,
-                    self.detect_anomaly,
-                )
-
-    def step_active(self, step: int) -> bool:
-        return bool(self.enabled and self.start_step <= step <= self.end_step)
-
-    def begin_step(
-        self,
-        *,
-        step: int,
-        epoch: int,
-        batch: dict[str, Any],
-        model,
-        optimizer,
-        scheduler,
-        completed_step: int,
-    ) -> None:
-        self.current_step = step
-        if not self.step_active(step):
-            return
-        if self.is_main:
-            logger.warning("[debug step %d] entering numerics debug window", step)
-        if self.dump_snapshot_at_start and step not in self._snapshot_saved_for_step:
-            snapshot_dir = self.dump_dir / f"snapshot-step-{step:06d}"
-            _save_debug_training_snapshot(
-                snapshot_dir=snapshot_dir,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                completed_step=completed_step,
-                upcoming_step=step,
-                epoch=epoch,
-                distributed=self.distributed,
-                is_main=self.is_main,
-            )
-            self._snapshot_saved_for_step.add(step)
-        if self.dump_batches:
-            self.dump_batch(step=step, batch=batch, label="pre_forward")
-
-    def anomaly_context(self, step: int):
-        if self.detect_anomaly and self.step_active(step):
-            return torch.autograd.set_detect_anomaly(True)
-        return nullcontext()
-
-    def dump_batch(self, *, step: int, batch: dict[str, Any], label: str) -> None:
-        if not self.step_active(step):
-            return
-        key = (step, label)
-        if key in self._batch_dumped:
-            return
-        step_dir = self.dump_dir / f"step-{step:06d}"
-        create_dirs(str(step_dir))
-        payload = {
-            "rank": self.rank,
-            "step": step,
-            "label": label,
-            "batch": {
-                k: (v.detach().cpu() if torch.is_tensor(v) else v)
-                for k, v in batch.items()
-            },
-        }
-        torch.save(payload, step_dir / f"rank{self.rank:02d}_{label}_batch.pt")
-        _dump_rng_state(step_dir / f"rank{self.rank:02d}_{label}_rng.pkl")
-        self._batch_dumped.add(key)
-
-    def log_nonfinite_tensor(
-        self,
-        *,
-        step: int,
-        stage: str,
-        tensor_name: str,
-        tensor: torch.Tensor,
-        batch: Optional[dict[str, Any]] = None,
-    ) -> None:
-        if not self.step_active(step):
-            return
-        summary = _tensor_summary(tensor)
-        if summary["finite"]:
-            return
-        self._write_event(step=step, stage=stage, tensor_name=tensor_name, summary=summary)
-        if batch is not None:
-            self.dump_batch(step=step, batch=batch, label=f"{stage}_batch")
-        if self.abort_on_nonfinite:
-            raise RuntimeError(
-                f"Non-finite tensor detected during {stage} ({tensor_name}) on rank {self.rank}. "
-                f"nan={summary['nan_count']} inf={summary['inf_count']}. "
-                f"Debug artifacts written to {self.dump_dir}."
-            )
-
-    def check_loss(self, *, step: int, loss: torch.Tensor, batch: dict[str, Any]) -> None:
-        self.log_nonfinite_tensor(
-            step=step,
-            stage="forward_loss",
-            tensor_name="loss",
-            tensor=loss,
-            batch=batch,
-        )
-
-    def check_gradients(self, *, step: int, model, batch: dict[str, Any], stage: str) -> None:
-        if not self.step_active(step):
-            return
-        for name, param in model.named_parameters():
-            if param.grad is None:
-                continue
-            grad = param.grad.detach()
-            if isinstance(grad, DTensor):
-                grad = grad.full_tensor()
-            if torch.isfinite(grad).all():
-                continue
-            self.log_nonfinite_tensor(
-                step=step,
-                stage=stage,
-                tensor_name=f"grad:{name}",
-                tensor=grad,
-                batch=batch,
-            )
-            return
-
-    def check_parameters(self, *, step: int, model, batch: dict[str, Any], stage: str) -> None:
-        if not self.step_active(step):
-            return
-        for name, param in model.named_parameters():
-            data = param.detach()
-            if isinstance(data, DTensor):
-                data = data.full_tensor()
-            if torch.isfinite(data).all():
-                continue
-            self.log_nonfinite_tensor(
-                step=step,
-                stage=stage,
-                tensor_name=f"param:{name}",
-                tensor=data,
-                batch=batch,
-            )
-            return
-
-    def check_optimizer_state(self, *, step: int, optimizer, batch: dict[str, Any], stage: str) -> None:
-        if not self.step_active(step):
-            return
-        for param_idx, state in optimizer.state_dict().get("state", {}).items():
-            for state_key, value in state.items():
-                if not isinstance(value, torch.Tensor):
-                    continue
-                if torch.isfinite(value).all():
-                    continue
-                self.log_nonfinite_tensor(
-                    step=step,
-                    stage=stage,
-                    tensor_name=f"optimizer_state:{param_idx}:{state_key}",
-                    tensor=value,
-                    batch=batch,
-                )
-                return
-
-    def optimizer_hook(self, event: str, tensor: torch.Tensor) -> None:
-        step = self.current_step
-        if step is None or not self.step_active(step):
-            return
-        self.log_nonfinite_tensor(
-            step=step,
-            stage=f"optimizer_{event}",
-            tensor_name=event,
-            tensor=tensor,
-        )
-
-    def _write_event(self, *, step: int, stage: str, tensor_name: str, summary: dict[str, Any]) -> None:
-        key = (step, stage, tensor_name)
-        if key in self._event_keys_written:
-            return
-        step_dir = self.dump_dir / f"step-{step:06d}"
-        create_dirs(str(step_dir))
-        payload = {
-            "rank": self.rank,
-            "step": step,
-            "stage": stage,
-            "tensor_name": tensor_name,
-            "summary": summary,
-        }
-        safe_name = tensor_name.replace("/", "_").replace(":", "_")
-        event_name = f"rank{self.rank:02d}_{stage}_{safe_name}.json"
-        (step_dir / event_name).write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.error(
-            "[debug step %d rank %d] non-finite tensor at %s (%s): nan=%d inf=%d abs_max=%s",
-            step,
-            self.rank,
-            stage,
-            tensor_name,
-            summary["nan_count"],
-            summary["inf_count"],
-            summary.get("abs_max"),
-        )
-        self._event_keys_written.add(key)
+def _first_nonfinite_param(model) -> tuple[str, torch.Tensor] | None:
+    for name, param in model.named_parameters():
+        data = _local_tensor(param.detach())
+        if not torch.isfinite(data).all():
+            return name, data
+    return None
 
 
-def _install_normuon_debug_hooks(debugger: _NumericsDebugger) -> None:
-    global _NUMERICS_DEBUGGER, _NORMUON_DEBUG_HOOKS_INSTALLED
-    _NUMERICS_DEBUGGER = debugger
-    set_optimizer_debug_hook(debugger.optimizer_hook if debugger.enabled else None)
-    if _NORMUON_DEBUG_HOOKS_INSTALLED:
-        return
-
-    orig_stacked = dion_normuon.normuon_normalization_stacked
-    orig_list = dion_normuon.normuon_normalization
-
-    def wrapped_stacked(U: torch.Tensor, V: torch.Tensor, muon_beta2: torch.Tensor):
-        dbg = _NUMERICS_DEBUGGER
-        if dbg is not None:
-            dbg.optimizer_hook("normuon_normalization_stacked_input_U", U)
-            dbg.optimizer_hook("normuon_normalization_stacked_input_V", V)
-        out_u, out_v = orig_stacked(U, V, muon_beta2)
-        if dbg is not None:
-            dbg.optimizer_hook("normuon_normalization_stacked_output_U", out_u)
-            dbg.optimizer_hook("normuon_normalization_stacked_output_V", out_v)
-        return out_u, out_v
-
-    def wrapped_list(U, V, muon_beta2):
-        dbg = _NUMERICS_DEBUGGER
-        if dbg is not None:
-            for idx, tensor in enumerate(U):
-                dbg.optimizer_hook(f"normuon_normalization_input_U_{idx}", tensor)
-            for idx, tensor in enumerate(V):
-                dbg.optimizer_hook(f"normuon_normalization_input_V_{idx}", tensor)
-        out = orig_list(U, V, muon_beta2)
-        if dbg is not None:
-            for idx, tensor in enumerate(out):
-                dbg.optimizer_hook(f"normuon_normalization_output_U_{idx}", tensor)
-        return out
-
-    dion_normuon.normuon_normalization_stacked = wrapped_stacked
-    dion_normuon.normuon_normalization = wrapped_list
-    _NORMUON_DEBUG_HOOKS_INSTALLED = True
+def _has_nonfinite_params(model) -> bool:
+    return _has_nonfinite_tensors([param for param in model.parameters()])
 
 
 def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
@@ -1393,14 +1072,6 @@ def run_pure_pretraining(
                 dist.init_process_group(backend=backend)
 
     is_main = (not distributed) or dist.get_rank() == 0
-    debugger = _NumericsDebugger(
-        cfg=pretrain_config,
-        output_dir=output_dir,
-        device=device,
-        distributed=distributed,
-        is_main=is_main,
-    )
-    _install_normuon_debug_hooks(debugger)
     eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
 
     # ---- Collator / Sampler / Packing ----
@@ -1714,6 +1385,7 @@ def run_pure_pretraining(
     accum_loss = torch.zeros((), device=device)
     window_loss = torch.zeros((), device=device)
     window_steps = 0
+    discard_accumulation = False
     token_count = torch.zeros((), dtype=torch.long, device=device)
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
     log_window_t0 = time.perf_counter()
@@ -1730,16 +1402,6 @@ def run_pure_pretraining(
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
                 epoch_setter.set_epoch(epoch)
 
-            in_resume_skip_epoch = resume_micro_step > 0 and epoch == resume_epoch
-            resume_skip_t0 = time.perf_counter() if in_resume_skip_epoch else None
-            last_resume_skip_log = resume_skip_t0
-            if in_resume_skip_epoch and is_main:
-                logger.info(
-                    "Resume catch-up: replaying %d micro-steps in epoch %d before training resumes.",
-                    resume_micro_step,
-                    epoch,
-                )
-
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
             # first logging window doesn't include iter(train_loader) overhead.
@@ -1750,28 +1412,11 @@ def run_pure_pretraining(
             epoch_ended_early = False
             for micro_step in range(synced_len):
                 has_batch = True
-                fetch_t0 = time.perf_counter()
                 try:
                     batch = next(train_iter)
                 except StopIteration:
                     has_batch = False
                     batch = None
-                fetch_dt = time.perf_counter() - fetch_t0
-                if (
-                    is_main
-                    and fetch_dt > 10.0
-                    and (
-                        (in_resume_skip_epoch and micro_step < resume_micro_step)
-                        or micro_step == 0
-                    )
-                ):
-                    logger.warning(
-                        "Slow train_loader fetch: epoch=%d micro_step=%d fetch_time=%.2fs skip_phase=%s",
-                        epoch,
-                        micro_step,
-                        fetch_dt,
-                        in_resume_skip_epoch and micro_step < resume_micro_step,
-                    )
 
                 # When packing + num_workers > 0, greedy bin-packing can produce
                 # different batch counts per rank.  Coordinate so all ranks break
@@ -1787,48 +1432,16 @@ def run_pure_pretraining(
                     break
 
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
-                    if is_main and resume_skip_t0 is not None:
-                        skipped = micro_step + 1
-                        now = time.perf_counter()
-                        should_log = (
-                            skipped == resume_micro_step
-                            or skipped == 1
-                            or skipped % 1000 == 0
-                            or (last_resume_skip_log is not None and now - last_resume_skip_log >= 30.0)
-                        )
-                        if should_log:
-                            elapsed = now - resume_skip_t0
-                            logger.info(
-                                "Resume catch-up progress: skipped %d/%d micro-steps in epoch %d (elapsed %.1fs, avg %.3fs/step)",
-                                skipped,
-                                resume_micro_step,
-                                epoch,
-                                elapsed,
-                                elapsed / max(1, skipped),
-                            )
-                            last_resume_skip_log = now
                     continue
 
-                if in_resume_skip_epoch and micro_step == resume_micro_step and is_main and resume_skip_t0 is not None:
-                    elapsed = time.perf_counter() - resume_skip_t0
-                    logger.info(
-                        "Resume catch-up complete: reached micro_step %d in epoch %d after %.1fs. Entering forward/backward.",
-                        resume_micro_step,
-                        epoch,
-                        elapsed,
-                    )
+                at_accum_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
+                if discard_accumulation:
+                    if at_accum_boundary:
+                        discard_accumulation = False
+                    continue
 
                 batch = _move_batch_to_device(batch, device)
                 upcoming_step = global_step + 1
-                debugger.begin_step(
-                    step=upcoming_step,
-                    epoch=epoch,
-                    batch=batch,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    completed_step=global_step,
-                )
 
                 if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
                     model.unshard()
@@ -1871,21 +1484,26 @@ def run_pure_pretraining(
                     out = model(**fwd_kwargs)
 
                 loss = out["loss"] if isinstance(out, dict) else out.loss
-                debugger.check_loss(step=upcoming_step, loss=loss, batch=batch)
+                if not torch.isfinite(loss.detach()).all():
+                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                    logger.error(
+                        "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d micro_step=%d).",
+                        upcoming_step,
+                        rank,
+                        epoch,
+                        micro_step,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss.zero_()
+                    discard_accumulation = not at_accum_boundary
+                    continue
                 loss = loss / inferred_grad_accum_steps
 
                 # Backward
-                with debugger.anomaly_context(upcoming_step):
-                    if scaler is not None and scaler.is_enabled():
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
-                debugger.check_gradients(
-                    step=upcoming_step,
-                    model=model,
-                    batch=batch,
-                    stage="backward_gradients",
-                )
+                if scaler is not None and scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
                 accum_loss = accum_loss + loss.detach()
 
@@ -1895,29 +1513,35 @@ def run_pure_pretraining(
                 # all_reduce exhaustion check above), making synced_len
                 # unreachable.  Any partial accumulation at epoch end is
                 # discarded in the epoch-boundary cleanup below.
-                if (micro_step + 1) % inferred_grad_accum_steps != 0:
+                if not at_accum_boundary:
                     continue
 
                 # Optimizer step
                 if scaler is not None and scaler.is_enabled():
                     scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
-                if isinstance(grad_norm, DTensor):
-                    debugger.log_nonfinite_tensor(
-                        step=upcoming_step,
-                        stage="grad_norm",
-                        tensor_name="clip_grad_norm",
-                        tensor=grad_norm.full_tensor(),
-                        batch=batch,
+                try:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_norm=max_grad_norm,
+                        error_if_nonfinite=True,
                     )
-                elif isinstance(grad_norm, torch.Tensor):
-                    debugger.log_nonfinite_tensor(
-                        step=upcoming_step,
-                        stage="grad_norm",
-                        tensor_name="clip_grad_norm",
-                        tensor=grad_norm,
-                        batch=batch,
+                except RuntimeError as exc:
+                    if "non-finite" not in str(exc).lower():
+                        raise
+                    bad_grad = _first_nonfinite_grad(model)
+                    bad_name = bad_grad[0] if bad_grad is not None else "<unknown>"
+                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                    logger.error(
+                        "Skipping optimizer step %d due to non-finite gradient in %s on rank %d (epoch=%d micro_step=%d).",
+                        upcoming_step,
+                        bad_name,
+                        rank,
+                        epoch,
+                        micro_step,
                     )
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_loss.zero_()
+                    continue
 
                 step_skipped = False
                 if scaler is not None and scaler.is_enabled():
@@ -1927,18 +1551,14 @@ def run_pure_pretraining(
                     step_skipped = scaler.get_scale() < old_scale
                 else:
                     optimizer.step()
-                debugger.check_parameters(
-                    step=upcoming_step,
-                    model=model,
-                    batch=batch,
-                    stage="post_step_parameters",
-                )
-                debugger.check_optimizer_state(
-                    step=upcoming_step,
-                    optimizer=optimizer,
-                    batch=batch,
-                    stage="post_step_optimizer_state",
-                )
+                if _has_nonfinite_params(model):
+                    bad_param = _first_nonfinite_param(model)
+                    bad_name = bad_param[0] if bad_param is not None else "<unknown>"
+                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                    raise RuntimeError(
+                        f"Non-finite parameter detected after optimizer step {upcoming_step} "
+                        f"in {bad_name} on rank {rank} (epoch={epoch} micro_step={micro_step})."
+                    )
 
                 if isinstance(optimizer, (Muon, NorMuon)):
                     muon_lr = optimizer.param_groups[0]["lr"]
@@ -2102,6 +1722,7 @@ def run_pure_pretraining(
                 )
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
+            discard_accumulation = False
             token_count.zero_()
             raw_token_count.zero_()
             window_loss.zero_()
