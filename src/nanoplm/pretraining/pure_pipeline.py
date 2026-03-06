@@ -413,6 +413,24 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
 # Optimizer / Scheduler
 # ---------------------------------------------------------------------------
 
+def _is_zero_init_fragile_param(name: str) -> bool:
+    """Detect 2-D parameters that are zero-initialized and have structurally
+    dormant rows, making them unsafe for NorMuon's per-row variance tracking.
+
+    Currently matches:
+      - mHC-lite W_all.weight  (32×3072, 75% of rows intentionally suppressed)
+      - RePO W_z.weight        (8×96, zero-init with per-head rows)
+    """
+    parts = name.split(".")
+    # W_all.weight (mHC-lite fused projection)
+    if len(parts) >= 2 and parts[-2] == "W_all" and parts[-1] == "weight":
+        return True
+    # W_z.weight (RePO position head)
+    if len(parts) >= 2 and parts[-2] == "W_z" and parts[-1] == "weight":
+        return True
+    return False
+
+
 def _build_muon_optimizer(model, cfg, distributed_mesh=None):
     muon_params, adamw_params = [], []
     resid_params, x0_params = [], []
@@ -432,7 +450,10 @@ def _build_muon_optimizer(model, cfg, distributed_mesh=None):
         if param.ndim == 1 or _is_embedding_or_unembedding_param(name):
             adamw_params.append(param)
         elif param.ndim == 2:
-            muon_params.append(param)
+            if _is_zero_init_fragile_param(name):
+                adamw_params.append(param)
+            else:
+                muon_params.append(param)
         else:
             adamw_params.append(param)
 
