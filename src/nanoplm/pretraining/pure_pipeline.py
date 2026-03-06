@@ -1080,8 +1080,10 @@ def _load_checkpoint(
                     chunk_size = val.shape[0] // world
                     state_dict_entry[key] = val.narrow(0, rank * chunk_size, chunk_size).contiguous()
                 elif val.ndim >= 1 and val.shape[0] != local_shape[0]:
-                    # Non-standard sharding; try simple chunk
-                    chunks = val.chunk(world, dim=0)
+                    # Non-standard / uneven sharding. tensor_split always returns
+                    # exactly one slice per rank, including empty trailing shards
+                    # when val.shape[0] < world.
+                    chunks = torch.tensor_split(val, world, dim=0)
                     if chunks[rank].shape[0] == local_shape[0]:
                         state_dict_entry[key] = chunks[rank].contiguous()
                     else:
@@ -1728,6 +1730,16 @@ def run_pure_pretraining(
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
                 epoch_setter.set_epoch(epoch)
 
+            in_resume_skip_epoch = resume_micro_step > 0 and epoch == resume_epoch
+            resume_skip_t0 = time.perf_counter() if in_resume_skip_epoch else None
+            last_resume_skip_log = resume_skip_t0
+            if in_resume_skip_epoch and is_main:
+                logger.info(
+                    "Resume catch-up: replaying %d micro-steps in epoch %d before training resumes.",
+                    resume_micro_step,
+                    epoch,
+                )
+
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
             # first logging window doesn't include iter(train_loader) overhead.
@@ -1738,11 +1750,28 @@ def run_pure_pretraining(
             epoch_ended_early = False
             for micro_step in range(synced_len):
                 has_batch = True
+                fetch_t0 = time.perf_counter()
                 try:
                     batch = next(train_iter)
                 except StopIteration:
                     has_batch = False
                     batch = None
+                fetch_dt = time.perf_counter() - fetch_t0
+                if (
+                    is_main
+                    and fetch_dt > 10.0
+                    and (
+                        (in_resume_skip_epoch and micro_step < resume_micro_step)
+                        or micro_step == 0
+                    )
+                ):
+                    logger.warning(
+                        "Slow train_loader fetch: epoch=%d micro_step=%d fetch_time=%.2fs skip_phase=%s",
+                        epoch,
+                        micro_step,
+                        fetch_dt,
+                        in_resume_skip_epoch and micro_step < resume_micro_step,
+                    )
 
                 # When packing + num_workers > 0, greedy bin-packing can produce
                 # different batch counts per rank.  Coordinate so all ranks break
@@ -1758,7 +1787,36 @@ def run_pure_pretraining(
                     break
 
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
+                    if is_main and resume_skip_t0 is not None:
+                        skipped = micro_step + 1
+                        now = time.perf_counter()
+                        should_log = (
+                            skipped == resume_micro_step
+                            or skipped == 1
+                            or skipped % 1000 == 0
+                            or (last_resume_skip_log is not None and now - last_resume_skip_log >= 30.0)
+                        )
+                        if should_log:
+                            elapsed = now - resume_skip_t0
+                            logger.info(
+                                "Resume catch-up progress: skipped %d/%d micro-steps in epoch %d (elapsed %.1fs, avg %.3fs/step)",
+                                skipped,
+                                resume_micro_step,
+                                epoch,
+                                elapsed,
+                                elapsed / max(1, skipped),
+                            )
+                            last_resume_skip_log = now
                     continue
+
+                if in_resume_skip_epoch and micro_step == resume_micro_step and is_main and resume_skip_t0 is not None:
+                    elapsed = time.perf_counter() - resume_skip_t0
+                    logger.info(
+                        "Resume catch-up complete: reached micro_step %d in epoch %d after %.1fs. Entering forward/backward.",
+                        resume_micro_step,
+                        epoch,
+                        elapsed,
+                    )
 
                 batch = _move_batch_to_device(batch, device)
                 upcoming_step = global_step + 1
