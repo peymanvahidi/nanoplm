@@ -183,20 +183,20 @@ class FastaShuffler:
             phase_name = phase_names.get(phase, f"phase {phase}")
             if phase in (1, 2):
                 logger.info(
-                    "Fast shuffle progress: %s %d%% (%s / %s scanned, %,d records found)",
+                    "Fast shuffle progress: %s %d%% (%s / %s scanned, %s records found)",
                     phase_name,
                     percent,
                     self._format_bytes(completed),
                     self._format_bytes(total),
-                    aux,
+                    f"{aux:,}",
                 )
             else:
                 logger.info(
-                    "Fast shuffle progress: %s %d%% (%,d / %,d records)",
+                    "Fast shuffle progress: %s %d%% (%s / %s records)",
                     phase_name,
                     percent,
-                    completed,
-                    total,
+                    f"{completed:,}",
+                    f"{total:,}",
                 )
 
         logger.info(
@@ -235,11 +235,11 @@ class FastaShuffler:
                     scanned = f.tell()
                     pct = (100.0 * scanned / input_size) if input_size > 0 else 0.0
                     logger.info(
-                        "Fast shuffle indexing progress: %.1f%% scanned (%s / %s, %,d records found)",
+                        "Fast shuffle indexing progress: %.1f%% scanned (%s / %s, %s records found)",
                         pct,
                         self._format_bytes(scanned),
                         self._format_bytes(input_size),
-                        len(starts),
+                        f"{len(starts):,}",
                     )
                     next_log_at = now + 10.0
             file_size = f.tell()
