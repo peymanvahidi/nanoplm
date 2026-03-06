@@ -362,6 +362,64 @@ def pretrain():
     default="nanoplm-pretraining",
     help="Weights & Biases project name (new runs named run-DDMMHHMM, unique)"
 )
+# Resume options
+@click.option(
+    "--resume/--no-resume",
+    default=False,
+    help="Resume training from a checkpoint",
+)
+@click.option(
+    "--resume-checkpoint-dir",
+    type=str,
+    default="",
+    help="Checkpoint directory to resume from",
+)
+@click.option(
+    "--resume-extra-epochs",
+    type=int,
+    default=None,
+    help="Extra epochs to add on top of the original/current run length when resuming",
+)
+@click.option(
+    "--resume-warmup-steps",
+    type=int,
+    default=None,
+    help="Override warmup steps for resumed training",
+)
+@click.option(
+    "--resume-learning-rate",
+    type=float,
+    default=None,
+    help="Override AdamW learning rate when resuming",
+)
+@click.option(
+    "--resume-muon-learning-rate",
+    type=float,
+    default=None,
+    help="Override Muon learning rate when resuming",
+)
+@click.option(
+    "--resume-lr-schedule",
+    type=click.Choice(["linear", "cosine"], case_sensitive=False),
+    default=None,
+    help="Override LR schedule when resuming",
+)
+@click.option(
+    "--resume-lr-decay-to-fraction",
+    type=float,
+    default=None,
+    help="Override LR decay floor fraction when resuming",
+)
+@click.option(
+    "--resume-reset-scheduler/--no-resume-reset-scheduler",
+    default=False,
+    help="Rebuild the LR scheduler from step 0 over the remaining steps when resuming",
+)
+@click.option(
+    "--resume-skip-warmup/--no-resume-skip-warmup",
+    default=False,
+    help="Skip warmup on resume and jump directly to peak LR",
+)
 # Model hyperparameters (ModernBERT)
 @click.option(
     "--hidden-size",
@@ -591,6 +649,16 @@ def run(
     multi_gpu: bool,
     world_size: str,
     project_name: str,
+    resume: bool,
+    resume_checkpoint_dir: str,
+    resume_extra_epochs: Optional[int],
+    resume_warmup_steps: Optional[int],
+    resume_learning_rate: Optional[float],
+    resume_muon_learning_rate: Optional[float],
+    resume_lr_schedule: Optional[str],
+    resume_lr_decay_to_fraction: Optional[float],
+    resume_reset_scheduler: bool,
+    resume_skip_warmup: bool,
     # model hp
     hidden_size: int,
     intermediate_size: int,
@@ -736,12 +804,39 @@ def run(
     logger.info(f"Total Trainable Parameters: {total_params}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
+    resume_cfg = ResumeConfig(
+        is_resume=resume,
+        checkpoint_dir=resume_checkpoint_dir,
+        extra_epochs=resume_extra_epochs,
+        warmup_steps=resume_warmup_steps,
+        learning_rate=resume_learning_rate,
+        muon_learning_rate=resume_muon_learning_rate,
+        lr_schedule=resume_lr_schedule,
+        lr_decay_to_fraction=resume_lr_decay_to_fraction,
+        reset_scheduler=resume_reset_scheduler,
+        skip_warmup=resume_skip_warmup,
+    )
+    if resume_cfg.is_resume and not resume_cfg.checkpoint_dir:
+        raise click.ClickException("--resume requires --resume-checkpoint-dir")
+
     if pure_te:
-        run_te_pretraining(model=model, pretrain_config=cfg)
+        run_te_pretraining(
+            model=model,
+            pretrain_config=cfg,
+            resume_config=resume_cfg if resume_cfg.is_resume else None,
+        )
     elif pure_torch:
-        run_pure_pretraining(model=model, pretrain_config=cfg)
+        run_pure_pretraining(
+            model=model,
+            pretrain_config=cfg,
+            resume_config=resume_cfg if resume_cfg.is_resume else None,
+        )
     else:
-        run_pretraining(model=model, pretrain_config=cfg)
+        run_pretraining(
+            model=model,
+            pretrain_config=cfg,
+            resume_config=resume_cfg if resume_cfg.is_resume else None,
+        )
 
 
 @pretrain.command("from-yaml")
@@ -992,12 +1087,26 @@ def get_yaml(output: Optional[str], force: bool):
         "  profiler_enabled: false\n"
         "  profiler_start_step: 10\n"
         "  profiler_end_step: 15\n"
+        "  debug_start_step: null\n"
+        "  debug_end_step: null\n"
+        "  debug_dump_dir: null\n"
+        "  debug_detect_anomaly: false\n"
+        "  debug_dump_batches: true\n"
+        "  debug_dump_snapshot_at_start: true\n"
+        "  debug_abort_on_nonfinite: true\n"
         "\n"
         "\n"
         "resume:\n"
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
         "  extra_epochs: 0\n"
+        "  warmup_steps: null\n"
+        "  learning_rate: null\n"
+        "  muon_learning_rate: null\n"
+        "  lr_schedule: null\n"
+        "  lr_decay_to_fraction: null\n"
+        "  reset_scheduler: false\n"
+        "  skip_warmup: false\n"
         "\n"
         "# pure_torch: false\n"
         "# pure_te: false\n"
@@ -1107,6 +1216,15 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                     f"Invalid {warmup_key} value: {kwargs[warmup_key]}. Must be an integer."
                 ) from exc
 
+    for debug_step_key in ("debug_start_step", "debug_end_step"):
+        if debug_step_key in kwargs and kwargs[debug_step_key] is not None:
+            try:
+                kwargs[debug_step_key] = int(kwargs[debug_step_key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid {debug_step_key} value: {kwargs[debug_step_key]}. Must be an integer."
+                ) from exc
+
     # Handle boolean values
     for bool_key in [
         'multi_gpu',
@@ -1122,6 +1240,10 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'compile_triton_persistent_reductions',
         'compile_triton_mix_order_reduction',
         'profiler_enabled',
+        'debug_detect_anomaly',
+        'debug_dump_batches',
+        'debug_dump_snapshot_at_start',
+        'debug_abort_on_nonfinite',
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
@@ -1207,13 +1329,44 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
 
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     if config is None:
-        return ResumeConfig(is_resume=False, checkpoint_dir="", extra_epochs=None)
+        return ResumeConfig(is_resume=False, checkpoint_dir="")
 
     expected_keys = set(ResumeConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
     extra = []
-    kwargs: Dict[str, Any] = {}
+    kwargs: Dict[str, Any] = {
+        "is_resume": False,
+        "checkpoint_dir": "",
+    }
+
+    def _parse_float_like(raw_value: Any, field_name: str) -> float:
+        if not isinstance(raw_value, str):
+            return float(raw_value)
+
+        stripped = raw_value.strip().lower()
+        if stripped in {
+            'float("inf")',
+            "float('inf')",
+            "inf",
+            "+inf",
+            "infinity",
+            "+infinity",
+            ".inf",
+        }:
+            return float("inf")
+        if stripped in {
+            'float("-inf")',
+            "float('-inf')",
+            "-inf",
+            "-infinity",
+            "-.inf",
+        }:
+            return float("-inf")
+        try:
+            return float(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid {field_name} value: {raw_value}. Must be a number.") from exc
 
     for key in present_keys:
         if key not in expected_keys:
@@ -1227,12 +1380,36 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             continue
         kwargs[key] = value
 
+    for int_key in ("extra_epochs", "warmup_steps"):
+        if int_key in kwargs and kwargs[int_key] is not None:
+            try:
+                kwargs[int_key] = int(kwargs[int_key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid {int_key} value: {kwargs[int_key]}. Must be an integer."
+                ) from exc
+
+    for float_key in ("learning_rate", "muon_learning_rate", "lr_decay_to_fraction"):
+        if float_key in kwargs and kwargs[float_key] is not None:
+            kwargs[float_key] = _parse_float_like(kwargs[float_key], float_key)
+
+    if "lr_schedule" in kwargs and kwargs["lr_schedule"] is not None:
+        lr_schedule = str(kwargs["lr_schedule"]).strip().lower()
+        if lr_schedule not in {"linear", "cosine"}:
+            raise ValueError(
+                f"Invalid lr_schedule value: {kwargs['lr_schedule']}. Must be one of: linear, cosine."
+            )
+        kwargs["lr_schedule"] = lr_schedule
+
+    for bool_key in ("is_resume", "reset_scheduler", "skip_warmup"):
+        if bool_key in kwargs:
+            value = kwargs[bool_key]
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, str):
+                kwargs[bool_key] = value.lower() == "true"
+
     checkpoint_dir = kwargs.get("checkpoint_dir")
-
-    # Ensure extra_epochs is always present (None-safe).
-    if "extra_epochs" in config:
-        kwargs["extra_epochs"] = config.get("extra_epochs")
-
     is_resume = kwargs.get("is_resume", False)
 
     if is_resume:

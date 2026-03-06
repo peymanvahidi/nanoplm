@@ -97,20 +97,35 @@ static void report_progress(
     progress_cb(phase, (double)percent / 100.0, completed, total);
 }
 
-static int count_fasta_records(const unsigned char *data, size_t size, uint64_t *out_count,
-                               shuffle_progress_cb_t progress_cb) {
-    uint64_t count = 0;
+static int collect_fasta_record_starts(
+    const unsigned char *data,
+    size_t size,
+    uint64_t **out_starts,
+    uint64_t *out_count,
+    shuffle_progress_cb_t progress_cb) {
+    if (!out_starts || !out_count) {
+        return -1;
+    }
+
+    *out_starts = NULL;
+    *out_count = 0;
     if (size == 0) {
-        *out_count = 0;
         return 0;
     }
 
+    uint64_t cap = 1024;
+    uint64_t *starts = (uint64_t *)malloc((size_t)(cap + 1) * sizeof(uint64_t));
+    if (!starts) {
+        return -1;
+    }
+
+    uint64_t count = 0;
     const unsigned char *cur = data;
     const unsigned char *end = data + size;
     long long last_reported_percent = -1;
 
     if (data[0] == '>') {
-        count++;
+        starts[count++] = 0;
     }
 
     while (cur < end) {
@@ -120,7 +135,18 @@ static int count_fasta_records(const unsigned char *data, size_t size, uint64_t 
         }
         const unsigned char *p = (const unsigned char *)found;
         if (p > data && p[-1] == '\n') {
-            count++;
+            if (count == cap) {
+                uint64_t new_cap = cap < 4096 ? cap * 2 : cap + cap / 2;
+                uint64_t *new_starts =
+                    (uint64_t *)realloc(starts, (size_t)(new_cap + 1) * sizeof(uint64_t));
+                if (!new_starts) {
+                    free(starts);
+                    return -1;
+                }
+                starts = new_starts;
+                cap = new_cap;
+            }
+            starts[count++] = (uint64_t)(p - data);
         }
         cur = p + 1;
         report_shuffle_progress(
@@ -132,6 +158,7 @@ static int count_fasta_records(const unsigned char *data, size_t size, uint64_t 
             &last_reported_percent);
     }
 
+    starts[count] = (uint64_t)size;
     report_shuffle_progress(
         progress_cb,
         1,
@@ -139,59 +166,8 @@ static int count_fasta_records(const unsigned char *data, size_t size, uint64_t 
         (long long)size,
         (long long)count,
         &last_reported_percent);
+    *out_starts = starts;
     *out_count = count;
-    return 0;
-}
-
-static int fill_fasta_record_starts(const unsigned char *data, size_t size, uint64_t *starts,
-                                    uint64_t count, shuffle_progress_cb_t progress_cb) {
-    uint64_t idx = 0;
-    if (size == 0) {
-        return count == 0 ? 0 : -1;
-    }
-
-    const unsigned char *cur = data;
-    const unsigned char *end = data + size;
-    long long last_reported_percent = -1;
-
-    if (data[0] == '>') {
-        starts[idx++] = 0;
-    }
-
-    while (cur < end) {
-        const void *found = memchr(cur, '>', (size_t)(end - cur));
-        if (!found) {
-            break;
-        }
-        const unsigned char *p = (const unsigned char *)found;
-        if (p > data && p[-1] == '\n') {
-            if (idx >= count) {
-                return -1;
-            }
-            starts[idx++] = (uint64_t)(p - data);
-        }
-        cur = p + 1;
-        report_shuffle_progress(
-            progress_cb,
-            2,
-            (long long)(cur - data),
-            (long long)size,
-            (long long)idx,
-            &last_reported_percent);
-    }
-
-    if (idx != count) {
-        return -1;
-    }
-
-    starts[count] = (uint64_t)size;
-    report_shuffle_progress(
-        progress_cb,
-        2,
-        (long long)size,
-        (long long)size,
-        (long long)idx,
-        &last_reported_percent);
     return 0;
 }
 
@@ -672,39 +648,31 @@ API_EXPORT int nanoplm_shuffle_fasta(
     }
 
     uint64_t num_records = 0;
-    if (count_fasta_records(in_map, file_size, &num_records, progress_cb) != 0 || num_records == 0) {
+    uint64_t *starts = NULL;
+    if (collect_fasta_record_starts(in_map, file_size, &starts, &num_records, progress_cb) != 0 ||
+        num_records == 0) {
         munmap(in_map, file_size);
         close(in_fd);
         set_error(error_msg, error_cap, "No FASTA records found in input");
         return -1;
     }
     if (num_records > UINT32_MAX) {
+        free(starts);
         munmap(in_map, file_size);
         close(in_fd);
         set_error(error_msg, error_cap, "FASTA contains too many records for in-memory shuffle");
         return -1;
     }
 
-    uint64_t *starts = (uint64_t *)malloc((size_t)(num_records + 1) * sizeof(uint64_t));
     uint32_t *perm = (uint32_t *)malloc((size_t)num_records * sizeof(uint32_t));
     CopyTask *tasks = (CopyTask *)malloc((size_t)batch_records * sizeof(CopyTask));
-    if (!starts || !perm || !tasks) {
+    if (!perm || !tasks) {
         free(starts);
-        free(perm);
         free(tasks);
+        free(perm);
         munmap(in_map, file_size);
         close(in_fd);
         set_error(error_msg, error_cap, "Out of memory while preparing FASTA shuffle");
-        return -1;
-    }
-
-    if (fill_fasta_record_starts(in_map, file_size, starts, num_records, progress_cb) != 0) {
-        free(starts);
-        free(perm);
-        free(tasks);
-        munmap(in_map, file_size);
-        close(in_fd);
-        set_error(error_msg, error_cap, "Failed to index FASTA record starts");
         return -1;
     }
 

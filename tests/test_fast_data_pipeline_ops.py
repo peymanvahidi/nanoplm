@@ -1,7 +1,10 @@
 import shutil
 import tempfile
+import time
+import os
 from pathlib import Path
 
+import pytest
 from Bio import SeqIO
 
 from nanoplm.data.filterer import Filterer
@@ -12,6 +15,23 @@ from nanoplm.data.splitor import Splitor
 
 def _parse_fasta(path: Path) -> list[tuple[str, str]]:
     return [(record.id, str(record.seq)) for record in SeqIO.parse(path, "fasta")]
+
+
+def _count_headers(path: Path) -> int:
+    count = 0
+    with open(path, "rb") as f:
+        for line in f:
+            if line.startswith(b">"):
+                count += 1
+    return count
+
+
+def _first_header(path: Path) -> bytes:
+    with open(path, "rb") as f:
+        for line in f:
+            if line.startswith(b">"):
+                return line.rstrip()
+    return b""
 
 
 def _reference_filter(
@@ -184,3 +204,47 @@ def test_auto_shuffle_backend_selection():
         assert selected == "seqkit"
     else:
         assert selected == "fast"
+
+
+@pytest.mark.slow
+def test_fast_shuffle_benchmark_5m_records(tmp_path, capsys):
+    records = int(os.environ.get("NANOPLM_SHUFFLE_BENCH_RECORDS", "5000000"))
+    min_records_per_sec = float(os.environ.get("NANOPLM_SHUFFLE_BENCH_MIN_RECORDS_PER_SEC", "0"))
+
+    input_path = tmp_path / "input.fasta"
+    output_path = tmp_path / "output.fasta"
+    seq = "ACDEFGHIKLMNPQRSTVWYACDEFGHIKLMN"
+
+    with open(input_path, "w", encoding="utf-8") as f:
+        for i in range(records):
+            f.write(f">seq{i}\n{seq}\n")
+
+    shuffler = FastaShuffler(
+        input_path=input_path,
+        output_path=output_path,
+        backend="fast",
+        seed=777,
+    )
+
+    start = time.perf_counter()
+    shuffler.shuffle()
+    elapsed = time.perf_counter() - start
+    records_per_sec = records / max(elapsed, 1e-9)
+
+    assert output_path.exists()
+    assert output_path.stat().st_size == input_path.stat().st_size
+    assert _count_headers(output_path) == records
+    assert _first_header(output_path) != _first_header(input_path)
+
+    if min_records_per_sec > 0:
+        assert records_per_sec >= min_records_per_sec
+
+    captured = capsys.readouterr()
+    benchmark_line = (
+        f"fast shuffle benchmark: records={records:,} "
+        f"elapsed={elapsed:.3f}s rate={records_per_sec:,.0f} rec/s "
+        f"threads={shuffler.threads} input_size={input_path.stat().st_size / (1024 ** 2):.1f} MiB"
+    )
+    print(benchmark_line)
+    if captured.out:
+        print(captured.out)

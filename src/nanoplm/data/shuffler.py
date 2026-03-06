@@ -20,6 +20,7 @@ from nanoplm.data.native_fasta_ops import (
 )
 
 Backend = Literal["auto", "seqkit", "fast", "biopython"]
+DEFAULT_SHUFFLE_THREADS = min(os.cpu_count() or 1, 16)
 
 
 class ShufflingError(RuntimeError):
@@ -43,7 +44,7 @@ class FastaShuffler:
         output_path: Union[str, Path],
         seed: Optional[int] = None,
         backend: Backend = "auto",
-        threads: int = os.cpu_count() or 1,
+        threads: int = DEFAULT_SHUFFLE_THREADS,
         two_pass: bool = True,
         keep_temp: bool = False,
     ):
@@ -161,8 +162,7 @@ class FastaShuffler:
         input_path = self._resolve_path(self.input_path)
         output_path = self._resolve_path(self.output_path)
         phase_names = {
-            1: "counting FASTA records",
-            2: "indexing record starts",
+            1: "indexing FASTA records",
             3: "copying shuffled records",
         }
         last_phase_progress: dict[int, int] = {}
@@ -181,7 +181,7 @@ class FastaShuffler:
                 return
             last_phase_progress[phase] = percent
             phase_name = phase_names.get(phase, f"phase {phase}")
-            if phase in (1, 2):
+            if phase == 1:
                 logger.info(
                     "Fast shuffle progress: %s %d%% (%s / %s scanned, %s records found)",
                     phase_name,
