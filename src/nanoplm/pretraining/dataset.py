@@ -10,9 +10,15 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from nanoplm.utils import logger, create_dirs
+from nanoplm.utils.common import run_with_heartbeat
+from nanoplm.pretraining.native_shard_writer import (
+    NativeShardWriterError,
+    create_shards_native,
+    is_native_shard_writer_available,
+)
 
 
 class ShardWriter:
@@ -23,6 +29,34 @@ class ShardWriter:
 
     This is NOT a Dataset - it's a preprocessing utility that creates shards.
     """
+
+    _NATIVE_TOKEN_IDS = {
+        "<pad>": 0,
+        "</s>": 1,
+        "<unk>": 2,
+        "<mask>": 3,
+        "A": 4,
+        "L": 5,
+        "G": 6,
+        "V": 7,
+        "S": 8,
+        "R": 9,
+        "E": 10,
+        "D": 11,
+        "T": 12,
+        "I": 13,
+        "P": 14,
+        "K": 15,
+        "F": 16,
+        "Q": 17,
+        "N": 18,
+        "Y": 19,
+        "M": 20,
+        "H": 21,
+        "W": 22,
+        "C": 23,
+        "X": 24,
+    }
 
     def __init__(
         self,
@@ -67,13 +101,43 @@ class ShardWriter:
         if fasta_path_obj.stat().st_size == 0:
             raise ValueError(f"FASTA file is empty: {self.fasta_path}")
 
-        # Create or open a persistent SQLite-backed index for random access
+        self._index = None
         self._db_path = f"{self.fasta_path}.idx"
-        self._index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
-        self._keys: List[str] = list(self._index.keys())
+        self._keys: Optional[List[str]] = None
+        self.sequence_count: Optional[int] = None
 
+        self._use_bos_token = bool(getattr(self.tokenizer, "use_bos_token", False))
+        self._native_compatible_tokenizer = self._is_native_compatible_tokenizer()
+
+    def _is_native_compatible_tokenizer(self) -> bool:
+        token_to_id = getattr(self.tokenizer, "convert_tokens_to_ids", None)
+        if not callable(token_to_id):
+            return False
+
+        for token, expected_id in self._NATIVE_TOKEN_IDS.items():
+            if token_to_id(token) != expected_id:
+                return False
+
+        unk_id = getattr(self.tokenizer, "unk_token_id", None)
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if unk_id != 2 or eos_id != 1:
+            return False
+
+        if self._use_bos_token:
+            if token_to_id("<s>") != 29:
+                return False
+
+        return True
+
+    def _ensure_index(self) -> None:
+        if self._index is not None and self._keys is not None:
+            return
+
+        self._index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
+        self._keys = list(self._index.keys())
         if len(self._keys) == 0:
             raise ValueError(f"No sequences found in FASTA: {self.fasta_path}")
+        self.sequence_count = len(self._keys)
 
         logger.info(
             f"Loaded FASTA: {self.fasta_path} with {len(self._keys):,} sequences (max_length={self.max_length})."
@@ -106,6 +170,60 @@ class ShardWriter:
         # Create output directory
         create_dirs(self.output_dir)
 
+        if self._native_compatible_tokenizer:
+            native_available, native_error = is_native_shard_writer_available()
+            if native_available:
+                try:
+                    last_percent = -1
+
+                    def progress_cb(_phase: int, progress: float, completed: int, total: int) -> None:
+                        nonlocal last_percent
+                        percent = int(progress * 100.0)
+                        if percent < 100 and percent % 5 != 0:
+                            return
+                        if percent == last_percent:
+                            return
+                        last_percent = percent
+                        logger.info(
+                            "Shard writer progress: %d%% (%d/%d bytes)",
+                            percent,
+                            completed,
+                            total,
+                        )
+
+                    result = run_with_heartbeat(
+                        "Tokenizing and writing shards (native backend)",
+                        lambda: create_shards_native(
+                            fasta_path=self.fasta_path,
+                            output_dir=self.output_dir,
+                            max_length=self.max_length,
+                            samples_per_shard=self.samples_per_shard,
+                            num_threads=self.max_workers,
+                            use_bos_token=self._use_bos_token,
+                            progress_cb=progress_cb,
+                        ),
+                    )
+                    self.sequence_count = result.sequence_count
+                    logger.info(
+                        "Successfully tokenized %d sequences into %d binary shards in %s (native backend).",
+                        self.sequence_count,
+                        len(result.shard_paths),
+                        self.output_dir,
+                    )
+                    return result.shard_paths
+                except NativeShardWriterError as e:
+                    logger.warning(
+                        "Native shard writer failed (%s). Falling back to Python tokenizer path.",
+                        e,
+                    )
+            else:
+                logger.warning(
+                    "Native shard writer unavailable (%s). Falling back to Python tokenizer path.",
+                    native_error,
+                )
+
+        self._ensure_index()
+        assert self._keys is not None
         total_seqs = len(self._keys)
         num_shards = ceil(total_seqs / self.samples_per_shard)
 
@@ -136,12 +254,42 @@ class ShardWriter:
 
         # Process shards in parallel
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            shard_paths = list(executor.map(process_shard, args))
+            def run_python_backend() -> list[str]:
+                futures = {
+                    executor.submit(process_shard, arg): i
+                    for i, arg in enumerate(args)
+                }
+                results: list[Optional[str]] = [None] * len(args)
+                completed = 0
+                last_percent = -1
+
+                for future in as_completed(futures):
+                    shard_idx = futures[future]
+                    results[shard_idx] = future.result()
+                    completed += 1
+
+                    percent = int((completed * 100) / num_shards) if num_shards > 0 else 100
+                    if percent >= 100 or (percent % 5 == 0 and percent != last_percent):
+                        last_percent = percent
+                        logger.info(
+                            "Shard writer progress (python backend): %d%% (%d/%d shards)",
+                            percent,
+                            completed,
+                            num_shards,
+                        )
+
+                return [path for path in results if path is not None]
+
+            shard_paths = run_with_heartbeat(
+                "Tokenizing and writing shards (python backend)",
+                run_python_backend,
+            )
 
         logger.info(
             f"Successfully tokenized {total_seqs:,} sequences and saved to {len(shard_paths)} binary shards in {self.output_dir}"
         )
 
+        self.sequence_count = total_seqs
         return [Path(p) for p in shard_paths]
 
 

@@ -6,6 +6,7 @@ nanoPLM CLI - Data subcommands for nanoPLM package
 import click
 from pathlib import Path
 import subprocess
+import time
 
 from nanoplm.config.datasets import DATASET_URLS
 
@@ -196,9 +197,9 @@ def extract(input: str, output: str, force: bool):
 )
 @click.option(
     "--backend",
-    type=click.Choice(["seqkit", "biopython"]),
-    default="biopython",
-    help="Backend to use for shuffling",
+    type=click.Choice(["auto", "seqkit", "fast", "biopython"]),
+    default="auto",
+    help="Backend to use for shuffling (auto: seqkit if available, else fast)",
 )
 @click.option(
     "--seed", type=int, default=None, help="Random seed for shuffling (optional)"
@@ -687,7 +688,7 @@ def get_yaml(output: str | None, force: bool):
         "  val_ratio: 0.1\n"
         '  device: "auto"\n'
         "\n"
-        '  shuffle_backend: "biopython"  # or "seqkit" (faster, requires installation)\n'
+        '  shuffle_backend: "auto"  # auto -> seqkit if available, else fast\n'
         "  shuffle: true\n"
         "  shuffle_seed: 24\n"
         "  filter_skip_n: 0\n"
@@ -969,6 +970,9 @@ def from_yaml(
     if target:
         cmd.append(target)
 
+    repro_target_desc = target if target else "full pipeline"
+    click.echo(f"Starting DVC reproduction ({repro_target_desc})...")
+    repro_start = time.perf_counter()
     try:
         subprocess.run(cmd, cwd=str(cwd), check=True)
     except FileNotFoundError:
@@ -977,6 +981,8 @@ def from_yaml(
         )
     except subprocess.CalledProcessError as e:
         raise click.ClickException(f"dvc repro failed with exit code {e.returncode}")
+    repro_elapsed = time.perf_counter() - repro_start
+    click.echo(f"DVC reproduction completed in {repro_elapsed:.1f}s")
 
     # Generate pretraining shards if pipeline_mode is 'pretrain'
     if pipeline_mode == "pretrain":
@@ -1005,6 +1011,7 @@ def from_yaml(
         tokenizer = ProtModernBertTokenizer()
 
         click.echo("Creating binary shards for training dataset...")
+        train_start = time.perf_counter()
         train_saver = ShardWriter(
             fasta_path=str(train_fasta),
             tokenizer=tokenizer,
@@ -1015,9 +1022,17 @@ def from_yaml(
             force=force,
         )
         train_shards = train_saver.create_shards()
-        train_sequences = len(train_saver._keys)
+        train_sequences = train_saver.sequence_count
+        if train_sequences is None:
+            raise click.ClickException(
+                "Failed to determine training sequence count after shard generation."
+            )
+        click.echo(
+            f"Training shard generation completed in {time.perf_counter() - train_start:.1f}s"
+        )
 
         click.echo("Creating binary shards for validation dataset...")
+        val_start = time.perf_counter()
         val_saver = ShardWriter(
             fasta_path=str(val_fasta),
             tokenizer=tokenizer,
@@ -1028,12 +1043,19 @@ def from_yaml(
             force=force,
         )
         val_shards = val_saver.create_shards()
-        val_sequences = len(val_saver._keys)
+        val_sequences = val_saver.sequence_count
+        if val_sequences is None:
+            raise click.ClickException(
+                "Failed to determine validation sequence count after shard generation."
+            )
+        click.echo(
+            f"Validation shard generation completed in {time.perf_counter() - val_start:.1f}s"
+        )
 
         # Write manifest
         manifest = PretrainManifest(
             pipeline_mode="pretrain",
-            seqs_num=data_params.get("seqs_num"),
+            seqs_num=train_sequences + val_sequences,
             min_seq_len=data_params.get("min_seq_len"),
             max_seq_len=max_seq_len,
             val_ratio=data_params.get("val_ratio"),
@@ -1074,7 +1096,7 @@ def from_yaml(
 
             manifest = DistillationManifest(
                 pipeline_mode="distillation",
-                seqs_num=data_params.get("seqs_num"),
+                seqs_num=train_sequences + val_sequences,
                 min_seq_len=data_params.get("min_seq_len"),
                 max_seq_len=data_params.get("max_seq_len"),
                 val_ratio=data_params.get("val_ratio"),
@@ -1115,7 +1137,7 @@ def from_yaml(
 
             manifest = DistillationManifest(
                 pipeline_mode="distillation",
-                seqs_num=data_params.get("seqs_num"),
+                seqs_num=train_sequences + val_sequences,
                 min_seq_len=data_params.get("min_seq_len"),
                 max_seq_len=data_params.get("max_seq_len"),
                 val_ratio=data_params.get("val_ratio"),

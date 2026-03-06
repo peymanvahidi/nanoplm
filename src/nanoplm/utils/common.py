@@ -4,14 +4,18 @@ import torch
 import inspect
 import sys
 import subprocess
+import time
+import threading
 from IPython import get_ipython
 from pathlib import Path
-from typing import Dict, Any, Union
+from typing import Dict, Any, Union, Callable, TypeVar
 
 from nanoplm.utils.logger import logger
 
 import torch
 from torch.nn.attention import sdpa_kernel, SDPBackend
+
+T = TypeVar("T")
 
 def is_flash_attention_available():
     if not torch.cuda.is_available():
@@ -164,3 +168,48 @@ def is_git_subdir(work_dir: Path) -> bool:
         return False
     except FileNotFoundError:
         return False
+
+
+def run_with_heartbeat(
+    step_name: str,
+    work_fn: Callable[[], T],
+    interval_seconds: float = 20.0,
+) -> T:
+    """
+    Run a callable while logging periodic heartbeat messages.
+
+    This is useful for long-running operations where there may be no native
+    progress output for extended periods.
+    """
+    if interval_seconds <= 0:
+        return work_fn()
+
+    start = time.perf_counter()
+    stop_event = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(interval_seconds):
+            elapsed = time.perf_counter() - start
+            logger.info(f"{step_name} in progress... ({elapsed:.1f}s elapsed)")
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat,
+        name=f"nanoplm-heartbeat-{step_name}",
+        daemon=True,
+    )
+
+    logger.info(f"{step_name} started")
+    heartbeat_thread.start()
+    try:
+        result = work_fn()
+    except Exception:
+        elapsed = time.perf_counter() - start
+        logger.error(f"{step_name} failed after {elapsed:.1f}s")
+        raise
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=1.0)
+
+    elapsed = time.perf_counter() - start
+    logger.info(f"{step_name} completed in {elapsed:.1f}s")
+    return result

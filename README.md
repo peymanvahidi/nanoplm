@@ -59,6 +59,12 @@ nanoplm data from-yaml
 > By default, this uses `params.yaml` in your current directory. You can optionally specify a different path argument (relative or absolute) if needed.
 Like: `nanoplm data from-yaml <path/to/params.yaml>`
 
+> For pretraining shard generation, nanoPLM auto-uses a native C tokenizer/writer backend (OpenMP-enabled if available) when using the default protein tokenizer.  
+> Disable it with `NANOPLM_DISABLE_NATIVE_SHARD_WRITER=1`.
+>
+> `shuffle`, `filter`, and `split` also use native C FASTA backends when available.  
+> Disable them with `NANOPLM_DISABLE_NATIVE_FASTA_OPS=1`.
+
 
 📊 Now your data is ready! Let's start the training.
 
@@ -104,7 +110,7 @@ data_params:
   val_ratio: 0.1
   device: "auto"
 
-  shuffle_backend: "biopython"  # or "seqkit" (faster, requires installation)
+  shuffle_backend: "auto"  # auto -> seqkit if available, else fast
   shuffle: true
   shuffle_seed: 24
   filter_skip_n: 0
