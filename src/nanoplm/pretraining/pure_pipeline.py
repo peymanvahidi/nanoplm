@@ -792,7 +792,17 @@ def _load_checkpoint(
                             f"shape {val.shape} cannot be sharded to match local {local_shape}"
                         )
 
-    optimizer.load_state_dict(opt_sd)
+    try:
+        optimizer.load_state_dict(opt_sd)
+    except ValueError as exc:
+        if "parameter group" in str(exc):
+            logger.warning(
+                "Optimizer param-group layout changed since checkpoint was saved "
+                f"({exc}). Skipping optimizer state restore — optimizer will "
+                "restart with fresh momentum/variance buffers."
+            )
+        else:
+            raise
 
     if load_scheduler:
         sched_path = ckp / "scheduler.pt"
@@ -1312,7 +1322,21 @@ def run_pure_pretraining(
             start_epoch = min(start_epoch + 1, num_epochs)
             resume_epoch = start_epoch
         elif resume_micro_step > 0:
-            logger.info(f"Skipping {resume_micro_step} micro-steps in resumed epoch {resume_epoch}")
+            if use_packing and hasattr(train_ds, "fast_forward"):
+                logger.info(
+                    f"Fast-forwarding dataloader by {resume_micro_step} packed batches "
+                    f"(index-only, no data I/O)..."
+                )
+                skipped_samples = train_ds.fast_forward(resume_micro_step)
+                logger.info(
+                    f"Fast-forward complete: will skip {skipped_samples} underlying samples "
+                    f"to resume at micro_step {resume_micro_step}"
+                )
+                # Reset resume_micro_step so the training loop doesn't also
+                # try to iterate-and-skip through the DataLoader.
+                resume_micro_step = 0
+            else:
+                logger.info(f"Skipping {resume_micro_step} micro-steps in resumed epoch {resume_epoch}")
 
     # ---- W&B ----
     wandb_enabled = False
@@ -1453,7 +1477,17 @@ def run_pure_pretraining(
                     break
 
                 if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
+                    if micro_step % 1000 == 0 and is_main:
+                        logger.info(
+                            f"Fast-forwarding dataloader: {micro_step}/{resume_micro_step} "
+                            f"micro-steps skipped ({100 * micro_step / resume_micro_step:.0f}%)"
+                        )
                     continue
+
+                if resume_micro_step > 0 and epoch == resume_epoch and micro_step == resume_micro_step and is_main:
+                    logger.info(
+                        f"Dataloader fast-forward complete — resuming training at micro_step {micro_step}"
+                    )
 
                 at_accum_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
                 if discard_accumulation:

@@ -553,7 +553,10 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         """
         samples = []
         current_length = 0
-        
+        skip_samples = getattr(self, "_skip_samples", 0)
+        if skip_samples > 0:
+            self._skip_samples = 0  # reset so next epoch starts from 0
+
         if self.sampler is not None:
              # Handle DataLoader worker sharding if using multiple workers
              worker_info = torch.utils.data.get_worker_info()
@@ -570,15 +573,20 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
                          drop_last=self.sampler.drop_last,
                      )
                      worker_sampler.set_epoch(self._epoch)
-                     iterator = (self.dataset[i] for i in worker_sampler)
+                     # When fast-forwarding, skip the corresponding per-worker share of samples.
+                     # Each worker sees 1/num_workers of the total samples, so scale accordingly.
+                     per_worker_skip = skip_samples // worker_info.num_workers
+                     indices = islice(worker_sampler, per_worker_skip, None)
+                     iterator = (self.dataset[i] for i in indices)
                  else:
                      # Generic fallback for non-distributed samplers.
                      iterator = (
                          self.dataset[i]
-                         for i in islice(self.sampler, worker_info.id, None, worker_info.num_workers)
+                         for i in islice(self.sampler, worker_info.id + skip_samples, None, worker_info.num_workers)
                      )
              else:
-                 iterator = (self.dataset[i] for i in self.sampler)
+                 indices = islice(self.sampler, skip_samples, None)
+                 iterator = (self.dataset[i] for i in indices)
 
         elif isinstance(self.dataset, torch.utils.data.IterableDataset):
              # For IterableDataset, we rely on the underlying dataset to handle worker sharding
@@ -633,6 +641,53 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
 
         if not self.drop_last and samples:
             yield samples
+
+    def fast_forward(self, n_batches: int) -> int:
+        """Advance the dataset state by *n_batches* without reading data.
+
+        Replays the packing logic on sequence lengths alone (read from index
+        files, no sample I/O) to determine how many underlying samples are
+        consumed in *n_batches* packed batches.  On the next ``__iter__`` call
+        the sampler will ``islice`` past those samples so iteration starts at
+        the correct position.
+
+        Returns the number of underlying samples that will be skipped.
+        """
+        if n_batches <= 0:
+            self._skip_samples = 0
+            return 0
+
+        lengths = self._resolve_sample_lengths()
+        batches_seen = 0
+        samples_consumed = 0
+        current_length = 0
+
+        for sample_length in lengths:
+            if batches_seen >= n_batches:
+                break
+            if sample_length <= 0:
+                samples_consumed += 1
+                continue
+
+            samples_consumed += 1
+            current_length += sample_length
+
+            if current_length == self.max_tokens_per_batch:
+                batches_seen += 1
+                current_length = 0
+            elif current_length > self.max_tokens_per_batch:
+                if not self.split_samples:
+                    batches_seen += 1
+                    current_length = sample_length
+                else:
+                    batches_seen += 1
+                    current_length -= self.max_tokens_per_batch
+                    while current_length >= self.max_tokens_per_batch and batches_seen < n_batches:
+                        batches_seen += 1
+                        current_length -= self.max_tokens_per_batch
+
+        self._skip_samples = samples_consumed
+        return samples_consumed
 
     def set_epoch(self, epoch: int):
         """Set the epoch for the dataset."""
