@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import wandb
 from datetime import datetime
+from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 
