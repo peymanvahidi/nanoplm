@@ -27,11 +27,13 @@ class Splitor:
         train_file: Union[str, Path],
         val_file: Union[str, Path],
         val_ratio: float,
+        use_native: bool = True,
     ):
         self.input_file = Path(input_file)
         self.train_file = Path(train_file)
         self.val_file = Path(val_file)
         self.val_ratio = float(val_ratio)
+        self.use_native = bool(use_native)
 
     def split(self):
         """Split filtered sequences into train and val files."""
@@ -47,56 +49,61 @@ class Splitor:
 
         logger.info(f"Creating splits with val ratio {self.val_ratio}")
 
-        native_available, native_error = is_native_fasta_ops_available()
-        if native_available:
-            try:
-                phase_names = {
-                    1: "counting records",
-                    2: "writing splits",
-                }
-                last_progress: dict[int, int] = {}
+        if self.use_native:
+            native_available, native_error = is_native_fasta_ops_available()
+            if native_available:
+                try:
+                    phase_names = {
+                        1: "counting records",
+                        2: "writing splits",
+                    }
+                    last_progress: dict[int, int] = {}
 
-                def progress_cb(phase: int, progress: float, completed: int, total: int) -> None:
-                    percent = int(progress * 100.0)
-                    if percent < 100 and percent % 5 != 0:
-                        return
-                    if last_progress.get(phase) == percent:
-                        return
-                    last_progress[phase] = percent
-                    logger.info(
-                        "Split progress: %s %d%% (%d/%d bytes)",
-                        phase_names.get(phase, f"phase {phase}"),
-                        percent,
-                        completed,
-                        total,
+                    def progress_cb(phase: int, progress: float, completed: int, total: int) -> None:
+                        percent = int(progress * 100.0)
+                        if percent < 100 and percent % 5 != 0:
+                            return
+                        if last_progress.get(phase) == percent:
+                            return
+                        last_progress[phase] = percent
+                        logger.info(
+                            "Split progress: %s %d%% (%d/%d bytes)",
+                            phase_names.get(phase, f"phase {phase}"),
+                            percent,
+                            completed,
+                            total,
+                        )
+
+                    result = run_with_heartbeat(
+                        "Splitting FASTA into train/val (native backend)",
+                        lambda: split_fasta_native(
+                            input_path=self.input_file,
+                            train_path=self.train_file,
+                            val_path=self.val_file,
+                            val_ratio=self.val_ratio,
+                            progress_cb=progress_cb,
+                        ),
                     )
-
-                result = run_with_heartbeat(
-                    "Splitting FASTA into train/val (native backend)",
-                    lambda: split_fasta_native(
-                        input_path=self.input_file,
-                        train_path=self.train_file,
-                        val_path=self.val_file,
-                        val_ratio=self.val_ratio,
-                        progress_cb=progress_cb,
-                    ),
-                )
-                train_size = result.train_size
-                val_size = result.val_size
-                logger.info("Split used native FASTA backend.")
-                logger.info(
-                    f"Sequences: {train_size + val_size}, Train: {train_size}, Val: {val_size}"
-                )
-                return (train_size, val_size)
-            except NativeFastaOpsError as exc:
+                    train_size = result.train_size
+                    val_size = result.val_size
+                    logger.info("Split used native FASTA backend.")
+                    logger.info(
+                        f"Sequences: {train_size + val_size}, Train: {train_size}, Val: {val_size}"
+                    )
+                    return (train_size, val_size)
+                except NativeFastaOpsError as exc:
+                    logger.warning(
+                        "Native FASTA split failed (%s). Falling back to Python streaming split.",
+                        exc,
+                    )
+            else:
                 logger.warning(
-                    "Native FASTA split failed (%s). Falling back to Python streaming split.",
-                    exc,
+                    "Native FASTA split unavailable (%s). Using Python streaming split.",
+                    native_error,
                 )
         else:
-            logger.warning(
-                "Native FASTA split unavailable (%s). Using Python streaming split.",
-                native_error,
+            logger.info(
+                "Split configured for legacy pipeline. Using Python streaming split."
             )
 
         return run_with_heartbeat(

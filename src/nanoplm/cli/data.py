@@ -4,6 +4,7 @@ nanoPLM CLI - Data subcommands for nanoPLM package
 """
 
 import click
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -23,6 +24,36 @@ from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertToken
 
 from nanoplm.utils import create_dirs
 from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml, is_flash_attention_available
+
+_PIPELINE_BACKEND_CHOICES = ("legacy", "fast")
+_DISABLE_NATIVE_FASTA_OPS_ENV = "NANOPLM_DISABLE_NATIVE_FASTA_OPS"
+_DISABLE_NATIVE_SHARD_WRITER_ENV = "NANOPLM_DISABLE_NATIVE_SHARD_WRITER"
+
+
+def _use_native_backend(pipeline_backend: str) -> bool:
+    return pipeline_backend == "fast"
+
+
+def _resolve_pipeline_backend(selected: str | None, from_params: str | None = None) -> str:
+    backend = selected or from_params or "legacy"
+    backend = str(backend).strip().lower()
+    if backend not in _PIPELINE_BACKEND_CHOICES:
+        raise click.ClickException(
+            f"Invalid pipeline_backend: '{backend}'. "
+            f"Must be one of: {', '.join(_PIPELINE_BACKEND_CHOICES)}"
+        )
+    return backend
+
+
+def _pipeline_backend_env(pipeline_backend: str) -> dict[str, str]:
+    env = dict(os.environ)
+    if _use_native_backend(pipeline_backend):
+        env.pop(_DISABLE_NATIVE_FASTA_OPS_ENV, None)
+        env.pop(_DISABLE_NATIVE_SHARD_WRITER_ENV, None)
+    else:
+        env[_DISABLE_NATIVE_FASTA_OPS_ENV] = "1"
+        env[_DISABLE_NATIVE_SHARD_WRITER_ENV] = "1"
+    return env
 
 
 @click.group(name="data")
@@ -204,8 +235,15 @@ def extract(input: str, output: str, force: bool):
 @click.option(
     "--seed", type=int, default=None, help="Random seed for shuffling (optional)"
 )
+@click.option(
+    "--pipeline-backend",
+    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
+    default="legacy",
+    show_default=True,
+    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
+)
 @click.help_option("--help", "-h")
-def shuffle(input: str, output: str, backend: str, seed: int):
+def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: str):
     """Shuffle sequences in a FASTA file."""
     # Check if the input file is a .fasta file
     if not input.endswith(".fasta"):
@@ -226,6 +264,7 @@ def shuffle(input: str, output: str, backend: str, seed: int):
             output_path=output_path,
             backend=backend,
             seed=seed,
+            use_native_fast=_use_native_backend(pipeline_backend),
         )
         shuffler.shuffle()
     except ShufflingError as e:
@@ -275,6 +314,13 @@ def shuffle(input: str, output: str, backend: str, seed: int):
     type=int,
     help="Number of sequences to skip from the beginning of the input FASTA file",
 )
+@click.option(
+    "--pipeline-backend",
+    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
+    default="legacy",
+    show_default=True,
+    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
+)
 @click.help_option("--help", "-h")
 def filter(
     input: str,
@@ -283,6 +329,7 @@ def filter(
     max_seq_len: int,
     seqs_num: int,
     skip_n: int,
+    pipeline_backend: str,
 ):
     """Filter sequences by length and optional max count."""
     input_path = Path(input)
@@ -301,6 +348,7 @@ def filter(
             max_seq_len=max_seq_len,
             seqs_num=seqs_num,
             skip_n=skip_n,
+            use_native=_use_native_backend(pipeline_backend),
         )
         filterer.filter()
         click.echo("Filtering completed successfully")
@@ -333,11 +381,19 @@ def filter(
     type=float,
     help="Validation ratio",
 )
+@click.option(
+    "--pipeline-backend",
+    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
+    default="legacy",
+    show_default=True,
+    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
+)
 @click.help_option("--help", "-h")
 def split(
     input: str,
     output: str,
     val_ratio: float,
+    pipeline_backend: str,
 ):
     """Split a filtered FASTA into train/val sets."""
     input_path = Path(input)
@@ -357,6 +413,7 @@ def split(
             train_file=train_file_path,
             val_file=val_file_path,
             val_ratio=val_ratio,
+            use_native=_use_native_backend(pipeline_backend),
         )
         train_size, val_size = splitor.split()
         click.echo(
@@ -534,6 +591,13 @@ def save_kd_dataset(
     help="Force overwrite existing output file",
     default=False,
 )
+@click.option(
+    "--pipeline-backend",
+    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
+    default="legacy",
+    show_default=True,
+    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
+)
 @click.help_option("--help", "-h")
 def save_pretrain_dataset(
     input: str,
@@ -542,6 +606,7 @@ def save_pretrain_dataset(
     max_workers: int,
     samples_per_shard: int,
     force: bool,
+    pipeline_backend: str,
 
 ):
 
@@ -567,6 +632,7 @@ def save_pretrain_dataset(
         samples_per_shard=samples_per_shard,
         max_workers=max_workers,
         force=force,
+        use_native=_use_native_backend(pipeline_backend),
     )
     shards = saver.create_shards()
 
@@ -689,6 +755,7 @@ def get_yaml(output: str | None, force: bool):
         '  device: "auto"\n'
         "\n"
         '  shuffle_backend: "auto"  # auto -> seqkit if available, else fast\n'
+        '  pipeline_backend: "legacy"  # legacy -> older Python/seqkit pipeline, fast -> native C pipeline\n'
         "  shuffle: true\n"
         "  shuffle_seed: 24\n"
         "  filter_skip_n: 0\n"
@@ -755,18 +822,19 @@ def get_yaml(output: str | None, force: bool):
         "      - ${data_dirs.extracted_fasta}\n"
         "\n"
         "  shuffle:\n"
-        "    cmd: nanoplm data shuffle -i ${data_dirs.extracted_fasta} -o ${data_dirs.shuffled_fasta} --backend ${data_params.shuffle_backend} --seed ${data_params.shuffle_seed}\n"
+        "    cmd: nanoplm data shuffle -i ${data_dirs.extracted_fasta} -o ${data_dirs.shuffled_fasta} --backend ${data_params.shuffle_backend} --seed ${data_params.shuffle_seed} --pipeline-backend ${data_params.pipeline_backend}\n"
         "    deps:\n"
         "      - ${data_dirs.extracted_fasta}\n"
         "    params:\n"
         "      - data_dirs.shuffled_fasta\n"
         "      - data_params.shuffle_backend\n"
         "      - data_params.shuffle_seed\n"
+        "      - data_params.pipeline_backend\n"
         "    outs:\n"
         "      - ${data_dirs.shuffled_fasta}\n"
         "\n"
         "  filter:\n"
-        "    cmd: nanoplm data filter -i ${data_dirs.shuffled_fasta} -o ${data_dirs.filtered_fasta} --min-seq-len ${data_params.min_seq_len} --max-seq-len ${data_params.max_seq_len} --seqs-num ${data_params.seqs_num} --skip-n ${data_params.filter_skip_n}\n"
+        "    cmd: nanoplm data filter -i ${data_dirs.shuffled_fasta} -o ${data_dirs.filtered_fasta} --min-seq-len ${data_params.min_seq_len} --max-seq-len ${data_params.max_seq_len} --seqs-num ${data_params.seqs_num} --skip-n ${data_params.filter_skip_n} --pipeline-backend ${data_params.pipeline_backend}\n"
         "    deps:\n"
         "      - ${data_dirs.shuffled_fasta}\n"
         "    params:\n"
@@ -775,17 +843,19 @@ def get_yaml(output: str | None, force: bool):
         "      - data_params.max_seq_len\n"
         "      - data_params.seqs_num\n"
         "      - data_params.filter_skip_n\n"
+        "      - data_params.pipeline_backend\n"
         "    outs:\n"
         "      - ${data_dirs.filtered_fasta}\n"
         "\n"
         "  split:\n"
-        "    cmd: nanoplm data split -i ${data_dirs.filtered_fasta} -o ${data_dirs.splitted_fasta_dir} --val-ratio ${data_params.val_ratio}\n"
+        "    cmd: nanoplm data split -i ${data_dirs.filtered_fasta} -o ${data_dirs.splitted_fasta_dir} --val-ratio ${data_params.val_ratio} --pipeline-backend ${data_params.pipeline_backend}\n"
         "    deps:\n"
         "      - ${data_dirs.filtered_fasta}\n"
         "    params:\n"
         "      - data_dirs.filtered_fasta\n"
         "      - data_dirs.splitted_fasta_dir\n"
         "      - data_params.val_ratio\n"
+        "      - data_params.pipeline_backend\n"
         "    outs:\n"
         "      - ${data_dirs.splitted_fasta_dir}\n"
         "\n"
@@ -863,12 +933,20 @@ def get_yaml(output: str | None, force: bool):
     default=False,
     help="Run 'dvc repro' with -v for verbose output.",
 )
+@click.option(
+    "--pipeline-backend",
+    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
+    required=False,
+    default=None,
+    help="Override data_params.pipeline_backend from params.yaml.",
+)
 def from_yaml(
     config: str,
     target: str | None,
     no_auto_init: bool,
     force_repro: bool,
     verbose: bool,
+    pipeline_backend: str | None,
 ):
     """Run the DVC data pipeline from a YAML file.
 
@@ -916,6 +994,11 @@ def from_yaml(
 
     data_params = params.get("data_params", {})
     pipeline_mode = data_params.get("pipeline_mode", "pretrain")
+    selected_pipeline_backend = _resolve_pipeline_backend(
+        pipeline_backend,
+        data_params.get("pipeline_backend"),
+    )
+    repro_env = _pipeline_backend_env(selected_pipeline_backend)
 
     # Validate pipeline_mode
     valid_modes = {"none", "pretrain", "distillation"}
@@ -971,10 +1054,11 @@ def from_yaml(
         cmd.append(target)
 
     repro_target_desc = target if target else "full pipeline"
+    click.echo(f"Using data pipeline backend: '{selected_pipeline_backend}'")
     click.echo(f"Starting DVC reproduction ({repro_target_desc})...")
     repro_start = time.perf_counter()
     try:
-        subprocess.run(cmd, cwd=str(cwd), check=True)
+        subprocess.run(cmd, cwd=str(cwd), check=True, env=repro_env)
     except FileNotFoundError:
         raise click.ClickException(
             "'dvc' command not found. Please install DVC (pip install dvc)."
@@ -1020,6 +1104,7 @@ def from_yaml(
             samples_per_shard=samples_per_shard,
             max_workers=max_workers,
             force=force,
+            use_native=_use_native_backend(selected_pipeline_backend),
         )
         train_shards = train_saver.create_shards()
         train_sequences = train_saver.sequence_count
@@ -1041,6 +1126,7 @@ def from_yaml(
             samples_per_shard=samples_per_shard,
             max_workers=max_workers,
             force=force,
+            use_native=_use_native_backend(selected_pipeline_backend),
         )
         val_shards = val_saver.create_shards()
         val_sequences = val_saver.sequence_count

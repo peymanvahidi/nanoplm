@@ -31,6 +31,7 @@ class Filterer:
         max_seq_len: int,
         seqs_num: int,
         skip_n: int = 0,
+        use_native: bool = True,
     ):
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
@@ -38,6 +39,7 @@ class Filterer:
         self.max_seq_len = int(max_seq_len)
         self.seqs_num = int(seqs_num)
         self.skip_n = int(skip_n)
+        self.use_native = bool(use_native)
 
         # Stats populated after running filter()
         self.processed_seqs_num: int | None = None
@@ -58,54 +60,63 @@ class Filterer:
         if not self.input_path.exists():
             raise FilterError(f"Input FASTA not found: {self.input_path}")
 
-        native_available, native_error = is_native_fasta_ops_available()
-        if native_available:
-            try:
-                last_percent = -1
+        if self.use_native:
+            native_available, native_error = is_native_fasta_ops_available()
+            if native_available:
+                try:
+                    last_percent = -1
 
-                def progress_cb(_phase: int, progress: float, completed: int, total: int) -> None:
-                    nonlocal last_percent
-                    percent = int(progress * 100.0)
-                    if percent < 100 and percent % 5 != 0:
-                        return
-                    if percent == last_percent:
-                        return
-                    last_percent = percent
-                    logger.info(
-                        "Filter progress: %d%% (%d/%d bytes)",
-                        percent,
-                        completed,
-                        total,
+                    def progress_cb(_phase: int, progress: float, completed: int, total: int) -> None:
+                        nonlocal last_percent
+                        percent = int(progress * 100.0)
+                        if percent < 100 and percent % 5 != 0:
+                            return
+                        if percent == last_percent:
+                            return
+                        last_percent = percent
+                        logger.info(
+                            "Filter progress: %d%% (%d/%d bytes)",
+                            percent,
+                            completed,
+                            total,
+                        )
+
+                    result = run_with_heartbeat(
+                        "Filtering FASTA records (native backend)",
+                        lambda: filter_fasta_native(
+                            input_path=self.input_path,
+                            output_path=self.output_path,
+                            min_seq_len=self.min_seq_len,
+                            max_seq_len=self.max_seq_len,
+                            seqs_num=self.seqs_num,
+                            skip_n=self.skip_n,
+                            progress_cb=progress_cb,
+                        ),
                     )
-
-                result = run_with_heartbeat(
-                    "Filtering FASTA records (native backend)",
-                    lambda: filter_fasta_native(
-                        input_path=self.input_path,
-                        output_path=self.output_path,
-                        min_seq_len=self.min_seq_len,
-                        max_seq_len=self.max_seq_len,
-                        seqs_num=self.seqs_num,
-                        skip_n=self.skip_n,
-                        progress_cb=progress_cb,
-                    ),
-                )
-                seq_count = result.processed_seqs
-                passed_count = result.passed_seqs
-                logger.info("Filtering used native FASTA backend.")
-            except NativeFastaOpsError as exc:
+                    seq_count = result.processed_seqs
+                    passed_count = result.passed_seqs
+                    logger.info("Filtering used native FASTA backend.")
+                except NativeFastaOpsError as exc:
+                    logger.warning(
+                        "Native FASTA filter failed (%s). Falling back to Python streaming filter.",
+                        exc,
+                    )
+                    seq_count, passed_count = run_with_heartbeat(
+                        "Filtering FASTA records (python backend)",
+                        self._filter_python_streaming,
+                    )
+            else:
                 logger.warning(
-                    "Native FASTA filter failed (%s). Falling back to Python streaming filter.",
-                    exc,
+                    "Native FASTA filter unavailable (%s). Using Python streaming filter.",
+                    native_error,
                 )
                 seq_count, passed_count = run_with_heartbeat(
                     "Filtering FASTA records (python backend)",
                     self._filter_python_streaming,
                 )
         else:
-            logger.warning(
-                "Native FASTA filter unavailable (%s). Using Python streaming filter.",
-                native_error,
+            logger.info(
+                "Filtering configured for legacy pipeline. Using Python streaming filter."
             )
             seq_count, passed_count = run_with_heartbeat(
                 "Filtering FASTA records (python backend)",

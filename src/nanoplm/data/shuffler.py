@@ -47,6 +47,7 @@ class FastaShuffler:
         threads: int = DEFAULT_SHUFFLE_THREADS,
         two_pass: bool = True,
         keep_temp: bool = False,
+        use_native_fast: bool = True,
     ):
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
@@ -55,6 +56,7 @@ class FastaShuffler:
         self.threads = max(1, int(threads))
         self.two_pass = bool(two_pass)
         self.keep_temp = bool(keep_temp)
+        self.use_native_fast = bool(use_native_fast)
         self.caller_dir = get_caller_dir()
 
     def shuffle(self):
@@ -141,6 +143,12 @@ class FastaShuffler:
             raise ShufflingError(f"seqkit shuffle failed: {e}")
 
     def _shuffle_with_fast_offsets(self):
+        if not self.use_native_fast:
+            logger.info(
+                "Fast shuffle configured for legacy pipeline. Using Python fast backend."
+            )
+            return self._shuffle_with_fast_offsets_python()
+
         native_available, native_error = is_native_fasta_ops_available()
         if native_available:
             try:

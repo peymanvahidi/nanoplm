@@ -67,6 +67,7 @@ class ShardWriter:
         samples_per_shard: int = 10000,
         max_workers: int = -1,
         force: bool = False,
+        use_native: bool = True,
     ) -> None:
         """
         Args:
@@ -77,6 +78,7 @@ class ShardWriter:
             samples_per_shard: Number of sequences per shard file
             max_workers: Number of parallel workers (-1 = all CPUs)
             force: If True, overwrite existing shards
+            use_native: If True, allow C native shard writer path when available.
         """
         self.fasta_path = str(fasta_path)
         self.tokenizer = tokenizer
@@ -85,6 +87,7 @@ class ShardWriter:
         self.samples_per_shard = int(samples_per_shard)
         self.max_workers = os.cpu_count() if max_workers == -1 else max_workers
         self.force = bool(force)
+        self.use_native = bool(use_native)
 
         # Validate that the FASTA file exists and is readable
         fasta_path_obj = Path(self.fasta_path)
@@ -170,7 +173,7 @@ class ShardWriter:
         # Create output directory
         create_dirs(self.output_dir)
 
-        if self._native_compatible_tokenizer:
+        if self.use_native and self._native_compatible_tokenizer:
             native_available, native_error = is_native_shard_writer_available()
             if native_available:
                 try:
@@ -221,6 +224,10 @@ class ShardWriter:
                     "Native shard writer unavailable (%s). Falling back to Python tokenizer path.",
                     native_error,
                 )
+        elif not self.use_native:
+            logger.info(
+                "Shard writer configured for legacy pipeline. Using Python tokenizer path."
+            )
 
         self._ensure_index()
         assert self._keys is not None

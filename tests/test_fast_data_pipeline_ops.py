@@ -197,6 +197,80 @@ def test_fast_shuffle_backend_preserves_records_and_seed():
         assert [x[0] for x in out1_records] != original_ids
 
 
+def test_fast_shuffle_legacy_mode_skips_native_probe(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        input_path = tmpdir / "input.fasta"
+        output_path = tmpdir / "out.fasta"
+        input_path.write_text(">a\nACDE\n>b\nFGHI\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            "nanoplm.data.shuffler.is_native_fasta_ops_available",
+            lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
+        )
+
+        shuffler = FastaShuffler(
+            input_path=input_path,
+            output_path=output_path,
+            backend="fast",
+            seed=7,
+            use_native_fast=False,
+        )
+        shuffler.shuffle()
+        assert output_path.exists()
+        assert sorted(_parse_fasta(output_path)) == sorted(_parse_fasta(input_path))
+
+
+def test_filter_legacy_mode_skips_native_probe(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        input_path = tmpdir / "input.fasta"
+        output_path = tmpdir / "filtered.fasta"
+        input_path.write_text(">a\nACDE\n>b\nA\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            "nanoplm.data.filterer.is_native_fasta_ops_available",
+            lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
+        )
+
+        filterer = Filterer(
+            input_path=input_path,
+            output_path=output_path,
+            min_seq_len=2,
+            max_seq_len=10,
+            seqs_num=-1,
+            skip_n=0,
+            use_native=False,
+        )
+        filterer.filter()
+        assert _parse_fasta(output_path) == [("a", "ACDE")]
+
+
+def test_split_legacy_mode_skips_native_probe(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        input_path = tmpdir / "input.fasta"
+        train_path = tmpdir / "train.fasta"
+        val_path = tmpdir / "val.fasta"
+        input_path.write_text(">a\nAAAA\n>b\nBBBB\n>c\nCCCC\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            "nanoplm.data.splitor.is_native_fasta_ops_available",
+            lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
+        )
+
+        splitter = Splitor(
+            input_file=input_path,
+            train_file=train_path,
+            val_file=val_path,
+            val_ratio=1 / 3,
+            use_native=False,
+        )
+        train_size, val_size = splitter.split()
+        assert (train_size, val_size) == (2, 1)
+        assert _parse_fasta(train_path) + _parse_fasta(val_path) == _parse_fasta(input_path)
+
+
 def test_auto_shuffle_backend_selection():
     shuffler = FastaShuffler("in.fasta", "out.fasta", backend="auto")
     selected = shuffler._choose_backend()
