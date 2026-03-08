@@ -28,7 +28,7 @@ import torch
 #     ResumeConfig,
 #     run_pretraining,
 # )
-from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
+from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 _TE_IMPORT_ERROR = None
@@ -777,7 +777,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
         model: {...}
         pretraining: {...}
-        pure_torch: {...}
         resume: {...}
 
     If resume.is_resume is True, training will resume from the given
@@ -861,7 +860,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         run_pure_pretraining(
             model=model,
             pretrain_config=pretrain_config,
-            pure_torch_config=pure_torch_config,
             resume_config=resume_config if resume_config.is_resume else None,
         )
     else:
@@ -1001,18 +999,6 @@ def get_yaml(output: Optional[str], force: bool):
         "  profiler_start_step: 10\n"
         "  profiler_end_step: 15\n"
         "\n"
-        "# Pure-torch training loop settings (alternative to HF Trainer).\n"
-        "pure_torch:\n"
-        "  enabled: false\n"
-        "  # torch.compile: compile the model for faster training. Disable for debugging,\n"
-        "  # unsupported hardware (e.g. Apple Silicon), or to avoid warmup overhead.\n"
-        "  use_compile: true\n"
-        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
-        "  # padding waste and increase GPU utilization. Requires flash attention.\n"
-        "  use_packing: false\n"
-        "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
-        "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
-        "  target_packed_rows: null\n"
         "\n"
         "resume:\n"
         "  is_resume: false\n"
@@ -1033,79 +1019,11 @@ def get_yaml(output: Optional[str], force: bool):
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
-def _resolve_pure_torch_config(raw: Dict[str, Any]) -> tuple:
-    """Resolve pure_torch configuration from YAML.
-
-    Expected YAML format::
-
-        pure_torch:
-          enabled: true
-          use_compile: true
-          use_packing: false
-          target_packed_rows: null
-
-    Returns ``(enabled, PureTorchConfig)``.
-    """
-    _PURE_TORCH_SUB_KEYS = ("use_compile", "use_packing", "target_packed_rows")
-
-    pure_torch_raw = raw.get("pure_torch")
-    pt_kwargs: Dict[str, Any] = {}
-
-    if isinstance(pure_torch_raw, dict):
-        enabled = bool(pure_torch_raw.get("enabled", False))
-        for key in _PURE_TORCH_SUB_KEYS:
-            if key in pure_torch_raw:
-                pt_kwargs[key] = pure_torch_raw[key]
-    else:
-        enabled = False
-
-    # Coerce types
-    for bool_key in ("use_compile", "use_packing"):
-        if bool_key in pt_kwargs and isinstance(pt_kwargs[bool_key], str):
-            pt_kwargs[bool_key] = pt_kwargs[bool_key].lower() == "true"
-    if "target_packed_rows" in pt_kwargs:
-        val = pt_kwargs["target_packed_rows"]
-        if isinstance(val, str):
-            pt_kwargs["target_packed_rows"] = int(val)
-
-    return enabled, PureTorchConfig(**pt_kwargs)
-
-
 def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
         raise ValueError("Pretraining configuration is required but not found in YAML")
 
     normalized_config = dict(config)
-    legacy_aliases = {
-        "learning_rate": "adam_learning_rate",
-        "weight_decay": "adam_weight_decay",
-    }
-    for legacy_key, canonical_key in legacy_aliases.items():
-        if legacy_key not in normalized_config:
-            continue
-
-        legacy_value = normalized_config.get(legacy_key)
-        canonical_value = normalized_config.get(canonical_key)
-
-        if canonical_value is not None and legacy_value is not None:
-            same_value = legacy_value == canonical_value
-            if not same_value:
-                try:
-                    same_value = float(legacy_value) == float(canonical_value)
-                except (TypeError, ValueError):
-                    same_value = False
-            if not same_value:
-                logger.warning(
-                    f"Both '{legacy_key}' and '{canonical_key}' are set with different values. "
-                    f"Using '{canonical_key}' and ignoring '{legacy_key}'."
-                )
-        elif canonical_value is None and legacy_value is not None:
-            normalized_config[canonical_key] = legacy_value
-            logger.warning(
-                f"Deprecated key '{legacy_key}' detected; please use '{canonical_key}' instead."
-            )
-
-        normalized_config.pop(legacy_key, None)
 
     expected_keys = set(PretrainingConfig.__annotations__.keys())
     present_keys = set(normalized_config.keys())
@@ -1206,6 +1124,9 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'muon_use_polar_express',
         'use_packing',
         'use_static_inp_size',
+        'use_compile_max_autotune',
+        'compile_triton_persistent_reductions',
+        'compile_triton_mix_order_reduction',
         'profiler_enabled',
     ]:
         if bool_key in kwargs:

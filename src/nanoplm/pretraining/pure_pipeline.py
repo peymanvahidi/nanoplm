@@ -55,7 +55,7 @@ from nanoplm.pretraining.fp8 import (
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import build_muon_optimizer, build_optimizer, is_muon_optimizer
-from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
+from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
@@ -789,7 +789,7 @@ def _rebuild_scheduler_for_resume(
     # -- Load saved schedule metadata from checkpoint ----------------------
     saved_warmup = warmup_steps
     saved_total = total_steps
-    saved_lr = pretrain_config.learning_rate
+    saved_lr = pretrain_config.adam_learning_rate
     saved_muon_lr = pretrain_config.muon_learning_rate
     saved_decay = pretrain_config.lr_decay_to_fraction
     saved_schedule = pretrain_config.lr_schedule
@@ -911,11 +911,8 @@ def _rebuild_scheduler_for_resume(
 def run_pure_pretraining(
     model: PureProtModernBertMLM,
     pretrain_config: PretrainingConfig,
-    pure_torch_config: Optional[PureTorchConfig] = None,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
-    if pure_torch_config is None:
-        pure_torch_config = PureTorchConfig()
 
     # Set allocator config (respect existing user settings)
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -1213,7 +1210,7 @@ def run_pure_pretraining(
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
-        pretrain_config.learning_rate, pretrain_config.lr_decay_to_fraction,
+        pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
         pretrain_config.lr_schedule,
     )
 

@@ -16,13 +16,17 @@ class PretrainingConfig:
     # Training hyperparameters
     micro_batch_size: int = 32
     num_epochs: int = 10
-    warmup_ratio: float = 0.05
     optimizer: str = "adamw"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     adam_epsilon: float = 1e-8
     adam_learning_rate: float = 1e-3
     adam_weight_decay: float = 0.0
+    max_grad_norm: float = float("inf")
+    warmup_steps: int = 302
+    repo_rope_warmup_steps: Optional[int] = None
+    lr_decay_to_fraction: float = 0.1
+    lr_schedule: str = "cosine"
     # Muon-specific hyperparameters (used only when optimizer == "muon" or "normuon").
     # adam_* fields are used for the AdamW sub-optimizer.
     muon_learning_rate: float = 2e-2
@@ -39,6 +43,7 @@ class PretrainingConfig:
     # Mixed precision
     bf16: bool = True
     tf32: bool = True
+    fp8: bool = False
 
     # MLM settings
     mlm_probability: float = 0.3
@@ -56,6 +61,18 @@ class PretrainingConfig:
     num_workers: Union[int, str] = "auto"
     prefetch_factor: int = 2
 
+    # Packing and compilation
+    use_packing: bool = True
+    use_static_inp_size: bool = True
+    use_compile_max_autotune: bool = False
+    compile_triton_persistent_reductions: bool = False
+    compile_triton_mix_order_reduction: bool = False
+
+    # Profiler
+    profiler_enabled: bool = False
+    profiler_start_step: int = 10
+    profiler_end_step: int = 15
+
     # Distributed training
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
@@ -67,19 +84,3 @@ class ResumeConfig:
     is_resume: bool
     checkpoint_dir: str
     extra_epochs: Optional[int] = None
-
-
-@dataclass
-class PureTorchConfig:
-    """Settings specific to the pure-torch training pipeline."""
-    # torch.compile for faster training (disable for debugging or unsupported hardware)
-    use_compile: bool = True
-    # Sequence packing (packs multiple sequences per row to eliminate padding waste).
-    # Requires flash attention (varlen path).  Falls back to padding if disabled.
-    use_packing: bool = False
-    # When set, enables static-shape compilation (dynamic=False).
-    # The collator pre-flattens packed batches to a fixed size
-    # (target_packed_rows × max_seq_len) so torch.compile sees no shape
-    # changes.  Set to ceil(micro_batch_size × avg_len / max_seq_len) + margin.
-    # If unset (None), uses dynamic=True compilation.
-    target_packed_rows: Optional[int] = None
