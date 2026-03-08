@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 
 from nanoplm.utils.logger import logger
+from nanoplm.pretraining.config import PretrainingConfig
 
 def is_muon_optimizer(optimizer) -> bool:
     """Return True if *optimizer* is a Dion Muon or NorMuon instance."""
@@ -16,18 +17,35 @@ def is_muon_optimizer(optimizer) -> bool:
     except ImportError:
         return False
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+def _is_embedding_or_unembedding_param(name: str) -> bool:
+    lname = name.lower()
+
+    # HF ModernBERT naming:
+    # - token embedding matrix: model.embeddings.tok_embeddings.weight
+    # - MLM output head: decoder.weight / decoder.bias
+    #   (decoder.weight is tied to token embeddings by default and may not appear
+    #   as a distinct named parameter).
+    if "embeddings.tok_embeddings" in lname:
+        return True
+    if lname.endswith("decoder.weight") or lname.endswith("decoder.bias"):
+        return True
+
+    # Fallbacks for other architectures.
+    return (
+        "embedding" in lname
+        or "lm_head" in lname
+        or "unembedding" in lname
+    )
+
+
 def build_muon_optimizer(
     model: torch.nn.Module,
-    pretrain_config,
-    distributed_mesh=None,
+    pretrain_config: PretrainingConfig,
 ):
-    """Partition model params into Muon (2D) and AdamW (1D/embedding) groups
-    and build a Dion Muon/NorMuon optimizer.
-
-    ``pretrain_config`` is expected to carry the standard Muon/AdamW hyper-
-    parameter attributes (duck-typed so both pipeline flavours can call this).
-    """
-    raw_model = model.module if hasattr(model, "module") else model
+    raw_model = unwrap_model(model)
 
     muon_params: list[torch.nn.Parameter] = []
     adamw_params: list[torch.nn.Parameter] = []
@@ -79,7 +97,6 @@ def build_muon_optimizer(
         adamw_weight_decay=pretrain_config.adam_weight_decay,
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
         adamw_epsilon=pretrain_config.adam_epsilon,
-        distributed_mesh=distributed_mesh,
     )
 
 polar_express_coeffs = [
