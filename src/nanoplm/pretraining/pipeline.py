@@ -2,13 +2,11 @@ import os
 import math
 import json
 import time
-import shutil
 import torch
 import torch.distributed as dist
 import wandb
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Optional
 from pathlib import Path
 
 from transformers import (
@@ -17,6 +15,7 @@ from transformers import (
     TrainingArguments,
 )
 
+from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
@@ -112,6 +111,16 @@ def _build_muon_optimizer(
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
         adamw_epsilon=pretrain_config.adam_epsilon,
     )
+# TODO: these are from the master branch
+# from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
+# from nanoplm.pretraining.utils import (
+#     compute_batch_setup,
+#     get_num_workers,
+#     prepare_run_and_steps,
+# )
+# from nanoplm.data.validation import validate_pretrain_dataset
+# from nanoplm.utils.logger import logger
+# from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
 
 
 def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, lr_decay_to_fraction: float, lr_schedule: str = "Linear") -> LambdaLR:
@@ -178,9 +187,12 @@ class TokenTrackingTrainer(Trainer):
         return loss
 
     def log(self, logs, start_time=None, **kwargs):
+        if logs is None:
+            logs = {}
+
         optimizer = self.optimizer
         seen: set[int] = set()
-        while optimizer is not None and not isinstance(optimizer, (DionMuon, DionNorMuon)):
+        while optimizer is not None and not is_muon_optimizer(optimizer):
             opt_id = id(optimizer)
             if opt_id in seen:
                 break
@@ -190,17 +202,19 @@ class TokenTrackingTrainer(Trainer):
                 break
             optimizer = inner
 
-        if isinstance(optimizer, (DionMuon, DionNorMuon)):
+        if is_muon_optimizer(optimizer):
             # param_groups[0] = muon, param_groups[1] = adamw
             muon_lr = optimizer.param_groups[0]["lr"]
             adamw_lr = optimizer.param_groups[1]["lr"]
             logs["learning_rate"] = adamw_lr
+            logs["adamw_lr"] = adamw_lr
             logs["muon_lr"] = muon_lr
         logs["tokens_per_sec"] = self._last_tokens_per_sec
         logs["raw_tokens_per_sec"] = self._last_raw_tokens_per_sec
         super().log(logs, start_time=start_time, **kwargs)
 
 
+# TODO: in the master branch we have moved all the cofigs to the config.py file, we should move them from here to that file
 class WandbSourceSnapshotCallback(TrainerCallback):
     """Upload run source snapshot once W&B is active."""
 
@@ -540,45 +554,12 @@ def run_pretraining(
 
     create_dirs(pretrain_config.ckp_dir)
 
-    # Determine effective world size
-    if pretrain_config.multi_gpu:
-        if pretrain_config.world_size == "auto":
-            env_ws = os.environ.get("WORLD_SIZE")
-            effective_world_size = (
-                int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
-            )
-        else:
-            effective_world_size = (
-                int(pretrain_config.world_size) if pretrain_config.world_size else 1
-            )
-    else:
-        effective_world_size = 1
+    effective_world_size = resolve_world_size(pretrain_config.multi_gpu, pretrain_config.world_size)
 
-    inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
-    global_batch_size_samples = pretrain_config.global_batch_size_samples
-    achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
+    batch = compute_batch_setup(pretrain_config, manifest.max_seq_len, effective_world_size)
 
-    if (
-        inferred_grad_accum_steps is None
-        or global_batch_size_samples is None
-        or achieved_global_batch_tokens is None
-    ):
-        raise ValueError(
-            "Batch setup is missing on PretrainingConfig. "
-            "Run pretraining through nanoplm CLI so inferred batch fields are populated."
-        )
-
-    world_tokens_per_micro_step = achieved_global_batch_tokens // max(
-        1, inferred_grad_accum_steps
-    )
-
-    logger.info(
-        "Batch setup: "
-        f"target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
-        f"micro_step_tokens={world_tokens_per_micro_step:,}, "
-        f"grad_accum_steps={inferred_grad_accum_steps}, "
-        f"effective_global_batch_size={achieved_global_batch_tokens:,} tokens"
-    )
+    inferred_grad_accum_steps = batch.grad_accum_steps
+    global_batch_size_samples = batch.global_batch_size_samples
 
     # Prepare run info and step intervals in a single place
     (
@@ -590,7 +571,7 @@ def run_pretraining(
         eval_steps,
         save_steps,
         resume_step,
-    ) = _prepare_run_and_steps(
+    ) = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
@@ -605,7 +586,7 @@ def run_pretraining(
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name
     os.environ["WANDB_NAME"] = wandb_run_name
 
-    num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
 
     training_dict = {
         "output_dir": output_dir,
@@ -613,8 +594,8 @@ def run_pretraining(
         "per_device_eval_batch_size": pretrain_config.micro_batch_size,
         "gradient_accumulation_steps": inferred_grad_accum_steps,
         "num_train_epochs": num_epochs,
-        "learning_rate": pretrain_config.learning_rate,
-        "weight_decay": pretrain_config.weight_decay,
+        "adam_learning_rate": pretrain_config.adam_learning_rate,
+        "adam_weight_decay": pretrain_config.adam_weight_decay,
         "max_grad_norm": pretrain_config.max_grad_norm,
         "logging_strategy": "steps",
         "logging_steps": logging_steps,
@@ -662,6 +643,7 @@ def run_pretraining(
             eps=pretrain_config.adam_epsilon,
         )
     elif optimizer_name in {"muon", "normuon"}:
+      # TODO: optimzer configs have been moved to the optim.py
         optimizer = _build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
@@ -742,38 +724,3 @@ def run_pretraining(
     logger.info("Saving final model and tokenizer")
     trainer.save_model(output_dir)
     trainer.save_state()
-
-def _get_num_workers(user_value: Union[int, str], world_size: int) -> int:
-
-    if isinstance(user_value, str) and user_value == "auto":
-        cpu_cores = os.cpu_count() or 1
-
-        # Leave some room for OS / other processes
-        max_reasonable = max(1, cpu_cores - 2)
-
-        # Heuristic: 4 workers per GPU is a good starting point
-        workers_per_gpu = 4
-        target = workers_per_gpu * max(1, world_size)
-
-        workers = max(1, min(target, max_reasonable))   
-
-        logger.info(f"Auto-setting num_workers to {workers} for {world_size} GPU(s).")
-
-        return workers
-
-    # Normalize string values to int if possible
-    if isinstance(user_value, str):
-        try:
-            user_value = int(user_value)
-        except ValueError:
-            raise ValueError(
-                f"Invalid num_workers value: {user_value}. Must be a non-negative integer or 'auto'"
-            )
-
-    # At this point we expect an int
-    if isinstance(user_value, int) and user_value >= 0:
-        return user_value
-    else:
-        raise ValueError(
-            f"Invalid num_workers value: {user_value}. Must be a non-negative integer"
-        )

@@ -130,6 +130,16 @@ def inside_git_repo(work_dir: Path) -> bool:
     except FileNotFoundError:
         return False
 
+def resolve_world_size(multi_gpu: bool, world_size: Union[int, str]) -> int:
+    """Resolve effective world size from config values and environment."""
+    if not multi_gpu:
+        return 1
+    if world_size == "auto":
+        env_ws = os.environ.get("WORLD_SIZE")
+        return int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
+    return int(world_size) if world_size else 1
+
+
 def is_git_subdir(work_dir: Path) -> bool:
     """
     Check if work_dir is a subdirectory of a Git repository (not at root).

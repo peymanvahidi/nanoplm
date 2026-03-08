@@ -33,7 +33,6 @@ dependencies = [
     "biotrainer @git+https://github.com/sacdallago/biotrainer@main",
     "biopython>=1.85",
     "click>=8.1.8",
-    "dion @git+https://github.com/alint77/dion@dev/megabatching",
     "dvc>=3.59.1",
     "h5py>=3.13.0",
     "pyyaml>=6.0.2",
@@ -48,6 +47,11 @@ dependencies = [
     "ipython>=8.3.0",
     "kernels",
     "pytest",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "dion @git+https://github.com/alint77/dion@dev/megabatching",
 ]
 
 [project.scripts]

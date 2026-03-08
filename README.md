@@ -30,7 +30,10 @@ Install the package from PyPi
 ```bash
 pip install nanoplm
 ```
-
+Remember for CUDA, you should install some other dependencies as well.
+```bash
+pip install "nanoplm[cuda]"
+```
 ---
 
 ## 🤖 Zero‑to‑model in 4 commands
@@ -146,7 +149,7 @@ data_dirs:
 # IMPORTANT: Before running pretraining, ensure you have prepared your data with:
 #   1. Set pipeline_mode: 'pretrain' in params.yaml
 #   2. Run: nanoplm data from-yaml
-# This will generate the HDF5 shards and a .data_manifest file.
+# This will generate binary shards and a .data_manifest file.
 
 model:
   hidden_size: 768
@@ -178,20 +181,25 @@ pretraining:
 
   # Hyperparameters
   micro_batch_size: 64
-  global_batch_size: 256000  # 2^20 ≈ 1M tokens/step (based on PLM best practices)
+  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)
+  #   micro_batch_size: samples per GPU per forward pass (limited by GPU memory)
+  #   global_batch_size: total tokens per optimizer step across all GPUs
+  #   gradient_accumulation_steps is inferred automatically:
+  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))
   num_epochs: 10
+  warmup_ratio: 0.05
 
-  optimizer: "normuon"  # adamw, stable_adamw, muon, normuon
+  optimizer: "adamw"  # adamw, stable_adamw, muon, normuon
   # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
-  learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)
+  adam_learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)
   max_grad_norm: .inf  # set to .inf (equivalent to float("inf")) to disable clipping
   warmup_steps: 302
   lr_decay_to_fraction: 0.1
   lr_schedule: "cosine" # Linear or Cosine
-  weight_decay: 0.0
+  adam_weight_decay: 0.0
   # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)
   muon_learning_rate: 1e-3
   muon_weight_decay: 0.01
@@ -230,6 +238,19 @@ pretraining:
   multi_gpu: true
   world_size: 'auto'  # Use "auto" if you want to use all available GPUs
   project_name: "nanoplm-pretraining"
+
+# Pure-torch training loop settings (alternative to HF Trainer).
+pure_torch:
+  enabled: false
+  # torch.compile: compile the model for faster training. Disable for debugging,
+  # unsupported hardware (e.g. Apple Silicon), or to avoid warmup overhead.
+  use_compile: true
+  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate
+  # padding waste and increase GPU utilization. Requires flash attention.
+  use_packing: false
+  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).
+  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.
+  target_packed_rows: null
 
 resume:
   # Set is_resume: true to resume training from a checkpoint
@@ -332,7 +353,7 @@ Tip: Paths are resolved relative to where you run the command (not where the YAM
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.12+
 - macOS or Linux
 - GPU recommended (CPU is fine for tiny tests)
 

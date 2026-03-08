@@ -54,15 +54,14 @@ from nanoplm.pretraining.fp8 import (
     convert_to_float8_training,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from dion import Muon as DionMuon, NorMuon as DionNorMuon
-from nanoplm.pretraining.optim import build_optimizer
-from nanoplm.pretraining.pipeline import (
-    PretrainingConfig,
-    ResumeConfig,
-    _get_num_workers,
-    _prepare_run_and_steps,
+from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
+from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
+from nanoplm.pretraining.utils import (
+    compute_batch_setup,
+    get_num_workers,
+    prepare_run_and_steps,
 )
-from nanoplm.utils.common import create_dirs, get_device
+from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
@@ -368,12 +367,6 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# torch.compile
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
 # Optimizer / Scheduler
 # ---------------------------------------------------------------------------
 
@@ -422,8 +415,8 @@ def _build_muon_optimizer(model, cfg, distributed_mesh=None):
         muon_nesterov=cfg.muon_nesterov,
         muon_eps=cfg.muon_eps,
         use_normuon=str(cfg.optimizer).lower() == "normuon",
-        adamw_learning_rate=cfg.learning_rate,
-        adamw_weight_decay=cfg.weight_decay,
+        adamw_learning_rate=cfg.adam_learning_rate,
+        adamw_weight_decay=cfg.adam_weight_decay,
         adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
         adamw_epsilon=cfg.adam_epsilon,
         distributed_mesh=distributed_mesh,
@@ -433,7 +426,7 @@ def _build_muon_optimizer(model, cfg, distributed_mesh=None):
 def _create_optimizer(model, cfg, distributed_mesh=None):
     name = str(cfg.optimizer).lower()
     if name in {"muon", "normuon"}:
-        return _build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
+        return build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
     decay, no_decay = [], []
     for p_name, param in model.named_parameters():
@@ -442,12 +435,12 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
         (decay if _use_weight_decay(p_name, param) else no_decay).append(param)
 
     groups = [
-        {"params": decay, "weight_decay": float(cfg.weight_decay)},
+        {"params": decay, "weight_decay": float(cfg.adam_weight_decay)},
         {"params": no_decay, "weight_decay": 0.0},
     ]
     kwargs = dict(
         params=groups,
-        lr=float(cfg.learning_rate),
+        lr=float(cfg.adam_learning_rate),
         betas=(float(cfg.adam_beta1), float(cfg.adam_beta2)),
         eps=float(cfg.adam_epsilon),
     )
@@ -534,6 +527,14 @@ def _sync_train_loader_len(
             max_len,
         )
     return min_len
+  # TODO: this is comming from master branch
+# def _dist_barrier(local_rank: int) -> None:
+#     if not dist.is_initialized():
+#         return
+#     if dist.get_backend() == "nccl":
+#         dist.barrier(device_ids=[local_rank])
+#     else:
+#         dist.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -910,8 +911,22 @@ def _rebuild_scheduler_for_resume(
 def run_pure_pretraining(
     model: PureProtModernBertMLM,
     pretrain_config: PretrainingConfig,
+    pure_torch_config: Optional[PureTorchConfig] = None,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
+    if pure_torch_config is None:
+        pure_torch_config = PureTorchConfig()
+
+    # Set allocator config (respect existing user settings)
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+    # Enable reduced-precision for training performance
+    if pretrain_config.bf16 or pretrain_config.tf32:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     _set_seed(pretrain_config.seed)
     tokenizer = model.tokenizer
     device = torch.device(get_device())
@@ -975,16 +990,22 @@ def run_pure_pretraining(
 
     # ---- Run naming / output dir ----
     (
-        _run_name, wandb_run_name, output_dir, num_epochs,
-        logging_steps, eval_steps, save_steps, _resume_step,
-    ) = _prepare_run_and_steps(
+        _run_name,
+        wandb_run_name,
+        output_dir,
+        num_epochs,
+        logging_steps,
+        eval_steps,
+        save_steps,
+        _resume_step,
+    ) = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=manifest.train_sequences,
         global_batch_size_samples=global_batch_size_samples,
     )
 
-    num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
     pin_memory = device.type == "cuda"
     # Disable persistent workers when packing: TokenPackingDataset + persistent_workers
     # can cause hangs near epoch boundaries (set_epoch doesn't reach workers, worker

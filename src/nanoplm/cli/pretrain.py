@@ -22,11 +22,14 @@ os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
 
 import torch
 
-from nanoplm.pretraining.pipeline import (
-    PretrainingConfig,
-    ResumeConfig,
-    run_pretraining,
-)
+# TODO: this is from new branch, maybe there should be some modification here
+# from nanoplm.pretraining.pipeline import (
+#     PretrainingConfig,
+#     ResumeConfig,
+#     run_pretraining,
+# )
+from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
+from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 _TE_IMPORT_ERROR = None
 try:
@@ -45,7 +48,17 @@ from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
-
+def _check_muon_available(optimizer: str) -> None:
+    """Abort early when a Muon variant is requested but ``dion`` is not installed."""
+    if optimizer.lower() in {"muon", "normuon"}:
+        try:
+            import dion  # noqa: F401
+        except ImportError:
+            raise click.ClickException(
+                f"Optimizer '{optimizer}' requires the 'dion' package which is not installed.\n"
+                "Install it with:  pip install nanoplm[cuda]"
+            )
+            
 def _set_seed_for_init(seed: int) -> None:
     """Set seed before model creation so both pipelines start with identical weights."""
     random.seed(seed)
@@ -95,7 +108,6 @@ def _populate_batch_setup(cfg: PretrainingConfig) -> None:
     cfg.global_batch_size_samples = global_batch_size_samples
     cfg.achieved_global_batch_tokens = achieved_global_batch_tokens
 
-
 @click.group(name="pretrain")
 @click.help_option(
     "--help",
@@ -138,16 +150,16 @@ def pretrain():
     help="Number of epochs"
 )
 @click.option(
-    "--learning-rate",
+    "--adam-learning-rate",
     type=float,
     default=1e-4,
-    help="Maximum Learning rate in the warmup"
+    help="AdamW learning rate (Muon uses --muon-learning-rate)"
 )
 @click.option(
-    "--weight-decay",
+    "--adam-weight-decay",
     type=float,
     default=0.0,
-    help="Weight decay"
+    help="AdamW weight decay (Muon uses --muon-weight-decay)"
 )
 @click.option(
     "--gradient-clipping/--no-gradient-clipping",
@@ -307,6 +319,11 @@ def pretrain():
     type=int,
     default=2,
     help="DataLoader prefetch factor"
+)
+@click.option(
+    "--compile/--no-compile",
+    default=True,
+    help="Enable torch.compile for faster training (disable for debugging or unsupported hardware)"
 )
 @click.option(
     "--use-packing/--no-packing",
@@ -539,8 +556,8 @@ def run(
     # training hp
     micro_batch_size: int,
     num_epochs: int,
-    learning_rate: float,
-    weight_decay: float,
+    adam_learning_rate: float,
+    adam_weight_decay: float,
     gradient_clipping: bool,
     warmup_steps: int,
     repo_rope_warmup_steps: Optional[int],
@@ -568,6 +585,7 @@ def run(
     keep_probability: float,
     num_workers: Union[int, str],
     prefetch_factor: int,
+    compile: bool,
     use_packing: bool,
     use_static_inp_size: bool,
     use_compile_max_autotune: bool,
@@ -610,14 +628,16 @@ def run(
 ):
     """Run MLM pretraining with ModernBERT backbone."""
 
+    _check_muon_available(optimizer)
+
     # Build config from CLI arguments
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
         micro_batch_size=micro_batch_size,
         num_epochs=num_epochs,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
+        adam_learning_rate=adam_learning_rate,
+        adam_weight_decay=adam_weight_decay,
         max_grad_norm=1.0 if gradient_clipping else float("inf"),
         warmup_steps=warmup_steps,
         repo_rope_warmup_steps=repo_rope_warmup_steps,
@@ -755,10 +775,10 @@ def run(
 def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     """Run pretraining from a YAML file with training and model parameters.
 
-    Expected YAML structure:
-    pretraining: {...}
-    model: {...}
-    resume: {...}
+        model: {...}
+        pretraining: {...}
+        pure_torch: {...}
+        resume: {...}
 
     If resume.is_resume is True, training will resume from the given
     checkpoint using the hyperparameters in the 'pretraining' block.
@@ -790,6 +810,8 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
+    _check_muon_available(pretrain_config.optimizer)
+    
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
     if model_config.use_canon_layers and not pure_torch:
@@ -839,6 +861,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         run_pure_pretraining(
             model=model,
             pretrain_config=pretrain_config,
+            pure_torch_config=pure_torch_config,
             resume_config=resume_config if resume_config.is_resume else None,
         )
     else:
@@ -884,6 +907,7 @@ def get_yaml(output: Optional[str], force: bool):
     create_dirs(output_path)
 
     # Define the YAML template
+    # TODO: there are some params that are currently in the pure_torch, let's move all of them to the pretrain params
     template = (
         "# Pretraining configuration for nanoPLM\n"
         "#\n"
@@ -925,17 +949,18 @@ def get_yaml(output: Optional[str], force: bool):
         "  micro_batch_size: 64\n"
         "  global_batch_size: 256000\n"
         "  num_epochs: 10\n"
-        "  optimizer: \"normuon\"\n"
+        "  optimizer: \"adamw\"\n"
+        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
-        "  learning_rate: 1e-4\n"
+        "  adam_learning_rate: 1e-4\n"
         "  max_grad_norm: .inf\n"
         "  warmup_steps: 302\n"
         "  repo_rope_warmup_steps: 302\n"
         "  lr_decay_to_fraction: 0.1\n"
         "  lr_schedule: \"cosine\"\n"
-        "  weight_decay: 0.0\n"
+        "  adam_weight_decay: 0.0\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
         "  muon_cautious_weight_decay: true\n"
@@ -943,6 +968,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
+        "\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
@@ -958,6 +984,13 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_compile_max_autotune: false  # pure_torch only: may improve throughput, but causes long compile/autotune time at run start\n"
         "  compile_triton_persistent_reductions: false  # pure_torch only: set true if it works on your shapes/GPU and you want the faster persistent reductions\n"
         "  compile_triton_mix_order_reduction: false  # pure_torch only: set true to enable mix-order reductions (may be faster, but can hit shared-mem limits)\n"
+        "\n"
+        "  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)\n"
+        "  # When bf16 is true, automatically selects the best precision for your hardware:\n"
+        "  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32\n"
+        "  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback\n"
+        "  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)\n"
+        "  #   - CPU: fp32 (no mixed precision)\n"
         "  bf16: true\n"
         "  tf32: true\n"
         "  fp8: false\n"
@@ -967,6 +1000,19 @@ def get_yaml(output: Optional[str], force: bool):
         "  profiler_enabled: false\n"
         "  profiler_start_step: 10\n"
         "  profiler_end_step: 15\n"
+        "\n"
+        "# Pure-torch training loop settings (alternative to HF Trainer).\n"
+        "pure_torch:\n"
+        "  enabled: false\n"
+        "  # torch.compile: compile the model for faster training. Disable for debugging,\n"
+        "  # unsupported hardware (e.g. Apple Silicon), or to avoid warmup overhead.\n"
+        "  use_compile: true\n"
+        "  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate\n"
+        "  # padding waste and increase GPU utilization. Requires flash attention.\n"
+        "  use_packing: false\n"
+        "  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).\n"
+        "  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.\n"
+        "  target_packed_rows: null\n"
         "\n"
         "resume:\n"
         "  is_resume: false\n"
@@ -987,12 +1033,82 @@ def get_yaml(output: Optional[str], force: bool):
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
+def _resolve_pure_torch_config(raw: Dict[str, Any]) -> tuple:
+    """Resolve pure_torch configuration from YAML.
+
+    Expected YAML format::
+
+        pure_torch:
+          enabled: true
+          use_compile: true
+          use_packing: false
+          target_packed_rows: null
+
+    Returns ``(enabled, PureTorchConfig)``.
+    """
+    _PURE_TORCH_SUB_KEYS = ("use_compile", "use_packing", "target_packed_rows")
+
+    pure_torch_raw = raw.get("pure_torch")
+    pt_kwargs: Dict[str, Any] = {}
+
+    if isinstance(pure_torch_raw, dict):
+        enabled = bool(pure_torch_raw.get("enabled", False))
+        for key in _PURE_TORCH_SUB_KEYS:
+            if key in pure_torch_raw:
+                pt_kwargs[key] = pure_torch_raw[key]
+    else:
+        enabled = False
+
+    # Coerce types
+    for bool_key in ("use_compile", "use_packing"):
+        if bool_key in pt_kwargs and isinstance(pt_kwargs[bool_key], str):
+            pt_kwargs[bool_key] = pt_kwargs[bool_key].lower() == "true"
+    if "target_packed_rows" in pt_kwargs:
+        val = pt_kwargs["target_packed_rows"]
+        if isinstance(val, str):
+            pt_kwargs["target_packed_rows"] = int(val)
+
+    return enabled, PureTorchConfig(**pt_kwargs)
+
+
 def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
         raise ValueError("Pretraining configuration is required but not found in YAML")
 
+    normalized_config = dict(config)
+    legacy_aliases = {
+        "learning_rate": "adam_learning_rate",
+        "weight_decay": "adam_weight_decay",
+    }
+    for legacy_key, canonical_key in legacy_aliases.items():
+        if legacy_key not in normalized_config:
+            continue
+
+        legacy_value = normalized_config.get(legacy_key)
+        canonical_value = normalized_config.get(canonical_key)
+
+        if canonical_value is not None and legacy_value is not None:
+            same_value = legacy_value == canonical_value
+            if not same_value:
+                try:
+                    same_value = float(legacy_value) == float(canonical_value)
+                except (TypeError, ValueError):
+                    same_value = False
+            if not same_value:
+                logger.warning(
+                    f"Both '{legacy_key}' and '{canonical_key}' are set with different values. "
+                    f"Using '{canonical_key}' and ignoring '{legacy_key}'."
+                )
+        elif canonical_value is None and legacy_value is not None:
+            normalized_config[canonical_key] = legacy_value
+            logger.warning(
+                f"Deprecated key '{legacy_key}' detected; please use '{canonical_key}' instead."
+            )
+
+        normalized_config.pop(legacy_key, None)
+
     expected_keys = set(PretrainingConfig.__annotations__.keys())
-    present_keys = set(config.keys())
+    present_keys = set(normalized_config.keys())
 
     extra = []
     kwargs: Dict[str, Any] = {}
@@ -1005,7 +1121,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         )
 
     # Required key
-    if 'dataset_dir' not in config or not config['dataset_dir']:
+    if 'dataset_dir' not in normalized_config or not normalized_config['dataset_dir']:
         raise ValueError("dataset_dir is required in pretraining configuration")
 
     # Classify provided keys in one pass
@@ -1013,7 +1129,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         if key not in expected_keys:
             extra.append(key)
             continue
-        value = config.get(key)
+        value = normalized_config.get(key)
         if value is not None:
             kwargs[key] = value
 
@@ -1024,8 +1140,8 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
 
     # Explicitly convert float-like fields if they are strings (handles scientific notation).
     float_fields = [
-        "learning_rate",
-        "weight_decay",
+        "adam_learning_rate",
+        "adam_weight_decay",
         "max_grad_norm",
         "adam_beta1",
         "adam_beta2",
@@ -1222,3 +1338,11 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
         )
 
     return ResumeConfig(**kwargs)
+
+def _set_seed_for_init(seed: int) -> None:
+    """Set seed before model creation so both pipelines start with identical weights."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
