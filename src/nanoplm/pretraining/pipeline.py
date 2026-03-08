@@ -1,13 +1,14 @@
 import os
 import math
 import json
+import shutil
 import time
 import torch
 import torch.distributed as dist
 import wandb
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple, Union
 from pathlib import Path
 
 from transformers import (
@@ -25,8 +26,9 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, unwrap_model
 from nanoplm.data.validation import validate_pretrain_dataset
+from nanoplm.pretraining.utils import compute_batch_setup, get_num_workers, prepare_run_and_steps
 from nanoplm.utils.logger import logger
-from nanoplm.utils.common import get_device, create_dirs
+from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 # TODO: these are from the master branch

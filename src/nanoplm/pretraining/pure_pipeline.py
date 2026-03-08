@@ -10,7 +10,7 @@ import math
 import os
 import yaml
 from dataclasses import asdict
-
+from dion import Muon,NorMuon
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -54,7 +54,7 @@ from nanoplm.pretraining.fp8 import (
     convert_to_float8_training,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
+from nanoplm.pretraining.optim import build_muon_optimizer, build_optimizer, is_muon_optimizer
 from nanoplm.pretraining.config import PretrainingConfig, PureTorchConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
@@ -861,7 +861,7 @@ def _rebuild_scheduler_for_resume(
         eff_warmup = 0
 
     # -- Override optimizer base LRs before creating scheduler -------------
-    if isinstance(optimizer, (DionMuon, DionNorMuon)):
+    if isinstance(optimizer, (Muon, NorMuon)):
         # group[0] = muon, group[1+] = adamw / scalar
         optimizer.param_groups[0]["lr"] = eff_muon_lr
         for pg in optimizer.param_groups[1:]:
@@ -1467,7 +1467,7 @@ def run_pure_pretraining(
                 else:
                     optimizer.step()
 
-                if isinstance(optimizer, (DionMuon, DionNorMuon)):
+                if isinstance(optimizer, (Muon, NorMuon)):
                     muon_lr = optimizer.param_groups[0]["lr"]
                     learning_rate = optimizer.param_groups[1]["lr"]
                 else:

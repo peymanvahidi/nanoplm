@@ -31,7 +31,7 @@ from nanoplm.pretraining.collator import (
 from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
-from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig, _get_num_workers, _prepare_run_and_steps
+from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig, _prepare_run_and_steps
 from nanoplm.pretraining.pure_pipeline import (
     H100_PEAK_TFLOPS,
     N_PREFETCH_LAYERS_FSDP2,
@@ -53,7 +53,7 @@ from nanoplm.pretraining.pure_pipeline import (
 from nanoplm.utils.common import create_dirs, get_device
 from nanoplm.utils.logger import logger
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
-
+from nanoplm.pretraining.utils import get_num_workers
 
 def _make_te_profiler(pretrain_config: PretrainingConfig, output_dir: str, is_main: bool):
     """Build profiler context and step callback for the TE training loop.
@@ -256,7 +256,7 @@ def run_te_pretraining(
         global_batch_size_samples=global_batch_size_samples,
     )
 
-    num_workers = _get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
     pin_memory = device.type == "cuda"
     # Disable persistent workers when packing: TokenPackingDataset + persistent_workers
     # can cause hangs near epoch boundaries (set_epoch doesn't reach workers).
