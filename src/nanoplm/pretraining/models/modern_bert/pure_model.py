@@ -90,6 +90,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
                 "Canon layers are currently implemented only in the pure-torch path. "
                 "Disable use_canon_layers or use --pure-torch."
             )
+        if config.use_mhc_lite and str(config.mhc_lite_wrapping_level).strip().lower() != "layer":
+            raise ValueError(
+                "Transformer Engine currently supports only layer-level mHC-lite. "
+                "Set mhc_lite_wrapping_level='layer' or use --pure-torch."
+            )
 
         self.tokenizer = ProtModernBertTokenizer()
         # Keep the original high-level config for checkpoint serialization.

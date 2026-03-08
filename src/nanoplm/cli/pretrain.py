@@ -747,10 +747,15 @@ def run(
             "use_canon_layers requires --pure-torch. "
             "Canon layers are not implemented in HF/TE paths."
         )
-    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not pure_torch:
+    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not (pure_torch or pure_te):
         raise click.ClickException(
-            "mHC-lite is only supported in the pure-torch pipeline. "
-            "Set --pure-torch (or disable mHC-lite settings)."
+            "mHC-lite requires --pure-torch or --pure-te. "
+            "Set one of those modes (or disable mHC-lite settings)."
+        )
+    if pure_te and mhc_lite_wrapping_level.lower() != "layer":
+        raise click.ClickException(
+            "Transformer Engine currently supports only layer-level mHC-lite. "
+            "Set --mhc-lite-wrapping-level layer or use --pure-torch."
         )
     if use_mhc_lite and use_resid_lambdas:
         raise click.ClickException(
@@ -910,11 +915,16 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     if (
         model_config.use_mhc_lite
         or str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower() != "layer"
-    ) and not pure_torch:
+    ) and not (pure_torch or pure_te):
         raise click.ClickException(
             "model.use_mhc_lite=true (or model.mhc_lite_wrapping_level != 'layer') "
-            "requires pure_torch: true (or --pure-torch). "
-            "mHC-lite is not implemented in HF/TE paths."
+            "requires pure_torch: true / --pure-torch or pure_te: true / --pure-te. "
+            "mHC-lite is not implemented in the HF path."
+        )
+    if pure_te and str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower() != "layer":
+        raise click.ClickException(
+            "Transformer Engine currently supports only layer-level mHC-lite. "
+            "Set model.mhc_lite_wrapping_level: layer or use pure_torch: true."
         )
     if model_config.use_mhc_lite and model_config.use_resid_lambdas:
         raise click.ClickException(

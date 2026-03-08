@@ -1235,6 +1235,16 @@ class MHCLiteBlock(nn.Module):
 
     def _forward_pytorch(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
         """Pure PyTorch forward path (always correct, works everywhere)."""
+        pre_map = (
+            self._compiled_mhc_pre_map_pytorch
+            if self.training and hasattr(self, "_compiled_mhc_pre_map_pytorch")
+            else self._mhc_pre_map_pytorch
+        )
+        post_res = (
+            self._compiled_mhc_post_res_pytorch
+            if self.training and hasattr(self, "_compiled_mhc_post_res_pytorch")
+            else self._mhc_post_res_pytorch
+        )
         use_ckpt = (
             USE_ACTIVATION_CHECKPOINTING_MHC
             and self.training
@@ -1244,24 +1254,24 @@ class MHCLiteBlock(nn.Module):
 
         if use_ckpt:
             layer_input, H_merged, h_post = _checkpoint(
-                lambda x_: self._mhc_pre_map_pytorch(x_),
+                lambda x_: pre_map(x_),
                 x_streams,
                 use_reentrant=False,
             )
         else:
-            layer_input, H_merged, h_post = self._mhc_pre_map_pytorch(x_streams)
+            layer_input, H_merged, h_post = pre_map(x_streams)
         layer_output = self.layer(layer_input, **kwargs)
 
         if use_ckpt:
             return _checkpoint(
-                lambda x_, lo_, H_, hp_: self._mhc_post_res_pytorch(x_, lo_, H_, hp_),
+                lambda x_, lo_, H_, hp_: post_res(x_, lo_, H_, hp_),
                 x_streams,
                 layer_output,
                 H_merged,
                 h_post,
                 use_reentrant=False,
             )
-        return self._mhc_post_res_pytorch(x_streams, layer_output, H_merged, h_post)
+        return post_res(x_streams, layer_output, H_merged, h_post)
 
     def _mhc_coeffs_triton(
         self, x_streams: torch.Tensor
@@ -1314,6 +1324,16 @@ class MHCLiteBlock(nn.Module):
         Uses Triton for the memory-heavy stream operations (K3: pre-map,
         K4: post-res) and PyTorch for the coefficient computation (tiny ops).
         """
+        pre_map = (
+            self._compiled_mhc_pre_map_triton
+            if self.training and hasattr(self, "_compiled_mhc_pre_map_triton")
+            else self._mhc_pre_map_triton
+        )
+        post_res = (
+            self._compiled_mhc_post_res_triton
+            if self.training and hasattr(self, "_compiled_mhc_post_res_triton")
+            else self._mhc_post_res_triton
+        )
         use_ckpt = (
             USE_ACTIVATION_CHECKPOINTING_MHC
             and self.training
@@ -1330,12 +1350,12 @@ class MHCLiteBlock(nn.Module):
         with autotune_ctx:
             if use_ckpt:
                 layer_input, H_merged, h_post = _checkpoint(
-                    lambda x_: self._mhc_pre_map_triton(x_),
+                    lambda x_: pre_map(x_),
                     x_streams,
                     use_reentrant=False,
                 )
             else:
-                layer_input, H_merged, h_post = self._mhc_pre_map_triton(x_streams)
+                layer_input, H_merged, h_post = pre_map(x_streams)
 
             # Transformer layer
             layer_output = self.layer(layer_input, **kwargs)
@@ -1343,14 +1363,14 @@ class MHCLiteBlock(nn.Module):
             # K4: Triton fused post-res (H_merged @ x + h_post * layer_output)
             if use_ckpt:
                 return _checkpoint(
-                    lambda x_, lo_, H_, hp_: self._mhc_post_res_triton(x_, lo_, H_, hp_),
+                    lambda x_, lo_, H_, hp_: post_res(x_, lo_, H_, hp_),
                     x_streams,
                     layer_output,
                     H_merged,
                     h_post,
                     use_reentrant=False,
                 )
-            return self._mhc_post_res_triton(x_streams, layer_output, H_merged, h_post)
+            return post_res(x_streams, layer_output, H_merged, h_post)
 
     def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
         """x_streams: (..., n, C).  Returns (..., n, C)."""

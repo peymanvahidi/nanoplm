@@ -14,6 +14,7 @@ from transformer_engine.pytorch.attention.dot_product_attention import backends 
 from transformer_engine.common.recipe import DelayedScaling, Format,NVFP4BlockScaling,Float8CurrentScaling,Float8BlockScaling,MXFP8BlockScaling
 
 from nanoplm.pretraining.models.modern_bert.modeling import (
+    MHCLiteBlock,
     ModernBertConfig,
     _get_activation,
     _unpad_input,
@@ -133,6 +134,10 @@ class TEModernBertEncoderLayer(nn.Module):
         else:
             self.mlp = None
 
+    @property
+    def attention_type(self) -> str:
+        return "full_attention" if self.is_full_attention else "sliding_attention"
+
     def forward(
         self,
         x: torch.Tensor,
@@ -171,9 +176,22 @@ class TEModernBertModel(nn.Module):
         super().__init__()
         self.config = config
         self.embeddings = TEModernBertEmbeddings(config)
-        self.layers = nn.ModuleList(
-            [TEModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
-        )
+        if config.use_mhc_lite:
+            self.layers = nn.ModuleList(
+                [
+                    MHCLiteBlock(
+                        config.mhc_n_streams,
+                        config.hidden_size,
+                        TEModernBertEncoderLayer(config, i),
+                        triton_fused=config.mhc_triton_fused,
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
+        else:
+            self.layers = nn.ModuleList(
+                [TEModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            )
         if config.use_resid_lambdas:
             self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
         else:
@@ -228,6 +246,9 @@ class TEModernBertModel(nn.Module):
                 cu_seqlens,
                 cu_seqlens[-1:] + pad,
             ])
+        if self.config.use_mhc_lite:
+            n = self.config.mhc_n_streams
+            x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))
         x0 = x if self.x0_lambdas is not None else None
 
         rope_full_freqs, rope_sliding_freqs = self._get_rope_freqs(max_seqlen)
@@ -246,9 +267,11 @@ class TEModernBertModel(nn.Module):
                 x = self.resid_lambdas[i] * x
             elif use_x0:
                 x = x + self.x0_lambdas[i] * x0
-            rope = rope_full_freqs if layer.is_full_attention else rope_sliding_freqs
+            rope = rope_full_freqs if layer.attention_type == "full_attention" else rope_sliding_freqs
             x = layer(x, rotary_pos_emb=rope, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, is_first_microbatch=is_first_microbatch)
 
+        if self.config.use_mhc_lite:
+            x = x[..., 0, :]
         # Trim padding before final norm and return.
         if pad > 0:
             x = x[:real_total]

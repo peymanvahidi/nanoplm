@@ -29,6 +29,7 @@ from nanoplm.pretraining.collator import (
     build_power_of_two_buckets,
 )
 from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
+from nanoplm.pretraining.models.modern_bert.modeling import MHCLiteBlock
 from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
@@ -58,6 +59,77 @@ from nanoplm.utils.common import create_dirs, get_device
 from nanoplm.utils.logger import logger
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 from nanoplm.pretraining.utils import get_num_workers
+
+
+def _compile_te_mhc_blocks(
+    model: TEProtModernBertMLM,
+    *,
+    compile_dynamic: bool,
+    compile_mode: Optional[str],
+) -> None:
+    compiled_blocks = 0
+    for layer in model.model.layers:
+        if not isinstance(layer, MHCLiteBlock):
+            continue
+        if layer.triton_fused:
+            if compile_mode is None:
+                layer._compiled_mhc_pre_map_triton = torch.compile(
+                    layer._mhc_pre_map_triton,
+                    dynamic=compile_dynamic,
+                    fullgraph=True,
+                )
+                layer._compiled_mhc_post_res_triton = torch.compile(
+                    layer._mhc_post_res_triton,
+                    dynamic=compile_dynamic,
+                    fullgraph=True,
+                )
+            else:
+                layer._compiled_mhc_pre_map_triton = torch.compile(
+                    layer._mhc_pre_map_triton,
+                    dynamic=compile_dynamic,
+                    fullgraph=True,
+                    mode=compile_mode,
+                )
+                layer._compiled_mhc_post_res_triton = torch.compile(
+                    layer._mhc_post_res_triton,
+                    dynamic=compile_dynamic,
+                    fullgraph=True,
+                    mode=compile_mode,
+                )
+        else:
+            if compile_mode is None:
+                layer._compiled_mhc_pre_map_pytorch = torch.compile(
+                    layer._mhc_pre_map_pytorch,
+                    dynamic=compile_dynamic,
+                    fullgraph=True,
+                )
+                layer._compiled_mhc_post_res_pytorch = torch.compile(
+                    layer._mhc_post_res_pytorch,
+                    dynamic=compile_dynamic,
+                    fullgraph=True,
+                )
+            else:
+                layer._compiled_mhc_pre_map_pytorch = torch.compile(
+                    layer._mhc_pre_map_pytorch,
+                    dynamic=compile_dynamic,
+                    fullgraph=True,
+                    mode=compile_mode,
+                )
+                layer._compiled_mhc_post_res_pytorch = torch.compile(
+                    layer._mhc_post_res_pytorch,
+                    dynamic=compile_dynamic,
+                    fullgraph=True,
+                    mode=compile_mode,
+                )
+        compiled_blocks += 1
+    if compiled_blocks:
+        logger.info(
+            "Locally compiled mHC-lite TE glue for %d blocks (dynamic=%s, mode=%s)",
+            compiled_blocks,
+            compile_dynamic,
+            compile_mode,
+        )
+
 
 def _make_te_profiler(pretrain_config: PretrainingConfig, output_dir: str, is_main: bool):
     """Build profiler context and step callback for the TE training loop.
@@ -282,6 +354,18 @@ def run_te_pretraining(
                 dist.init_process_group(backend=backend)
 
     model.to(device)
+    compile_dynamic = not bool(use_packing and use_static_inp_size)
+    compile_mode = (
+        "max-autotune-no-cudagraphs"
+        if getattr(pretrain_config, "use_compile_max_autotune", False)
+        else None
+    )
+    if model.model.config.use_mhc_lite:
+        _compile_te_mhc_blocks(
+            model,
+            compile_dynamic=compile_dynamic,
+            compile_mode=compile_mode,
+        )
     if model.model.resid_lambdas is not None and model.model.x0_lambdas is not None:
         model.model._blend_resid_x0 = torch.compile(
             model.model._blend_resid_x0,
