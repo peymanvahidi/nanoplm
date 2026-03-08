@@ -1,15 +1,12 @@
 import os
 import math
-import json
-import shutil
 import time
 import torch
 import torch.distributed as dist
 import wandb
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional, Tuple, Union
 from pathlib import Path
+from typing import Optional
 
 from transformers import (
     Trainer,
@@ -30,17 +27,6 @@ from nanoplm.pretraining.utils import compute_batch_setup, get_num_workers, prep
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
-
-# TODO: these are from the master branch
-# from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
-# from nanoplm.pretraining.utils import (
-#     compute_batch_setup,
-#     get_num_workers,
-#     prepare_run_and_steps,
-# )
-# from nanoplm.data.validation import validate_pretrain_dataset
-# from nanoplm.utils.logger import logger
-# from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
 
 
 def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, lr_decay_to_fraction: float, lr_schedule: str = "Linear") -> LambdaLR:
@@ -134,298 +120,12 @@ class TokenTrackingTrainer(Trainer):
         super().log(logs, start_time=start_time, **kwargs)
 
 
-# TODO: in the master branch we have moved all the cofigs to the config.py file, we should move them from here to that file
 class WandbSourceSnapshotCallback(TrainerCallback):
     """Upload run source snapshot once W&B is active."""
 
     def on_train_begin(self, args, state, control, **kwargs):
         upload_run_source_snapshot()
         return control
-
-
-@dataclass
-class PretrainingConfig:
-    # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
-    dataset_dir: Union[str, Path]
-
-    # Checkpoint and output
-    ckp_dir: str = "output/pretraining"
-
-    # Training hyperparameters
-    micro_batch_size: int = 64
-    num_epochs: int = 10
-    warmup_steps: int = 302
-    # RePO activation warmup (optimizer-step based) for pure-torch path.
-    # If None, defaults to warmup_steps (backward-compatible behavior).
-    repo_rope_warmup_steps: Optional[int] = None
-    lr_decay_to_fraction: float = 0.1
-    lr_schedule: str = "cosine"
-    optimizer: str = "normuon"
-    adam_beta1: float = 0.9
-    adam_beta2: float = 0.999
-    adam_epsilon: float = 1e-8
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.0
-    # Gradient clipping threshold (L2 norm). Set float("inf") to disable clipping.
-    max_grad_norm: float = float("inf")
-    # Muon-specific hyperparameters (used only when optimizer == "muon" or "normuon").
-    # Plain learning_rate/weight_decay/adam_* are used for the AdamW sub-optimizer.
-    muon_learning_rate: float = 1e-3
-    muon_weight_decay: float = 0.01
-    muon_cautious_weight_decay: bool = True
-    muon_use_polar_express: bool = False
-    muon_momentum: float = 0.95
-    muon_nesterov: bool = True
-    muon_eps: float = 1e-7
-    # Target effective batch size in tokens per optimizer step.
-    # gradient_accumulation_steps is inferred from this value at runtime.
-    global_batch_size: int = 256000
-    inferred_grad_accum_steps: Optional[int] = None
-    global_batch_size_samples: Optional[int] = None
-    achieved_global_batch_tokens: Optional[int] = None
-
-    # Mixed precision
-    bf16: bool = True
-    tf32: bool = True
-    fp8: bool = False
-
-    # MLM settings
-    mlm_probability: float = 0.3
-    mask_replace_prob: float = 0.8
-    random_token_prob: float = 0.1
-    keep_probability: float = 0.1
-
-    # Logging/checkpointing
-    logging_steps: int = 1
-    eval_steps: int = 250
-    save_steps: int = 5000
-    seed: int = 42
-
-    # Data loading
-    num_workers: Union[int, str] = "auto"
-    prefetch_factor: int = 2
-
-    # Sequence packing (packs multiple sequences per row to eliminate padding waste).
-    # Requires flash attention (varlen path).  Falls back to padding if disabled.
-    use_packing: bool = True
-    # When packing is enabled, force fixed flat token count and bucketed attention metadata
-    # (cu_seqlens/max_seqlen). This enables static-shape execution for torch.compile
-    # (dynamic=False) and improves CUDA graph capture reuse.
-    use_static_inp_size: bool = True
-    # If enabled, pure-torch compile uses mode='max-autotune-no-cudagraphs'.
-    # This may improve steady-state performance, but increases compile/autotune time
-    # noticeably at the start of a run.
-    use_compile_max_autotune: bool = False
-    # TorchInductor Triton setting. Persistent reductions can exceed per-block shared
-    # memory limits for some fused kernels (e.g. LayerNorm backward at hidden >= 1536),
-    # causing "No valid triton configs / out of resource". Set to False to force
-    # non-persistent reduction kernels while keeping torch.compile enabled.
-    compile_triton_persistent_reductions: bool = False
-    # TorchInductor Triton setting. Mix-order reductions can generate persistent
-    # reduction kernels that exceed shared memory limits on some shapes (notably
-    # layernorm backward fusions at larger hidden sizes). Disable to prefer the
-    # legacy reduction codegen while keeping torch.compile enabled.
-    compile_triton_mix_order_reduction: bool = False
-
-    # Profiling (pure_torch / pure_te pipelines). When enabled on rank 0:
-    # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.
-    # - Otherwise: uses PyTorch profiler and exports a Chrome trace (chrome://tracing) to ckp_dir.
-    profiler_enabled: bool = False
-    profiler_start_step: int = 10
-    profiler_end_step: int = 15
-
-    # Distributed training
-    multi_gpu: bool = True
-    world_size: Union[int, str] = "auto"
-    project_name: str = "nanoplm-pretraining"
-
-
-@dataclass
-class ResumeConfig:
-    is_resume: bool
-    checkpoint_dir: str
-    extra_epochs: Optional[int] = None
-    # Schedule override options for resumed training.
-    # When set to None (the YAML default), the corresponding value is read
-    # from the checkpoint's saved pretrain_config.yaml so the original
-    # schedule is reconstructed exactly.  Explicit values override.
-    warmup_steps: Optional[int] = None
-    learning_rate: Optional[float] = None
-    muon_learning_rate: Optional[float] = None
-    lr_schedule: Optional[str] = None
-    lr_decay_to_fraction: Optional[float] = None
-    # reset_scheduler: rebuild the LR schedule from step 0 covering only the
-    # remaining training steps (new warmup + decay).  Useful when you want a
-    # fresh learning-rate curve after a long pause.
-    reset_scheduler: bool = False
-    # skip_warmup: jump straight to peak LR on resume (sets warmup_steps=0).
-    skip_warmup: bool = False
-
-
-def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
-    """Archive checkpoints with steps greater than resume_step.
-
-    When resuming from a checkpoint, any checkpoints with higher step numbers
-    are moved to an archived subdirectory to prevent conflicts while preserving
-    the data for potential future analysis.
-
-    Args:
-        run_dir: The run directory containing checkpoints
-        resume_step: The step number being resumed from
-    """
-    checkpoints_to_archive = []
-
-    for ckpt_dir in run_dir.glob("checkpoint-*"):
-        try:
-            step = int(ckpt_dir.name.split("-")[1])
-            if step > resume_step:
-                checkpoints_to_archive.append((step, ckpt_dir))
-        except (IndexError, ValueError):
-            continue
-
-    if checkpoints_to_archive:
-        checkpoints_to_archive.sort()
-
-        # Create archive directory with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_dir = run_dir / f"archived_{timestamp}"
-        archive_dir.mkdir(exist_ok=True)
-
-        logger.warning(
-            f"Found {len(checkpoints_to_archive)} checkpoint(s) with steps > {resume_step}. "
-            f"Moving to archive: {[s for s, _ in checkpoints_to_archive]}"
-        )
-
-        for step, ckpt_path in checkpoints_to_archive:
-            dest = archive_dir / ckpt_path.name
-            logger.info(f"Archiving checkpoint-{step} to {archive_dir.name}/")
-            shutil.move(str(ckpt_path), str(dest))
-
-        logger.info(f"Archived checkpoints moved to: {archive_dir}")
-
-
-def _prepare_run_and_steps(
-    pretrain_config: "PretrainingConfig",
-    resume_config: Optional["ResumeConfig"],
-    train_samples: int,
-    global_batch_size_samples: int,
-) -> Tuple[str, str, str, int, int, int, int, Optional[int]]:
-    """Prepare run naming/dirs and compute epochs & step intervals.
-
-    Args:
-        pretrain_config: Pretraining configuration
-        resume_config: Resume configuration (if resuming)
-        train_samples: Number of training samples (from manifest)
-        global_batch_size_samples: Effective samples per optimizer step
-
-    Returns a tuple: (run_name, wandb_run_name, output_dir, num_epochs,
-                      logging_steps, eval_steps, save_steps, resume_step)
-    """
-    ckp_root = Path(pretrain_config.ckp_dir)
-
-    # Determine run directory and name
-    if resume_config and resume_config.is_resume:
-        checkpoint_path = Path(resume_config.checkpoint_dir)
-        original_run_name = checkpoint_path.parent.name
-        run_name = original_run_name  # Continue in same directory
-        run_root = ckp_root / run_name
-
-        # Track resume counter for W&B run naming
-        counter_file = run_root / ".resume_counter"
-        if counter_file.exists():
-            try:
-                resume_counter = int(counter_file.read_text().strip()) + 1
-            except (ValueError, FileNotFoundError):
-                resume_counter = 1
-        else:
-            resume_counter = 1
-
-        # Save updated counter
-        counter_file.write_text(str(resume_counter), encoding="utf-8")
-
-        # Create W&B run name with counter
-        wandb_run_name = f"{run_name}-re{resume_counter}"
-        logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
-
-        # Archive any future checkpoints to prevent conflicts
-        resume_step = None
-        try:
-            resume_step = int(checkpoint_path.name.split("-")[1])
-            _archive_future_checkpoints(run_root, resume_step)
-        except (IndexError, ValueError) as e:
-            logger.warning(
-                f"Could not extract step number from checkpoint path: {checkpoint_path.name}. "
-                f"Skipping future checkpoint archival. Error: {e}"
-            )
-    else:
-        base_stamp = datetime.now().strftime("%d%m%H%M")
-        base_name = f"run-{base_stamp}"
-        candidate = base_name
-        if ckp_root.exists():
-            suffix = 2
-            while (ckp_root / candidate).exists():
-                candidate = f"{base_name}-{suffix}"
-                suffix += 1
-        run_name = candidate
-        run_root = ckp_root / run_name
-        wandb_run_name = run_name  # Same as directory name for new runs
-        resume_step = None
-
-    create_dirs(str(run_root))
-    output_dir = str(run_root)
-
-    # Persist run metadata for future resumes
-    try:
-        (Path(output_dir) / "run_name.txt").write_text(run_name, encoding="utf-8")
-    except Exception:
-        pass
-
-    # Compute epochs and step intervals
-    if resume_config and resume_config.is_resume:
-        training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
-
-        if resume_config.extra_epochs is not None and resume_config.extra_epochs > 0:
-            num_epochs = pretrain_config.num_epochs + int(resume_config.extra_epochs)
-        else:
-            num_epochs = pretrain_config.num_epochs
-
-        # Preserve original logging/eval/save intervals when available
-        if training_args_path.exists():
-            try:
-                original_args = torch.load(training_args_path, weights_only=False)
-                logging_steps = original_args.logging_steps
-                eval_steps = original_args.eval_steps
-                save_steps = original_args.save_steps
-                logger.info(
-                    f"Resuming with preserved intervals: save_steps={save_steps}, eval_steps={eval_steps}"
-                )
-            except Exception:
-                # Use ceiling division to ensure at least 1 step per epoch
-                steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
-                total_steps = num_epochs * steps_per_epoch
-                # Use direct step counts from config (clamped to valid range)
-                logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-                eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-                save_steps = max(1, min(total_steps, pretrain_config.save_steps))
-        else:
-            # Use ceiling division to ensure at least 1 step per epoch
-            steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
-            total_steps = num_epochs * steps_per_epoch
-            # Use direct step counts from config (clamped to valid range)
-            logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-            eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-            save_steps = max(1, min(total_steps, pretrain_config.save_steps))
-    else:
-        num_epochs = pretrain_config.num_epochs
-        # Use ceiling division to ensure at least 1 step per epoch
-        steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
-        total_steps = num_epochs * steps_per_epoch
-        # Use direct step counts from config (clamped to valid range)
-        logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-        eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-        save_steps = max(1, min(total_steps, pretrain_config.save_steps))
-
-    return run_name, wandb_run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps, resume_step
 
 
 def run_pretraining(
@@ -545,8 +245,8 @@ def run_pretraining(
     if optimizer_name == "adamw":
         optimizer = torch.optim.AdamW(
             raw_model.parameters(),
-            lr=pretrain_config.learning_rate,
-            weight_decay=pretrain_config.weight_decay,
+            lr=pretrain_config.adam_learning_rate,
+            weight_decay=pretrain_config.adam_weight_decay,
             betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
             eps=pretrain_config.adam_epsilon,
         )
@@ -557,13 +257,12 @@ def run_pretraining(
             stable_cls = torch.optim.AdamW
         optimizer = stable_cls(
             raw_model.parameters(),
-            lr=pretrain_config.learning_rate,
-            weight_decay=pretrain_config.weight_decay,
+            lr=pretrain_config.adam_learning_rate,
+            weight_decay=pretrain_config.adam_weight_decay,
             betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
             eps=pretrain_config.adam_epsilon,
         )
     elif optimizer_name in {"muon", "normuon"}:
-      # TODO: optimzer configs have been moved to the optim.py
         optimizer = build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
@@ -573,7 +272,7 @@ def run_pretraining(
 
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
-        pretrain_config.learning_rate, pretrain_config.lr_decay_to_fraction,
+        pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
         pretrain_config.lr_schedule,
     )
 

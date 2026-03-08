@@ -31,7 +31,8 @@ from nanoplm.pretraining.collator import (
 from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
-from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig, _prepare_run_and_steps
+from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
+from nanoplm.pretraining.utils import prepare_run_and_steps
 from nanoplm.pretraining.pure_pipeline import (
     H100_PEAK_TFLOPS,
     N_PREFETCH_LAYERS_FSDP2,
@@ -249,7 +250,7 @@ def run_te_pretraining(
         eval_steps,
         save_steps,
         _resume_step,
-    ) = _prepare_run_and_steps(
+    ) = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
@@ -469,7 +470,7 @@ def run_te_pretraining(
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
-        pretrain_config.learning_rate, pretrain_config.lr_decay_to_fraction,
+        pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
         pretrain_config.lr_schedule,
     )
 

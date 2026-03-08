@@ -12,7 +12,8 @@ from transformers import DataCollatorForLanguageModeling
 from nanoplm.pretraining.dataset import LazyFastaDataset
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
-from nanoplm.pretraining.pipeline import PretrainingConfig, ResumeConfig, run_pretraining
+from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
+from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.cli.pretrain import from_yaml, pretrain
 
 

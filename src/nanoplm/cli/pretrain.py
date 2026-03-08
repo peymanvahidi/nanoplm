@@ -22,12 +22,6 @@ os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
 
 import torch
 
-# TODO: this is from new branch, maybe there should be some modification here
-# from nanoplm.pretraining.pipeline import (
-#     PretrainingConfig,
-#     ResumeConfig,
-#     run_pretraining,
-# )
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
