@@ -44,6 +44,7 @@ def _is_embedding_or_unembedding_param(name: str) -> bool:
 def build_muon_optimizer(
     model: torch.nn.Module,
     pretrain_config: PretrainingConfig,
+    distributed_mesh=None,
 ):
     raw_model = unwrap_model(model)
 
@@ -97,6 +98,7 @@ def build_muon_optimizer(
         adamw_weight_decay=pretrain_config.adam_weight_decay,
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
         adamw_epsilon=pretrain_config.adam_epsilon,
+        distributed_mesh=distributed_mesh,
     )
 
 polar_express_coeffs = [
