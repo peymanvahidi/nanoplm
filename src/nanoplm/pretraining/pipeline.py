@@ -18,7 +18,6 @@ from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from dion import Muon as DionMuon, NorMuon as DionNorMuon
 from torch.optim.lr_scheduler import LambdaLR
 
 from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, unwrap_model
@@ -214,8 +213,8 @@ def run_pretraining(
         "per_device_eval_batch_size": pretrain_config.micro_batch_size,
         "gradient_accumulation_steps": inferred_grad_accum_steps,
         "num_train_epochs": num_epochs,
-        "adam_learning_rate": pretrain_config.adam_learning_rate,
-        "adam_weight_decay": pretrain_config.adam_weight_decay,
+        "learning_rate": pretrain_config.adam_learning_rate,
+        "weight_decay": pretrain_config.adam_weight_decay,
         "max_grad_norm": pretrain_config.max_grad_norm,
         "logging_strategy": "steps",
         "logging_steps": logging_steps,
