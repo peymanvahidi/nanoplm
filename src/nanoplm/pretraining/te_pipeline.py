@@ -676,6 +676,18 @@ def run_te_pretraining(
     # keeping scaling factors in sync (avoids divergent quantization between data-parallel replicas).
     fp8_group = dist.group.WORLD if (fp8_enabled and distributed and dist.is_initialized()) else None
 
+    # ProRes: set up progressive residual warmup step tracking.
+    _use_prores = getattr(model.config, "use_prores", False) if hasattr(model, "config") else False
+    _prores_model = model.model if hasattr(model, "model") else None
+    if _use_prores and _prores_model is not None and hasattr(_prores_model, "update_prores_alphas"):
+        _prores_model.update_prores_alphas(start_step)
+        logger.info(
+            f"ProRes: T={model.config.prores_T}, "
+            f"last_layer_warmup_done_at_step={model.config.prores_T * model.config.num_hidden_layers}"
+        )
+    else:
+        _prores_model = None
+
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
@@ -872,6 +884,11 @@ def run_te_pretraining(
 
                 global_step += 1
                 profiler_step_cb(global_step)
+
+                # ProRes: update alphas for next step (pure Python, no CUDA sync).
+                if _prores_model is not None:
+                    _prores_model.update_prores_alphas(global_step)
+
                 window_loss += accum_loss.detach()
                 window_steps += 1
                 accum_loss.zero_()

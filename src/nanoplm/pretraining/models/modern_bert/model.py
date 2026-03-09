@@ -56,6 +56,8 @@ class ProtModernBertMLMConfig:
     x0_lambda_init: float = 0.1
     use_repo: bool = False
     repo_after_n_layers: int = 3
+    use_prores: bool = False
+    prores_T: int = 1000
     gradient_checkpointing: bool = False
     gradient_checkpointing_mode: str = "layer"
     use_mhc_lite: bool = False

@@ -536,6 +536,17 @@ def pretrain():
     help="First N layers keep standard RoPE; layers after use RePO (only when --use-repo)",
 )
 @click.option(
+    "--use-prores/--no-use-prores",
+    default=False,
+    help="Enable ProRes: progressive residual warmup (scales each layer's residual from 0 to 1, deeper layers warm up slower).",
+)
+@click.option(
+    "--prores-t",
+    type=int,
+    default=1000,
+    help="ProRes warmup length T for the first layer. Layer l finishes warmup at step T*l.",
+)
+@click.option(
     "--gradient-checkpointing/--no-gradient-checkpointing",
     default=False,
     help="Enable activation checkpointing (recompute transformer layers in backward to save VRAM).",
@@ -680,6 +691,8 @@ def run(
     canon_layers_kernel_size: Optional[int],
     use_repo: bool,
     repo_after_n_layers: int,
+    use_prores: bool,
+    prores_t: int,
     gradient_checkpointing: bool,
     gradient_checkpointing_mode: str,
     use_mhc_lite: bool,
@@ -787,6 +800,8 @@ def run(
         canon_layers_kernel_size=canon_layers_kernel_size,
         use_repo=use_repo,
         repo_after_n_layers=repo_after_n_layers,
+        use_prores=use_prores,
+        prores_T=prores_t,
         gradient_checkpointing=gradient_checkpointing,
         gradient_checkpointing_mode=gradient_checkpointing_mode.lower(),
         use_mhc_lite=use_mhc_lite,
@@ -1035,6 +1050,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  canon_layers_kernel_size: 5  # symmetric Canon kernel size (allowed: 3/5/7, default: 5)\n"
         "  use_repo: false  # RePO: learned per-head positions replacing fixed RoPE (pure_torch only)\n"
         "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
+        "  use_prores: false  # ProRes: progressive residual warmup (deeper layers warm up slower)\n"
+        "  prores_T: 1000  # ProRes warmup length for first layer; layer l finishes at step T*l\n"
         "  use_mhc_lite: false  # mHC-lite: multi-stream residual with doubly stochastic mixing (pure_torch only)\n"
         "  mhc_n_streams: 4  # number of residual streams for mHC-lite (n! permutation matrices)\n"
         "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"

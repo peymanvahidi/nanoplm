@@ -147,6 +147,8 @@ class ModernBertConfig:
     x0_lambda_init: float = 0.1
     use_repo: bool = False
     repo_after_n_layers: int = 3
+    use_prores: bool = False
+    prores_T: int = 1000
     gradient_checkpointing: bool = False
     gradient_checkpointing_mode: Literal["layer", "attn", "attn+mlp"] = "layer"
     use_mhc_lite: bool = False
@@ -931,6 +933,7 @@ class ModernBertEncoderLayer(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         token_mask: Optional[torch.Tensor] = None,
         repo_active: bool = False,
+        prores_alpha: "torch.Tensor | float" = 1.0,
     ) -> torch.Tensor:
         do_ckpt_attn = (
             self.gradient_checkpointing
@@ -973,9 +976,10 @@ class ModernBertEncoderLayer(nn.Module):
                 )
 
             try:
-                x = x + _checkpoint(_attn_branch, x, use_reentrant=False)
+                attn_out = _checkpoint(_attn_branch, x, use_reentrant=False)
             except TypeError:  # older torch checkpoint API
-                x = x + _checkpoint(_attn_branch, x)
+                attn_out = _checkpoint(_attn_branch, x)
+            x = x + prores_alpha * attn_out
         else:
             attn_in = self.attn_norm(x)
             if self.canon_a is not None:
@@ -985,7 +989,7 @@ class ModernBertEncoderLayer(nn.Module):
                     cu_seqlens=cu_seqlens,
                     attention_mask=token_mask,
                 )
-            x = x + self.attn(
+            attn_out = self.attn(
                 attn_in,
                 cos_sin=cos_sin,
                 attn_mask=attn_mask,
@@ -996,6 +1000,7 @@ class ModernBertEncoderLayer(nn.Module):
                 token_mask=token_mask,
                 repo_active=repo_active,
             )
+            x = x + prores_alpha * attn_out
         if self.mlp is not None:
             do_ckpt_mlp = (
                 self.gradient_checkpointing
@@ -1028,9 +1033,10 @@ class ModernBertEncoderLayer(nn.Module):
                     )
 
                 try:
-                    x = x + _checkpoint(_mlp_branch, x, use_reentrant=False)
+                    mlp_out = _checkpoint(_mlp_branch, x, use_reentrant=False)
                 except TypeError:  # older torch checkpoint API
-                    x = x + _checkpoint(_mlp_branch, x)
+                    mlp_out = _checkpoint(_mlp_branch, x)
+                x = x + prores_alpha * mlp_out
             else:
                 mlp_in = self.mlp_norm(x)
                 if self.canon_c is not None:
@@ -1040,12 +1046,13 @@ class ModernBertEncoderLayer(nn.Module):
                         cu_seqlens=cu_seqlens,
                         attention_mask=token_mask,
                     )
-                x = x + self.mlp(
+                mlp_out = self.mlp(
                     mlp_in,
                     position_ids=position_ids,
                     cu_seqlens=cu_seqlens,
                     attention_mask=token_mask,
                 )
+                x = x + prores_alpha * mlp_out
         return x
 
 
@@ -1460,6 +1467,24 @@ class ModernBertModel(nn.Module):
         # RePO: disabled at init; enabled by the training loop after
         # repo_rope_warmup_steps (or warmup_steps fallback).
         self.repo_active = False
+        # ProRes: progressive residual warmup. The training loop calls
+        # update_prores_alphas(step) once per optimizer step.
+        # Stored as a non-persistent buffer so torch.compile treats values as
+        # dynamic (no graph-break / recompilation per unique float).
+        self.use_prores = config.use_prores
+        self._prores_T = config.prores_T
+        _init_val = 0.0 if config.use_prores else 1.0
+        self.register_buffer(
+            "_prores_alphas",
+            torch.full((config.num_hidden_layers,), _init_val),
+            persistent=False,
+        )
+
+    def update_prores_alphas(self, step: int) -> None:
+        """Recompute per-layer ProRes alphas. Call once per optimizer step."""
+        T = self._prores_T
+        vals = [min(step / (T * (l + 1)), 1.0) for l in range(self.config.num_hidden_layers)]
+        self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
 
     def forward(
         self,
@@ -1510,12 +1535,14 @@ class ModernBertModel(nn.Module):
             }
 
             repo_active = self.repo_active
+            prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
             for i, layer in enumerate(self.layers):
                 if self.resid_lambdas is not None:
                     x = self.resid_lambdas[i] * x
                 if self.x0_lambdas is not None:
                     x = x + self.x0_lambdas[i] * x0
+                alpha = prores_alphas[i]
                 lt = layer.attention_type
                 if (
                     self.config.gradient_checkpointing
@@ -1538,6 +1565,7 @@ class ModernBertModel(nn.Module):
                         _window_size=window_size,
                         _position_ids=position_ids,
                         _repo_active: bool = repo_active,
+                        _prores_alpha=alpha,
                     ) -> torch.Tensor:
                         return _layer(
                             x_in,
@@ -1547,6 +1575,7 @@ class ModernBertModel(nn.Module):
                             window_size=_window_size,
                             position_ids=_position_ids,
                             repo_active=_repo_active,
+                            prores_alpha=_prores_alpha,
                         )
 
                     try:
@@ -1562,6 +1591,7 @@ class ModernBertModel(nn.Module):
                         window_size=windows[lt],
                         position_ids=_position_ids,
                         repo_active=repo_active,
+                        prores_alpha=alpha,
                     )
 
             if self.config.use_mhc_lite:
@@ -1608,12 +1638,14 @@ class ModernBertModel(nn.Module):
         }
 
         repo_active = self.repo_active
+        prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
         for i, layer in enumerate(self.layers):
             if self.resid_lambdas is not None:
                 x = self.resid_lambdas[i] * x
             if self.x0_lambdas is not None:
                 x = x + self.x0_lambdas[i] * x0
+            alpha = prores_alphas[i]
             layer_type = layer.attention_type
             if (
                 self.config.gradient_checkpointing
@@ -1632,6 +1664,7 @@ class ModernBertModel(nn.Module):
                     _cos_sin=cos_sin,
                     _token_mask=token_mask,
                     _repo_active: bool = repo_active,
+                    _prores_alpha=alpha,
                 ) -> torch.Tensor:
                     return _layer(
                         x_in,
@@ -1640,6 +1673,7 @@ class ModernBertModel(nn.Module):
                         position_ids=None,
                         token_mask=_token_mask,
                         repo_active=_repo_active,
+                        prores_alpha=_prores_alpha,
                     )
 
                 try:
@@ -1654,6 +1688,7 @@ class ModernBertModel(nn.Module):
                     position_ids=None,
                     token_mask=attention_mask,
                     repo_active=repo_active,
+                    prores_alpha=alpha,
                 )
 
         if self.config.use_mhc_lite:

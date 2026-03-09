@@ -145,6 +145,7 @@ class TEModernBertEncoderLayer(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         is_first_microbatch: Optional[bool] = None,
+        prores_alpha: "torch.Tensor | float" = 1.0,
     ) -> torch.Tensor:
         # x: (total_tokens, hidden) — flat thd layout
         attn_out = self.attn(
@@ -161,14 +162,14 @@ class TEModernBertEncoderLayer(nn.Module):
         )
         if isinstance(attn_out, tuple):
             attn_out = attn_out[0]
-        x = x + attn_out
+        x = x + prores_alpha * attn_out
 
         if self.mlp is None:
             return x
         mlp_out = self.mlp(x, is_first_microbatch=is_first_microbatch)
         if isinstance(mlp_out, tuple):
             mlp_out = mlp_out[0]
-        return x + mlp_out
+        return x + prores_alpha * mlp_out
 
 
 class TEModernBertModel(nn.Module):
@@ -212,6 +213,24 @@ class TEModernBertModel(nn.Module):
         self._rope_full_freqs: Optional[torch.Tensor] = None
         self._rope_sliding_freqs: Optional[torch.Tensor] = None
         self._blend_resid_x0 = _blend_resid_x0
+        # ProRes: progressive residual warmup. The training loop calls
+        # update_prores_alphas(step) once per optimizer step.
+        # Stored as a non-persistent buffer (tensor) for consistency with
+        # the pure-torch path (and future torch.compile compatibility).
+        self.use_prores = config.use_prores
+        self._prores_T = config.prores_T
+        _init_val = 0.0 if config.use_prores else 1.0
+        self.register_buffer(
+            "_prores_alphas",
+            torch.full((config.num_hidden_layers,), _init_val),
+            persistent=False,
+        )
+
+    def update_prores_alphas(self, step: int) -> None:
+        """Recompute per-layer ProRes alphas. Call once per optimizer step."""
+        T = self._prores_T
+        vals = [min(step / (T * (l + 1)), 1.0) for l in range(self.config.num_hidden_layers)]
+        self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
 
     def _get_rope_freqs(self, max_seqlen: int):
         """Return cached RoPE frequency tensors, computing on first call."""
@@ -254,6 +273,7 @@ class TEModernBertModel(nn.Module):
         rope_full_freqs, rope_sliding_freqs = self._get_rope_freqs(max_seqlen)
         use_resid = self.resid_lambdas is not None
         use_x0 = self.x0_lambdas is not None
+        prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
         for i, layer in enumerate(self.layers):
             if use_resid and use_x0:
@@ -267,8 +287,9 @@ class TEModernBertModel(nn.Module):
                 x = self.resid_lambdas[i] * x
             elif use_x0:
                 x = x + self.x0_lambdas[i] * x0
+            alpha = prores_alphas[i]
             rope = rope_full_freqs if layer.attention_type == "full_attention" else rope_sliding_freqs
-            x = layer(x, rotary_pos_emb=rope, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, is_first_microbatch=is_first_microbatch)
+            x = layer(x, rotary_pos_emb=rope, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, is_first_microbatch=is_first_microbatch, prores_alpha=alpha)
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]

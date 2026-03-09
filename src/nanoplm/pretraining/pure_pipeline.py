@@ -1447,6 +1447,18 @@ def run_pure_pretraining(
             logger.warning("RePO: use_repo=True but model has no repo_active attribute")
             _use_repo = False
 
+    # ProRes: set up progressive residual warmup step tracking.
+    _use_prores = getattr(_cfg, "use_prores", False)
+    _prores_model = _raw.model if hasattr(_raw, "model") else None
+    if _use_prores and _prores_model is not None and hasattr(_prores_model, "update_prores_alphas"):
+        _prores_model.update_prores_alphas(start_step)
+        logger.info(
+            f"ProRes: T={_cfg.prores_T}, "
+            f"last_layer_warmup_done_at_step={_cfg.prores_T * _cfg.num_hidden_layers}"
+        )
+    else:
+        _prores_model = None
+
     # ---- Training loop ----
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -1653,6 +1665,10 @@ def run_pure_pretraining(
 
                 global_step += 1
                 profiler_step_cb(global_step)
+
+                # ProRes: update alphas for next step (pure Python, no CUDA sync).
+                if _prores_model is not None:
+                    _prores_model.update_prores_alphas(global_step)
 
                 # RePO: activate once RePO warmup completes.
                 if _use_repo and global_step == repo_rope_warmup_steps:
