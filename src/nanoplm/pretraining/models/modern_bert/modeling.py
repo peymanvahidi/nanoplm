@@ -25,7 +25,7 @@ from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
-USE_ACTIVATION_CHECKPOINTING_CANON = True
+USE_ACTIVATION_CHECKPOINTING_CANON = False
 # mHC-lite selective recompute (paper-inspired):
 # checkpoint only mHC pre/post kernels, keep heavy layer function outside.
 USE_ACTIVATION_CHECKPOINTING_MHC = False

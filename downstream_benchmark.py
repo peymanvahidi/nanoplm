@@ -33,13 +33,15 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import MISSING, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Generator, Tuple
+from typing import Any, Iterable, Generator, Tuple
 
 import torch
 import yaml
@@ -49,19 +51,6 @@ from tqdm import tqdm
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
-
-# -- biotrainer imports ------------------------------------------------------
-from biotrainer.autoeval import autoeval_pipeline
-from biotrainer.autoeval.autoeval import (
-    get_unique_framework_sequences,
-    _setup_embedding_functions,
-    _check_h5_file,
-)
-from biotrainer.autoeval.config_bank import AutoEvalConfigBank
-from biotrainer.autoeval.report_manager import ReportManager
-from biotrainer.protocols import Protocol
-from biotrainer.utilities.executer import parse_config_file_and_execute_run
-
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -94,37 +83,121 @@ def load_model_config_from_checkpoint(checkpoint_dir: str | Path) -> ProtModernB
 
 def _model_config_from_dict(m: dict) -> ProtModernBertMLMConfig:
     """Construct a ProtModernBertMLMConfig from a flat dict of model fields."""
-    return ProtModernBertMLMConfig(
-        vocab_size=m.get("vocab_size", 32),
-        hidden_size=m["hidden_size"],
-        intermediate_size=m["intermediate_size"],
-        num_hidden_layers=m["num_hidden_layers"],
-        num_attention_heads=m["num_attention_heads"],
-        mlp_activation=m.get("mlp_activation", "swiglu"),
-        mlp_dropout=m.get("mlp_dropout", 0.0),
-        mlp_bias=m.get("mlp_bias", False),
-        no_mlp_on_first_layer=m.get("no_mlp_on_first_layer", True),
-        attention_bias=m.get("attention_bias", False),
-        attention_dropout=m.get("attention_dropout", 0.0),
-        classifier_activation=m.get("classifier_activation", "gelu"),
-        use_resid_lambdas=m.get("use_resid_lambdas", False),
-        use_x0_lambdas=m.get("use_x0_lambdas", False),
-        use_qk_norm=m.get("use_qk_norm", False),
-        use_canon_layers=m.get("use_canon_layers", False),
-        canon_layers_mode=m.get("canon_layers_mode", "abcd"),
-        canon_layers_kernel_size=m.get("canon_layers_kernel_size", None),
-        use_repo=m.get("use_repo", False),
-        repo_after_n_layers=m.get("repo_after_n_layers", 3),
-        use_mhc_lite=m.get("use_mhc_lite", False),
-        mhc_n_streams=m.get("mhc_n_streams", 4),
-        mhc_triton_fused=m.get("mhc_triton_fused", False),
-        mhc_lite_wrapping_level=m.get("mhc_lite_wrapping_level", "layer"),
+    kwargs: dict[str, Any] = {}
+    missing_required: list[str] = []
+
+    for field in fields(ProtModernBertMLMConfig):
+        if not field.init:
+            continue
+        if field.name in m:
+            kwargs[field.name] = m[field.name]
+        elif field.default is not MISSING:
+            kwargs[field.name] = field.default
+        elif field.default_factory is not MISSING:
+            kwargs[field.name] = field.default_factory()
+        else:
+            missing_required.append(field.name)
+
+    if missing_required:
+        raise KeyError(
+            "Missing required model config field(s): "
+            + ", ".join(sorted(missing_required))
+        )
+
+    return ProtModernBertMLMConfig(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# biotrainer imports
+# ---------------------------------------------------------------------------
+
+def _load_biotrainer_symbols() -> dict[str, Any]:
+    """Import biotrainer lazily so checkpoint helpers remain importable in tests."""
+    from biotrainer.autoeval import autoeval_pipeline
+    from biotrainer.autoeval.autoeval import (
+        _check_h5_file,
+        _setup_embedding_functions,
+        get_unique_framework_sequences,
     )
+    from biotrainer.autoeval.config_bank import AutoEvalConfigBank
+    from biotrainer.autoeval.report_manager import ReportManager
+    from biotrainer.protocols import Protocol
+    from biotrainer.utilities.executer import parse_config_file_and_execute_run
+
+    return {
+        "autoeval_pipeline": autoeval_pipeline,
+        "get_unique_framework_sequences": get_unique_framework_sequences,
+        "_setup_embedding_functions": _setup_embedding_functions,
+        "_check_h5_file": _check_h5_file,
+        "AutoEvalConfigBank": AutoEvalConfigBank,
+        "ReportManager": ReportManager,
+        "Protocol": Protocol,
+        "parse_config_file_and_execute_run": parse_config_file_and_execute_run,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
+
+def _checkpoint_step(checkpoint_dir: str | Path) -> int:
+    name = Path(checkpoint_dir).name
+    if not name.startswith("checkpoint-"):
+        return -1
+    try:
+        return int(name.split("-", 1)[1])
+    except ValueError:
+        return -1
+
+
+def _find_latest_checkpoint(checkpoint_root: str | Path) -> Path:
+    checkpoint_root = Path(checkpoint_root)
+    if not checkpoint_root.exists():
+        raise FileNotFoundError(f"Checkpoint root not found: {checkpoint_root}")
+
+    checkpoints = [
+        path for path in checkpoint_root.glob("run-*/checkpoint-*")
+        if path.is_dir()
+    ]
+    if not checkpoints:
+        raise FileNotFoundError(
+            f"No checkpoint-* directories found under {checkpoint_root}"
+        )
+
+    return max(
+        checkpoints,
+        key=lambda path: (path.stat().st_mtime, _checkpoint_step(path), str(path)),
+    )
+
+
+def resolve_checkpoint_dir(
+    checkpoint_dir: str | Path,
+    checkpoint_root: str | Path = "output/pretraining_checkpoints",
+) -> Path:
+    """Resolve `latest`, run directories, or explicit checkpoint paths."""
+    checkpoint_arg = Path(checkpoint_dir)
+
+    if str(checkpoint_dir).strip().lower() == "latest":
+        return _find_latest_checkpoint(checkpoint_root).resolve()
+
+    if checkpoint_arg.is_dir() and checkpoint_arg.name.startswith("checkpoint-"):
+        return checkpoint_arg.resolve()
+
+    if checkpoint_arg.is_dir():
+        checkpoints = [
+            path for path in checkpoint_arg.iterdir()
+            if path.is_dir() and path.name.startswith("checkpoint-")
+        ]
+        if checkpoints:
+            return max(
+                checkpoints,
+                key=lambda path: (_checkpoint_step(path), path.stat().st_mtime, str(path)),
+            ).resolve()
+
+    raise FileNotFoundError(
+        "Checkpoint directory must be a checkpoint-* directory, a run-* directory, "
+        f"or the keyword 'latest'. Got: {checkpoint_dir}"
+    )
 
 def load_checkpoint(
     checkpoint_dir: str | Path,
@@ -146,10 +219,39 @@ def load_checkpoint(
     model.to(device)
     model.eval()
 
-    # Activate RePO learned positions if the model was trained with it
+    training_state_path = checkpoint_dir / "training_state.json"
+    checkpoint_step = 0
+    if training_state_path.exists():
+        checkpoint_state = json.loads(training_state_path.read_text(encoding="utf-8"))
+        checkpoint_step = int(checkpoint_state.get("global_step", 0))
+
+    # Restore step-dependent runtime state that is intentionally not persisted
+    # in the model weights.
+    if getattr(config, "use_prores", False) and hasattr(model.model, "update_prores_alphas"):
+        model.model.update_prores_alphas(checkpoint_step)
+        print(f"  ProRes restored for global_step={checkpoint_step}")
+
     if config.use_repo:
-        model.model.repo_active = True
-        print(f"  RePO activated (repo_after_n_layers={config.repo_after_n_layers})")
+        repo_warmup_steps = 0
+        pretrain_cfg_path = checkpoint_dir / "pretrain_config.yaml"
+        if pretrain_cfg_path.exists():
+            with open(pretrain_cfg_path) as f:
+                pretrain_cfg = yaml.safe_load(f) or {}
+            repo_warmup_steps = int(
+                pretrain_cfg.get(
+                    "repo_rope_warmup_steps",
+                    pretrain_cfg.get("warmup_steps", 0),
+                )
+            )
+        elif training_state_path.exists():
+            repo_warmup_steps = int(checkpoint_state.get("warmup_steps", 0))
+
+        model.model.repo_active = checkpoint_step >= repo_warmup_steps
+        state = "activated" if model.model.repo_active else "inactive"
+        print(
+            "  RePO "
+            f"{state} (step={checkpoint_step}, repo_rope_warmup_steps={repo_warmup_steps})"
+        )
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model loaded: {n_params:.1f}M parameters on {device}")
@@ -244,6 +346,9 @@ def embed_per_sequence(
 def _run_single_task(task_name: str, config: dict) -> tuple[str, dict | None]:
     """Run a single biotrainer task. Returns ``(task_name, result_dict)``."""
     try:
+        parse_config_file_and_execute_run = _load_biotrainer_symbols()[
+            "parse_config_file_and_execute_run"
+        ]
         result = parse_config_file_and_execute_run(config=config)
         return task_name, result
     except Exception as e:
@@ -266,7 +371,16 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint-dir",
         type=str,
         required=True,
-        help="Path to the checkpoint directory (contains pytorch_model.bin).",
+        help=(
+            "Checkpoint path. Accepts a checkpoint-* directory, a run-* directory, "
+            "or the keyword 'latest'."
+        ),
+    )
+    p.add_argument(
+        "--checkpoint-root",
+        type=str,
+        default="output/pretraining_checkpoints",
+        help="Root searched when --checkpoint-dir=latest.",
     )
     p.add_argument(
         "--framework",
@@ -329,6 +443,9 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    checkpoint_dir = resolve_checkpoint_dir(args.checkpoint_dir, args.checkpoint_root)
+    print(f"Resolved checkpoint: {checkpoint_dir}")
+    biotrainer = _load_biotrainer_symbols()
 
     # Device selection
     if args.device:
@@ -341,17 +458,17 @@ def main():
 
     # Load config: prefer model_config.yaml inside the checkpoint (self-contained),
     # fall back to the external pretrain.yaml.
-    model_config = load_model_config_from_checkpoint(args.checkpoint_dir)
+    model_config = load_model_config_from_checkpoint(checkpoint_dir)
     if model_config is not None:
-        print(f"Loaded model config from checkpoint: {args.checkpoint_dir}/model_config.yaml")
+        print(f"Loaded model config from checkpoint: {checkpoint_dir}/model_config.yaml")
     else:
         print(f"No model_config.yaml in checkpoint, falling back to {args.config_yaml}")
         model_config = load_model_config(args.config_yaml)
-    model = load_checkpoint(args.checkpoint_dir, model_config, device)
+    model = load_checkpoint(checkpoint_dir, model_config, device)
     tokenizer = model.tokenizer
 
     # Embedder name for the report
-    embedder_name = args.embedder_name or Path(args.checkpoint_dir).resolve().stem
+    embedder_name = args.embedder_name or checkpoint_dir.stem
     print(f"Embedder name: {embedder_name}")
 
     # Build embedding closures
@@ -367,7 +484,7 @@ def main():
         print("=" * 60)
 
         current_progress = None
-        for progress in autoeval_pipeline(
+        for progress in biotrainer["autoeval_pipeline"](
             embedder_name=embedder_name,
             framework=args.framework,
             output_dir=args.output_dir,
@@ -412,14 +529,14 @@ def main():
 
     # Use biotrainer's internal helpers to get tasks, sequences, and setup
     task_config_tuples, unique_per_residue, unique_per_sequence = (
-        get_unique_framework_sequences(
+        biotrainer["get_unique_framework_sequences"](
             framework=args.framework,
             min_seq_length=args.min_seq_length,
             max_seq_length=args.max_seq_length,
         )
     )
 
-    embedding_fn_per_residue, embedding_fn_per_sequence = _setup_embedding_functions(
+    embedding_fn_per_residue, embedding_fn_per_sequence = biotrainer["_setup_embedding_functions"](
         embedder_name=embedder_name,
         output_dir=output_dir,
         use_half_precision=False,
@@ -435,8 +552,12 @@ def main():
         [sr.seq for _, sr in unique_per_sequence.items()]
     )
 
-    _check_h5_file("per-residue", embeddings_file_per_residue, len(unique_per_residue))
-    _check_h5_file("per-sequence", embeddings_file_per_sequence, len(unique_per_sequence))
+    biotrainer["_check_h5_file"](
+        "per-residue", embeddings_file_per_residue, len(unique_per_residue)
+    )
+    biotrainer["_check_h5_file"](
+        "per-sequence", embeddings_file_per_sequence, len(unique_per_sequence)
+    )
 
     print(f"Embeddings done in {time.time() - t0:.1f}s")
 
@@ -447,7 +568,7 @@ def main():
     # --- Phase 2: Prepare task configs -----------------------------------
     print("\n>>> Phase 2: Preparing task configs …")
     prepared_tasks: list[tuple] = []  # (task, task_name, config_dict)
-    report_manager = ReportManager(
+    report_manager = biotrainer["ReportManager"](
         embedder_name=embedder_name,
         training_date=str(datetime.now().date().isoformat()),
         min_seq_len=args.min_seq_length,
@@ -459,12 +580,13 @@ def main():
         task_output_dir = output_dir / task_name
 
         # Pick the right embeddings file based on protocol
-        if Protocol.from_string(cfg["protocol"]) in Protocol.using_per_sequence_embeddings():
+        protocol = biotrainer["Protocol"]
+        if protocol.from_string(cfg["protocol"]) in protocol.using_per_sequence_embeddings():
             task_emb_file = embeddings_file_per_sequence
         else:
             task_emb_file = embeddings_file_per_residue
 
-        cfg = AutoEvalConfigBank.add_custom_values_to_config(
+        cfg = biotrainer["AutoEvalConfigBank"].add_custom_values_to_config(
             config=cfg,
             embedder_name=embedder_name,
             embeddings_file=task_emb_file,

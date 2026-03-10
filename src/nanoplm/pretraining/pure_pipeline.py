@@ -1514,7 +1514,10 @@ def run_pure_pretraining(
                     f"Fast-forwarding dataloader by {resume_micro_step} packed batches "
                     f"(index-only, no data I/O)..."
                 )
-                skipped_samples = train_ds.fast_forward(resume_micro_step)
+                skipped_samples = train_ds.fast_forward(
+                    resume_micro_step,
+                    epoch=resume_epoch,
+                )
                 logger.info(
                     f"Fast-forward complete: will skip {skipped_samples} underlying samples "
                     f"to resume at micro_step {resume_micro_step}"

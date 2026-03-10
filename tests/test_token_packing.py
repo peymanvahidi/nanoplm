@@ -1,6 +1,7 @@
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+import pickle
+from torch.utils.data import Dataset, DataLoader, SequentialSampler
 from nanoplm.pretraining.dataset import TokenPackingDataset
 from nanoplm.pretraining.collator import DataCollatorWithFlattening, ProtDataCollatorForLM
 
@@ -55,6 +56,32 @@ def test_token_packing_len_matches_iterator_with_split():
     batches = list(packed_ds)
 
     assert len(packed_ds) == len(batches) == 3
+
+
+def test_token_packing_fast_forward_applies_only_to_target_epoch():
+    lengths = [10] * 10
+    ds = MockDataset(lengths)
+    packed_ds = TokenPackingDataset(
+        ds,
+        max_tokens_per_batch=30,
+        drop_last=False,
+        split_samples=False,
+        sampler=SequentialSampler(ds),
+    )
+
+    consumed = packed_ds.fast_forward(1, epoch=5)
+
+    packed_ds.set_epoch(5)
+    worker_epoch_5 = pickle.loads(pickle.dumps(packed_ds))
+    resumed_batches = list(worker_epoch_5)
+
+    packed_ds.set_epoch(6)
+    worker_epoch_6 = pickle.loads(pickle.dumps(packed_ds))
+    next_epoch_batches = list(worker_epoch_6)
+
+    assert consumed == 3
+    assert len(resumed_batches) == 3
+    assert len(next_epoch_batches) == 4
 
 def test_data_collator_flattening():
     # Mock tokenizer

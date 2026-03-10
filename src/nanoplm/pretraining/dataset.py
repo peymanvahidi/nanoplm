@@ -500,6 +500,8 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         self.sampler = sampler
         self._epoch = 0
         self._cached_len: Optional[int] = None
+        self._skip_samples = 0
+        self._skip_epoch: Optional[int] = None
 
     def _resolve_sample_lengths(self) -> list[int]:
         if hasattr(self.dataset, "get_all_sequence_lengths"):
@@ -575,9 +577,12 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         """
         samples = []
         current_length = 0
-        skip_samples = getattr(self, "_skip_samples", 0)
+        skip_epoch = getattr(self, "_skip_epoch", None)
+        skip_samples = getattr(self, "_skip_samples", 0) if skip_epoch == self._epoch else 0
         if skip_samples > 0:
-            self._skip_samples = 0  # reset so next epoch starts from 0
+            # Reset in the local worker copy after consuming the scheduled skip.
+            self._skip_samples = 0
+            self._skip_epoch = None
 
         if self.sampler is not None:
              # Handle DataLoader worker sharding if using multiple workers
@@ -664,7 +669,7 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         if not self.drop_last and samples:
             yield samples
 
-    def fast_forward(self, n_batches: int) -> int:
+    def fast_forward(self, n_batches: int, epoch: Optional[int] = None) -> int:
         """Advance the dataset state by *n_batches* without reading data.
 
         Replays the packing logic on sequence lengths alone (read from index
@@ -677,6 +682,7 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         """
         if n_batches <= 0:
             self._skip_samples = 0
+            self._skip_epoch = None
             return 0
 
         lengths = self._resolve_sample_lengths()
@@ -709,6 +715,7 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
                         current_length -= self.max_tokens_per_batch
 
         self._skip_samples = samples_consumed
+        self._skip_epoch = self._epoch if epoch is None else int(epoch)
         return samples_consumed
 
     def set_epoch(self, epoch: int):
