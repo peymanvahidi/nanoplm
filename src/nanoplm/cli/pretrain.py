@@ -102,6 +102,35 @@ def _populate_batch_setup(cfg: PretrainingConfig) -> None:
     cfg.global_batch_size_samples = global_batch_size_samples
     cfg.achieved_global_batch_tokens = achieved_global_batch_tokens
 
+
+def _normalize_distributed_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in {"fsdp", "ddp"}:
+        raise click.ClickException(
+            f"Unsupported distributed_mode={value!r}. Expected one of: fsdp, ddp."
+        )
+    return mode
+
+
+def _validate_distributed_mode(
+    cfg: PretrainingConfig,
+    *,
+    pure_torch: bool,
+    pure_te: bool,
+) -> None:
+    cfg.distributed_mode = _normalize_distributed_mode(cfg.distributed_mode)
+    cfg.ddp_bucket_cap_mb = int(cfg.ddp_bucket_cap_mb)
+    if cfg.ddp_bucket_cap_mb <= 0:
+        raise click.ClickException("ddp_bucket_cap_mb must be > 0.")
+    if not (pure_torch or pure_te):
+        return
+    if cfg.distributed_mode == "ddp" and not cfg.multi_gpu:
+        raise click.ClickException("distributed_mode=ddp requires multi_gpu=true.")
+    if cfg.distributed_mode != "ddp" and cfg.ddp_bucket_cap_mb != 25:
+        raise click.ClickException(
+            "ddp_bucket_cap_mb applies only when distributed_mode=ddp."
+        )
+
 @click.group(name="pretrain")
 @click.help_option(
     "--help",
@@ -285,6 +314,11 @@ def pretrain():
     help="Random seed"
 )
 @click.option(
+    "--debug-non-finite-params/--no-debug-non-finite-params",
+    default=True,
+    help="Check parameters for non-finite values after every optimizer step.",
+)
+@click.option(
     "--mask-replace-prob",
     type=float,
     default=0.8,
@@ -351,10 +385,24 @@ def pretrain():
     help="Enable multi-GPU training"
 )
 @click.option(
+    "--distributed-mode",
+    type=click.Choice(["fsdp", "ddp"], case_sensitive=False),
+    default="fsdp",
+    show_default=True,
+    help="Distributed wrapper for multi-GPU runs. DDP is supported only in pure-torch / pure-te.",
+)
+@click.option(
     "--world-size",
     type=str,
     default="auto",
     help="Total number of processes for distributed training; use 'auto' to use all available GPUs"
+)
+@click.option(
+    "--ddp-bucket-cap-mb",
+    type=int,
+    default=25,
+    show_default=True,
+    help="DDP gradient bucket size in MB (only used when --distributed-mode=ddp).",
 )
 @click.option(
     "--project-name",
@@ -662,6 +710,7 @@ def run(
     eval_steps: int,
     save_steps: int,
     seed: int,
+    debug_non_finite_params: bool,
     mask_replace_prob: float,
     random_token_prob: float,
     keep_probability: float,
@@ -677,7 +726,9 @@ def run(
     tf32: bool,
     fp8: bool,
     multi_gpu: bool,
+    distributed_mode: str,
     world_size: str,
+    ddp_bucket_cap_mb: int,
     project_name: str,
     resume: bool,
     resume_checkpoint_dir: str,
@@ -760,6 +811,7 @@ def run(
         eval_steps=eval_steps,
         save_steps=save_steps,
         seed=seed,
+        debug_non_finite_params=debug_non_finite_params,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
@@ -771,7 +823,9 @@ def run(
         tf32=tf32,
         fp8=fp8,
         multi_gpu=multi_gpu,
+        distributed_mode=distributed_mode,
         world_size=world_size,
+        ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         project_name=project_name,
     )
     
@@ -808,6 +862,7 @@ def run(
             "resid_lambdas scales the hidden state before each layer, which breaks "
             "mHC-lite's doubly-stochastic stability guarantees."
         )
+    _validate_distributed_mode(cfg, pure_torch=pure_torch, pure_te=pure_te)
 
     _populate_batch_setup(cfg)
 
@@ -1006,6 +1061,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.num_kv_heads != model.num_attention_heads requires pure_torch: true / --pure-torch "
             "or pure_te: true / --pure-te. The HF path does not implement GQA."
         )
+    _validate_distributed_mode(
+        pretrain_config,
+        pure_torch=pure_torch,
+        pure_te=pure_te,
+    )
     _populate_batch_setup(pretrain_config)
 
     _set_seed_for_init(pretrain_config.seed)
@@ -1153,6 +1213,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  eval_steps: 250\n"
         "  save_steps: 5000\n"
         "  seed: 42\n"
+        "  debug_non_finite_params: true  # checks params for NaN/Inf after every optimizer step\n"
         "  num_workers: \"auto\"\n"
         "  prefetch_factor: 2\n"
         "  use_packing: true\n"
@@ -1171,7 +1232,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  tf32: true\n"
         "  fp8: false\n"
         "  multi_gpu: true\n"
+        "  distributed_mode: \"fsdp\"  # fsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n"
         "  world_size: 'auto'\n"
+        "  ddp_bucket_cap_mb: 25  # only used when distributed_mode: ddp in pure_torch/pure_te; HF path ignores it\n"
         "  project_name: \"nanoplm-pretraining\"\n"
         "  profiler_enabled: false\n"
         "  profiler_start_step: 10\n"
@@ -1313,6 +1376,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         'compile_triton_persistent_reductions',
         'compile_triton_mix_order_reduction',
         'profiler_enabled',
+        'debug_non_finite_params',
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]

@@ -62,6 +62,7 @@ class PretrainingConfig:
     eval_steps: int = 250
     save_steps: int = 5000
     seed: int = 42
+    debug_non_finite_params: bool = True
 
     # Data loading
     num_workers: Union[int, str] = "auto"
@@ -99,6 +100,8 @@ class PretrainingConfig:
     # Distributed training
     multi_gpu: bool = True
     world_size: Union[int, str] = "auto"
+    distributed_mode: str = "fsdp"
+    ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
 
 

@@ -37,6 +37,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -95,10 +96,21 @@ def _set_seed(seed: int) -> None:
 
 
 def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
-    return {
-        k: v.to(device, non_blocking=True) if torch.is_tensor(v) else v
-        for k, v in batch.items()
-    }
+    moved = {}
+    for k, v in batch.items():
+        if not torch.is_tensor(v):
+            moved[k] = v
+            continue
+        if v.device == device:
+            moved[k] = v
+            continue
+        # DataLoader pinning should cover the common path already, but custom
+        # collators and batch_size=None loaders can still surface pageable
+        # tensors. Pin them here so the transfer can stay non-blocking.
+        if device.type == "cuda" and v.device.type == "cpu" and not v.is_pinned():
+            v = v.pin_memory()
+        moved[k] = v.to(device, non_blocking=True)
+    return moved
 
 
 def _format_vram_for_log(
@@ -275,6 +287,25 @@ def _dist_barrier(local_rank: int) -> None:
         dist.barrier(device_ids=[local_rank])
     else:
         dist.barrier()
+
+
+def _get_distributed_mode(cfg: PretrainingConfig, *, distributed: bool) -> str:
+    mode = str(getattr(cfg, "distributed_mode", "fsdp")).strip().lower()
+    if mode not in {"fsdp", "ddp"}:
+        raise ValueError(f"Unsupported distributed_mode={mode!r}. Expected 'fsdp' or 'ddp'.")
+    if not distributed and mode == "ddp":
+        raise ValueError("distributed_mode='ddp' requires multi_gpu=True.")
+    return mode
+
+
+def _checkpoint_distributed_mode(*, distributed: bool, distributed_mode: str) -> str:
+    return distributed_mode if distributed else "single"
+
+
+def _ddp_sync_context(model: torch.nn.Module, *, distributed_mode: str, sync: bool):
+    if distributed_mode == "ddp" and hasattr(model, "no_sync") and not sync:
+        return model.no_sync()
+    return nullcontext()
 
 
 def _make_pure_profiler(
@@ -683,8 +714,12 @@ def _sync_train_loader_len(
 # Eval
 # ---------------------------------------------------------------------------
 
+@torch.compiler.disable
 @torch.inference_mode()
 def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
+    # Eval intentionally stays eager. The eval loader uses the padded path
+    # (no cu_seqlens/max_seqlen), which differs from packed training and can
+    # otherwise trigger Dynamo recompiles of helper submodules.
     model.eval()
     total_loss, total_samples = 0.0, 0
 
@@ -729,14 +764,14 @@ def _to_full_tensors(obj):
 def _save_checkpoint(
     model, optimizer, scheduler, global_step, epoch,
     output_dir, logging_steps, eval_steps, save_steps,
-    distributed=False, is_main=True,
+    distributed=False, is_main=True, distributed_mode="fsdp",
     model_config=None, manifest=None,
     pretrain_config=None, total_steps=None, warmup_steps=None,
     dataset_fingerprint=None,
 ) -> None:
     ckpt = Path(output_dir) / f"checkpoint-{global_step}"
 
-    if distributed:
+    if distributed and distributed_mode == "fsdp":
         model_sd = get_model_state_dict(
             model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
         )
@@ -766,6 +801,10 @@ def _save_checkpoint(
     training_state = dict(
         global_step=global_step, epoch=epoch,
         logging_steps=logging_steps, eval_steps=eval_steps, save_steps=save_steps,
+        distributed_mode=_checkpoint_distributed_mode(
+            distributed=distributed,
+            distributed_mode=distributed_mode,
+        ),
     )
     if total_steps is not None:
         training_state["total_steps"] = total_steps
@@ -808,7 +847,7 @@ def _save_checkpoint(
 
 def _load_checkpoint(
     model, optimizer, scheduler, checkpoint_dir, device,
-    distributed=False, load_scheduler=True,
+    distributed=False, load_scheduler=True, distributed_mode="fsdp",
 ) -> Tuple[int, int]:
     """Restore model, optimizer, (optionally) scheduler, and RNG states.
 
@@ -819,19 +858,42 @@ def _load_checkpoint(
             instead of relying on the pickled ``lr_lambda``.
     """
     ckp = Path(checkpoint_dir)
+    state_path = ckp / "training_state.json"
+    training_state = None
+    if state_path.exists():
+        training_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+    current_mode = _checkpoint_distributed_mode(
+        distributed=distributed,
+        distributed_mode=distributed_mode,
+    )
+    checkpoint_mode = (
+        None if training_state is None else training_state.get("distributed_mode")
+    )
+    mode_mismatch = checkpoint_mode is not None and checkpoint_mode != current_mode
 
     model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
-    if distributed:
+    if distributed and distributed_mode == "fsdp":
         set_model_state_dict(model, model_sd, options=StateDictOptions(full_state_dict=True))
     else:
         model.load_state_dict(model_sd)
 
-    opt_sd = torch.load(ckp / "optimizer.pt", map_location=device, weights_only=True)
+    opt_path = ckp / "optimizer.pt"
+    if mode_mismatch and opt_path.exists():
+        raise RuntimeError(
+            "Checkpoint distributed_mode mismatch: "
+            f"checkpoint={checkpoint_mode}, current={current_mode}. "
+            "Model weights were loaded, but optimizer-state resume across FSDP/DDP/single "
+            "modes is not supported. Restart with a fresh optimizer state or resume "
+            "with the matching distributed_mode."
+        )
+
+    opt_sd = torch.load(opt_path, map_location=device, weights_only=True)
 
     # When resuming under FSDP2, the checkpoint contains full (unsharded) optimizer
     # state tensors but the live parameters are sharded across ranks. We must slice
     # each optimizer buffer to match the corresponding parameter's local shard shape.
-    if distributed and dist.is_initialized():
+    if distributed and distributed_mode == "fsdp" and dist.is_initialized():
         rank = dist.get_rank()
         world = dist.get_world_size()
 
@@ -911,9 +973,8 @@ def _load_checkpoint(
         np.random.set_state(rng["numpy_rng"])
         random.setstate(rng["python_rng"])
 
-    state_path = ckp / "training_state.json"
-    if state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+    if training_state is not None:
+        state = training_state
         return int(state.get("global_step", 0)), int(state.get("epoch", 0))
     return 0, 0
 
@@ -1172,6 +1233,8 @@ def run_pure_pretraining(
     # ---- Distributed init ----
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     distributed = bool(pretrain_config.multi_gpu)
+    distributed_mode = _get_distributed_mode(pretrain_config, distributed=distributed)
+    ddp_bucket_cap_mb = int(getattr(pretrain_config, "ddp_bucket_cap_mb", 25))
 
 
     if distributed:
@@ -1264,6 +1327,7 @@ def run_pure_pretraining(
 
     # ---- Model to device + compile + FSDP ----
     model.to(device)
+    base_model = model
 
     compile_dynamic = not bool(use_packing and use_static_inp_size)
 
@@ -1274,27 +1338,29 @@ def run_pure_pretraining(
     )
 
     fsdp_mesh = None
-    if distributed:
+    optimizer_dist = None
+    if distributed and distributed_mode == "fsdp":
         fsdp_kwargs: dict = {}
         if use_bf16:
             fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
-        for layer in model.model.layers:
+        for layer in base_model.model.layers:
             _fully_shard_transformer_layer(layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
-        _fully_shard_root_groups(model, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
-        fully_shard(model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+        _fully_shard_root_groups(base_model, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
+        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+        optimizer_dist = fsdp_mesh
 
         # Explicit prefetching for FSDP2
         if N_PREFETCH_LAYERS_FSDP2 > 1:
-            layers = model.model.layers
+            layers = base_model.model.layers
             for i, layer in enumerate(layers):
                 if i + 1 < len(layers):
                     layer.set_modules_to_forward_prefetch(layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2])
                 if i - 1 >= 0:
                     layer.set_modules_to_backward_prefetch(list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i])))
 
-    # Keep orig_model reference for checkpointing/eval (eval changes shapes → recompilation)
-    orig_model = model
+    # Keep base_model for checkpointing/eval (eval changes shapes → recompilation).
+    orig_model = base_model
     compile_mode = (
         "max-autotune-no-cudagraphs"
         if getattr(pretrain_config, "use_compile_max_autotune", False)
@@ -1335,15 +1401,27 @@ def run_pure_pretraining(
             logger.exception("Failed to apply TorchInductor config overrides; continuing.")
 
     if compile_mode is None:
-        model = torch.compile(model, dynamic=compile_dynamic)
+        model = torch.compile(base_model, dynamic=compile_dynamic)
         logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic})")
     else:
-        model = torch.compile(model, dynamic=compile_dynamic, mode=compile_mode)
+        model = torch.compile(base_model, dynamic=compile_dynamic, mode=compile_mode)
         logger.info(
             "Model compiled with torch.compile(dynamic=%s, mode=%s)",
             compile_dynamic,
             compile_mode,
         )
+    if distributed and distributed_mode == "ddp":
+        ddp_kwargs = dict(
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=ddp_bucket_cap_mb,
+        )
+        if device.type == "cuda":
+            ddp_kwargs["device_ids"] = [local_rank]
+            ddp_kwargs["output_device"] = local_rank
+        model = DistributedDataParallel(model, **ddp_kwargs)
+        optimizer_dist = dist.group.WORLD
 
     # ---- DataLoaders ----
     eval_collator = ProtDataCollatorForLM(
@@ -1354,7 +1432,12 @@ def run_pure_pretraining(
         keep_probability=pretrain_config.keep_probability,
     )
 
-    dl_kwargs = dict(num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers, prefetch_factor=prefetch_factor)
+    dl_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
     if use_packing:
         train_loader = DataLoader(train_ds, batch_size=None, collate_fn=collator, **dl_kwargs)
     else:
@@ -1362,7 +1445,7 @@ def run_pure_pretraining(
     eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_size, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
 
     # ---- Optimizer / Scheduler ----
-    optimizer = _create_optimizer(model, pretrain_config, distributed_mesh=fsdp_mesh)
+    optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
     steps_per_epoch = max(1, math.ceil(synced_len / max(1, inferred_grad_accum_steps)))
@@ -1380,8 +1463,8 @@ def run_pure_pretraining(
     if resume_config and resume_config.is_resume:
         logger.info(f"Resuming from checkpoint: {resume_config.checkpoint_dir}")
         start_step, start_epoch = _load_checkpoint(
-            model, optimizer, scheduler, resume_config.checkpoint_dir,
-            device, distributed, load_scheduler=False,
+            orig_model, optimizer, scheduler, resume_config.checkpoint_dir,
+            device, distributed, load_scheduler=False, distributed_mode=distributed_mode,
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
@@ -1463,7 +1546,7 @@ def run_pure_pretraining(
 
     # ---- AMP / TF32 ----
     amp_dtype: Optional[torch.dtype] = None
-    if use_bf16 and not distributed:
+    if use_bf16 and (not distributed or distributed_mode == "ddp"):
         amp_dtype = torch.bfloat16
     elif use_fp16:
         amp_dtype = torch.float16
@@ -1479,7 +1562,7 @@ def run_pure_pretraining(
     )
 
     # ---- MFU estimation ----
-    _raw = model if hasattr(model, "config") else getattr(model, "_orig_mod", model)
+    _raw = orig_model
     _cfg = _raw.config
     _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len)
     _peak_flops = H100_PEAK_TFLOPS * 1e12
@@ -1494,6 +1577,12 @@ def run_pure_pretraining(
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
         f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, fp8={pretrain_config.fp8}"
+    )
+    logger.info(
+        "Distributed config: multi_gpu=%s mode=%s%s",
+        distributed,
+        distributed_mode,
+        f" ddp_bucket_cap_mb={ddp_bucket_cap_mb}" if distributed_mode == "ddp" else "",
     )
     max_grad_norm = float(pretrain_config.max_grad_norm)
     logger.info(
@@ -1551,6 +1640,7 @@ def run_pure_pretraining(
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
+    debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
 
     epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
@@ -1614,15 +1704,12 @@ def run_pure_pretraining(
                 batch = _move_batch_to_device(batch, device)
                 upcoming_step = global_step + 1
 
-                if distributed and N_PREFETCH_LAYERS_FSDP2 > 1:
-                    model.unshard()
-
                 # FSDP2: only reduce-scatter gradients at regular accumulation
                 # boundaries.  (Do NOT use synced_len as a fallback — the loop may
                 # break early via all_reduce, making synced_len unreachable.
                 # Partial accumulation at epoch end is discarded, not stepped.)
-                if distributed:
-                    sync = (micro_step + 1) % inferred_grad_accum_steps == 0
+                sync = (micro_step + 1) % inferred_grad_accum_steps == 0
+                if distributed and distributed_mode == "fsdp":
                     model.set_requires_gradient_sync(sync)
 
                 # Token counting
@@ -1637,44 +1724,46 @@ def run_pure_pretraining(
                     raw_token_count += batch["input_ids"].numel()
 
                 # Forward
+                sync_ctx = _ddp_sync_context(model, distributed_mode=distributed_mode, sync=sync)
                 amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
-                with amp_ctx:
-                    fwd_kwargs = dict(input_ids=batch["input_ids"], labels=batch["labels"])
-                    if "attention_mask" in batch:
-                        fwd_kwargs["attention_mask"] = batch["attention_mask"]
-                    if "cu_seqlens" in batch:
-                        cu_seqlens = batch["cu_seqlens"]
-                        # cu_seqlens has shape (num_seqs+1,) which varies per packing
-                        # bucket.  Mark dim-0 dynamic so torch.compile(dynamic=False)
-                        # doesn't create a separate compiled graph per bucket count.
-                        torch._dynamo.mark_dynamic(cu_seqlens, 0)
-                        fwd_kwargs["cu_seqlens"] = cu_seqlens
-                        fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
-                    if "position_ids" in batch:
-                        fwd_kwargs["position_ids"] = batch["position_ids"]
-                    out = model(**fwd_kwargs)
+                with sync_ctx:
+                    with amp_ctx:
+                        fwd_kwargs = dict(input_ids=batch["input_ids"], labels=batch["labels"])
+                        if "attention_mask" in batch:
+                            fwd_kwargs["attention_mask"] = batch["attention_mask"]
+                        if "cu_seqlens" in batch:
+                            cu_seqlens = batch["cu_seqlens"]
+                            # cu_seqlens has shape (num_seqs+1,) which varies per packing
+                            # bucket.  Mark dim-0 dynamic so torch.compile(dynamic=False)
+                            # doesn't create a separate compiled graph per bucket count.
+                            torch._dynamo.mark_dynamic(cu_seqlens, 0)
+                            fwd_kwargs["cu_seqlens"] = cu_seqlens
+                            fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
+                        if "position_ids" in batch:
+                            fwd_kwargs["position_ids"] = batch["position_ids"]
+                        out = model(**fwd_kwargs)
 
-                loss = out["loss"] if isinstance(out, dict) else out.loss
-                if not torch.isfinite(loss.detach()).all():
-                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-                    logger.error(
-                        "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d micro_step=%d).",
-                        upcoming_step,
-                        rank,
-                        epoch,
-                        micro_step,
-                    )
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_loss.zero_()
-                    discard_accumulation = not at_accum_boundary
-                    continue
-                loss = loss / inferred_grad_accum_steps
+                    loss = out["loss"] if isinstance(out, dict) else out.loss
+                    if not torch.isfinite(loss.detach()).all():
+                        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                        logger.error(
+                            "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d micro_step=%d).",
+                            upcoming_step,
+                            rank,
+                            epoch,
+                            micro_step,
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_loss.zero_()
+                        discard_accumulation = not at_accum_boundary
+                        continue
+                    loss = loss / inferred_grad_accum_steps
 
-                # Backward
-                if scaler is not None and scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                    # Backward
+                    if scaler is not None and scaler.is_enabled():
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
                 accum_loss = accum_loss + loss.detach()
 
@@ -1692,14 +1781,14 @@ def run_pure_pretraining(
                     scaler.unscale_(optimizer)
                 try:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
+                        orig_model.parameters(),
                         max_norm=max_grad_norm,
                         error_if_nonfinite=True,
                     )
                 except RuntimeError as exc:
                     if "non-finite" not in str(exc).lower():
                         raise
-                    bad_grad = _first_nonfinite_grad(model)
+                    bad_grad = _first_nonfinite_grad(orig_model)
                     bad_name = bad_grad[0] if bad_grad is not None else "<unknown>"
                     rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                     logger.error(
@@ -1722,8 +1811,8 @@ def run_pure_pretraining(
                     step_skipped = scaler.get_scale() < old_scale
                 else:
                     optimizer.step()
-                if _has_nonfinite_params(model):
-                    bad_param = _first_nonfinite_param(model)
+                if debug_non_finite_params and _has_nonfinite_params(orig_model):
+                    bad_param = _first_nonfinite_param(orig_model)
                     bad_name = bad_param[0] if bad_param is not None else "<unknown>"
                     rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                     raise RuntimeError(
@@ -1867,9 +1956,9 @@ def run_pure_pretraining(
                 # ---- Save ----
                 if global_step % save_steps == 0:
                     _save_checkpoint(
-                        model, optimizer, scheduler, global_step, epoch,
+                        orig_model, optimizer, scheduler, global_step, epoch,
                         output_dir, logging_steps, eval_steps, save_steps,
-                        distributed, is_main,
+                        distributed, is_main, distributed_mode=distributed_mode,
                         model_config=_model_config, manifest=_manifest,
                         pretrain_config=pretrain_config,
                         total_steps=total_steps, warmup_steps=warmup_steps,
@@ -1912,9 +2001,9 @@ def run_pure_pretraining(
         _dist_barrier(local_rank)
 
     _save_checkpoint(
-        model, optimizer, scheduler, global_step, num_epochs,
+        orig_model, optimizer, scheduler, global_step, num_epochs,
         output_dir, logging_steps, eval_steps, save_steps,
-        distributed, is_main,
+        distributed, is_main, distributed_mode=distributed_mode,
         model_config=_model_config, manifest=_manifest,
         pretrain_config=pretrain_config,
         total_steps=total_steps, warmup_steps=warmup_steps,
