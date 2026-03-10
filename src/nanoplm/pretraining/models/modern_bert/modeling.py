@@ -261,6 +261,8 @@ def _get_activation(name: str):
         return F.gelu
     if name == "relu":
         return F.relu
+    if name == "srelu":
+        return lambda x: F.relu(x).square()
     if name == "silu":
         return F.silu
     if name == "tanh":

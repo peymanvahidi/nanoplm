@@ -494,9 +494,9 @@ def pretrain():
 )
 @click.option(
     "--classifier-activation",
-    type=click.Choice(["relu", "gelu"], case_sensitive=False),
+    type=click.Choice(["relu", "gelu", "srelu"], case_sensitive=False),
     default="gelu",
-    help="Classifier activation",
+    help="Classifier activation (srelu is supported only in pure-torch and pure-te paths)",
 )
 @click.option(
     "--use-resid-lambdas/--no-use-resid-lambdas",
@@ -782,6 +782,11 @@ def run(
             "use_canon_layers requires --pure-torch. "
             "Canon layers are not implemented in HF/TE paths."
         )
+    if classifier_activation.lower() == "srelu" and not (pure_torch or pure_te):
+        raise click.ClickException(
+            "classifier_activation=srelu requires --pure-torch or --pure-te. "
+            "The default HF path supports only relu/gelu."
+        )
     if num_kv_heads is not None and num_kv_heads != num_attention_heads and not (pure_torch or pure_te):
         raise click.ClickException(
             "GQA requires --pure-torch or --pure-te. "
@@ -987,6 +992,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
             "Differential Attention V2 is not implemented in HF/TE paths."
         )
+    if str(getattr(model_config, "classifier_activation", "gelu")).lower() == "srelu" and not (pure_torch or pure_te):
+        raise click.ClickException(
+            "model.classifier_activation=srelu requires pure_torch: true / --pure-torch or "
+            "pure_te: true / --pure-te. The HF path supports only relu/gelu."
+        )
     if (
         getattr(model_config, "num_kv_heads", None) is not None
         and model_config.num_kv_heads != model_config.num_attention_heads
@@ -1090,7 +1100,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  no_mlp_on_first_layer: true\n"
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
-        "  classifier_activation: \"gelu\"\n"
+        "  classifier_activation: \"gelu\"  # relu | gelu | srelu (srelu requires pure_torch or pure_te)\n"
         "  # The options below only work on pure-torch and TE pipelines unless noted\n"
         "  use_resid_lambdas: false  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"

@@ -85,6 +85,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
                 "GQA is not implemented in the HF ModernBERT path. "
                 "Set num_kv_heads equal to num_attention_heads or use --pure-torch / --pure-te."
             )
+        if str(config.classifier_activation).strip().lower() == "srelu":
+            raise ValueError(
+                "classifier_activation='srelu' is implemented only in the pure-torch and "
+                "Transformer Engine paths. Use --pure-torch / --pure-te or choose relu/gelu."
+            )
 
         self.tokenizer = ProtModernBertTokenizer()
         # Keep the original high-level config for checkpoint serialization.

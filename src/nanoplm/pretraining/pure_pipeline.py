@@ -53,6 +53,11 @@ from nanoplm.pretraining.fp8 import (
     Float8LinearConfig,
     convert_to_float8_training,
 )
+from nanoplm.pretraining.models.modern_bert.modeling import (
+    MHCLiteBlock,
+    MHCLiteSublayersLayer,
+    ModernBertEncoderLayer,
+)
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import build_muon_optimizer, build_optimizer, is_muon_optimizer
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
@@ -135,6 +140,73 @@ def _format_vram_for_log(
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor._local_tensor if isinstance(tensor, DTensor) else tensor
+
+
+def _fully_shard_encoder_sublayers(
+    enc: ModernBertEncoderLayer,
+    *,
+    mesh,
+    fsdp_kwargs: dict,
+    shard_parent: bool = True,
+) -> None:
+    """Shard the heavy attention/MLP weights separately before the enclosing layer."""
+    fully_shard(enc.attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+    if enc.mlp is not None:
+        fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+    if shard_parent:
+        fully_shard(enc, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+
+
+def _fully_shard_transformer_layer(
+    layer: torch.nn.Module,
+    *,
+    mesh,
+    fsdp_kwargs: dict,
+) -> None:
+    """Shard one logical transformer layer bottom-up for better overlap."""
+    if isinstance(layer, ModernBertEncoderLayer):
+        _fully_shard_encoder_sublayers(
+            layer,
+            mesh=mesh,
+            fsdp_kwargs=fsdp_kwargs,
+            shard_parent=False,
+        )
+    elif isinstance(layer, MHCLiteBlock):
+        _fully_shard_encoder_sublayers(layer.layer, mesh=mesh, fsdp_kwargs=fsdp_kwargs)
+    elif isinstance(layer, MHCLiteSublayersLayer):
+        _fully_shard_encoder_sublayers(
+            layer.enc,
+            mesh=mesh,
+            fsdp_kwargs=fsdp_kwargs,
+            shard_parent=False,
+        )
+        fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        if layer.mhc_mlp is not None:
+            fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+    fully_shard(layer, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+
+
+def _fully_shard_root_groups(
+    model: PureProtModernBertMLM,
+    *,
+    mesh,
+    fsdp_kwargs: dict,
+) -> None:
+    """Split root-only params into separate groups to avoid a serialized root tail."""
+    tied_embeddings = model.decoder.weight is model.model.embeddings.tok_embeddings.weight
+    if tied_embeddings:
+        # Keep the tied embedding/unembedding weight in one FSDP group.
+        fully_shard(
+            [model.model.embeddings, model.decoder],
+            mesh=mesh,
+            reshard_after_forward=False,
+            **fsdp_kwargs,
+        )
+    else:
+        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+    fully_shard(model.head, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
 
 
 def _has_nonfinite_tensors(tensors: list[torch.Tensor]) -> bool:
@@ -1208,7 +1280,8 @@ def run_pure_pretraining(
             fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
         for layer in model.model.layers:
-            fully_shard(layer, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+            _fully_shard_transformer_layer(layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
+        _fully_shard_root_groups(model, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
         fully_shard(model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
 
         # Explicit prefetching for FSDP2
