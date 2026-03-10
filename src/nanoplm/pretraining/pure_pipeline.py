@@ -320,22 +320,28 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
     sliding_window = config.local_attention // 2
 
     # -- Attention matmul FLOPs per layer (varies with window size) --
-    # QK matmul: (S, h) × (h, S) => 2*h*S FLOPs per token
-    # AV matmul: (S, S) × (S, h) => 2*h*S FLOPs per token
-    # Total: 4*h*effective_S per token per layer (forward only)
+    # With DiffV2: 2h query heads × h KV heads (GQA ratio 2), so QK and AV
+    # matmuls use 2h query dimension but shared KV.  Effective FLOPs double
+    # for the QK and AV matmuls since there are 2× more query heads.
+    use_diff_v2 = getattr(config, "use_diff_attn_v2", False)
+    q_heads_mult = 2 if use_diff_v2 else 1
     attn_flops = 0
     for layer_type in config.layer_types:
         if layer_type == "full_attention":
             effective_seq = seq_len
         else:
             effective_seq = min(2 * sliding_window, seq_len)
-        attn_flops += 4 * h * effective_seq
+        attn_flops += 4 * h * effective_seq * q_heads_mult
 
     # -- Attention projection FLOPs (same for all layers) --
-    # Wqkv: h -> 3h  => 2 * h * 3h = 6h²
-    # Wo:   h -> h    => 2 * h * h  = 2h²
-    # Total: 8h² per layer
-    attn_proj_flops = n_layers * 8 * h * h
+    # Wqkv: h -> (num_q_heads + 2*num_kv_heads)*head_dim
+    # Wo:   h -> h (2h²)
+    # With DiffV2: num_q_heads = 2*n_heads, else num_q_heads = n_heads
+    # With GQA: num_kv_heads < n_heads
+    num_kv_heads = getattr(config, "num_kv_heads", n_heads) or n_heads
+    num_q_heads = 2 * n_heads if use_diff_v2 else n_heads
+    qkv_out_dim = (num_q_heads + 2 * num_kv_heads) * head_dim
+    attn_proj_flops = n_layers * (2 * h * qkv_out_dim + 2 * h * h)  # Wqkv + Wo
 
     # -- MLP FLOPs --
     # swiglu/glu: Wi is h -> 2*ff, Wo is ff -> h => 2*h*2*ff + 2*ff*h = 6*h*ff
@@ -363,8 +369,8 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
         canon_set = config.canon_layer_set
         if "a" in canon_set:                        # before attention, C = h
             canon_flops += n_layers * 2 * K * h
-        if "b" in canon_set:                        # on QKV, C = 3h
-            canon_flops += n_layers * 2 * K * 3 * h
+        if "b" in canon_set:                        # on QKV output
+            canon_flops += n_layers * 2 * K * qkv_out_dim
         if "c" in canon_set:                        # before MLP, C = h
             canon_flops += n_layers * 2 * K * h
         if "d" in canon_set and config.mlp_activation != "srelu":

@@ -109,6 +109,7 @@ class ModernBertConfig:
     intermediate_size: int = 1152
     num_hidden_layers: int = 22
     num_attention_heads: int = 12
+    num_kv_heads: Optional[int] = None  # GQA: None means MHA (num_kv_heads = num_attention_heads)
     mlp_activation: str = "swiglu"
     hidden_activation: str = "gelu"
     max_position_embeddings: int = 8192
@@ -155,6 +156,8 @@ class ModernBertConfig:
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
     mhc_lite_wrapping_level: Literal["layer", "sublayers"] = "layer"
+    use_diff_attn_v2: bool = False
+    attn_layer_pattern: Optional[str] = None
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -167,6 +170,19 @@ class ModernBertConfig:
             raise ValueError(
                 "hidden_size must be divisible by num_attention_heads: "
                 f"{self.hidden_size} vs {self.num_attention_heads}"
+            )
+        # GQA: resolve num_kv_heads (None = MHA, i.e. same as num_attention_heads).
+        if self.num_kv_heads is None:
+            self.num_kv_heads = self.num_attention_heads
+        if self.num_attention_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                "num_attention_heads must be divisible by num_kv_heads for GQA: "
+                f"{self.num_attention_heads} % {self.num_kv_heads} != 0"
+            )
+        if self.use_diff_attn_v2 and (2 * self.num_attention_heads) % self.num_kv_heads != 0:
+            raise ValueError(
+                "With DiffV2, 2*num_attention_heads must be divisible by num_kv_heads: "
+                f"2*{self.num_attention_heads} % {self.num_kv_heads} != 0"
             )
         if self.mhc_lite_wrapping_level not in {"layer", "sublayers"}:
             raise ValueError(
@@ -203,10 +219,40 @@ class ModernBertConfig:
                 "use_canon_layers=True requires non-empty canon_layers_mode "
                 "(for example: 'abcd' or 'ac')."
             )
-        self.layer_types = [
-            "full_attention" if i % attn_stride == 0 else "sliding_attention"
-            for i in range(self.num_hidden_layers)
-        ]
+        # Build layer_types from explicit pattern or stride.
+        if self.attn_layer_pattern is not None:
+            pattern = self.attn_layer_pattern.upper().strip()
+            if not pattern:
+                raise ValueError("attn_layer_pattern must not be empty when provided.")
+            _map = {"F": "full_attention", "S": "sliding_attention"}
+            for ch in pattern:
+                if ch not in _map:
+                    raise ValueError(
+                        f"Invalid character '{ch}' in attn_layer_pattern. "
+                        "Use 'F' for full attention and 'S' for sliding attention."
+                    )
+            # Tile pattern to cover all layers.
+            self.layer_types = [
+                _map[pattern[i % len(pattern)]]
+                for i in range(self.num_hidden_layers)
+            ]
+        else:
+            self.layer_types = [
+                "full_attention" if i % attn_stride == 0 else "sliding_attention"
+                for i in range(self.num_hidden_layers)
+            ]
+        if self.use_diff_attn_v2 and self.use_repo:
+            raise ValueError(
+                "use_diff_attn_v2 is not compatible with use_repo. "
+                "Differential attention V2 changes Q/K head counts which is "
+                "incompatible with RePO's per-head position prediction."
+            )
+        if self.use_repo and self.num_kv_heads != self.num_attention_heads:
+            raise ValueError(
+                "GQA (num_kv_heads != num_attention_heads) is not compatible with use_repo. "
+                "RePO predicts per-head positions for Q and K jointly, which requires "
+                "equal Q/K head counts."
+            )
 
 
 def _get_activation(name: str):
@@ -233,7 +279,8 @@ def _apply_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # q/k: (B, H, S, D), cos/sin: (1, S, D)
+    # q/k: (B, H, S, D) or (T, H, D), cos/sin: (1, S, D) or (T, D)
+    # Head dim broadcasts — works for different Q/KV head counts.
     q_dtype = q.dtype
     k_dtype = k.dtype
     cos = cos.unsqueeze(1)
@@ -242,6 +289,21 @@ def _apply_rope(
     q = qf * cos + _rotate_half(qf) * sin
     k = kf * cos + _rotate_half(kf) * sin
     return q.to(dtype=q_dtype), k.to(dtype=k_dtype)
+
+
+@torch.compile
+def _diff_attn_v2(
+    attn1: torch.Tensor,
+    attn2: torch.Tensor,
+    lam: torch.Tensor,
+) -> torch.Tensor:
+    """Differential Attention V2 subtraction.
+
+    attn1, attn2: attention outputs from paired heads (same shape).
+    lam: per-token, per-head scalar (broadcastable to attn shape).
+    Returns attn1 - sigmoid(lam) * attn2.
+    """
+    return attn1 - torch.sigmoid(lam).unsqueeze(-1) * attn2
 
 
 class RePOModule(nn.Module):
@@ -736,12 +798,28 @@ class ModernBertAttention(nn.Module):
         self.use_qk_norm = config.use_qk_norm
         self.dropout = config.attention_dropout
         self.scale = self.head_dim ** -0.5
+        self.use_diff_attn_v2 = config.use_diff_attn_v2
 
+        # GQA: num_kv_heads <= num_heads. MHA when num_kv_heads == num_heads.
+        self.num_kv_heads = config.num_kv_heads
+
+        if self.use_diff_attn_v2:
+            # DiffV2 doubles Q heads on top of whatever GQA config is set.
+            # Each original head splits into a pair for differential subtraction.
+            self.num_q_heads = 2 * self.num_heads
+            # Lambda: per-token, per-head scalar controlling subtraction weight.
+            self.lambda_proj = nn.Linear(
+                config.hidden_size, self.num_heads, bias=False,
+            )
+        else:
+            self.num_q_heads = self.num_heads
+            self.lambda_proj = None
+
+        qkv_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
         self.Wqkv = nn.Linear(
-            config.hidden_size,
-            3 * config.hidden_size,
-            bias=config.attention_bias,
+            config.hidden_size, qkv_dim, bias=config.attention_bias,
         )
+
         self.Wo = nn.Linear(
             config.hidden_size,
             config.hidden_size,
@@ -752,8 +830,9 @@ class ModernBertAttention(nn.Module):
             if config.attention_dropout > 0.0
             else nn.Identity()
         )
+        qkv_out_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
         self.canon_b = (
-            _make_canon_layer(3 * config.hidden_size, config)
+            _make_canon_layer(qkv_out_dim, config)
             if "b" in config.canon_layer_set
             else None
         )
@@ -792,8 +871,13 @@ class ModernBertAttention(nn.Module):
         qkv = self.Wqkv(x)
         if self.canon_b is not None:
             qkv = self.canon_b(qkv, position_ids=position_ids, cu_seqlens=cu_seqlens)
-        qkv = qkv.view(total, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=1)  # each: (total, H, D)
+
+        q_dim = self.num_q_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+        q = q.view(total, self.num_q_heads, self.head_dim)
+        k = k.view(total, self.num_kv_heads, self.head_dim)
+        v = v.view(total, self.num_kv_heads, self.head_dim)
 
         if self.repo is not None and repo_active:
             positions = self.repo(x)  # (T, num_heads)
@@ -823,6 +907,13 @@ class ModernBertAttention(nn.Module):
         y = _flash_varlen_fn(q, k, v, **kwargs)
         if isinstance(y, tuple):
             y = y[0]
+
+        if self.use_diff_attn_v2:
+            # y: (total, 2*num_heads, head_dim) — paired heads in same GQA group
+            # are contiguous, so 0::2 and 1::2 select the two halves.
+            lam = self.lambda_proj(x)  # (total, num_heads)
+            y = _diff_attn_v2(y[:, 0::2], y[:, 1::2], lam)
+            # y: (total, num_heads, head_dim)
 
         y = y.contiguous().view(total, -1)  # (total, hidden)
         return self.out_drop(self.Wo(y))
@@ -856,11 +947,13 @@ class ModernBertAttention(nn.Module):
         qkv = self.Wqkv(x)
         if self.canon_b is not None:
             qkv = self.canon_b(qkv, attention_mask=token_mask)
-        qkv = qkv.view(bsz, seq_len, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+
+        q_dim = self.num_q_heads * self.head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
+        q = q.view(bsz, seq_len, self.num_q_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         if self.repo is not None and repo_active:
             positions = self.repo(x)  # (B, S, num_heads)
@@ -872,6 +965,13 @@ class ModernBertAttention(nn.Module):
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
 
+        # SDPA requires matching Q/KV head counts — expand KV when using GQA
+        # (and/or DiffV2 which doubles Q heads).
+        if self.num_q_heads != self.num_kv_heads:
+            gqa_expand = self.num_q_heads // self.num_kv_heads
+            k = k.repeat_interleave(gqa_expand, dim=1)  # (B, num_q_heads, S, D)
+            v = v.repeat_interleave(gqa_expand, dim=1)
+
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -880,6 +980,14 @@ class ModernBertAttention(nn.Module):
             dropout_p=(self.dropout if self.training else 0.0),
             scale=self.scale,
         )
+
+        if self.use_diff_attn_v2:
+            # y: (B, 2H, S, D) -> differential subtraction
+            lam = self.lambda_proj(x)  # (B, S, H)
+            lam = lam.transpose(1, 2)  # (B, H, S)
+            y = _diff_attn_v2(y[:, 0::2], y[:, 1::2], lam)
+            # y: (B, H, S, D)
+
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.out_drop(self.Wo(y))
 
@@ -1781,6 +1889,10 @@ class ModernBertForMaskedLM(nn.Module):
                         nn.init.zeros_(enc.mlp.Wo.bias)
                 elif enc.mlp.Wo_bias is not None:
                     nn.init.zeros_(enc.mlp.Wo_bias)
+
+            # DiffV2: zero-init lambda_proj so sigmoid(0)=0.5 at start.
+            if enc.attn.lambda_proj is not None:
+                nn.init.zeros_(enc.attn.lambda_proj.weight)
 
             # RePO: zero-init W_z so positions start at zero (NoPE-like).
             # W_g and W_c keep default Kaiming uniform init.

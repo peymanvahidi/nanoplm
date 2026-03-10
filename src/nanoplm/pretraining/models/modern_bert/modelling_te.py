@@ -99,9 +99,11 @@ class TEModernBertEncoderLayer(nn.Module):
         # qkv_format='thd': flat (total_tokens, heads, dim) — required for varlen with
         # correct per-sequence RoPE position resets via cu_seqlens.
         # attn_mask_type='padding': required by TE when qkv_format='thd'.
+        num_gqa_groups = config.num_attention_heads // config.num_kv_heads
         self.attn = te.MultiheadAttention(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
+            num_gqa_groups=num_gqa_groups,
             attention_dropout=config.attention_dropout,
             layernorm_epsilon=config.norm_eps,
             bias=config.attention_bias,

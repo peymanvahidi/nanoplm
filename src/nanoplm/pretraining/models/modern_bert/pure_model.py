@@ -44,6 +44,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             intermediate_size=config.intermediate_size,
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_kv_heads,
             mlp_activation=config.mlp_activation,
             # Keep this comfortably above common dataset max_seq_len values.
             # Position embeddings are RoPE frequencies (not learned tables), so a
@@ -78,6 +79,8 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             mhc_n_streams=config.mhc_n_streams,
             mhc_triton_fused=config.mhc_triton_fused,
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
+            use_diff_attn_v2=config.use_diff_attn_v2,
+            attn_layer_pattern=config.attn_layer_pattern,
         )
 
         super().__init__(mb_config)
@@ -97,6 +100,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
                 "Transformer Engine currently supports only layer-level mHC-lite. "
                 "Set mhc_lite_wrapping_level='layer' or use --pure-torch."
             )
+        if config.use_diff_attn_v2:
+            raise ValueError(
+                "Differential Attention V2 is currently implemented only in the "
+                "pure-torch path. Disable use_diff_attn_v2 or use --pure-torch."
+            )
 
         self.tokenizer = ProtModernBertTokenizer()
         # Keep the original high-level config for checkpoint serialization.
@@ -108,6 +116,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             intermediate_size=config.intermediate_size,
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_kv_heads,
             mlp_activation=config.mlp_activation,
             # Keep this comfortably above common dataset max_seq_len values.
             max_position_embeddings=8192,
@@ -140,6 +149,8 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             mhc_n_streams=config.mhc_n_streams,
             mhc_triton_fused=config.mhc_triton_fused,
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
+            use_diff_attn_v2=config.use_diff_attn_v2,
+            attn_layer_pattern=config.attn_layer_pattern,
         )
 
         super().__init__(mb_config)

@@ -38,6 +38,7 @@ class ProtModernBertMLMConfig:
     intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
+    num_kv_heads: Optional[int] = None  # GQA: K,V head count (None = same as num_attention_heads = MHA)
     vocab_size: int = 32
     mlp_activation: str = "swiglu"
     mlp_dropout: float = 0.0
@@ -64,6 +65,8 @@ class ProtModernBertMLMConfig:
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
     mhc_lite_wrapping_level: str = "layer"
+    use_diff_attn_v2: bool = False
+    attn_layer_pattern: Optional[str] = None
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):

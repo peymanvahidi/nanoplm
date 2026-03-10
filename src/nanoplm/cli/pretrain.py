@@ -446,6 +446,12 @@ def pretrain():
     help="Number of attention heads",
 )
 @click.option(
+    "--num-kv-heads",
+    type=int,
+    default=None,
+    help="Number of KV heads for GQA (default: same as num_attention_heads = MHA)",
+)
+@click.option(
     "--vocab-size",
     type=int,
     default=32,
@@ -559,6 +565,19 @@ def pretrain():
     help="Checkpoint scope. 'layer' checkpoints the whole transformer layer; "
          "'attn' checkpoints only the attention residual branch (usually the best tradeoff); "
          "'attn+mlp' checkpoints both attention and MLP branches.",
+)
+@click.option(
+    "--use-diff-attn-v2/--no-use-diff-attn-v2",
+    default=False,
+    help="Enable Differential Attention V2: doubles query heads, applies differential "
+         "subtraction for noise cancellation in attention (pure-torch only).",
+)
+@click.option(
+    "--attn-layer-pattern",
+    type=str,
+    default=None,
+    help="Attention layer pattern string using F (full) and S (sliding), e.g. 'FSS'. "
+         "Tiles to cover all layers. Overrides --global-attn-every-n-layers when set.",
 )
 @click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
@@ -675,6 +694,7 @@ def run(
     intermediate_size: int,
     num_hidden_layers: int,
     num_attention_heads: int,
+    num_kv_heads: Optional[int],
     vocab_size: int,
     mlp_activation: str,
     mlp_dropout: float,
@@ -695,6 +715,8 @@ def run(
     prores_t: int,
     gradient_checkpointing: bool,
     gradient_checkpointing_mode: str,
+    use_diff_attn_v2: bool,
+    attn_layer_pattern: Optional[str],
     use_mhc_lite: bool,
     mhc_n_streams: int,
     mhc_lite_wrapping_level: str,
@@ -784,6 +806,7 @@ def run(
         intermediate_size=intermediate_size,
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
+        num_kv_heads=num_kv_heads,
         vocab_size=vocab_size,
         mlp_activation=mlp_activation,
         mlp_dropout=mlp_dropout,
@@ -807,9 +830,16 @@ def run(
         use_mhc_lite=use_mhc_lite,
         mhc_n_streams=mhc_n_streams,
         mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),
+        use_diff_attn_v2=use_diff_attn_v2,
+        attn_layer_pattern=attn_layer_pattern,
     )
 
     _set_seed_for_init(seed)
+    if use_diff_attn_v2 and not pure_torch:
+        raise click.ClickException(
+            "use_diff_attn_v2 requires --pure-torch. "
+            "Differential Attention V2 is not implemented in HF/TE paths."
+        )
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
         model = TEProtModernBertMLM(model_cfg)
@@ -947,6 +977,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "resid_lambdas scales the hidden state before each layer, which breaks "
             "mHC-lite's doubly-stochastic stability guarantees."
         )
+    if getattr(model_config, "use_diff_attn_v2", False) and not pure_torch:
+        raise click.ClickException(
+            "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
+            "Differential Attention V2 is not implemented in HF/TE paths."
+        )
     _populate_batch_setup(pretrain_config)
 
     _set_seed_for_init(pretrain_config.seed)
@@ -1033,6 +1068,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  intermediate_size: 1536\n"
         "  num_hidden_layers: 12\n"
         "  num_attention_heads: 8\n"
+        "  # num_kv_heads: 8  # GQA: number of KV heads (default: same as num_attention_heads = MHA)\n"
         "  vocab_size: 32\n"
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
@@ -1056,6 +1092,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_n_streams: 4  # number of residual streams for mHC-lite (n! permutation matrices)\n"
         "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
+        "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
+        "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "\n"
         "pretraining:\n"
         "  dataset_dir: \"output/data/pretrain_data\"\n"
