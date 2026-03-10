@@ -293,7 +293,6 @@ def _apply_rope(
     return q.to(dtype=q_dtype), k.to(dtype=k_dtype)
 
 
-@torch.compile
 def _diff_attn_v2(
     attn1: torch.Tensor,
     attn2: torch.Tensor,
