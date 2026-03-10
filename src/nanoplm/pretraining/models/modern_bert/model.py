@@ -80,6 +80,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
                 "Canon layers are currently implemented only in the pure-torch path. "
                 "Use --pure-torch with use_canon_layers=true."
             )
+        if config.num_kv_heads is not None and config.num_kv_heads != config.num_attention_heads:
+            raise ValueError(
+                "GQA is not implemented in the HF ModernBERT path. "
+                "Set num_kv_heads equal to num_attention_heads or use --pure-torch / --pure-te."
+            )
 
         self.tokenizer = ProtModernBertTokenizer()
         # Keep the original high-level config for checkpoint serialization.

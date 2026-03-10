@@ -965,13 +965,6 @@ class ModernBertAttention(nn.Module):
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
 
-        # SDPA requires matching Q/KV head counts — expand KV when using GQA
-        # (and/or DiffV2 which doubles Q heads).
-        if self.num_q_heads != self.num_kv_heads:
-            gqa_expand = self.num_q_heads // self.num_kv_heads
-            k = k.repeat_interleave(gqa_expand, dim=1)  # (B, num_q_heads, S, D)
-            v = v.repeat_interleave(gqa_expand, dim=1)
-
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -979,6 +972,7 @@ class ModernBertAttention(nn.Module):
             attn_mask=attn_mask,
             dropout_p=(self.dropout if self.training else 0.0),
             scale=self.scale,
+            enable_gqa=(self.num_q_heads != self.num_kv_heads),
         )
 
         if self.use_diff_attn_v2:

@@ -782,6 +782,11 @@ def run(
             "use_canon_layers requires --pure-torch. "
             "Canon layers are not implemented in HF/TE paths."
         )
+    if num_kv_heads is not None and num_kv_heads != num_attention_heads and not (pure_torch or pure_te):
+        raise click.ClickException(
+            "GQA requires --pure-torch or --pure-te. "
+            "The default HF path does not implement num_kv_heads != num_attention_heads."
+        )
     if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not (pure_torch or pure_te):
         raise click.ClickException(
             "mHC-lite requires --pure-torch or --pure-te. "
@@ -981,6 +986,15 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         raise click.ClickException(
             "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
             "Differential Attention V2 is not implemented in HF/TE paths."
+        )
+    if (
+        getattr(model_config, "num_kv_heads", None) is not None
+        and model_config.num_kv_heads != model_config.num_attention_heads
+        and not (pure_torch or pure_te)
+    ):
+        raise click.ClickException(
+            "model.num_kv_heads != model.num_attention_heads requires pure_torch: true / --pure-torch "
+            "or pure_te: true / --pure-te. The HF path does not implement GQA."
         )
     _populate_batch_setup(pretrain_config)
 
