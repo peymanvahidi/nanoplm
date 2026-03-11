@@ -1315,14 +1315,74 @@ def run_pure_pretraining(
         fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
         optimizer_dist = fsdp_mesh
 
-        # Explicit prefetching for FSDP2
-        if N_PREFETCH_LAYERS_FSDP2 > 1:
-            layers = base_model.model.layers
-            for i, layer in enumerate(layers):
-                if i + 1 < len(layers):
-                    layer.set_modules_to_forward_prefetch(layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2])
-                if i - 1 >= 0:
-                    layer.set_modules_to_backward_prefetch(list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i])))
+        # ---- Pin embedding/decoder AllGather permanently --------------------
+        # The embedding+decoder FSDP group is tiny relative to model params.
+        # By disabling reshard-after-backward, these weights stay unsharded
+        # across iterations, eliminating the ~1.5 ms AllGather bubble at the
+        # start of every forward pass.
+        tied_embeddings = base_model.decoder.weight is base_model.model.embeddings.tok_embeddings.weight
+        if tied_embeddings:
+            # Tied case: embeddings & decoder share one FSDP group on embeddings
+            base_model.model.embeddings.set_reshard_after_backward(False, recurse=False)
+        else:
+            base_model.model.embeddings.set_reshard_after_backward(False, recurse=False)
+            base_model.decoder.set_reshard_after_backward(False, recurse=False)
+        logger.info("FSDP: pinned embedding/decoder weights (reshard_after_backward=False)")
+
+        # ---- Pin layers[0] AllGather permanently -----------------------------
+        # After pinning embeddings, the top gaps shifted to waiting for
+        # layers[0] AllGather (~1.8 ms × 4 per profiling window). Since the
+        # embedding forward is near-instant (already unsharded), the GPU races
+        # ahead to layers[0] before its prefetched AllGather completes.
+        # Pinning layers[0] (and its sublayer FSDP groups: attn, mlp) keeps
+        # them permanently unsharded, eliminating these gaps entirely.
+        layers = base_model.model.layers
+        layers[0].set_reshard_after_backward(False)  # recurse=True covers attn/mlp
+        # Eagerly unshard layers[0] now so the very first forward is also fast.
+        layers[0].unshard()
+        logger.info("FSDP: pinned layers[0] weights (reshard_after_backward=False) + eager unshard")
+
+        # ---- Explicit forward/backward prefetching for FSDP2 ----------------
+        # Chain: embeddings → layers[0..N-1] → final_norm → head → decoder
+        # Forward prefetch: each module prefetches the next module's AllGather
+        # so it overlaps with the current module's compute.
+        # Backward prefetch: each module prefetches the previous module's
+        # AllGather so it overlaps with the current module's gradient compute.
+        tail_modules = [base_model.model.final_norm, base_model.head]
+
+        # Embeddings → skip layers[0] (pinned), prefetch layers[1:1+N]
+        base_model.model.embeddings.set_modules_to_forward_prefetch(
+            list(layers[1 : 1 + min(N_PREFETCH_LAYERS_FSDP2, len(layers) - 1)])
+        )
+        # layers[0] is pinned, so forward prefetch now starts from layers[1:1+N]
+        layers[0].set_modules_to_forward_prefetch(
+            list(layers[1 : 1 + N_PREFETCH_LAYERS_FSDP2])
+        )
+
+        # Layer-to-layer prefetch (start at i=1; layers[0] configured above)
+        # layers[0] backward → prefetch embeddings (for grad compute)
+        layers[0].set_modules_to_backward_prefetch([base_model.model.embeddings])
+        for i, layer in enumerate(layers):
+            if i == 0:
+                continue  # Already configured above
+            if i + 1 < len(layers):
+                fwd_targets = list(layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2])
+            else:
+                # Last layer → prefetch tail modules (final_norm, head)
+                fwd_targets = tail_modules[:]
+            layer.set_modules_to_forward_prefetch(fwd_targets)
+
+            # Backward prefetch: include layers[0] for layers[1]
+            bwd_start = max(0, i - N_PREFETCH_LAYERS_FSDP2)
+            layer.set_modules_to_backward_prefetch(
+                list(reversed(layers[bwd_start : i]))
+            )
+
+        # Tail backward prefetch: final_norm → last layer(s), head → final_norm
+        base_model.model.final_norm.set_modules_to_backward_prefetch(
+            list(reversed(layers[max(0, len(layers) - N_PREFETCH_LAYERS_FSDP2) :]))
+        )
+        base_model.head.set_modules_to_backward_prefetch([base_model.model.final_norm])
 
     # Keep base_model for checkpointing/eval (eval changes shapes → recompilation).
     orig_model = base_model
