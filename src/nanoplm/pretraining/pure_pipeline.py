@@ -60,7 +60,7 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertEncoderLayer,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.optim import build_muon_optimizer, build_optimizer, is_muon_optimizer
+from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, MuonAdamWGroup
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
@@ -266,18 +266,6 @@ def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
         return False
     lname = name.lower()
     return "bias" not in lname and "norm" not in lname
-
-
-def _is_embedding_or_unembedding_param(name: str) -> bool:
-    lname = name.lower()
-    return (
-        "embeddings.tok_embeddings" in lname
-        or lname.endswith("decoder.weight")
-        or lname.endswith("decoder.bias")
-        or "embedding" in lname
-        or "lm_head" in lname
-        or "unembedding" in lname
-    )
 
 
 def _dist_barrier(local_rank: int) -> None:
@@ -522,80 +510,6 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
 # Optimizer / Scheduler
 # ---------------------------------------------------------------------------
 
-def _is_zero_init_fragile_param(name: str) -> bool:
-    """Detect 2-D parameters that are zero-initialized and have structurally
-    dormant rows, making them unsafe for NorMuon's per-row variance tracking.
-
-    Currently matches:
-      - mHC-lite W_all.weight  (32×3072, 75% of rows intentionally suppressed)
-      - RePO W_z.weight        (8×96, zero-init with per-head rows)
-    """
-    parts = name.split(".")
-    # W_all.weight (mHC-lite fused projection)
-    if len(parts) >= 2 and parts[-2] == "W_all" and parts[-1] == "weight":
-        return True
-    # W_z.weight (RePO position head)
-    if len(parts) >= 2 and parts[-2] == "W_z" and parts[-1] == "weight":
-        return True
-    return False
-
-
-def _build_muon_optimizer(model, cfg, distributed_mesh=None):
-    muon_params, adamw_params = [], []
-    resid_params, x0_params = [], []
-    seen: set[int] = set()
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad or id(param) in seen:
-            continue
-        seen.add(id(param))
-        lname = name.lower()
-        if lname.endswith("resid_lambdas") or ".resid_lambdas" in lname:
-            resid_params.append(param)
-            continue
-        if lname.endswith("x0_lambdas") or ".x0_lambdas" in lname:
-            x0_params.append(param)
-            continue
-        if param.ndim == 1 or _is_embedding_or_unembedding_param(name):
-            adamw_params.append(param)
-        elif param.ndim == 2:
-            if _is_zero_init_fragile_param(name):
-                adamw_params.append(param)
-            else:
-                muon_params.append(param)
-        else:
-            adamw_params.append(param)
-
-    if not muon_params:
-        raise ValueError("No eligible 2-D matrix parameters found for Muon.")
-
-    logger.info(
-        f"Muon grouping: muon_params={len(muon_params)} tensors, "
-        f"adamw_params={len(adamw_params)} tensors, "
-        f"resid_scalar_params={len(resid_params)} tensors, "
-        f"x0_scalar_params={len(x0_params)} tensors"
-    )
-    return build_optimizer(
-        muon_params=muon_params,
-        adamw_params=adamw_params,
-        resid_params=resid_params,
-        x0_params=x0_params,
-        muon_learning_rate=cfg.muon_learning_rate,
-        muon_weight_decay=cfg.muon_weight_decay,
-        muon_cautious_weight_decay=cfg.muon_cautious_weight_decay,
-        muon_use_polar_express=cfg.muon_use_polar_express,
-        muon_momentum=cfg.muon_momentum,
-        muon_nesterov=cfg.muon_nesterov,
-        muon_eps=cfg.muon_eps,
-        use_normuon=str(cfg.optimizer).lower() == "normuon",
-        adamw_learning_rate=cfg.adam_learning_rate,
-        adamw_weight_decay=cfg.adam_weight_decay,
-        adamw_betas=(cfg.adam_beta1, cfg.adam_beta2),
-        adamw_epsilon=cfg.adam_epsilon,
-        distributed_mesh=distributed_mesh,
-    )
-
-
 def _create_optimizer(model, cfg, distributed_mesh=None):
     name = str(cfg.optimizer).lower()
     if name in {"muon", "normuon"}:
@@ -629,6 +543,39 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
     raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon]")
 
 
+class _SchedulerGroup:
+    """Wraps two LambdaLR schedulers (muon + adamw) for MuonAdamWGroup.
+
+    Exposes the same interface as a single LambdaLR so the training loop
+    can call .step() and .state_dict() / .load_state_dict() transparently.
+    """
+
+    def __init__(self, muon_scheduler: LambdaLR, adamw_scheduler: LambdaLR):
+        self.muon_sched = muon_scheduler
+        self.adamw_sched = adamw_scheduler
+
+    def step(self):
+        self.muon_sched.step()
+        self.adamw_sched.step()
+
+    def state_dict(self):
+        return {
+            "muon": self.muon_sched.state_dict(),
+            "adamw": self.adamw_sched.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict):
+        if "muon" in state_dict and "adamw" in state_dict:
+            self.muon_sched.load_state_dict(state_dict["muon"])
+            self.adamw_sched.load_state_dict(state_dict["adamw"])
+        else:
+            # Legacy single-scheduler checkpoint — skip gracefully.
+            logger.warning(
+                "Scheduler checkpoint uses legacy single-scheduler format. "
+                "Skipping scheduler state restore."
+            )
+
+
 def _create_scheduler(
     optimizer,
     warmup_steps: int,
@@ -637,11 +584,15 @@ def _create_scheduler(
     lr_decay_to_fraction: float,
     lr_schedule: str = "Linear",
     last_epoch: int = -1,
-) -> LambdaLR:
+):
     """Build a LambdaLR scheduler with warmup + cosine/linear decay.
 
+    For MuonAdamWGroup, returns a _SchedulerGroup wrapping two LambdaLR
+    schedulers (one per inner optimizer). For plain optimizers, returns
+    a single LambdaLR.
+
     Args:
-        last_epoch: If ≥ 0 the scheduler is positioned at that step
+        last_epoch: If >= 0 the scheduler is positioned at that step
             (useful when reconstructing the schedule on resume).
             ``initial_lr`` is injected into param groups automatically.
     """
@@ -655,9 +606,18 @@ def _create_scheduler(
         else:
             return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
 
-    # When positioning at a non-zero step, LambdaLR requires `initial_lr`
-    # in every param group.  Set it from the current LR (which the caller
-    # has already configured to the desired base value).
+    def _make_scheduler(opt, last_ep):
+        if last_ep >= 0:
+            for pg in opt.param_groups:
+                pg.setdefault("initial_lr", pg["lr"])
+        return LambdaLR(opt, lr_lambda, last_epoch=last_ep)
+
+    if isinstance(optimizer, MuonAdamWGroup):
+        return _SchedulerGroup(
+            _make_scheduler(optimizer.muon, last_epoch),
+            _make_scheduler(optimizer.adamw, last_epoch),
+        )
+
     if last_epoch >= 0:
         for pg in optimizer.param_groups:
             pg.setdefault("initial_lr", pg["lr"])
@@ -893,39 +853,31 @@ def _load_checkpoint(
     # When resuming under FSDP2, the checkpoint contains full (unsharded) optimizer
     # state tensors but the live parameters are sharded across ranks. We must slice
     # each optimizer buffer to match the corresponding parameter's local shard shape.
-    if distributed and distributed_mode == "fsdp" and dist.is_initialized():
+    def _shard_opt_state_for_fsdp(sub_opt_sd, sub_optimizer):
+        """In-place shard a single optimizer's state_dict to match FSDP local param shapes."""
         rank = dist.get_rank()
         world = dist.get_world_size()
-
-        # Build map: param index -> local parameter tensor.
-        # Iterate *all* param groups (muon, adamw, resid, x0, …).
         param_by_idx: dict[int, torch.nn.Parameter] = {}
         all_params: list[torch.nn.Parameter] = []
-        for pg in optimizer.param_groups:
+        for pg in sub_optimizer.param_groups:
             all_params.extend(pg["params"])
         for idx, p in enumerate(all_params):
             param_by_idx[idx] = p
 
-        for param_idx, state_dict_entry in opt_sd.get("state", {}).items():
+        for param_idx, state_dict_entry in sub_opt_sd.get("state", {}).items():
             local_param = param_by_idx.get(param_idx)
             if local_param is None:
                 continue
-            # Get local shape (after FSDP sharding)
             local_shape = local_param.shape if not isinstance(local_param, DTensor) else local_param._local_tensor.shape
             for key, val in state_dict_entry.items():
                 if not isinstance(val, torch.Tensor):
                     continue
-                # If shapes already match, skip
                 if val.shape == local_shape:
                     continue
-                # Shard along dim 0 (FSDP default sharding dimension)
                 if val.ndim >= 1 and val.shape[0] == local_shape[0] * world:
                     chunk_size = val.shape[0] // world
                     state_dict_entry[key] = val.narrow(0, rank * chunk_size, chunk_size).contiguous()
                 elif val.ndim >= 1 and val.shape[0] != local_shape[0]:
-                    # Non-standard / uneven sharding. tensor_split always returns
-                    # exactly one slice per rank, including empty trailing shards
-                    # when val.shape[0] < world.
                     chunks = torch.tensor_split(val, world, dim=0)
                     if chunks[rank].shape[0] == local_shape[0]:
                         state_dict_entry[key] = chunks[rank].contiguous()
@@ -934,6 +886,14 @@ def _load_checkpoint(
                             f"Optimizer state param {param_idx} key '{key}': "
                             f"shape {val.shape} cannot be sharded to match local {local_shape}"
                         )
+
+    if distributed and distributed_mode == "fsdp" and dist.is_initialized():
+        if isinstance(optimizer, MuonAdamWGroup) and "muon" in opt_sd:
+            _shard_opt_state_for_fsdp(opt_sd["muon"], optimizer.muon)
+            _shard_opt_state_for_fsdp(opt_sd["adamw"], optimizer.adamw)
+        else:
+            # Legacy single-optimizer checkpoint or non-MuonAdamWGroup
+            _shard_opt_state_for_fsdp(opt_sd, optimizer)
 
     try:
         optimizer.load_state_dict(opt_sd)
@@ -988,7 +948,7 @@ def _rebuild_scheduler_for_resume(
     total_steps: int,
     warmup_steps: int,
     is_main: bool = True,
-) -> LambdaLR:
+):
     """Rebuild the LR scheduler for a resumed run.
 
     The default behaviour reconstructs the *original* LR curve from the
@@ -1079,7 +1039,12 @@ def _rebuild_scheduler_for_resume(
         eff_warmup = 0
 
     # -- Override optimizer base LRs before creating scheduler -------------
-    if isinstance(optimizer, (Muon, NorMuon)):
+    if isinstance(optimizer, MuonAdamWGroup):
+        for pg in optimizer.muon.param_groups:
+            pg["lr"] = eff_muon_lr
+        for pg in optimizer.adamw.param_groups:
+            pg["lr"] = eff_lr
+    elif isinstance(optimizer, (Muon, NorMuon)):
         # group[0] = muon, group[1+] = adamw / scalar
         optimizer.param_groups[0]["lr"] = eff_muon_lr
         for pg in optimizer.param_groups[1:]:
@@ -1781,35 +1746,25 @@ def run_pure_pretraining(
 
                 # Optimizer step
                 if scaler is not None and scaler.is_enabled():
-                    scaler.unscale_(optimizer)
-                try:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        orig_model.parameters(),
-                        max_norm=max_grad_norm,
-                        error_if_nonfinite=True,
-                    )
-                except RuntimeError as exc:
-                    if "non-finite" not in str(exc).lower():
-                        raise
-                    bad_grad = _first_nonfinite_grad(orig_model)
-                    bad_name = bad_grad[0] if bad_grad is not None else "<unknown>"
-                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-                    logger.error(
-                        "Skipping optimizer step %d due to non-finite gradient in %s on rank %d (epoch=%d micro_step=%d).",
-                        upcoming_step,
-                        bad_name,
-                        rank,
-                        epoch,
-                        micro_step,
-                    )
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_loss.zero_()
-                    continue
+                    if isinstance(optimizer, MuonAdamWGroup):
+                        scaler.unscale_(optimizer.muon)
+                        scaler.unscale_(optimizer.adamw)
+                    else:
+                        scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    orig_model.parameters(),
+                    max_norm=max_grad_norm,
+                    error_if_nonfinite=False,
+                )
 
                 step_skipped = False
                 if scaler is not None and scaler.is_enabled():
                     old_scale = scaler.get_scale()
-                    scaler.step(optimizer)
+                    if isinstance(optimizer, MuonAdamWGroup):
+                        scaler.step(optimizer.muon)
+                        scaler.step(optimizer.adamw)
+                    else:
+                        scaler.step(optimizer)
                     scaler.update()
                     step_skipped = scaler.get_scale() < old_scale
                 else:
@@ -1823,7 +1778,10 @@ def run_pure_pretraining(
                         f"in {bad_name} on rank {rank} (epoch={epoch} micro_step={micro_step})."
                     )
 
-                if isinstance(optimizer, (Muon, NorMuon)):
+                if isinstance(optimizer, MuonAdamWGroup):
+                    muon_lr = optimizer.muon.param_groups[0]["lr"]
+                    learning_rate = optimizer.adamw.param_groups[0]["lr"]
+                elif isinstance(optimizer, (Muon, NorMuon)):
                     muon_lr = optimizer.param_groups[0]["lr"]
                     learning_rate = optimizer.param_groups[1]["lr"]
                 else:

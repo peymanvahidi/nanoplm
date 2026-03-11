@@ -20,7 +20,7 @@ from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from torch.optim.lr_scheduler import LambdaLR
 
-from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, unwrap_model
+from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, unwrap_model, MuonAdamWGroup
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.pretraining.utils import compute_batch_setup, get_num_workers, prepare_run_and_steps
 from nanoplm.utils.logger import logger
@@ -28,7 +28,7 @@ from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 
-def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, lr_decay_to_fraction: float, lr_schedule: str = "Linear") -> LambdaLR:
+def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, lr_decay_to_fraction: float, lr_schedule: str = "Linear"):
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
@@ -39,6 +39,12 @@ def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_r
         else:
             return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
 
+    if isinstance(optimizer, MuonAdamWGroup):
+        from nanoplm.pretraining.pure_pipeline import _SchedulerGroup
+        return _SchedulerGroup(
+            LambdaLR(optimizer.muon, lr_lambda),
+            LambdaLR(optimizer.adamw, lr_lambda),
+        )
     return LambdaLR(optimizer, lr_lambda)
 
 
