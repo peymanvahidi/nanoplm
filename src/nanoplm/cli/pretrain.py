@@ -392,6 +392,14 @@ def pretrain():
     help="Distributed wrapper for multi-GPU runs. DDP is supported only in pure-torch / pure-te.",
 )
 @click.option(
+    "--fsdp-shard-granularity",
+    type=click.Choice(["layer", "sublayer"], case_sensitive=False),
+    default="layer",
+    show_default=True,
+    help="FSDP2 wrapping granularity. 'layer' = whole transformer blocks (fewer boundaries, "
+         "best for NVLink/SXM). 'sublayer' = attn & mlp separately (finer overlap, best for PCIe).",
+)
+@click.option(
     "--world-size",
     type=str,
     default="auto",
@@ -727,6 +735,7 @@ def run(
     fp8: bool,
     multi_gpu: bool,
     distributed_mode: str,
+    fsdp_shard_granularity: str,
     world_size: str,
     ddp_bucket_cap_mb: int,
     project_name: str,
@@ -824,6 +833,7 @@ def run(
         fp8=fp8,
         multi_gpu=multi_gpu,
         distributed_mode=distributed_mode,
+        fsdp_shard_granularity=fsdp_shard_granularity,
         world_size=world_size,
         ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         project_name=project_name,
@@ -1233,6 +1243,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  fp8: false\n"
         "  multi_gpu: true\n"
         "  distributed_mode: \"fsdp\"  # fsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n"
+        "  fsdp_shard_granularity: \"layer\"  # layer (fewer boundaries, NVLink/SXM) | sublayer (finer overlap, PCIe)\n"
         "  world_size: 'auto'\n"
         "  ddp_bucket_cap_mb: 25  # only used when distributed_mode: ddp in pure_torch/pure_te; HF path ignores it\n"
         "  project_name: \"nanoplm-pretraining\"\n"

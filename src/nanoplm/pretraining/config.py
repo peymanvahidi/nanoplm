@@ -101,6 +101,11 @@ class PretrainingConfig:
     multi_gpu: bool = True
     world_size: Union[int, str] = "auto"
     distributed_mode: str = "fsdp"
+    # FSDP2 wrapping granularity: "layer" wraps whole transformer blocks (fewer
+    # boundaries, less CPU dispatch overhead — better for fast interconnects like
+    # NVLink/SXM); "sublayer" wraps attn & mlp separately (more boundaries, but
+    # finer-grained comm/compute overlap — better for slow interconnects like PCIe).
+    fsdp_shard_granularity: str = "layer"
     ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
 

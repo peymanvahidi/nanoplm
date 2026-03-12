@@ -160,11 +160,19 @@ def _fully_shard_encoder_sublayers(
     mesh,
     fsdp_kwargs: dict,
     shard_parent: bool = True,
+    sublayer: bool = False,
 ) -> None:
-    """Shard the heavy attention/MLP weights separately before the enclosing layer."""
-    fully_shard(enc.attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    if enc.mlp is not None:
-        fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+    """Shard encoder weights with configurable granularity.
+
+    When *sublayer* is True, attn and mlp are wrapped as separate FSDP units
+    for finer comm/compute overlap (better on slow interconnects like PCIe).
+    When False, only the parent layer is wrapped (fewer FSDP boundaries,
+    less CPU dispatch overhead — better on fast interconnects like NVLink).
+    """
+    if sublayer:
+        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        if enc.mlp is not None:
+            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
     if shard_parent:
         fully_shard(enc, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
 
@@ -174,6 +182,7 @@ def _fully_shard_transformer_layer(
     *,
     mesh,
     fsdp_kwargs: dict,
+    sublayer: bool = False,
 ) -> None:
     """Shard one logical transformer layer bottom-up for better overlap."""
     if isinstance(layer, ModernBertEncoderLayer):
@@ -182,19 +191,22 @@ def _fully_shard_transformer_layer(
             mesh=mesh,
             fsdp_kwargs=fsdp_kwargs,
             shard_parent=False,
+            sublayer=sublayer,
         )
     elif isinstance(layer, MHCLiteBlock):
-        _fully_shard_encoder_sublayers(layer.layer, mesh=mesh, fsdp_kwargs=fsdp_kwargs)
+        _fully_shard_encoder_sublayers(layer.layer, mesh=mesh, fsdp_kwargs=fsdp_kwargs, sublayer=sublayer)
     elif isinstance(layer, MHCLiteSublayersLayer):
         _fully_shard_encoder_sublayers(
             layer.enc,
             mesh=mesh,
             fsdp_kwargs=fsdp_kwargs,
             shard_parent=False,
+            sublayer=sublayer,
         )
-        fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-        if layer.mhc_mlp is not None:
-            fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        if sublayer:
+            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+            if layer.mhc_mlp is not None:
+                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
     fully_shard(layer, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
 
 
@@ -1309,8 +1321,9 @@ def run_pure_pretraining(
         if use_bf16:
             fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
+        fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
         for layer in base_model.model.layers:
-            _fully_shard_transformer_layer(layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
+            _fully_shard_transformer_layer(layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs, sublayer=fsdp_sublayer)
         _fully_shard_root_groups(base_model, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
         fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
         optimizer_dist = fsdp_mesh
@@ -1613,7 +1626,6 @@ def run_pure_pretraining(
     epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
-
     profiler_ctx, profiler_step_cb = _make_pure_profiler(pretrain_config, output_dir, is_main)
 
     with profiler_ctx:
@@ -1712,19 +1724,6 @@ def run_pure_pretraining(
                         out = model(**fwd_kwargs)
 
                     loss = out["loss"] if isinstance(out, dict) else out.loss
-                    if not torch.isfinite(loss.detach()).all():
-                        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-                        logger.error(
-                            "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d micro_step=%d).",
-                            upcoming_step,
-                            rank,
-                            epoch,
-                            micro_step,
-                        )
-                        optimizer.zero_grad(set_to_none=True)
-                        accum_loss.zero_()
-                        discard_accumulation = not at_accum_boundary
-                        continue
                     loss = loss / inferred_grad_accum_steps
 
                     # Backward
