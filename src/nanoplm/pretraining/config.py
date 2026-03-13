@@ -35,7 +35,7 @@ class PretrainingConfig:
     muon_learning_rate: float = 1e-3
     muon_weight_decay: float = 0.01
     muon_cautious_weight_decay: bool = True
-    muon_use_polar_express: bool = False
+    muon_use_polar_express: bool = True
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_eps: float = 1e-7
