@@ -1008,13 +1008,15 @@ def run_te_pretraining(
                     window_steps = 0
 
                 if global_step % eval_steps == 0:
-                    eval_loss = _evaluate(
-                        model=orig_model,
-                        eval_loader=eval_loader,
-                        device=device,
-                        distributed=distributed,
-                        amp_dtype=amp_dtype,
-                    )
+                    fp8_eval_ctx = te.autocast(enabled=fp8_enabled, recipe=FP8_RECIPE, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
+                    with fp8_eval_ctx:
+                        eval_loss = _evaluate(
+                            model=orig_model,
+                            eval_loader=eval_loader,
+                            device=device,
+                            distributed=distributed,
+                            amp_dtype=amp_dtype,
+                        )
                     if is_main:
                         if wandb_enabled and wandb.run is not None:
                             try:
