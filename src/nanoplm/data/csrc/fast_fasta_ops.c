@@ -651,6 +651,7 @@ API_EXPORT int nanoplm_shuffle_fasta(
     uint64_t *starts = NULL;
     if (collect_fasta_record_starts(in_map, file_size, &starts, &num_records, progress_cb) != 0 ||
         num_records == 0) {
+        free(starts);
         munmap(in_map, file_size);
         close(in_fd);
         set_error(error_msg, error_cap, "No FASTA records found in input");
