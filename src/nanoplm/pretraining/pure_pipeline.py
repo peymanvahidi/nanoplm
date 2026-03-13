@@ -994,7 +994,7 @@ def _rebuild_scheduler_for_resume(
     if saved_config_path.exists():
         with open(saved_config_path) as f:
             saved_cfg = yaml.safe_load(f) or {}
-        saved_lr = float(saved_cfg.get("learning_rate", saved_lr))
+        saved_lr = float(saved_cfg.get("adam_learning_rate", saved_lr))
         saved_muon_lr = float(saved_cfg.get("muon_learning_rate", saved_muon_lr))
         saved_decay = float(saved_cfg.get("lr_decay_to_fraction", saved_decay))
         saved_schedule = str(saved_cfg.get("lr_schedule", saved_schedule))
@@ -1003,7 +1003,7 @@ def _rebuild_scheduler_for_resume(
         if is_main:
             diffs: list[str] = []
             for key in (
-                "learning_rate", "muon_learning_rate", "warmup_steps",
+                "adam_learning_rate", "muon_learning_rate", "warmup_steps",
                 "lr_schedule", "lr_decay_to_fraction",
             ):
                 ckpt_val = saved_cfg.get(key)
