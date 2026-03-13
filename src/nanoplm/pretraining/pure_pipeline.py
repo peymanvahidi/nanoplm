@@ -11,7 +11,7 @@ import os
 import yaml
 from dataclasses import asdict
 from dion import Muon,NorMuon
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
 # here helps ensure stable defaults even when invoked via torchrun.
