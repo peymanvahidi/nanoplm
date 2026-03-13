@@ -338,9 +338,9 @@ def pretrain():
 )
 @click.option(
     "--num-workers",
-    type=Union[int, str],
+    type=str,
     default="auto",
-    help="Number of DataLoader workers. Use 'auto' to use all available CPUs"
+    help="Number of DataLoader workers ('auto' or integer)"
 )
 @click.option(
     "--prefetch-factor",
