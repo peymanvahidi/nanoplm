@@ -33,7 +33,9 @@ from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
+    get_optimizer_state_dict,
     set_model_state_dict,
+    set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -722,15 +724,54 @@ def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
 # Checkpointing
 # ---------------------------------------------------------------------------
 
-def _to_full_tensors(obj):
-    """Recursively convert DTensors to plain tensors (collective operation)."""
-    if isinstance(obj, DTensor):
-        return obj.full_tensor()
-    if isinstance(obj, dict):
-        return {k: _to_full_tensors(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_to_full_tensors(v) for v in obj]
-    return obj
+def _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer):
+    """Backward-compat fallback: manually shard a full optimizer state_dict for FSDP2.
+
+    Used only when loading checkpoints saved before the switch to
+    ``get_optimizer_state_dict`` / ``set_optimizer_state_dict``.
+    """
+
+    def _shard_sub(sub_sd, sub_optimizer):
+        rank = dist.get_rank()
+        world = dist.get_world_size()
+        all_params: list[torch.nn.Parameter] = []
+        for pg in sub_optimizer.param_groups:
+            all_params.extend(pg["params"])
+        param_by_idx = {idx: p for idx, p in enumerate(all_params)}
+
+        for param_idx, entry in sub_sd.get("state", {}).items():
+            local_param = param_by_idx.get(param_idx)
+            if local_param is None:
+                continue
+            local_shape = (
+                local_param._local_tensor.shape
+                if isinstance(local_param, DTensor)
+                else local_param.shape
+            )
+            for key, val in entry.items():
+                if not isinstance(val, torch.Tensor):
+                    continue
+                if val.shape == local_shape:
+                    continue
+                if val.ndim >= 1 and val.shape[0] == local_shape[0] * world:
+                    chunk_size = val.shape[0] // world
+                    entry[key] = val.narrow(0, rank * chunk_size, chunk_size).contiguous()
+                elif val.ndim >= 1 and val.shape[0] != local_shape[0]:
+                    chunks = torch.tensor_split(val, world, dim=0)
+                    if chunks[rank].shape[0] == local_shape[0]:
+                        entry[key] = chunks[rank].contiguous()
+                    else:
+                        logger.warning(
+                            "Optimizer state param %s key '%s': shape %s cannot "
+                            "be sharded to match local %s",
+                            param_idx, key, val.shape, local_shape,
+                        )
+
+    if isinstance(optimizer, MuonAdamWGroup) and "muon" in opt_sd:
+        _shard_sub(opt_sd["muon"], optimizer.muon)
+        _shard_sub(opt_sd["adamw"], optimizer.adamw)
+    else:
+        _shard_sub(opt_sd, optimizer)
 
 
 def _save_checkpoint(
@@ -744,10 +785,15 @@ def _save_checkpoint(
     ckpt = Path(output_dir) / f"checkpoint-{global_step}"
 
     if distributed and distributed_mode == "fsdp":
-        model_sd = get_model_state_dict(
-            model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
-        )
-        opt_sd = _to_full_tensors(optimizer.state_dict())
+        _fsdp_opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        model_sd = get_model_state_dict(model, options=_fsdp_opts)
+        if isinstance(optimizer, MuonAdamWGroup):
+            opt_sd = {
+                "muon": get_optimizer_state_dict(model, optimizer.muon, options=_fsdp_opts),
+                "adamw": get_optimizer_state_dict(model, optimizer.adamw, options=_fsdp_opts),
+            }
+        else:
+            opt_sd = get_optimizer_state_dict(model, optimizer, options=_fsdp_opts)
     else:
         model_sd = model.state_dict()
         opt_sd = optimizer.state_dict()
@@ -862,62 +908,55 @@ def _load_checkpoint(
 
     opt_sd = torch.load(opt_path, map_location=device, weights_only=True)
 
-    # When resuming under FSDP2, the checkpoint contains full (unsharded) optimizer
-    # state tensors but the live parameters are sharded across ranks. We must slice
-    # each optimizer buffer to match the corresponding parameter's local shard shape.
-    def _shard_opt_state_for_fsdp(sub_opt_sd, sub_optimizer):
-        """In-place shard a single optimizer's state_dict to match FSDP local param shapes."""
-        rank = dist.get_rank()
-        world = dist.get_world_size()
-        param_by_idx: dict[int, torch.nn.Parameter] = {}
-        all_params: list[torch.nn.Parameter] = []
-        for pg in sub_optimizer.param_groups:
-            all_params.extend(pg["params"])
-        for idx, p in enumerate(all_params):
-            param_by_idx[idx] = p
-
-        for param_idx, state_dict_entry in sub_opt_sd.get("state", {}).items():
-            local_param = param_by_idx.get(param_idx)
-            if local_param is None:
-                continue
-            local_shape = local_param.shape if not isinstance(local_param, DTensor) else local_param._local_tensor.shape
-            for key, val in state_dict_entry.items():
-                if not isinstance(val, torch.Tensor):
-                    continue
-                if val.shape == local_shape:
-                    continue
-                if val.ndim >= 1 and val.shape[0] == local_shape[0] * world:
-                    chunk_size = val.shape[0] // world
-                    state_dict_entry[key] = val.narrow(0, rank * chunk_size, chunk_size).contiguous()
-                elif val.ndim >= 1 and val.shape[0] != local_shape[0]:
-                    chunks = torch.tensor_split(val, world, dim=0)
-                    if chunks[rank].shape[0] == local_shape[0]:
-                        state_dict_entry[key] = chunks[rank].contiguous()
-                    else:
-                        logger.warning(
-                            f"Optimizer state param {param_idx} key '{key}': "
-                            f"shape {val.shape} cannot be sharded to match local {local_shape}"
-                        )
-
+    # Use FSDP2-aware optimizer state restore so that both DTensor and plain-
+    # tensor optimizer buffers are correctly gathered/sharded.  Falls back to
+    # legacy manual sharding for checkpoints saved before this change.
     if distributed and distributed_mode == "fsdp" and dist.is_initialized():
-        if isinstance(optimizer, MuonAdamWGroup) and "muon" in opt_sd:
-            _shard_opt_state_for_fsdp(opt_sd["muon"], optimizer.muon)
-            _shard_opt_state_for_fsdp(opt_sd["adamw"], optimizer.adamw)
-        else:
-            # Legacy single-optimizer checkpoint or non-MuonAdamWGroup
-            _shard_opt_state_for_fsdp(opt_sd, optimizer)
-
-    try:
-        optimizer.load_state_dict(opt_sd)
-    except ValueError as exc:
-        if "parameter group" in str(exc):
+        _fsdp_opts = StateDictOptions(full_state_dict=True)
+        try:
+            if isinstance(optimizer, MuonAdamWGroup) and "muon" in opt_sd:
+                set_optimizer_state_dict(
+                    model, optimizer.muon,
+                    optim_state_dict=opt_sd["muon"], options=_fsdp_opts,
+                )
+                set_optimizer_state_dict(
+                    model, optimizer.adamw,
+                    optim_state_dict=opt_sd["adamw"], options=_fsdp_opts,
+                )
+            else:
+                set_optimizer_state_dict(
+                    model, optimizer,
+                    optim_state_dict=opt_sd, options=_fsdp_opts,
+                )
+        except Exception as exc:
             logger.warning(
-                "Optimizer param-group layout changed since checkpoint was saved "
-                f"({exc}). Skipping optimizer state restore — optimizer will "
-                "restart with fresh momentum/variance buffers."
+                "FSDP2-aware optimizer state restore failed (%s). "
+                "Falling back to legacy manual sharding.", exc,
             )
-        else:
-            raise
+            _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer)
+            try:
+                optimizer.load_state_dict(opt_sd)
+            except ValueError as exc2:
+                if "parameter group" in str(exc2):
+                    logger.warning(
+                        "Optimizer param-group layout changed since checkpoint was saved "
+                        "(%s). Skipping optimizer state restore — optimizer will "
+                        "restart with fresh momentum/variance buffers.", exc2,
+                    )
+                else:
+                    raise
+    else:
+        try:
+            optimizer.load_state_dict(opt_sd)
+        except ValueError as exc:
+            if "parameter group" in str(exc):
+                logger.warning(
+                    "Optimizer param-group layout changed since checkpoint was saved "
+                    "(%s). Skipping optimizer state restore — optimizer will "
+                    "restart with fresh momentum/variance buffers.", exc,
+                )
+            else:
+                raise
 
     if load_scheduler:
         sched_path = ckp / "scheduler.pt"
