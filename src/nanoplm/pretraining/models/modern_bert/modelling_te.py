@@ -267,6 +267,7 @@ class TEModernBertModel(nn.Module):
                 cu_seqlens,
                 cu_seqlens[-1:] + pad,
             ])
+            max_seqlen = max(max_seqlen, pad)
         if self.config.use_mhc_lite:
             n = self.config.mhc_n_streams
             x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))
