@@ -421,10 +421,10 @@ def run_te_pretraining(
                     )
 
         eval_sampler = DistributedSampler(val_ds, shuffle=False)
-        is_main = dist.get_rank() == 0
     else:
         eval_sampler = SequentialSampler(val_ds)
-        is_main = True
+
+    is_main = (not distributed) or dist.get_rank() == 0
 
     # Build train sampler.
     train_sampler = None
