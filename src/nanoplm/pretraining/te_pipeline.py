@@ -354,7 +354,7 @@ def run_te_pretraining(
             device = torch.device(f"cuda:{local_rank}")
         if not dist.is_initialized():
             if backend == "nccl":
-                dist.init_process_group(backend=backend, device_id=local_rank)
+                dist.init_process_group(backend=backend, device_id=device)
             else:
                 dist.init_process_group(backend=backend)
 
