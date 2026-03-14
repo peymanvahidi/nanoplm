@@ -409,6 +409,43 @@ def _maybe_expand_dynamo_cache_for_batch_warmup(batch_size_warmup_steps: int) ->
         logger.exception("Failed to raise Dynamo cache_size_limit for batch-size warmup; continuing.")
 
 
+def _build_compiled_training_model(
+    base_model: torch.nn.Module,
+    *,
+    compile_dynamic: bool,
+    compile_mode: Optional[str],
+    distributed: bool,
+    distributed_mode: str,
+    ddp_bucket_cap_mb: int,
+    local_rank: int,
+    device: torch.device,
+) -> torch.nn.Module:
+    """Compile the training model and apply DDP wrapping when requested."""
+    if compile_mode is None:
+        compiled_model = torch.compile(base_model, dynamic=compile_dynamic)
+        logger.info("Model compiled with torch.compile(dynamic=%s)", compile_dynamic)
+    else:
+        compiled_model = torch.compile(base_model, dynamic=compile_dynamic, mode=compile_mode)
+        logger.info(
+            "Model compiled with torch.compile(dynamic=%s, mode=%s)",
+            compile_dynamic,
+            compile_mode,
+        )
+
+    if distributed and distributed_mode == "ddp":
+        ddp_kwargs = dict(
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=ddp_bucket_cap_mb,
+        )
+        if device.type == "cuda":
+            ddp_kwargs["device_ids"] = [local_rank]
+            ddp_kwargs["output_device"] = local_rank
+        compiled_model = DistributedDataParallel(compiled_model, **ddp_kwargs)
+    return compiled_model
+
+
 def _format_vram_for_log(
     *,
     device: torch.device,
@@ -1740,27 +1777,17 @@ def run_pure_pretraining(
         except Exception:
             logger.exception("Failed to apply TorchInductor config overrides; continuing.")
 
-    if compile_mode is None:
-        model = torch.compile(base_model, dynamic=compile_dynamic)
-        logger.info(f"Model compiled with torch.compile(dynamic={compile_dynamic})")
-    else:
-        model = torch.compile(base_model, dynamic=compile_dynamic, mode=compile_mode)
-        logger.info(
-            "Model compiled with torch.compile(dynamic=%s, mode=%s)",
-            compile_dynamic,
-            compile_mode,
-        )
+    model = _build_compiled_training_model(
+        base_model,
+        compile_dynamic=compile_dynamic,
+        compile_mode=compile_mode,
+        distributed=distributed,
+        distributed_mode=distributed_mode,
+        ddp_bucket_cap_mb=ddp_bucket_cap_mb,
+        local_rank=local_rank,
+        device=device,
+    )
     if distributed and distributed_mode == "ddp":
-        ddp_kwargs = dict(
-            broadcast_buffers=False,
-            find_unused_parameters=False,
-            gradient_as_bucket_view=True,
-            bucket_cap_mb=ddp_bucket_cap_mb,
-        )
-        if device.type == "cuda":
-            ddp_kwargs["device_ids"] = [local_rank]
-            ddp_kwargs["output_device"] = local_rank
-        model = DistributedDataParallel(model, **ddp_kwargs)
         optimizer_dist = dist.group.WORLD
 
     # ---- DataLoaders ----
@@ -2018,6 +2045,8 @@ def run_pure_pretraining(
         pretrain_config.micro_batch_size,
         batch_size_warmup_steps,
     )
+    pending_compile_rebuild = False
+    pending_compile_target_divisor = mbs_divisor
     accum_loss = torch.zeros((), device=device)
     window_loss = torch.zeros((), device=device)
     window_steps = 0
@@ -2057,6 +2086,45 @@ def run_pure_pretraining(
             epoch_ended_early = False
             epoch_sub_batch_count = 0
             for micro_step in range(synced_len):
+                if pending_compile_rebuild:
+                    if distributed and dist.is_initialized():
+                        _dist_barrier(local_rank)
+                    if device.type == "cuda":
+                        torch.cuda.synchronize()
+                    if is_main:
+                        logger.info(
+                            "[step %d] Rebuilding compiled training graph for split_divisor=%d",
+                            global_step,
+                            pending_compile_target_divisor,
+                        )
+                    old_model = model
+                    model = None
+                    del old_model
+                    gc.collect()
+                    try:
+                        torch.compiler.reset()
+                    except Exception:
+                        logger.exception(
+                            "torch.compiler.reset() failed during batch-size warmup transition; continuing."
+                        )
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    model = _build_compiled_training_model(
+                        base_model,
+                        compile_dynamic=compile_dynamic,
+                        compile_mode=compile_mode,
+                        distributed=distributed,
+                        distributed_mode=distributed_mode,
+                        ddp_bucket_cap_mb=ddp_bucket_cap_mb,
+                        local_rank=local_rank,
+                        device=device,
+                    )
+                    model.train()
+                    pending_compile_rebuild = False
+                    if distributed and dist.is_initialized():
+                        _dist_barrier(local_rank)
+
                 has_batch = True
                 try:
                     full_batch = next(train_iter)
@@ -2245,6 +2313,9 @@ def run_pure_pretraining(
                         pretrain_config.micro_batch_size,
                         batch_size_warmup_steps,
                     )
+                    if prev_warmup_state[2] != mbs_divisor:
+                        pending_compile_rebuild = True
+                        pending_compile_target_divisor = mbs_divisor
                     if (
                         batch_size_warmup_steps > 0
                         and is_main
