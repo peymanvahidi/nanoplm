@@ -1,21 +1,36 @@
+"""Sequence-packing and MLM collators for varlen flash attention.
+
+Key classes:
+    ``DataCollatorWithFlattening`` -- production packing collator. Flattens inputs for flash-attention.
+    ``ProtDataCollatorForLM`` -- standard padding-based MLM collator used for masking.
+"""
+
+import logging
 import torch
-import numpy as np
-from typing import Iterable, Optional, List
+from dataclasses import dataclass
+from typing import Iterable, Optional, List, Any, Dict, Union
 from transformers import DataCollatorForLanguageModeling
+
+logger = logging.getLogger(__name__)
+
+
+# -------------------------------------------------------------------- #
+#  ProtDataCollatorForLM -- padding-based MLM collator
+# -------------------------------------------------------------------- #
 
 
 class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
-    """
-    Protein-aware MLM collator:
-      - custom (mask, random, keep) proportions
-      - random replacements drawn only from non-special tokens
-      - never masks at padding (attention_mask == 0)
+    """Protein-aware MLM collator.
+
+    - Custom (mask, random, keep) proportions.
+    - Random replacements drawn only from non-special tokens.
+    - Never masks at padding (``attention_mask == 0``).
     """
 
     def __init__(
         self,
         tokenizer,
-        mlm_probability: float = 0.03,
+        mlm_probability: float = 0.15,
         mask_token_probability: float = 0.80,
         random_token_probability: float = 0.10,
         keep_probability: float = 0.10,
@@ -23,12 +38,10 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         extra_excluded_token_ids: Optional[Iterable[int]] = None,
         **kwargs,
     ):
-        # parent handles dynamic padding, tensor type, etc.
         super().__init__(
-            tokenizer=tokenizer, mlm=True, mlm_probability=mlm_probability, **kwargs
+            tokenizer=tokenizer, mlm=True, mlm_probability=mlm_probability, **kwargs,
         )
 
-        # normalize split (robust to slight mis-specified sums)
         total = mask_token_probability + random_token_probability + keep_probability
         self.p_mask = mask_token_probability / total
         self.p_rand = random_token_probability / total
@@ -37,7 +50,6 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         if getattr(self.tokenizer, "mask_token_id", None) is None:
             raise ValueError("Tokenizer must define a mask_token_id for MLM.")
 
-        # Build the pool for random replacements: all vocab ids minus specials (and optional extras)
         vocab_ids = list(self.tokenizer.get_vocab().values())
         special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
         special_ids.add(self.tokenizer.mask_token_id)
@@ -52,39 +64,32 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         self.allowed_random_token_ids = torch.tensor(allowed, dtype=torch.long)
 
     def torch_mask_tokens(
-        self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None
+        self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None,
     ):
-        """
-        Mirrors HF logic but uses custom p_mask/p_rand/p_keep and a restricted random pool.
-        """
+        """Mirrors HF logic but uses custom p_mask/p_rand/p_keep and a restricted random pool."""
         labels = inputs.clone()
 
-        # base Bernoulli for whether a position is subject to any corruption
         probability_matrix = torch.full(
-            labels.shape, self.mlm_probability, device=inputs.device
+            labels.shape, self.mlm_probability, device=inputs.device,
         )
 
         if special_tokens_mask is None:
-            # compute via tokenizer
             special_tokens_mask = [
                 self.tokenizer.get_special_tokens_mask(
-                    val.tolist(), already_has_special_tokens=True
+                    val.tolist(), already_has_special_tokens=True,
                 )
                 for val in labels
             ]
             special_tokens_mask = torch.tensor(
-                special_tokens_mask, dtype=torch.bool, device=inputs.device
+                special_tokens_mask, dtype=torch.bool, device=inputs.device,
             )
 
-        # never corrupt special positions
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
 
-        # sample which positions to corrupt at all
         masked_indices = torch.bernoulli(probability_matrix).to(torch.bool)
-        labels[~masked_indices] = -100  # ignore in loss
+        labels[~masked_indices] = -100
 
         if masked_indices.any():
-            # Within the selected positions, decide mask / random / keep
             dice = torch.rand(size=inputs.shape, device=inputs.device)
 
             mask_choice = (dice < self.p_mask) & masked_indices
@@ -93,21 +98,17 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
                 & (dice < self.p_mask + self.p_rand)
                 & masked_indices
             )
-            # keep_choice is implicit
 
-            # 1) replace with [MASK]
             inputs[mask_choice] = self.tokenizer.mask_token_id
 
-            # 2) replace with random non-special token
             if rand_choice.any():
                 pool = self.allowed_random_token_ids.to(inputs.device)
                 n = rand_choice.sum().item()
                 idxs = torch.randint(
-                    low=0, high=pool.numel(), size=(n,), device=inputs.device
+                    low=0, high=pool.numel(), size=(n,), device=inputs.device,
                 )
                 inputs[rand_choice] = pool[idxs]
 
-            # 3) keep_choice -> unchanged
         return inputs, labels
 
     def __call__(self, examples: List[dict]):
@@ -118,25 +119,24 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
 
-        # Ensure tensors are in long dtype (what HF models expect)
         batch["input_ids"] = batch["input_ids"].long()
+        if "token_type_ids" in batch:
+            batch["token_type_ids"] = batch["token_type_ids"].long()
         batch["attention_mask"] = batch["attention_mask"].long()
 
         input_ids = batch["input_ids"]
 
-        # Build/augment special mask
         if "special_tokens_mask" in batch:
             special = batch["special_tokens_mask"].bool()
         else:
             special = [
                 self.tokenizer.get_special_tokens_mask(
-                    v.tolist(), already_has_special_tokens=True
+                    v.tolist(), already_has_special_tokens=True,
                 )
                 for v in input_ids
             ]
             special = torch.tensor(special, dtype=torch.bool, device=input_ids.device)
 
-        # Forbid masking where attention_mask == 0 (padding, packed slack, etc.)
         if "attention_mask" in batch:
             special |= ~batch["attention_mask"].bool()
 
@@ -147,312 +147,319 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         return batch
 
 
-class PackingCollator:
-    """Sequence-packing MLM collator for varlen flash attention.
+# -------------------------------------------------------------------- #
+#  DataCollatorWithFlattening -- production collator
+# -------------------------------------------------------------------- #
 
-    Packs multiple protein sequences into fixed-length rows to eliminate padding
-    waste. Each packed row contains several sequences back-to-back; the collator
-    emits ``cu_seqlens`` and ``max_seqlen`` so the model can pass them directly
-    to ``flash_attn_varlen_func`` without re-deriving sequence boundaries from
-    ``attention_mask``.
 
-    Algorithm (first-fit-decreasing):
-        1. Sort incoming examples by length (descending).
-        2. Greedily assign each sequence to the first row that has room.
-        3. Apply MLM masking on the packed result.
+@dataclass
+class DataCollatorWithFlattening:
+    """Data collator that wraps a DataCollatorForLanguageModeling and flattens inputs for flash-attention.
 
-    **Static-shape mode** (``target_rows`` is set):
+    This collator enables efficient training on batches containing variable-length sequences, by first flattening
+    (packing) multiple input sequences into a single contiguous tensor without padding between sequences. Then, it
+    applies masked language modeling (MLM) masking using the provided DataCollatorForLanguageModeling instance.
 
-    When ``target_rows`` is provided the collator produces *flat* 1-D tensors
-    padded to a fixed size ``F = target_rows × max_seq_len`` so that
-    ``torch.compile(model, dynamic=False)`` never sees shape changes.
-    Dynamic operations (``torch.nonzero``, position-id computation) are done
-    here in the collator — outside the compiled graph.
-
-    Static output dict:
-        ``input_ids``    – (F,)           flat token IDs (real then padding)
-        ``labels``       – (F,)           MLM targets (-100 for pad / unmasked)
-        ``position_ids`` – (F,)           per-token positions (reset per seq)
-        ``cu_seqlens``   – (CU_LEN,)      fixed-length cumulative seq lengths
-        ``max_seqlen``   – int            = max_seq_len (constant)
-
-    **Dynamic mode** (``target_rows`` is ``None``, default):
-
-    Output dict:
-        ``input_ids``      – (num_rows, max_seq_len)
-        ``attention_mask`` – (num_rows, max_seq_len)
-        ``labels``         – (num_rows, max_seq_len)
-        ``cu_seqlens``     – (num_sequences + 1,)
-        ``max_seqlen``     – int
+    The collator also generates metadata required for Flash Attention or context-parallel attention:
+      - `cu_seqlens` tensors, denoting cumulative sequence lengths so that sequence boundaries
+        within the packed tensor are known during attention computation.
     """
 
-    def __init__(
-        self,
-        tokenizer,
-        max_seq_len: int,
-        mlm_probability: float = 0.03,
-        mask_token_probability: float = 0.80,
-        random_token_probability: float = 0.10,
-        keep_probability: float = 0.10,
-        *,
-        target_rows: Optional[int] = None,
-        batch_size: Optional[int] = None,
-        extra_excluded_token_ids: Optional[Iterable[int]] = None,
-    ):
-        self.tokenizer = tokenizer
-        self.max_seq_len = int(max_seq_len)
-        self.mlm_probability = mlm_probability
+    collator: DataCollatorForLanguageModeling
+    return_position_ids: bool = False
+    fixed_tokens_per_batch: int | None = None
+    seq_count_buckets: list[int] | None = None
+    max_seqlen_buckets: list[int] | None = None
+    pad_to_multiple_of: int | None = None
+    pad_sequences_to_be_divisible_by: int | None = None
+    separator_id: int | None = None
 
-        # Normalise mask/random/keep proportions
-        total = mask_token_probability + random_token_probability + keep_probability
-        self.p_mask = mask_token_probability / total
-        self.p_rand = random_token_probability / total
-        self.p_keep = keep_probability / total
-
-        if getattr(self.tokenizer, "mask_token_id", None) is None:
-            raise ValueError("Tokenizer must define a mask_token_id for MLM.")
-
-        self.pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
-
-        # Static-shape mode: pre-flatten and pad to fixed sizes so the compiled
-        # model graph has no data-dependent shapes.
-        self.target_rows = target_rows
-        if target_rows is not None:
-            self.F = target_rows * self.max_seq_len  # fixed flat length
-            # Fixed cu_seqlens length: N (= batch_size) real sequences + 1
-            # leading zero + up to target_rows padding sequences (each ≤ max_seq_len).
-            # We pad cu_seqlens to this fixed length with the final value (F).
-            if batch_size is None:
-                raise ValueError(
-                    "batch_size must be provided when target_rows is set "
-                    "(needed to fix cu_seqlens length)."
-                )
-            self.batch_size = batch_size
-            self.cu_len = batch_size + 1 + target_rows  # fixed cu_seqlens length
-
-        # Build random-replacement pool (same logic as ProtDataCollatorForLM)
-        vocab_ids = list(self.tokenizer.get_vocab().values())
-        special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
-        special_ids.add(self.tokenizer.mask_token_id)
-        if extra_excluded_token_ids:
-            special_ids.update(extra_excluded_token_ids)
-        allowed = [tid for tid in vocab_ids if tid not in special_ids]
-        if not allowed:
+    def __post_init__(self):
+        """Ensure padding options are not used together."""
+        if (
+            self.pad_sequences_to_be_divisible_by is not None
+            and self.pad_to_multiple_of is not None
+        ):
             raise ValueError(
-                "No allowable token ids for random replacement after exclusions."
+                "pad_sequences_to_be_divisible_by and pad_to_multiple_of cannot be used together"
             )
-        self.allowed_random_token_ids = torch.tensor(allowed, dtype=torch.long)
-
-    # --------------------------------------------------------------------- #
-    # Packing
-    # --------------------------------------------------------------------- #
-
-    def _pack_sequences(
-        self, examples: List[dict]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Pack *examples* into fixed-width rows using first-fit-decreasing.
-
-        Returns:
-            input_ids      – (R, max_seq_len)
-            attention_mask – (R, max_seq_len)
-            cu_seqlens     – (total_seqs + 1,) int32
-            max_seqlen     – int
-        """
-        # Extract per-example token tensors (variable length)
-        seqs: List[torch.Tensor] = []
-        for ex in examples:
-            ids = ex["input_ids"]
-            if not isinstance(ids, torch.Tensor):
-                ids = torch.tensor(ids, dtype=torch.long)
-            # Trim trailing padding (datasets may store fixed-width rows)
-            mask = ex.get("attention_mask", None)
-            if mask is not None:
-                if not isinstance(mask, torch.Tensor):
-                    mask = torch.tensor(mask)
-                length = int(mask.sum().item())
-                ids = ids[:length]
-            seqs.append(ids)
-
-        # Sort descending by length for better bin-packing
-        order = sorted(range(len(seqs)), key=lambda i: len(seqs[i]), reverse=True)
-        seqs = [seqs[i] for i in order]
-
-        W = self.max_seq_len  # row width
-
-        # Greedy first-fit-decreasing into rows
-        rows: List[List[torch.Tensor]] = []     # per-row list of sequences
-        row_fill: List[int] = []                 # current fill of each row
-
-        for seq in seqs:
-            slen = len(seq)
-            if slen > W:
-                seq = seq[:W]
-                slen = W
-            placed = False
-            for r_idx in range(len(rows)):
-                if row_fill[r_idx] + slen <= W:
-                    rows[r_idx].append(seq)
-                    row_fill[r_idx] += slen
-                    placed = True
-                    break
-            if not placed:
-                rows.append([seq])
-                row_fill.append(slen)
-
-        R = len(rows)  # number of packed rows
-
-        # Build output tensors
-        input_ids = torch.full((R, W), self.pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros((R, W), dtype=torch.long)
-
-        seq_lengths: List[int] = []
-        max_seqlen = 0
-
-        for r_idx, row_seqs in enumerate(rows):
-            pos = 0
-            for seq in row_seqs:
-                slen = len(seq)
-                input_ids[r_idx, pos : pos + slen] = seq.long()
-                attention_mask[r_idx, pos : pos + slen] = 1
-                seq_lengths.append(slen)
-                if slen > max_seqlen:
-                    max_seqlen = slen
-                pos += slen
-
-        cu_seqlens = torch.zeros(len(seq_lengths) + 1, dtype=torch.int32)
-        cu_seqlens[1:] = torch.cumsum(
-            torch.tensor(seq_lengths, dtype=torch.int32), dim=0
-        )
-
-        return input_ids, attention_mask, cu_seqlens, max_seqlen
-
-    # --------------------------------------------------------------------- #
-    # MLM masking (operates on the packed 2-D tensors)
-    # --------------------------------------------------------------------- #
-
-    def _apply_mlm(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply MLM masking, respecting padding and special tokens."""
-        labels = input_ids.clone()
-
-        probability_matrix = torch.full(
-            labels.shape, self.mlm_probability, device=input_ids.device
-        )
-
-        # Build special-token mask per row (each row may contain multiple seqs)
-        special = torch.zeros_like(input_ids, dtype=torch.bool)
-        for row_idx in range(input_ids.size(0)):
-            row_ids = input_ids[row_idx].tolist()
-            stm = self.tokenizer.get_special_tokens_mask(
-                row_ids, already_has_special_tokens=True
-            )
-            special[row_idx] = torch.tensor(stm, dtype=torch.bool)
-
-        # Never mask padding positions
-        special |= ~attention_mask.bool()
-
-        probability_matrix.masked_fill_(special, 0.0)
-
-        masked_indices = torch.bernoulli(probability_matrix).to(torch.bool)
-        labels[~masked_indices] = -100
-
-        if masked_indices.any():
-            dice = torch.rand(size=input_ids.shape, device=input_ids.device)
-
-            mask_choice = (dice < self.p_mask) & masked_indices
-            rand_choice = (
-                (dice >= self.p_mask)
-                & (dice < self.p_mask + self.p_rand)
-                & masked_indices
-            )
-
-            input_ids[mask_choice] = self.tokenizer.mask_token_id
-
-            if rand_choice.any():
-                pool = self.allowed_random_token_ids.to(input_ids.device)
-                n = rand_choice.sum().item()
-                idxs = torch.randint(
-                    low=0, high=pool.numel(), size=(n,), device=input_ids.device
+        if self.fixed_tokens_per_batch is not None:
+            self.fixed_tokens_per_batch = int(self.fixed_tokens_per_batch)
+            if self.fixed_tokens_per_batch <= 0:
+                raise ValueError("fixed_tokens_per_batch must be > 0")
+            if self.pad_to_multiple_of is not None:
+                raise ValueError(
+                    "fixed_tokens_per_batch and pad_to_multiple_of cannot be used together"
                 )
-                input_ids[rand_choice] = pool[idxs]
+        if self.seq_count_buckets is not None:
+            buckets = sorted({int(x) for x in self.seq_count_buckets if int(x) > 0})
+            if not buckets:
+                raise ValueError("seq_count_buckets must contain at least one positive value")
+            self.seq_count_buckets = buckets
+        if self.max_seqlen_buckets is not None:
+            buckets = sorted({int(x) for x in self.max_seqlen_buckets if int(x) > 0})
+            if not buckets:
+                raise ValueError("max_seqlen_buckets must contain at least one positive value")
+            self.max_seqlen_buckets = buckets
 
-        return input_ids, labels
+    def __call__(self, features, return_tensors=None):
+        """Process a batch of variable-length sequences for Flash Attention with MLM.
 
-    # --------------------------------------------------------------------- #
-    # __call__
-    # --------------------------------------------------------------------- #
+        This method performs the following steps:
+        1. Flattens multiple sequences into a single packed tensor with Flash Attention metadata
+        2. Applies MLM masking by delegating to the underlying collator
+        3. Optionally pads to a multiple of a specified number
+        """
+        # 1. Perform masking with the underlying collator (padding locally to apply mask)
+        # Note: We rely on the collator to handle tokenization/masking.
+        bshd_batch = self.collator(features)
 
-    def __call__(self, examples: List[dict]) -> dict:
-        input_ids_2d, attention_mask_2d, cu_seqlens, max_seqlen = self._pack_sequences(
-            examples
+        # 2. Create the flattened batch structure and compute cu_seqlens based on effective lengths
+        #    Wait, we need to be careful. The collator pads the batch. We want the UNPADDED lengths
+        #    for cu_seqlens. But we also want the MASKED input_ids.
+        #
+        #    Strategy:
+        #    - Use bshd_batch['attention_mask'] to identify valid tokens.
+        #    - Select valid tokens from bshd_batch['input_ids'] (which are masked).
+        #    - Select valid tokens from bshd_batch['labels'].
+        
+        mask = bshd_batch["attention_mask"].bool()
+        
+        # Flattened tensors (only valid tokens)
+        flat_input_ids = bshd_batch["input_ids"][mask]
+        flat_labels = bshd_batch["labels"][mask]
+        
+        # Reconstruct sample lengths from the mask (sum-rows)
+        # bshd_batch is [Batch, MaxSeqLen]
+        # lengths is [Batch]
+        seq_lengths = mask.sum(dim=1).to(torch.int32)
+        
+        # Verify
+        assert flat_input_ids.numel() == seq_lengths.sum().item()
+
+        # Build packet batch
+        packed_batch = {}
+        packed_batch["input_ids"] = flat_input_ids
+        packed_batch["labels"] = flat_labels
+        
+        # Compute cu_seqlens
+        cu_seqlens = torch.zeros(len(seq_lengths) + 1, dtype=torch.int32, device=flat_input_ids.device)
+        cu_seqlens[1:] = torch.cumsum(seq_lengths, dim=0)
+        
+        packed_batch["cu_seqlens"] = cu_seqlens
+        packed_batch["max_seqlen"] = seq_lengths.max().item() if len(seq_lengths) > 0 else 0
+        packed_batch["num_valid_tokens"] = flat_input_ids.numel()
+
+        if self.return_position_ids:
+             # position_ids [0..len-1] for each sequence, concatenated
+             # We can generate this easily
+             position_ids_list = [
+                 torch.arange(int(slen.item()), device=flat_input_ids.device)
+                 for slen in seq_lengths
+             ]
+             packed_batch["position_ids"] = torch.cat(position_ids_list)
+
+        if self.fixed_tokens_per_batch is not None:
+            packed_batch = self._pad_batch_to_fixed_tokens(packed_batch)
+        elif self.pad_to_multiple_of is not None:
+            packed_batch = self._pad_batch_to_multiple_of(packed_batch)
+
+        if self.max_seqlen_buckets is not None:
+            packed_batch["max_seqlen"] = _bucket_ceiling(
+                int(packed_batch["max_seqlen"]),
+                self.max_seqlen_buckets,
+                name="max_seqlen",
+            )
+
+        if self.seq_count_buckets is not None and "cu_seqlens" in packed_batch:
+            num_seq = int(packed_batch["cu_seqlens"].numel() - 1)
+            bucketed_num_seq = _bucket_ceiling(
+                num_seq,
+                self.seq_count_buckets,
+                name="num_sequences",
+            )
+            target_cu_entries = bucketed_num_seq + 1
+            packed_batch["cu_seqlens"] = _pad_cu_seqlens_entries(
+                packed_batch["cu_seqlens"],
+                target_entries=target_cu_entries,
+            )
+
+        return packed_batch
+
+    def _pad_batch_to_multiple_of(self, batch):
+        """Add a mock sequence to make the total number of tokens divisible by pad_to_multiple_of."""
+        pad_token_id = self.collator.tokenizer.pad_token_id
+        if not isinstance(pad_token_id, int):
+            pad_token_id = 0
+
+        assert self.pad_to_multiple_of is not None
+
+        return _pt_pad_to_multiple_of(
+            batch,
+            self.pad_to_multiple_of,
+            token_pad=pad_token_id,
+            label_pad=-100,
         )
 
-        input_ids_2d, labels_2d = self._apply_mlm(input_ids_2d, attention_mask_2d)
+    def _pad_batch_to_fixed_tokens(self, batch):
+        """Pad batch to exactly fixed_tokens_per_batch with a trailing dummy sequence."""
+        pad_token_id = self.collator.tokenizer.pad_token_id
+        if not isinstance(pad_token_id, int):
+            pad_token_id = 0
 
-        # ---- dynamic mode (default): return 2-D tensors ------------------
-        if self.target_rows is None:
-            return {
-                "input_ids": input_ids_2d,
-                "attention_mask": attention_mask_2d,
-                "labels": labels_2d,
-                "cu_seqlens": cu_seqlens,
-                "max_seqlen": max_seqlen,
-            }
-
-        # ---- static-shape mode: pre-flatten + pad to fixed sizes ---------
-        from nanoplm.pretraining.models.modern_bert.modeling import (
-            _position_ids_from_cu_seqlens,
+        assert self.fixed_tokens_per_batch is not None
+        return _pt_pad_to_fixed_tokens(
+            batch,
+            fixed_tokens=self.fixed_tokens_per_batch,
+            token_pad=pad_token_id,
+            label_pad=-100,
         )
 
-        # 1. Extract real tokens contiguously (outside compiled graph).
-        real_mask = attention_mask_2d.flatten().bool()
-        flat_ids = input_ids_2d.flatten()[real_mask]       # (T,)
-        flat_labels = labels_2d.flatten()[real_mask]        # (T,)
-        T = flat_ids.shape[0]  # total real tokens
 
-        # 2. Position IDs for real tokens.
-        position_ids_real = _position_ids_from_cu_seqlens(
-            cu_seqlens, T, cu_seqlens.device
+def build_power_of_two_buckets(max_value: int, min_power_of_two: int = 32) -> list[int]:
+    """Build ascending bucket edges with powers-of-two plus an exact max_value tail."""
+    max_value = int(max_value)
+    min_power_of_two = int(min_power_of_two)
+    if max_value <= 0:
+        raise ValueError("max_value must be > 0")
+    if min_power_of_two <= 0:
+        raise ValueError("min_power_of_two must be > 0")
+
+    buckets: list[int] = []
+    bucket = 1
+    while bucket < min_power_of_two:
+        bucket <<= 1
+    while bucket < max_value:
+        buckets.append(bucket)
+        bucket <<= 1
+    if not buckets or buckets[-1] != max_value:
+        buckets.append(max_value)
+    return buckets
+
+
+def _bucket_ceiling(value: int, buckets: list[int], name: str) -> int:
+    """Return first bucket >= value or raise if out of range."""
+    for bucket in buckets:
+        if value <= bucket:
+            return bucket
+    raise ValueError(
+        f"{name}={value} exceeds configured bucket max={buckets[-1]}. "
+        "Increase bucket ranges."
+    )
+
+
+def _pad_cu_seqlens_entries(cu_seqlens: torch.Tensor, target_entries: int) -> torch.Tensor:
+    """Right-pad cu_seqlens with repeated terminal value to target length."""
+    target_entries = int(target_entries)
+    if target_entries <= 0:
+        raise ValueError("target_entries must be > 0")
+    if cu_seqlens.numel() > target_entries:
+        raise ValueError(
+            f"cu_seqlens has {cu_seqlens.numel()} entries, target_entries={target_entries}"
+        )
+    if cu_seqlens.numel() == target_entries:
+        return cu_seqlens
+    pad_n = target_entries - cu_seqlens.numel()
+    pad = cu_seqlens[-1].repeat(pad_n)
+    return torch.cat([cu_seqlens, pad], dim=0)
+
+
+def _pt_pad_to_multiple_of(batch: Dict[str, Any], pad_to_multiple_of: int, token_pad: int, label_pad: int):
+    """Pad a batch to a multiple of pad_to_multiple_of."""
+    total_tokens = batch["input_ids"].numel()
+    remainder = (-total_tokens) % pad_to_multiple_of
+
+    if remainder == 0:
+        return batch
+
+    # Check device
+    device = batch["input_ids"].device
+
+    # Extend input_ids
+    batch["input_ids"] = torch.cat(
+        [batch["input_ids"], torch.full((remainder,), token_pad, dtype=batch["input_ids"].dtype, device=device)], dim=0
+    )
+
+    # Extend labels
+    if "labels" in batch:
+        batch["labels"] = torch.cat(
+            [batch["labels"], torch.full((remainder,), label_pad, dtype=batch["labels"].dtype, device=device)], dim=0
         )
 
-        # 3. Pad to fixed size F.
-        F = self.F
-        padded_ids = torch.full((F,), self.pad_token_id, dtype=torch.long)
-        padded_labels = torch.full((F,), -100, dtype=torch.long)
-        padded_pos = torch.zeros(F, dtype=torch.int32)
-        padded_ids[:T] = flat_ids
-        padded_labels[:T] = flat_labels
-        padded_pos[:T] = position_ids_real
+    # Handling cu_seqlens with padding in flattened batch:
+    # Option 1: Treat padding as a new dummy sequence.
+    # Option 2: Append to the last sequence (messy for attention).
+    # Option 3: Do nothing to cu_seqlens if Flash Attention implementation ignores trailing tokens not in cu_seqlens ranges.
+    #
+    # ESM2 adds a new entry to cu_seq_lens.
+    
+    if "cu_seqlens" in batch:
+        current_cu = batch["cu_seqlens"]
+        # Add a new "sequence" for the padding
+        new_end = current_cu[-1] + remainder
+        batch["cu_seqlens"] = torch.cat([current_cu, new_end.unsqueeze(0)])
+    
+    if "position_ids" in batch:
+        # Extend position ids for padding (usually 0 or continue?)
+        # ESM2 uses arange(remainder)
+        batch["position_ids"] = torch.cat(
+            [batch["position_ids"], torch.arange(remainder, dtype=batch["position_ids"].dtype, device=device)], dim=0
+        )
+        
+    return batch
 
-        # 4. Build fixed-length cu_seqlens.
-        #    - First N+1 entries: real sequence boundaries (N = len(examples))
-        #    - Then: padding "sequences" of ≤ max_seq_len each (so max_seqlen
-        #      stays ≤ max_seq_len and flash attention tiles optimally).
-        #    - Remaining slots filled with F (zero-length sequences).
-        W = self.max_seq_len
-        padded_cu = torch.full((self.cu_len,), F, dtype=torch.int32)
-        N_real = len(cu_seqlens)  # N_seqs + 1
-        padded_cu[:N_real] = cu_seqlens
 
-        # Fill padding sequences: split (F - T) padding tokens into chunks ≤ W.
-        pad_tokens = F - T
-        pos = T
-        idx = N_real
-        while pad_tokens > 0 and idx < self.cu_len:
-            chunk = min(W, pad_tokens)
-            pos += chunk
-            padded_cu[idx] = pos
-            pad_tokens -= chunk
-            idx += 1
-        # Remaining entries in padded_cu are already F (zero-length).
+def _pt_pad_to_fixed_tokens(
+    batch: Dict[str, Any],
+    fixed_tokens: int,
+    token_pad: int,
+    label_pad: int,
+):
+    """Pad a flattened batch to exactly fixed_tokens."""
+    fixed_tokens = int(fixed_tokens)
+    if fixed_tokens <= 0:
+        raise ValueError("fixed_tokens must be > 0")
 
-        return {
-            "input_ids": padded_ids,        # (F,) fixed
-            "labels": padded_labels,         # (F,) fixed
-            "position_ids": padded_pos,      # (F,) fixed
-            "cu_seqlens": padded_cu,         # (cu_len,) fixed
-            "max_seqlen": W,                 # constant = max_seq_len
-        }
+    total_tokens = batch["input_ids"].numel()
+    if total_tokens > fixed_tokens:
+        raise ValueError(
+            f"Packed batch has {total_tokens} tokens but fixed_tokens={fixed_tokens}. "
+            "Reduce packing size or enable sample splitting."
+        )
+    remainder = fixed_tokens - total_tokens
+    if remainder == 0:
+        return batch
+
+    device = batch["input_ids"].device
+    batch["input_ids"] = torch.cat(
+        [
+            batch["input_ids"],
+            torch.full((remainder,), token_pad, dtype=batch["input_ids"].dtype, device=device),
+        ],
+        dim=0,
+    )
+
+    if "labels" in batch:
+        batch["labels"] = torch.cat(
+            [
+                batch["labels"],
+                torch.full((remainder,), label_pad, dtype=batch["labels"].dtype, device=device),
+            ],
+            dim=0,
+        )
+
+    if "cu_seqlens" in batch:
+        current_cu = batch["cu_seqlens"]
+        new_end = current_cu[-1] + remainder
+        batch["cu_seqlens"] = torch.cat([current_cu, new_end.unsqueeze(0)])
+
+    if "position_ids" in batch:
+        batch["position_ids"] = torch.cat(
+            [
+                batch["position_ids"],
+                torch.arange(remainder, dtype=batch["position_ids"].dtype, device=device),
+            ],
+            dim=0,
+        )
+
+    return batch

@@ -2,16 +2,23 @@ import os
 import torch
 import bisect
 import numpy as np
+from itertools import islice
 from math import ceil
 from Bio import SeqIO
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from tqdm import tqdm
 from pathlib import Path
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from nanoplm.utils import logger, create_dirs
+from nanoplm.utils.common import run_with_heartbeat
+from nanoplm.pretraining.native_shard_writer import (
+    NativeShardWriterError,
+    create_shards_native,
+    is_native_shard_writer_available,
+)
 
 
 class ShardWriter:
@@ -23,6 +30,34 @@ class ShardWriter:
     This is NOT a Dataset - it's a preprocessing utility that creates shards.
     """
 
+    _NATIVE_TOKEN_IDS = {
+        "<pad>": 0,
+        "</s>": 1,
+        "<unk>": 2,
+        "<mask>": 3,
+        "A": 4,
+        "L": 5,
+        "G": 6,
+        "V": 7,
+        "S": 8,
+        "R": 9,
+        "E": 10,
+        "D": 11,
+        "T": 12,
+        "I": 13,
+        "P": 14,
+        "K": 15,
+        "F": 16,
+        "Q": 17,
+        "N": 18,
+        "Y": 19,
+        "M": 20,
+        "H": 21,
+        "W": 22,
+        "C": 23,
+        "X": 24,
+    }
+
     def __init__(
         self,
         fasta_path: str,
@@ -32,6 +67,7 @@ class ShardWriter:
         samples_per_shard: int = 10000,
         max_workers: int = -1,
         force: bool = False,
+        use_native: bool = True,
     ) -> None:
         """
         Args:
@@ -42,6 +78,7 @@ class ShardWriter:
             samples_per_shard: Number of sequences per shard file
             max_workers: Number of parallel workers (-1 = all CPUs)
             force: If True, overwrite existing shards
+            use_native: If True, allow C native shard writer path when available.
         """
         self.fasta_path = str(fasta_path)
         self.tokenizer = tokenizer
@@ -50,6 +87,7 @@ class ShardWriter:
         self.samples_per_shard = int(samples_per_shard)
         self.max_workers = os.cpu_count() if max_workers == -1 else max_workers
         self.force = bool(force)
+        self.use_native = bool(use_native)
 
         # Validate that the FASTA file exists and is readable
         fasta_path_obj = Path(self.fasta_path)
@@ -66,13 +104,43 @@ class ShardWriter:
         if fasta_path_obj.stat().st_size == 0:
             raise ValueError(f"FASTA file is empty: {self.fasta_path}")
 
-        # Create or open a persistent SQLite-backed index for random access
+        self._index = None
         self._db_path = f"{self.fasta_path}.idx"
-        self._index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
-        self._keys: List[str] = list(self._index.keys())
+        self._keys: Optional[List[str]] = None
+        self.sequence_count: Optional[int] = None
 
+        self._use_bos_token = bool(getattr(self.tokenizer, "use_bos_token", False))
+        self._native_compatible_tokenizer = self._is_native_compatible_tokenizer()
+
+    def _is_native_compatible_tokenizer(self) -> bool:
+        token_to_id = getattr(self.tokenizer, "convert_tokens_to_ids", None)
+        if not callable(token_to_id):
+            return False
+
+        for token, expected_id in self._NATIVE_TOKEN_IDS.items():
+            if token_to_id(token) != expected_id:
+                return False
+
+        unk_id = getattr(self.tokenizer, "unk_token_id", None)
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+        if unk_id != 2 or eos_id != 1:
+            return False
+
+        if self._use_bos_token:
+            if token_to_id("<s>") != 29:
+                return False
+
+        return True
+
+    def _ensure_index(self) -> None:
+        if self._index is not None and self._keys is not None:
+            return
+
+        self._index = SeqIO.index_db(self._db_path, [self.fasta_path], "fasta")
+        self._keys = list(self._index.keys())
         if len(self._keys) == 0:
             raise ValueError(f"No sequences found in FASTA: {self.fasta_path}")
+        self.sequence_count = len(self._keys)
 
         logger.info(
             f"Loaded FASTA: {self.fasta_path} with {len(self._keys):,} sequences (max_length={self.max_length})."
@@ -105,6 +173,64 @@ class ShardWriter:
         # Create output directory
         create_dirs(self.output_dir)
 
+        if self.use_native and self._native_compatible_tokenizer:
+            native_available, native_error = is_native_shard_writer_available()
+            if native_available:
+                try:
+                    last_percent = -1
+
+                    def progress_cb(_phase: int, progress: float, completed: int, total: int) -> None:
+                        nonlocal last_percent
+                        percent = int(progress * 100.0)
+                        if percent < 100 and percent % 5 != 0:
+                            return
+                        if percent == last_percent:
+                            return
+                        last_percent = percent
+                        logger.info(
+                            "Shard writer progress: %d%% (%d/%d bytes)",
+                            percent,
+                            completed,
+                            total,
+                        )
+
+                    result = run_with_heartbeat(
+                        "Tokenizing and writing shards (native backend)",
+                        lambda: create_shards_native(
+                            fasta_path=self.fasta_path,
+                            output_dir=self.output_dir,
+                            max_length=self.max_length,
+                            samples_per_shard=self.samples_per_shard,
+                            num_threads=self.max_workers,
+                            use_bos_token=self._use_bos_token,
+                            progress_cb=progress_cb,
+                        ),
+                    )
+                    self.sequence_count = result.sequence_count
+                    logger.info(
+                        "Successfully tokenized %d sequences into %d binary shards in %s (native backend).",
+                        self.sequence_count,
+                        len(result.shard_paths),
+                        self.output_dir,
+                    )
+                    return result.shard_paths
+                except NativeShardWriterError as e:
+                    logger.warning(
+                        "Native shard writer failed (%s). Falling back to Python tokenizer path.",
+                        e,
+                    )
+            else:
+                logger.warning(
+                    "Native shard writer unavailable (%s). Falling back to Python tokenizer path.",
+                    native_error,
+                )
+        elif not self.use_native:
+            logger.info(
+                "Shard writer configured for legacy pipeline. Using Python tokenizer path."
+            )
+
+        self._ensure_index()
+        assert self._keys is not None
         total_seqs = len(self._keys)
         num_shards = ceil(total_seqs / self.samples_per_shard)
 
@@ -135,12 +261,42 @@ class ShardWriter:
 
         # Process shards in parallel
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            shard_paths = list(executor.map(process_shard, args))
+            def run_python_backend() -> list[str]:
+                futures = {
+                    executor.submit(process_shard, arg): i
+                    for i, arg in enumerate(args)
+                }
+                results: list[Optional[str]] = [None] * len(args)
+                completed = 0
+                last_percent = -1
+
+                for future in as_completed(futures):
+                    shard_idx = futures[future]
+                    results[shard_idx] = future.result()
+                    completed += 1
+
+                    percent = int((completed * 100) / num_shards) if num_shards > 0 else 100
+                    if percent >= 100 or (percent % 5 == 0 and percent != last_percent):
+                        last_percent = percent
+                        logger.info(
+                            "Shard writer progress (python backend): %d%% (%d/%d shards)",
+                            percent,
+                            completed,
+                            num_shards,
+                        )
+
+                return [path for path in results if path is not None]
+
+            shard_paths = run_with_heartbeat(
+                "Tokenizing and writing shards (python backend)",
+                run_python_backend,
+            )
 
         logger.info(
             f"Successfully tokenized {total_seqs:,} sequences and saved to {len(shard_paths)} binary shards in {self.output_dir}"
         )
 
+        self.sequence_count = total_seqs
         return [Path(p) for p in shard_paths]
 
 
@@ -156,21 +312,24 @@ class ShardedDataset(Dataset):
     metadata (paths + offsets), not the mapped data itself.
     """
 
-    def __init__(self, data_dir: str) -> None:
+    def __init__(self, data_dir: str, pad_token_id: int = 0) -> None:
         """
         Args:
             data_dir: Directory containing binary shard files (*.bin + *.idx.npy)
+            pad_token_id: Token ID used for padding (default 0).
         """
-        self._init_dataset(str(data_dir), log=True)
+        self._init_dataset(str(data_dir), pad_token_id=pad_token_id, log=True)
 
-    def _init_dataset(self, data_dir: str, log: bool = False) -> None:
+    def _init_dataset(self, data_dir: str, pad_token_id: int = 0, log: bool = False) -> None:
         """Shared init logic (called from __init__ and __setstate__).
 
         Args:
             data_dir: Path to the shard directory.
+            pad_token_id: Token ID used for padding.
             log: Whether to emit log messages (suppressed in DataLoader workers).
         """
         self.data_dir = Path(data_dir)
+        self.pad_token_id = pad_token_id
 
         # Validate directory exists
         if not self.data_dir.exists():
@@ -224,11 +383,15 @@ class ShardedDataset(Dataset):
     # Without this, pickling serializes the entire memmap data to each worker.
     # With this, only the directory path is pickled; memmaps are re-created lazily.
 
-    def __getstate__(self) -> str:
-        return str(self.data_dir)
+    def __getstate__(self) -> dict:
+        return {"data_dir": str(self.data_dir), "pad_token_id": self.pad_token_id}
 
-    def __setstate__(self, state: str) -> None:
-        self._init_dataset(state, log=False)
+    def __setstate__(self, state) -> None:
+        # Backward compat: old pickles stored just the data_dir string.
+        if isinstance(state, str):
+            self._init_dataset(state, pad_token_id=0, log=False)
+        else:
+            self._init_dataset(state["data_dir"], pad_token_id=state.get("pad_token_id", 0), log=False)
 
     # -- Lazy memmap creation --
 
@@ -257,10 +420,10 @@ class ShardedDataset(Dataset):
         end = int(offsets[local_idx + 1])
 
         raw = self._mmaps[shard_idx][start:end]
-        input_ids = torch.from_numpy(raw.copy())  # single copy, stays uint8
+        input_ids = torch.from_numpy(raw.copy()).long() # To long since it will be concat
 
-        # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding (pad_token_id=0)
-        attention_mask = (input_ids != 0).to(torch.uint8)
+        # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding
+        attention_mask = (input_ids != self.pad_token_id).long()
 
         return {
             "input_ids": input_ids,
@@ -274,12 +437,339 @@ class ShardedDataset(Dataset):
             idx -= self.cum_lengths[shard_idx - 1]
         return shard_idx, idx
 
+    def get_all_sequence_lengths(self) -> np.ndarray:
+        """Return a flat int32 array of the length of every sequence in the dataset."""
+        all_lengths = []
+        for offsets in self._offsets:
+            all_lengths.append(np.diff(offsets).astype(np.int32))
+        return np.concatenate(all_lengths)
+
+    def fingerprint(self) -> str:
+        """Return a lightweight hex digest identifying this dataset's content.
+
+        Hashes the number of shards, number of sequences per shard, and all
+        sequence lengths (from the already-loaded index arrays).  This is fast
+        because it only touches metadata already in memory — no data I/O.
+        """
+        import hashlib
+        h = hashlib.sha256()
+        h.update(len(self._bin_paths).to_bytes(4, "little"))
+        for offsets in self._offsets:
+            lengths = np.diff(offsets).astype(np.int32)
+            h.update(lengths.tobytes())
+        return h.hexdigest()[:16]
+
     def cleanup(self):
         """Release memmap objects (public API, kept for compatibility)."""
         if self._mmaps is not None:
             for mmap in self._mmaps:
                 del mmap
             self._mmaps = None
+
+    @property
+    def total_tokens(self) -> int:
+        """Return the total number of tokens in the dataset."""
+        if not hasattr(self, "_total_tokens"):
+             self._total_tokens = sum(int(offsets[-1]) for offsets in self._offsets)
+        return self._total_tokens
+
+
+class TokenPackingDataset(torch.utils.data.IterableDataset):
+    """Dataset that uses sequence packing to construct batches with variable length up to a maximum number of tokens."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        max_tokens_per_batch: int,
+        drop_last: bool = True,
+        split_samples: bool = False,
+        sampler: Optional[torch.utils.data.Sampler] = None,
+    ):
+        """
+        Args:
+            dataset: Dataset to pack.
+            max_tokens_per_batch: Maximum number of tokens per batch.
+            drop_last: Whether to drop the last batch if it's less than max_length.
+            split_samples: Whether to split samples to ensure batches have exactly max_tokens_per_batch tokens.
+            sampler: Optional sampler to determine the order of iteration over the dataset.
+        """
+        self.dataset = dataset
+        self.max_tokens_per_batch = max_tokens_per_batch
+        self.drop_last = drop_last
+        self.split_samples = split_samples
+        self.sampler = sampler
+        self._epoch = 0
+        self._cached_len: Optional[int] = None
+        self._skip_samples = 0
+        self._skip_epoch: Optional[int] = None
+
+    def _resolve_sample_lengths(self) -> list[int]:
+        if hasattr(self.dataset, "get_all_sequence_lengths"):
+            lengths = self.dataset.get_all_sequence_lengths()
+            if self.sampler is None:
+                return [int(length) for length in lengths.tolist()]
+            return [int(lengths[idx]) for idx in self.sampler]
+
+        if self.sampler is not None:
+            if not hasattr(self.dataset, "__getitem__"):
+                raise TypeError(
+                    "Underlying dataset must support indexed access or expose "
+                    "'get_all_sequence_lengths' to compute TokenPackingDataset length"
+                )
+            return [int(len(self.dataset[idx]["input_ids"])) for idx in self.sampler]
+
+        if hasattr(self.dataset, "__len__") and hasattr(self.dataset, "__getitem__"):
+            return [int(len(self.dataset[idx]["input_ids"])) for idx in range(len(self.dataset))]
+
+        raise TypeError(
+            "Underlying dataset must support indexed access or expose "
+            "'get_all_sequence_lengths' to compute TokenPackingDataset length"
+        )
+
+    def _count_batches_from_lengths(self, lengths: list[int]) -> int:
+        if not lengths:
+            return 0
+
+        batches = 0
+        current_length = 0
+
+        for sample_length in lengths:
+            if sample_length <= 0:
+                continue
+
+            current_length += sample_length
+
+            if current_length == self.max_tokens_per_batch:
+                batches += 1
+                current_length = 0
+            elif current_length > self.max_tokens_per_batch:
+                if not self.split_samples:
+                    if current_length > sample_length:
+                        batches += 1
+                    current_length = sample_length
+                else:
+                    batches += 1
+                    current_length -= self.max_tokens_per_batch
+                    while current_length >= self.max_tokens_per_batch:
+                        batches += 1
+                        current_length -= self.max_tokens_per_batch
+
+        if not self.drop_last and current_length > 0:
+            batches += 1
+
+        return batches
+
+    def __len__(self) -> int:
+        """Return the exact number of batches yielded by the dataset."""
+        if self._cached_len is None:
+            lengths = self._resolve_sample_lengths()
+            self._cached_len = self._count_batches_from_lengths(lengths)
+        return self._cached_len
+
+    def __iter__(self):
+        """Yield batches of samples, each with a variable number of tokens up to the maximum length.
+
+        When split_samples=True, ensures each batch has exactly max_tokens_per_batch by splitting
+        the final sample if needed. The remaining tokens from the split sample start the next batch.
+
+        Returns:
+            A generator of batches of samples, each with a variable number of tokens up to the maximum length.
+        """
+        samples = []
+        current_length = 0
+        skip_epoch = getattr(self, "_skip_epoch", None)
+        skip_samples = getattr(self, "_skip_samples", 0) if skip_epoch == self._epoch else 0
+        if skip_samples > 0:
+            # Reset in the local worker copy after consuming the scheduled skip.
+            self._skip_samples = 0
+            self._skip_epoch = None
+
+        if self.sampler is not None:
+             # Handle DataLoader worker sharding if using multiple workers
+             worker_info = torch.utils.data.get_worker_info()
+             if worker_info is not None and worker_info.num_workers > 1:
+                 if isinstance(self.sampler, torch.utils.data.DistributedSampler):
+                     # Build a per-worker DistributedSampler instead of sharing one sampler
+                     # and slicing in Python. This avoids O(dataset_size) index fan-out per worker.
+                     worker_sampler = torch.utils.data.DistributedSampler(
+                         self.dataset,
+                         num_replicas=self.sampler.num_replicas * worker_info.num_workers,
+                         rank=self.sampler.rank * worker_info.num_workers + worker_info.id,
+                         shuffle=self.sampler.shuffle,
+                         seed=self.sampler.seed,
+                         drop_last=self.sampler.drop_last,
+                     )
+                     worker_sampler.set_epoch(self._epoch)
+                     # When fast-forwarding, skip the corresponding per-worker share of samples.
+                     # Each worker sees 1/num_workers of the total samples, so scale accordingly.
+                     per_worker_skip = skip_samples // worker_info.num_workers
+                     indices = islice(worker_sampler, per_worker_skip, None)
+                     iterator = (self.dataset[i] for i in indices)
+                 else:
+                     # Generic fallback for non-distributed samplers.
+                     iterator = (
+                         self.dataset[i]
+                         for i in islice(self.sampler, worker_info.id + skip_samples, None, worker_info.num_workers)
+                     )
+             else:
+                 indices = islice(self.sampler, skip_samples, None)
+                 iterator = (self.dataset[i] for i in indices)
+
+        elif isinstance(self.dataset, torch.utils.data.IterableDataset):
+             # For IterableDataset, we rely on the underlying dataset to handle worker sharding
+             # (See PyTorch docs: underlying dataset should implement __iter__ with worker awareness)
+             iterator = iter(self.dataset)
+        else:
+             # Map-style dataset without sampler
+             worker_info = torch.utils.data.get_worker_info()
+             if worker_info is not None and worker_info.num_workers > 1:
+                 per_worker = int(ceil(len(self.dataset) / worker_info.num_workers))
+                 start = worker_info.id * per_worker
+                 end = min(start + per_worker, len(self.dataset))
+                 # Only iterate the indices assigned to this worker
+                 iterator = (self.dataset[i] for i in range(start, end))
+             else:
+                 iterator = (self.dataset[i] for i in range(len(self.dataset)))
+
+        for sample in iterator:
+            # handle case where sample might be None or invalid if dataset has holes
+            if sample is None:
+                continue
+
+            current_length += len(sample["input_ids"])
+            
+            if current_length == self.max_tokens_per_batch:
+                yield [*samples, sample]
+                samples = []
+                current_length = 0
+
+            elif current_length > self.max_tokens_per_batch:
+                if not self.split_samples:
+                    # If we are not splitting samples, we can just yield the current batch (before this sample) and
+                    # start a new one.
+                    if samples: # yield only if we have accumulated samples
+                        yield samples
+                    samples = [sample]
+                    current_length = len(sample["input_ids"])
+                else:
+                    # Calculate how many tokens are already in the batch from previous samples
+                    # We need to recalculate tokens_in_batch because current_length includes the current sample
+                    tokens_in_batch = current_length - len(sample["input_ids"])
+                    
+                    tokens_available = self.max_tokens_per_batch - tokens_in_batch
+                    
+                    first_part, remaining_part = _split_sample_by_num_tokens(sample, tokens_available)
+                    yield [*samples, first_part]
+                    samples = [remaining_part]
+                    # current_length for next iteration is just the remaining part length
+                    current_length = len(remaining_part["input_ids"])
+            else:
+                samples.append(sample)
+
+        if not self.drop_last and samples:
+            yield samples
+
+    def fast_forward(self, n_batches: int, epoch: Optional[int] = None) -> int:
+        """Advance the dataset state by *n_batches* without reading data.
+
+        Replays the packing logic on sequence lengths alone (read from index
+        files, no sample I/O) to determine how many underlying samples are
+        consumed in *n_batches* packed batches.  On the next ``__iter__`` call
+        the sampler will ``islice`` past those samples so iteration starts at
+        the correct position.
+
+        Returns the number of underlying samples that will be skipped.
+        """
+        if n_batches <= 0:
+            self._skip_samples = 0
+            self._skip_epoch = None
+            return 0
+
+        lengths = self._resolve_sample_lengths()
+        batches_seen = 0
+        samples_consumed = 0
+        current_length = 0
+
+        for sample_length in lengths:
+            if batches_seen >= n_batches:
+                break
+            if sample_length <= 0:
+                samples_consumed += 1
+                continue
+
+            samples_consumed += 1
+            current_length += sample_length
+
+            if current_length == self.max_tokens_per_batch:
+                batches_seen += 1
+                current_length = 0
+            elif current_length > self.max_tokens_per_batch:
+                if not self.split_samples:
+                    batches_seen += 1
+                    current_length = sample_length
+                else:
+                    batches_seen += 1
+                    current_length -= self.max_tokens_per_batch
+                    while current_length >= self.max_tokens_per_batch and batches_seen < n_batches:
+                        batches_seen += 1
+                        current_length -= self.max_tokens_per_batch
+
+        self._skip_samples = samples_consumed
+        self._skip_epoch = self._epoch if epoch is None else int(epoch)
+        return samples_consumed
+
+    def set_epoch(self, epoch: int):
+        """Set the epoch for the dataset."""
+        self._epoch = int(epoch)
+        if hasattr(self.dataset, "set_epoch"):
+            self.dataset.set_epoch(self._epoch)
+        if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+            self.sampler.set_epoch(self._epoch)
+
+
+def _split_sample_by_num_tokens(sample: Dict[str, Any], num_tokens: int) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Split a sample dictionary at a specified number of tokens.
+
+    This function splits a sample into two parts: the first part contains exactly `num_tokens` tokens,
+    and the second part contains the remaining tokens. All fields that are sequences (input_ids, attention_mask,
+    token_type_ids, labels, etc.) are split accordingly.
+    """
+    sample_length = len(sample["input_ids"])
+    if num_tokens >= sample_length:
+        raise ValueError(
+            f"num_tokens ({num_tokens}) must be less than sample length ({sample_length}) to split the sample"
+        )
+    if num_tokens <= 0:
+        raise ValueError(f"num_tokens ({num_tokens}) must be positive")
+
+    first_part = {}
+    remaining_part = {}
+
+    # Fields that should be split by tokens (sequence fields)
+    sequence_fields = ["input_ids", "attention_mask", "token_type_ids", "token_type", "labels"]
+
+    for key, value in sample.items():
+        if key in sequence_fields:
+            # Handle both list and tensor inputs
+            if isinstance(value, torch.Tensor):
+                first_part[key] = value[:num_tokens].clone()
+                remaining_part[key] = value[num_tokens:].clone()
+            elif isinstance(value, list):
+                first_part[key] = value[:num_tokens]
+                remaining_part[key] = value[num_tokens:]
+            else:
+                # For other types, try to slice if possible
+                try:
+                    first_part[key] = value[:num_tokens]
+                    remaining_part[key] = value[num_tokens:]
+                except (TypeError, IndexError):
+                    first_part[key] = value
+                    remaining_part[key] = value
+        else:
+            first_part[key] = value
+            remaining_part[key] = value
+
+    return first_part, remaining_part
 
 
 def process_shard(args):

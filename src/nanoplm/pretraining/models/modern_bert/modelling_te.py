@@ -1,0 +1,429 @@
+"""Transformer Engine ModernBERT path for masked language modeling."""
+
+from __future__ import annotations
+
+import math
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import transformer_engine.pytorch as te
+from transformer_engine.pytorch import attention as te_attention
+from transformer_engine.pytorch.attention.dot_product_attention import backends as te_dpa_backends
+from transformer_engine.common.recipe import DelayedScaling, Format,NVFP4BlockScaling,Float8CurrentScaling,Float8BlockScaling,MXFP8BlockScaling
+
+from nanoplm.pretraining.models.modern_bert.modeling import (
+    MHCLiteBlock,
+    ModernBertConfig,
+    _get_activation,
+    _unpad_input,
+)
+
+try:
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
+        # Match modeling.py's FA3 kernel loading pattern and wire it into TE internals.
+        from kernels import get_kernel
+
+        _te_fa3 = get_kernel("varunneal/flash-attention-3")
+        _te_fa3 = getattr(_te_fa3, "flash_attn_interface", _te_fa3)
+        te_dpa_backends.flash_attn_func_v3 = _te_fa3.flash_attn_func
+        te_dpa_backends.flash_attn_varlen_func_v3 = _te_fa3.flash_attn_varlen_func
+        te_dpa_backends.fa_utils.fa3_version = te_dpa_backends.PkgVersion("3.0.0")
+        te_dpa_backends.fa_utils.set_flash_attention_3_params()
+except Exception as exc:
+    print(f"FA3 monkey patch failed; using default TE attention backend: {exc}")
+
+USE_FP_ATTN=False
+USE_FP8 = True
+FULL_ATTN_EVERY_N_LAYER = 3
+
+# FP8 recipe: delayed scaling with HYBRID format (E4M3 forward, E5M2 backward).
+# amax_history_len=16 is a reasonable default for stability; increase for smoother scaling.
+FP8_RECIPE = DelayedScaling()
+
+# TE requires window_size=(-1, -1) for full attention, not None.
+_FULL_ATTN_WINDOW: tuple[int, int] = (-1, -1)
+
+
+def _blend_resid_x0(
+    x: torch.Tensor,
+    x0: torch.Tensor,
+    resid_lambda: torch.Tensor,
+    x0_lambda: torch.Tensor,
+) -> torch.Tensor:
+    return resid_lambda * x + x0_lambda * x0
+
+
+class TEModernBertEmbeddings(nn.Module):
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.tok_embeddings = nn.Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            padding_idx=config.pad_token_id,
+        )
+        self.norm = te.RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.drop = nn.Dropout(config.embedding_dropout)
+
+    def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
+        return self.drop(self.norm(self.tok_embeddings(input_ids)))
+
+
+class TEModernBertEncoderLayer(nn.Module):
+    def __init__(self, config: ModernBertConfig, layer_idx: int):
+        super().__init__()
+        self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
+
+        if FULL_ATTN_EVERY_N_LAYER == 0:
+            self.is_full_attention = True
+        else:
+            self.is_full_attention = layer_idx % FULL_ATTN_EVERY_N_LAYER == 0
+
+        # TE requires (-1, -1) for full attention (not None).
+        self.window_size: tuple[int, int] = (
+            _FULL_ATTN_WINDOW
+            if self.is_full_attention
+            else (config.sliding_window, config.sliding_window)
+        )
+
+        bound = math.sqrt(3.0 / config.hidden_size)
+
+        def _init(t: torch.Tensor) -> None:
+            nn.init.uniform_(t, -bound, bound)
+
+        def _output_init(t: torch.Tensor) -> None:
+            nn.init.zeros_(t)
+
+        # Fused LayerNorm + QKV projection + attention + output projection.
+        # qkv_format='thd': flat (total_tokens, heads, dim) — required for varlen with
+        # correct per-sequence RoPE position resets via cu_seqlens.
+        # attn_mask_type='padding': required by TE when qkv_format='thd'.
+        num_gqa_groups = config.num_kv_heads
+        self.attn = te.MultiheadAttention(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_gqa_groups=num_gqa_groups,
+            attention_dropout=config.attention_dropout,
+            layernorm_epsilon=config.norm_eps,
+            bias=config.attention_bias,
+            normalization="RMSNorm",
+            input_layernorm=layer_idx != 0,  # layer 0: embedding already normed
+            attn_mask_type="padding",         # required for qkv_format=thd
+            window_size=self.window_size,
+            fuse_qkv_params=True,
+            qkv_format="thd",
+            return_layernorm_output=False,
+            return_bias=False,
+            init_method=_init,
+            output_layer_init_method=_output_init,
+            qk_norm_type="RMSNorm" if config.use_qk_norm else None,
+        )
+
+        # Fused LayerNorm + FC1 + activation + FC2.
+        if self.has_mlp:
+            te_mlp_activation = "srelu" if config.mlp_activation == "srelu" else "swiglu"
+            self.mlp = te.LayerNormMLP(
+                hidden_size=config.hidden_size,
+                ffn_hidden_size=config.intermediate_size,
+                eps=config.norm_eps,
+                bias=config.mlp_bias,
+                normalization="RMSNorm",
+                activation=te_mlp_activation,
+                init_method=_init,
+                output_layer_init_method=_output_init,
+            )
+        else:
+            self.mlp = None
+
+    @property
+    def attention_type(self) -> str:
+        return "full_attention" if self.is_full_attention else "sliding_attention"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        is_first_microbatch: Optional[bool] = None,
+        prores_alpha: "torch.Tensor | float" = 1.0,
+    ) -> torch.Tensor:
+        # x: (total_tokens, hidden) — flat thd layout
+        attn_out = self.attn(
+            hidden_states=x,
+            rotary_pos_emb=rotary_pos_emb,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            attn_mask_type="padding",
+            window_size=self.window_size,
+            checkpoint_core_attention = False,
+            is_first_microbatch=is_first_microbatch,
+        )
+        if isinstance(attn_out, tuple):
+            attn_out = attn_out[0]
+        x = x + prores_alpha * attn_out
+
+        if self.mlp is None:
+            return x
+        mlp_out = self.mlp(x, is_first_microbatch=is_first_microbatch)
+        if isinstance(mlp_out, tuple):
+            mlp_out = mlp_out[0]
+        return x + prores_alpha * mlp_out
+
+
+class TEModernBertModel(nn.Module):
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.config = config
+        self.embeddings = TEModernBertEmbeddings(config)
+        if config.use_mhc_lite:
+            self.layers = nn.ModuleList(
+                [
+                    MHCLiteBlock(
+                        config.mhc_n_streams,
+                        config.hidden_size,
+                        TEModernBertEncoderLayer(config, i),
+                        triton_fused=config.mhc_triton_fused,
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
+        else:
+            self.layers = nn.ModuleList(
+                [TEModernBertEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            )
+        if config.use_resid_lambdas:
+            self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
+        else:
+            self.register_parameter("resid_lambdas", None)
+        if config.use_x0_lambdas:
+            self.x0_lambdas = nn.Parameter(torch.zeros(config.num_hidden_layers))
+        else:
+            self.register_parameter("x0_lambdas", None)
+        self.final_norm = te.RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self._rope_full_emb = te_attention.RotaryPositionEmbedding(
+            config.head_dim, rotary_base=config.global_rope_theta
+        )
+        self._rope_sliding_emb = te_attention.RotaryPositionEmbedding(
+            config.head_dim, rotary_base=config.local_rope_theta
+        )
+        self._max_pos = config.max_position_embeddings
+        # Lazily cached on first forward (needs CUDA device).
+        self._rope_full_freqs: Optional[torch.Tensor] = None
+        self._rope_sliding_freqs: Optional[torch.Tensor] = None
+        self._blend_resid_x0 = _blend_resid_x0
+        # ProRes: progressive residual warmup. The training loop calls
+        # update_prores_alphas(step) once per optimizer step.
+        # Stored as a non-persistent buffer (tensor) for consistency with
+        # the pure-torch path (and future torch.compile compatibility).
+        self.use_prores = config.use_prores
+        self._prores_T = config.prores_T
+        _init_val = 0.0 if config.use_prores else 1.0
+        self.register_buffer(
+            "_prores_alphas",
+            torch.full((config.num_hidden_layers,), _init_val),
+            persistent=False,
+        )
+
+    def update_prores_alphas(self, step: int) -> None:
+        """Recompute per-layer ProRes alphas. Call once per optimizer step."""
+        T = self._prores_T
+        vals = [min(step / (T * (l + 1)), 1.0) for l in range(self.config.num_hidden_layers)]
+        self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
+
+    def _get_rope_freqs(self, max_seqlen: int):
+        """Return cached RoPE frequency tensors, computing on first call."""
+        if self._rope_full_freqs is None:
+            self._rope_full_freqs = self._rope_full_emb(self._max_pos)
+            self._rope_sliding_freqs = self._rope_sliding_emb(self._max_pos)
+        return self._rope_full_freqs[:max_seqlen], self._rope_sliding_freqs[:max_seqlen]
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        is_first_microbatch: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """Always runs in thd (flat/varlen) mode.
+
+        input_ids: (total_tokens,) — already unpadded by TEModernBertForMaskedLM.
+        cu_seqlens: cumulative sequence lengths (batch+1,) int32.
+        max_seqlen: length of the longest sequence in the batch.
+        is_first_microbatch: for FP8 weight caching in gradient accumulation.
+        """
+        x = self.embeddings(input_ids)  # (total_tokens, hidden)
+
+        # FP8 GEMMs require total_tokens divisible by 16 (forward needs %8, wgrad needs %16).
+        # Pad x with zeros and extend cu_seqlens with a dummy entry for the pad tokens.
+        real_total = x.shape[0]
+        pad = (-real_total) % 16
+        if pad > 0:
+            x = F.pad(x, (0, 0, 0, pad))  # (real_total + pad, hidden)
+            cu_seqlens = torch.cat([
+                cu_seqlens,
+                cu_seqlens[-1:] + pad,
+            ])
+            max_seqlen = max(max_seqlen, pad)
+        if self.config.use_mhc_lite:
+            n = self.config.mhc_n_streams
+            x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))
+        x0 = x if self.x0_lambdas is not None else None
+
+        rope_full_freqs, rope_sliding_freqs = self._get_rope_freqs(max_seqlen)
+        use_resid = self.resid_lambdas is not None
+        use_x0 = self.x0_lambdas is not None
+        prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
+
+        for i, layer in enumerate(self.layers):
+            if use_resid and use_x0:
+                x = self._blend_resid_x0(
+                    x,
+                    x0,
+                    self.resid_lambdas[i],
+                    self.x0_lambdas[i],
+                )
+            elif use_resid:
+                x = self.resid_lambdas[i] * x
+            elif use_x0:
+                x = x + self.x0_lambdas[i] * x0
+            alpha = prores_alphas[i]
+            rope = rope_full_freqs if layer.attention_type == "full_attention" else rope_sliding_freqs
+            x = layer(x, rotary_pos_emb=rope, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, is_first_microbatch=is_first_microbatch, prores_alpha=alpha)
+
+        if self.config.use_mhc_lite:
+            x = x[..., 0, :]
+        # Trim padding before final norm and return.
+        if pad > 0:
+            x = x[:real_total]
+
+        return self.final_norm(x)
+
+
+class TEModernBertPredictionHead(nn.Module):
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.dense = nn.Linear(
+            config.hidden_size,
+            config.hidden_size,
+            bias=config.classifier_bias,
+        )
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.norm_eps)
+        self.act = _get_activation(config.classifier_activation)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.act(self.dense(x)))
+
+
+class TEModernBertForMaskedLM(nn.Module):
+    _tied_weights_keys = {"decoder.weight": "model.embeddings.tok_embeddings.weight"}
+
+    def __init__(self, config: ModernBertConfig):
+        super().__init__()
+        self.config = config
+        self.model = TEModernBertModel(config)
+        self.head = TEModernBertPredictionHead(config)
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=config.decoder_bias)
+        self.sparse_prediction = config.sparse_prediction
+        self.sparse_pred_ignore_index = config.sparse_pred_ignore_index
+        self.init_weights()
+        if config.tie_word_embeddings:
+            self.decoder.weight = self.model.embeddings.tok_embeddings.weight
+
+    @torch.no_grad()
+    def init_weights(self) -> None:
+        width = self.config.hidden_size
+        bound = math.sqrt(3.0 / width)
+        embedding_std = 0.02 if self.config.tie_word_embeddings else 1.0
+
+        nn.init.normal_(self.model.embeddings.tok_embeddings.weight, mean=0.0, std=embedding_std)
+
+        for module in self.modules():
+            if module.__class__.__name__ in {"RMSNorm"}:
+                if getattr(module, "weight", None) is not None:
+                    nn.init.ones_(module.weight)
+                if getattr(module, "bias", None) is not None:
+                    nn.init.zeros_(module.bias)
+
+        nn.init.uniform_(self.head.dense.weight, -bound, bound)
+        if self.head.dense.bias is not None:
+            nn.init.zeros_(self.head.dense.bias)
+
+        decoder_std = embedding_std if self.config.tie_word_embeddings else 0.001
+        nn.init.normal_(self.decoder.weight, mean=0.0, std=decoder_std)
+        if self.decoder.bias is not None:
+            nn.init.zeros_(self.decoder.bias)
+        if self.model.resid_lambdas is not None:
+            self.model.resid_lambdas.fill_(self.config.resid_lambda_init)
+        if self.model.x0_lambdas is not None:
+            self.model.x0_lambdas.fill_(self.config.x0_lambda_init)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embeddings.tok_embeddings
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.decoder
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        max_seqlen: Optional[int] = None,
+        is_first_microbatch: Optional[bool] = None,
+    ) -> dict[str, Optional[torch.Tensor]]:
+        # Always unpad to flat (total_tokens,) before the encoder.
+        indices = None  # set when we need to index into flattened input_ids/labels
+        if cu_seqlens is not None and attention_mask is None:
+            # Static packed input: already flat (F,) with cu_seqlens provided.
+            # No attention_mask means all tokens are valid (padding is explicit
+            # in cu_seqlens as zero-length sequences at the end).
+            flat_ids = input_ids.view(-1)
+            if max_seqlen is None:
+                max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+        elif attention_mask is not None:
+            if cu_seqlens is not None:
+                # Packed input: cu_seqlens already provided by the packing collator.
+                indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+                if max_seqlen is None:
+                    max_seqlen = int(attention_mask.sum(dim=-1).max().item())
+            else:
+                # Unpacked padded input: derive cu_seqlens from attention_mask.
+                indices, cu_seqlens, max_seqlen_t = _unpad_input(attention_mask)
+                max_seqlen = int(max_seqlen_t.item())
+            flat_ids = input_ids.view(-1)[indices]
+        else:
+            # No mask, no cu_seqlens: treat each row as a full sequence.
+            total = input_ids.numel()
+            flat_ids = input_ids.view(-1)
+            cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device=input_ids.device)
+            max_seqlen = input_ids.shape[-1]
+        x = self.model(flat_ids, cu_seqlens=cu_seqlens, max_seqlen=int(max_seqlen), is_first_microbatch=is_first_microbatch)
+
+        if self.sparse_prediction and labels is not None:
+            flat_labels = labels.view(-1)[indices] if indices is not None else labels.view(-1)
+            keep = flat_labels != self.sparse_pred_ignore_index
+            logits = self.decoder(self.head(x[keep]))
+            loss = F.cross_entropy(logits.float(), flat_labels[keep])
+        elif labels is not None:
+            flat_labels = labels.view(-1)[indices] if indices is not None else labels.view(-1)
+            logits = self.decoder(self.head(x))
+            loss = F.cross_entropy(
+                logits.float(),
+                flat_labels,
+                ignore_index=self.sparse_pred_ignore_index,
+            )
+        else:
+            logits = self.decoder(self.head(x))
+            loss = None
+
+        return {"loss": loss, "logits": logits}
+
+    def num_parameters(self, only_trainable: bool = True) -> int:
+        return sum(
+            p.numel() for p in self.parameters() if (p.requires_grad or not only_trainable)
+        )

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,20 +26,48 @@ class ModernBertMLPSwiGLU(nn.Module):
         x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
         return self.Wo(self.drop(self.act(x, gate)))
 
+
+class ModernBertNoOpMLP(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states.new_zeros(hidden_states.shape)
+
+
 @dataclass
 class ProtModernBertMLMConfig:
     hidden_size: int
     intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
+    num_kv_heads: Optional[int] = None  # GQA: K,V head count (None = same as num_attention_heads = MHA)
     vocab_size: int = 32
     mlp_activation: str = "swiglu"
     mlp_dropout: float = 0.0
     mlp_bias: bool = False
+    no_mlp_on_first_layer: bool = True
     attention_bias: bool = False
     attention_dropout: float = 0.0
     classifier_activation: str = "gelu"
-    max_position_embeddings: int = 1024
+    use_resid_lambdas: bool = False
+    use_x0_lambdas: bool = False
+    use_qk_norm: bool = False
+    use_canon_layers: bool = False
+    canon_layers_mode: str = "abcd"
+    canon_layers_kernel_size: Optional[int] = None
+    resid_lambda_init: float = 1.0
+    x0_lambda_init: float = 0.1
+    use_repo: bool = False
+    repo_after_n_layers: int = 3
+    use_prores: bool = False
+    prores_T: int = 1000
+    activation_checkpointing: bool = False
+    activation_checkpointing_mode: str = "layer"
+    use_mhc_lite: bool = False
+    mhc_n_streams: int = 4
+    mhc_triton_fused: bool = False
+    mhc_lite_wrapping_level: str = "layer"
+    use_diff_attn_v2: bool = False
+    attn_layer_pattern: Optional[str] = None
+
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
 
@@ -46,7 +75,25 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         self,
         config: ProtModernBertMLMConfig
     ):
+        if config.use_canon_layers:
+            raise ValueError(
+                "Canon layers are currently implemented only in the pure-torch path. "
+                "Use --pure-torch with use_canon_layers=true."
+            )
+        if config.num_kv_heads is not None and config.num_kv_heads != config.num_attention_heads:
+            raise ValueError(
+                "GQA is not implemented in the HF ModernBERT path. "
+                "Set num_kv_heads equal to num_attention_heads or use --pure-torch / --pure-te."
+            )
+        if str(config.classifier_activation).strip().lower() == "srelu":
+            raise ValueError(
+                "classifier_activation='srelu' is implemented only in the pure-torch and "
+                "Transformer Engine paths. Use --pure-torch / --pure-te or choose relu/gelu."
+            )
+
         self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
 
         self.config = ModernBertConfig(
             vocab_size=config.vocab_size,
@@ -54,7 +101,9 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             intermediate_size=config.intermediate_size,
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
-            max_position_embeddings=config.max_position_embeddings, 
+            # Keep this comfortably above common dataset max_seq_len values.
+            # RoPE frequencies are generated from this bound at runtime.
+            max_position_embeddings=8192,
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
             attention_bias=config.attention_bias,
@@ -80,3 +129,8 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         if config.mlp_activation.lower() == "swiglu":
             for layer in self.model.layers:
                 layer.mlp = ModernBertMLPSwiGLU(self.config)
+        if config.no_mlp_on_first_layer and len(self.model.layers) > 0:
+            first_layer = self.model.layers[0]
+            if hasattr(first_layer, "mlp_norm"):
+                first_layer.mlp_norm = nn.Identity()
+            first_layer.mlp = ModernBertNoOpMLP()

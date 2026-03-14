@@ -1,14 +1,16 @@
 import os
+import math
 import time
 import torch
 import torch.distributed as dist
 import wandb
 from datetime import datetime
-from typing import Optional
 from pathlib import Path
+from typing import Optional
 
 from transformers import (
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 
@@ -16,15 +18,34 @@ from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
-from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer
-from nanoplm.pretraining.utils import (
-    compute_batch_setup,
-    get_num_workers,
-    prepare_run_and_steps,
-)
+from torch.optim.lr_scheduler import LambdaLR
+
+from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, unwrap_model, MuonAdamWGroup
 from nanoplm.data.validation import validate_pretrain_dataset
+from nanoplm.pretraining.utils import compute_batch_setup, get_num_workers, prepare_run_and_steps
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
+from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
+
+
+def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, lr_decay_to_fraction: float, lr_schedule: str = "Linear"):
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        decay_steps = max(1, total_steps - warmup_steps)
+        progress = min(1.0, (step - warmup_steps) / decay_steps)
+        if lr_schedule.lower() == "cosine":
+            return lr_decay_to_fraction + 0.5 * (1.0 - lr_decay_to_fraction) * (1.0 + math.cos(math.pi * progress))
+        else:
+            return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
+
+    if isinstance(optimizer, MuonAdamWGroup):
+        from nanoplm.pretraining.pure_pipeline import _SchedulerGroup
+        return _SchedulerGroup(
+            LambdaLR(optimizer.muon, lr_lambda),
+            LambdaLR(optimizer.adamw, lr_lambda),
+        )
+    return LambdaLR(optimizer, lr_lambda)
 
 
 class TokenTrackingTrainer(Trainer):
@@ -104,6 +125,14 @@ class TokenTrackingTrainer(Trainer):
         super().log(logs, start_time=start_time, **kwargs)
 
 
+class WandbSourceSnapshotCallback(TrainerCallback):
+    """Upload run source snapshot once W&B is active."""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        upload_run_source_snapshot()
+        return control
+
+
 def run_pretraining(
     model: ProtModernBertMLM,
     pretrain_config: PretrainingConfig,
@@ -174,6 +203,10 @@ def run_pretraining(
         global_batch_size_samples=global_batch_size_samples,
     )
 
+    steps_per_epoch = (train_sequences + global_batch_size_samples - 1) // global_batch_size_samples
+    total_steps = num_epochs * steps_per_epoch
+    warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+
     # Configure Weights & Biases via environment variables so HF Trainer attaches correctly
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name
     os.environ["WANDB_NAME"] = wandb_run_name
@@ -188,7 +221,7 @@ def run_pretraining(
         "num_train_epochs": num_epochs,
         "learning_rate": pretrain_config.adam_learning_rate,
         "weight_decay": pretrain_config.adam_weight_decay,
-        "warmup_ratio": pretrain_config.warmup_ratio,
+        "max_grad_norm": pretrain_config.max_grad_norm,
         "logging_strategy": "steps",
         "logging_steps": logging_steps,
         "logging_dir": Path(output_dir) / "logs",
@@ -211,20 +244,42 @@ def run_pretraining(
         training_dict["dataloader_prefetch_factor"] = pretrain_config.prefetch_factor
         training_dict["dataloader_persistent_workers"] = True
 
-    # Configure optimizer through TrainingArguments
+    # Build optimizer and scheduler (warmup_steps + min_lr) for all optimizer types
     optimizer_name = pretrain_config.optimizer.lower()
-    custom_optimizer = None
+    raw_model = unwrap_model(model)
     if optimizer_name == "adamw":
-        training_dict["optim"] = "adamw_torch"
+        optimizer = torch.optim.AdamW(
+            raw_model.parameters(),
+            lr=pretrain_config.adam_learning_rate,
+            weight_decay=pretrain_config.adam_weight_decay,
+            betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
+            eps=pretrain_config.adam_epsilon,
+        )
     elif optimizer_name == "stable_adamw":
-        training_dict["optim"] = "stable_adamw"
+        stable_cls = getattr(torch.optim, "StableAdamW", None)
+        if stable_cls is None:
+            logger.warning("StableAdamW unavailable; falling back to AdamW.")
+            stable_cls = torch.optim.AdamW
+        optimizer = stable_cls(
+            raw_model.parameters(),
+            lr=pretrain_config.adam_learning_rate,
+            weight_decay=pretrain_config.adam_weight_decay,
+            betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
+            eps=pretrain_config.adam_epsilon,
+        )
     elif optimizer_name in {"muon", "normuon"}:
-        custom_optimizer = build_muon_optimizer(model, pretrain_config)
+        optimizer = build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
             f"Invalid optimizer: {pretrain_config.optimizer}. "
             f"Currently supported: [adamw, stable_adamw, muon, normuon]"
         )
+
+    scheduler = _create_scheduler(
+        optimizer, warmup_steps, total_steps,
+        pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
+        pretrain_config.lr_schedule,
+    )
 
     if pretrain_config.multi_gpu:
         training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
@@ -239,8 +294,8 @@ def run_pretraining(
         train_dataset=train_ds,
         eval_dataset=val_ds,
         processing_class=tokenizer,
-        # When provided, custom optimizer/scheduler override TrainingArguments.optim.
-        optimizers=(custom_optimizer, None),
+        optimizers=(optimizer, scheduler),
+        callbacks=[WandbSourceSnapshotCallback()],
     )
 
     logger.info("Starting Trainer")

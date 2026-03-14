@@ -19,18 +19,16 @@ class Extractor:
         self.output_path = Path(output_path)
 
     def extract(self):
-        file_size = self.input_path.stat().st_size
+        chunk_size = 8 * 1024 * 1024
 
         try:
-            with gzip.open(self.input_path, "rb") as f_in:
-                f_in.read(10)
             with tqdm(
-                total=file_size, unit="B", unit_scale=True, desc="Extracting FASTA"
+                unit="B", unit_scale=True, desc="Extracting FASTA"
             ) as pbar:
                 with gzip.open(self.input_path, "rb") as f_in:
                     with open(self.output_path, "wb") as f_out:
                         while True:
-                            chunk = f_in.read(4096)
+                            chunk = f_in.read(chunk_size)
                             if not chunk:
                                 break
                             f_out.write(chunk)

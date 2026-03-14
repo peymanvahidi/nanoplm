@@ -16,12 +16,27 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 
+_TE_IMPORT_ERROR = None
+try:
+    from nanoplm.pretraining.models.modern_bert.modelling_te import TEModernBertForMaskedLM
+except Exception as exc:  # pragma: no cover - depends on TE availability
+    _TE_IMPORT_ERROR = exc
+
+    class TEModernBertForMaskedLM:  # type: ignore[no-redef]
+        def __init__(self, *_args, **_kwargs):
+            raise ImportError(
+                "Transformer Engine model requested but unavailable. "
+                "Install `transformer-engine` to use --pure-te."
+            ) from _TE_IMPORT_ERROR
+
 
 class PureProtModernBertMLM(ModernBertForMaskedLM):
     """Pure-torch ``ProtModernBertMLM`` (no HF ``transformers`` dependency)."""
 
     def __init__(self, config: ProtModernBertMLMConfig):
         self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
 
         mb_config = ModernBertConfig(
             vocab_size=config.vocab_size,
@@ -29,10 +44,15 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             intermediate_size=config.intermediate_size,
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_kv_heads,
             mlp_activation=config.mlp_activation,
-            max_position_embeddings=config.max_position_embeddings,  # hardcoded (matches HF wrapper)
+            # Keep this comfortably above common dataset max_seq_len values.
+            # Position embeddings are RoPE frequencies (not learned tables), so a
+            # larger cap avoids runtime index asserts with minimal overhead.
+            max_position_embeddings=8192,
             mlp_dropout=config.mlp_dropout,
             mlp_bias=config.mlp_bias,
+            no_mlp_on_first_layer=config.no_mlp_on_first_layer,
             attention_bias=config.attention_bias,
             attention_dropout=config.attention_dropout,
             classifier_activation=config.classifier_activation,
@@ -41,6 +61,96 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             bos_token_id=None,
             unk_token_id=self.tokenizer.unk_token_id,
             mask_token_id=self.tokenizer.mask_token_id,
+            use_resid_lambdas=config.use_resid_lambdas,
+            use_x0_lambdas=config.use_x0_lambdas,
+            use_qk_norm=config.use_qk_norm,
+            use_canon_layers=config.use_canon_layers,
+            canon_layers_mode=config.canon_layers_mode,
+            canon_layers_kernel_size=config.canon_layers_kernel_size,
+            resid_lambda_init=config.resid_lambda_init,
+            x0_lambda_init=config.x0_lambda_init,
+            use_repo=config.use_repo,
+            repo_after_n_layers=config.repo_after_n_layers,
+            use_prores=config.use_prores,
+            prores_T=config.prores_T,
+            activation_checkpointing=config.activation_checkpointing,
+            activation_checkpointing_mode=str(getattr(config, "activation_checkpointing_mode", "layer")).strip().lower(),
+            use_mhc_lite=config.use_mhc_lite,
+            mhc_n_streams=config.mhc_n_streams,
+            mhc_triton_fused=config.mhc_triton_fused,
+            mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
+            use_diff_attn_v2=config.use_diff_attn_v2,
+            attn_layer_pattern=config.attn_layer_pattern,
+        )
+
+        super().__init__(mb_config)
+
+
+class TEProtModernBertMLM(TEModernBertForMaskedLM):
+    """Transformer-Engine ``ProtModernBertMLM`` wrapper."""
+
+    def __init__(self, config: ProtModernBertMLMConfig):
+        if config.use_canon_layers:
+            raise ValueError(
+                "Canon layers are currently implemented only in the pure-torch path. "
+                "Disable use_canon_layers or use --pure-torch."
+            )
+        if config.use_mhc_lite and str(config.mhc_lite_wrapping_level).strip().lower() != "layer":
+            raise ValueError(
+                "Transformer Engine currently supports only layer-level mHC-lite. "
+                "Set mhc_lite_wrapping_level='layer' or use --pure-torch."
+            )
+        if config.use_diff_attn_v2:
+            raise ValueError(
+                "Differential Attention V2 is currently implemented only in the "
+                "pure-torch path. Disable use_diff_attn_v2 or use --pure-torch."
+            )
+
+        self.tokenizer = ProtModernBertTokenizer()
+        # Keep the original high-level config for checkpoint serialization.
+        self.model_config = config
+
+        mb_config = ModernBertConfig(
+            vocab_size=config.vocab_size,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_kv_heads=config.num_kv_heads,
+            mlp_activation=config.mlp_activation,
+            # Keep this comfortably above common dataset max_seq_len values.
+            max_position_embeddings=8192,
+            mlp_dropout=config.mlp_dropout,
+            mlp_bias=config.mlp_bias,
+            no_mlp_on_first_layer=config.no_mlp_on_first_layer,
+            attention_bias=config.attention_bias,
+            attention_dropout=config.attention_dropout,
+            classifier_activation=config.classifier_activation,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            bos_token_id=None,
+            unk_token_id=self.tokenizer.unk_token_id,
+            mask_token_id=self.tokenizer.mask_token_id,
+            use_resid_lambdas=config.use_resid_lambdas,
+            use_x0_lambdas=config.use_x0_lambdas,
+            use_qk_norm=config.use_qk_norm,
+            use_canon_layers=config.use_canon_layers,
+            canon_layers_mode=config.canon_layers_mode,
+            canon_layers_kernel_size=config.canon_layers_kernel_size,
+            resid_lambda_init=config.resid_lambda_init,
+            x0_lambda_init=config.x0_lambda_init,
+            use_repo=config.use_repo,
+            repo_after_n_layers=config.repo_after_n_layers,
+            use_prores=config.use_prores,
+            prores_T=config.prores_T,
+            activation_checkpointing=config.activation_checkpointing,
+            activation_checkpointing_mode=str(getattr(config, "activation_checkpointing_mode", "layer")).strip().lower(),
+            use_mhc_lite=config.use_mhc_lite,
+            mhc_n_streams=config.mhc_n_streams,
+            mhc_triton_fused=config.mhc_triton_fused,
+            mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
+            use_diff_attn_v2=config.use_diff_attn_v2,
+            attn_layer_pattern=config.attn_layer_pattern,
         )
 
         super().__init__(mb_config)

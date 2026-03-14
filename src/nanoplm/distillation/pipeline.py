@@ -31,6 +31,7 @@ from nanoplm.distillation.dataset import (
 from nanoplm.data.manifest import get_dataset_paths
 from nanoplm.data.validation import validate_distillation_dataset, ValidationError
 from nanoplm.utils import get_device, logger, create_dirs
+from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 
 @dataclass
@@ -664,6 +665,7 @@ def run_distillation(
         wandb_config["id"] = wandb_run_name
 
         wandb.init(**wandb_config)
+        upload_run_source_snapshot()
 
     # Create optimizer
     optimizer = AdamW(model.parameters(), lr=distill_config.learning_rate)
