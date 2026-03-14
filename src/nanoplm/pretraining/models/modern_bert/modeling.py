@@ -150,8 +150,8 @@ class ModernBertConfig:
     repo_after_n_layers: int = 3
     use_prores: bool = False
     prores_T: int = 1000
-    gradient_checkpointing: bool = False
-    gradient_checkpointing_mode: Literal["layer", "attn", "attn+mlp"] = "layer"
+    activation_checkpointing: bool = False
+    activation_checkpointing_mode: Literal["layer", "attn", "attn+mlp"] = "layer"
     use_mhc_lite: bool = False
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
@@ -992,9 +992,9 @@ class ModernBertEncoderLayer(nn.Module):
         super().__init__()
         self.attention_type = config.layer_types[layer_idx]
         self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
-        self.gradient_checkpointing = bool(getattr(config, "gradient_checkpointing", False))
-        self.gradient_checkpointing_mode = str(
-            getattr(config, "gradient_checkpointing_mode", "layer")
+        self.activation_checkpointing = bool(getattr(config, "activation_checkpointing", False))
+        self.activation_checkpointing_mode = str(
+            getattr(config, "activation_checkpointing_mode", "layer")
         ).strip().lower()
         self.attn_norm = (
             nn.Identity()
@@ -1039,9 +1039,9 @@ class ModernBertEncoderLayer(nn.Module):
         prores_alpha: "torch.Tensor | float" = 1.0,
     ) -> torch.Tensor:
         do_ckpt_attn = (
-            self.gradient_checkpointing
+            self.activation_checkpointing
             and self.training
-            and self.gradient_checkpointing_mode in {"attn", "attn+mlp"}
+            and self.activation_checkpointing_mode in {"attn", "attn+mlp"}
         )
         if do_ckpt_attn:
             _attn_mask = attn_mask
@@ -1106,9 +1106,9 @@ class ModernBertEncoderLayer(nn.Module):
             x = x + prores_alpha * attn_out
         if self.mlp is not None:
             do_ckpt_mlp = (
-                self.gradient_checkpointing
+                self.activation_checkpointing
                 and self.training
-                and self.gradient_checkpointing_mode == "attn+mlp"
+                and self.activation_checkpointing_mode == "attn+mlp"
             )
             if do_ckpt_mlp:
                 _position_ids = position_ids
@@ -1648,9 +1648,9 @@ class ModernBertModel(nn.Module):
                 alpha = prores_alphas[i]
                 lt = layer.attention_type
                 if (
-                    self.config.gradient_checkpointing
+                    self.config.activation_checkpointing
                     and self.training
-                    and str(self.config.gradient_checkpointing_mode).strip().lower() == "layer"
+                    and str(self.config.activation_checkpointing_mode).strip().lower() == "layer"
                 ):
                     cos_sin = rope[lt]
                     cu_seqlens = _cu_seqlens
@@ -1751,9 +1751,9 @@ class ModernBertModel(nn.Module):
             alpha = prores_alphas[i]
             layer_type = layer.attention_type
             if (
-                self.config.gradient_checkpointing
+                self.config.activation_checkpointing
                 and self.training
-                and str(self.config.gradient_checkpointing_mode).strip().lower() == "layer"
+                and str(self.config.activation_checkpointing_mode).strip().lower() == "layer"
             ):
                 attn_mask = attn_masks[layer_type]
                 cos_sin = rope[layer_type]

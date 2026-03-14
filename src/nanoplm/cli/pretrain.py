@@ -616,12 +616,12 @@ def pretrain():
     help="ProRes warmup length T for the first layer. Layer l finishes warmup at step T*l.",
 )
 @click.option(
-    "--gradient-checkpointing/--no-gradient-checkpointing",
+    "--activation-checkpointing/--no-activation-checkpointing",
     default=False,
     help="Enable activation checkpointing (recompute transformer layers in backward to save VRAM).",
 )
 @click.option(
-    "--gradient-checkpointing-mode",
+    "--activation-checkpointing-mode",
     type=click.Choice(["layer", "attn", "attn+mlp"], case_sensitive=False),
     default="layer",
     show_default=True,
@@ -781,8 +781,8 @@ def run(
     repo_after_n_layers: int,
     use_prores: bool,
     prores_t: int,
-    gradient_checkpointing: bool,
-    gradient_checkpointing_mode: str,
+    activation_checkpointing: bool,
+    activation_checkpointing_mode: str,
     use_diff_attn_v2: bool,
     attn_layer_pattern: Optional[str],
     use_mhc_lite: bool,
@@ -909,8 +909,8 @@ def run(
         repo_after_n_layers=repo_after_n_layers,
         use_prores=use_prores,
         prores_T=prores_t,
-        gradient_checkpointing=gradient_checkpointing,
-        gradient_checkpointing_mode=gradient_checkpointing_mode.lower(),
+        activation_checkpointing=activation_checkpointing,
+        activation_checkpointing_mode=activation_checkpointing_mode.lower(),
         use_mhc_lite=use_mhc_lite,
         mhc_n_streams=mhc_n_streams,
         mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),

@@ -59,8 +59,8 @@ class ProtModernBertMLMConfig:
     repo_after_n_layers: int = 3
     use_prores: bool = False
     prores_T: int = 1000
-    gradient_checkpointing: bool = False
-    gradient_checkpointing_mode: str = "layer"
+    activation_checkpointing: bool = False
+    activation_checkpointing_mode: str = "layer"
     use_mhc_lite: bool = False
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
