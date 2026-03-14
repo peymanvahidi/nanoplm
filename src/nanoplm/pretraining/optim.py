@@ -90,11 +90,14 @@ def _is_zero_init_fragile_param(name: str) -> bool:
     Currently matches:
       - mHC-lite W_all.weight  (32×3072, 75% of rows intentionally suppressed)
       - RePO W_z.weight        (8×96, zero-init with per-head rows)
+      - DiffAttnV2 lambda_proj.weight (num_heads×hidden, zero-init, very few rows)
     """
     parts = name.split(".")
     if len(parts) >= 2 and parts[-2] == "W_all" and parts[-1] == "weight":
         return True
     if len(parts) >= 2 and parts[-2] == "W_z" and parts[-1] == "weight":
+        return True
+    if len(parts) >= 2 and parts[-2] == "lambda_proj" and parts[-1] == "weight":
         return True
     return False
 
