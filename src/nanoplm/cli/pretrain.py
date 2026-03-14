@@ -1197,6 +1197,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
+        "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
+        "  activation_checkpointing_mode: \"attn\"  # (layer | attn | attn+mlp), attn mode has highest ROI \n"
         "\n"
         "pretraining:\n"
         "  dataset_dir: \"output/data/pretrain_data\"\n"
