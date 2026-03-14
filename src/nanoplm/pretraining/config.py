@@ -45,6 +45,7 @@ class PretrainingConfig:
     inferred_grad_accum_steps: Optional[int] = None
     global_batch_size_samples: Optional[int] = None
     achieved_global_batch_tokens: Optional[int] = None
+    batch_size_warmup_steps: int = 0
 
     # Mixed precision
     bf16: bool = True

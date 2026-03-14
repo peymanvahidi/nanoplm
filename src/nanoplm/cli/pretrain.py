@@ -203,6 +203,13 @@ def pretrain():
          "If unset, defaults to --warmup-steps.",
 )
 @click.option(
+    "--batch-size-warmup-steps",
+    type=int,
+    default=0,
+    help="Optimizer steps to ramp effective batch size from 1/8 to full by reducing "
+         "grad accumulation first, then splitting DataLoader batches when needed.",
+)
+@click.option(
     "--lr-decay-to-fraction",
     type=float,
     default=0.1,
@@ -699,6 +706,7 @@ def run(
     gradient_clipping: bool,
     warmup_steps: int,
     repo_rope_warmup_steps: Optional[int],
+    batch_size_warmup_steps: int,
     lr_decay_to_fraction: float,
     lr_schedule: str,
     global_batch_size: int,
@@ -798,6 +806,7 @@ def run(
         max_grad_norm=1.0 if gradient_clipping else float("inf"),
         warmup_steps=warmup_steps,
         repo_rope_warmup_steps=repo_rope_warmup_steps,
+        batch_size_warmup_steps=batch_size_warmup_steps,
         lr_decay_to_fraction=lr_decay_to_fraction,
         lr_schedule=lr_schedule,
         global_batch_size=global_batch_size,
@@ -1204,6 +1213,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  max_grad_norm: .inf\n"
         "  warmup_steps: 302\n"
         "  repo_rope_warmup_steps: 302\n"
+        "  batch_size_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
         "  lr_decay_to_fraction: 0.1\n"
         "  lr_schedule: \"cosine\"\n"
         "  adam_weight_decay: 0.0\n"
@@ -1363,7 +1373,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             kwargs[field] = _parse_float_like(kwargs[field], field)
 
     # Ensure warmup-related fields are ints (YAML may load as int or float).
-    for warmup_key in ("warmup_steps", "repo_rope_warmup_steps"):
+    for warmup_key in ("warmup_steps", "repo_rope_warmup_steps", "batch_size_warmup_steps"):
         if warmup_key in kwargs and kwargs[warmup_key] is not None:
             try:
                 kwargs[warmup_key] = int(kwargs[warmup_key])

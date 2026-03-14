@@ -3,6 +3,7 @@
 
 
 import gc
+import json
 import math
 import os
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -38,6 +39,7 @@ from nanoplm.pretraining.utils import prepare_run_and_steps
 from nanoplm.pretraining.pure_pipeline import (
     H100_PEAK_TFLOPS,
     N_PREFETCH_LAYERS_FSDP2,
+    _compute_epoch_start_steps,
     _create_optimizer,
     _create_scheduler,
     _ddp_sync_context,
@@ -47,15 +49,19 @@ from nanoplm.pretraining.pure_pipeline import (
     _first_nonfinite_grad,
     _first_nonfinite_param,
     _format_vram_for_log,
+    _get_batch_warmup_params,
     _get_distributed_mode,
     _has_nonfinite_params,
     _load_checkpoint,
+    _locate_resume_position_in_epoch,
+    _maybe_expand_dynamo_cache_for_batch_warmup,
     _move_batch_to_device,
     _num_update_steps_per_epoch,
     _rebuild_scheduler_for_resume,
     _resolve_world_size,
     _save_checkpoint,
     _set_seed,
+    _split_batch,
     _sync_train_loader_len,
 )
 from nanoplm.utils.common import create_dirs, get_device
@@ -297,6 +303,10 @@ def run_te_pretraining(
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
     global_batch_size_samples = pretrain_config.global_batch_size_samples
     achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
+    batch_size_warmup_steps = max(
+        0,
+        int(getattr(pretrain_config, "batch_size_warmup_steps", 0)),
+    )
 
     if (
         inferred_grad_accum_steps is None
@@ -311,6 +321,7 @@ def run_te_pretraining(
     world_tokens_per_micro_step = achieved_global_batch_tokens // max(
         1, inferred_grad_accum_steps
     )
+    tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
     logger.info(
         "Batch setup: "
         f"target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
@@ -366,6 +377,7 @@ def run_te_pretraining(
         if getattr(pretrain_config, "use_compile_max_autotune", False)
         else None
     )
+    _maybe_expand_dynamo_cache_for_batch_warmup(batch_size_warmup_steps)
     if model.model.config.use_mhc_lite:
         _compile_te_mhc_blocks(
             model,
@@ -429,7 +441,6 @@ def run_te_pretraining(
     # Build train sampler.
     train_sampler = None
     if use_packing:
-        tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
         # For packing, we use a sampler on the *underlying* dataset to handle shuffling and distributed sharding.
         if distributed:
             _inner_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed)
@@ -566,11 +577,15 @@ def run_te_pretraining(
         distributed=distributed,
         device=device,
     )
-    steps_per_epoch = _num_update_steps_per_epoch(
+    epoch_start_steps = _compute_epoch_start_steps(
+        num_epochs=num_epochs,
         train_loader_len=synced_train_loader_len,
-        grad_accum=inferred_grad_accum_steps,
+        full_grad_accum=inferred_grad_accum_steps,
+        full_micro_batch=pretrain_config.micro_batch_size,
+        batch_size_warmup_steps=batch_size_warmup_steps,
     )
-    total_steps = num_epochs * steps_per_epoch
+    steps_per_epoch = max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
+    total_steps = epoch_start_steps[-1]
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
@@ -580,6 +595,10 @@ def run_te_pretraining(
 
     start_step = 0
     start_epoch = 0
+    resume_data_step = 0
+    resume_sub_batch_step = 0
+    resume_batch_split_divisor = 1
+    resume_epoch = 0
     if resume_config and resume_config.is_resume:
         logger.info(f"Resuming from checkpoint: {resume_config.checkpoint_dir}")
         start_step, start_epoch = _load_checkpoint(
@@ -606,19 +625,38 @@ def run_te_pretraining(
             warmup_steps=warmup_steps,
             is_main=is_main,
         )
-
-    resume_micro_step = 0
-    resume_epoch = start_epoch
-    if resume_config and resume_config.is_resume:
-        steps_done = max(0, start_step - start_epoch * steps_per_epoch)
-        resume_micro_step = steps_done * inferred_grad_accum_steps
-        if resume_micro_step >= synced_train_loader_len:
-            resume_micro_step = 0
+        resume_epoch = start_epoch
+        _ckp_state_path = Path(resume_config.checkpoint_dir) / "training_state.json"
+        _ckp_state = None
+        if _ckp_state_path.exists():
+            _ckp_state = json.loads(_ckp_state_path.read_text(encoding="utf-8"))
+        if _ckp_state is not None and "epoch_data_step" in _ckp_state:
+            resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
+            resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
+            resume_batch_split_divisor = max(1, int(_ckp_state.get("batch_split_divisor", 1)))
+        else:
+            epoch_start_step = epoch_start_steps[min(start_epoch, len(epoch_start_steps) - 1)]
+            resume_data_step, resume_sub_batch_step, resume_batch_split_divisor = _locate_resume_position_in_epoch(
+                train_loader_len=synced_train_loader_len,
+                epoch_start_step=epoch_start_step,
+                resume_global_step=start_step,
+                full_grad_accum=inferred_grad_accum_steps,
+                full_micro_batch=pretrain_config.micro_batch_size,
+                batch_size_warmup_steps=batch_size_warmup_steps,
+            )
+        if resume_data_step >= synced_train_loader_len:
+            resume_data_step = 0
+            resume_sub_batch_step = 0
+            resume_batch_split_divisor = 1
             start_epoch = min(start_epoch + 1, num_epochs)
             resume_epoch = start_epoch
-        if resume_micro_step > 0:
+        elif resume_data_step > 0 or resume_sub_batch_step > 0:
             logger.info(
-                f"Skipping {resume_micro_step} micro-steps in resumed epoch {resume_epoch}"
+                "Resuming inside epoch %d at data_step=%d sub_batch=%d/%d",
+                resume_epoch,
+                resume_data_step,
+                resume_sub_batch_step,
+                resume_batch_split_divisor,
             )
 
     wandb_enabled = False
@@ -674,6 +712,7 @@ def run_te_pretraining(
     logger.info(
         "Starting Transformer Engine training: "
         f"epochs={num_epochs}, total_steps={total_steps}, warmup_steps={warmup_steps}, "
+        f"batch_size_warmup_steps={batch_size_warmup_steps}, "
         f"grad_accum={inferred_grad_accum_steps}, "
         f"achieved_global_batch_size={achieved_global_batch_tokens:,} tokens"
     )
@@ -716,6 +755,13 @@ def run_te_pretraining(
     optimizer.zero_grad(set_to_none=True)
 
     global_step = start_step
+    accum_micro_count = 0
+    effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
+        global_step,
+        inferred_grad_accum_steps,
+        pretrain_config.micro_batch_size,
+        batch_size_warmup_steps,
+    )
     accum_loss = torch.zeros((), device=device)
     window_loss = torch.zeros((), device=device)
     window_steps = 0
@@ -732,11 +778,20 @@ def run_te_pretraining(
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
 
     profiler_ctx, profiler_step_cb = _make_te_profiler(pretrain_config, output_dir, is_main)
+    if batch_size_warmup_steps > 0 and is_main:
+        logger.info(
+            "Batch-size warmup active: steps=%d, initial_grad_accum=%d, initial_micro_batch=%d, split_divisor=%d",
+            batch_size_warmup_steps,
+            effective_grad_accum,
+            effective_micro_batch,
+            mbs_divisor,
+        )
 
     with profiler_ctx:
         for epoch in range(start_epoch, num_epochs):
             if _epoch_setter is not None and hasattr(_epoch_setter, "set_epoch"):
                 _epoch_setter.set_epoch(epoch)
+            epoch_start_step = epoch_start_steps[min(epoch, len(epoch_start_steps) - 1)]
 
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
@@ -746,13 +801,14 @@ def run_te_pretraining(
             log_window_t0 = time.perf_counter()
 
             epoch_ended_early = False
+            epoch_sub_batch_count = 0
             for micro_step in range(synced_train_loader_len):
                 has_batch = True
                 try:
-                    batch = next(train_iter)
+                    full_batch = next(train_iter)
                 except StopIteration:
                     has_batch = False
-                    batch = None
+                    full_batch = None
 
                 # When packing + num_workers > 0, greedy bin-packing can produce
                 # different batch counts per rank.  Coordinate so all ranks break
@@ -767,291 +823,366 @@ def run_te_pretraining(
                     epoch_ended_early = True
                     break
 
-                if resume_micro_step > 0 and epoch == resume_epoch and micro_step < resume_micro_step:
+                if resume_data_step > 0 and epoch == resume_epoch and micro_step < resume_data_step:
                     continue
 
-                at_accum_boundary = (micro_step + 1) % inferred_grad_accum_steps == 0
-                if discard_accumulation:
-                    if at_accum_boundary:
-                        discard_accumulation = False
-                    continue
+                resume_sub_batch_start = 0
+                batch_split_divisor = mbs_divisor
+                if epoch == resume_epoch and micro_step == resume_data_step and resume_sub_batch_step > 0:
+                    resume_sub_batch_start = resume_sub_batch_step
+                    batch_split_divisor = resume_batch_split_divisor
+                elif epoch == resume_epoch and micro_step == resume_data_step and resume_data_step > 0 and is_main:
+                    logger.info(
+                        "Dataloader fast-forward complete — resuming training at data_step %d",
+                        micro_step,
+                    )
 
-                batch = _move_batch_to_device(batch, device)
-
-                # FSDP2: only reduce-scatter gradients at regular accumulation
-                # boundaries.  (Do NOT use synced_train_loader_len as a fallback
-                # — the loop may break early via all_reduce, making it
-                # unreachable.  Partial accumulation at epoch end is discarded.)
-                _is_sync_step = (micro_step + 1) % inferred_grad_accum_steps == 0
-                if distributed and distributed_mode == "fsdp":
-                    model.set_requires_gradient_sync(_is_sync_step)
-
-                if "num_valid_tokens" in batch:
-                    token_count += batch["num_valid_tokens"]
-                    raw_token_count += batch["input_ids"].numel()
-                elif "attention_mask" in batch:
-                    token_count += batch["attention_mask"].sum()
-                    raw_token_count += batch["attention_mask"].numel()
-                else:
-                    token_count += batch["input_ids"].numel()
-                    raw_token_count += batch["input_ids"].numel()
-
-                sync_ctx = _ddp_sync_context(model, distributed_mode=distributed_mode, sync=_is_sync_step)
-                amp_ctx = (
-                    torch.autocast(device_type=device.type, dtype=amp_dtype)
-                    if amp_dtype is not None
-                    else nullcontext()
+                effective_tokens_per_split = max(1, tokens_per_micro // max(1, batch_split_divisor))
+                sub_batches = _split_batch(
+                    full_batch,
+                    n_splits=batch_split_divisor,
+                    effective_tokens_per_split=effective_tokens_per_split if "cu_seqlens" in full_batch else None,
                 )
-                fp8_ctx = te.autocast(enabled=fp8_enabled, recipe=FP8_RECIPE, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
-                with sync_ctx:
-                    with amp_ctx, fp8_ctx:
-                        fwd_kwargs = {
-                            "input_ids": batch["input_ids"],
-                            "labels": batch["labels"],
-                        }
-                        if "attention_mask" in batch:
-                            fwd_kwargs["attention_mask"] = batch["attention_mask"]
-                        if "cu_seqlens" in batch:
-                            fwd_kwargs["cu_seqlens"] = batch["cu_seqlens"]
-                            fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
-                        if fp8_enabled and inferred_grad_accum_steps > 1:
-                            fwd_kwargs["is_first_microbatch"] = (micro_step % inferred_grad_accum_steps == 0)
-                        out = model(**fwd_kwargs)
+                total_sub_batches = len(sub_batches)
+                if resume_sub_batch_start > 0 and is_main:
+                    logger.info(
+                        "Resuming at data_step=%d sub_batch=%d/%d",
+                        micro_step,
+                        resume_sub_batch_start,
+                        total_sub_batches,
+                    )
 
-                    loss = out["loss"] if isinstance(out, dict) else out.loss
-                    if not torch.isfinite(loss.detach()).all():
+                for sub_batch_idx, batch in enumerate(sub_batches):
+                    if sub_batch_idx < resume_sub_batch_start:
+                        continue
+
+                    accum_micro_count += 1
+                    epoch_sub_batch_count += 1
+                    at_accum_boundary = accum_micro_count >= effective_grad_accum
+                    if discard_accumulation:
+                        if at_accum_boundary:
+                            discard_accumulation = False
+                            accum_micro_count = 0
+                            effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
+                                global_step,
+                                inferred_grad_accum_steps,
+                                pretrain_config.micro_batch_size,
+                                batch_size_warmup_steps,
+                            )
+                        continue
+
+                    batch = _move_batch_to_device(batch, device)
+
+                    if distributed and distributed_mode == "fsdp":
+                        model.set_requires_gradient_sync(at_accum_boundary)
+
+                    if "num_valid_tokens" in batch:
+                        token_count += batch["num_valid_tokens"]
+                        raw_token_count += batch["input_ids"].numel()
+                    elif "attention_mask" in batch:
+                        token_count += batch["attention_mask"].sum()
+                        raw_token_count += batch["attention_mask"].numel()
+                    else:
+                        token_count += batch["input_ids"].numel()
+                        raw_token_count += batch["input_ids"].numel()
+
+                    sync_ctx = _ddp_sync_context(model, distributed_mode=distributed_mode, sync=at_accum_boundary)
+                    amp_ctx = (
+                        torch.autocast(device_type=device.type, dtype=amp_dtype)
+                        if amp_dtype is not None
+                        else nullcontext()
+                    )
+                    fp8_ctx = te.autocast(enabled=fp8_enabled, recipe=FP8_RECIPE, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
+                    with sync_ctx:
+                        with amp_ctx, fp8_ctx:
+                            fwd_kwargs = {
+                                "input_ids": batch["input_ids"],
+                                "labels": batch["labels"],
+                            }
+                            if "attention_mask" in batch:
+                                fwd_kwargs["attention_mask"] = batch["attention_mask"]
+                            if "cu_seqlens" in batch:
+                                fwd_kwargs["cu_seqlens"] = batch["cu_seqlens"]
+                                fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
+                            if fp8_enabled and effective_grad_accum > 1:
+                                fwd_kwargs["is_first_microbatch"] = (accum_micro_count == 1)
+                            out = model(**fwd_kwargs)
+
+                        loss = out["loss"] if isinstance(out, dict) else out.loss
+                        if not torch.isfinite(loss.detach()).all():
+                            rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                            logger.error(
+                                "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d data_step=%d sub_batch=%d).",
+                                global_step + 1,
+                                rank,
+                                epoch,
+                                micro_step,
+                                sub_batch_idx,
+                            )
+                            optimizer.zero_grad(set_to_none=True)
+                            accum_loss.zero_()
+                            if at_accum_boundary:
+                                accum_micro_count = 0
+                            else:
+                                discard_accumulation = True
+                            continue
+                        loss = loss / effective_grad_accum
+
+                        if scaler is not None and scaler.is_enabled():
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+
+                    accum_loss = accum_loss + loss.detach()
+
+                    if not at_accum_boundary:
+                        continue
+
+                    if scaler is not None and scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+                    try:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            orig_model.parameters(),
+                            max_norm=max_grad_norm,
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError as exc:
+                        if "non-finite" not in str(exc).lower():
+                            raise
+                        bad_grad = _first_nonfinite_grad(orig_model)
+                        bad_name = bad_grad[0] if bad_grad is not None else "<unknown>"
                         rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                         logger.error(
-                            "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d micro_step=%d).",
+                            "Skipping optimizer step %d due to non-finite gradient in %s on rank %d (epoch=%d data_step=%d sub_batch=%d).",
                             global_step + 1,
+                            bad_name,
                             rank,
                             epoch,
                             micro_step,
+                            sub_batch_idx,
                         )
                         optimizer.zero_grad(set_to_none=True)
                         accum_loss.zero_()
-                        discard_accumulation = not at_accum_boundary
+                        accum_micro_count = 0
                         continue
-                    loss = loss / inferred_grad_accum_steps
 
+                    optimizer_step_skipped = False
                     if scaler is not None and scaler.is_enabled():
-                        scaler.scale(loss).backward()
+                        old_scale = scaler.get_scale()
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer_step_skipped = scaler.get_scale() < old_scale
                     else:
-                        loss.backward()
+                        optimizer.step()
 
-                accum_loss = accum_loss + loss.detach()
+                    if debug_non_finite_params and _has_nonfinite_params(orig_model):
+                        bad_param = _first_nonfinite_param(orig_model)
+                        bad_name = bad_param[0] if bad_param is not None else "<unknown>"
+                        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                        raise RuntimeError(
+                            f"Non-finite parameter detected after optimizer step {global_step + 1} "
+                            f"in {bad_name} on rank {rank} (epoch={epoch} data_step={micro_step} "
+                            f"sub_batch={sub_batch_idx})."
+                        )
 
-                # Skip to next micro-step if not at a regular accumulation
-                # boundary.  We intentionally do NOT treat the last micro-step of
-                # the epoch as a boundary: the loop can break early (via the
-                # all_reduce exhaustion check above), making
-                # synced_train_loader_len unreachable.  Any partial accumulation
-                # at epoch end is discarded in the epoch-boundary cleanup below.
-                if not at_accum_boundary:
-                    continue
+                    if isinstance(optimizer, (DionMuon, DionNorMuon)):
+                        muon_lr = optimizer.param_groups[0]["lr"]
+                        learning_rate = optimizer.param_groups[1]["lr"]
+                    else:
+                        learning_rate = optimizer.param_groups[0]["lr"]
+                        muon_lr = None
 
-                if scaler is not None and scaler.is_enabled():
-                    scaler.unscale_(optimizer)
-                try:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        orig_model.parameters(),
-                        max_norm=max_grad_norm,
-                        error_if_nonfinite=True,
-                    )
-                except RuntimeError as exc:
-                    if "non-finite" not in str(exc).lower():
-                        raise
-                    bad_grad = _first_nonfinite_grad(orig_model)
-                    bad_name = bad_grad[0] if bad_grad is not None else "<unknown>"
-                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-                    logger.error(
-                        "Skipping optimizer step %d due to non-finite gradient in %s on rank %d (epoch=%d micro_step=%d).",
-                        global_step + 1,
-                        bad_name,
-                        rank,
-                        epoch,
-                        micro_step,
-                    )
+                    if not optimizer_step_skipped:
+                        scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    global_step += 1
+                    profiler_step_cb(global_step)
+
+                    if _prores_model is not None:
+                        _prores_model.update_prores_alphas(global_step)
+
+                    prev_warmup_state = (
+                        effective_grad_accum,
+                        effective_micro_batch,
+                        mbs_divisor,
+                    )
+                    accum_micro_count = 0
+                    effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
+                        global_step,
+                        inferred_grad_accum_steps,
+                        pretrain_config.micro_batch_size,
+                        batch_size_warmup_steps,
+                    )
+                    if (
+                        batch_size_warmup_steps > 0
+                        and is_main
+                        and prev_warmup_state != (effective_grad_accum, effective_micro_batch, mbs_divisor)
+                    ):
+                        logger.info(
+                            "[step %d] Batch-size warmup -> grad_accum=%d micro_batch=%d split_divisor=%d",
+                            global_step,
+                            effective_grad_accum,
+                            effective_micro_batch,
+                            mbs_divisor,
+                        )
+
+                    window_loss += accum_loss.detach()
+                    window_steps += 1
                     accum_loss.zero_()
-                    continue
 
-                optimizer_step_skipped = False
-                if scaler is not None and scaler.is_enabled():
-                    old_scale = scaler.get_scale()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer_step_skipped = scaler.get_scale() < old_scale
-                else:
-                    optimizer.step()
+                    should_log = global_step % logging_steps == 0
+                    vram_log = ""
+                    tokens_per_sec = mfu = tok = raw_tok = 0.0
+                    step_tok = step_raw_tok = 0.0
+                    real_tokens_per_sec = real_tokens_per_sec_log = 0.0
+                    avg_step_ms = 0.0
+                    if should_log:
+                        if device.type == "cuda":
+                            torch.cuda.synchronize()
+                        t1 = time.perf_counter()
+                        window_dt = max(1e-9, t1 - log_window_t0)
+                        log_window_t0 = t1
+                        avg_step_ms = (window_dt * 1000.0) / max(1, window_steps)
+                        log_buf[0] = window_loss / max(1, window_steps)
+                        log_buf[1] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
+                        log_vals = log_buf.cpu()
+                        loss_to_log = float(log_vals[0])
+                        grad_norm_val = float(log_vals[1])
+                        tok = float(token_count.item())
+                        raw_tok = float(raw_token_count.item())
+                        if distributed and dist.is_initialized():
+                            tok_buf = torch.tensor([tok, raw_tok], device=device)
+                            dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
+                            tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
+                        tokens_per_sec = int(raw_tok / window_dt)
+                        step_tok = tok / max(1, window_steps)
+                        step_raw_tok = raw_tok / max(1, window_steps)
+                        real_tokens_per_sec = tok / window_dt
+                        real_tokens_per_sec_log = int(real_tokens_per_sec)
+                        mfu = (
+                            _flops_per_token * real_tokens_per_sec
+                        ) / (_peak_flops_per_gpu * max(effective_world_size, 1))
 
-                if debug_non_finite_params and _has_nonfinite_params(orig_model):
-                    bad_param = _first_nonfinite_param(orig_model)
-                    bad_name = bad_param[0] if bad_param is not None else "<unknown>"
-                    rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-                    raise RuntimeError(
-                        f"Non-finite parameter detected after optimizer step {global_step + 1} "
-                        f"in {bad_name} on rank {rank} (epoch={epoch} micro_step={micro_step})."
-                    )
+                        token_count.zero_()
+                        raw_token_count.zero_()
 
-                if isinstance(optimizer, (DionMuon, DionNorMuon)):
-                    muon_lr = optimizer.param_groups[0]["lr"]
-                    learning_rate = optimizer.param_groups[1]["lr"]
-                else:
-                    learning_rate = optimizer.param_groups[0]["lr"]
-                    muon_lr = None
-
-                if not optimizer_step_skipped:
-                    scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-                global_step += 1
-                profiler_step_cb(global_step)
-
-                # ProRes: update alphas for next step (pure Python, no CUDA sync).
-                if _prores_model is not None:
-                    _prores_model.update_prores_alphas(global_step)
-
-                window_loss += accum_loss.detach()
-                window_steps += 1
-                accum_loss.zero_()
-
-                should_log = global_step % logging_steps == 0
-                vram_log = ""
-                tokens_per_sec = mfu = tok = raw_tok = 0.0
-                step_tok = step_raw_tok = 0.0
-                real_tokens_per_sec = real_tokens_per_sec_log = 0.0
-                avg_step_ms = 0.0
-                if should_log:
-                    # Synchronize and measure only at logging boundaries to amortize sync cost.
-                    if device.type == "cuda":
-                        torch.cuda.synchronize()
-                    t1 = time.perf_counter()
-                    window_dt = max(1e-9, t1 - log_window_t0)
-                    log_window_t0 = t1
-                    avg_step_ms = (window_dt * 1000.0) / max(1, window_steps)
-                    tokens_per_sec = int((achieved_global_batch_tokens * window_steps) / window_dt)
-                    log_buf[0] = window_loss / max(1, window_steps)
-                    log_buf[1] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
-                    log_vals = log_buf.cpu()
-                    loss_to_log = float(log_vals[0])
-                    grad_norm_val = float(log_vals[1])
-                    tok = float(token_count.item())
-                    raw_tok = float(raw_token_count.item())
-                    if distributed and dist.is_initialized():
-                        tok_buf = torch.tensor([tok, raw_tok], device=device)
-                        dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
-                        tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
-                    step_tok = tok / max(1, window_steps)
-                    step_raw_tok = raw_tok / max(1, window_steps)
-                    real_tokens_per_sec = tok / window_dt
-                    real_tokens_per_sec_log = int(real_tokens_per_sec)
-                    mfu = (
-                        _flops_per_token * real_tokens_per_sec
-                    ) / (_peak_flops_per_gpu * max(effective_world_size, 1))
-
-                    token_count.zero_()
-                    raw_token_count.zero_()
-
-                    # VRAM logging only at eval steps (expensive: all_reduce + multiple .item())
-                    if global_step % eval_steps == 0:
-                        vram_log = _format_vram_for_log(
-                            device=device,
-                            distributed=distributed,
-                            reset_peak=True,
-                        )
-                if should_log and is_main:
-                    waste_pct = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
-                    wall_elapsed = time.perf_counter() - _run_t0
-                    payload = {
-                        "train/global_step": global_step,
-                        "train/loss": loss_to_log,
-                        "train/grad_norm": grad_norm_val,
-                        "train/learning_rate": learning_rate,
-                        "train/epoch": epoch + (micro_step + 1) / synced_train_loader_len,
-                        "train/tokens_per_sec": tokens_per_sec,
-                        "train/real_tokens_per_sec": real_tokens_per_sec,
-                        "train/step_real_tokens": step_tok,
-                        "train/step_raw_tokens": step_raw_tok,
-                        "train/packing_waste_pct": waste_pct,
-                        "time_elapsed_sec": wall_elapsed,
-                        "train/time_elapsed_sec": wall_elapsed,
-                    }
-                    if muon_lr is not None:
-                        payload["train/muon_lr"] = muon_lr
-                    if wandb_enabled and wandb.run is not None:
-                        try:
-                            wandb.log(payload)
-                        except Exception as exc:
-                            wandb_enabled = False
-                            logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
-                    muon_lr_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
-                    logger.info(
-                        f"[step {global_step}/{total_steps}] "
-                        f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
-                        f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,} real_tok/s={real_tokens_per_sec_log:,} "
-                        f"real_tok/step={step_tok:,.0f} "
-                        f"dt={avg_step_ms:.2f}ms waste={waste_pct:.1f}% "
-                        f"h100_mfu={mfu:.2%} {vram_log}"
-                    )
-
-                if first_step_of_run:
-                    first_step_of_run = False
-                    gc.collect()
-                    gc.freeze()
-                    gc.disable()
-                elif global_step % 5000 == 0:
-                    gc.collect()
-
-                if should_log:
-                    window_loss.zero_()
-                    window_steps = 0
-
-                if global_step % eval_steps == 0:
-                    fp8_eval_ctx = te.autocast(enabled=fp8_enabled, recipe=FP8_RECIPE, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
-                    with fp8_eval_ctx:
-                        eval_loss = _evaluate(
-                            model=orig_model,
-                            eval_loader=eval_loader,
-                            device=device,
-                            distributed=distributed,
-                            amp_dtype=amp_dtype,
-                        )
-                    if is_main:
+                        if global_step % eval_steps == 0:
+                            vram_log = _format_vram_for_log(
+                                device=device,
+                                distributed=distributed,
+                                reset_peak=True,
+                            )
+                    if should_log and is_main:
+                        waste_pct = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
+                        wall_elapsed = time.perf_counter() - _run_t0
+                        epoch_progress = epoch + (
+                            micro_step + ((sub_batch_idx + 1) / max(1, total_sub_batches))
+                        ) / max(1, synced_train_loader_len)
+                        payload = {
+                            "train/global_step": global_step,
+                            "train/loss": loss_to_log,
+                            "train/grad_norm": grad_norm_val,
+                            "train/learning_rate": learning_rate,
+                            "train/epoch": epoch_progress,
+                            "train/tokens_per_sec": tokens_per_sec,
+                            "train/real_tokens_per_sec": real_tokens_per_sec,
+                            "train/step_real_tokens": step_tok,
+                            "train/step_raw_tokens": step_raw_tok,
+                            "train/packing_waste_pct": waste_pct,
+                            "time_elapsed_sec": wall_elapsed,
+                            "train/time_elapsed_sec": wall_elapsed,
+                        }
+                        if muon_lr is not None:
+                            payload["train/muon_lr"] = muon_lr
                         if wandb_enabled and wandb.run is not None:
                             try:
-                                wandb.log(
-                                    {
-                                        "train/global_step": global_step,
-                                        "eval/loss": eval_loss,
-                                    }
-                                )
+                                wandb.log(payload)
                             except Exception as exc:
                                 wandb_enabled = False
                                 logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
-                        logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
-                    model.train()
+                        muon_lr_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
+                        logger.info(
+                            f"[step {global_step}/{total_steps}] "
+                            f"loss={loss_to_log:.4f} lr={learning_rate:.2e} {muon_lr_str}"
+                            f"grad_norm={grad_norm_val:.4f} tok/s={tokens_per_sec:,} real_tok/s={real_tokens_per_sec_log:,} "
+                            f"real_tok/step={step_tok:,.0f} "
+                            f"dt={avg_step_ms:.2f}ms waste={waste_pct:.1f}% "
+                            f"h100_mfu={mfu:.2%} {vram_log}"
+                        )
 
-                if global_step % save_steps == 0:
-                    _save_checkpoint(
-                        model=orig_model,
-                        optimizer=optimizer,
-                        scheduler=scheduler,
-                        global_step=global_step,
-                        epoch=epoch,
-                        output_dir=output_dir,
-                        logging_steps=logging_steps,
-                        eval_steps=eval_steps,
-                        save_steps=save_steps,
-                        distributed=distributed,
-                        is_main=is_main,
-                        distributed_mode=distributed_mode,
-                        model_config=_model_config,
-                        manifest=_manifest,
-                        pretrain_config=pretrain_config,
-                        total_steps=total_steps,
-                        warmup_steps=warmup_steps,
-                    )
+                    if first_step_of_run:
+                        first_step_of_run = False
+                        gc.collect()
+                        gc.freeze()
+                        gc.disable()
+                    elif global_step % 5000 == 0:
+                        gc.collect()
+
+                    if should_log:
+                        window_loss.zero_()
+                        window_steps = 0
+
+                    if global_step % eval_steps == 0:
+                        fp8_eval_ctx = te.autocast(enabled=fp8_enabled, recipe=FP8_RECIPE, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
+                        with fp8_eval_ctx:
+                            eval_loss = _evaluate(
+                                model=orig_model,
+                                eval_loader=eval_loader,
+                                device=device,
+                                distributed=distributed,
+                                amp_dtype=amp_dtype,
+                            )
+                        if is_main:
+                            if wandb_enabled and wandb.run is not None:
+                                try:
+                                    wandb.log(
+                                        {
+                                            "train/global_step": global_step,
+                                            "eval/loss": eval_loss,
+                                        }
+                                    )
+                                except Exception as exc:
+                                    wandb_enabled = False
+                                    logger.warning(f"W&B log failed; disabling logging. Error: {exc}")
+                            logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
+                        model.train()
+
+                    if global_step % save_steps == 0:
+                        next_data_step = micro_step
+                        next_sub_batch_step = sub_batch_idx + 1
+                        next_batch_split_divisor = batch_split_divisor
+                        if next_sub_batch_step >= total_sub_batches:
+                            next_data_step = micro_step + 1
+                            next_sub_batch_step = 0
+                            next_batch_split_divisor = mbs_divisor
+                        _save_checkpoint(
+                            model=orig_model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            global_step=global_step,
+                            epoch=epoch,
+                            output_dir=output_dir,
+                            logging_steps=logging_steps,
+                            eval_steps=eval_steps,
+                            save_steps=save_steps,
+                            distributed=distributed,
+                            is_main=is_main,
+                            distributed_mode=distributed_mode,
+                            model_config=_model_config,
+                            manifest=_manifest,
+                            pretrain_config=pretrain_config,
+                            total_steps=total_steps,
+                            warmup_steps=warmup_steps,
+                            epoch_data_step=next_data_step,
+                            epoch_sub_batch_step=next_sub_batch_step,
+                            batch_split_divisor=next_batch_split_divisor,
+                        )
+
+                if epoch == resume_epoch and micro_step == resume_data_step:
+                    resume_data_step = 0
+                    resume_sub_batch_step = 0
+                    resume_batch_split_divisor = 1
 
             # ---- Epoch boundary cleanup ----
             # Flush partial gradient-accumulation state left over from
@@ -1060,26 +1191,29 @@ def run_te_pretraining(
             # FSDP gradient desync, and token/loss counter bleed across the
             # boundary.  Timing window is reset at the top of the next epoch
             # iteration, after iter(train_loader).
-            epoch_fwd_count = micro_step if epoch_ended_early else synced_train_loader_len
-            partial_discarded = epoch_fwd_count % inferred_grad_accum_steps
+            epoch_fwd_count = epoch_sub_batch_count
+            partial_discarded = accum_micro_count
             if is_main:
                 logger.info(
-                    "Epoch %d/%d complete: %d micro-steps, %d optimizer steps%s",
+                    "Epoch %d/%d complete: %d effective micro-steps, %d optimizer steps%s",
                     epoch + 1, num_epochs, epoch_fwd_count,
-                    epoch_fwd_count // inferred_grad_accum_steps,
+                    global_step - epoch_start_step,
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
                     if partial_discarded else "",
                 )
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
+            accum_micro_count = 0
             discard_accumulation = False
             token_count.zero_()
             raw_token_count.zero_()
             window_loss.zero_()
             window_steps = 0
 
-            if resume_micro_step > 0 and epoch == resume_epoch:
-                resume_micro_step = 0
+            if (resume_data_step > 0 or resume_sub_batch_step > 0) and epoch == resume_epoch:
+                resume_data_step = 0
+                resume_sub_batch_step = 0
+                resume_batch_split_divisor = 1
 
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
