@@ -284,6 +284,9 @@ def run_te_pretraining(
         )
         raise
 
+    _dataset_fingerprint = train_ds.fingerprint()
+    logger.info(f"Train dataset fingerprint: {_dataset_fingerprint}")
+
     use_packing = bool(pretrain_config.use_packing)
     use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
     pack_tokens_per_micro = None
@@ -633,31 +636,70 @@ def run_te_pretraining(
             warmup_steps=warmup_steps,
             is_main=is_main,
         )
-        resume_epoch = start_epoch
+        # Detect dataset change: if the current dataset differs from the
+        # checkpoint's dataset, start from batch 0 instead of fast-forwarding.
         _ckp_state_path = Path(resume_config.checkpoint_dir) / "training_state.json"
+        _dataset_changed = False
         _ckp_state = None
         if _ckp_state_path.exists():
             _ckp_state = json.loads(_ckp_state_path.read_text(encoding="utf-8"))
-        if _ckp_state is not None and "epoch_data_step" in _ckp_state:
-            resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
-            resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
-            resume_batch_split_divisor = max(1, int(_ckp_state.get("batch_split_divisor", 1)))
-        else:
-            epoch_start_step = epoch_start_steps[min(start_epoch, len(epoch_start_steps) - 1)]
-            resume_data_step, resume_sub_batch_step, resume_batch_split_divisor = _locate_resume_position_in_epoch(
-                train_loader_len=synced_train_loader_len,
-                epoch_start_step=epoch_start_step,
-                resume_global_step=start_step,
-                full_grad_accum=inferred_grad_accum_steps,
-                full_micro_batch=pretrain_config.micro_batch_size,
-                batch_size_warmup_steps=batch_size_warmup_steps,
-            )
+            _ckp_fp = _ckp_state.get("dataset_fingerprint")
+            if _ckp_fp is not None and _ckp_fp != _dataset_fingerprint:
+                _dataset_changed = True
+                logger.warning(
+                    f"Dataset changed since checkpoint (fingerprint {_ckp_fp} → "
+                    f"{_dataset_fingerprint}). Dataloader will start from batch 0 "
+                    f"instead of fast-forwarding."
+                )
+            elif _ckp_fp is None and is_main:
+                logger.info(
+                    "Checkpoint has no dataset fingerprint (pre-upgrade checkpoint). "
+                    "Assuming same dataset for dataloader positioning."
+                )
+
+        resume_epoch = start_epoch
+        if not _dataset_changed:
+            if _ckp_state is not None and "epoch_data_step" in _ckp_state:
+                resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
+                resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
+                resume_batch_split_divisor = max(1, int(_ckp_state.get("batch_split_divisor", 1)))
+            else:
+                epoch_start_step = epoch_start_steps[min(start_epoch, len(epoch_start_steps) - 1)]
+                resume_data_step, resume_sub_batch_step, resume_batch_split_divisor = _locate_resume_position_in_epoch(
+                    train_loader_len=synced_train_loader_len,
+                    epoch_start_step=epoch_start_step,
+                    resume_global_step=start_step,
+                    full_grad_accum=inferred_grad_accum_steps,
+                    full_micro_batch=pretrain_config.micro_batch_size,
+                    batch_size_warmup_steps=batch_size_warmup_steps,
+                )
         if resume_data_step >= synced_train_loader_len:
             resume_data_step = 0
             resume_sub_batch_step = 0
             resume_batch_split_divisor = 1
             start_epoch = min(start_epoch + 1, num_epochs)
             resume_epoch = start_epoch
+        elif resume_data_step > 0 and resume_sub_batch_step == 0:
+            if use_packing and hasattr(train_ds, "fast_forward"):
+                logger.info(
+                    f"Fast-forwarding dataloader by {resume_data_step} packed batches "
+                    f"(index-only, no data I/O)..."
+                )
+                skipped_samples = train_ds.fast_forward(
+                    resume_data_step,
+                    epoch=resume_epoch,
+                )
+                logger.info(
+                    f"Fast-forward complete: will skip {skipped_samples} underlying samples "
+                    f"to resume at data_step {resume_data_step}"
+                )
+                # Reset resume_data_step so the training loop doesn't also
+                # try to iterate-and-skip through the DataLoader.
+                resume_data_step = 0
+            else:
+                logger.info(
+                    f"Skipping {resume_data_step} DataLoader batch(es) in resumed epoch {resume_epoch}"
+                )
         elif resume_data_step > 0 or resume_sub_batch_step > 0:
             logger.info(
                 "Resuming inside epoch %d at data_step=%d sub_batch=%d/%d",
@@ -1182,6 +1224,7 @@ def run_te_pretraining(
                             pretrain_config=pretrain_config,
                             total_steps=total_steps,
                             warmup_steps=warmup_steps,
+                            dataset_fingerprint=_dataset_fingerprint,
                             epoch_data_step=next_data_step,
                             epoch_sub_batch_step=next_sub_batch_step,
                             batch_split_divisor=next_batch_split_divisor,
@@ -1244,6 +1287,7 @@ def run_te_pretraining(
         pretrain_config=pretrain_config,
         total_steps=total_steps,
         warmup_steps=warmup_steps,
+        dataset_fingerprint=_dataset_fingerprint,
     )
     if is_main:
         if wandb_enabled and wandb.run is not None:

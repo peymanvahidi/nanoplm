@@ -1486,20 +1486,34 @@ def _rebuild_scheduler_for_resume(
         eff_warmup = 0
 
     # -- Override optimizer base LRs before creating scheduler -------------
+    # Only override the main param group LR; preserve special groups
+    # (resid_lambdas, x0_lambdas, NOBLE) which have their own base LRs.
     if isinstance(optimizer, MuonAdamWGroup):
         for pg in optimizer.muon.param_groups:
             pg["lr"] = eff_muon_lr
-        for pg in optimizer.adamw.param_groups:
-            pg["lr"] = eff_lr
+        # First adamw group is the main one; others are resid/x0/noble
+        if optimizer.adamw.param_groups:
+            optimizer.adamw.param_groups[0]["lr"] = eff_lr
     elif _DION_MUON_TYPES and isinstance(optimizer, _DION_MUON_TYPES):
-        # group[0] = muon, group[1+] = adamw / scalar
+        # Standalone dion optimizer (not wrapped in MuonAdamWGroup).
+        # group[0] = muon; group[1], if present, = adamw.
         optimizer.param_groups[0]["lr"] = eff_muon_lr
-        for pg in optimizer.param_groups[1:]:
-            if pg.get("algorithm") == "adamw":
-                pg["lr"] = eff_lr
+        if len(optimizer.param_groups) > 1:
+            optimizer.param_groups[1]["lr"] = eff_lr
     else:
-        for pg in optimizer.param_groups:
-            pg["lr"] = eff_lr
+        # Plain AdamW — typically a single group
+        if optimizer.param_groups:
+            optimizer.param_groups[0]["lr"] = eff_lr
+
+    def _clear_initial_lr(opt):
+        for pg in opt.param_groups:
+            pg.pop("initial_lr", None)
+
+    if isinstance(optimizer, MuonAdamWGroup):
+        _clear_initial_lr(optimizer.muon)
+        _clear_initial_lr(optimizer.adamw)
+    else:
+        _clear_initial_lr(optimizer)
 
     # -- Build scheduler ---------------------------------------------------
     if resume_config.reset_scheduler:

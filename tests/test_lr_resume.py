@@ -587,3 +587,62 @@ class TestSaveAndResumeIntegration:
                     orig_params[name].detach().cpu(),
                     loaded_params[name].detach().cpu(),
                 ), f"Parameter {name} not restored correctly"
+
+    def test_lr_override_after_load_checkpoint(self):
+        """LR override must take effect even when load_state_dict restores stale initial_lr."""
+        from nanoplm.pretraining.pure_pipeline import _save_checkpoint, _load_checkpoint
+
+        model = self._make_tiny_model().to("cpu")
+        optimizer = AdamW(model.parameters(), lr=1e-3)
+        pretrain_cfg = _make_pretrain_config(adam_learning_rate=1e-3)
+        total_steps = 50
+        warmup_steps = 5
+
+        # Create scheduler (adds initial_lr=1e-3 to param groups) and step
+        sched = _create_scheduler(
+            optimizer, warmup_steps, total_steps, 1e-3, 0.1, "cosine"
+        )
+        for _ in range(20):
+            sched.step()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _save_checkpoint(
+                model, optimizer, sched,
+                global_step=20, epoch=0,
+                output_dir=tmpdir,
+                logging_steps=1, eval_steps=10, save_steps=10,
+                distributed=False, is_main=True,
+                pretrain_config=pretrain_cfg,
+                total_steps=total_steps,
+                warmup_steps=warmup_steps,
+            )
+            ckpt_dir = Path(tmpdir) / "checkpoint-20"
+
+            # Resume with a DIFFERENT learning_rate override
+            new_lr = 5e-4
+            resume_cfg = _make_resume_config(
+                checkpoint_dir=str(ckpt_dir),
+                reset_scheduler=True,
+                skip_warmup=True,
+                learning_rate=new_lr,
+            )
+
+            model2 = self._make_tiny_model().to("cpu")
+            opt2 = AdamW(model2.parameters(), lr=1e-3)
+            dummy_sched = _create_scheduler(opt2, warmup_steps, total_steps, 1e-3, 0.1, "cosine")
+
+            # load_state_dict restores initial_lr=1e-3 from checkpoint
+            _load_checkpoint(
+                model2, opt2, dummy_sched, str(ckpt_dir), "cpu",
+                distributed=False, load_scheduler=False,
+            )
+
+            new_sched = _rebuild_scheduler_for_resume(
+                opt2, resume_cfg, pretrain_cfg, str(ckpt_dir),
+                start_step=20, total_steps=total_steps,
+                warmup_steps=warmup_steps, is_main=False,
+            )
+
+            # The scheduler must use the NEW lr (5e-4), not the checkpoint's 1e-3
+            assert new_sched.get_last_lr()[0] == pytest.approx(new_lr, rel=1e-4)
+            assert opt2.param_groups[0]["initial_lr"] == pytest.approx(new_lr, rel=1e-6)
