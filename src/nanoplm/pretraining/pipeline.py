@@ -32,6 +32,8 @@ def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_r
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
+        if lr_schedule.lower() == "constant":
+            return 1.0
         decay_steps = max(1, total_steps - warmup_steps)
         progress = min(1.0, (step - warmup_steps) / decay_steps)
         if lr_schedule.lower() == "cosine":

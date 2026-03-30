@@ -16,6 +16,9 @@ try:
 except ImportError:
     Muon = None  # type: ignore[assignment,misc]
     NorMuon = None  # type: ignore[assignment,misc]
+
+# Safe tuple for isinstance() checks — filters out None when dion is missing.
+_DION_MUON_TYPES: tuple = tuple(t for t in (Muon, NorMuon) if t is not None)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -980,6 +983,8 @@ def _create_scheduler(
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return step / max(1, warmup_steps)
+        if lr_schedule.lower() == "constant":
+            return 1.0
         decay_steps = max(1, total_steps - warmup_steps)
         progress = min(1.0, (step - warmup_steps) / decay_steps)
         if lr_schedule.lower() == "cosine":
@@ -1486,7 +1491,7 @@ def _rebuild_scheduler_for_resume(
             pg["lr"] = eff_muon_lr
         for pg in optimizer.adamw.param_groups:
             pg["lr"] = eff_lr
-    elif isinstance(optimizer, (Muon, NorMuon)):
+    elif _DION_MUON_TYPES and isinstance(optimizer, _DION_MUON_TYPES):
         # group[0] = muon, group[1+] = adamw / scalar
         optimizer.param_groups[0]["lr"] = eff_muon_lr
         for pg in optimizer.param_groups[1:]:
@@ -2332,7 +2337,7 @@ def run_pure_pretraining(
                     if isinstance(optimizer, MuonAdamWGroup):
                         muon_lr = optimizer.muon.param_groups[0]["lr"]
                         learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                    elif isinstance(optimizer, (Muon, NorMuon)):
+                    elif _DION_MUON_TYPES and isinstance(optimizer, _DION_MUON_TYPES):
                         muon_lr = optimizer.param_groups[0]["lr"]
                         learning_rate = optimizer.param_groups[1]["lr"]
                     else:

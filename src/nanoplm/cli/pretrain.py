@@ -217,7 +217,7 @@ def pretrain():
 )
 @click.option(
     "--lr-schedule",
-    type=click.Choice(["linear", "cosine"], case_sensitive=False),
+    type=click.Choice(["linear", "cosine", "constant"], case_sensitive=False),
     default="cosine",
     help="Learning rate schedule to use after warmup"
 )
@@ -463,7 +463,7 @@ def pretrain():
 )
 @click.option(
     "--resume-lr-schedule",
-    type=click.Choice(["linear", "cosine"], case_sensitive=False),
+    type=click.Choice(["linear", "cosine", "constant"], case_sensitive=False),
     default=None,
     help="Override LR schedule when resuming",
 )
@@ -1572,9 +1572,9 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
 
     if "lr_schedule" in kwargs and kwargs["lr_schedule"] is not None:
         lr_schedule = str(kwargs["lr_schedule"]).strip().lower()
-        if lr_schedule not in {"linear", "cosine"}:
+        if lr_schedule not in {"linear", "cosine", "constant"}:
             raise ValueError(
-                f"Invalid lr_schedule value: {kwargs['lr_schedule']}. Must be one of: linear, cosine."
+                f"Invalid lr_schedule value: {kwargs['lr_schedule']}. Must be one of: linear, cosine, constant."
             )
         kwargs["lr_schedule"] = lr_schedule
 
