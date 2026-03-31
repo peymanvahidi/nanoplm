@@ -44,7 +44,9 @@ enum {
     TOKEN_W = 22,
     TOKEN_C = 23,
     TOKEN_X = 24,
-    TOKEN_BOS = 29
+    TOKEN_BOS = 29,
+    TOKEN_UNUSED0 = 30,
+    TOKEN_UNUSED1 = 31
 };
 
 typedef struct {
@@ -213,8 +215,9 @@ static void init_token_lut(uint8_t lut[256]) {
     }
 }
 
-static inline int encoded_length(size_t seq_len, int max_length, int use_bos_token) {
-    int special = use_bos_token ? 2 : 1;
+static inline int encoded_length(size_t seq_len, int max_length, int use_bos_token,
+                                  int num_register_tokens) {
+    int special = (use_bos_token ? 2 : 1) + num_register_tokens;
     if (max_length <= 0) {
         return 0;
     }
@@ -301,8 +304,9 @@ static int write_npy_int32(const char *path, const int32_t *data, size_t n, char
 }
 
 static int tokenize_and_write_shard(const SequenceBatch *batch, const char *output_dir, int shard_idx,
-                                    int max_length, int use_bos_token, int num_threads,
-                                    const uint8_t lut[256], char *error_msg, size_t error_cap) {
+                                    int max_length, int use_bos_token, int num_register_tokens,
+                                    int num_threads, const uint8_t lut[256],
+                                    char *error_msg, size_t error_cap) {
     char bin_path[4096];
     char idx_path[4096];
 
@@ -341,7 +345,8 @@ static int tokenize_and_write_shard(const SequenceBatch *batch, const char *outp
 #pragma omp parallel for schedule(static)
 #endif
     for (size_t i = 0; i < n; i++) {
-        lengths[i] = (int32_t)encoded_length(batch->items[i].len, max_length, use_bos_token);
+        lengths[i] = (int32_t)encoded_length(batch->items[i].len, max_length, use_bos_token,
+                                              num_register_tokens);
     }
 
     size_t total_tokens = 0;
@@ -379,7 +384,8 @@ static int tokenize_and_write_shard(const SequenceBatch *batch, const char *outp
             }
         }
 
-        int slots_for_seq = out_len - pos - 1;  // Keep last slot for EOS.
+        int tail = 1 + num_register_tokens;  // EOS + register tokens
+        int slots_for_seq = out_len - pos - tail;
         if (slots_for_seq < 0) {
             slots_for_seq = 0;
         }
@@ -396,6 +402,13 @@ static int tokenize_and_write_shard(const SequenceBatch *batch, const char *outp
 
         if (pos < out_len) {
             tokens[off + (size_t)pos] = TOKEN_EOS;
+            pos += 1;
+        }
+        // Append register tokens after EOS
+        static const uint8_t reg_ids[] = {TOKEN_UNUSED0, TOKEN_UNUSED1};
+        for (int r = 0; r < num_register_tokens && pos < out_len; r++) {
+            tokens[off + (size_t)pos] = reg_ids[r];
+            pos += 1;
         }
     }
 
@@ -430,6 +443,7 @@ API_EXPORT int nanoplm_create_fasta_shards(
     int samples_per_shard,
     int num_threads,
     int use_bos_token,
+    int num_register_tokens,
     progress_cb_t progress_cb,
     int *out_num_shards,
     long long *out_num_sequences,
@@ -509,7 +523,8 @@ API_EXPORT int nanoplm_create_fasta_shards(
 
             if (batch.count == (size_t)samples_per_shard) {
                 if (tokenize_and_write_shard(&batch, output_dir, shard_idx, max_length, use_bos_token,
-                                             num_threads, lut, error_msg, error_cap) != 0) {
+                                             num_register_tokens, num_threads, lut,
+                                             error_msg, error_cap) != 0) {
                     status = -1;
                     goto cleanup;
                 }
@@ -550,8 +565,9 @@ API_EXPORT int nanoplm_create_fasta_shards(
     }
 
     if (batch.count > 0) {
-        if (tokenize_and_write_shard(&batch, output_dir, shard_idx, max_length, use_bos_token, num_threads,
-                                     lut, error_msg, error_cap) != 0) {
+        if (tokenize_and_write_shard(&batch, output_dir, shard_idx, max_length, use_bos_token,
+                                     num_register_tokens, num_threads, lut,
+                                     error_msg, error_cap) != 0) {
             status = -1;
             goto cleanup;
         }

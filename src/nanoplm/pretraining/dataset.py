@@ -110,6 +110,7 @@ class ShardWriter:
         self.sequence_count: Optional[int] = None
 
         self._use_bos_token = bool(getattr(self.tokenizer, "use_bos_token", False))
+        self._num_register_tokens = int(getattr(self.tokenizer, "num_register_tokens", 0))
         self._native_compatible_tokenizer = self._is_native_compatible_tokenizer()
 
     def _is_native_compatible_tokenizer(self) -> bool:
@@ -203,6 +204,7 @@ class ShardWriter:
                             samples_per_shard=self.samples_per_shard,
                             num_threads=self.max_workers,
                             use_bos_token=self._use_bos_token,
+                            num_register_tokens=self._num_register_tokens,
                             progress_cb=progress_cb,
                         ),
                     )
