@@ -4,6 +4,7 @@ nanoPLM CLI - Distillation subcommands for nanoPLM package
 """
 
 import json
+import typing
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -549,17 +550,35 @@ def get_yaml(output: Optional[str], force: bool):
         "# This will generate a .data_manifest file with the appropriate configuration.\n"
         "\n"
         "model:\n"
+        "  # Core architecture\n"
         "  hidden_size: 512\n"
         "  intermediate_size: 1024\n"
         "  num_hidden_layers: 6\n"
         "  num_attention_heads: 8\n"
+        "  num_kv_heads: null  # GQA: set < num_attention_heads to enable; null = MHA\n"
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: false\n"
+        "  no_mlp_on_first_layer: true\n"
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
         "  projection_layer: true  # Set to false if student hidden_size matches teacher (1024)\n"
+        "\n"
+        "  # Advanced architecture features (pure-torch Triton-fused kernels)\n"
+        "  use_canon_layers: false       # Canon depthwise-conv token-mixing layers\n"
+        "  canon_layers_mode: \"abcd\"\n"
+        "  use_mhc_lite: false           # mHC-lite multi-stream residual mixing\n"
+        "  mhc_n_streams: 4\n"
+        "  mhc_triton_fused: false\n"
+        "  mhc_lite_wrapping_level: \"layer\"\n"
+        "  use_diff_attn_v2: false       # Differential Attention V2\n"
+        "  use_repo: false               # Residual Proportional Output\n"
+        "  use_resid_lambdas: false\n"
+        "  use_x0_lambdas: false\n"
+        "  use_qk_norm: false\n"
+        "  activation_checkpointing: false\n"
+        "  activation_checkpointing_mode: \"layer\"\n"
         "\n"
         "distillation:\n"
         "\n"
@@ -631,7 +650,10 @@ def _load_model_config(config: Dict[str, Any]) -> ProtXConfig:
     if config is None:
         raise ValueError("Model configuration is required but not found in YAML")
 
-    expected_keys = set(ProtXConfig.__annotations__.keys())
+    # Use get_type_hints() instead of __annotations__ so that inherited fields
+    # from ProtModernBertMLMConfig (Canon, mHC, GQA, DiffAttn, etc.) are
+    # recognised as valid keys.
+    expected_keys = set(typing.get_type_hints(ProtXConfig).keys())
     present_keys = set(config.keys())
 
     extra = []
