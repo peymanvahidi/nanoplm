@@ -19,12 +19,16 @@ class DistillDataCollator:
         student_tokenizer: Optional[PreTrainedTokenizer] = None,
         on_the_fly: bool = False,
         max_seq_len: int = 1024,
+        teacher_preprocess=None,
     ):
         self.teacher_model = teacher_model
         self.teacher_tokenizer = teacher_tokenizer
         self.student_tokenizer = student_tokenizer
         self.on_the_fly = on_the_fly
         self.max_seq_len = max_seq_len
+        # Callable that preprocesses a raw sequence for the teacher tokenizer.
+        # Defaults to ProtT5-style space-separation for backwards compatibility.
+        self.teacher_preprocess = teacher_preprocess or (lambda seq: " ".join(list(seq)))
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         if self.on_the_fly:
@@ -45,7 +49,7 @@ class DistillDataCollator:
         raw_sequences = [f["raw_sequence"] for f in features]
 
         # Student tokenization (for student model input)
-        student_encoding = self.student_tokenizer.batch_encode_plus(
+        student_encoding = self.student_tokenizer(
             raw_sequences,
             add_special_tokens=True,
             padding="max_length",
@@ -55,9 +59,8 @@ class DistillDataCollator:
         )
 
         # Teacher tokenization (for computing teacher embeddings)
-        # Preprocess for teacher: add spaces between amino acids
-        preprocessed_sequences = [" ".join(list(seq)) for seq in raw_sequences]
-        teacher_encoding = self.teacher_tokenizer.batch_encode_plus(
+        preprocessed_sequences = [self.teacher_preprocess(seq) for seq in raw_sequences]
+        teacher_encoding = self.teacher_tokenizer(
             preprocessed_sequences,
             add_special_tokens=True,
             padding="max_length",
