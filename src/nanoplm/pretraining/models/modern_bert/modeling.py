@@ -257,8 +257,18 @@ class ModernBertConfig:
                 "RePO predicts per-head positions for Q and K jointly, which requires "
                 "equal Q/K head counts."
             )
-
-
+            
+def to_dict(self):
+    """Return a JSON-serialisable dict (required by Transformers/W&B callbacks)."""
+    import dataclasses
+    result = {}
+    for f in dataclasses.fields(self):
+        val = getattr(self, f.name)
+        if isinstance(val, frozenset):
+            val = sorted(val)
+        result[f.name] = val
+    return result
+    
 def _get_activation(name: str):
     name = name.lower()
     if name == "gelu":
