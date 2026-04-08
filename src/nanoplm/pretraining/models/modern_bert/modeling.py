@@ -25,6 +25,7 @@ from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
 from . import canon_ops as _canon_ops
 from .canon_ops import varlen_canon_conv as _varlen_canon_conv
 from .canon_ops import varlen_ln_canon_conv as _varlen_ln_canon_conv
+import dataclasses
 
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
@@ -257,7 +258,15 @@ class ModernBertConfig:
                 "RePO predicts per-head positions for Q and K jointly, which requires "
                 "equal Q/K head counts."
             )
-
+def to_dict(self):
+    """Return a JSON-serialisable dict (required by Transformers/W&B callbacks)."""
+    result = {}
+    for f in dataclasses.fields(self):
+        val = getattr(self, f.name)
+        if isinstance(val, frozenset):
+            val = sorted(val)
+        result[f.name] = val
+    return result
 
 def _get_activation(name: str):
     name = name.lower()
