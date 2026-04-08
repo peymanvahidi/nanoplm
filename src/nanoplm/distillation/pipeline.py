@@ -851,7 +851,8 @@ def run_distillation(
 
     # Evaluate
     if val_dataset:
-        logger.info(f"Evaluating on {len(val_dataset)} samples")
+        n_val = distill_config.val_sequences or "?"
+        logger.info(f"Evaluating on {n_val} samples") 
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
         trainer.log_metrics("eval", metrics)
