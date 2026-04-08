@@ -20,10 +20,13 @@ class ProtXConfig(ProtModernBertMLMConfig):
     """Student model config.
 
     Inherits all architecture fields from ProtModernBertMLMConfig (Canon,
-    mHC-lite, GQA, DiffAttn, activation checkpointing, etc.) and adds the
-    distillation-specific projection_layer flag.
+    mHC-lite, GQA, DiffAttn, activation checkpointing, etc.) and adds
+    distillation-specific fields.
     """
     projection_layer: bool = True
+    # Output dimension of the projection head — must match the teacher encoder's
+    # hidden size (480 for ESM-2 35M, 768 for ProtT5-Base, 1024 for ProtT5-XL).
+    teacher_hidden_size: int = 1024
 
 
 class ProtX(ModernBertForMaskedLM):
@@ -36,7 +39,7 @@ class ProtX(ModernBertForMaskedLM):
 
     The MLM head (self.head + self.decoder) from the parent is removed.  A
     linear projection + T5LayerNorm is added to project student hidden states
-    to the teacher's embedding dimension (1024 for ProtT5).
+    to the teacher's embedding dimension (config.teacher_hidden_size).
 
     Tokenizer note: uses ProtXTokenizer (vocab_size=28, amino acids at IDs
     3-27) to keep compatibility with existing H5 datasets. This is different
@@ -102,11 +105,19 @@ class ProtX(ModernBertForMaskedLM):
         # Store for serialisation
         self.model_config = config
 
-        # Projection head: student hidden_size → teacher embedding dim (1024 for ProtT5).
-        # Only added when projection_layer=True (i.e. student hidden_size ≠ 1024).
+        # Projection head: student hidden_size → teacher embedding dim.
+        # Only added when projection_layer=True (i.e. student hidden_size ≠ teacher_hidden_size).
         if self._use_projection_layer:
-            self.proj = nn.Linear(config.hidden_size, 1024, bias=False)
-            self.proj_norm = T5LayerNorm(1024)
+            self.proj = nn.Linear(config.hidden_size, config.teacher_hidden_size, bias=False)
+            self.proj_norm = T5LayerNorm(config.teacher_hidden_size)
+
+    def num_parameters(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
+        params = (p for p in self.parameters() if not only_trainable or p.requires_grad)
+        total = sum(p.numel() for p in params)
+        if exclude_embeddings:
+            emb_params = sum(p.numel() for p in self.model.embeddings.parameters())
+            total -= emb_params
+        return total
 
     def forward(self, input_ids, attention_mask, training_mode=False):
         # Call the pure-torch encoder (self.model) directly via the SDPA path.
