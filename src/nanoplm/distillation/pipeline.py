@@ -1,9 +1,19 @@
 import os
+
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "0")
+os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
+
 import json
 import shutil
 import time
 import torch
 import wandb
+
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union, Dict, Any
@@ -23,6 +33,7 @@ from transformers import (
 from nanoplm.distillation.collator import DistillDataCollator
 from nanoplm.distillation.trainer import DistillationTrainer
 from nanoplm.distillation.models.student import ProtX, ProtXConfig, ProtXTokenizer
+from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.distillation.dataset import (
     KDDatasetOnTheFly,
@@ -54,6 +65,28 @@ class DistillationConfig:
     learning_rate: float = 1e-3
     gradient_accumulation_steps: int = 1
     warmup_ratio: float = 0.05
+    max_grad_norm: float = float("inf")
+
+    # Optimizer — "adamw" | "muon" | "normuon"
+    # Muon/NorMuon routes 2-D weight matrices through dion.Muon/NorMuon and
+    # biases / embeddings / special zero-init params through fused AdamW,
+    # matching the pretraining optimizer setup.
+    optimizer: str = "adamw"
+    # Muon-specific (ignored when optimizer == "adamw")
+    muon_learning_rate: float = 1e-3
+    muon_weight_decay: float = 0.01
+    muon_cautious_weight_decay: bool = True
+    muon_use_polar_express: bool = True
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_eps: float = 1e-7
+    # AdamW sub-optimizer used for 1-D / embedding params when optimizer is
+    # muon/normuon, and as the sole optimizer when optimizer == "adamw".
+    adam_learning_rate: float = 1e-4
+    adam_weight_decay: float = 0.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-8
 
     # Mixed precision
     bf16: bool = True
@@ -456,7 +489,7 @@ def _save_training_config(output_dir: Path, config: Dict[str, Any]):
 
 
 def run_distillation(
-    model_config: ProtXConfig,
+    model_config: ProtModernBertMLMConfig,
     distill_config: DistillationConfig,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
@@ -668,7 +701,19 @@ def run_distillation(
         upload_run_source_snapshot()
 
     # Create optimizer
-    optimizer = AdamW(model.parameters(), lr=distill_config.learning_rate)
+    opt_name = distill_config.optimizer.lower()
+    if opt_name in ("muon", "normuon"):
+        from nanoplm.pretraining.optim import build_muon_optimizer
+        optimizer = build_muon_optimizer(model, distill_config)
+        logger.info(f"Using {opt_name} optimizer (muon_lr={distill_config.muon_learning_rate}, "
+                    f"adam_lr={distill_config.adam_learning_rate})")
+    else:
+        optimizer = AdamW(
+            model.parameters(),
+            lr=distill_config.learning_rate,
+            fused=is_cuda,
+        )
+        logger.info(f"Using AdamW optimizer (lr={distill_config.learning_rate}, fused={is_cuda})")
 
     # Create scheduler
     scheduler = _get_scheduler(

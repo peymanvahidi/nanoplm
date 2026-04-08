@@ -116,7 +116,7 @@ def distill():
     '--learning-rate',
     type=float,
     default=1e-3,
-    help='Maximum learning rate'
+    help='Learning rate (AdamW) or ignored when optimizer is muon/normuon'
 )
 @click.option(
     '--gradient-accumulation-steps',
@@ -129,6 +129,37 @@ def distill():
     type=float,
     default=0.05,
     help='Ratio of total training steps used for warmup'
+)
+@click.option(
+    '--max-grad-norm',
+    type=float,
+    default=float('inf'),
+    help='Gradient clipping L2 norm threshold (inf = disabled)'
+)
+# Optimizer options
+@click.option(
+    '--optimizer',
+    type=click.Choice(['adamw', 'muon', 'normuon']),
+    default='adamw',
+    help='Optimizer: adamw, muon, or normuon'
+)
+@click.option(
+    '--muon-learning-rate',
+    type=float,
+    default=1e-3,
+    help='Learning rate for Muon/NorMuon (2-D weight matrices)'
+)
+@click.option(
+    '--adam-learning-rate',
+    type=float,
+    default=1e-4,
+    help='Learning rate for AdamW sub-optimizer (embeddings, biases, 1-D params)'
+)
+@click.option(
+    '--adam-weight-decay',
+    type=float,
+    default=0.0,
+    help='AdamW weight decay'
 )
 # LR scheduler options
 @click.option(
@@ -264,6 +295,11 @@ def run(
     learning_rate: float,
     gradient_accumulation_steps: int,
     warmup_ratio: float,
+    max_grad_norm: float,
+    optimizer: str,
+    muon_learning_rate: float,
+    adam_learning_rate: float,
+    adam_weight_decay: float,
     lr_scheduler: str,
     lr_scheduler_kwargs: str,
     max_open_files: int,
@@ -381,6 +417,11 @@ def run(
         "learning_rate": learning_rate,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "warmup_ratio": warmup_ratio,
+        "max_grad_norm": max_grad_norm,
+        "optimizer": optimizer,
+        "muon_learning_rate": muon_learning_rate,
+        "adam_learning_rate": adam_learning_rate,
+        "adam_weight_decay": adam_weight_decay,
         "lr_scheduler": lr_scheduler,
         "lr_scheduler_kwargs": lr_scheduler_kwargs_dict,
         "max_open_files": max_open_files,
@@ -592,9 +633,18 @@ def get_yaml(output: Optional[str], force: bool):
         "  # Training hyperparameters\n"
         "  num_epochs: 10\n"
         "  batch_size: 64\n"
-        "  learning_rate: 1e-3\n"
+        "  learning_rate: 1e-3  # used only when optimizer: adamw\n"
         "  gradient_accumulation_steps: 1\n"
         "  warmup_ratio: 0.05\n"
+        "  max_grad_norm: .inf  # gradient clipping L2 norm (.inf = disabled)\n"
+        "\n"
+        "  # Optimizer: adamw | muon | normuon\n"
+        "  # muon/normuon routes 2-D matrices through Dion Muon/NorMuon and\n"
+        "  # biases/embeddings through fused AdamW (same as pretraining).\n"
+        "  optimizer: \"adamw\"\n"
+        "  muon_learning_rate: 1e-3\n"
+        "  adam_learning_rate: 1e-4\n"
+        "  adam_weight_decay: 0.0\n"
         "\n"
         "  # LR scheduler\n"
         "  lr_scheduler: \"cosine\"  # cosine, linear, polynomial, constant\n"
@@ -716,6 +766,7 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
     # Handle boolean values
     bool_keys = [
         'multi_gpu', 'on_the_fly', 'sharded', 'use_threading', 'bf16', 'tf32',
+        'muon_cautious_weight_decay', 'muon_use_polar_express', 'muon_nesterov',
     ]
     for bool_key in bool_keys:
         if bool_key in kwargs:
