@@ -246,6 +246,17 @@ def distill():
     default=True,
     help='Enable TF32 mode on Ampere+ GPUs for faster fp32 matmuls'
 )
+# torch.compile options
+@click.option(
+    '--use-compile/--no-compile',
+    default=False,
+    help='Enable torch.compile on the student model'
+)
+@click.option(
+    '--use-compile-max-autotune/--no-compile-max-autotune',
+    default=False,
+    help='Use max-autotune-no-cudagraphs compile mode (slower start, faster steady state)'
+)
 # Distributed training options
 @click.option(
     '--multi-gpu',
@@ -257,6 +268,18 @@ def distill():
     type=str,
     default='1',
     help='Number of GPUs to use (or "auto" for automatic detection)'
+)
+@click.option(
+    '--distributed-mode',
+    type=click.Choice(['ddp', 'fsdp']),
+    default='ddp',
+    help='Distributed training mode: ddp (default) or fsdp (FSDP2 with bf16)'
+)
+@click.option(
+    '--fsdp-shard-granularity',
+    type=click.Choice(['layer', 'sublayer']),
+    default='layer',
+    help='FSDP2 sharding granularity: layer (whole block) or sublayer (attn+mlp separately)'
 )
 @click.option(
     '--seed',
@@ -314,8 +337,12 @@ def run(
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
+    use_compile: bool,
+    use_compile_max_autotune: bool,
     multi_gpu: bool,
     world_size: str,
+    distributed_mode: str,
+    fsdp_shard_granularity: str,
     seed: int,
     resume_from: Optional[str],
     extra_epochs: int,
@@ -436,8 +463,12 @@ def run(
         "logging_steps": logging_steps,
         "eval_steps": eval_steps,
         "save_steps": save_steps,
+        "use_compile": use_compile,
+        "use_compile_max_autotune": use_compile_max_autotune,
         "multi_gpu": multi_gpu,
         "world_size": world_size_value,
+        "distributed_mode": distributed_mode,
+        "fsdp_shard_granularity": fsdp_shard_granularity,
         "seed": seed,
     }
 
@@ -673,10 +704,23 @@ def get_yaml(output: Optional[str], force: bool):
         "  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)\n"
         "             # Provides 3x faster fp32 matmuls with negligible precision loss\n"
         "\n"
+        "  # torch.compile (requires CUDA)\n"
+        "  use_compile: false\n"
+        "  use_compile_max_autotune: false  # slower warmup, faster steady-state\n"
+        "  compile_triton_persistent_reductions: false\n"
+        "  compile_triton_mix_order_reduction: false\n"
+        "\n"
         "  # Distributed training\n"
         "  multi_gpu: false\n"
         "  world_size: 1\n"
+        "  distributed_mode: \"ddp\"   # ddp | fsdp (FSDP2 with bf16/fp32 mixed)\n"
+        "  fsdp_shard_granularity: \"layer\"  # layer | sublayer\n"
         "  seed: 42\n"
+        "\n"
+        "  # Profiling (rank-0 only; writes Chrome trace or Nsight profile)\n"
+        "  profiler_enabled: false\n"
+        "  profiler_start_step: 10\n"
+        "  profiler_end_step: 15\n"
         "\n"
         "resume:\n"
         "  # Set is_resume: true to resume training from a checkpoint\n"

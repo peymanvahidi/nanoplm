@@ -119,10 +119,26 @@ class DistillationConfig:
     eval_steps: int = 50
     save_steps: int = 100
 
+    # torch.compile
+    use_compile: bool = False
+    use_compile_max_autotune: bool = False
+    # Disable TorchInductor persistent/mix-order reductions — can exceed
+    # shared-memory limits for large hidden sizes (same flags as pretraining).
+    compile_triton_persistent_reductions: bool = False
+    compile_triton_mix_order_reduction: bool = False
+
     # Distributed
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
+    # "ddp" (default) or "fsdp" (FSDP2 with MixedPrecisionPolicy bf16/fp32)
+    distributed_mode: str = "ddp"
+    fsdp_shard_granularity: str = "layer"  # "layer" | "sublayer"
     seed: int = 42
+
+    # Profiling (rank-0 only)
+    profiler_enabled: bool = False
+    profiler_start_step: int = 10
+    profiler_end_step: int = 15
 
     def __post_init__(self):
         if self.lr_scheduler_kwargs is None:
@@ -506,6 +522,8 @@ def run_distillation(
     distill_config = _resolve_config_from_manifest(distill_config)
 
     device = get_device()
+    is_cuda = torch.cuda.is_available() and str(device).startswith("cuda")
+
     model = ProtX(model_config)
     model.to(device)
 
@@ -527,6 +545,52 @@ def run_distillation(
             )
     else:
         effective_world_size = 1
+
+    # FSDP2 wrapping (must happen before torch.compile)
+    if distill_config.distributed_mode == "fsdp" and effective_world_size > 1:
+        import torch.distributed as dist
+        from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+        from torch.distributed.device_mesh import init_device_mesh
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+
+        device_mesh = init_device_mesh("cuda", (effective_world_size,))
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+
+        # Wrap at layer or sublayer granularity, matching pretraining
+        if distill_config.fsdp_shard_granularity == "sublayer":
+            for layer in model.model.layers:
+                if hasattr(layer, "attn"):
+                    fully_shard(layer.attn, mesh=device_mesh, mp_policy=mp_policy)
+                if hasattr(layer, "mlp") and layer.mlp is not None:
+                    fully_shard(layer.mlp, mesh=device_mesh, mp_policy=mp_policy)
+        else:  # "layer" — wrap whole transformer blocks
+            for layer in model.model.layers:
+                fully_shard(layer, mesh=device_mesh, mp_policy=mp_policy)
+
+        fully_shard(model, mesh=device_mesh, mp_policy=mp_policy)
+        logger.info(
+            f"FSDP2 enabled: granularity={distill_config.fsdp_shard_granularity}, "
+            f"world_size={effective_world_size}"
+        )
+
+    # torch.compile (applied after FSDP2 wrapping, before optimizer creation)
+    if distill_config.use_compile and is_cuda:
+        if not distill_config.compile_triton_persistent_reductions:
+            torch._inductor.config.triton.persistent_reductions = False
+        if not distill_config.compile_triton_mix_order_reduction:
+            torch._inductor.config.triton.use_block_ptr = False
+        compile_mode = (
+            "max-autotune-no-cudagraphs"
+            if distill_config.use_compile_max_autotune
+            else "default"
+        )
+        model = torch.compile(model, dynamic=True, mode=compile_mode)
+        logger.info(f"torch.compile enabled (mode={compile_mode})")
 
     global_batch_size = (
         distill_config.gradient_accumulation_steps
@@ -639,9 +703,6 @@ def run_distillation(
     os.environ["WANDB_PROJECT"] = distill_config.project_name
     os.environ["WANDB_NAME"] = wandb_run_name
     os.environ["WANDB_LOG_MODEL"] = "end"
-
-    # Determine if we're using CUDA (for DataLoader optimizations)
-    is_cuda = torch.cuda.is_available() and device.startswith('cuda')
 
     # For on-the-fly mode, use 0 workers to avoid pickling issues with teacher model
     # For pre-computed embeddings, use configured workers
