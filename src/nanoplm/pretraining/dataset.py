@@ -373,9 +373,6 @@ class ShardedDataset(Dataset):
 
         self.cum_lengths = np.cumsum(self.lengths)
 
-        # Memmaps created lazily per-process (not here)
-        self._mmaps: Optional[List[np.memmap]] = None
-
         if log:
             logger.info(
                 f"Loaded {int(self.cum_lengths[-1]):,} pre-tokenized sequences from {len(self._bin_paths)} shards"
@@ -395,15 +392,6 @@ class ShardedDataset(Dataset):
         else:
             self._init_dataset(state["data_dir"], pad_token_id=state.get("pad_token_id", 0), log=False)
 
-    # -- Lazy memmap creation --
-
-    def _ensure_mmaps(self) -> None:
-        """Create memmap objects on first access (once per process)."""
-        if self._mmaps is None:
-            self._mmaps = [
-                np.memmap(p, dtype=np.uint8, mode="r") for p in self._bin_paths
-            ]
-
     def __len__(self) -> int:
         return int(self.cum_lengths[-1])
 
@@ -413,16 +401,17 @@ class ShardedDataset(Dataset):
                 f"Index {idx} out of bounds for dataset of size {len(self)}"
             )
 
-        self._ensure_mmaps()
-
         shard_idx, local_idx = self._get_shard(idx)
 
         offsets = self._offsets[shard_idx]
         start = int(offsets[local_idx])
         end = int(offsets[local_idx + 1])
 
-        raw = self._mmaps[shard_idx][start:end]
-        input_ids = torch.from_numpy(raw.copy()).long() # To long since it will be concat
+        mm = np.memmap(self._bin_paths[shard_idx], dtype=np.uint8, mode="r")
+        raw = mm[start:end].copy()
+        del mm
+
+        input_ids = torch.from_numpy(raw).long() # To long since it will be concat
 
         # Generate attention_mask on-the-fly: 1 for non-padding tokens, 0 for padding
         attention_mask = (input_ids != self.pad_token_id).long()
@@ -462,11 +451,8 @@ class ShardedDataset(Dataset):
         return h.hexdigest()[:16]
 
     def cleanup(self):
-        """Release memmap objects (public API, kept for compatibility)."""
-        if self._mmaps is not None:
-            for mmap in self._mmaps:
-                del mmap
-            self._mmaps = None
+        """No-op kept for API compatibility; no persistent file handles to release."""
+        pass
 
     @property
     def total_tokens(self) -> int:
