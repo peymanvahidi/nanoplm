@@ -78,6 +78,7 @@ class ProtModernBertMLMConfig:
     attn_layer_pattern: Optional[str] = None
     fused_qkv: bool = True
     fused_up_gate: bool = True
+    wo_init: str = "zero"
     # NOBLE
     use_noble: bool = False
     noble_rank: int = 64

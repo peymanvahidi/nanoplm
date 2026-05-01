@@ -144,6 +144,21 @@ def _validate_distributed_mode(
         )
 
 
+def _validate_muonh_wo_init_compat(
+    pretrain_cfg: PretrainingConfig,
+    model_cfg: ProtModernBertMLMConfig,
+) -> None:
+    optimizer = str(pretrain_cfg.optimizer).strip().lower()
+    wo_init = str(getattr(model_cfg, "wo_init", "zero")).strip().lower()
+    if optimizer == "muonh" and wo_init == "zero":
+        raise click.ClickException(
+            "optimizer=muonh is incompatible with model.wo_init='zero'. "
+            "MuonH initializes each matrix hyperball radius from ||W_init||_F, "
+            "so zero-initialized Wo matrices are locked at zero. "
+            "Set model.wo_init='kaiming' (or --wo-init kaiming)."
+        )
+
+
 @click.group(name="pretrain")
 @click.help_option("--help", "-h")
 def pretrain():
@@ -633,6 +648,13 @@ def pretrain():
     "up and gate use separate linear layers so Muon orthogonalizes each independently.",
 )
 @click.option(
+    "--wo-init",
+    type=click.Choice(["kaiming", "zero"], case_sensitive=False),
+    default="zero",
+    show_default=True,
+    help="Initialization for residual out-projections (attn.Wo and mlp.Wo).",
+)
+@click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
     default=False,
     help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only). "
@@ -784,6 +806,7 @@ def run(
     attn_layer_pattern: Optional[str],
     fused_qkv: bool,
     fused_up_gate: bool,
+    wo_init: str,
     use_mhc_lite: bool,
     mhc_n_streams: int,
     mhc_lite_wrapping_level: str,
@@ -930,7 +953,10 @@ def run(
         attn_layer_pattern=attn_layer_pattern,
         fused_qkv=fused_qkv,
         fused_up_gate=fused_up_gate,
+        wo_init=wo_init,
     )
+
+    _validate_muonh_wo_init_compat(cfg, model_cfg)
 
     _set_seed_for_init(seed)
     if use_diff_attn_v2 and not pure_torch:
@@ -1056,6 +1082,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
+    _validate_muonh_wo_init_compat(pretrain_config, model_config)
     if getattr(model_config, "use_noble", False) and not pure_torch:
         raise click.ClickException(
             "model.use_noble=true requires pure_torch: true (or --pure-torch). "
@@ -1242,6 +1269,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  fused_qkv: true  # false = separate Wq/Wk/Wv instead of a single Wqkv\n"
         "  fused_up_gate: true  # false = separate W_up/W_gate instead of a single Wi for SwiGLU/GLU\n"
+        '  wo_init: "zero"  # residual out-projection init for attn.Wo/mlp.Wo: kaiming | zero\n'
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         '  activation_checkpointing_mode: "attn"  # (layer | attn | attn+mlp), attn mode has highest ROI \n'
         "\n"
