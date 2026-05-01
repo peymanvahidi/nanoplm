@@ -78,6 +78,7 @@ from nanoplm.pretraining.utils import (
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
+from nanoplm.pretraining.debug_metrics import LayerwiseDebugTracker
 
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
@@ -119,6 +120,16 @@ def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
             v = v.pin_memory()
         moved[k] = v.to(device, non_blocking=True)
     return moved
+
+
+def _clone_batch(batch: dict[str, Any]) -> dict[str, Any]:
+    cloned: dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            cloned[key] = value.clone()
+        else:
+            cloned[key] = value
+    return cloned
 
 
 def _get_batch_warmup_params(
@@ -2098,6 +2109,32 @@ def run_pure_pretraining(
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
+    debug_layerwise_enabled = bool(getattr(pretrain_config, "debug_layerwise_metrics", False))
+    debug_tracker: LayerwiseDebugTracker | None = None
+    if debug_layerwise_enabled:
+        if is_main:
+            logger.warning(
+                "debug_layerwise_metrics=True: forward hooks will be installed on "
+                "every transformer block and the lm_head. If torch.compile is "
+                "enabled, expect graph breaks at those boundaries (5-20%% throughput "
+                "regression typical)."
+            )
+        debug_tracker = LayerwiseDebugTracker(
+            model=orig_model,
+            log_every=int(getattr(pretrain_config, "debug_layerwise_log_every", 20)),
+            device=device,
+            output_dir=output_dir,
+            is_main=is_main,
+            distributed=bool(distributed and dist.is_initialized()),
+        )
+    has_batch_t = (
+        torch.empty((), device=device, dtype=torch.int32)
+        if distributed and dist.is_initialized() else None
+    )
+    use_tail_replay = bool(use_packing and distributed and dist.is_initialized())
+    replay_buffer_size = 8
+    replay_batches: list[dict[str, Any]] = []
+    replay_index = 0
 
     epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
@@ -2117,6 +2154,7 @@ def run_pure_pretraining(
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
                 epoch_setter.set_epoch(epoch)
             epoch_start_step = epoch_start_steps[min(epoch, len(epoch_start_steps) - 1)]
+            epoch_synced_len = synced_len
 
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
@@ -2127,7 +2165,10 @@ def run_pure_pretraining(
 
             epoch_ended_early = False
             epoch_sub_batch_count = 0
-            for micro_step in range(synced_len):
+            replay_count = 0
+            replay_batches.clear()
+            replay_index = 0
+            for micro_step in range(epoch_synced_len):
                 if pending_compile_rebuild:
                     if distributed and dist.is_initialized():
                         _dist_barrier(local_rank)
@@ -2174,11 +2215,20 @@ def run_pure_pretraining(
                     has_batch = False
                     full_batch = None
 
+                if use_tail_replay and not has_batch:
+                    if not replay_batches:
+                        epoch_ended_early = True
+                        break
+                    full_batch = _clone_batch(replay_batches[replay_index % len(replay_batches)])
+                    replay_index += 1
+                    replay_count += 1
+                    has_batch = True
+
                 # When packing + num_workers > 0, greedy bin-packing can produce
                 # different batch counts per rank.  Coordinate so all ranks break
                 # together to avoid FSDP / NCCL deadlock.
-                if distributed and dist.is_initialized():
-                    has_batch_t = torch.tensor(1 if has_batch else 0, device=device, dtype=torch.int32)
+                if has_batch_t is not None and not use_tail_replay:
+                    has_batch_t.fill_(1 if has_batch else 0)
                     dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
                     if int(has_batch_t.item()) == 0:
                         epoch_ended_early = True
@@ -2186,6 +2236,11 @@ def run_pure_pretraining(
                 elif not has_batch:
                     epoch_ended_early = True
                     break
+
+                if use_tail_replay and len(replay_batches) < replay_buffer_size:
+                    replay_batches.append(_clone_batch(full_batch))
+                elif use_tail_replay and replay_buffer_size > 0:
+                    replay_batches[micro_step % replay_buffer_size] = _clone_batch(full_batch)
 
                 if resume_data_step > 0 and epoch == resume_epoch and micro_step < resume_data_step:
                     if micro_step % 1000 == 0 and is_main:
@@ -2272,7 +2327,7 @@ def run_pure_pretraining(
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
-                        if not torch.isfinite(loss.detach()).all():
+                        if debug_non_finite_params and not torch.isfinite(loss.detach()).all():
                             rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                             logger.error(
                                 "Skipping optimizer step %d due to non-finite loss on rank %d "
@@ -2304,6 +2359,8 @@ def run_pure_pretraining(
                             scaler.unscale_(optimizer.adamw)
                         else:
                             scaler.unscale_(optimizer)
+                    if debug_tracker is not None and debug_tracker.should_flush(upcoming_step):
+                        debug_tracker.record_step_boundary()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         orig_model.parameters(),
                         max_norm=max_grad_norm,
@@ -2437,7 +2494,7 @@ def run_pure_pretraining(
                         wall_elapsed = time.perf_counter() - _run_t0
                         epoch_progress = epoch + (
                             micro_step + ((sub_batch_idx + 1) / max(1, total_sub_batches))
-                        ) / max(1, synced_len)
+                        ) / max(1, epoch_synced_len)
                         logger.info(
                             f"[step {global_step}/{total_steps}] "
                             f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
@@ -2468,6 +2525,14 @@ def run_pure_pretraining(
                             except Exception as exc:
                                 wandb_enabled = False
                                 logger.warning(f"W&B log failed; disabling. Error: {exc}")
+
+                    if debug_tracker is not None and debug_tracker.should_flush(global_step):
+                        debug_payload = debug_tracker.flush(global_step)
+                        if is_main and debug_payload is not None and wandb_enabled and wandb.run is not None:
+                            try:
+                                wandb.log({**debug_payload, "train/global_step": global_step})
+                            except Exception as exc:
+                                logger.warning(f"W&B debug log failed: {exc}")
 
                     if first_step_of_run:
                         first_step_of_run = False
@@ -2537,6 +2602,13 @@ def run_pure_pretraining(
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
                     if partial_discarded else "",
                 )
+                if replay_count:
+                    logger.info(
+                        "Epoch %d/%d tail replayed %d packed batch(es) to keep ranks aligned.",
+                        epoch + 1,
+                        num_epochs,
+                        replay_count,
+                    )
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
             accum_micro_count = 0
@@ -2564,6 +2636,9 @@ def run_pure_pretraining(
         total_steps=total_steps, warmup_steps=warmup_steps,
         dataset_fingerprint=_dataset_fingerprint,
     )
+
+    if debug_tracker is not None:
+        debug_tracker.close()
 
     if is_main and wandb_enabled and wandb.run is not None:
         try:

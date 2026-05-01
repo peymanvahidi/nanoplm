@@ -68,6 +68,8 @@ class PretrainingConfig:
     save_steps: int = 5000
     seed: int = 42
     debug_non_finite_params: bool = True
+    debug_layerwise_metrics: bool = False
+    debug_layerwise_log_every: int = 20
 
     # Data loading
     num_workers: Union[int, str] = "auto"

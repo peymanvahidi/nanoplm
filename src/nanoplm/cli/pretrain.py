@@ -306,6 +306,18 @@ def pretrain():
     help="Check parameters for non-finite values after every optimizer step.",
 )
 @click.option(
+    "--debug-layerwise-metrics/--no-debug-layerwise-metrics",
+    default=False,
+    help="Log per-layer grad/weight norms, residual-stream RMS, and logit stats. "
+    "Has non-trivial overhead; installs forward hooks that may break torch.compile graphs.",
+)
+@click.option(
+    "--debug-layerwise-log-every",
+    type=int,
+    default=20,
+    help="Log layerwise debug metrics every N optimizer steps.",
+)
+@click.option(
     "--mask-replace-prob",
     type=float,
     default=0.8,
@@ -706,6 +718,8 @@ def run(
     save_steps: int,
     seed: int,
     debug_non_finite_params: bool,
+    debug_layerwise_metrics: bool,
+    debug_layerwise_log_every: int,
     mask_replace_prob: float,
     random_token_prob: float,
     keep_probability: float,
@@ -816,6 +830,8 @@ def run(
         save_steps=save_steps,
         seed=seed,
         debug_non_finite_params=debug_non_finite_params,
+        debug_layerwise_metrics=debug_layerwise_metrics,
+        debug_layerwise_log_every=debug_layerwise_log_every,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
@@ -1272,6 +1288,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  save_steps: 5000\n"
         "  seed: 42\n"
         "  debug_non_finite_params: true  # checks params for NaN/Inf after every optimizer step\n"
+        "  debug_layerwise_metrics: false  # per-layer grad/weight norms, residual RMS, logit stats (overhead; breaks torch.compile graphs)\n"
+        "  debug_layerwise_log_every: 20  # log layerwise metrics every N optimizer steps\n"
         '  num_workers: "auto"\n'
         "  prefetch_factor: 2\n"
         "  use_packing: true\n"
@@ -1449,6 +1467,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "compile_triton_mix_order_reduction",
         "profiler_enabled",
         "debug_non_finite_params",
+        "debug_layerwise_metrics",
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
