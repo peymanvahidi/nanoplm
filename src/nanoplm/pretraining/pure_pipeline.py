@@ -12,10 +12,11 @@ import yaml
 from copy import deepcopy
 from dataclasses import asdict
 try:
-    from dion import Muon, NorMuon
+    from dion import Muon, NorMuon, MuonH
 except ImportError:
     Muon = None  # type: ignore[assignment,misc]
     NorMuon = None  # type: ignore[assignment,misc]
+    MuonH = None  # type: ignore[assignment,misc]
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -84,7 +85,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 # H100 SXM peak BF16 tensor-core throughput (TFLOPS).
-H100_PEAK_TFLOPS = 989.4
+H100_PEAK_TFLOPS = 835.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
 N_PREFETCH_LAYERS_FSDP2 = 2
@@ -863,7 +864,7 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
 
 def _create_optimizer(model, cfg, distributed_mesh=None):
     name = str(cfg.optimizer).lower()
-    if name in {"muon", "normuon"}:
+    if name in {"muon", "normuon", "muonh"}:
         return build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
     from nanoplm.pretraining.optim import _classify_noble_param
@@ -923,7 +924,7 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
             logger.warning("StableAdamW unavailable; falling back to AdamW.")
             return torch.optim.AdamW(**kwargs)
         return cls(**kwargs)
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon]")
+    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon, muonh]")
 
 
 class _SchedulerGroup:
@@ -1488,7 +1489,7 @@ def _rebuild_scheduler_for_resume(
             pg["lr"] = eff_muon_lr
         for pg in optimizer.adamw.param_groups:
             pg["lr"] = eff_lr
-    elif isinstance(optimizer, (Muon, NorMuon)):
+    elif isinstance(optimizer, (Muon, NorMuon, MuonH) if MuonH is not None else (Muon, NorMuon)):
         # group[0] = muon, group[1+] = adamw / scalar
         optimizer.param_groups[0]["lr"] = eff_muon_lr
         for pg in optimizer.param_groups[1:]:
@@ -2334,7 +2335,7 @@ def run_pure_pretraining(
                     if isinstance(optimizer, MuonAdamWGroup):
                         muon_lr = optimizer.muon.param_groups[0]["lr"]
                         learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                    elif isinstance(optimizer, (Muon, NorMuon)):
+                    elif isinstance(optimizer, (Muon, NorMuon, MuonH) if MuonH is not None else (Muon, NorMuon)):
                         muon_lr = optimizer.param_groups[0]["lr"]
                         learning_rate = optimizer.param_groups[1]["lr"]
                     else:

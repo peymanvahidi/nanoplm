@@ -39,6 +39,10 @@ class PretrainingConfig:
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_eps: float = 1e-7
+    # MuonH-specific. Only used when optimizer == "muonh".
+    # 'neuron' normalizes along the last axis; 'short_axis' along the shorter
+    # matrix axis. Set to "none" to disable update normalization in MuonH.
+    muonh_normalization: str = "neuron"
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_size: int = 256000

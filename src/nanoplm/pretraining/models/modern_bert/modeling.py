@@ -2745,6 +2745,11 @@ class ModernBertForMaskedLM(nn.Module):
 
         width = self.config.hidden_size
         bound = math.sqrt(3.0 / width)
+        # Residual-branch out-projections (attn.Wo, mlp.Wo) used to be zero-init.
+        # MuonH stores ||W_init||_F as a hard hyperball radius and would lock a
+        # zero-init matrix at zero, so they are now Kaiming-uniform on their own
+        # fan_in (intermediate_size for mlp.Wo, hidden_size for attn.Wo).
+        mlp_out_bound = math.sqrt(3.0 / self.config.intermediate_size)
         # NOBLE half-Kaiming: halve init scale for layers that use Kaiming
         # (Wqkv, Wi). Wo stays zero-init regardless — see §3.3 of paper.
         noble_kaiming = (
@@ -2796,7 +2801,7 @@ class ModernBertForMaskedLM(nn.Module):
                 nn.init.uniform_(enc.attn.Wk.weight, -bk, bk)
                 bv = _noble_bound(enc.attn.Wv)
                 nn.init.uniform_(enc.attn.Wv.weight, -bv, bv)
-            nn.init.zeros_(enc.attn.Wo.weight)
+            nn.init.uniform_(enc.attn.Wo.weight, -bound, bound)
 
             # MLP weight init (NOBLE modules get half-Kaiming bound)
             if enc.mlp is not None:
@@ -2809,9 +2814,9 @@ class ModernBertForMaskedLM(nn.Module):
                     bg = _noble_bound(enc.mlp.W_gate)
                     nn.init.uniform_(enc.mlp.W_gate.weight, -bg, bg)
                 if hasattr(enc.mlp, "Wo"):
-                    nn.init.zeros_(enc.mlp.Wo.weight)
+                    nn.init.uniform_(enc.mlp.Wo.weight, -mlp_out_bound, mlp_out_bound)
                 else:
-                    nn.init.zeros_(enc.mlp.Wo_weight)
+                    nn.init.uniform_(enc.mlp.Wo_weight, -mlp_out_bound, mlp_out_bound)
 
             # QKV bias init
             if enc.attn.Wqkv is not None:

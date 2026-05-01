@@ -53,7 +53,7 @@ from nanoplm.utils.logger import logger
 
 def _check_muon_available(optimizer: str) -> None:
     """Abort early when a Muon variant is requested but ``dion`` is not installed."""
-    if optimizer.lower() in {"muon", "normuon"}:
+    if optimizer.lower() in {"muon", "normuon", "muonh"}:
         try:
             import dion  # noqa: F401
         except ImportError:
@@ -232,7 +232,7 @@ def pretrain():
 @click.option(
     "--optimizer",
     type=click.Choice(
-        ["adamw", "stable_adamw", "muon", "normuon"], case_sensitive=False
+        ["adamw", "stable_adamw", "muon", "normuon", "muonh"], case_sensitive=False
     ),
     default="normuon",
     help="Optimizer to use",
@@ -278,6 +278,13 @@ def pretrain():
     type=float,
     default=1e-7,
     help="Muon epsilon (used only when optimizer=muon or normuon)",
+)
+@click.option(
+    "--muonh-normalization",
+    type=click.Choice(["neuron", "short_axis", "none"], case_sensitive=False),
+    default="neuron",
+    help="MuonH update normalization (used only when optimizer=muonh): "
+    "'neuron' = per-row, 'short_axis' = along the shorter matrix axis, 'none' = disabled.",
 )
 @click.option("--mlm-probability", type=float, default=0.3, help="MLM probability")
 @click.option(
@@ -692,6 +699,7 @@ def run(
     muon_momentum: float,
     muon_nesterov: bool,
     muon_eps: float,
+    muonh_normalization: str,
     mlm_probability: float,
     logging_steps: int,
     eval_steps: int,
@@ -798,6 +806,7 @@ def run(
         muon_momentum=muon_momentum,
         muon_nesterov=muon_nesterov,
         muon_eps=muon_eps,
+        muonh_normalization=muonh_normalization,
         mlm_probability=mlm_probability,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
@@ -1226,8 +1235,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  micro_batch_size: 64\n"
         "  global_batch_size: 256000\n"
         "  num_epochs: 10\n"
-        '  optimizer: "adamw"\n'
-        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
+        '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh\n'
+        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
@@ -1246,6 +1255,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
+        '  muonh_normalization: "neuron"  # used only when optimizer=muonh: neuron | short_axis | none\n'
         "  # NOBLE optimizer LR scaling (only used when model.use_noble=true)\n"
         "  noble_base_lr: 3e-4  # independent base LR for NOBLE branch params\n"
         "  noble_lr_gamma: 0.3  # W_up LR power (actual exponent = 2γ = 0.6)\n"
