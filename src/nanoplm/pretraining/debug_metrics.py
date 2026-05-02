@@ -166,6 +166,26 @@ class LayerwiseDebugTracker:
                 "logit stats disabled."
             )
 
+        # ---- final_norm output stats (the "embedding" fed into head/decoder)
+        # [0]=sq_sum, [1]=sum (for mean), [2]=abs_max
+        self.final_norm_buf = torch.zeros(3, device=device, dtype=torch.float32)
+        self.final_norm_elem_count = torch.zeros(1, device=device, dtype=torch.float32)
+        # `final_norm` lives on `model.model` (the encoder) in ModernBert; also
+        # accept it directly on `model` for robustness.
+        final_norm = getattr(model, "final_norm", None)
+        if final_norm is None:
+            inner = getattr(model, "model", None)
+            final_norm = getattr(inner, "final_norm", None) if inner is not None else None
+        if isinstance(final_norm, nn.Module):
+            self._hook_handles.append(
+                final_norm.register_forward_hook(self._final_norm_hook)
+            )
+        else:
+            logger.warning(
+                "LayerwiseDebugTracker: model has no `final_norm` module; "
+                "final-norm output stats disabled."
+            )
+
         # ---- JSONL sink -----------------------------------------------------
         self._jsonl_fh = None
         if self.is_main:
@@ -201,6 +221,24 @@ class LayerwiseDebugTracker:
                 buf_cnt[idx].add_(1.0)
 
         return hook
+
+    def _final_norm_hook(self, _module, _inputs, output):
+        if not _module.training:
+            return
+        x = output[0] if isinstance(output, (tuple, list)) else output
+        if not torch.is_tensor(x):
+            return
+        with torch.no_grad():
+            xd = x.detach()
+            sq_sum = (xd * xd).sum()
+            sum_ = xd.sum()
+            abs_max = xd.abs().amax()
+            self.final_norm_buf[0].add_(sq_sum.float())
+            self.final_norm_buf[1].add_(sum_.float())
+            self.final_norm_buf[2].copy_(
+                torch.maximum(self.final_norm_buf[2], abs_max.float())
+            )
+            self.final_norm_elem_count.add_(float(xd.numel()))
 
     def _logit_hook(self, _module, _inputs, output):
         if not _module.training:
@@ -297,9 +335,12 @@ class LayerwiseDebugTracker:
                 self.logit_buf[2:3],
                 self.logit_elem_count,
                 self.logit_token_count,
+                self.final_norm_buf[0:1],   # sq_sum
+                self.final_norm_buf[1:2],   # sum
+                self.final_norm_elem_count,
             ]
         )
-        max_buf = self.logit_buf[1:2].clone()
+        max_buf = torch.stack([self.logit_buf[1], self.final_norm_buf[2]])
 
         # Boundary between "summed-squared-norm" slots and "averaged-stat" slots.
         gw_end = 2 * n_p
@@ -324,7 +365,11 @@ class LayerwiseDebugTracker:
         logit_entropy_sum = float(sum_cpu[off]); off += 1
         logit_elem_count = float(sum_cpu[off]); off += 1
         logit_token_count = float(sum_cpu[off]); off += 1
+        final_norm_sq_sum = float(sum_cpu[off]); off += 1
+        final_norm_sum = float(sum_cpu[off]); off += 1
+        final_norm_elem_count = float(sum_cpu[off]); off += 1
         logit_abs_max = float(max_cpu[0])
+        final_norm_abs_max = float(max_cpu[1])
 
         # Reset GPU state in-place for next window.
         with torch.no_grad():
@@ -333,6 +378,8 @@ class LayerwiseDebugTracker:
             self.logit_buf.zero_()
             self.logit_elem_count.zero_()
             self.logit_token_count.zero_()
+            self.final_norm_buf.zero_()
+            self.final_norm_elem_count.zero_()
         self._step_recorded = False
 
         if not self.is_main:
@@ -359,6 +406,13 @@ class LayerwiseDebugTracker:
             payload["debug/logits/abs_max"] = logit_abs_max
         if logit_token_count > 0:
             payload["debug/logits/entropy"] = logit_entropy_sum / logit_token_count
+
+        if final_norm_elem_count > 0:
+            mean = final_norm_sum / final_norm_elem_count
+            mean_sq = final_norm_sq_sum / final_norm_elem_count
+            payload["debug/final_norm/rms"] = mean_sq ** 0.5
+            payload["debug/final_norm/mean"] = mean
+            payload["debug/final_norm/abs_max"] = final_norm_abs_max
 
         if self._jsonl_fh is not None:
             self._jsonl_fh.write(
