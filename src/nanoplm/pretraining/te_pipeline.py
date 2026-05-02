@@ -676,6 +676,7 @@ def run_te_pretraining(
                 name=wandb_run_name,
                 config={
                     "pretrain": pretrain_config.__dict__,
+                    "model": model.model_config.__dict__,
                     "total_steps": total_steps,
                     "warmup_steps": warmup_steps,
                 },

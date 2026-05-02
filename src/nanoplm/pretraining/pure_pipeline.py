@@ -1990,7 +1990,7 @@ def run_pure_pretraining(
             wandb.init(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
-                config={"pretrain": pretrain_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
