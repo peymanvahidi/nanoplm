@@ -28,6 +28,22 @@ from torch import nn
 from nanoplm.utils.logger import logger
 
 
+def _is_sharded(t: torch.Tensor) -> bool:
+    """True if ``t`` is a DTensor with at least one Shard placement.
+
+    Replicated DTensors and plain Tensors return False — every rank already
+    holds the full data, so SUM-reducing local squared sums would overcount
+    by world_size.
+    """
+    placements = getattr(t, "placements", None)
+    if placements is None:
+        return False
+    for p in placements:
+        if getattr(p, "is_shard", None) is not None and p.is_shard():
+            return True
+    return False
+
+
 _BLOCK_CLASS_NAMES = (
     "ModernBertCanonLayer",
     "ModernBertEncoderLayer",
@@ -105,6 +121,10 @@ class LayerwiseDebugTracker:
         self.param_names: list[str] = [n for n, _ in params]
         self._params: list[nn.Parameter] = [p for _, p in params]
         n_params = len(self._params)
+        # These hold per-param LOCAL-SHARD squared sums after
+        # record_step_boundary; the global squared norm is recovered by the
+        # SUM all_reduce in flush(). Stored squared so flush can pack with the
+        # other reduction stats and do a single all_reduce.
         self.grad_norm_buf = torch.zeros(n_params, device=device, dtype=torch.float32)
         self.weight_norm_buf = torch.zeros(n_params, device=device, dtype=torch.float32)
         self._step_recorded = False  # set when record_step_boundary ran this window
@@ -208,27 +228,46 @@ class LayerwiseDebugTracker:
 
     # --------------------------------------------------------- step boundary
     def record_step_boundary(self) -> None:
-        """Called once per optimizer step, post-bwd, pre-clip."""
-        grads = []
-        weights = []
-        for p in self._params:
-            g = p.grad
-            if g is None:
-                # Preserve position order: push a zero placeholder to keep indices aligned.
-                grads.append(torch.zeros((), device=self.device, dtype=torch.float32))
-            else:
-                # DTensor → full tensor so the norm is global, not per-shard.
-                g_full = g.full_tensor() if hasattr(g, "full_tensor") else g
-                grads.append(g_full)
-            w = p.data
-            w_full = w.full_tensor() if hasattr(w, "full_tensor") else w
-            weights.append(w_full)
+        """Called once per optimizer step, post-bwd, pre-clip.
+
+        Stores the local-shard squared sum for each grad/weight in
+        ``grad_norm_buf`` / ``weight_norm_buf``. The cross-rank reduction is
+        deferred to the single packed ``all_reduce`` in ``flush()``, so this
+        method issues NO collectives.
+
+        Earlier versions called ``DTensor.full_tensor()`` on every grad and
+        weight here, which materialized via 2*N eager all-gathers per flush
+        window. Racing with FSDP's prefetched all-gather schedule could leave
+        per-rank collective queues mismatched and trigger NCCL deadlocks
+        several steps later. The local-shard form avoids that entirely.
+        """
+        # For replicated DTensors and plain Tensors, every rank already holds
+        # the same data; pre-dividing by world_size cancels the SUM-reduce
+        # overcount in flush().
+        world = (
+            dist.get_world_size()
+            if self.distributed and dist.is_initialized()
+            else 1
+        )
 
         with torch.no_grad():
-            grad_norms = torch._foreach_norm(grads)
-            weight_norms = torch._foreach_norm(weights)
-            torch.stack([g.float() for g in grad_norms], out=self.grad_norm_buf)
-            torch.stack([w.float() for w in weight_norms], out=self.weight_norm_buf)
+            for i, p in enumerate(self._params):
+                w = p.data
+                w_local = w.to_local() if hasattr(w, "to_local") else w
+                w_sq = w_local.float().pow(2).sum()
+                if world > 1 and not _is_sharded(w):
+                    w_sq = w_sq / world
+                self.weight_norm_buf[i].copy_(w_sq)
+
+                g = p.grad
+                if g is None:
+                    self.grad_norm_buf[i].zero_()
+                    continue
+                g_local = g.to_local() if hasattr(g, "to_local") else g
+                g_sq = g_local.float().pow(2).sum()
+                if world > 1 and not _is_sharded(g):
+                    g_sq = g_sq / world
+                self.grad_norm_buf[i].copy_(g_sq)
         self._step_recorded = True
 
     # ---------------------------------------------------------------- flush
@@ -241,20 +280,17 @@ class LayerwiseDebugTracker:
         # Layout (SUM): [grad_norm_sq... weight_norm_sq... residual_sq... residual_cnt...
         #                logit_sq_sum, logit_entropy_sum, logit_elem_count, logit_token_count]
         # Layout (MAX): [logit_abs_max]
-        # Norms are stored squared so we can all_reduce via SUM across ranks and
-        # sqrt after. (Each rank's per-tensor norm is already global via full_tensor
-        # above, so the sum across ranks is NOT the right reduction for grad/weight
-        # norms — instead we take the mean over ranks to agree on one value; the
-        # values are already identical across ranks post-full_tensor so averaging
-        # is a no-op that silences rank drift from non-determinism.)
+        # grad/weight slots hold per-rank LOCAL-shard sums of squares (set in
+        # record_step_boundary). After SUM-all-reduce they become global squared
+        # norms directly — no per-rank averaging. Residual/logit slots are
+        # per-rank stats and are averaged across ranks below.
 
-        # Build SUM buffer
-        g_sq = self.grad_norm_buf * self.grad_norm_buf
-        w_sq = self.weight_norm_buf * self.weight_norm_buf
+        n_p = len(self._params)
+        n_b = len(self.block_names)
         sum_buf = torch.cat(
             [
-                g_sq,
-                w_sq,
+                self.grad_norm_buf,
+                self.weight_norm_buf,
                 self.residual_sq_sum,
                 self.residual_count,
                 self.logit_buf[0:1],
@@ -265,19 +301,20 @@ class LayerwiseDebugTracker:
         )
         max_buf = self.logit_buf[1:2].clone()
 
+        # Boundary between "summed-squared-norm" slots and "averaged-stat" slots.
+        gw_end = 2 * n_p
+
         if self.distributed and dist.is_initialized():
             world = dist.get_world_size()
-            # Averaging SUM buf keeps grad/weight norms correct (identical across
-            # ranks) and gives mean residual/logit stats across ranks.
             dist.all_reduce(sum_buf, op=dist.ReduceOp.SUM)
-            sum_buf.div_(world)
+            # Only residual/logit stats want a mean across ranks. Grad/weight
+            # squared sums are SUM-correct as-is.
+            sum_buf[gw_end:].div_(world)
             dist.all_reduce(max_buf, op=dist.ReduceOp.MAX)
 
         sum_cpu = sum_buf.cpu()
         max_cpu = max_buf.cpu()
 
-        n_p = len(self._params)
-        n_b = len(self.block_names)
         off = 0
         grad_sq_cpu = sum_cpu[off : off + n_p]; off += n_p
         weight_sq_cpu = sum_cpu[off : off + n_p]; off += n_p
