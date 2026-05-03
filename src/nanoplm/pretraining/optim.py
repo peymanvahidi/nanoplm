@@ -346,7 +346,7 @@ def build_optimizer(
         Cls = DionMuonH
         kwargs = {
             **common_kwargs,
-            "muon_beta2": 0.9,
+            "muon_beta2": 0.95,
             "normalization": muonh_normalization,
         }
     else:
@@ -357,7 +357,7 @@ def build_optimizer(
             "cautious_wd": bool(muon_cautious_weight_decay),
         }
         if variant == "normuon":
-            kwargs["muon_beta2"] = 0.9
+            kwargs["muon_beta2"] = 0.95
             kwargs["normalization"] = "neuron"
 
     muon_opt = Cls([dict(params=muon_params)], **kwargs)

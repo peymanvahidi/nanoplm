@@ -86,7 +86,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 # H100 SXM peak BF16 tensor-core throughput (TFLOPS).
-H100_PEAK_TFLOPS = 835.4
+H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
 N_PREFETCH_LAYERS_FSDP2 = 2
