@@ -159,6 +159,18 @@ def _validate_muonh_wo_init_compat(
         )
 
 
+def _validate_debug_layerwise_metrics_compat(
+    cfg: PretrainingConfig,
+    *,
+    pure_te: bool,
+) -> None:
+    if pure_te and cfg.debug_layerwise_metrics:
+        raise click.ClickException(
+            "debug_layerwise_metrics is not supported with --pure-te / pure_te: true. "
+            "Use the pure-torch path for layerwise debug hooks, or disable debug_layerwise_metrics."
+        )
+
+
 @click.group(name="pretrain")
 @click.help_option("--help", "-h")
 def pretrain():
@@ -324,7 +336,8 @@ def pretrain():
     "--debug-layerwise-metrics/--no-debug-layerwise-metrics",
     default=False,
     help="Log per-layer grad/weight norms, residual-stream RMS, and logit stats. "
-    "Has non-trivial overhead; installs forward hooks that may break torch.compile graphs.",
+    "Has non-trivial overhead; installs forward hooks that may break torch.compile graphs. "
+    "Not supported with --pure-te.",
 )
 @click.option(
     "--debug-layerwise-log-every",
@@ -913,6 +926,7 @@ def run(
             "resid_lambdas scales the hidden state before each layer, which breaks "
             "mHC-lite's doubly-stochastic stability guarantees."
         )
+    _validate_debug_layerwise_metrics_compat(cfg, pure_te=pure_te)
     _validate_distributed_mode(cfg, pure_torch=pure_torch, pure_te=pure_te)
 
     _populate_batch_setup(cfg)
@@ -1150,6 +1164,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.num_kv_heads != model.num_attention_heads requires pure_torch: true / --pure-torch "
             "or pure_te: true / --pure-te. The HF path does not implement GQA."
         )
+    _validate_debug_layerwise_metrics_compat(pretrain_config, pure_te=pure_te)
     _validate_distributed_mode(
         pretrain_config,
         pure_torch=pure_torch,
@@ -1316,7 +1331,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  save_steps: 5000\n"
         "  seed: 42\n"
         "  debug_non_finite_params: true  # checks params for NaN/Inf after every optimizer step\n"
-        "  debug_layerwise_metrics: false  # per-layer grad/weight norms, residual RMS, logit stats (overhead; breaks torch.compile graphs)\n"
+        "  debug_layerwise_metrics: false  # per-layer grad/weight norms, residual RMS, logit stats (overhead; breaks torch.compile graphs; not supported with pure_te)\n"
         "  debug_layerwise_log_every: 20  # log layerwise metrics every N optimizer steps\n"
         '  num_workers: "auto"\n'
         "  prefetch_factor: 2\n"
