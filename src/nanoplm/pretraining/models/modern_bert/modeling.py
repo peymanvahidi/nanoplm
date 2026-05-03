@@ -208,6 +208,7 @@ class ModernBertConfig:
     noble_phi_std: float = 0.1              # phase init std
     noble_half_kaiming: bool = True          # halve main weight init scale
     noble_targets: str = "all"              # which projections get NOBLE: all|attn|ffn|qkv|out
+    wo_init: Literal["kaiming", "zero"] = "zero"
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -355,6 +356,11 @@ class ModernBertConfig:
             raise ValueError(
                 f"noble_targets={self.noble_targets!r} is not supported. "
                 f"Choose from: {', '.join(sorted(_NOBLE_TARGET_ROLES))}."
+            )
+        self.wo_init = str(self.wo_init).strip().lower()  # type: ignore[assignment]
+        if self.wo_init not in {"kaiming", "zero"}:
+            raise ValueError(
+                f"wo_init must be 'kaiming' or 'zero', got {self.wo_init!r}"
             )
         # Normalize norm_type and validate
         self.norm_type = str(self.norm_type).strip().lower()
@@ -2745,8 +2751,13 @@ class ModernBertForMaskedLM(nn.Module):
 
         width = self.config.hidden_size
         bound = math.sqrt(3.0 / width)
+        # Residual-branch out-projections (attn.Wo, mlp.Wo) are configurable.
+        # For MuonH, zero-init is invalid because ||W_init||_F defines a hard
+        # hyperball radius and a zero-initialized matrix would be locked at zero.
+        wo_init = self.config.wo_init
+        mlp_out_bound = math.sqrt(3.0 / self.config.intermediate_size)
         # NOBLE half-Kaiming: halve init scale for layers that use Kaiming
-        # (Wqkv, Wi). Wo stays zero-init regardless — see §3.3 of paper.
+        # (Wqkv, Wi).
         noble_kaiming = (
             self.config.use_noble and self.config.noble_half_kaiming
         )
@@ -2754,6 +2765,12 @@ class ModernBertForMaskedLM(nn.Module):
 
         def _noble_bound(mod: nn.Module) -> float:
             return kaiming_bound if isinstance(mod, NOBLELinear) else bound
+
+        def _init_wo(tensor: torch.Tensor, init_bound: float) -> None:
+            if wo_init == "zero":
+                nn.init.zeros_(tensor)
+            else:
+                nn.init.uniform_(tensor, -init_bound, init_bound)
 
         embedding_std = 0.02 if self.config.tie_word_embeddings else 1.0
 
@@ -2796,7 +2813,7 @@ class ModernBertForMaskedLM(nn.Module):
                 nn.init.uniform_(enc.attn.Wk.weight, -bk, bk)
                 bv = _noble_bound(enc.attn.Wv)
                 nn.init.uniform_(enc.attn.Wv.weight, -bv, bv)
-            nn.init.zeros_(enc.attn.Wo.weight)
+            _init_wo(enc.attn.Wo.weight, bound)
 
             # MLP weight init (NOBLE modules get half-Kaiming bound)
             if enc.mlp is not None:
@@ -2809,9 +2826,9 @@ class ModernBertForMaskedLM(nn.Module):
                     bg = _noble_bound(enc.mlp.W_gate)
                     nn.init.uniform_(enc.mlp.W_gate.weight, -bg, bg)
                 if hasattr(enc.mlp, "Wo"):
-                    nn.init.zeros_(enc.mlp.Wo.weight)
+                    _init_wo(enc.mlp.Wo.weight, mlp_out_bound)
                 else:
-                    nn.init.zeros_(enc.mlp.Wo_weight)
+                    _init_wo(enc.mlp.Wo_weight, mlp_out_bound)
 
             # QKV bias init
             if enc.attn.Wqkv is not None:

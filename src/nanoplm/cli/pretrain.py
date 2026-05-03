@@ -53,7 +53,7 @@ from nanoplm.utils.logger import logger
 
 def _check_muon_available(optimizer: str) -> None:
     """Abort early when a Muon variant is requested but ``dion`` is not installed."""
-    if optimizer.lower() in {"muon", "normuon"}:
+    if optimizer.lower() in {"muon", "normuon", "muonh"}:
         try:
             import dion  # noqa: F401
         except ImportError:
@@ -141,6 +141,33 @@ def _validate_distributed_mode(
     if cfg.distributed_mode != "ddp" and cfg.ddp_bucket_cap_mb != 25:
         raise click.ClickException(
             "ddp_bucket_cap_mb applies only when distributed_mode=ddp."
+        )
+
+
+def _validate_muonh_wo_init_compat(
+    pretrain_cfg: PretrainingConfig,
+    model_cfg: ProtModernBertMLMConfig,
+) -> None:
+    optimizer = str(pretrain_cfg.optimizer).strip().lower()
+    wo_init = str(getattr(model_cfg, "wo_init", "zero")).strip().lower()
+    if optimizer == "muonh" and wo_init == "zero":
+        raise click.ClickException(
+            "optimizer=muonh is incompatible with model.wo_init='zero'. "
+            "MuonH initializes each matrix hyperball radius from ||W_init||_F, "
+            "so zero-initialized Wo matrices are locked at zero. "
+            "Set model.wo_init='kaiming' (or --wo-init kaiming)."
+        )
+
+
+def _validate_debug_layerwise_metrics_compat(
+    cfg: PretrainingConfig,
+    *,
+    pure_te: bool,
+) -> None:
+    if pure_te and cfg.debug_layerwise_metrics:
+        raise click.ClickException(
+            "debug_layerwise_metrics is not supported with --pure-te / pure_te: true. "
+            "Use the pure-torch path for layerwise debug hooks, or disable debug_layerwise_metrics."
         )
 
 
@@ -232,7 +259,7 @@ def pretrain():
 @click.option(
     "--optimizer",
     type=click.Choice(
-        ["adamw", "stable_adamw", "muon", "normuon"], case_sensitive=False
+        ["adamw", "stable_adamw", "muon", "normuon", "muonh"], case_sensitive=False
     ),
     default="normuon",
     help="Optimizer to use",
@@ -279,6 +306,13 @@ def pretrain():
     default=1e-7,
     help="Muon epsilon (used only when optimizer=muon or normuon)",
 )
+@click.option(
+    "--muonh-normalization",
+    type=click.Choice(["neuron", "short_axis", "none"], case_sensitive=False),
+    default="neuron",
+    help="MuonH update normalization (used only when optimizer=muonh): "
+    "'neuron' = per-row, 'short_axis' = along the shorter matrix axis, 'none' = disabled.",
+)
 @click.option("--mlm-probability", type=float, default=0.3, help="MLM probability")
 @click.option(
     "--logging-steps", type=int, default=1, help="Number of steps between log events"
@@ -297,6 +331,19 @@ def pretrain():
     "--debug-non-finite-params/--no-debug-non-finite-params",
     default=True,
     help="Check parameters for non-finite values after every optimizer step.",
+)
+@click.option(
+    "--debug-layerwise-metrics/--no-debug-layerwise-metrics",
+    default=False,
+    help="Log per-layer grad/weight norms, residual-stream RMS, and logit stats. "
+    "Has non-trivial overhead; installs forward hooks that may break torch.compile graphs. "
+    "Not supported with --pure-te.",
+)
+@click.option(
+    "--debug-layerwise-log-every",
+    type=int,
+    default=20,
+    help="Log layerwise debug metrics every N optimizer steps.",
 )
 @click.option(
     "--mask-replace-prob",
@@ -614,6 +661,13 @@ def pretrain():
     "up and gate use separate linear layers so Muon orthogonalizes each independently.",
 )
 @click.option(
+    "--wo-init",
+    type=click.Choice(["kaiming", "zero"], case_sensitive=False),
+    default="zero",
+    show_default=True,
+    help="Initialization for residual out-projections (attn.Wo and mlp.Wo).",
+)
+@click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
     default=False,
     help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only). "
@@ -692,12 +746,15 @@ def run(
     muon_momentum: float,
     muon_nesterov: bool,
     muon_eps: float,
+    muonh_normalization: str,
     mlm_probability: float,
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
     seed: int,
     debug_non_finite_params: bool,
+    debug_layerwise_metrics: bool,
+    debug_layerwise_log_every: int,
     mask_replace_prob: float,
     random_token_prob: float,
     keep_probability: float,
@@ -762,6 +819,7 @@ def run(
     attn_layer_pattern: Optional[str],
     fused_qkv: bool,
     fused_up_gate: bool,
+    wo_init: str,
     use_mhc_lite: bool,
     mhc_n_streams: int,
     mhc_lite_wrapping_level: str,
@@ -798,6 +856,7 @@ def run(
         muon_momentum=muon_momentum,
         muon_nesterov=muon_nesterov,
         muon_eps=muon_eps,
+        muonh_normalization=muonh_normalization,
         mlm_probability=mlm_probability,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
@@ -807,6 +866,8 @@ def run(
         save_steps=save_steps,
         seed=seed,
         debug_non_finite_params=debug_non_finite_params,
+        debug_layerwise_metrics=debug_layerwise_metrics,
+        debug_layerwise_log_every=debug_layerwise_log_every,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
@@ -865,6 +926,7 @@ def run(
             "resid_lambdas scales the hidden state before each layer, which breaks "
             "mHC-lite's doubly-stochastic stability guarantees."
         )
+    _validate_debug_layerwise_metrics_compat(cfg, pure_te=pure_te)
     _validate_distributed_mode(cfg, pure_torch=pure_torch, pure_te=pure_te)
 
     _populate_batch_setup(cfg)
@@ -905,7 +967,10 @@ def run(
         attn_layer_pattern=attn_layer_pattern,
         fused_qkv=fused_qkv,
         fused_up_gate=fused_up_gate,
+        wo_init=wo_init,
     )
+
+    _validate_muonh_wo_init_compat(cfg, model_cfg)
 
     _set_seed_for_init(seed)
     if use_diff_attn_v2 and not pure_torch:
@@ -1031,6 +1096,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
+    _validate_muonh_wo_init_compat(pretrain_config, model_config)
     if getattr(model_config, "use_noble", False) and not pure_torch:
         raise click.ClickException(
             "model.use_noble=true requires pure_torch: true (or --pure-torch). "
@@ -1098,6 +1164,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.num_kv_heads != model.num_attention_heads requires pure_torch: true / --pure-torch "
             "or pure_te: true / --pure-te. The HF path does not implement GQA."
         )
+    _validate_debug_layerwise_metrics_compat(pretrain_config, pure_te=pure_te)
     _validate_distributed_mode(
         pretrain_config,
         pure_torch=pure_torch,
@@ -1217,6 +1284,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  fused_qkv: true  # false = separate Wq/Wk/Wv instead of a single Wqkv\n"
         "  fused_up_gate: true  # false = separate W_up/W_gate instead of a single Wi for SwiGLU/GLU\n"
+        '  wo_init: "zero"  # residual out-projection init for attn.Wo/mlp.Wo: kaiming | zero\n'
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         '  activation_checkpointing_mode: "attn"  # (layer | attn | attn+mlp), attn mode has highest ROI \n'
         "\n"
@@ -1226,8 +1294,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  micro_batch_size: 64\n"
         "  global_batch_size: 256000\n"
         "  num_epochs: 10\n"
-        '  optimizer: "adamw"\n'
-        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
+        '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh\n'
+        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
@@ -1246,6 +1314,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
+        '  muonh_normalization: "neuron"  # used only when optimizer=muonh: neuron | short_axis | none\n'
         "  # NOBLE optimizer LR scaling (only used when model.use_noble=true)\n"
         "  noble_base_lr: 3e-4  # independent base LR for NOBLE branch params\n"
         "  noble_lr_gamma: 0.3  # W_up LR power (actual exponent = 2γ = 0.6)\n"
@@ -1262,6 +1331,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  save_steps: 5000\n"
         "  seed: 42\n"
         "  debug_non_finite_params: true  # checks params for NaN/Inf after every optimizer step\n"
+        "  debug_layerwise_metrics: false  # per-layer grad/weight norms, residual RMS, logit stats (overhead; breaks torch.compile graphs; not supported with pure_te)\n"
+        "  debug_layerwise_log_every: 20  # log layerwise metrics every N optimizer steps\n"
         '  num_workers: "auto"\n'
         "  prefetch_factor: 2\n"
         "  use_packing: true\n"
@@ -1439,6 +1510,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "compile_triton_mix_order_reduction",
         "profiler_enabled",
         "debug_non_finite_params",
+        "debug_layerwise_metrics",
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]

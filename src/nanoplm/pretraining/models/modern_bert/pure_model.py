@@ -92,6 +92,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             attn_layer_pattern=config.attn_layer_pattern,
             fused_qkv=config.fused_qkv,
             fused_up_gate=config.fused_up_gate,
+            wo_init=config.wo_init,
             # NOBLE
             use_noble=config.use_noble,
             noble_rank=config.noble_rank,
@@ -201,6 +202,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             attn_layer_pattern=config.attn_layer_pattern,
             fused_qkv=config.fused_qkv,
             fused_up_gate=config.fused_up_gate,
+            wo_init=config.wo_init,
         )
 
         super().__init__(mb_config)
