@@ -58,13 +58,23 @@ def is_muon_optimizer(optimizer) -> bool:
     """Return True if *optimizer* is a Dion Muon/NorMuon/MuonH instance or a MuonAdamWGroup."""
     if isinstance(optimizer, MuonAdamWGroup):
         return True
+    classes: list = []
     try:
         from dion import Muon as DionMuon
-        from dion import NorMuon as DionNorMuon
-        from dion import MuonH as DionMuonH
-        return isinstance(optimizer, (DionMuon, DionNorMuon, DionMuonH))
+        classes.append(DionMuon)
     except ImportError:
-        return False
+        pass
+    try:
+        from dion import NorMuon as DionNorMuon
+        classes.append(DionNorMuon)
+    except ImportError:
+        pass
+    try:
+        from dion import MuonH as DionMuonH
+        classes.append(DionMuonH)
+    except ImportError:
+        pass
+    return bool(classes) and isinstance(optimizer, tuple(classes))
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -320,9 +330,9 @@ def build_optimizer(
     NANOCHAT_SCALAR_EPS = 1e-10
 
     # -- Dion Muon/NorMuon/MuonH: only muon params ----------------------------
+    import inspect
     from dion import Muon as DionMuon
     from dion import NorMuon as DionNorMuon
-    from dion import MuonH as DionMuonH
 
     variant = str(muon_variant).lower()
     if variant not in {"muon", "normuon", "muonh"}:
@@ -341,6 +351,15 @@ def build_optimizer(
         adjust_lr="rms_norm",
     )
     if variant == "muonh":
+        # MuonH lives on a dion PR branch; import lazily so the package without
+        # it still works for muon/normuon variants.
+        try:
+            from dion import MuonH as DionMuonH
+        except ImportError as e:
+            raise ImportError(
+                "muon_variant='muonh' requires a dion build that includes MuonH "
+                "(currently only available on the dion PR branch)."
+            ) from e
         # MuonH does not accept cautious_wd, weight_decay (matrix params skip
         # decoupled WD by design). Hyperball constraint replaces WD.
         Cls = DionMuonH
@@ -358,7 +377,9 @@ def build_optimizer(
         }
         if variant == "normuon":
             kwargs["muon_beta2"] = 0.95
-            kwargs["normalization"] = "neuron"
+            # `normalization` is only on the NorMuon PR branch; skip if absent.
+            if "normalization" in inspect.signature(DionNorMuon).parameters:
+                kwargs["normalization"] = "neuron"
 
     muon_opt = Cls([dict(params=muon_params)], **kwargs)
 

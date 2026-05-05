@@ -43,7 +43,6 @@ from nanoplm.pretraining.utils import prepare_run_and_steps
 from nanoplm.pretraining.pure_pipeline import (
     H100_PEAK_TFLOPS,
     N_PREFETCH_LAYERS_FSDP2,
-    _clone_batch,
     _compute_epoch_start_steps,
     _create_optimizer,
     _create_scheduler,
@@ -782,14 +781,6 @@ def run_te_pretraining(
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
-    has_batch_t = (
-        torch.empty((), device=device, dtype=torch.int32)
-        if distributed and dist.is_initialized() else None
-    )
-    use_tail_replay = bool(use_packing and distributed and dist.is_initialized())
-    replay_buffer_size = 8
-    replay_batches: list[dict[str, torch.Tensor]] = []
-    replay_index = 0
     # When packing, TokenPackingDataset holds the DistributedSampler; call set_epoch on it.
     _epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
@@ -810,7 +801,6 @@ def run_te_pretraining(
             if _epoch_setter is not None and hasattr(_epoch_setter, "set_epoch"):
                 _epoch_setter.set_epoch(epoch)
             epoch_start_step = epoch_start_steps[min(epoch, len(epoch_start_steps) - 1)]
-            epoch_synced_train_loader_len = synced_train_loader_len
 
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
@@ -821,10 +811,7 @@ def run_te_pretraining(
 
             epoch_ended_early = False
             epoch_sub_batch_count = 0
-            replay_count = 0
-            replay_batches.clear()
-            replay_index = 0
-            for micro_step in range(epoch_synced_train_loader_len):
+            for micro_step in range(synced_train_loader_len):
                 has_batch = True
                 try:
                     full_batch = next(train_iter)
@@ -832,20 +819,11 @@ def run_te_pretraining(
                     has_batch = False
                     full_batch = None
 
-                if use_tail_replay and not has_batch:
-                    if not replay_batches:
-                        epoch_ended_early = True
-                        break
-                    full_batch = _clone_batch(replay_batches[replay_index % len(replay_batches)])
-                    replay_index += 1
-                    replay_count += 1
-                    has_batch = True
-
                 # When packing + num_workers > 0, greedy bin-packing can produce
                 # different batch counts per rank.  Coordinate so all ranks break
                 # together to avoid FSDP / NCCL deadlock.
-                if has_batch_t is not None and not use_tail_replay:
-                    has_batch_t.fill_(1 if has_batch else 0)
+                if distributed and dist.is_initialized():
+                    has_batch_t = torch.tensor(1 if has_batch else 0, device=device, dtype=torch.int32)
                     dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
                     if int(has_batch_t.item()) == 0:
                         epoch_ended_early = True
@@ -853,11 +831,6 @@ def run_te_pretraining(
                 elif not has_batch:
                     epoch_ended_early = True
                     break
-
-                if use_tail_replay and len(replay_batches) < replay_buffer_size:
-                    replay_batches.append(_clone_batch(full_batch))
-                elif use_tail_replay and replay_buffer_size > 0:
-                    replay_batches[micro_step % replay_buffer_size] = _clone_batch(full_batch)
 
                 if resume_data_step > 0 and epoch == resume_epoch and micro_step < resume_data_step:
                     continue
@@ -1114,7 +1087,7 @@ def run_te_pretraining(
                         wall_elapsed = time.perf_counter() - _run_t0
                         epoch_progress = epoch + (
                             micro_step + ((sub_batch_idx + 1) / max(1, total_sub_batches))
-                        ) / max(1, epoch_synced_train_loader_len)
+                        ) / max(1, synced_train_loader_len)
                         payload = {
                             "train/global_step": global_step,
                             "train/loss": loss_to_log,
@@ -1237,13 +1210,6 @@ def run_te_pretraining(
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
                     if partial_discarded else "",
                 )
-                if replay_count:
-                    logger.info(
-                        "Epoch %d/%d tail replayed %d packed batch(es) to keep ranks aligned.",
-                        epoch + 1,
-                        num_epochs,
-                        replay_count,
-                    )
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
             accum_micro_count = 0
