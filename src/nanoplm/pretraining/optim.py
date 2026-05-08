@@ -112,7 +112,6 @@ def _is_zero_init_fragile_param(name: str) -> bool:
         return True
     return False
 
-
 def _classify_noble_param(name: str) -> str | None:
     """Classify a NOBLE param for optimizer routing.
 
@@ -128,6 +127,16 @@ def _classify_noble_param(name: str) -> str | None:
     if name.endswith(".noble_w_up.weight"):
         return "wup"
     return None
+
+
+def _is_router_param(name: str) -> bool:
+    parts = name.split(".")
+    return len(parts) >= 3 and parts[-3:] == ["router", "gate", "weight"]
+
+
+def _is_moe_routed_expert_param(name: str) -> bool:
+    parts = name.split(".")
+    return len(parts) >= 2 and parts[-2:] in (["mlp", "Wi"], ["mlp", "Wo"])
 
 
 def build_muon_optimizer(
@@ -166,10 +175,15 @@ def build_muon_optimizer(
         elif param.ndim == 1 or _is_embedding_or_unembedding_param(name):
             adamw_params.append(param)
         elif param.ndim == 2:
-            if _is_zero_init_fragile_param(name):
+            if _is_zero_init_fragile_param(name) or _is_router_param(name):
                 adamw_params.append(param)
             else:
                 muon_params.append(param)
+        elif param.ndim == 3 and _is_moe_routed_expert_param(name):
+            # MoE routed experts are stored as stacked 3D tensors for grouped_mm.
+            # NorMuon supports batched 2D updates, so keep these on the Muon side
+            # instead of falling back to AdamW just because of the storage layout.
+            muon_params.append(param)
         else:
             adamw_params.append(param)
 
@@ -178,15 +192,27 @@ def build_muon_optimizer(
             "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
         )
 
+    muon_numel = sum(p.numel() for p in muon_params)
+    adamw_numel = sum(p.numel() for p in adamw_params)
+    resid_numel = sum(p.numel() for p in resid_params)
+    x0_numel = sum(p.numel() for p in x0_params)
     noble_total = len(noble_wup_params) + len(noble_M_params) + len(noble_freq_params) + len(noble_phase_params)
+    noble_numel = (
+        sum(p.numel() for p in noble_wup_params)
+        + sum(p.numel() for p in noble_M_params)
+        + sum(p.numel() for p in noble_freq_params)
+        + sum(p.numel() for p in noble_phase_params)
+    )
     logger.info(
         f"Muon grouping: muon_params={len(muon_params)} tensors, "
         f"adamw_params={len(adamw_params)} tensors, "
         f"resid_scalar_params={len(resid_params)} tensors, "
-        f"x0_scalar_params={len(x0_params)} tensors"
+        f"x0_scalar_params={len(x0_params)} tensors; "
+        f"muon_numel={muon_numel:,}, adamw_numel={adamw_numel:,}, "
+        f"resid_numel={resid_numel:,}, x0_numel={x0_numel:,}"
         + (f", noble_params={noble_total} tensors (wup={len(noble_wup_params)}, "
            f"M={len(noble_M_params)}, freq={len(noble_freq_params)}, "
-           f"phase={len(noble_phase_params)})" if noble_total > 0 else "")
+           f"phase={len(noble_phase_params)}, noble_numel={noble_numel:,})" if noble_total > 0 else "")
     )
 
     # Compute NOBLE LR values if any NOBLE params exist

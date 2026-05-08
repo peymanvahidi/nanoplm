@@ -101,6 +101,17 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             noble_phi_std=config.noble_phi_std,
             noble_half_kaiming=config.noble_half_kaiming,
             noble_targets=config.noble_targets,
+            use_moe=config.use_moe,
+            moe_num_experts=config.moe_num_experts,
+            moe_top_k=config.moe_top_k,
+            moe_use_bias_correction=config.moe_use_bias_correction,
+            moe_aux_loss_coef=config.moe_aux_loss_coef,
+            moe_z_loss_coef=config.moe_z_loss_coef,
+            moe_routed_scaling_factor=config.moe_routed_scaling_factor,
+            moe_n_group=config.moe_n_group,
+            moe_topk_group=config.moe_topk_group,
+            moe_bias_update_rate=config.moe_bias_update_rate,
+            moe_leading_dense_layers=config.moe_leading_dense_layers,
         )
 
         super().__init__(mb_config)
@@ -114,6 +125,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             raise ValueError(
                 "NOBLE is currently implemented only in the pure-torch path. "
                 "Disable use_noble or use --pure-torch."
+            )
+        if config.use_moe:
+            raise ValueError(
+                "MoE is currently implemented only in the pure-torch path. "
+                "Disable use_moe or use --pure-torch."
             )
         if config.use_canon_layers:
             raise ValueError(

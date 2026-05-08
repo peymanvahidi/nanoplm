@@ -87,6 +87,18 @@ class ProtModernBertMLMConfig:
     noble_phi_std: float = 0.1
     noble_half_kaiming: bool = True
     noble_targets: str = "all"
+    # MoE
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_use_bias_correction: bool = True
+    moe_aux_loss_coef: float = 0.01
+    moe_z_loss_coef: float = 5e-5
+    moe_routed_scaling_factor: float = 1.0
+    moe_n_group: int = 1  # group-limited routing: number of expert groups (1 = flat top-k)
+    moe_topk_group: int = 1  # group-limited routing: number of groups kept per token
+    moe_bias_update_rate: float = 1e-3  # Ling-style expert-bias update rate
+    moe_leading_dense_layers: int = 0
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
@@ -105,6 +117,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             raise ValueError(
                 "fused_up_gate=False is implemented only in the pure-torch path. "
                 "Use --pure-torch with fused_up_gate=false."
+            )
+        if config.use_moe:
+            raise ValueError(
+                "MoE is implemented only in the pure-torch path. "
+                "Use --pure-torch with use_moe=true."
             )
         if config.use_canon_layers:
             raise ValueError(

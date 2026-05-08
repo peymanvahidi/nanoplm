@@ -25,19 +25,59 @@
 
 ## 🛠️ Install
 
-Install the package from PyPi
+Install the package from PyPI:
 
 ```bash
 pip install nanoplm
 ```
-Remember for CUDA, you should install dion package (used for muon and normuon optimizers) manually.
+
+For a local editable install:
+
 ```bash
-pip install git+https://github.com/alint77/dion@dev/megabatching
+uv pip install -e .
 ```
 For benchmarking you also need Biotrainer.
 ```bash
 pip install git+https://github.com/sacdallago/biotrainer@main
 ```
+
+For CUDA training, install Dion manually from the Microsoft repository:
+
+```bash
+pip install git+https://github.com/microsoft/dion.git
+```
+
+MoE training now uses an in-tree CUTLASS grouped GEMM extension instead of the
+external `grouped_gemm` package. The extension is JIT-built on first use, so
+you only need a CUDA toolkit that matches `torch.version.cuda`.
+
+1. Check your active PyTorch CUDA version:
+
+```bash
+uv run python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+2. Point `CUDA_HOME` at the matching toolkit and set the architectures you want
+to build for:
+
+```bash
+export CUDA_HOME=/path/to/cuda-matching-torch
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export TORCH_CUDA_ARCH_LIST="9.0"  # H100; adjust for your GPU
+```
+
+3. Run nanoPLM normally. The first CUDA MoE call will compile the vendored
+CUTLASS backend and cache it under `.cache/torch_extensions`:
+
+```bash
+nanoplm pretrain from-yaml --pure-torch
+```
+
+If you need different architectures, override `TORCH_CUDA_ARCH_LIST` before
+running your first MoE job. If CUTLASS is not checked out under
+`third_party/cutlass`, set `NANOPLM_CUTLASS_ROOT` or `CUTLASS_ROOT` to a CUTLASS
+checkout.
 ---
 
 ## 🤖 Zero‑to‑model in 4 commands

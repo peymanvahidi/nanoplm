@@ -418,9 +418,10 @@ def run_te_pretraining(
                 reduce_dtype=torch.float32,
             )
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
+        fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
         for layer in base_model.model.layers:
-            fully_shard(layer, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
-        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(layer, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
+        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
         optimizer_dist = fsdp_mesh
 
         # FSDP2 Explicit Prefetching

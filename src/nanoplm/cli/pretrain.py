@@ -138,6 +138,10 @@ def _validate_distributed_mode(
         return
     if cfg.distributed_mode == "ddp" and not cfg.multi_gpu:
         raise click.ClickException("distributed_mode=ddp requires multi_gpu=true.")
+    if cfg.distributed_mode != "fsdp" and cfg.fsdp_reshard_after_forward:
+        raise click.ClickException(
+            "fsdp_reshard_after_forward applies only when distributed_mode=fsdp."
+        )
     if cfg.distributed_mode != "ddp" and cfg.ddp_bucket_cap_mb != 25:
         raise click.ClickException(
             "ddp_bucket_cap_mb applies only when distributed_mode=ddp."
@@ -419,6 +423,12 @@ def pretrain():
     show_default=True,
     help="FSDP2 wrapping granularity. 'layer' = whole transformer blocks (fewer boundaries, "
     "best for NVLink/SXM). 'sublayer' = attn & mlp separately (finer overlap, best for PCIe).",
+)
+@click.option(
+    "--fsdp-reshard-after-forward/--no-fsdp-reshard-after-forward",
+    default=False,
+    show_default=True,
+    help="Universal FSDP2 reshard_after_forward setting for all fully_shard groups in pure-torch / pure-te.",
 )
 @click.option(
     "--world-size",
@@ -772,6 +782,7 @@ def run(
     multi_gpu: bool,
     distributed_mode: str,
     fsdp_shard_granularity: str,
+    fsdp_reshard_after_forward: bool,
     world_size: str,
     ddp_bucket_cap_mb: int,
     project_name: str,
@@ -881,6 +892,7 @@ def run(
         multi_gpu=multi_gpu,
         distributed_mode=distributed_mode,
         fsdp_shard_granularity=fsdp_shard_granularity,
+        fsdp_reshard_after_forward=fsdp_reshard_after_forward,
         world_size=world_size,
         ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         project_name=project_name,
@@ -996,9 +1008,17 @@ def run(
     else:
         model = ProtModernBertMLM(model_cfg)
 
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
+    if getattr(model_cfg, "use_moe", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        inactive = 0
+        for m in model.modules():
+            if isinstance(m, _MoELayer):
+                inactive += (m.num_experts - m.top_k) * m.Wi.shape[1] * m.Wi.shape[2]
+                inactive += (m.num_experts - m.top_k) * m.Wo.shape[1] * m.Wo.shape[2]
+        logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     resume_cfg = ResumeConfig(
@@ -1182,9 +1202,17 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     else:
         model = ProtModernBertMLM(config=model_config)
 
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
+    if getattr(model_config, "use_moe", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        inactive = 0
+        for m in model.modules():
+            if isinstance(m, _MoELayer):
+                inactive += (m.num_experts - m.top_k) * m.Wi.shape[1] * m.Wi.shape[2]
+                inactive += (m.num_experts - m.top_k) * m.Wo.shape[1] * m.Wo.shape[2]
+        logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     if pure_te:
@@ -1287,6 +1315,19 @@ def get_yaml(output: Optional[str], force: bool):
         '  wo_init: "zero"  # residual out-projection init for attn.Wo/mlp.Wo: kaiming | zero\n'
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         '  activation_checkpointing_mode: "attn"  # (layer | attn | attn+mlp), attn mode has highest ROI \n'
+        "  # MoE (Mixture-of-Experts) — pure_torch only, requires use_packing + use_static_inp_size\n"
+        "  use_moe: false\n"
+        "  moe_num_experts: 8              # number of routed experts\n"
+        "  moe_top_k: 2                    # experts activated per token\n"
+        "  # one shared expert is always enabled; routing is always sigmoid\n"
+        "  moe_use_bias_correction: true   # expert-bias load balancing (selection-only)\n"
+        "  moe_aux_loss_coef: 0.01         # differentiable balance regularizer over router mass\n"
+        "  moe_z_loss_coef: 5e-5           # router z-loss for small-model MoE stability\n"
+        "  moe_routed_scaling_factor: 1.0  # routed branch output scale; start conservative\n"
+        "  moe_n_group: 1                  # group-limited routing: 1 disables, >1 partitions experts into groups\n"
+        "  moe_topk_group: 1               # with moe_n_group > 1, keep top K groups per token\n"
+        "  moe_bias_update_rate: 1e-3      # expert-bias correction step size\n"
+        "  moe_leading_dense_layers: 1     # first N layers are always dense (DeepSeek uses 1)\n"
         "\n"
         "pretraining:\n"
         '  dataset_dir: "output/data/pretrain_data"\n'
@@ -1353,6 +1394,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  multi_gpu: true\n"
         '  distributed_mode: "fsdp"  # fsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n'
         '  fsdp_shard_granularity: "layer"  # layer (fewer boundaries, NVLink/SXM) | sublayer (finer overlap, PCIe)\n'
+        "  fsdp_reshard_after_forward: false  # universal FSDP2 reshard_after_forward setting for pure_torch/pure_te\n"
         "  world_size: 'auto'\n"
         "  ddp_bucket_cap_mb: 25  # only used when distributed_mode: ddp in pure_torch/pure_te; HF path ignores it\n"
         '  project_name: "nanoplm-pretraining"\n'
@@ -1526,36 +1568,17 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     if config is None:
         raise ValueError("Model configuration is required but not found in YAML")
 
+    config = dict(config)
+
     model_fields = {f.name: f for f in fields(ProtModernBertMLMConfig)}
     expected_keys = set(model_fields.keys())
     present_keys = set(config.keys())
-
-    if "canon_layer_type" in present_keys:
-        legacy_canon_layer_type = config.get("canon_layer_type")
-        if legacy_canon_layer_type is not None:
-            legacy_value = str(legacy_canon_layer_type).strip().lower()
-            if legacy_value == "causal":
-                raise ValueError(
-                    "model.canon_layer_type='causal' is no longer supported. "
-                    "Causal Canon layers were removed. Delete model.canon_layer_type "
-                    "and use the symmetric Canon layer (kernel sizes: 3/5/7)."
-                )
-            if legacy_value != "symmetric":
-                raise ValueError(
-                    f"model.canon_layer_type={legacy_canon_layer_type!r} is no longer supported. "
-                    "Delete model.canon_layer_type; Canon layers are now symmetric-only."
-                )
-        logger.warning(
-            "Ignoring deprecated model.canon_layer_type; Canon layers are now symmetric-only."
-        )
 
     extra = []
     kwargs: Dict[str, Any] = {}
 
     # Classify provided keys in one pass
     for key in present_keys:
-        if key == "canon_layer_type":
-            continue
         if key not in expected_keys:
             extra.append(key)
             continue

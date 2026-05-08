@@ -113,6 +113,7 @@ class PretrainingConfig:
     # NVLink/SXM); "sublayer" wraps attn & mlp separately (more boundaries, but
     # finer-grained comm/compute overlap — better for slow interconnects like PCIe).
     fsdp_shard_granularity: str = "layer"
+    fsdp_reshard_after_forward: bool = False
     ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
     run_name: str = "run"
