@@ -29,6 +29,24 @@ def _build_directory() -> str | None:
     return None
 
 
+def _cuda_arch_flags() -> list[str]:
+    """Build fatbins explicitly so login-node builds do not need a visible GPU."""
+    override = os.environ.get("NANOPLM_CUTLASS_GENCODE_FLAGS")
+    if override:
+        return override.split()
+
+    # Keep the A100 fallback kernel available and add native H100 cubins. The
+    # Hopper TMA/GMMA grouped GEMM uses arch-conditional instructions, so it
+    # must have an sm_90a image; a plain sm_90 image will compile but assert at
+    # runtime inside CUTLASS.
+    return [
+        "-gencode=arch=compute_80,code=sm_80",
+        "-gencode=arch=compute_90,code=sm_90",
+        "-gencode=arch=compute_90a,code=sm_90a",
+        "-gencode=arch=compute_90,code=compute_90",
+    ]
+
+
 def _load_extension():
     global _EXTENSION
     if _EXTENSION is not None:
@@ -50,6 +68,7 @@ def _load_extension():
     ]
     include_paths = [
         str(cutlass_root / "include"),
+        str(cutlass_root / "tools" / "util" / "include"),
     ]
 
     _EXTENSION = load(
@@ -60,6 +79,7 @@ def _load_extension():
         extra_cuda_cflags=[
             "-O3",
             "-std=c++17",
+            *(_cuda_arch_flags()),
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "-U__CUDA_NO_HALF_OPERATORS__",

@@ -36,6 +36,33 @@ def test_grouped_gemm_matches_reference(device, trans_a, trans_b, a_shape, b_sha
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("backend", ["auto", "sm80", "sm90"])
+@pytest.mark.parametrize(
+    ("trans_a", "trans_b", "a_shape", "b_shape"),
+    [
+        (False, False, (5, 8), (3, 8, 16)),
+        (False, True, (5, 16), (3, 8, 16)),
+        (True, False, (5, 8), (5, 16)),
+    ],
+)
+def test_grouped_gemm_backend_selection_matches_reference(
+    monkeypatch, backend, trans_a, trans_b, a_shape, b_shape
+):
+    if backend == "sm90" and torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("SM90 backend requires Hopper or newer")
+
+    monkeypatch.setenv("NANOPLM_MOE_GROUPED_GEMM_BACKEND", backend)
+    counts = _make_counts(torch.device("cuda"))
+    a = torch.randn(a_shape, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(b_shape, device="cuda", dtype=torch.bfloat16)
+
+    out = moe_grouped_gemm(a, b, counts, trans_a=trans_a, trans_b=trans_b)
+    ref = _reference_grouped_gemm(a, b, counts, trans_a, trans_b)
+
+    assert torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
     ("trans_a", "trans_b", "a_shape", "b_shape"),
     [
