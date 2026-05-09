@@ -44,6 +44,11 @@ enum {
     TOKEN_W = 22,
     TOKEN_C = 23,
     TOKEN_X = 24,
+    // Commented out because these tokens are mapped to X
+    // TOKEN_B = 25,
+    // TOKEN_O = 26,
+    // TOKEN_U = 27,
+    // TOKEN_Z = 28,
     TOKEN_BOS = 29,
     TOKEN_UNUSED0 = 30,
     TOKEN_UNUSED1 = 31
