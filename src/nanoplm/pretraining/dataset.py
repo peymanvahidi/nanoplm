@@ -401,15 +401,19 @@ class ShardedDataset(Dataset):
                 f"Index {idx} out of bounds for dataset of size {len(self)}"
             )
 
+        # Per-worker lazy cache: rebuild if we're in a new process (fork or spawn).
+        pid = os.getpid()
+        if getattr(self, '_mmaps_pid', None) != pid:
+            self._mmaps = [np.memmap(p, dtype=np.uint8, mode="r") for p in self._bin_paths]
+            self._mmaps_pid = pid
+
         shard_idx, local_idx = self._get_shard(idx)
 
         offsets = self._offsets[shard_idx]
         start = int(offsets[local_idx])
         end = int(offsets[local_idx + 1])
 
-        mm = np.memmap(self._bin_paths[shard_idx], dtype=np.uint8, mode="r")
-        raw = mm[start:end].copy()
-        del mm
+        raw = self._mmaps[shard_idx][start:end].copy()
 
         input_ids = torch.from_numpy(raw).long() # To long since it will be concat
 
@@ -451,8 +455,9 @@ class ShardedDataset(Dataset):
         return h.hexdigest()[:16]
 
     def cleanup(self):
-        """No-op kept for API compatibility; no persistent file handles to release."""
-        pass
+        """Release per-worker memmap handles."""
+        self._mmaps = None
+        self._mmaps_pid = None
 
     @property
     def total_tokens(self) -> int:
