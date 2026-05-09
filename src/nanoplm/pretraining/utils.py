@@ -160,6 +160,8 @@ def prepare_run_and_steps(
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
+    is_local_main = int(os.environ.get("LOCAL_RANK", 0)) == 0
+
     # Determine run directory and name
     if resume_config and resume_config.is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
@@ -177,26 +179,28 @@ def prepare_run_and_steps(
         else:
             resume_counter = 1
 
-        # Save updated counter
-        counter_file.write_text(str(resume_counter), encoding="utf-8")
+        # Save updated counter and archive future checkpoints (rank 0 only)
+        if is_local_main:
+            counter_file.write_text(str(resume_counter), encoding="utf-8")
 
         # Create W&B run name with counter
         wandb_run_name = f"{run_name}-re{resume_counter}"
         logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
 
-        # Archive any future checkpoints to prevent conflicts
+        # Archive any future checkpoints to prevent conflicts (rank 0 only)
         resume_step = None
-        try:
-            resume_step = int(checkpoint_path.name.split("-")[1])
-            _archive_future_checkpoints(run_root, resume_step)
-        except (IndexError, ValueError) as e:
-            logger.warning(
-                f"Could not extract step number from checkpoint path: {checkpoint_path.name}. "
-                f"Skipping future checkpoint archival. Error: {e}"
-            )
+        if is_local_main:
+            try:
+                resume_step = int(checkpoint_path.name.split("-")[1])
+                _archive_future_checkpoints(run_root, resume_step)
+            except (IndexError, ValueError) as e:
+                logger.warning(
+                    f"Could not extract step number from checkpoint path: {checkpoint_path.name}. "
+                    f"Skipping future checkpoint archival. Error: {e}"
+                )
     else:
         base_stamp = datetime.now().strftime("%d%m%H%M")
-        base_name = f"run-{base_stamp}"
+        base_name = f"{base_stamp}-{pretrain_config.run_name}"
         candidate = base_name
         if ckp_root.exists():
             suffix = 2
@@ -208,14 +212,16 @@ def prepare_run_and_steps(
         wandb_run_name = run_name  # Same as directory name for new runs
         resume_step = None
 
-    create_dirs(str(run_root))
+    if is_local_main:
+        create_dirs(str(run_root))
     output_dir = str(run_root)
 
-    # Persist run metadata for future resumes
-    try:
-        (Path(output_dir) / "run_name.txt").write_text(run_name, encoding="utf-8")
-    except Exception:
-        pass
+    # Persist run metadata for future resumes (rank 0 only)
+    if is_local_main:
+        try:
+            (Path(output_dir) / "run_name.txt").write_text(run_name, encoding="utf-8")
+        except Exception:
+            pass
 
     # Compute epochs and step intervals
     if resume_config and resume_config.is_resume:

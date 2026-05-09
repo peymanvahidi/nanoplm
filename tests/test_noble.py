@@ -92,7 +92,7 @@ class TestNOBLELinear:
 
         full_out = noble(x)
         main_out = noble.linear(x)
-        branch_out = noble.W_up(noble.cosnet(noble.W_down(x)))
+        branch_out = noble.noble_w_up(noble.cosnet(noble.W_down(x)))
 
         # Branch magnitude should be much smaller than main
         main_norm = main_out.norm()
@@ -131,7 +131,7 @@ class TestNOBLELinear:
         alpha = 0.01
         noble = NOBLELinear(768, 768, rank=rank, alpha=alpha)
         expected_std = alpha / math.sqrt(rank)
-        actual_std = noble.W_up.weight.std().item()
+        actual_std = noble.noble_w_up.weight.std().item()
         # Allow 3x tolerance for random init
         assert actual_std < expected_std * 3, (
             f"W_up std {actual_std:.6f} too far from expected {expected_std:.6f}"
@@ -159,7 +159,7 @@ class TestNOBLELinear:
             + in_f * rank         # W_down.weight
             + 4 * rank            # omega1, phi1, omega2, phi2
             + rank * rank         # M
-            + rank * out_f        # W_up.weight
+            + rank * out_f        # noble_w_up.weight
         )
         actual = sum(p.numel() for p in noble.parameters())
         assert actual == expected, f"Param count: expected {expected}, got {actual}"
@@ -177,7 +177,7 @@ class TestNOBLELinear:
             "cosnet.M",
             "cosnet.omega2",
             "cosnet.phi2",
-            "W_up.weight",
+            "noble_w_up.weight",
         }
         assert names == expected, f"Unexpected param names: {names - expected}"
 
@@ -215,7 +215,7 @@ class TestBuildLinear:
         )
         layer = _build_linear(64, 128, config, bias=False)
         assert layer.rank == 32
-        # Check W_up init reflects alpha=0.05
+        # Check noble_w_up init reflects alpha=0.05
         expected_std = 0.05 / math.sqrt(32)
-        actual_std = layer.W_up.weight.std().item()
+        actual_std = layer.noble_w_up.weight.std().item()
         assert actual_std < expected_std * 3

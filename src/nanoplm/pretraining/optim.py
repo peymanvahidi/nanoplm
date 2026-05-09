@@ -55,15 +55,26 @@ class MuonAdamWGroup:
 
 
 def is_muon_optimizer(optimizer) -> bool:
-    """Return True if *optimizer* is a Dion Muon/NorMuon instance or a MuonAdamWGroup."""
+    """Return True if *optimizer* is a Dion Muon/NorMuon/MuonH instance or a MuonAdamWGroup."""
     if isinstance(optimizer, MuonAdamWGroup):
         return True
+    classes: list = []
     try:
         from dion import Muon as DionMuon
-        from dion import NorMuon as DionNorMuon
-        return isinstance(optimizer, (DionMuon, DionNorMuon))
+        classes.append(DionMuon)
     except ImportError:
-        return False
+        pass
+    try:
+        from dion import NorMuon as DionNorMuon
+        classes.append(DionNorMuon)
+    except ImportError:
+        pass
+    try:
+        from dion import MuonH as DionMuonH
+        classes.append(DionMuonH)
+    except ImportError:
+        pass
+    return bool(classes) and isinstance(optimizer, tuple(classes))
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -106,17 +117,16 @@ def _classify_noble_param(name: str) -> str | None:
     """Classify a NOBLE param for optimizer routing.
 
     Returns one of: 'wup', 'M', 'freq', 'phase', or None (not a NOBLE param).
-    Uses case-sensitive matching on the original param name.
-    Note: W_down is intentionally NOT matched — it stays in Muon.
+    W_down is intentionally NOT matched — it stays in Muon.
     """
-    if ".W_up." in name:
-        return "wup"
     if ".cosnet.M" in name:
         return "M"
     if ".cosnet.omega" in name:
         return "freq"
     if ".cosnet.phi" in name:
         return "phase"
+    if name.endswith(".noble_w_up.weight"):
+        return "wup"
     return None
 
 
@@ -226,7 +236,8 @@ def build_muon_optimizer(
         muon_momentum=pretrain_config.muon_momentum,
         muon_nesterov=pretrain_config.muon_nesterov,
         muon_eps=pretrain_config.muon_eps,
-        use_normuon=str(pretrain_config.optimizer).lower() == "normuon",
+        muon_variant=str(pretrain_config.optimizer).lower(),
+        muonh_normalization=pretrain_config.muonh_normalization,
         adamw_learning_rate=pretrain_config.adam_learning_rate,
         adamw_weight_decay=pretrain_config.adam_weight_decay,
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
@@ -289,10 +300,11 @@ def build_optimizer(
     noble_freq_params: list[torch.nn.Parameter] | None = None,
     noble_phase_params: list[torch.nn.Parameter] | None = None,
     noble_lrs: dict | None = None,
-    use_normuon: bool = False,
+    muon_variant: str = "muon",
+    muonh_normalization: str = "neuron",
     distributed_mesh=None,
 ) -> MuonAdamWGroup:
-    """Build a MuonAdamWGroup: Dion Muon/NorMuon for muon params + torch.optim.AdamW(fused=True) for AdamW params."""
+    """Build a MuonAdamWGroup: Dion Muon/NorMuon/MuonH for muon params + torch.optim.AdamW(fused=True) for AdamW params."""
     if not muon_params:
         raise ValueError("Muon optimizer requires at least one matrix parameter.")
     resid_params = resid_params or []
@@ -317,27 +329,57 @@ def build_optimizer(
     NANOCHAT_X0_BETAS = (0.96, 0.95)
     NANOCHAT_SCALAR_EPS = 1e-10
 
-    # -- Dion Muon/NorMuon: only muon params ----------------------------------
+    # -- Dion Muon/NorMuon/MuonH: only muon params ----------------------------
+    import inspect
     from dion import Muon as DionMuon
     from dion import NorMuon as DionNorMuon
 
-    Cls = DionNorMuon if use_normuon else DionMuon
-    kwargs = dict(
+    variant = str(muon_variant).lower()
+    if variant not in {"muon", "normuon", "muonh"}:
+        raise ValueError(
+            f"Unknown muon_variant: {muon_variant!r}. Expected one of: muon, normuon, muonh."
+        )
+
+    common_kwargs = dict(
         distributed_mesh=distributed_mesh,
         lr=float(muon_learning_rate),
         mu=float(muon_momentum),
-        weight_decay=float(muon_weight_decay),
         epsilon=float(muon_eps),
         nesterov=bool(muon_nesterov),
         use_triton=True,
-        cautious_wd=bool(muon_cautious_weight_decay),
         newton_schulz_func=ns_func,
+        adjust_lr="rms_norm",
     )
-    if use_normuon:
-        kwargs["muon_beta2"] = 0.95
-        kwargs["adjust_lr"] = "rms_norm"
+    if variant == "muonh":
+        # MuonH lives on a dion PR branch; import lazily so the package without
+        # it still works for muon/normuon variants.
+        try:
+            from dion import MuonH as DionMuonH
+        except ImportError as e:
+            raise ImportError(
+                "muon_variant='muonh' requires a dion build that includes MuonH "
+                "(currently only available on the dion PR branch)."
+            ) from e
+        # MuonH does not accept cautious_wd, weight_decay (matrix params skip
+        # decoupled WD by design). Hyperball constraint replaces WD.
+        Cls = DionMuonH
+        kwargs = {
+            **common_kwargs,
+            "muon_beta2": 0.95,
+            "normalization": muonh_normalization,
+        }
     else:
-        kwargs["adjust_lr"] = None
+        Cls = DionNorMuon if variant == "normuon" else DionMuon
+        kwargs = {
+            **common_kwargs,
+            "weight_decay": float(muon_weight_decay),
+            "cautious_wd": bool(muon_cautious_weight_decay),
+        }
+        if variant == "normuon":
+            kwargs["muon_beta2"] = 0.95
+            # `normalization` is only on the NorMuon PR branch; skip if absent.
+            if "normalization" in inspect.signature(DionNorMuon).parameters:
+                kwargs["normalization"] = "neuron"
 
     muon_opt = Cls([dict(params=muon_params)], **kwargs)
 

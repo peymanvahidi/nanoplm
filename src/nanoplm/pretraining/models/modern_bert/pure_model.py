@@ -18,7 +18,9 @@ from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 
 _TE_IMPORT_ERROR = None
 try:
-    from nanoplm.pretraining.models.modern_bert.modelling_te import TEModernBertForMaskedLM
+    from nanoplm.pretraining.models.modern_bert.modelling_te import (
+        TEModernBertForMaskedLM,
+    )
 except Exception as exc:  # pragma: no cover - depends on TE availability
     _TE_IMPORT_ERROR = exc
 
@@ -45,6 +47,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_kv_heads,
+            norm_type=config.norm_type,
             mlp_activation=config.mlp_activation,
             # Keep this comfortably above common dataset max_seq_len values.
             # Position embeddings are RoPE frequencies (not learned tables), so a
@@ -74,13 +77,22 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             use_prores=config.use_prores,
             prores_T=config.prores_T,
             activation_checkpointing=config.activation_checkpointing,
-            activation_checkpointing_mode=str(getattr(config, "activation_checkpointing_mode", "layer")).strip().lower(),
+            activation_checkpointing_mode=str(
+                getattr(config, "activation_checkpointing_mode", "layer")
+            )
+            .strip()
+            .lower(),
             use_mhc_lite=config.use_mhc_lite,
             mhc_n_streams=config.mhc_n_streams,
             mhc_triton_fused=config.mhc_triton_fused,
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
+            tie_word_embeddings=config.tie_word_embeddings,
             use_diff_attn_v2=config.use_diff_attn_v2,
+            use_paired_head_attention=config.use_paired_head_attention,
             attn_layer_pattern=config.attn_layer_pattern,
+            fused_qkv=config.fused_qkv,
+            fused_up_gate=config.fused_up_gate,
+            wo_init=config.wo_init,
             # NOBLE
             use_noble=config.use_noble,
             noble_rank=config.noble_rank,
@@ -108,7 +120,10 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
                 "Canon layers are currently implemented only in the pure-torch path. "
                 "Disable use_canon_layers or use --pure-torch."
             )
-        if config.use_mhc_lite and str(config.mhc_lite_wrapping_level).strip().lower() != "layer":
+        if (
+            config.use_mhc_lite
+            and str(config.mhc_lite_wrapping_level).strip().lower() != "layer"
+        ):
             raise ValueError(
                 "Transformer Engine currently supports only layer-level mHC-lite. "
                 "Set mhc_lite_wrapping_level='layer' or use --pure-torch."
@@ -117,6 +132,21 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             raise ValueError(
                 "Differential Attention V2 is currently implemented only in the "
                 "pure-torch path. Disable use_diff_attn_v2 or use --pure-torch."
+            )
+        if config.use_paired_head_attention:
+            raise ValueError(
+                "Paired head attention is currently implemented only in the pure-torch "
+                "path. Disable use_paired_head_attention or use --pure-torch."
+            )
+        if not config.fused_qkv:
+            raise ValueError(
+                "fused_qkv=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_qkv=false."
+            )
+        if not config.fused_up_gate:
+            raise ValueError(
+                "fused_up_gate=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_up_gate=false."
             )
 
         self.tokenizer = ProtModernBertTokenizer()
@@ -130,6 +160,7 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
             num_kv_heads=config.num_kv_heads,
+            norm_type=config.norm_type,
             mlp_activation=config.mlp_activation,
             # Keep this comfortably above common dataset max_seq_len values.
             max_position_embeddings=8192,
@@ -157,13 +188,21 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             use_prores=config.use_prores,
             prores_T=config.prores_T,
             activation_checkpointing=config.activation_checkpointing,
-            activation_checkpointing_mode=str(getattr(config, "activation_checkpointing_mode", "layer")).strip().lower(),
+            activation_checkpointing_mode=str(
+                getattr(config, "activation_checkpointing_mode", "layer")
+            )
+            .strip()
+            .lower(),
             use_mhc_lite=config.use_mhc_lite,
             mhc_n_streams=config.mhc_n_streams,
             mhc_triton_fused=config.mhc_triton_fused,
             mhc_lite_wrapping_level=str(config.mhc_lite_wrapping_level).strip().lower(),
+            tie_word_embeddings=config.tie_word_embeddings,
             use_diff_attn_v2=config.use_diff_attn_v2,
             attn_layer_pattern=config.attn_layer_pattern,
+            fused_qkv=config.fused_qkv,
+            fused_up_gate=config.fused_up_gate,
+            wo_init=config.wo_init,
         )
 
         super().__init__(mb_config)

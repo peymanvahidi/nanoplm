@@ -413,6 +413,9 @@ def _pt_pad_to_multiple_of(batch: Dict[str, Any], pad_to_multiple_of: int, token
         batch["position_ids"] = torch.cat(
             [batch["position_ids"], torch.arange(remainder, dtype=batch["position_ids"].dtype, device=device)], dim=0
         )
+
+    if "max_seqlen" in batch:
+        batch["max_seqlen"] = max(int(batch["max_seqlen"]), int(remainder))
         
     return batch
 
@@ -469,5 +472,8 @@ def _pt_pad_to_fixed_tokens(
             ],
             dim=0,
         )
+
+    if "max_seqlen" in batch:
+        batch["max_seqlen"] = max(int(batch["max_seqlen"]), int(remainder))
 
     return batch
