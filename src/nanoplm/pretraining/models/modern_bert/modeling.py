@@ -209,11 +209,25 @@ class ModernBertConfig:
     noble_half_kaiming: bool = True          # halve main weight init scale
     noble_targets: str = "all"              # which projections get NOBLE: all|attn|ffn|qkv|out
     wo_init: Literal["kaiming", "zero"] = "zero"
+    # MoE (Mixture-of-Experts)
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_use_bias_correction: bool = True
+    moe_aux_loss_coef: float = 0.01
+    moe_z_loss_coef: float = 5e-5  # prevents sigmoid saturation in router (DeepSeek-V3 style)
+    moe_routed_scaling_factor: float = 1.0
+    moe_n_group: int = 1
+    moe_topk_group: int = 1
+    moe_bias_update_rate: float = 1e-3
+    moe_leading_dense_layers: int = 0  # first N layers are always dense (DeepSeek uses 1)
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
     layer_types: list[str] = field(init=False)
     canon_layer_set: frozenset[str] = field(init=False)
+    moe_layer_flags: list[bool] = field(init=False)
+    moe_dense_intermediate_size: int = field(init=False)
 
     def __post_init__(self) -> None:
         self.mhc_lite_wrapping_level = str(self.mhc_lite_wrapping_level).strip().lower()  # type: ignore[assignment]
@@ -373,6 +387,59 @@ class ModernBertConfig:
                 "norm_bias=True is not compatible with norm_type='rmsnorm'. "
                 "RMSNorm does not support bias. Set norm_bias=False."
             )
+        # MoE layer flags.
+        if self.use_moe:
+            if self.mlp_activation != "swiglu":
+                raise ValueError(
+                    "use_moe=True currently requires mlp_activation='swiglu'."
+                )
+            if self.moe_num_experts < 1:
+                raise ValueError(
+                    f"moe_num_experts must be >= 1, got {self.moe_num_experts}"
+                )
+            if self.moe_top_k < 1 or self.moe_top_k > self.moe_num_experts:
+                raise ValueError(
+                    "moe_top_k must satisfy 1 <= moe_top_k <= moe_num_experts: "
+                    f"{self.moe_top_k} vs {self.moe_num_experts}"
+                )
+            if self.moe_n_group < 1:
+                raise ValueError(f"moe_n_group must be >= 1, got {self.moe_n_group}")
+            if self.moe_topk_group < 1:
+                raise ValueError(f"moe_topk_group must be >= 1, got {self.moe_topk_group}")
+            if self.moe_n_group > 1:
+                if self.moe_num_experts % self.moe_n_group != 0:
+                    raise ValueError(
+                        "moe_num_experts must be divisible by moe_n_group: "
+                        f"{self.moe_num_experts} % {self.moe_n_group} != 0"
+                    )
+                if self.moe_topk_group > self.moe_n_group:
+                    raise ValueError(
+                        "moe_topk_group must be <= moe_n_group: "
+                        f"{self.moe_topk_group} > {self.moe_n_group}"
+                    )
+            else:
+                self.moe_topk_group = 1
+            self.moe_layer_flags = [True] * self.num_hidden_layers
+            # Force first N layers to dense.
+            for i in range(min(self.moe_leading_dense_layers, self.num_hidden_layers)):
+                self.moe_layer_flags[i] = False
+            if (
+                self.activation_checkpointing
+                and self.activation_checkpointing_mode == "attn+mlp"
+                and any(self.moe_layer_flags)
+            ):
+                raise ValueError(
+                    "MoE is not compatible with activation_checkpointing_mode='attn+mlp'. "
+                    "Use 'attn' or 'layer' mode instead."
+                )
+            # Dense layers in MoE mode use the full active intermediate size
+            # so they match the per-token compute of MoE layers.
+            self.moe_dense_intermediate_size = (
+                (self.moe_top_k + 1) * self.intermediate_size
+            )
+        else:
+            self.moe_layer_flags = [False] * self.num_hidden_layers
+            self.moe_dense_intermediate_size = self.intermediate_size
 
 
 def _create_norm(hidden_size: int, eps: float, bias: bool, norm_type: str) -> nn.Module:
@@ -1815,12 +1882,23 @@ class ModernBertEncoderLayer(nn.Module):
                 if "c" in config.canon_layer_set
                 else None
             )
-            if config.mlp_activation == "srelu":
-                self.mlp = ModernBertSReluMLP(config)
-            elif config.mlp_activation == "swiglu":
-                self.mlp = ModernBertSwiGLUMLP(config)
+            if config.use_moe and config.moe_layer_flags[layer_idx]:
+                from .moe import MoELayer
+                self.mlp = MoELayer(config)
             else:
-                self.mlp = ModernBertMLP(config)
+                # For dense layers in MoE mode, use the full active intermediate
+                # size so per-token capacity matches the MoE layers.
+                mlp_config = config
+                if config.use_moe and not config.moe_layer_flags[layer_idx]:
+                    import copy
+                    mlp_config = copy.copy(config)
+                    mlp_config.intermediate_size = config.moe_dense_intermediate_size
+                if mlp_config.mlp_activation == "srelu":
+                    self.mlp = ModernBertSReluMLP(mlp_config)
+                elif mlp_config.mlp_activation == "swiglu":
+                    self.mlp = ModernBertSwiGLUMLP(mlp_config)
+                else:
+                    self.mlp = ModernBertMLP(mlp_config)
         else:
             self.mlp_norm = nn.Identity()
             self.canon_c = None
@@ -2817,7 +2895,27 @@ class ModernBertForMaskedLM(nn.Module):
 
             # MLP weight init (NOBLE modules get half-Kaiming bound)
             if enc.mlp is not None:
-                if enc.mlp.Wi is not None:
+                is_moe_mlp = False
+                if getattr(self.config, "use_moe", False):
+                    from .moe import MoELayer as _MoELayer
+                    is_moe_mlp = isinstance(enc.mlp, _MoELayer)
+
+                if is_moe_mlp:
+                    # Routed expert stacked weights (nn.Parameter, not nn.Linear).
+                    nn.init.uniform_(enc.mlp.Wi, -bound, bound)
+                    _init_wo(enc.mlp.Wo, mlp_out_bound)
+                    nn.init.uniform_(enc.mlp.router.gate.weight, -bound, bound)
+                    shared = enc.mlp.shared_expert
+                    if shared.Wi is not None:
+                        bi = _noble_bound(shared.Wi)
+                        nn.init.uniform_(shared.Wi.weight, -bi, bi)
+                    elif hasattr(shared, "W_up") and shared.W_up is not None:
+                        bu = _noble_bound(shared.W_up)
+                        nn.init.uniform_(shared.W_up.weight, -bu, bu)
+                        bg = _noble_bound(shared.W_gate)
+                        nn.init.uniform_(shared.W_gate.weight, -bg, bg)
+                    _init_wo(shared.Wo.weight, mlp_out_bound)
+                elif enc.mlp.Wi is not None:
                     bi = _noble_bound(enc.mlp.Wi)
                     nn.init.uniform_(enc.mlp.Wi.weight, -bi, bi)
                 elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
@@ -2825,10 +2923,11 @@ class ModernBertForMaskedLM(nn.Module):
                     nn.init.uniform_(enc.mlp.W_up.weight, -bu, bu)
                     bg = _noble_bound(enc.mlp.W_gate)
                     nn.init.uniform_(enc.mlp.W_gate.weight, -bg, bg)
-                if hasattr(enc.mlp, "Wo"):
-                    _init_wo(enc.mlp.Wo.weight, mlp_out_bound)
-                else:
-                    _init_wo(enc.mlp.Wo_weight, mlp_out_bound)
+                if not is_moe_mlp:
+                    if hasattr(enc.mlp, "Wo"):
+                        _init_wo(enc.mlp.Wo.weight, mlp_out_bound)
+                    else:
+                        _init_wo(enc.mlp.Wo_weight, mlp_out_bound)
 
             # QKV bias init
             if enc.attn.Wqkv is not None:
@@ -2848,7 +2947,24 @@ class ModernBertForMaskedLM(nn.Module):
 
             # MLP bias init
             if enc.mlp is not None:
-                if enc.mlp.Wi is not None:
+                is_moe_mlp = False
+                if getattr(self.config, "use_moe", False):
+                    from .moe import MoELayer as _MoELayer
+                    is_moe_mlp = isinstance(enc.mlp, _MoELayer)
+
+                if is_moe_mlp:
+                    shared = enc.mlp.shared_expert
+                    if shared.Wi is not None:
+                        if shared.Wi.bias is not None:
+                            nn.init.zeros_(shared.Wi.bias)
+                    elif hasattr(shared, "W_up") and shared.W_up is not None:
+                        if shared.W_up.bias is not None:
+                            nn.init.zeros_(shared.W_up.bias)
+                        if shared.W_gate.bias is not None:
+                            nn.init.zeros_(shared.W_gate.bias)
+                    if shared.Wo.bias is not None:
+                        nn.init.zeros_(shared.Wo.bias)
+                elif enc.mlp.Wi is not None:
                     if enc.mlp.Wi.bias is not None:
                         nn.init.zeros_(enc.mlp.Wi.bias)
                 elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
@@ -2856,11 +2972,12 @@ class ModernBertForMaskedLM(nn.Module):
                         nn.init.zeros_(enc.mlp.W_up.bias)
                     if enc.mlp.W_gate.bias is not None:
                         nn.init.zeros_(enc.mlp.W_gate.bias)
-                if hasattr(enc.mlp, "Wo"):
-                    if enc.mlp.Wo.bias is not None:
-                        nn.init.zeros_(enc.mlp.Wo.bias)
-                elif enc.mlp.Wo_bias is not None:
-                    nn.init.zeros_(enc.mlp.Wo_bias)
+                if not is_moe_mlp:
+                    if hasattr(enc.mlp, "Wo"):
+                        if enc.mlp.Wo.bias is not None:
+                            nn.init.zeros_(enc.mlp.Wo.bias)
+                    elif enc.mlp.Wo_bias is not None:
+                        nn.init.zeros_(enc.mlp.Wo_bias)
 
             # DiffV2: zero-init lambda_proj so sigmoid(0)=0.5 at start.
             if enc.attn.lambda_proj is not None:
@@ -2945,6 +3062,17 @@ class ModernBertForMaskedLM(nn.Module):
                     labels,
                     ignore_index=self.sparse_pred_ignore_index,
                 )
+                # MoE auxiliary losses (balance + z-loss, coefficients baked in).
+                if self.config.use_moe:
+                    from .moe import MoELayer as _MoELayer
+                    aux_losses = [
+                        module.last_aux_loss
+                        for module in self.modules()
+                        if isinstance(module, _MoELayer)
+                        and module.last_aux_loss is not None
+                    ]
+                    if aux_losses:
+                        loss = loss + sum(aux_losses) / len(aux_losses)
             else:
                 logits = self.decoder(self.head(x))
                 loss = None

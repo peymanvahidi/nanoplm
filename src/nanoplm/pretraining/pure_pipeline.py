@@ -89,7 +89,7 @@ torch.backends.cudnn.allow_tf32 = True
 H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
-N_PREFETCH_LAYERS_FSDP2 = 2
+N_PREFETCH_LAYERS_FSDP2 = 1
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +500,7 @@ def _fully_shard_encoder_sublayers(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
     shard_parent: bool = True,
     sublayer: bool = False,
 ) -> None:
@@ -511,11 +512,11 @@ def _fully_shard_encoder_sublayers(
     less CPU dispatch overhead — better on fast interconnects like NVLink).
     """
     if sublayer:
-        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
         if enc.mlp is not None:
-            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
     if shard_parent:
-        fully_shard(enc, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(enc, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_transformer_layer(
@@ -523,6 +524,7 @@ def _fully_shard_transformer_layer(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
     sublayer: bool = False,
 ) -> None:
     """Shard one logical transformer layer bottom-up for better overlap."""
@@ -531,24 +533,32 @@ def _fully_shard_transformer_layer(
             layer,
             mesh=mesh,
             fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
             shard_parent=False,
             sublayer=sublayer,
         )
     elif isinstance(layer, MHCLiteBlock):
-        _fully_shard_encoder_sublayers(layer.layer, mesh=mesh, fsdp_kwargs=fsdp_kwargs, sublayer=sublayer)
+        _fully_shard_encoder_sublayers(
+            layer.layer,
+            mesh=mesh,
+            fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
+            sublayer=sublayer,
+        )
     elif isinstance(layer, MHCLiteSublayersLayer):
         _fully_shard_encoder_sublayers(
             layer.enc,
             mesh=mesh,
             fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
             shard_parent=False,
             sublayer=sublayer,
         )
         if sublayer:
-            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
             if layer.mhc_mlp is not None:
-                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(layer, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(layer, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_root_groups(
@@ -556,6 +566,7 @@ def _fully_shard_root_groups(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
 ) -> None:
     """Split root-only params into separate groups to avoid a serialized root tail."""
     tied_embeddings = model.decoder.weight is model.model.embeddings.tok_embeddings.weight
@@ -564,14 +575,14 @@ def _fully_shard_root_groups(
         fully_shard(
             [model.model.embeddings, model.decoder],
             mesh=mesh,
-            reshard_after_forward=False,
+            reshard_after_forward=reshard_after_forward,
             **fsdp_kwargs,
         )
     else:
-        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(model.head, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(model.head, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _has_nonfinite_tensors(tensors: list[torch.Tensor]) -> bool:
@@ -791,10 +802,41 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
     # swiglu/glu: Wi is h -> 2*ff, Wo is ff -> h => 2*h*2*ff + 2*ff*h = 6*h*ff
     # srelu:      Wi is h -> ff,   Wo is ff -> h => 2*h*ff   + 2*ff*h = 4*h*ff
     if config.mlp_activation == "srelu":
-        mlp_flops_per_layer = 4 * h * ff
+        dense_mlp_flops = 4 * h * ff
     else:
-        mlp_flops_per_layer = 6 * h * ff
-    mlp_flops = n_layers * mlp_flops_per_layer
+        dense_mlp_flops = 6 * h * ff
+
+    no_mlp_first = getattr(config, "no_mlp_on_first_layer", False)
+    use_moe = getattr(config, "use_moe", False)
+    if use_moe:
+        # MoE active FLOPs per token per MoE layer:
+        #  - Router gate: h -> num_experts (2 * h * E)
+        #  - Routed experts: top_k experts, each SwiGLU with ff intermediate
+        #      Wi: h -> 2*ff, Wo: ff -> h => top_k * 6 * h * ff
+        #  - Shared expert: same as one dense MLP => 6 * h * ff (or 4 for srelu)
+        moe_top_k = config.moe_top_k
+        moe_E = config.moe_num_experts
+        router_flops = 2 * h * moe_E
+        routed_flops = moe_top_k * dense_mlp_flops
+        shared_flops = dense_mlp_flops
+        moe_mlp_flops = router_flops + routed_flops + shared_flops
+
+        # Dense layers in MoE mode use the full active intermediate size.
+        dense_ff = config.moe_dense_intermediate_size
+        if config.mlp_activation == "srelu":
+            moe_dense_mlp_flops = 4 * h * dense_ff
+        else:
+            moe_dense_mlp_flops = 6 * h * dense_ff
+
+        moe_flags = config.moe_layer_flags
+        mlp_flops = sum(
+            0 if (no_mlp_first and i == 0) else
+            (moe_mlp_flops if moe_flags[i] else moe_dense_mlp_flops)
+            for i in range(n_layers)
+        )
+    else:
+        n_mlp_layers = (n_layers - 1) if no_mlp_first else n_layers
+        mlp_flops = n_mlp_layers * dense_mlp_flops
 
     # -- LM head (decoder): h -> V --
     # Not counted when tied (it's the same weight as embedding), but the matmul
@@ -1598,6 +1640,13 @@ def run_pure_pretraining(
     use_packing = bool(pretrain_config.use_packing)
     use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
 
+    # MoE guard rails.
+    if getattr(model.config, "use_moe", False):
+        if not use_packing:
+            raise ValueError("MoE requires use_packing=True")
+        if not use_static_inp_size:
+            raise ValueError("MoE requires use_static_inp_size=True")
+
     # ---- Batch sizing ----
     create_dirs(pretrain_config.ckp_dir)
     effective_world_size = _resolve_world_size(pretrain_config)
@@ -1762,10 +1811,22 @@ def run_pure_pretraining(
             fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
         fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
+        fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
         for layer in base_model.model.layers:
-            _fully_shard_transformer_layer(layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs, sublayer=fsdp_sublayer)
-        _fully_shard_root_groups(base_model, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
-        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+            _fully_shard_transformer_layer(
+                layer,
+                mesh=fsdp_mesh,
+                fsdp_kwargs=fsdp_kwargs,
+                reshard_after_forward=fsdp_reshard_after_forward,
+                sublayer=fsdp_sublayer,
+            )
+        _fully_shard_root_groups(
+            base_model,
+            mesh=fsdp_mesh,
+            fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=fsdp_reshard_after_forward,
+        )
+        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
         optimizer_dist = fsdp_mesh
 
         # Explicit prefetching for FSDP2
@@ -2091,6 +2152,23 @@ def run_pure_pretraining(
     pending_compile_rebuild = False
     pending_compile_target_divisor = mbs_divisor
     accum_loss = torch.zeros((), device=device)
+    # MoE routing bias update state.
+    _moe_layers: list = []
+    _moe_bias_lr = float(getattr(_cfg, "moe_bias_update_rate", 1e-3))
+    if getattr(orig_model.config, "use_moe", False) and getattr(orig_model.config, "moe_use_bias_correction", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        _moe_layers = [
+            m for m in orig_model.modules() if isinstance(m, _MoELayer)
+        ]
+        if _moe_layers:
+            _moe_num_experts = _moe_layers[0].num_experts
+            _moe_count_accum = torch.zeros(
+                len(_moe_layers), _moe_num_experts, device=device,
+            )
+            logger.info(
+                f"MoE routing bias correction enabled: "
+                f"{len(_moe_layers)} MoE layers, {_moe_num_experts} experts"
+            )
     window_loss = torch.zeros((), device=device)
     window_steps = 0
     discard_accumulation = False
@@ -2299,6 +2377,8 @@ def run_pure_pretraining(
                             )
                             optimizer.zero_grad(set_to_none=True)
                             accum_loss.zero_()
+                            if _moe_layers:
+                                _moe_count_accum.zero_()
                             if at_accum_boundary:
                                 accum_micro_count = 0
                             else:
@@ -2312,6 +2392,12 @@ def run_pure_pretraining(
                             loss.backward()
 
                     accum_loss = accum_loss + loss.detach()
+
+                    # Accumulate MoE expert counts for routing bias update.
+                    if _moe_layers:
+                        for j, moe_layer in enumerate(_moe_layers):
+                            if moe_layer.last_expert_counts is not None:
+                                _moe_count_accum[j] += moe_layer.last_expert_counts.float()
 
                     if not at_accum_boundary:
                         continue
@@ -2365,6 +2451,31 @@ def run_pure_pretraining(
                     if not step_skipped:
                         scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # MoE routing bias correction: update after each optimizer step.
+                    if _moe_layers:
+                        if not step_skipped:
+                            with torch.no_grad():
+                                # All-reduce counts across ranks for global view.
+                                if distributed and dist.is_initialized():
+                                    dist.all_reduce(_moe_count_accum, op=dist.ReduceOp.SUM)
+                                for j, moe_layer in enumerate(_moe_layers):
+                                    counts_j = _moe_count_accum[j]
+                                    # Keep the update branchless so we never materialize
+                                    # a CUDA scalar on CPU via `if total > 0`.
+                                    total = counts_j.sum().clamp_min(1.0)
+                                    target = total / _moe_num_experts
+                                    # Nudge bias: positive for underused, negative for overused.
+                                    # correction_bias is a registered buffer (not a
+                                    # parameter), so FSDP won't shard it.
+                                    delta = _moe_bias_lr * (target - counts_j) / target
+                                    # Zero-mean: keep bias vector centered (Ling-V2 style).
+                                    # When counts are all zero, this naturally becomes all-zero.
+                                    delta = delta - delta.mean()
+                                    moe_layer.router.correction_bias.add_(
+                                        delta.to(moe_layer.router.correction_bias.device)
+                                    )
+                        _moe_count_accum.zero_()
 
                     global_step += 1
                     profiler_step_cb(global_step)
