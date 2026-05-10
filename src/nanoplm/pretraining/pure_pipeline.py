@@ -17,6 +17,7 @@ except ImportError:
     Muon = None  # type: ignore[assignment,misc]
     NorMuon = None  # type: ignore[assignment,misc]
     MuonH = None  # type: ignore[assignment,misc]
+_DION_OPTIMIZER_TYPES = tuple(t for t in (Muon, NorMuon, MuonH) if t is not None)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -1534,7 +1535,7 @@ def _rebuild_scheduler_for_resume(
             pg["lr"] = eff_muon_lr
         for pg in optimizer.adamw.param_groups:
             pg["lr"] = eff_lr
-    elif isinstance(optimizer, (Muon, NorMuon, MuonH) if MuonH is not None else (Muon, NorMuon)):
+    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
         # group[0] = muon, group[1+] = adamw / scalar
         optimizer.param_groups[0]["lr"] = eff_muon_lr
         for pg in optimizer.param_groups[1:]:
@@ -2483,7 +2484,7 @@ def run_pure_pretraining(
                     if isinstance(optimizer, MuonAdamWGroup):
                         muon_lr = optimizer.muon.param_groups[0]["lr"]
                         learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                    elif isinstance(optimizer, (Muon, NorMuon, MuonH) if MuonH is not None else (Muon, NorMuon)):
+                    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
                         muon_lr = optimizer.param_groups[0]["lr"]
                         learning_rate = optimizer.param_groups[1]["lr"]
                     else:
