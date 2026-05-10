@@ -1435,144 +1435,154 @@ def _rebuild_scheduler_for_resume(
     checkpoint_dir: str,
     start_step: int,
     total_steps: int,
-    warmup_steps: int,
     is_main: bool = True,
 ):
-    """Rebuild the LR scheduler for a resumed run.
+    """Build a fresh LR scheduler for a resumed run.
 
-    The default behaviour reconstructs the *original* LR curve from the
-    checkpoint's saved ``pretrain_config.yaml`` (if present) so that the
-    schedule is bit-exact even if the user has since changed their
-    ``pretrain.yaml``.  Explicit overrides in ``resume_config`` take
-    precedence over the saved values.
+    Two modes (validated at YAML load time by ``_validate_resume_config_modes``):
 
-    Falls back to the current ``pretrain_config`` if the checkpoint
-    pre-dates this feature (no ``pretrain_config.yaml`` file).
+    EXTEND (``reset_scheduler=False``, default):
+        Per-group peak LR is read from the optimizer's loaded state
+        (``optimizer.pt``).  When ``resume.lr_decay_to_fraction`` is set,
+        each group decays to ``peak * fraction``.  When null, decay
+        targets the original final LR (``saved_base_lr * saved_decay``)
+        so crash-recovery preserves the original endpoint.
 
-    Returns a :class:`LambdaLR` positioned at *start_step*.
+    RESET (``reset_scheduler=True``):
+        Per-group peak LR is overwritten with ``resume.learning_rate``
+        (and ``resume.muon_learning_rate`` for Muon-side groups).  Decay
+        shape and fraction come directly from ``resume_config``.
+
+    Warmup at resume is controlled solely by ``resume_config.warmup_steps``
+    (null/0 = none, positive int = fresh ramp over the first N resumed steps).
+
+    The new schedule is anchored at ``start_step``: warmup (if any) ramps
+    over the first ``resume.warmup_steps`` resumed steps, then decay runs
+    over the rest of the ``[start_step, eff_total]`` window.
     """
     ckp = Path(checkpoint_dir)
 
-    # -- Load saved schedule metadata from checkpoint ----------------------
-    saved_warmup = warmup_steps
-    saved_total = total_steps
-    saved_lr = pretrain_config.adam_learning_rate
-    saved_muon_lr = pretrain_config.muon_learning_rate
-    saved_decay = pretrain_config.lr_decay_to_fraction
-    saved_schedule = pretrain_config.lr_schedule
-
-    state_path = ckp / "training_state.json"
-    if state_path.exists():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        saved_warmup = int(state.get("warmup_steps", saved_warmup))
-        saved_total = int(state.get("total_steps", saved_total))
+    # ---- Inheritance defaults from checkpoint's pretrain_config.yaml -----
+    saved_base_lr = float(pretrain_config.adam_learning_rate)
+    saved_muon_lr = float(pretrain_config.muon_learning_rate)
+    saved_decay = float(pretrain_config.lr_decay_to_fraction)
+    saved_schedule = str(pretrain_config.lr_schedule)
 
     saved_config_path = ckp / "pretrain_config.yaml"
     if saved_config_path.exists():
         with open(saved_config_path) as f:
             saved_cfg = yaml.safe_load(f) or {}
-        saved_lr = float(saved_cfg.get("adam_learning_rate", saved_lr))
+        saved_base_lr = float(saved_cfg.get("adam_learning_rate", saved_base_lr))
         saved_muon_lr = float(saved_cfg.get("muon_learning_rate", saved_muon_lr))
         saved_decay = float(saved_cfg.get("lr_decay_to_fraction", saved_decay))
         saved_schedule = str(saved_cfg.get("lr_schedule", saved_schedule))
-
-        # Detect config drift and warn (informational only).
-        if is_main:
-            diffs: list[str] = []
-            for key in (
-                "adam_learning_rate", "muon_learning_rate", "warmup_steps",
-                "lr_schedule", "lr_decay_to_fraction",
-            ):
-                ckpt_val = saved_cfg.get(key)
-                yaml_val = getattr(pretrain_config, key, None)
-                if ckpt_val is not None and yaml_val is not None and ckpt_val != yaml_val:
-                    diffs.append(f"  {key}: {ckpt_val} (checkpoint) \u2192 {yaml_val} (current YAML)")
-            if diffs:
-                logger.warning(
-                    "Schedule config drift detected between checkpoint and current YAML:\n"
-                    + "\n".join(diffs)
-                    + "\nUsing checkpoint values as base. "
-                    "Override explicitly via resume.* fields if intended."
-                )
-    else:
-        if is_main:
-            logger.info(
-                "No pretrain_config.yaml in checkpoint (pre-upgrade checkpoint). "
-                "Using current YAML schedule params as base."
-            )
-
-    # -- Apply explicit overrides from resume config -----------------------
-    eff_warmup = saved_warmup
-    eff_total = saved_total
-    eff_lr = saved_lr
-    eff_muon_lr = saved_muon_lr
-    eff_decay = saved_decay
-    eff_schedule = saved_schedule
-
-    if resume_config.resume_epochs is not None and resume_config.resume_epochs > 0:
-        # total_steps was already computed by prepare_run_and_steps to cover
-        # checkpoint_epoch + resume_epochs (and may have been further bumped
-        # post-_load_checkpoint() to account for the mid-epoch start_epoch+1
-        # adjustment); use the caller-provided value.
-        eff_total = total_steps
-
-    if resume_config.warmup_steps is not None:
-        eff_warmup = resume_config.warmup_steps
-    if resume_config.learning_rate is not None:
-        eff_lr = resume_config.learning_rate
-    if resume_config.muon_learning_rate is not None:
-        eff_muon_lr = resume_config.muon_learning_rate
-    if resume_config.lr_schedule is not None:
-        eff_schedule = resume_config.lr_schedule
-    if resume_config.lr_decay_to_fraction is not None:
-        eff_decay = resume_config.lr_decay_to_fraction
-    if resume_config.skip_warmup:
-        eff_warmup = 0
-
-    # -- Override optimizer base LRs before creating scheduler -------------
-    if isinstance(optimizer, MuonAdamWGroup):
-        for pg in optimizer.muon.param_groups:
-            pg["lr"] = eff_muon_lr
-        for pg in optimizer.adamw.param_groups:
-            pg["lr"] = eff_lr
-    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
-        # group[0] = muon, group[1+] = adamw / scalar
-        optimizer.param_groups[0]["lr"] = eff_muon_lr
-        for pg in optimizer.param_groups[1:]:
-            if pg.get("algorithm") == "adamw":
-                pg["lr"] = eff_lr
-    else:
-        for pg in optimizer.param_groups:
-            pg["lr"] = eff_lr
-
-    # -- Build scheduler ---------------------------------------------------
-    if resume_config.reset_scheduler:
-        remaining = max(1, eff_total - start_step)
-        if is_main:
-            logger.info(
-                f"Resetting LR schedule from step 0: remaining_steps={remaining}, "
-                f"warmup={eff_warmup}, schedule={eff_schedule}, "
-                f"base_lr={eff_lr:.2e}, decay_to={eff_decay}"
-            )
-        scheduler = _create_scheduler(
-            optimizer, eff_warmup, remaining,
-            eff_lr, eff_decay, eff_schedule,
-        )
-    else:
-        # Reconstruct the original schedule and position at start_step.
-        # last_epoch=N-1 causes __init__ to call step() once → last_epoch=N.
-        scheduler = _create_scheduler(
-            optimizer, eff_warmup, eff_total,
-            eff_lr, eff_decay, eff_schedule,
-            last_epoch=max(-1, start_step - 1),
-        )
-
-    current_lrs = [pg["lr"] for pg in optimizer.param_groups]
-    if is_main:
+    elif is_main:
         logger.info(
-            f"Resume schedule built: warmup={eff_warmup}, total={eff_total}, "
-            f"schedule={eff_schedule}, decay_to={eff_decay}, "
-            f"current_lrs={[f'{lr:.2e}' for lr in current_lrs]}"
+            "No pretrain_config.yaml in checkpoint (pre-upgrade checkpoint). "
+            "Using current YAML schedule params as inheritance base."
+        )
+
+    # ---- Resolve effective totals / warmup / shape -----------------------
+    eff_total = int(total_steps)
+    eff_warmup = int(resume_config.warmup_steps) if resume_config.warmup_steps else 0
+    if eff_total <= start_step:
+        raise ValueError(
+            f"Resume cannot proceed: eff_total ({eff_total}) <= start_step "
+            f"({start_step}). Increase resume_epochs to extend training."
+        )
+
+    eff_schedule = (resume_config.lr_schedule or saved_schedule or "cosine").lower()
+    if eff_schedule not in {"linear", "cosine"}:
+        raise ValueError(f"Invalid lr_schedule: {eff_schedule}")
+
+    # ---- Per-group peak + fraction resolution ----------------------------
+    def _peak_and_fraction(pg, side: str):
+        """Compute (peak_lr, fraction) for one param group.
+
+        side: "muon" or "adamw" -- selects which RESET peak to use and which
+        saved base LR drives the EXTEND auto-fraction default.
+        """
+        if resume_config.reset_scheduler:
+            peak = float(
+                resume_config.muon_learning_rate if side == "muon"
+                else resume_config.learning_rate
+            )
+            pg["lr"] = peak  # overwrite the loaded LR
+            fraction = float(resume_config.lr_decay_to_fraction)
+        else:
+            peak = float(pg["lr"])
+            if peak < 1e-10 and is_main:
+                logger.warning(
+                    f"Resume EXTEND: {side} group LR is near zero "
+                    f"({peak:.2e}); decay-from-current is effectively a no-op."
+                )
+            if resume_config.lr_decay_to_fraction is not None:
+                fraction = float(resume_config.lr_decay_to_fraction)
+            else:
+                # Q4(b): default end LR = original final LR.
+                base_for_side = saved_muon_lr if side == "muon" else saved_base_lr
+                target_end = base_for_side * saved_decay
+                if peak > 0:
+                    fraction = max(0.0, min(1.0, target_end / peak))
+                else:
+                    fraction = 1.0
+        pg["initial_lr"] = peak
+        return peak, fraction
+
+    # ---- Lambda factory anchored at start_step ---------------------------
+    decay_steps = max(1, (eff_total - start_step) - eff_warmup)
+    eff_warmup_local = eff_warmup  # capture for closure clarity
+
+    def _make_lambda(fraction: float):
+        # Capture fraction via default arg to avoid late-binding in loops.
+        def lr_lambda(step: int, fraction=fraction) -> float:
+            local = step - start_step
+            if local < eff_warmup_local:
+                return local / max(1, eff_warmup_local) if local >= 0 else 0.0
+            progress = min(1.0, (local - eff_warmup_local) / decay_steps)
+            if eff_schedule == "cosine":
+                return fraction + 0.5 * (1.0 - fraction) * (
+                    1.0 + math.cos(math.pi * progress)
+                )
+            return max(fraction, 1.0 - (1.0 - fraction) * progress)
+        return lr_lambda
+
+    last_epoch = max(-1, start_step - 1)
+
+    def _build_inner(inner_opt, sides):
+        """Build a LambdaLR for a flat optimizer with per-group sides."""
+        lambdas = []
+        peaks = []
+        for pg, side in zip(inner_opt.param_groups, sides):
+            peak, fraction = _peak_and_fraction(pg, side)
+            lambdas.append(_make_lambda(fraction))
+            peaks.append(peak)
+        return LambdaLR(inner_opt, lambdas, last_epoch=last_epoch), peaks
+
+    # ---- Wire the new scheduler ------------------------------------------
+    if isinstance(optimizer, MuonAdamWGroup):
+        muon_sched, muon_peaks = _build_inner(
+            optimizer.muon, ["muon"] * len(optimizer.muon.param_groups)
+        )
+        adamw_sched, adamw_peaks = _build_inner(
+            optimizer.adamw, ["adamw"] * len(optimizer.adamw.param_groups)
+        )
+        scheduler = _SchedulerGroup(muon_sched, adamw_sched)
+        peaks = muon_peaks + adamw_peaks
+    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
+        # DION layout: group[0] = muon-algorithm, group[1+] = adamw / scalar.
+        sides = ["muon"] + ["adamw"] * (len(optimizer.param_groups) - 1)
+        scheduler, peaks = _build_inner(optimizer, sides)
+    else:
+        sides = ["adamw"] * len(optimizer.param_groups)
+        scheduler, peaks = _build_inner(optimizer, sides)
+
+    if is_main:
+        mode = "RESET" if resume_config.reset_scheduler else "EXTEND"
+        logger.info(
+            f"Resume schedule built [{mode}]: start_step={start_step}, "
+            f"eff_total={eff_total}, warmup={eff_warmup}, "
+            f"schedule={eff_schedule}, peaks={[f'{p:.2e}' for p in peaks]}"
         )
 
     return scheduler
@@ -1951,8 +1961,7 @@ def run_pure_pretraining(
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
-        # Rebuild the LR scheduler from the checkpoint's saved schedule
-        # params (with any explicit overrides from resume config).
+        # Build the resumed LR scheduler (EXTEND or RESET per resume_config).
         scheduler = _rebuild_scheduler_for_resume(
             optimizer=optimizer,
             resume_config=resume_config,
@@ -1960,7 +1969,6 @@ def run_pure_pretraining(
             checkpoint_dir=resume_config.checkpoint_dir,
             start_step=start_step,
             total_steps=total_steps,
-            warmup_steps=warmup_steps,
             is_main=is_main,
         )
 
@@ -2040,7 +2048,6 @@ def run_pure_pretraining(
                     checkpoint_dir=resume_config.checkpoint_dir,
                     start_step=start_step,
                     total_steps=total_steps,
-                    warmup_steps=warmup_steps,
                     is_main=is_main,
                 )
                 logger.info(

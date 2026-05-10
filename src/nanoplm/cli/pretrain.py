@@ -510,12 +510,10 @@ def pretrain():
 @click.option(
     "--resume-reset-scheduler/--no-resume-reset-scheduler",
     default=False,
-    help="Rebuild the LR scheduler from step 0 over the remaining steps when resuming",
-)
-@click.option(
-    "--resume-skip-warmup/--no-resume-skip-warmup",
-    default=False,
-    help="Skip warmup on resume and jump directly to peak LR",
+    help=(
+        "Reset (true) builds a fresh LR curve from a new peak; default (false) "
+        "extends smoothly from the checkpoint's current LR."
+    ),
 )
 # Model hyperparameters (ModernBERT)
 @click.option("--hidden-size", type=int, default=768, help="Model hidden size")
@@ -800,7 +798,6 @@ def run(
     resume_lr_schedule: Optional[str],
     resume_lr_decay_to_fraction: Optional[float],
     resume_reset_scheduler: bool,
-    resume_skip_warmup: bool,
     # model hp
     hidden_size: int,
     intermediate_size: int,
@@ -1038,10 +1035,10 @@ def run(
         lr_schedule=resume_lr_schedule,
         lr_decay_to_fraction=resume_lr_decay_to_fraction,
         reset_scheduler=resume_reset_scheduler,
-        skip_warmup=resume_skip_warmup,
     )
     if resume_cfg.is_resume and not resume_cfg.checkpoint_dir:
         raise click.ClickException("--resume requires --resume-checkpoint-dir")
+    _validate_resume_config_modes(resume_cfg, optimizer)
 
     if pure_te:
         run_te_pretraining(
@@ -1123,6 +1120,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
+    _validate_resume_config_modes(resume_config, pretrain_config.optimizer)
     _validate_muonh_wo_init_compat(pretrain_config, model_config)
     if getattr(model_config, "use_noble", False) and not pure_torch:
         raise click.ClickException(
@@ -1417,13 +1415,21 @@ def get_yaml(output: Optional[str], force: bool):
         "  # resume_epochs: 0 (or unset) continues to the original 'pretraining.num_epochs'.\n"
         "  # N>0 trains for exactly N more epochs from the checkpoint\n"
         "  resume_epochs: 0\n"
+        "  # warmup_steps: null/0 = no warmup at resume; positive int = fresh ramp from 0 to peak\n"
         "  warmup_steps: null\n"
+        "  # Two LR modes:\n"
+        "  # EXTEND (reset_scheduler: false) - continue smoothly from checkpoint's current LR.\n"
+        "  #   learning_rate / muon_learning_rate MUST be null.\n"
+        "  #   lr_schedule / lr_decay_to_fraction may be null (inherit -> end at original final LR)\n"
+        "  #   or set to override.\n"
+        "  # RESET (reset_scheduler: true) - fresh curve from a new peak.\n"
+        "  #   lr_schedule, lr_decay_to_fraction, learning_rate are REQUIRED.\n"
+        "  #   muon_learning_rate is REQUIRED when optimizer is muon/normuon/muonh.\n"
+        "  reset_scheduler: false\n"
         "  learning_rate: null\n"
         "  muon_learning_rate: null\n"
         "  lr_schedule: null\n"
         "  lr_decay_to_fraction: null\n"
-        "  reset_scheduler: false\n"
-        "  skip_warmup: false\n"
         "\n"
         "# pure_torch: false\n"
         "# pure_te: false\n"
@@ -1709,7 +1715,7 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             )
         kwargs["lr_schedule"] = lr_schedule
 
-    for bool_key in ("is_resume", "reset_scheduler", "skip_warmup"):
+    for bool_key in ("is_resume", "reset_scheduler"):
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):
@@ -1733,9 +1739,79 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             )
 
     if extra:
-        logger.warning(f"Unknown keys in resume config (ignored): {extra}")
+        raise ValueError(
+            f"Unexpected resume configuration keys: {', '.join(sorted(extra))}"
+        )
 
     return ResumeConfig(**kwargs)
+
+
+_MUON_OPTIMIZER_NAMES = {"muon", "normuon", "muonh"}
+
+
+def _validate_resume_config_modes(
+    resume_config: ResumeConfig,
+    optimizer: str,
+) -> None:
+    """Enforce the EXTEND vs RESET contract on a loaded ResumeConfig.
+
+    Raises ``ValueError`` if the user's resume block mixes the two modes
+    incoherently — peak LR overrides without ``reset_scheduler``, or a
+    reset that's missing required fields.
+    """
+    if not resume_config.is_resume:
+        return
+
+    is_muon = str(optimizer).strip().lower() in _MUON_OPTIMIZER_NAMES
+    has_lr = resume_config.learning_rate is not None
+    has_muon_lr = resume_config.muon_learning_rate is not None
+
+    if not resume_config.reset_scheduler:
+        # EXTEND mode: peak LR overrides are forbidden.
+        offending = []
+        if has_lr:
+            offending.append("learning_rate")
+        if has_muon_lr:
+            offending.append("muon_learning_rate")
+        if offending:
+            raise ValueError(
+                "resume.{} can only be set when resume.reset_scheduler=true. "
+                "Leave them null on the EXTEND path; the peak LR comes from "
+                "the checkpoint's optimizer state.".format(
+                    " and resume.".join(offending)
+                )
+            )
+        return
+
+    # RESET mode: lr_schedule, lr_decay_to_fraction, learning_rate(s) required.
+    missing = []
+    if resume_config.lr_schedule is None:
+        missing.append("lr_schedule")
+    if resume_config.lr_decay_to_fraction is None:
+        missing.append("lr_decay_to_fraction")
+    if not has_lr:
+        missing.append("learning_rate")
+    if is_muon and not has_muon_lr:
+        missing.append("muon_learning_rate")
+    if missing:
+        raise ValueError(
+            "resume.reset_scheduler=true requires explicit values for: "
+            f"{', '.join(missing)}."
+        )
+
+    # Both LR fields must be coherent with the optimizer:
+    if is_muon:
+        if has_lr != has_muon_lr:
+            raise ValueError(
+                "Optimizer is a Muon variant: resume.learning_rate and "
+                "resume.muon_learning_rate must both be set."
+            )
+    else:
+        if has_muon_lr:
+            raise ValueError(
+                "resume.muon_learning_rate is only valid when optimizer is "
+                f"muon/normuon/muonh (current optimizer: {optimizer})."
+            )
 
 
 def _set_seed_for_init(seed: int) -> None:

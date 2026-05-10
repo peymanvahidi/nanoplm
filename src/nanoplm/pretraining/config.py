@@ -134,18 +134,9 @@ class ResumeConfig:
     # 0 (or None) means "continue to the original num_epochs from pretrain config".
     # N > 0 means "train for exactly N more epochs from the checkpoint"
     resume_epochs: Optional[int] = None
-    # Schedule override options for resumed training.
-    # When set to None (the YAML default), the corresponding value is read
-    # from the checkpoint's saved pretrain_config.yaml so the original
-    # schedule is reconstructed exactly.  Explicit values override.
     warmup_steps: Optional[int] = None
     learning_rate: Optional[float] = None
     muon_learning_rate: Optional[float] = None
     lr_schedule: Optional[str] = None
     lr_decay_to_fraction: Optional[float] = None
-    # reset_scheduler: rebuild the LR schedule from step 0 covering only the
-    # remaining training steps (new warmup + decay).  Useful when you want a
-    # fresh learning-rate curve after a long pause.
     reset_scheduler: bool = False
-    # skip_warmup: jump straight to peak LR on resume (sets warmup_steps=0).
-    skip_warmup: bool = False

@@ -133,11 +133,48 @@ class WandbSourceSnapshotCallback(TrainerCallback):
         return control
 
 
+def _warn_unsupported_resume_fields_on_hf(
+    resume_config: Optional[ResumeConfig],
+) -> None:
+    """Warn the user when EXTEND/RESET schedule fields are set on the HF path.
+
+    HF Trainer manages its own scheduler/optimizer state and bit-exactly
+    resumes from ``resume_from_checkpoint``.  ``ResumeConfig.lr_schedule``,
+    ``lr_decay_to_fraction``, ``learning_rate``, ``muon_learning_rate``,
+    ``warmup_steps``, and ``reset_scheduler`` are silently ignored on this
+    path -- which is a footgun.  The pure-torch and pure-te pipelines honor
+    them via ``_rebuild_scheduler_for_resume``; HF does not.
+    """
+    if resume_config is None or not resume_config.is_resume:
+        return
+
+    set_fields = []
+    if resume_config.reset_scheduler:
+        set_fields.append("reset_scheduler")
+    for name in (
+        "warmup_steps", "learning_rate", "muon_learning_rate",
+        "lr_schedule", "lr_decay_to_fraction",
+    ):
+        if getattr(resume_config, name) is not None:
+            set_fields.append(name)
+
+    if set_fields:
+        logger.warning(
+            "HF Trainer pipeline ignores resume schedule fields: "
+            f"{', '.join(set_fields)}. The HF path bit-exactly resumes the "
+            "scheduler from the checkpoint. To use the EXTEND/RESET resume "
+            "semantics, switch to --pure-torch (or --pure-te), where these "
+            "fields are honored."
+        )
+
+
 def run_pretraining(
     model: ProtModernBertMLM,
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
+
+    _warn_unsupported_resume_fields_on_hf(resume_config)
 
     device = get_device()
 
