@@ -1508,9 +1508,11 @@ def _rebuild_scheduler_for_resume(
     eff_decay = saved_decay
     eff_schedule = saved_schedule
 
-    if resume_config.extra_epochs is not None and resume_config.extra_epochs > 0:
-        # total_steps was already extended by _prepare_run_and_steps;
-        # use the caller-provided value which accounts for extra epochs.
+    if resume_config.resume_epochs is not None and resume_config.resume_epochs > 0:
+        # total_steps was already computed by prepare_run_and_steps to cover
+        # checkpoint_epoch + resume_epochs (and may have been further bumped
+        # post-_load_checkpoint() to account for the mid-epoch start_epoch+1
+        # adjustment); use the caller-provided value.
         eff_total = total_steps
 
     if resume_config.warmup_steps is not None:
@@ -2002,8 +2004,48 @@ def run_pure_pretraining(
             resume_data_step = 0
             resume_sub_batch_step = 0
             resume_batch_split_divisor = 1
+            _pre_adjust_start_epoch = start_epoch
             start_epoch = min(start_epoch + 1, num_epochs)
             resume_epoch = start_epoch
+            # If the +1 advanced past a fully-consumed epoch boundary AND the
+            # user asked for a bounded resume (resume_epochs > 0), num_epochs
+            # was set to checkpoint_epoch + resume_epochs; the +1 would now
+            # leave range(start_epoch, num_epochs) empty.  Bump num_epochs by
+            # the same amount and rebuild the scheduler so we run exactly
+            # resume_epochs full epochs from the new start_epoch.
+            if (
+                start_epoch > _pre_adjust_start_epoch
+                and resume_config.resume_epochs is not None
+                and int(resume_config.resume_epochs) > 0
+            ):
+                num_epochs = start_epoch + int(resume_config.resume_epochs)
+                epoch_start_steps = _compute_epoch_start_steps(
+                    num_epochs=num_epochs,
+                    train_loader_len=synced_len,
+                    full_grad_accum=inferred_grad_accum_steps,
+                    full_micro_batch=pretrain_config.micro_batch_size,
+                    batch_size_warmup_steps=batch_size_warmup_steps,
+                )
+                steps_per_epoch = (
+                    max(1, epoch_start_steps[1] - epoch_start_steps[0])
+                    if num_epochs > 0 else 1
+                )
+                total_steps = epoch_start_steps[-1]
+                warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+                scheduler = _rebuild_scheduler_for_resume(
+                    optimizer=optimizer,
+                    resume_config=resume_config,
+                    pretrain_config=pretrain_config,
+                    checkpoint_dir=resume_config.checkpoint_dir,
+                    start_step=start_step,
+                    total_steps=total_steps,
+                    warmup_steps=warmup_steps,
+                    is_main=is_main,
+                )
+                logger.info(
+                    f"Mid-epoch resume detected; bumped num_epochs to {num_epochs} "
+                    f"and rebuilt scheduler with total_steps={total_steps}."
+                )
         elif resume_data_step > 0 and resume_sub_batch_step == 0:
             if use_packing and hasattr(train_ds, "fast_forward"):
                 logger.info(

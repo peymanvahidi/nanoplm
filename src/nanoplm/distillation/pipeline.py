@@ -30,6 +30,7 @@ from nanoplm.distillation.dataset import (
 )
 from nanoplm.data.manifest import get_dataset_paths
 from nanoplm.data.validation import validate_distillation_dataset, ValidationError
+from nanoplm.pretraining.utils import _read_checkpoint_epoch
 from nanoplm.utils import get_device, logger, create_dirs
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
@@ -102,7 +103,11 @@ class ResumeConfig:
 
     is_resume: bool = False
     checkpoint_dir: str = ""
-    extra_epochs: Optional[int] = None
+    # resume_epochs: number of additional epochs to train from the checkpoint.
+    # 0 (or None) means "continue to the original num_epochs from distill config".
+    # N > 0 means "train for exactly N more epochs from the checkpoint" (i.e.,
+    # num_epochs = checkpoint_epoch + N).
+    resume_epochs: Optional[int] = None
 
 
 def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
@@ -235,8 +240,20 @@ def _prepare_run_and_steps(
 
     # Compute epochs and step intervals
     num_epochs = distill_config.num_epochs
-    if resume_config and resume_config.is_resume and resume_config.extra_epochs:
-        num_epochs = distill_config.num_epochs + int(resume_config.extra_epochs)
+    if (
+        resume_config
+        and resume_config.is_resume
+        and resume_config.resume_epochs
+        and int(resume_config.resume_epochs) > 0
+    ):
+        checkpoint_epoch = _read_checkpoint_epoch(resume_config.checkpoint_dir)
+        num_epochs = checkpoint_epoch + int(resume_config.resume_epochs)
+        if num_epochs <= checkpoint_epoch:
+            raise ValueError(
+                f"resume_epochs would result in zero or negative training: "
+                f"checkpoint is at epoch {checkpoint_epoch}, requested target "
+                f"is {num_epochs}."
+            )
 
     # Calculate total steps using train_samples from manifest
     # Use ceiling division to ensure at least 1 step per epoch

@@ -130,7 +130,10 @@ class PretrainingConfig:
 class ResumeConfig:
     is_resume: bool
     checkpoint_dir: str
-    extra_epochs: Optional[int] = None
+    # resume_epochs: number of additional epochs to train from the checkpoint.
+    # 0 (or None) means "continue to the original num_epochs from pretrain config".
+    # N > 0 means "train for exactly N more epochs from the checkpoint"
+    resume_epochs: Optional[int] = None
     # Schedule override options for resumed training.
     # When set to None (the YAML default), the corresponding value is read
     # from the checkpoint's saved pretrain_config.yaml so the original

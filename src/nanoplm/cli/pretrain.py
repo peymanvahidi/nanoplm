@@ -468,10 +468,14 @@ def pretrain():
     help="Checkpoint directory to resume from",
 )
 @click.option(
-    "--resume-extra-epochs",
+    "--resume-epochs",
     type=int,
     default=None,
-    help="Extra epochs to add on top of the original/current run length when resuming",
+    help=(
+        "Number of additional epochs to train from the checkpoint. "
+        "0 (or unset) continues to the original num_epochs from the pretrain "
+        "config; N>0 trains for exactly N more epochs from the checkpoint."
+    ),
 )
 @click.option(
     "--resume-warmup-steps",
@@ -789,7 +793,7 @@ def run(
     run_name: str,
     resume: bool,
     resume_checkpoint_dir: str,
-    resume_extra_epochs: Optional[int],
+    resume_epochs: Optional[int],
     resume_warmup_steps: Optional[int],
     resume_learning_rate: Optional[float],
     resume_muon_learning_rate: Optional[float],
@@ -1021,10 +1025,13 @@ def run(
         logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
+    if resume_epochs is not None and resume_epochs < 0:
+        raise click.ClickException("--resume-epochs must be >= 0")
+
     resume_cfg = ResumeConfig(
         is_resume=resume,
         checkpoint_dir=resume_checkpoint_dir,
-        extra_epochs=resume_extra_epochs,
+        resume_epochs=resume_epochs,
         warmup_steps=resume_warmup_steps,
         learning_rate=resume_learning_rate,
         muon_learning_rate=resume_muon_learning_rate,
@@ -1407,7 +1414,9 @@ def get_yaml(output: Optional[str], force: bool):
         "resume:\n"
         "  is_resume: false\n"
         '  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"\n'
-        "  extra_epochs: 0\n"
+        "  # resume_epochs: 0 (or unset) continues to the original 'pretraining.num_epochs'.\n"
+        "  # N>0 trains for exactly N more epochs from the checkpoint\n"
+        "  resume_epochs: 0\n"
         "  warmup_steps: null\n"
         "  learning_rate: null\n"
         "  muon_learning_rate: null\n"
@@ -1674,7 +1683,7 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             continue
         kwargs[key] = value
 
-    for int_key in ("extra_epochs", "warmup_steps"):
+    for int_key in ("resume_epochs", "warmup_steps"):
         if int_key in kwargs and kwargs[int_key] is not None:
             try:
                 kwargs[int_key] = int(kwargs[int_key])
@@ -1682,6 +1691,11 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
                 raise ValueError(
                     f"Invalid {int_key} value: {kwargs[int_key]}. Must be an integer."
                 ) from exc
+
+    if kwargs.get("resume_epochs") is not None and kwargs["resume_epochs"] < 0:
+        raise ValueError(
+            f"Invalid resume_epochs value: {kwargs['resume_epochs']}. Must be >= 0."
+        )
 
     for float_key in ("learning_rate", "muon_learning_rate", "lr_decay_to_fraction"):
         if float_key in kwargs and kwargs[float_key] is not None:

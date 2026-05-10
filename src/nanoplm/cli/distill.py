@@ -240,10 +240,14 @@ def distill():
     help='Path to checkpoint directory to resume training from'
 )
 @click.option(
-    '--extra-epochs',
+    '--resume-epochs',
     type=int,
     default=0,
-    help='Additional epochs to train when resuming (added to num-epochs)'
+    help=(
+        'Number of additional epochs to train from the checkpoint. '
+        '0 (default) continues to the original num_epochs from the distill '
+        'config; N>0 trains for exactly N more epochs from the checkpoint.'
+    ),
 )
 def run(
     dataset_dir: Optional[str],
@@ -281,7 +285,7 @@ def run(
     world_size: str,
     seed: int,
     resume_from: Optional[str],
-    extra_epochs: int,
+    resume_epochs: int,
 ):
     """Distill the teacher model into a student model.
 
@@ -434,10 +438,12 @@ def run(
             raise click.ClickException(
                 f"Resume checkpoint directory does not exist: {resume_from}"
             )
+        if resume_epochs < 0:
+            raise click.ClickException("--resume-epochs must be >= 0")
         resume_config = ResumeConfig(
             is_resume=True,
             checkpoint_dir=resume_from,
-            extra_epochs=extra_epochs if extra_epochs > 0 else None,
+            resume_epochs=resume_epochs if resume_epochs > 0 else None,
         )
 
     # Run distillation
@@ -612,10 +618,12 @@ def get_yaml(output: Optional[str], force: bool):
         "resume:\n"
         "  # Set is_resume: true to resume training from a checkpoint\n"
         "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
-        "  # extra_epochs: adds to 'distillation.num_epochs' to define total epochs.\n"
+        "  # resume_epochs: 0 (or unset) continues to the original 'distillation.num_epochs'.\n"
+        "  # N>0 trains for exactly N more epochs from the checkpoint\n"
+        "  # (i.e., final num_epochs = checkpoint_epoch + N).\n"
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/distillation/run-1/checkpoint-1\"\n"
-        "  extra_epochs: 0\n"
+        "  resume_epochs: 0\n"
     )
 
     # If forcing, remove existing file first
@@ -709,7 +717,7 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     """Load and validate resume configuration from YAML."""
     if config is None:
-        return ResumeConfig(is_resume=False, checkpoint_dir="", extra_epochs=None)
+        return ResumeConfig(is_resume=False, checkpoint_dir="", resume_epochs=None)
 
     expected_keys = set(ResumeConfig.__annotations__.keys())
     present_keys = set(config.keys())
@@ -724,6 +732,25 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
         value = config.get(key)
         if value is not None:
             kwargs[key] = value
+
+    if extra:
+        raise ValueError(
+            f"Unknown key(s) under 'resume': {sorted(extra)}. "
+            f"Expected: {sorted(expected_keys)}."
+        )
+
+    if "resume_epochs" in kwargs and kwargs["resume_epochs"] is not None:
+        try:
+            kwargs["resume_epochs"] = int(kwargs["resume_epochs"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid resume_epochs value: {kwargs['resume_epochs']}. "
+                f"Must be an integer."
+            ) from exc
+        if kwargs["resume_epochs"] < 0:
+            raise ValueError(
+                f"Invalid resume_epochs value: {kwargs['resume_epochs']}. Must be >= 0."
+            )
 
     checkpoint_dir = kwargs.get("checkpoint_dir", "")
     is_resume = kwargs.get("is_resume", False)
