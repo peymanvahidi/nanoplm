@@ -53,6 +53,10 @@ nanoplm = "nanoplm.cli:cli"
 nanoplm-data = "nanoplm.cli.data:data"
 nanoplm-distill = "nanoplm.cli.distill:distill"
 nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
+nanoplm-eval = "nanoplm.cli.eval:eval"
+
+[project.optional-dependencies]
+eval = ["biotrainer"]
 
 [project.urls]
 "Homepage" = "https://github.com/peymanvahidi/nanoplm"
