@@ -546,6 +546,8 @@ def run_distillation(
     else:
         effective_world_size = 1
 
+    device_mesh = None
+
     # FSDP2 wrapping (must happen before torch.compile)
     if distill_config.distributed_mode == "fsdp" and effective_world_size > 1:
         import torch.distributed as dist
@@ -766,7 +768,7 @@ def run_distillation(
     opt_name = distill_config.optimizer.lower()
     if opt_name in ("muon", "normuon"):
         from nanoplm.pretraining.optim import build_muon_optimizer
-        optimizer = build_muon_optimizer(model, distill_config)
+        optimizer = build_muon_optimizer(model, distill_config, distributed_mesh=device_mesh)
         logger.info(f"Using {opt_name} optimizer (muon_lr={distill_config.muon_learning_rate}, "
                     f"adam_lr={distill_config.adam_learning_rate})")
     else:
