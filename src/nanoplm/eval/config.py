@@ -1,8 +1,8 @@
 """Configuration dataclass for the downstream evaluation pipeline."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 
 @dataclass
@@ -14,8 +14,8 @@ class EvalConfig:
     # Root searched when checkpoint_dir == 'latest'.
     checkpoint_root: Union[str, Path] = "output/pretraining_checkpoints"
 
-    # Benchmark framework to evaluate on. One of: pbc, flip.
-    framework: str = "pbc"
+    # Benchmark framework(s) to evaluate on. One or more of: pbc, flip, pgym.
+    framework: List[str] = field(default_factory=lambda: ["pbc"])
 
     # Directory where autoeval results, H5 embeddings, and per-task outputs are written.
     output_dir: Union[str, Path] = "autoeval_output"
@@ -42,3 +42,14 @@ class EvalConfig:
     # 0 = sequential (runs through biotrainer.autoeval_pipeline).
     # >0 = parallel mode (GPU embedding first, then CPU task training in a ThreadPoolExecutor).
     parallel_tasks: int = 0
+
+    # Zero-shot scoring method when framework includes 'pgym'.
+    # One of: masked_marginals, wt_marginals, pseudoperplexity.
+    zero_shot_method: str = "masked_marginals"
+
+    # Optional whitelist of task names (e.g. PBC-secondary_structure).
+    # Parallel mode only — sequential mode warns and ignores.
+    tasks: Optional[List[str]] = None
+
+    # Force re-download of framework datasets (use when new tasks land upstream).
+    force_download: bool = False
