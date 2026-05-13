@@ -741,7 +741,7 @@ def run_distillation(
         "max_grad_norm": distill_config.max_grad_norm,
     }
 
-    if distill_config.multi_gpu:
+    if distill_config.multi_gpu and distill_config.distributed_mode == "ddp":
         training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
         training_dict["ddp_find_unused_parameters"] = True
 
