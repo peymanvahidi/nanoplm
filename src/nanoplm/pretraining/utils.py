@@ -199,8 +199,9 @@ def prepare_run_and_steps(
                     f"Skipping future checkpoint archival. Error: {e}"
                 )
     else:
-        base_stamp = datetime.now().strftime("%d%m%H%M")
-        base_name = f"{base_stamp}-{pretrain_config.run_name}"
+        slurm_job_id = os.environ.get("SLURM_JOB_ID")
+        base_stamp = slurm_job_id if slurm_job_id else datetime.now().strftime("%d%m%H%M")
+        base_name = f"{pretrain_config.run_name}-{base_stamp}"
         candidate = base_name
         if ckp_root.exists():
             suffix = 2

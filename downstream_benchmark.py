@@ -2,8 +2,8 @@
 """Downstream benchmark script for pure-torch nanoPLM checkpoints.
 
 Loads a pure-torch checkpoint (PureProtModernBertMLM) and runs biotrainer's
-autoeval pipeline to measure downstream task performance on PBC or FLIP
-benchmarks.
+autoeval pipeline to measure downstream task performance on PBC, FLIP, or
+ProteinGym (pgym) benchmarks.
 
 Supports both sequential execution and parallel task training (GPU embedding
 first, then CPU-based biotrainer training tasks in parallel).
@@ -20,6 +20,12 @@ Usage
         --checkpoint-dir output/pretraining_checkpoints/run-04031843/checkpoint-16066 \
         --framework pbc \
         --parallel-tasks 4
+
+    # ProteinGym zero-shot:
+    python downstream_benchmark.py \
+        --checkpoint-dir output/pretraining_checkpoints/run-04031843/checkpoint-16066 \
+        --framework pgym \
+        --zero-shot-method masked_marginals
 
     # Custom settings:
     python downstream_benchmark.py \
@@ -41,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import MISSING, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Generator, Tuple
+from typing import Any, Iterable, Generator, List, Tuple
 
 import torch
 import yaml
@@ -51,6 +57,8 @@ from tqdm import tqdm
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
+import nanoplm.pretraining.models.modern_bert.modeling as _bert_modeling
+_bert_modeling.USE_TRITON_SRELU = False  # Fused srelu kernel may OOM on some H100s; plain PyTorch is sufficient for inference
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -113,16 +121,18 @@ def _model_config_from_dict(m: dict) -> ProtModernBertMLMConfig:
 
 def _load_biotrainer_symbols() -> dict[str, Any]:
     """Import biotrainer lazily so checkpoint helpers remain importable in tests."""
-    from biotrainer.autoeval import autoeval_pipeline
-    from biotrainer.autoeval.autoeval import (
+    from biotrainer.autoeval import autoeval_pipeline, AutoEvalReport
+    from biotrainer.autoeval.pipelines.autoeval_supervised import (
         _check_h5_file,
         _setup_embedding_functions,
         get_unique_framework_sequences,
     )
-    from biotrainer.autoeval.config_bank import AutoEvalConfigBank
-    from biotrainer.autoeval.report_manager import ReportManager
+    from biotrainer.autoeval.pipelines.autoeval_report import SupervisedFrameworkReport
+    from biotrainer.autoeval.core.autoeval_config_bank import AutoEvalConfigBank
     from biotrainer.protocols import Protocol
     from biotrainer.utilities.executer import parse_config_file_and_execute_run
+    from biotrainer.bioengineer import CustomBioEngineerModel, BioEngineer, ZeroShotMethod
+    from biotrainer.utilities import STANDARD_AAS
 
     return {
         "autoeval_pipeline": autoeval_pipeline,
@@ -130,10 +140,78 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
         "_setup_embedding_functions": _setup_embedding_functions,
         "_check_h5_file": _check_h5_file,
         "AutoEvalConfigBank": AutoEvalConfigBank,
-        "ReportManager": ReportManager,
+        "AutoEvalReport": AutoEvalReport,
+        "SupervisedFrameworkReport": SupervisedFrameworkReport,
         "Protocol": Protocol,
         "parse_config_file_and_execute_run": parse_config_file_and_execute_run,
+        "CustomBioEngineerModel": CustomBioEngineerModel,
+        "BioEngineer": BioEngineer,
+        "ZeroShotMethod": ZeroShotMethod,
+        "STANDARD_AAS": STANDARD_AAS,
     }
+
+
+# ---------------------------------------------------------------------------
+# ProteinGym BioEngineer wrapper
+# ---------------------------------------------------------------------------
+
+class NanoPLMBioEngineer:
+    """Wraps PureProtModernBertMLM for biotrainer's zero-shot BioEngineer interface.
+
+    Instantiated lazily inside _build_bioengineer() so that biotrainer symbols
+    are already loaded before the class body is evaluated.
+    """
+
+    @staticmethod
+    def build(model: PureProtModernBertMLM, tokenizer: ProtModernBertTokenizer, device: torch.device, biotrainer: dict):
+        """Return a BioEngineer wrapping ``model`` for ProteinGym zero-shot scoring."""
+        CustomBioEngineerModel = biotrainer["CustomBioEngineerModel"]
+        BioEngineer = biotrainer["BioEngineer"]
+        STANDARD_AAS = biotrainer["STANDARD_AAS"]
+
+        import re as _re
+
+        class _Impl(CustomBioEngineerModel):
+            def __init__(self):
+                super().__init__()
+                self._model = model
+                self._tokenizer = tokenizer
+                self._device = device
+
+            def get_name(self) -> str:
+                return "nanoPLM"
+
+            def supported_methods(self):
+                ZeroShotMethod = biotrainer["ZeroShotMethod"]
+                return [
+                    ZeroShotMethod.MASKED_MARGINALS,
+                    ZeroShotMethod.WT_MARGINALS,
+                    ZeroShotMethod.PSEUDOPERPLEXITY,
+                ]
+
+            def tokenize(self, batch: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+                enc = self._tokenizer(batch, padding="longest", return_tensors="pt")
+                return enc["input_ids"].to(self._device), enc["attention_mask"].to(self._device)
+
+            def run_model(self, input_ids, attention_mask=None):
+                with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=self._device.type == "cuda"):
+                    outputs = self._model(input_ids=input_ids, attention_mask=attention_mask)
+                return outputs["logits"].squeeze(0)
+
+            def get_mask_token_id(self):
+                return self._tokenizer.mask_token_id
+
+            def preprocess_sequences(self, sequences: List[str]) -> List[str]:
+                return [_re.sub(r"[UZOB]", "X", s) for s in sequences]
+
+            def aa_to_idx(self):
+                vocab = self._tokenizer.get_vocab()
+                return {aa: vocab[aa] for aa in STANDARD_AAS}
+
+            def strip_special_tokens(self, tensor: torch.Tensor) -> torch.Tensor:
+                return tensor[0:-1]  # strip trailing EOS; no leading CLS in this tokenizer
+
+        return BioEngineer.from_custom_model(_Impl(), device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -385,9 +463,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--framework",
         type=str,
-        default="pbc",
-        choices=["pbc", "flip"],
-        help="Benchmark framework to evaluate on.",
+        nargs="+",
+        default=["pbc"],
+        choices=["pbc", "flip", "pgym"],
+        help="Benchmark framework(s) to evaluate on. Can specify multiple, e.g. --framework pbc pgym. "
+             "'pgym' runs zero-shot ProteinGym evaluation.",
+    )
+    p.add_argument(
+        "--zero-shot-method",
+        type=str,
+        default="masked_marginals",
+        choices=["masked_marginals", "wt_marginals", "pseudoperplexity"],
+        help="Zero-shot scoring method for ProteinGym (--framework pgym only).",
     )
     p.add_argument(
         "--output-dir",
@@ -438,11 +525,27 @@ def parse_args() -> argparse.Namespace:
         help="Number of parallel workers for downstream task training. "
              "0 = sequential (via autoeval_pipeline), >0 = parallel mode.",
     )
+    p.add_argument(
+        "--tasks",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Whitelist of task names to run (e.g. PBC-secondary_structure). "
+             "If not set, all tasks are run.",
+    )
+    p.add_argument(
+        "--force-download",
+        action="store_true",
+        default=False,
+        help="Force re-download of framework datasets (use when new tasks are added).",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    frameworks = args.framework  # list, e.g. ["pbc"] or ["pbc", "pgym"]
+
     checkpoint_dir = resolve_checkpoint_dir(args.checkpoint_dir, args.checkpoint_root)
     print(f"Resolved checkpoint: {checkpoint_dir}")
     biotrainer = _load_biotrainer_symbols()
@@ -471,6 +574,18 @@ def main():
     embedder_name = args.embedder_name or checkpoint_dir.stem
     print(f"Embedder name: {embedder_name}")
 
+    # Embedder-level output directory — all framework subdirs and the combined report live here
+    embedder_dir_name = embedder_name.replace("/", "-")
+    embedder_output_dir = Path(args.output_dir) / embedder_dir_name
+    os.makedirs(embedder_output_dir, exist_ok=True)
+
+    # Load existing combined report or start fresh (supports incremental runs)
+    autoeval_report = biotrainer["AutoEvalReport"].loaded_or_empty(
+        embedder_name=embedder_name,
+        training_date=str(datetime.now().date().isoformat()),
+        output_dir=embedder_output_dir,
+    )
+
     # Build embedding closures
     def _embed_residue(seqs):
         return embed_per_residue(model, tokenizer, seqs, device, args.batch_size)
@@ -478,20 +593,27 @@ def main():
     def _embed_sequence(seqs):
         return embed_per_sequence(model, tokenizer, seqs, device, args.batch_size)
 
-    # ── Sequential mode (original behavior via autoeval_pipeline) ─────────
-    if args.parallel_tasks <= 0:
-        print(f"\nStarting autoeval pipeline (sequential): framework={args.framework}")
+    # ── ProteinGym zero-shot (runs first — needs the GPU model throughout) ─
+    if "pgym" in frameworks:
+        zero_shot_method_map = {
+            "masked_marginals": biotrainer["ZeroShotMethod"].MASKED_MARGINALS,
+            "wt_marginals": biotrainer["ZeroShotMethod"].WT_MARGINALS,
+            "pseudoperplexity": biotrainer["ZeroShotMethod"].PSEUDOPERPLEXITY,
+        }
+        zero_shot_method = zero_shot_method_map[args.zero_shot_method]
+        print(f"\nStarting ProteinGym zero-shot evaluation: method={args.zero_shot_method}")
         print("=" * 60)
+
+        bio_engineer = NanoPLMBioEngineer.build(model, tokenizer, device, biotrainer)
 
         current_progress = None
         for progress in biotrainer["autoeval_pipeline"](
             embedder_name=embedder_name,
-            framework=args.framework,
+            framework="pgym",
+            zero_shot_method=zero_shot_method,
+            custom_bioengineer=bio_engineer,
             output_dir=args.output_dir,
-            min_seq_length=args.min_seq_length,
-            max_seq_length=args.max_seq_length,
-            custom_embedding_function_per_residue=_embed_residue,
-            custom_embedding_function_per_sequence=_embed_sequence,
+            force_download=args.force_download,
         ):
             current_progress = progress
             print(
@@ -499,148 +621,195 @@ def main():
                 f"{progress.current_framework_name}: {progress.current_task_name}"
             )
 
-        # Final report
         if current_progress and current_progress.final_report:
-            print("\n" + "=" * 60)
-            print("AUTOEVAL COMPLETE — Final Report Summary")
+            pgym_report = current_progress.final_report.zeroshot_results.get("PGYM")
+            if pgym_report:
+                autoeval_report.add_zeroshot_result("PGYM", pgym_report)
+                print("\nPGYM results added to combined report.")
+            else:
+                print("\n[WARN] No PGYM zeroshot results found in final report.")
+        else:
+            print("\n[WARN] No final report generated for PGYM.")
+
+    # ── Supervised frameworks (pbc, flip) ────────────────────────────────
+    supervised_frameworks = [f for f in frameworks if f != "pgym"]
+    model_freed = False
+
+    for framework in supervised_frameworks:
+        framework_key = framework.upper()
+        framework_dir = f"{framework}_{args.min_seq_length}_{args.max_seq_length}"
+        output_dir = embedder_output_dir / framework_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # ── Sequential mode ───────────────────────────────────────────────
+        if args.parallel_tasks <= 0:
+            if args.tasks:
+                print(f"[WARN] --tasks filter is not supported in sequential mode; ignoring.")
+            print(f"\nStarting autoeval pipeline (sequential): framework={framework}")
             print("=" * 60)
-            current_progress.final_report.summary()
-        else:
-            print("\n[WARN] No final report generated.")
-        return
 
-    # ── Parallel mode ────────────────────────────────────────────────────
-    print(
-        f"\nStarting autoeval pipeline (PARALLEL, {args.parallel_tasks} workers): "
-        f"framework={args.framework}"
-    )
-    print("=" * 60)
-    overall_start = time.time()
+            current_progress = None
+            for progress in biotrainer["autoeval_pipeline"](
+                embedder_name=embedder_name,
+                framework=framework,
+                output_dir=args.output_dir,
+                min_seq_length=args.min_seq_length,
+                max_seq_length=args.max_seq_length,
+                custom_embedding_function_per_residue=_embed_residue,
+                custom_embedding_function_per_sequence=_embed_sequence,
+                force_download=args.force_download,
+            ):
+                current_progress = progress
+                print(
+                    f"[{progress.completed_tasks}/{progress.total_tasks}] "
+                    f"{progress.current_framework_name}: {progress.current_task_name}"
+                )
 
-    # Build the same output_dir structure that autoeval_pipeline uses
-    embedder_dir_name = embedder_name.replace("/", "-")
-    framework_dir = f"{args.framework}_{args.min_seq_length}_{args.max_seq_length}"
-    output_dir = Path(args.output_dir) / embedder_dir_name / framework_dir
-    os.makedirs(output_dir, exist_ok=True)
-
-    # --- Phase 1: Compute embeddings (sequential, GPU) -------------------
-    print("\n>>> Phase 1: Computing embeddings …")
-    t0 = time.time()
-
-    # Use biotrainer's internal helpers to get tasks, sequences, and setup
-    task_config_tuples, unique_per_residue, unique_per_sequence = (
-        biotrainer["get_unique_framework_sequences"](
-            framework=args.framework,
-            min_seq_length=args.min_seq_length,
-            max_seq_length=args.max_seq_length,
-        )
-    )
-
-    embedding_fn_per_residue, embedding_fn_per_sequence = biotrainer["_setup_embedding_functions"](
-        embedder_name=embedder_name,
-        output_dir=output_dir,
-        use_half_precision=False,
-        custom_embedding_function_per_residue=_embed_residue,
-        custom_embedding_function_per_sequence=_embed_sequence,
-    )
-
-    # Actually compute embeddings (or skip if H5 already exists)
-    embeddings_file_per_residue = embedding_fn_per_residue(
-        [sr.seq for _, sr in unique_per_residue.items()]
-    )
-    embeddings_file_per_sequence = embedding_fn_per_sequence(
-        [sr.seq for _, sr in unique_per_sequence.items()]
-    )
-
-    biotrainer["_check_h5_file"](
-        "per-residue", embeddings_file_per_residue, len(unique_per_residue)
-    )
-    biotrainer["_check_h5_file"](
-        "per-sequence", embeddings_file_per_sequence, len(unique_per_sequence)
-    )
-
-    print(f"Embeddings done in {time.time() - t0:.1f}s")
-
-    # Free GPU memory — the model is no longer needed for downstream training
-    del model
-    torch.cuda.empty_cache()
-
-    # --- Phase 2: Prepare task configs -----------------------------------
-    print("\n>>> Phase 2: Preparing task configs …")
-    prepared_tasks: list[tuple] = []  # (task, task_name, config_dict)
-    report_manager = biotrainer["ReportManager"](
-        embedder_name=embedder_name,
-        training_date=str(datetime.now().date().isoformat()),
-        min_seq_len=args.min_seq_length,
-        max_seq_len=args.max_seq_length,
-    )
-
-    for task, cfg in task_config_tuples:
-        task_name = task.combined_name()
-        task_output_dir = output_dir / task_name
-
-        # Pick the right embeddings file based on protocol
-        protocol = biotrainer["Protocol"]
-        if protocol.from_string(cfg["protocol"]) in protocol.using_per_sequence_embeddings():
-            task_emb_file = embeddings_file_per_sequence
-        else:
-            task_emb_file = embeddings_file_per_residue
-
-        cfg = biotrainer["AutoEvalConfigBank"].add_custom_values_to_config(
-            config=cfg,
-            embedder_name=embedder_name,
-            embeddings_file=task_emb_file,
-            input_file=task.input_file,
-            output_dir=task_output_dir,
-        )
-
-        # Check for existing results (resume support)
-        maybe_result = report_manager.maybe_load_existing_result(
-            task_output_dir=task_output_dir
-        )
-        if maybe_result:
-            print(f"  Loaded existing result for {task_name}, skipping …")
-            report_manager.add_result(task=task, result_dict=maybe_result)
-        else:
-            prepared_tasks.append((task, task_name, cfg))
-
-    if not prepared_tasks:
-        print("All tasks already have results — nothing to run!")
-    else:
-        task_names = [tn for _, tn, _ in prepared_tasks]
-        print(f"  Tasks to run ({len(prepared_tasks)}): {task_names}")
-
-        # --- Phase 3: Run tasks in parallel ------------------------------
-        print(
-            f"\n>>> Phase 3: Running {len(prepared_tasks)} tasks in parallel "
-            f"({args.parallel_tasks} workers) …"
-        )
-        t1 = time.time()
-
-        with ThreadPoolExecutor(max_workers=args.parallel_tasks) as pool:
-            futures = {
-                pool.submit(_run_single_task, task_name, cfg): (task, task_name)
-                for task, task_name, cfg in prepared_tasks
-            }
-            for future in as_completed(futures):
-                task, task_name = futures[future]
-                returned_name, result = future.result()
-                if result is not None:
-                    report_manager.add_result(task=task, result_dict=result)
-                    print(f"  ✓ {returned_name} done")
+            if current_progress and current_progress.final_report:
+                supervised_report = current_progress.final_report.supervised_results.get(framework_key)
+                if supervised_report:
+                    autoeval_report.add_supervised_result(framework_key, supervised_report)
                 else:
-                    print(f"  ✗ {returned_name} FAILED")
+                    print(f"\n[WARN] No {framework_key} supervised results in final report.")
+            else:
+                print(f"\n[WARN] No final report generated for {framework}.")
 
-        print(f"All tasks finished in {time.time() - t1:.1f}s")
+        # ── Parallel mode ─────────────────────────────────────────────────
+        else:
+            print(
+                f"\nStarting autoeval pipeline (PARALLEL, {args.parallel_tasks} workers): "
+                f"framework={framework}"
+            )
+            print("=" * 60)
+            overall_start = time.time()
 
-    # --- Phase 4: Write report -------------------------------------------
-    report = report_manager.write(output_dir=output_dir.parent)
+            # --- Phase 1: Compute embeddings (sequential, GPU) ---------------
+            print("\n>>> Phase 1: Computing embeddings …")
+            t0 = time.time()
 
-    total_time = time.time() - overall_start
+            task_config_tuples, unique_per_residue, unique_per_sequence = (
+                biotrainer["get_unique_framework_sequences"](
+                    framework=framework,
+                    min_seq_length=args.min_seq_length,
+                    max_seq_length=args.max_seq_length,
+                    force_download=args.force_download,
+                )
+            )
+
+            if args.tasks:
+                task_config_tuples = [
+                    (task, cfg) for task, cfg in task_config_tuples
+                    if task.combined_name() in args.tasks
+                ]
+                print(f"  Filtered to tasks: {[t.combined_name() for t, _ in task_config_tuples]}")
+
+            embedding_fn_per_residue, embedding_fn_per_sequence = biotrainer["_setup_embedding_functions"](
+                embedder_name=embedder_name,
+                output_dir=output_dir,
+                use_half_precision=False,
+                custom_embedding_function_per_residue=_embed_residue,
+                custom_embedding_function_per_sequence=_embed_sequence,
+            )
+
+            embeddings_file_per_residue = embedding_fn_per_residue(
+                [sr.seq for _, sr in unique_per_residue.items()]
+            )
+            embeddings_file_per_sequence = embedding_fn_per_sequence(
+                [sr.seq for _, sr in unique_per_sequence.items()]
+            )
+
+            biotrainer["_check_h5_file"](
+                "per-residue", embeddings_file_per_residue, len(unique_per_residue)
+            )
+            biotrainer["_check_h5_file"](
+                "per-sequence", embeddings_file_per_sequence, len(unique_per_sequence)
+            )
+
+            print(f"Embeddings done in {time.time() - t0:.1f}s")
+
+            # Free GPU memory after the last framework that needs the model
+            if not model_freed:
+                del model
+                torch.cuda.empty_cache()
+                model_freed = True
+
+            # --- Phase 2: Prepare task configs --------------------------------
+            print("\n>>> Phase 2: Preparing task configs …")
+            prepared_tasks: list[tuple] = []
+            framework_report = biotrainer["SupervisedFrameworkReport"].empty(
+                min_seq_len=args.min_seq_length,
+                max_seq_len=args.max_seq_length,
+            )
+
+            for task, cfg in task_config_tuples:
+                task_name = task.combined_name()
+                task_output_dir = output_dir / task_name
+
+                protocol = biotrainer["Protocol"]
+                if protocol.from_string(cfg["protocol"]) in protocol.using_per_sequence_embeddings():
+                    task_emb_file = embeddings_file_per_sequence
+                else:
+                    task_emb_file = embeddings_file_per_residue
+
+                cfg = biotrainer["AutoEvalConfigBank"].add_custom_values_to_config(
+                    config=cfg,
+                    embedder_name=embedder_name,
+                    embeddings_file=task_emb_file,
+                    input_file=task.input_files[0],
+                    output_dir=task_output_dir,
+                )
+
+                cfg["device"] = "cpu"  # probe training runs on CPU; GPU was only needed for embedding
+
+                maybe_result = biotrainer["SupervisedFrameworkReport"].maybe_load_existing_result(
+                    embedder_name=embedder_name,
+                    task_output_dir=task_output_dir,
+                )
+                if maybe_result:
+                    print(f"  Loaded existing result for {task_name}, skipping …")
+                    framework_report.update_result(task_name, maybe_result)
+                else:
+                    prepared_tasks.append((task, task_name, cfg))
+
+            if not prepared_tasks:
+                print("All tasks already have results — nothing to run!")
+            else:
+                task_names = [tn for _, tn, _ in prepared_tasks]
+                print(f"  Tasks to run ({len(prepared_tasks)}): {task_names}")
+
+                # --- Phase 3: Run tasks in parallel ---------------------------
+                print(
+                    f"\n>>> Phase 3: Running {len(prepared_tasks)} tasks in parallel "
+                    f"({args.parallel_tasks} workers) …"
+                )
+                t1 = time.time()
+
+                with ThreadPoolExecutor(max_workers=args.parallel_tasks) as pool:
+                    futures = {
+                        pool.submit(_run_single_task, task_name, cfg): (task, task_name)
+                        for task, task_name, cfg in prepared_tasks
+                    }
+                    for future in as_completed(futures):
+                        task, task_name = futures[future]
+                        returned_name, result = future.result()
+                        if result is not None:
+                            framework_report.update_result(task_name, result)
+                            print(f"{returned_name} done")
+                        else:
+                            print(f"{returned_name} FAILED")
+
+                print(f"All tasks finished in {time.time() - t1:.1f}s")
+
+            autoeval_report.add_supervised_result(framework_key, framework_report)
+            print(f"{framework_key} results added to combined report. (total: {time.time() - overall_start:.1f}s)")
+
+    # Write the combined report (PBC + PGYM in one file)
+    autoeval_report.write(output_dir=embedder_output_dir)
+
     print(f"\n{'=' * 60}")
-    print(f"AUTOEVAL COMPLETE — Final Report Summary  (total: {total_time:.1f}s)")
+    print(f"AUTOEVAL COMPLETE — Final Report Summary")
     print(f"{'=' * 60}")
-    report.summary()
+    autoeval_report.summary()
 
 
 if __name__ == "__main__":
