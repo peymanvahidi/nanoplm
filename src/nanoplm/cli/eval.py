@@ -2,7 +2,7 @@
 """nanoPLM CLI — eval subcommands for downstream benchmark evaluation."""
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import click
 
@@ -10,7 +10,8 @@ from nanoplm.eval.config import EvalConfig
 from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
 
-_VALID_FRAMEWORKS = {"pbc", "flip"}
+_VALID_FRAMEWORKS = {"pbc", "flip", "pgym"}
+_VALID_ZERO_SHOT_METHODS = {"masked_marginals", "wt_marginals", "pseudoperplexity"}
 
 
 def _check_biotrainer_available() -> None:
@@ -24,12 +25,24 @@ def _check_biotrainer_available() -> None:
         )
 
 
-def _validate_framework(framework: str) -> None:
-    if framework not in _VALID_FRAMEWORKS:
-        raise click.ClickException(
-            f"Unsupported framework: {framework!r}. "
-            f"Expected one of: {sorted(_VALID_FRAMEWORKS)}"
-        )
+def _validate_frameworks(frameworks: List[str]) -> None:
+    for fw in frameworks:
+        if fw not in _VALID_FRAMEWORKS:
+            raise click.ClickException(
+                f"Unsupported framework: {fw!r}. "
+                f"Expected one of: {sorted(_VALID_FRAMEWORKS)}"
+            )
+
+
+def _coerce_list_of_str(value: Any, field_name: str) -> List[str]:
+    """Accept a string (wrap to [s]) or a list of strings."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    raise ValueError(
+        f"{field_name} must be a string or list of strings; got {type(value).__name__}"
+    )
 
 
 def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
@@ -41,15 +54,12 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
         raise ValueError("Eval configuration is required but not found in YAML")
 
     config = dict(config)
-
     expected_keys = set(EvalConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
     extra = sorted(present_keys - expected_keys)
     if extra:
-        raise ValueError(
-            f"Unexpected eval configuration keys: {', '.join(extra)}"
-        )
+        raise ValueError(f"Unexpected eval configuration keys: {', '.join(extra)}")
 
     if "checkpoint_dir" not in config or not config["checkpoint_dir"]:
         raise ValueError("checkpoint_dir is required in eval configuration")
@@ -60,7 +70,7 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
         if value is not None:
             kwargs[key] = value
 
-    # Type coercion for fields that may arrive as strings from YAML.
+    # Integer fields.
     int_fields = ("batch_size", "min_seq_length", "max_seq_length", "parallel_tasks")
     for key in int_fields:
         if key in kwargs:
@@ -71,10 +81,29 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
                     f"Invalid {key} value: {kwargs[key]}. Must be an integer."
                 ) from exc
 
-    str_fields = ("framework", "device", "embedder_name")
+    # Scalar string fields.
+    str_fields = ("device", "embedder_name", "zero_shot_method")
     for key in str_fields:
         if key in kwargs and kwargs[key] is not None:
             kwargs[key] = str(kwargs[key])
+
+    # List-of-string fields.
+    if "framework" in kwargs:
+        kwargs["framework"] = _coerce_list_of_str(kwargs["framework"], "framework")
+
+    if "tasks" in kwargs:
+        kwargs["tasks"] = _coerce_list_of_str(kwargs["tasks"], "tasks")
+
+    # Boolean flag.
+    if "force_download" in kwargs:
+        kwargs["force_download"] = bool(kwargs["force_download"])
+
+    # Validate zero_shot_method against the allowed set.
+    if "zero_shot_method" in kwargs and kwargs["zero_shot_method"] not in _VALID_ZERO_SHOT_METHODS:
+        raise ValueError(
+            f"Invalid zero_shot_method: {kwargs['zero_shot_method']!r}. "
+            f"Expected one of: {sorted(_VALID_ZERO_SHOT_METHODS)}"
+        )
 
     return EvalConfig(**kwargs)
 
@@ -107,8 +136,19 @@ def eval():
 @click.option(
     "--framework",
     type=click.Choice(sorted(_VALID_FRAMEWORKS)),
-    default="pbc",
-    help="Benchmark framework to evaluate on.",
+    multiple=True,
+    default=("pbc",),
+    help=(
+        "Benchmark framework(s) to evaluate on. Pass multiple times to run "
+        "multiple frameworks, e.g. --framework pbc --framework pgym."
+    ),
+    show_default=True,
+)
+@click.option(
+    "--zero-shot-method",
+    type=click.Choice(sorted(_VALID_ZERO_SHOT_METHODS)),
+    default="masked_marginals",
+    help="Zero-shot scoring method when --framework includes 'pgym'.",
     show_default=True,
 )
 @click.option(
@@ -168,10 +208,27 @@ def eval():
     ),
     show_default=True,
 )
+@click.option(
+    "--tasks",
+    type=str,
+    multiple=True,
+    default=(),
+    help=(
+        "Whitelist of task names (e.g. PBC-secondary_structure). "
+        "Parallel mode only — sequential mode warns and ignores."
+    ),
+)
+@click.option(
+    "--force-download",
+    is_flag=True,
+    default=False,
+    help="Force re-download of framework datasets (use when new tasks land upstream).",
+)
 def run(
     checkpoint_dir: str,
     checkpoint_root: str,
-    framework: str,
+    framework: tuple,
+    zero_shot_method: str,
     output_dir: str,
     config_yaml: str,
     batch_size: int,
@@ -180,15 +237,18 @@ def run(
     device: Optional[str],
     embedder_name: Optional[str],
     parallel_tasks: int,
+    tasks: tuple,
+    force_download: bool,
 ):
     """Run downstream evaluation directly from CLI flags."""
-    _validate_framework(framework)
+    frameworks_list = list(framework)
+    _validate_frameworks(frameworks_list)
     _check_biotrainer_available()
 
     eval_config = EvalConfig(
         checkpoint_dir=checkpoint_dir,
         checkpoint_root=checkpoint_root,
-        framework=framework,
+        framework=frameworks_list,
         output_dir=output_dir,
         config_yaml=config_yaml,
         batch_size=batch_size,
@@ -197,10 +257,12 @@ def run(
         device=device,
         embedder_name=embedder_name,
         parallel_tasks=parallel_tasks,
+        zero_shot_method=zero_shot_method,
+        tasks=list(tasks) if tasks else None,
+        force_download=force_download,
     )
 
     from nanoplm.eval.pipeline import run_eval
-
     run_eval(eval_config)
 
 
@@ -218,7 +280,7 @@ def from_yaml(config: str):
 
         eval:
             checkpoint_dir: ...
-            framework: pbc
+            framework: [pbc]
             ...
     """
     config_path = Path(config)
@@ -231,13 +293,11 @@ def from_yaml(config: str):
     eval_dict = raw.get("eval")
 
     eval_config = _load_eval_config(eval_dict)
-    _validate_framework(eval_config.framework)
+    _validate_frameworks(eval_config.framework)
     _check_biotrainer_available()
 
     logger.info(f"Loaded eval config from {eval_yaml}")
-
     from nanoplm.eval.pipeline import run_eval
-
     run_eval(eval_config)
 
 
@@ -279,7 +339,9 @@ def get_yaml(output: Optional[str], force: bool):
         '  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"\n'
         '  checkpoint_root: "output/pretraining_checkpoints"\n'
         "\n"
-        "  framework: pbc                     # one of: pbc, flip\n"
+        "  # One or more of: pbc, flip, pgym. 'pgym' is zero-shot ProteinGym.\n"
+        "  framework: [pbc]\n"
+        "\n"
         '  output_dir: "autoeval_output"\n'
         "\n"
         "  # Fallback model config when the checkpoint has no model_config.yaml.\n"
@@ -292,6 +354,15 @@ def get_yaml(output: Optional[str], force: bool):
         "  # device: cuda                     # auto-detected when omitted\n"
         "  # embedder_name: my-run            # defaults to checkpoint dir stem\n"
         "  parallel_tasks: 0                  # 0 = sequential, >0 = parallel workers\n"
+        "\n"
+        "  # Zero-shot scoring method when framework includes 'pgym'.\n"
+        "  zero_shot_method: masked_marginals  # masked_marginals | wt_marginals | pseudoperplexity\n"
+        "\n"
+        "  # Optional whitelist of task names. Parallel mode only.\n"
+        "  # tasks: [PBC-secondary_structure]\n"
+        "\n"
+        "  # Re-download framework datasets (use when new tasks land upstream).\n"
+        "  force_download: false\n"
     )
 
     if output_path.exists() and not force:
