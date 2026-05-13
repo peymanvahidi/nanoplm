@@ -26,6 +26,8 @@ def _check_biotrainer_available() -> None:
 
 
 def _validate_frameworks(frameworks: List[str]) -> None:
+    if not frameworks:
+        raise click.ClickException("At least one framework must be specified.")
     for fw in frameworks:
         if fw not in _VALID_FRAMEWORKS:
             raise click.ClickException(
@@ -289,10 +291,18 @@ def from_yaml(config: str):
     else:
         eval_yaml = Path.cwd() / config_path
 
-    raw = read_yaml(eval_yaml)
+    raw = read_yaml(eval_yaml) or {}
+    if not isinstance(raw, dict):
+        raise click.ClickException(
+            f"Expected top-level YAML mapping in {eval_yaml}; got {type(raw).__name__}."
+        )
     eval_dict = raw.get("eval")
 
-    eval_config = _load_eval_config(eval_dict)
+    try:
+        eval_config = _load_eval_config(eval_dict)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+
     _validate_frameworks(eval_config.framework)
     _check_biotrainer_available()
 
