@@ -21,7 +21,6 @@ from pathlib import Path
 
 from torch.utils.data import Dataset
 from torch.optim import AdamW
-from safetensors.torch import load_file
 from transformers import (
     TrainingArguments,
     get_cosine_schedule_with_warmup,
@@ -636,22 +635,6 @@ def run_distillation(
         train_samples=distill_config.train_sequences,
         global_batch_size=global_batch_size,
     )
-
-    # Load model weights if resuming
-    if is_resuming:
-        checkpoint_path = Path(resume_config.checkpoint_dir)
-        safetensors_path = checkpoint_path / "model.safetensors"
-
-        model_loaded = False
-        if safetensors_path.exists():
-            logger.info(f"Loading model weights from {safetensors_path}")
-            state_dict = load_file(safetensors_path, device=device)
-            model.load_state_dict(state_dict)
-            model_loaded = True
-        if not model_loaded:
-            logger.warning(
-                f"Could not find model weights in {resume_config.checkpoint_dir}. Training from scratch."
-            )
 
     # Save training configuration for future resumes
     if not is_resuming:
