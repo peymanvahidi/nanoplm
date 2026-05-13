@@ -112,6 +112,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             moe_topk_group=config.moe_topk_group,
             moe_bias_update_rate=config.moe_bias_update_rate,
             moe_leading_dense_layers=config.moe_leading_dense_layers,
+            num_loops=config.num_loops,
         )
 
         super().__init__(mb_config)
@@ -121,6 +122,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
     """Transformer-Engine ``ProtModernBertMLM`` wrapper."""
 
     def __init__(self, config: ProtModernBertMLMConfig):
+        if config.num_loops != 1:
+            raise ValueError(
+                "num_loops > 1 is implemented only in the pure-torch path. "
+                "Use --pure-torch with num_loops>1."
+            )
         if config.use_noble:
             raise ValueError(
                 "NOBLE is currently implemented only in the pure-torch path. "

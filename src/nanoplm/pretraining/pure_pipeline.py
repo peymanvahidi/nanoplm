@@ -17,6 +17,13 @@ except ImportError:
     Muon = None  # type: ignore[assignment,misc]
     NorMuon = None  # type: ignore[assignment,misc]
     MuonH = None  # type: ignore[assignment,misc]
+
+# Pre-computed isinstance tuple that excludes any optimizer classes that
+# failed to import. `isinstance(x, (None, None))` raises TypeError, so naive
+# tuples like `(Muon, NorMuon)` break when dion is not installed.
+_MUON_OPTIMIZER_TYPES: tuple = tuple(
+    c for c in (Muon, NorMuon, MuonH) if c is not None
+)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -889,15 +896,15 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
             proj_flops + perm_mix_flops + pre_map_flops + post_res_flops
         )
 
-    forward_flops = (
-        attn_proj_flops
-        + attn_flops
-        + mlp_flops
-        + head_flops
-        + pred_head_flops
-        + canon_flops
-        + mhc_flops
+    # ALBERT-style weight-tied looping: every per-layer term runs num_loops times
+    # per forward pass. head_flops and pred_head_flops run once after the layer
+    # stack, so they do NOT scale. Without this multiplier W&B MFU and
+    # tokens/sec metrics silently halve for looped runs.
+    num_loops = max(1, int(getattr(config, "num_loops", 1)))
+    per_layer_flops = (
+        attn_proj_flops + attn_flops + mlp_flops + canon_flops + mhc_flops
     )
+    forward_flops = num_loops * per_layer_flops + head_flops + pred_head_flops
     return 3 * forward_flops
 
 
@@ -1532,7 +1539,7 @@ def _rebuild_scheduler_for_resume(
             pg["lr"] = eff_muon_lr
         for pg in optimizer.adamw.param_groups:
             pg["lr"] = eff_lr
-    elif isinstance(optimizer, (Muon, NorMuon, MuonH) if MuonH is not None else (Muon, NorMuon)):
+    elif _MUON_OPTIMIZER_TYPES and isinstance(optimizer, _MUON_OPTIMIZER_TYPES):
         # group[0] = muon, group[1+] = adamw / scalar
         optimizer.param_groups[0]["lr"] = eff_muon_lr
         for pg in optimizer.param_groups[1:]:
@@ -2441,7 +2448,7 @@ def run_pure_pretraining(
                     if isinstance(optimizer, MuonAdamWGroup):
                         muon_lr = optimizer.muon.param_groups[0]["lr"]
                         learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                    elif isinstance(optimizer, (Muon, NorMuon, MuonH) if MuonH is not None else (Muon, NorMuon)):
+                    elif _MUON_OPTIMIZER_TYPES and isinstance(optimizer, _MUON_OPTIMIZER_TYPES):
                         muon_lr = optimizer.param_groups[0]["lr"]
                         learning_rate = optimizer.param_groups[1]["lr"]
                     else:

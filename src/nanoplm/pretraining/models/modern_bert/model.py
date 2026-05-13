@@ -99,10 +99,18 @@ class ProtModernBertMLMConfig:
     moe_topk_group: int = 1  # group-limited routing: number of groups kept per token
     moe_bias_update_rate: float = 1e-3  # Ling-style expert-bias update rate
     moe_leading_dense_layers: int = 0
+    # ALBERT-style weight-tied looping: apply the L-layer stack T times with tied weights.
+    # num_loops=1 is the standard non-looped model. Pure-torch path only.
+    num_loops: int = 1
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
     def __init__(self, config: ProtModernBertMLMConfig):
+        if config.num_loops != 1:
+            raise ValueError(
+                "num_loops > 1 is implemented only in the pure-torch path. "
+                "Use --pure-torch with num_loops>1."
+            )
         if config.use_noble:
             raise ValueError(
                 "NOBLE is implemented only in the pure-torch path. "

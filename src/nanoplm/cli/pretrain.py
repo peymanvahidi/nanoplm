@@ -534,6 +534,13 @@ def pretrain():
     help="Number of attention heads",
 )
 @click.option(
+    "--num-loops",
+    type=int,
+    default=1,
+    help="ALBERT-style weight-tied looping: apply the layer stack T times with tied weights. "
+    "Pure-torch only. 1 = standard non-looped model.",
+)
+@click.option(
     "--num-kv-heads",
     type=int,
     default=None,
@@ -802,6 +809,7 @@ def run(
     intermediate_size: int,
     num_hidden_layers: int,
     num_attention_heads: int,
+    num_loops: int,
     num_kv_heads: Optional[int],
     vocab_size: int,
     norm_type: str,
@@ -949,6 +957,7 @@ def run(
         num_hidden_layers=num_hidden_layers,
         num_attention_heads=num_attention_heads,
         num_kv_heads=num_kv_heads,
+        num_loops=num_loops,
         vocab_size=vocab_size,
         norm_type=norm_type,
         mlp_activation=mlp_activation,
@@ -1278,6 +1287,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_attention_heads: 8\n"
         "  # num_kv_heads: 8  # GQA: number of KV heads (default: same as num_attention_heads = MHA)\n"
         "  vocab_size: 32\n"
+        "  num_loops: 1  # ALBERT-style weight-tied looping (pure_torch only); 1 = standard non-looped model\n"
         '  norm_type: "layernorm"  # layernorm | rmsnorm (rmsnorm is slightly faster, no bias)\n'
         '  mlp_activation: "swiglu"\n'
         "  mlp_dropout: 0.0\n"
