@@ -15,23 +15,9 @@ from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBert
 from nanoplm.utils.logger import logger
 
 
-# SafeLoader rejects ``!!python/tuple``; nanoPLM's checkpoint serializer emits
-# this tag for tuple-valued config fields (e.g. ``noble_omega_range``). We
-# register a tuple constructor so safe_load still works on those checkpoints
-# without opening the door to arbitrary Python deserialization.
-class _CheckpointYAMLLoader(yaml.SafeLoader):
-    pass
-
-
-_CheckpointYAMLLoader.add_constructor(
-    "tag:yaml.org,2002:python/tuple",
-    lambda loader, node: tuple(loader.construct_sequence(node)),
-)
-
-
 def _safe_load_checkpoint_yaml(path: Path) -> Any:
     with open(path) as f:
-        return yaml.load(f, Loader=_CheckpointYAMLLoader)
+        return yaml.safe_load(f)
 
 
 def load_model_config(yaml_path: Union[str, Path] = "pretrain.yaml") -> ProtModernBertMLMConfig:
