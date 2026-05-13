@@ -150,6 +150,39 @@ def distill():
     help='Learning rate for Muon/NorMuon (2-D weight matrices)'
 )
 @click.option(
+    '--muon-weight-decay',
+    type=float,
+    default=0.01,
+    help='Muon weight decay (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-cautious-weight-decay/--no-muon-cautious-weight-decay',
+    default=True,
+    help='Enable cautious weight decay in Muon/NorMuon (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-use-polar-express/--no-muon-use-polar-express',
+    default=True,
+    help='Use Polar Express orthogonalization for Muon/NorMuon (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-momentum',
+    type=float,
+    default=0.95,
+    help='Muon momentum (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-nesterov/--no-muon-nesterov',
+    default=True,
+    help='Enable Nesterov in Muon (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-eps',
+    type=float,
+    default=1e-7,
+    help='Muon epsilon (used only when optimizer=muon or normuon)',
+)
+@click.option(
     '--adam-learning-rate',
     type=float,
     default=1e-4,
@@ -321,6 +354,12 @@ def run(
     max_grad_norm: float,
     optimizer: str,
     muon_learning_rate: float,
+    muon_weight_decay: float,
+    muon_cautious_weight_decay: bool,
+    muon_use_polar_express: bool,
+    muon_momentum: float,
+    muon_nesterov: bool,
+    muon_eps: float,
     adam_learning_rate: float,
     adam_weight_decay: float,
     lr_scheduler: str,
@@ -447,6 +486,12 @@ def run(
         "max_grad_norm": max_grad_norm,
         "optimizer": optimizer,
         "muon_learning_rate": muon_learning_rate,
+        "muon_weight_decay": muon_weight_decay,
+        "muon_cautious_weight_decay": muon_cautious_weight_decay,
+        "muon_use_polar_express": muon_use_polar_express,
+        "muon_momentum": muon_momentum,
+        "muon_nesterov": muon_nesterov,
+        "muon_eps": muon_eps,
         "adam_learning_rate": adam_learning_rate,
         "adam_weight_decay": adam_weight_decay,
         "lr_scheduler": lr_scheduler,
@@ -674,6 +719,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  # biases/embeddings through fused AdamW (same as pretraining).\n"
         "  optimizer: \"adamw\"\n"
         "  muon_learning_rate: 1e-3\n"
+        "  muon_weight_decay: 0.01\n"
+        "  muon_cautious_weight_decay: true\n"
+        "  muon_use_polar_express: true\n"
+        "  muon_momentum: 0.95\n"
+        "  muon_nesterov: true\n"
+        "  muon_eps: 1e-7\n"
         "  adam_learning_rate: 1e-4\n"
         "  adam_weight_decay: 0.0\n"
         "\n"
