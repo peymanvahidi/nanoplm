@@ -1277,6 +1277,7 @@ def _save_checkpoint(
     # original pretrain.yaml or dataset directory).
     if model_config is not None:
         cfg_dict = asdict(model_config) if hasattr(model_config, '__dataclass_fields__') else dict(model_config)
+        cfg_dict = json.loads(json.dumps(cfg_dict))  # tuples → lists; avoids !!python/tuple tags
         with open(ckpt / "model_config.yaml", "w") as f:
             yaml.dump(cfg_dict, f, default_flow_style=False, sort_keys=False)
     if manifest is not None:
