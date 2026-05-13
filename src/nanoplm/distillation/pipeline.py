@@ -565,10 +565,26 @@ def run_distillation(
         # Wrap at layer or sublayer granularity, matching pretraining
         if distill_config.fsdp_shard_granularity == "sublayer":
             for layer in model.model.layers:
-                if hasattr(layer, "attn"):
+                # MHCLiteSublayersLayer: .mhc_attn / .mhc_mlp at top level
+                if hasattr(layer, "mhc_attn"):
+                    fully_shard(layer.mhc_attn, mesh=device_mesh, mp_policy=mp_policy)
+                    if hasattr(layer, "mhc_mlp") and layer.mhc_mlp is not None:
+                        fully_shard(layer.mhc_mlp, mesh=device_mesh, mp_policy=mp_policy)
+                # MHCLiteBlock: nested .layer.attn / .layer.mlp
+                elif hasattr(layer, "layer") and hasattr(layer.layer, "attn"):
+                    fully_shard(layer.layer.attn, mesh=device_mesh, mp_policy=mp_policy)
+                    if hasattr(layer.layer, "mlp") and layer.layer.mlp is not None:
+                        fully_shard(layer.layer.mlp, mesh=device_mesh, mp_policy=mp_policy)
+                # Vanilla ModernBertEncoderLayer: .attn / .mlp
+                elif hasattr(layer, "attn"):
                     fully_shard(layer.attn, mesh=device_mesh, mp_policy=mp_policy)
-                if hasattr(layer, "mlp") and layer.mlp is not None:
-                    fully_shard(layer.mlp, mesh=device_mesh, mp_policy=mp_policy)
+                    if hasattr(layer, "mlp") and layer.mlp is not None:
+                        fully_shard(layer.mlp, mesh=device_mesh, mp_policy=mp_policy)
+                else:
+                    logger.warning(
+                        f"FSDP2 sublayer wrap: skipping layer {type(layer).__name__} "
+                        "(no recognized sub-modules)"
+                    )
         else:  # "layer" — wrap whole transformer blocks
             for layer in model.model.layers:
                 fully_shard(layer, mesh=device_mesh, mp_policy=mp_policy)
