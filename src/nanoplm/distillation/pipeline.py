@@ -738,6 +738,7 @@ def run_distillation(
         "bf16": distill_config.bf16 and is_cuda and torch.cuda.is_bf16_supported(),
         "fp16": distill_config.bf16 and ((is_cuda and not torch.cuda.is_bf16_supported()) or device == "mps"),
         "tf32": distill_config.tf32 and is_cuda,
+        "max_grad_norm": distill_config.max_grad_norm,
     }
 
     if distill_config.multi_gpu:
