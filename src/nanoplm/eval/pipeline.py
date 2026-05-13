@@ -305,12 +305,12 @@ def _run_supervised_parallel(
             logger.info(f"  Loaded existing result for {task_name}, skipping …")
             framework_report.update_result(task_name, maybe_result)
         else:
-            prepared_tasks.append((task, task_name, cfg))
+            prepared_tasks.append((task_name, cfg))
 
     if not prepared_tasks:
         logger.info("All tasks already have results — nothing to run!")
     else:
-        task_names = [tn for _, tn, _ in prepared_tasks]
+        task_names = [tn for tn, _ in prepared_tasks]
         logger.info(f"  Tasks to run ({len(prepared_tasks)}): {task_names}")
 
         # --- Phase 3: Run tasks in parallel --------------------------
@@ -326,12 +326,11 @@ def _run_supervised_parallel(
         # parallel_tasks > 1, log lines from concurrent tasks may
         # interleave or land in the wrong logger_out.log file.
         with ThreadPoolExecutor(max_workers=eval_config.parallel_tasks) as pool:
-            futures = {
-                pool.submit(_run_single_task, tn, cfg, parse_and_execute): tn
-                for _task, tn, cfg in prepared_tasks
-            }
+            futures = [
+                pool.submit(_run_single_task, tn, cfg, parse_and_execute)
+                for tn, cfg in prepared_tasks
+            ]
             for future in as_completed(futures):
-                task_name = futures[future]
                 returned_name, result = future.result()
                 if result is not None:
                     framework_report.update_result(returned_name, result)
