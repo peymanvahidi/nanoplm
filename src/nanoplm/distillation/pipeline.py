@@ -583,8 +583,12 @@ def run_distillation(
     if distill_config.use_compile and is_cuda:
         if not distill_config.compile_triton_persistent_reductions:
             torch._inductor.config.triton.persistent_reductions = False
-        if not distill_config.compile_triton_mix_order_reduction:
-            torch._inductor.config.triton.use_block_ptr = False
+        os.environ["TORCHINDUCTOR_MIX_ORDER_REDUCTION"] = (
+            "1" if distill_config.compile_triton_mix_order_reduction else "0"
+        )
+        torch._inductor.config.triton.mix_order_reduction = (
+            distill_config.compile_triton_mix_order_reduction
+        )
         compile_mode = (
             "max-autotune-no-cudagraphs"
             if distill_config.use_compile_max_autotune
