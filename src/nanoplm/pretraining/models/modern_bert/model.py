@@ -17,10 +17,14 @@ class ModernBertMLPSwiGLU(nn.Module):
 
     def __init__(self, config: ModernBertConfig):
         super().__init__()
-        self.Wi = nn.Linear(config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias)
+        self.Wi = nn.Linear(
+            config.hidden_size, config.intermediate_size * 2, bias=config.mlp_bias
+        )
         self.drop = nn.Dropout(config.mlp_dropout)
         self.act = SwiGLU()
-        self.Wo = nn.Linear(config.intermediate_size, config.hidden_size, bias=config.mlp_bias)
+        self.Wo = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
 
     def forward(self, hidden_states):
         x, gate = self.Wi(hidden_states).chunk(2, dim=-1)
@@ -38,8 +42,11 @@ class ProtModernBertMLMConfig:
     intermediate_size: int
     num_hidden_layers: int
     num_attention_heads: int
-    num_kv_heads: Optional[int] = None  # GQA: K,V head count (None = same as num_attention_heads = MHA)
+    num_kv_heads: Optional[int] = (
+        None  # GQA: K,V head count (None = same as num_attention_heads = MHA)
+    )
     vocab_size: int = 32
+    norm_type: str = "layernorm"  # layernorm | rmsnorm
     mlp_activation: str = "swiglu"
     mlp_dropout: float = 0.0
     mlp_bias: bool = False
@@ -65,22 +72,66 @@ class ProtModernBertMLMConfig:
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
     mhc_lite_wrapping_level: str = "layer"
+    tie_word_embeddings: bool = True
     use_diff_attn_v2: bool = False
+    use_paired_head_attention: bool = False
     attn_layer_pattern: Optional[str] = None
+    fused_qkv: bool = True
+    fused_up_gate: bool = True
+    wo_init: str = "zero"
+    # NOBLE
+    use_noble: bool = False
+    noble_rank: int = 64
+    noble_alpha: float = 0.01
+    noble_omega_range: tuple = (0.8, 1.2)
+    noble_phi_std: float = 0.1
+    noble_half_kaiming: bool = True
+    noble_targets: str = "all"
+    # MoE
+    use_moe: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_use_bias_correction: bool = True
+    moe_aux_loss_coef: float = 0.01
+    moe_z_loss_coef: float = 5e-5
+    moe_routed_scaling_factor: float = 1.0
+    moe_n_group: int = 1  # group-limited routing: number of expert groups (1 = flat top-k)
+    moe_topk_group: int = 1  # group-limited routing: number of groups kept per token
+    moe_bias_update_rate: float = 1e-3  # Ling-style expert-bias update rate
+    moe_leading_dense_layers: int = 0
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
-
-    def __init__(
-        self,
-        config: ProtModernBertMLMConfig
-    ):
+    def __init__(self, config: ProtModernBertMLMConfig):
+        if config.use_noble:
+            raise ValueError(
+                "NOBLE is implemented only in the pure-torch path. "
+                "Use --pure-torch with use_noble=true."
+            )
+        if not config.fused_qkv:
+            raise ValueError(
+                "fused_qkv=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_qkv=false."
+            )
+        if not config.fused_up_gate:
+            raise ValueError(
+                "fused_up_gate=False is implemented only in the pure-torch path. "
+                "Use --pure-torch with fused_up_gate=false."
+            )
+        if config.use_moe:
+            raise ValueError(
+                "MoE is implemented only in the pure-torch path. "
+                "Use --pure-torch with use_moe=true."
+            )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "
                 "Use --pure-torch with use_canon_layers=true."
             )
-        if config.num_kv_heads is not None and config.num_kv_heads != config.num_attention_heads:
+        if (
+            config.num_kv_heads is not None
+            and config.num_kv_heads != config.num_attention_heads
+        ):
             raise ValueError(
                 "GQA is not implemented in the HF ModernBERT path. "
                 "Set num_kv_heads equal to num_attention_heads or use --pure-torch / --pure-te."
@@ -89,6 +140,11 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             raise ValueError(
                 "classifier_activation='srelu' is implemented only in the pure-torch and "
                 "Transformer Engine paths. Use --pure-torch / --pure-te or choose relu/gelu."
+            )
+        if config.use_paired_head_attention:
+            raise ValueError(
+                "Paired head attention is implemented only in the pure-torch path. "
+                "Use --pure-torch or disable use_paired_head_attention."
             )
 
         self.tokenizer = ProtModernBertTokenizer()
@@ -115,6 +171,7 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             bos_token_id=None,  # Not used in our tokenizer
             unk_token_id=self.tokenizer.unk_token_id,
             mask_token_id=self.tokenizer.mask_token_id,
+            tie_word_embeddings=config.tie_word_embeddings,
             loss_type="ForMaskedLM",
         )
 

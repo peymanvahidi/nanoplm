@@ -63,6 +63,7 @@ _AUTOTUNE_BWD_DX_CONFIGS = _autotune_configs(
     stages=(2, 3),
 )
 
+
 def _bwd_dw_db_pre_hook(nargs):
     """Zero accumulator buffers before each autotune trial."""
     nargs["grad_w_ptr"].zero_()
@@ -190,17 +191,13 @@ def _canon_bwd_dx_kernel(
         nbr_seq = tl.load(seq_id_ptr + nbr_t, mask=in_bounds & t_mask, other=-1)
         valid = in_bounds & (my_seq == nbr_seq)
 
-        go_ptrs = (
-            grad_out_ptr + nbr_t[:, None] * stride_t + c_offs[None, :] * stride_c
-        )
+        go_ptrs = grad_out_ptr + nbr_t[:, None] * stride_t + c_offs[None, :] * stride_c
         go_val = tl.load(go_ptrs, mask=valid[:, None] & c_mask[None, :], other=0.0)
         if FP32_ACCUM:
             go_val = go_val.to(tl.float32)
 
         # Flipped weight index: K-1-k
-        w_k = tl.load(
-            weight_ptr + c_offs * K + (K - 1 - k), mask=c_mask, other=0.0
-        )
+        w_k = tl.load(weight_ptr + c_offs * K + (K - 1 - k), mask=c_mask, other=0.0)
         if FP32_ACCUM:
             w_k = w_k.to(tl.float32)
 
@@ -265,9 +262,7 @@ def _canon_bwd_dw_db_kernel(
         valid = in_bounds & (my_seq == nbr_seq)
 
         x_ptrs = x_ptr + nbr_t[:, None] * stride_t + c_offs[None, :] * stride_c
-        x_val = tl.load(
-            x_ptrs, mask=valid[:, None] & c_mask[None, :], other=0.0
-        )
+        x_val = tl.load(x_ptrs, mask=valid[:, None] & c_mask[None, :], other=0.0)
         if FP32_ACCUM:
             x_val = x_val.to(tl.float32)
 
@@ -284,51 +279,102 @@ def _canon_bwd_dw_db_kernel(
 @triton.autotune(configs=_AUTOTUNE_FWD_CONFIGS, key=["T", "C"], cache_results=True)
 @triton.jit
 def _canon_fwd_kernel_autotuned(
-    x_ptr, seq_id_ptr, weight_ptr, bias_ptr, out_ptr,
-    T, C, stride_t, stride_c,
+    x_ptr,
+    seq_id_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
     RADIUS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     _canon_fwd_kernel(
-        x_ptr, seq_id_ptr, weight_ptr, bias_ptr, out_ptr,
-        T, C, stride_t, stride_c,
-        RADIUS, BLOCK_T, BLOCK_C, FP32_ACCUM,
+        x_ptr,
+        seq_id_ptr,
+        weight_ptr,
+        bias_ptr,
+        out_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        RADIUS,
+        BLOCK_T,
+        BLOCK_C,
+        FP32_ACCUM,
     )
 
 
 @triton.autotune(configs=_AUTOTUNE_BWD_DX_CONFIGS, key=["T", "C"], cache_results=True)
 @triton.jit
 def _canon_bwd_dx_kernel_autotuned(
-    grad_out_ptr, seq_id_ptr, weight_ptr, grad_x_ptr,
-    T, C, stride_t, stride_c,
+    grad_out_ptr,
+    seq_id_ptr,
+    weight_ptr,
+    grad_x_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
     RADIUS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     _canon_bwd_dx_kernel(
-        grad_out_ptr, seq_id_ptr, weight_ptr, grad_x_ptr,
-        T, C, stride_t, stride_c,
-        RADIUS, BLOCK_T, BLOCK_C, FP32_ACCUM,
+        grad_out_ptr,
+        seq_id_ptr,
+        weight_ptr,
+        grad_x_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        RADIUS,
+        BLOCK_T,
+        BLOCK_C,
+        FP32_ACCUM,
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_BWD_DW_DB_CONFIGS, key=["T", "C"], cache_results=True)
+@triton.autotune(
+    configs=_AUTOTUNE_BWD_DW_DB_CONFIGS, key=["T", "C"], cache_results=True
+)
 @triton.jit
 def _canon_bwd_dw_db_kernel_autotuned(
-    grad_out_ptr, x_ptr, seq_id_ptr, grad_w_ptr, grad_b_ptr,
-    T, C, stride_t, stride_c,
+    grad_out_ptr,
+    x_ptr,
+    seq_id_ptr,
+    grad_w_ptr,
+    grad_b_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
     RADIUS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     _canon_bwd_dw_db_kernel(
-        grad_out_ptr, x_ptr, seq_id_ptr, grad_w_ptr, grad_b_ptr,
-        T, C, stride_t, stride_c,
-        RADIUS, BLOCK_T, BLOCK_C, FP32_ACCUM,
+        grad_out_ptr,
+        x_ptr,
+        seq_id_ptr,
+        grad_w_ptr,
+        grad_b_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        RADIUS,
+        BLOCK_T,
+        BLOCK_C,
+        FP32_ACCUM,
     )
 
 
@@ -345,17 +391,19 @@ def _canon_ln_fwd_kernel(
     x_ptr,
     seq_id_ptr,
     # LN params / stats (pre-computed)
-    mean_ptr,       # (T,)   fp32
-    rstd_ptr,       # (T,)   fp32
-    ln_w_ptr,       # (C,)   LN gamma
+    mean_ptr,  # (T,)   fp32
+    rstd_ptr,  # (T,)   fp32
+    ln_w_ptr,  # (C,)   LN gamma
     # Conv params
-    conv_w_ptr,     # (C, K)
-    conv_b_ptr,     # (C,)
+    conv_w_ptr,  # (C, K)
+    conv_b_ptr,  # (C,)
     # Output
     out_ptr,
     # Dims
-    T, C,
-    stride_t, stride_c,
+    T,
+    C,
+    stride_t,
+    stride_c,
     # Compile-time
     RADIUS: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -448,10 +496,12 @@ def _canon_ln_fwd_kernel(
 @triton.jit
 def _ln_stats_kernel(
     x_ptr,
-    mean_ptr,      # (T,) output
-    rstd_ptr,      # (T,) output
-    T, C,
-    stride_t, stride_c,
+    mean_ptr,  # (T,) output
+    rstd_ptr,  # (T,) output
+    T,
+    C,
+    stride_t,
+    stride_c,
     eps,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
@@ -466,8 +516,7 @@ def _ln_stats_kernel(
     cols = tl.arange(0, BLOCK_N)
     mask = cols < C
 
-    x = tl.load(x_ptr + row * stride_t + cols * stride_c,
-                 mask=mask, other=0.0)
+    x = tl.load(x_ptr + row * stride_t + cols * stride_c, mask=mask, other=0.0)
     if FP32_ACCUM:
         x = x.to(tl.float32)
 
@@ -485,15 +534,17 @@ def _ln_stats_kernel(
 
 @triton.jit
 def _ln_bwd_kernel(
-    grad_ln_out_ptr,    # (T, C)
-    x_ptr,              # (T, C)
-    mean_ptr,           # (T,)
-    rstd_ptr,           # (T,)
-    ln_w_ptr,           # (C,)
-    grad_x_ptr,         # (T, C) output
-    partial_dgamma_ptr, # (num_programs, C) output
-    T, C,
-    stride_t, stride_c,
+    grad_ln_out_ptr,  # (T, C)
+    x_ptr,  # (T, C)
+    mean_ptr,  # (T,)
+    rstd_ptr,  # (T,)
+    ln_w_ptr,  # (C,)
+    grad_x_ptr,  # (T, C) output
+    partial_dgamma_ptr,  # (num_programs, C) output
+    T,
+    C,
+    stride_t,
+    stride_c,
     rows_per_program,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
@@ -517,10 +568,8 @@ def _ln_bwd_kernel(
 
     for row in range(row_start, row_end):
         row_off = row * stride_t
-        glo = tl.load(grad_ln_out_ptr + row_off + cols * stride_c,
-                       mask=mask, other=0.0)
-        x = tl.load(x_ptr + row_off + cols * stride_c,
-                     mask=mask, other=0.0)
+        glo = tl.load(grad_ln_out_ptr + row_off + cols * stride_c, mask=mask, other=0.0)
+        x = tl.load(x_ptr + row_off + cols * stride_c, mask=mask, other=0.0)
         if FP32_ACCUM:
             glo = glo.to(tl.float32)
             x = x.to(tl.float32)
@@ -556,17 +605,19 @@ def _ln_bwd_kernel(
 
 @triton.jit
 def _fused_conv_bwd_dx_ln_bwd_kernel(
-    grad_out_ptr,        # (T, C) input
-    x_ptr,               # (T, C) input
-    seq_id_ptr,          # (T,)   input
-    mean_ptr,            # (T,)   input
-    rstd_ptr,            # (T,)   input
-    ln_w_ptr,            # (C,)   input — LN gamma
-    conv_w_ptr,          # (C, K) input — conv weight
-    grad_x_ptr,          # (T, C) output
+    grad_out_ptr,  # (T, C) input
+    x_ptr,  # (T, C) input
+    seq_id_ptr,  # (T,)   input
+    mean_ptr,  # (T,)   input
+    rstd_ptr,  # (T,)   input
+    ln_w_ptr,  # (C,)   input — LN gamma
+    conv_w_ptr,  # (C, K) input — conv weight
+    grad_x_ptr,  # (T, C) output
     partial_dgamma_ptr,  # (num_programs, C) output
-    T, C,
-    stride_t, stride_c,
+    T,
+    C,
+    stride_t,
+    stride_c,
     rows_per_program,
     RADIUS: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -602,8 +653,9 @@ def _fused_conv_bwd_dx_ln_bwd_kernel(
         row_off = row * stride_t
 
         # Load grad_out for this row
-        go_self = tl.load(grad_out_ptr + row_off + cols * stride_c,
-                          mask=mask, other=0.0)
+        go_self = tl.load(
+            grad_out_ptr + row_off + cols * stride_c, mask=mask, other=0.0
+        )
         if FP32_ACCUM:
             go_self = go_self.to(tl.float32)
 
@@ -621,14 +673,14 @@ def _fused_conv_bwd_dx_ln_bwd_kernel(
 
             go_nbr = tl.load(
                 grad_out_ptr + nbr * stride_t + cols * stride_c,
-                mask=valid & mask, other=0.0,
+                mask=valid & mask,
+                other=0.0,
             )
             if FP32_ACCUM:
                 go_nbr = go_nbr.to(tl.float32)
 
             # Flipped weight: K-1-k
-            w_k = tl.load(conv_w_ptr + cols * K + (K - 1 - k),
-                          mask=mask, other=0.0)
+            w_k = tl.load(conv_w_ptr + cols * K + (K - 1 - k), mask=mask, other=0.0)
             if FP32_ACCUM:
                 w_k = w_k.to(tl.float32)
 
@@ -638,8 +690,7 @@ def _fused_conv_bwd_dx_ln_bwd_kernel(
         grad_ln_out = go_self + conv_acc
 
         # ── Step 3: LN backward ──
-        x_row = tl.load(x_ptr + row_off + cols * stride_c,
-                        mask=mask, other=0.0)
+        x_row = tl.load(x_ptr + row_off + cols * stride_c, mask=mask, other=0.0)
         if FP32_ACCUM:
             x_row = x_row.to(tl.float32)
         m = tl.load(mean_ptr + row)
@@ -671,13 +722,15 @@ def _canon_ln_bwd_dw_db_partial_kernel(
     grad_out_ptr,
     x_ptr,
     seq_id_ptr,
-    mean_ptr,       # (T,) fp32
-    rstd_ptr,       # (T,) fp32
-    ln_w_ptr,       # (C,) LN gamma
+    mean_ptr,  # (T,) fp32
+    rstd_ptr,  # (T,) fp32
+    ln_w_ptr,  # (C,) LN gamma
     partial_w_ptr,  # (max_t_blocks, C * K) fp32 — pre-zeroed
     partial_b_ptr,  # (max_t_blocks, C) fp32 — pre-zeroed
-    T, C,
-    stride_t, stride_c,
+    T,
+    C,
+    stride_t,
+    stride_c,
     RADIUS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -740,6 +793,399 @@ def _canon_ln_bwd_dw_db_partial_kernel(
         tl.store(partial_w_ptr + pid_t * C * K + c_offs * K + k, pw_k, mask=c_mask)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# RMSNorm + Conv fused kernels
+#
+# RMSNorm: x * rsqrt(mean(x²) + eps) * gamma
+# Key difference from LayerNorm: no mean subtraction, no bias
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@triton.jit
+def _rms_stats_kernel(
+    x_ptr,
+    inv_rms_ptr,  # (T,) output: 1/rms per row
+    T,
+    C,
+    stride_t,
+    stride_c,
+    eps,
+    BLOCK_N: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    """One-pass RMS stats per row.  Grid = (T,).
+
+    Computes inv_rms = rsqrt(mean(x²) + eps) for each row.
+    BLOCK_N >= C (covers full hidden dim in registers).
+    """
+    row = tl.program_id(0)
+    if row >= T:
+        return
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < C
+
+    x = tl.load(x_ptr + row * stride_t + cols * stride_c, mask=mask, other=0.0)
+    if FP32_ACCUM:
+        x = x.to(tl.float32)
+
+    sum_sq = tl.sum(x * x, axis=0)
+    inv_rms = 1.0 / tl.sqrt(sum_sq / C + eps)
+
+    tl.store(inv_rms_ptr + row, inv_rms)
+
+
+@triton.jit
+def _canon_rms_fwd_kernel(
+    # Raw (un-normalized) input
+    x_ptr,
+    seq_id_ptr,
+    # RMS params / stats (pre-computed)
+    inv_rms_ptr,  # (T,)   fp32 — 1/rms per row
+    rms_w_ptr,  # (C,)   RMS gamma
+    # Conv params
+    conv_w_ptr,  # (C, K)
+    conv_b_ptr,  # (C,)
+    # Output
+    out_ptr,
+    # Dims
+    T,
+    C,
+    stride_t,
+    stride_c,
+    # Compile-time
+    RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    """out[t,c] = RMS(x)[t,c] + conv_bias[c] + Σ_k conv_w[c,k] * RMS(x)[t+k-r,c]
+
+    RMS(x)[t,c] = x[t,c] * inv_rms[t] * gamma[c]
+
+    Fuses the RMS normalize+scale into the conv forward, eliminating the
+    intermediate (T, C) RMS output tensor.
+    """
+    K: tl.constexpr = 2 * RADIUS + 1
+
+    pid_t = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    t_mask = t_offs < T
+    c_mask = c_offs < C
+
+    my_seq = tl.load(seq_id_ptr + t_offs, mask=t_mask, other=-1)
+
+    # RMS gamma — shared across all K taps, load once
+    gamma = tl.load(rms_w_ptr + c_offs, mask=c_mask, other=1.0)
+    if FP32_ACCUM:
+        gamma = gamma.to(tl.float32)
+
+    # Skip connection: RMS(x)[t, c] for the residual
+    x_self_ptrs = x_ptr + t_offs[:, None] * stride_t + c_offs[None, :] * stride_c
+    x_self = tl.load(x_self_ptrs, mask=t_mask[:, None] & c_mask[None, :], other=0.0)
+    if FP32_ACCUM:
+        x_self = x_self.to(tl.float32)
+    my_inv_rms = tl.load(inv_rms_ptr + t_offs, mask=t_mask, other=1.0)
+    if FP32_ACCUM:
+        my_inv_rms = my_inv_rms.to(tl.float32)
+    skip = x_self * my_inv_rms[:, None] * gamma[None, :]
+
+    # Conv bias
+    cb = tl.load(conv_b_ptr + c_offs, mask=c_mask, other=0.0)
+    if FP32_ACCUM:
+        cb = cb.to(tl.float32)
+
+    # Initialize accumulator with skip + bias
+    acc = skip + cb[None, :]
+
+    # Conv taps with inline RMS normalization
+    for k in tl.static_range(K):
+        offset = k - RADIUS
+        nbr_t = t_offs + offset
+        in_bounds = (nbr_t >= 0) & (nbr_t < T)
+
+        nbr_seq = tl.load(seq_id_ptr + nbr_t, mask=in_bounds & t_mask, other=-1)
+        valid = in_bounds & (my_seq == nbr_seq)
+
+        # Load raw x at neighbor position
+        x_ptrs = x_ptr + nbr_t[:, None] * stride_t + c_offs[None, :] * stride_c
+        x_val = tl.load(x_ptrs, mask=valid[:, None] & c_mask[None, :], other=0.0)
+        if FP32_ACCUM:
+            x_val = x_val.to(tl.float32)
+
+        # Inline RMS normalize (no mean subtraction)
+        nbr_inv_rms = tl.load(inv_rms_ptr + nbr_t, mask=in_bounds & t_mask, other=1.0)
+        if FP32_ACCUM:
+            nbr_inv_rms = nbr_inv_rms.to(tl.float32)
+        x_val = x_val * nbr_inv_rms[:, None] * gamma[None, :]
+        # Re-zero invalid positions
+        x_val = tl.where(valid[:, None], x_val, 0.0)
+
+        # Conv weight
+        w_k = tl.load(conv_w_ptr + c_offs * K + k, mask=c_mask, other=0.0)
+        if FP32_ACCUM:
+            w_k = w_k.to(tl.float32)
+
+        acc += x_val * w_k[None, :]
+
+    out_ptrs = out_ptr + t_offs[:, None] * stride_t + c_offs[None, :] * stride_c
+    tl.store(out_ptrs, acc, mask=t_mask[:, None] & c_mask[None, :])
+
+
+@triton.jit
+def _rms_bwd_kernel(
+    grad_rms_out_ptr,  # (T, C)
+    x_ptr,  # (T, C)
+    inv_rms_ptr,  # (T,)
+    rms_w_ptr,  # (C,)
+    grad_x_ptr,  # (T, C) output
+    partial_dgamma_ptr,  # (num_programs, C) output
+    T,
+    C,
+    stride_t,
+    stride_c,
+    rows_per_program,
+    BLOCK_N: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    """RMSNorm backward: dx per-row + partial dgamma in registers.
+
+    For RMSNorm: y = x * inv_rms * gamma
+    dy/dx = gamma * inv_rms - gamma * inv_rms^3 * x * sum(x * dy/dL * gamma) / C
+          = gamma * inv_rms * (1 - x * sum(x * dy/dL * gamma) / (rms^2 * C))
+          = gamma * inv_rms * (1 - x * inv_rms^2 * sum(x * dy/dL * gamma) / C)
+
+    Simplified: dx = inv_rms * (wdy - x * inv_rms^2 * sum(x * wdy) / C)
+    where wdy = grad_out * gamma
+
+    dgamma = sum_t(grad_out * x * inv_rms)
+
+    Grid = (num_programs,) where num_programs = SM_count * 8.
+    Each program handles ``rows_per_program`` consecutive rows.
+    """
+    pid = tl.program_id(0)
+    row_start = pid * rows_per_program
+    row_end = min(row_start + rows_per_program, T)
+
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < C
+
+    gamma = tl.load(rms_w_ptr + cols, mask=mask, other=0.0)
+    if FP32_ACCUM:
+        gamma = gamma.to(tl.float32)
+    dgamma_acc = tl.zeros((BLOCK_N,), dtype=gamma.dtype)
+
+    for row in range(row_start, row_end):
+        row_off = row * stride_t
+        gro = tl.load(
+            grad_rms_out_ptr + row_off + cols * stride_c, mask=mask, other=0.0
+        )
+        x = tl.load(x_ptr + row_off + cols * stride_c, mask=mask, other=0.0)
+        if FP32_ACCUM:
+            gro = gro.to(tl.float32)
+            x = x.to(tl.float32)
+        inv_rms = tl.load(inv_rms_ptr + row)
+        if FP32_ACCUM:
+            inv_rms = inv_rms.to(tl.float32)
+
+        # x_norm = x * inv_rms (normalized x, before gamma scaling)
+        x_norm = x * inv_rms
+        x_norm = tl.where(mask, x_norm, 0.0)
+
+        # dgamma accumulation
+        dgamma_acc += gro * x_norm
+
+        # dx computation
+        wdy = gro * gamma
+        # c1 = inv_rms^2 * sum(x * wdy) / C
+        c1 = inv_rms * inv_rms * tl.sum(x * wdy, axis=0) / C
+        dx = inv_rms * (wdy - x * c1)
+
+        tl.store(grad_x_ptr + row_off + cols * stride_c, dx, mask=mask)
+
+    tl.store(partial_dgamma_ptr + pid * C + cols, dgamma_acc, mask=mask)
+
+
+@triton.jit
+def _fused_conv_bwd_dx_rms_bwd_kernel(
+    grad_out_ptr,  # (T, C) input
+    x_ptr,  # (T, C) input
+    seq_id_ptr,  # (T,)   input
+    inv_rms_ptr,  # (T,)   input
+    rms_w_ptr,  # (C,)   input — RMS gamma
+    conv_w_ptr,  # (C, K) input — conv weight
+    grad_x_ptr,  # (T, C) output
+    partial_dgamma_ptr,  # (num_programs, C) output
+    T,
+    C,
+    stride_t,
+    stride_c,
+    rows_per_program,
+    RADIUS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    """Fused conv transpose + residual add + RMSNorm backward.
+
+    Grid = (num_programs,) where num_programs = SM_count * 8.
+    Each program handles ``rows_per_program`` consecutive rows.
+    Per row: compute conv_bwd_dx via K-tap transpose conv in registers,
+    add to grad_out for grad_rms_out, then run RMS backward for dx + dgamma.
+    """
+    K: tl.constexpr = 2 * RADIUS + 1
+
+    pid = tl.program_id(0)
+    row_start = pid * rows_per_program
+    row_end = min(row_start + rows_per_program, T)
+
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < C
+
+    gamma = tl.load(rms_w_ptr + cols, mask=mask, other=0.0)
+    if FP32_ACCUM:
+        gamma = gamma.to(tl.float32)
+    dgamma_acc = tl.zeros((BLOCK_N,), dtype=gamma.dtype)
+
+    for row in range(row_start, row_end):
+        row_off = row * stride_t
+
+        # Load grad_out for this row
+        go_self = tl.load(
+            grad_out_ptr + row_off + cols * stride_c, mask=mask, other=0.0
+        )
+        if FP32_ACCUM:
+            go_self = go_self.to(tl.float32)
+
+        my_seq = tl.load(seq_id_ptr + row)
+
+        # ── Step 1: conv_bwd_dx — transpose conv with flipped weights ──
+        conv_acc = tl.zeros((BLOCK_N,), dtype=go_self.dtype)
+        for k in tl.static_range(K):
+            offset = k - RADIUS
+            nbr = row + offset
+            in_bounds = (nbr >= 0) & (nbr < T)
+
+            nbr_seq = tl.load(seq_id_ptr + nbr, mask=in_bounds, other=-1)
+            valid = in_bounds & (my_seq == nbr_seq)
+
+            go_nbr = tl.load(
+                grad_out_ptr + nbr * stride_t + cols * stride_c,
+                mask=valid & mask,
+                other=0.0,
+            )
+            if FP32_ACCUM:
+                go_nbr = go_nbr.to(tl.float32)
+
+            # Flipped weight: K-1-k
+            w_k = tl.load(conv_w_ptr + cols * K + (K - 1 - k), mask=mask, other=0.0)
+            if FP32_ACCUM:
+                w_k = w_k.to(tl.float32)
+
+            conv_acc += go_nbr * w_k
+
+        # ── Step 2: grad_rms_out = grad_out + conv_grad (skip + conv) ──
+        grad_rms_out = go_self + conv_acc
+
+        # ── Step 3: RMS backward ──
+        x_row = tl.load(x_ptr + row_off + cols * stride_c, mask=mask, other=0.0)
+        if FP32_ACCUM:
+            x_row = x_row.to(tl.float32)
+        inv_rms = tl.load(inv_rms_ptr + row)
+        if FP32_ACCUM:
+            inv_rms = inv_rms.to(tl.float32)
+
+        x_norm = x_row * inv_rms
+        x_norm = tl.where(mask, x_norm, 0.0)
+
+        dgamma_acc += grad_rms_out * x_norm
+
+        wdy = grad_rms_out * gamma
+        c1 = inv_rms * inv_rms * tl.sum(x_row * wdy, axis=0) / C
+        dx = inv_rms * (wdy - x_row * c1)
+
+        tl.store(grad_x_ptr + row_off + cols * stride_c, dx, mask=mask)
+
+    tl.store(partial_dgamma_ptr + pid * C + cols, dgamma_acc, mask=mask)
+
+
+@triton.jit
+def _canon_rms_bwd_dw_db_partial_kernel(
+    grad_out_ptr,
+    x_ptr,
+    seq_id_ptr,
+    inv_rms_ptr,  # (T,) fp32
+    rms_w_ptr,  # (C,) RMS gamma
+    partial_w_ptr,  # (max_t_blocks, C * K) fp32 — pre-zeroed
+    partial_b_ptr,  # (max_t_blocks, C) fp32 — pre-zeroed
+    T,
+    C,
+    stride_t,
+    stride_c,
+    RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    """Conv weight/bias grads with partial-buffer reduction (no atomics).
+
+    Same 2-D (T, C) grid as the atomic version, but each T-block writes
+    its partial sums to ``partial_w[pid_t, :]`` and ``partial_b[pid_t, :]``.
+    The caller sums over dim-0 afterward.
+
+    Uses RMSNorm instead of LayerNorm for inline normalization.
+    """
+    K: tl.constexpr = 2 * RADIUS + 1
+
+    pid_t = tl.program_id(0)
+    pid_c = tl.program_id(1)
+
+    t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    t_mask = t_offs < T
+    c_mask = c_offs < C
+
+    gamma = tl.load(rms_w_ptr + c_offs, mask=c_mask, other=1.0)
+    if FP32_ACCUM:
+        gamma = gamma.to(tl.float32)
+
+    go_ptrs = grad_out_ptr + t_offs[:, None] * stride_t + c_offs[None, :] * stride_c
+    go = tl.load(go_ptrs, mask=t_mask[:, None] & c_mask[None, :], other=0.0)
+    if FP32_ACCUM:
+        go = go.to(tl.float32)
+
+    my_seq = tl.load(seq_id_ptr + t_offs, mask=t_mask, other=-1)
+
+    # Bias grad partial — store to per-block row
+    pb = tl.sum(go, axis=0)
+    tl.store(partial_b_ptr + pid_t * C + c_offs, pb, mask=c_mask)
+
+    # Weight grad partials with inline RMS recompute
+    for k in tl.static_range(K):
+        offset = k - RADIUS
+        nbr_t = t_offs + offset
+        in_bounds = (nbr_t >= 0) & (nbr_t < T)
+
+        nbr_seq = tl.load(seq_id_ptr + nbr_t, mask=in_bounds & t_mask, other=-1)
+        valid = in_bounds & (my_seq == nbr_seq)
+
+        x_ptrs = x_ptr + nbr_t[:, None] * stride_t + c_offs[None, :] * stride_c
+        x_val = tl.load(x_ptrs, mask=valid[:, None] & c_mask[None, :], other=0.0)
+        if FP32_ACCUM:
+            x_val = x_val.to(tl.float32)
+
+        # RMSNorm: x * inv_rms * gamma (no mean subtraction)
+        nbr_inv_rms = tl.load(inv_rms_ptr + nbr_t, mask=in_bounds & t_mask, other=1.0)
+        if FP32_ACCUM:
+            nbr_inv_rms = nbr_inv_rms.to(tl.float32)
+        x_val = x_val * nbr_inv_rms[:, None] * gamma[None, :]
+        x_val = tl.where(valid[:, None], x_val, 0.0)
+
+        pw_k = tl.sum(go * x_val, axis=0)
+        tl.store(partial_w_ptr + pid_t * C * K + c_offs * K + k, pw_k, mask=c_mask)
+
+
 # ── Fused LN+Conv autotune configs ─────────────────────────────────────
 
 _AUTOTUNE_LN_FWD_CONFIGS = _autotune_configs(
@@ -749,13 +1195,9 @@ _AUTOTUNE_LN_FWD_CONFIGS = _autotune_configs(
     stages=(2, 3),
 )
 
-_AUTOTUNE_LN_STATS_CONFIGS = [
-    triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
-]
+_AUTOTUNE_LN_STATS_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)]
 
-_AUTOTUNE_LN_BWD_CONFIGS = [
-    triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
-]
+_AUTOTUNE_LN_BWD_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)]
 
 _AUTOTUNE_FUSED_CONV_LN_BWD_CONFIGS = [
     triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
@@ -782,95 +1224,418 @@ _AUTOTUNE_LN_BWD_DW_DB_PARTIAL_CONFIGS = [
 ]
 
 
+# ── Fused RMS+Conv autotune configs ─────────────────────────────────────
+# Reuse the same config patterns as LN kernels
+
+_AUTOTUNE_RMS_FWD_CONFIGS = _autotune_configs(
+    block_ts=(32, 64, 128),
+    block_cs=(64, 128),
+    warps=(4, 8),
+    stages=(2, 3),
+)
+
+_AUTOTUNE_RMS_STATS_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)]
+
+_AUTOTUNE_RMS_BWD_CONFIGS = [triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)]
+
+_AUTOTUNE_FUSED_CONV_RMS_BWD_CONFIGS = [
+    triton.Config({}, num_warps=nw) for nw in (1, 2, 4, 8)
+]
+
+
+def _rms_bwd_dw_db_partial_pre_hook(nargs):
+    """Zero partial buffers before each autotune trial."""
+    nargs["partial_w_ptr"].zero_()
+    nargs["partial_b_ptr"].zero_()
+
+
+_AUTOTUNE_RMS_BWD_DW_DB_PARTIAL_CONFIGS = [
+    triton.Config(
+        {"BLOCK_T": bt, "BLOCK_C": bc},
+        num_warps=nw,
+        num_stages=ns,
+        pre_hook=_rms_bwd_dw_db_partial_pre_hook,
+    )
+    for bt in (64, 128, 256)
+    for bc in (32, 64, 128)
+    for nw in (4, 8)
+    for ns in (2, 3)
+]
+
+
 # ── Fused LN+Conv autotuned wrappers ───────────────────────────────────
 
 
 @triton.autotune(configs=_AUTOTUNE_LN_FWD_CONFIGS, key=["T", "C"], cache_results=True)
 @triton.jit
 def _canon_ln_fwd_kernel_autotuned(
-    x_ptr, seq_id_ptr, mean_ptr, rstd_ptr, ln_w_ptr,
-    conv_w_ptr, conv_b_ptr, out_ptr,
-    T, C, stride_t, stride_c,
+    x_ptr,
+    seq_id_ptr,
+    mean_ptr,
+    rstd_ptr,
+    ln_w_ptr,
+    conv_w_ptr,
+    conv_b_ptr,
+    out_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
     RADIUS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     _canon_ln_fwd_kernel(
-        x_ptr, seq_id_ptr, mean_ptr, rstd_ptr, ln_w_ptr,
-        conv_w_ptr, conv_b_ptr, out_ptr,
-        T, C, stride_t, stride_c,
-        RADIUS, BLOCK_T, BLOCK_C, FP32_ACCUM,
+        x_ptr,
+        seq_id_ptr,
+        mean_ptr,
+        rstd_ptr,
+        ln_w_ptr,
+        conv_w_ptr,
+        conv_b_ptr,
+        out_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        RADIUS,
+        BLOCK_T,
+        BLOCK_C,
+        FP32_ACCUM,
     )
 
 
 @triton.autotune(configs=_AUTOTUNE_LN_STATS_CONFIGS, key=["T", "C"], cache_results=True)
 @triton.jit
 def _ln_stats_kernel_autotuned(
-    x_ptr, mean_ptr, rstd_ptr,
-    T, C, stride_t, stride_c,
+    x_ptr,
+    mean_ptr,
+    rstd_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
     eps,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     _ln_stats_kernel(
-        x_ptr, mean_ptr, rstd_ptr,
-        T, C, stride_t, stride_c,
-        eps, BLOCK_N, FP32_ACCUM,
+        x_ptr,
+        mean_ptr,
+        rstd_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        eps,
+        BLOCK_N,
+        FP32_ACCUM,
     )
 
 
 @triton.autotune(configs=_AUTOTUNE_LN_BWD_CONFIGS, key=["T", "C"], cache_results=True)
 @triton.jit
 def _ln_bwd_kernel_autotuned(
-    grad_ln_out_ptr, x_ptr, mean_ptr, rstd_ptr, ln_w_ptr,
-    grad_x_ptr, partial_dgamma_ptr,
-    T, C, stride_t, stride_c,
+    grad_ln_out_ptr,
+    x_ptr,
+    mean_ptr,
+    rstd_ptr,
+    ln_w_ptr,
+    grad_x_ptr,
+    partial_dgamma_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
     rows_per_program,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     _ln_bwd_kernel(
-        grad_ln_out_ptr, x_ptr, mean_ptr, rstd_ptr, ln_w_ptr,
-        grad_x_ptr, partial_dgamma_ptr,
-        T, C, stride_t, stride_c,
-        rows_per_program, BLOCK_N, FP32_ACCUM,
+        grad_ln_out_ptr,
+        x_ptr,
+        mean_ptr,
+        rstd_ptr,
+        ln_w_ptr,
+        grad_x_ptr,
+        partial_dgamma_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        rows_per_program,
+        BLOCK_N,
+        FP32_ACCUM,
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_FUSED_CONV_LN_BWD_CONFIGS, key=["T", "C"], cache_results=True)
+@triton.autotune(
+    configs=_AUTOTUNE_FUSED_CONV_LN_BWD_CONFIGS, key=["T", "C"], cache_results=True
+)
 @triton.jit
 def _fused_conv_bwd_dx_ln_bwd_kernel_autotuned(
-    grad_out_ptr, x_ptr, seq_id_ptr, mean_ptr, rstd_ptr, ln_w_ptr, conv_w_ptr,
-    grad_x_ptr, partial_dgamma_ptr,
-    T, C, stride_t, stride_c,
+    grad_out_ptr,
+    x_ptr,
+    seq_id_ptr,
+    mean_ptr,
+    rstd_ptr,
+    ln_w_ptr,
+    conv_w_ptr,
+    grad_x_ptr,
+    partial_dgamma_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
     rows_per_program,
     RADIUS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     _fused_conv_bwd_dx_ln_bwd_kernel(
-        grad_out_ptr, x_ptr, seq_id_ptr, mean_ptr, rstd_ptr, ln_w_ptr, conv_w_ptr,
-        grad_x_ptr, partial_dgamma_ptr,
-        T, C, stride_t, stride_c,
-        rows_per_program, RADIUS, BLOCK_N, FP32_ACCUM,
+        grad_out_ptr,
+        x_ptr,
+        seq_id_ptr,
+        mean_ptr,
+        rstd_ptr,
+        ln_w_ptr,
+        conv_w_ptr,
+        grad_x_ptr,
+        partial_dgamma_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        rows_per_program,
+        RADIUS,
+        BLOCK_N,
+        FP32_ACCUM,
     )
 
 
-@triton.autotune(configs=_AUTOTUNE_LN_BWD_DW_DB_PARTIAL_CONFIGS, key=["T", "C"], cache_results=True)
+@triton.autotune(
+    configs=_AUTOTUNE_LN_BWD_DW_DB_PARTIAL_CONFIGS, key=["T", "C"], cache_results=True
+)
 @triton.jit
 def _canon_ln_bwd_dw_db_partial_kernel_autotuned(
-    grad_out_ptr, x_ptr, seq_id_ptr, mean_ptr, rstd_ptr, ln_w_ptr,
-    partial_w_ptr, partial_b_ptr,
-    T, C, stride_t, stride_c,
+    grad_out_ptr,
+    x_ptr,
+    seq_id_ptr,
+    mean_ptr,
+    rstd_ptr,
+    ln_w_ptr,
+    partial_w_ptr,
+    partial_b_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
     RADIUS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_C: tl.constexpr,
     FP32_ACCUM: tl.constexpr,
 ):
     _canon_ln_bwd_dw_db_partial_kernel(
-        grad_out_ptr, x_ptr, seq_id_ptr, mean_ptr, rstd_ptr, ln_w_ptr,
-        partial_w_ptr, partial_b_ptr,
-        T, C, stride_t, stride_c,
-        RADIUS, BLOCK_T, BLOCK_C, FP32_ACCUM,
+        grad_out_ptr,
+        x_ptr,
+        seq_id_ptr,
+        mean_ptr,
+        rstd_ptr,
+        ln_w_ptr,
+        partial_w_ptr,
+        partial_b_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        RADIUS,
+        BLOCK_T,
+        BLOCK_C,
+        FP32_ACCUM,
+    )
+
+
+# ── Fused RMS+Conv autotuned wrappers ───────────────────────────────────
+
+
+@triton.autotune(
+    configs=_AUTOTUNE_RMS_STATS_CONFIGS, key=["T", "C"], cache_results=True
+)
+@triton.jit
+def _rms_stats_kernel_autotuned(
+    x_ptr,
+    inv_rms_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
+    eps,
+    BLOCK_N: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    _rms_stats_kernel(
+        x_ptr,
+        inv_rms_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        eps,
+        BLOCK_N,
+        FP32_ACCUM,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_RMS_FWD_CONFIGS, key=["T", "C"], cache_results=True)
+@triton.jit
+def _canon_rms_fwd_kernel_autotuned(
+    x_ptr,
+    seq_id_ptr,
+    inv_rms_ptr,
+    rms_w_ptr,
+    conv_w_ptr,
+    conv_b_ptr,
+    out_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
+    RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    _canon_rms_fwd_kernel(
+        x_ptr,
+        seq_id_ptr,
+        inv_rms_ptr,
+        rms_w_ptr,
+        conv_w_ptr,
+        conv_b_ptr,
+        out_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        RADIUS,
+        BLOCK_T,
+        BLOCK_C,
+        FP32_ACCUM,
+    )
+
+
+@triton.autotune(configs=_AUTOTUNE_RMS_BWD_CONFIGS, key=["T", "C"], cache_results=True)
+@triton.jit
+def _rms_bwd_kernel_autotuned(
+    grad_rms_out_ptr,
+    x_ptr,
+    inv_rms_ptr,
+    rms_w_ptr,
+    grad_x_ptr,
+    partial_dgamma_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
+    rows_per_program,
+    BLOCK_N: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    _rms_bwd_kernel(
+        grad_rms_out_ptr,
+        x_ptr,
+        inv_rms_ptr,
+        rms_w_ptr,
+        grad_x_ptr,
+        partial_dgamma_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        rows_per_program,
+        BLOCK_N,
+        FP32_ACCUM,
+    )
+
+
+@triton.autotune(
+    configs=_AUTOTUNE_FUSED_CONV_RMS_BWD_CONFIGS, key=["T", "C"], cache_results=True
+)
+@triton.jit
+def _fused_conv_bwd_dx_rms_bwd_kernel_autotuned(
+    grad_out_ptr,
+    x_ptr,
+    seq_id_ptr,
+    inv_rms_ptr,
+    rms_w_ptr,
+    conv_w_ptr,
+    grad_x_ptr,
+    partial_dgamma_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
+    rows_per_program,
+    RADIUS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    _fused_conv_bwd_dx_rms_bwd_kernel(
+        grad_out_ptr,
+        x_ptr,
+        seq_id_ptr,
+        inv_rms_ptr,
+        rms_w_ptr,
+        conv_w_ptr,
+        grad_x_ptr,
+        partial_dgamma_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        rows_per_program,
+        RADIUS,
+        BLOCK_N,
+        FP32_ACCUM,
+    )
+
+
+@triton.autotune(
+    configs=_AUTOTUNE_RMS_BWD_DW_DB_PARTIAL_CONFIGS, key=["T", "C"], cache_results=True
+)
+@triton.jit
+def _canon_rms_bwd_dw_db_partial_kernel_autotuned(
+    grad_out_ptr,
+    x_ptr,
+    seq_id_ptr,
+    inv_rms_ptr,
+    rms_w_ptr,
+    partial_w_ptr,
+    partial_b_ptr,
+    T,
+    C,
+    stride_t,
+    stride_c,
+    RADIUS: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    FP32_ACCUM: tl.constexpr,
+):
+    _canon_rms_bwd_dw_db_partial_kernel(
+        grad_out_ptr,
+        x_ptr,
+        seq_id_ptr,
+        inv_rms_ptr,
+        rms_w_ptr,
+        partial_w_ptr,
+        partial_b_ptr,
+        T,
+        C,
+        stride_t,
+        stride_c,
+        RADIUS,
+        BLOCK_T,
+        BLOCK_C,
+        FP32_ACCUM,
     )

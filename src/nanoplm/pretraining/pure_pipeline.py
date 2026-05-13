@@ -11,7 +11,12 @@ import os
 import yaml
 from copy import deepcopy
 from dataclasses import asdict
-from dion import Muon,NorMuon
+try:
+    from dion import Muon, NorMuon, MuonH
+except ImportError:
+    Muon = None  # type: ignore[assignment,misc]
+    NorMuon = None  # type: ignore[assignment,misc]
+    MuonH = None  # type: ignore[assignment,misc]
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -73,6 +78,7 @@ from nanoplm.pretraining.utils import (
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
+from nanoplm.pretraining.debug_metrics import LayerwiseDebugTracker
 
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
@@ -83,7 +89,7 @@ torch.backends.cudnn.allow_tf32 = True
 H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
-N_PREFETCH_LAYERS_FSDP2 = 2
+N_PREFETCH_LAYERS_FSDP2 = 1
 
 
 # ---------------------------------------------------------------------------
@@ -217,12 +223,14 @@ def _split_packed_batch(
         e = int(cu[end_seq].item())
         actual_tokens = e - s
         pad_tokens = effective_tokens_per_split - actual_tokens
+        sub_cu = cu[start_seq : end_seq + 1] - cu[start_seq]
+        actual_max_seqlen = int((sub_cu[1:] - sub_cu[:-1]).max().item())
 
         sub = {
             "input_ids": batch["input_ids"].new_zeros(effective_tokens_per_split),
             "labels": batch["labels"].new_full((effective_tokens_per_split,), -100),
-            "cu_seqlens": cu[start_seq : end_seq + 1] - cu[start_seq],
-            "max_seqlen": batch["max_seqlen"],
+            "cu_seqlens": sub_cu,
+            "max_seqlen": max(actual_max_seqlen, pad_tokens),
             "num_valid_tokens": actual_tokens,
         }
         if actual_tokens > effective_tokens_per_split:
@@ -492,6 +500,7 @@ def _fully_shard_encoder_sublayers(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
     shard_parent: bool = True,
     sublayer: bool = False,
 ) -> None:
@@ -503,11 +512,11 @@ def _fully_shard_encoder_sublayers(
     less CPU dispatch overhead — better on fast interconnects like NVLink).
     """
     if sublayer:
-        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
         if enc.mlp is not None:
-            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
     if shard_parent:
-        fully_shard(enc, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(enc, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_transformer_layer(
@@ -515,6 +524,7 @@ def _fully_shard_transformer_layer(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
     sublayer: bool = False,
 ) -> None:
     """Shard one logical transformer layer bottom-up for better overlap."""
@@ -523,24 +533,32 @@ def _fully_shard_transformer_layer(
             layer,
             mesh=mesh,
             fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
             shard_parent=False,
             sublayer=sublayer,
         )
     elif isinstance(layer, MHCLiteBlock):
-        _fully_shard_encoder_sublayers(layer.layer, mesh=mesh, fsdp_kwargs=fsdp_kwargs, sublayer=sublayer)
+        _fully_shard_encoder_sublayers(
+            layer.layer,
+            mesh=mesh,
+            fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
+            sublayer=sublayer,
+        )
     elif isinstance(layer, MHCLiteSublayersLayer):
         _fully_shard_encoder_sublayers(
             layer.enc,
             mesh=mesh,
             fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=reshard_after_forward,
             shard_parent=False,
             sublayer=sublayer,
         )
         if sublayer:
-            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
             if layer.mhc_mlp is not None:
-                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(layer, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(layer, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_root_groups(
@@ -548,6 +566,7 @@ def _fully_shard_root_groups(
     *,
     mesh,
     fsdp_kwargs: dict,
+    reshard_after_forward: bool,
 ) -> None:
     """Split root-only params into separate groups to avoid a serialized root tail."""
     tied_embeddings = model.decoder.weight is model.model.embeddings.tok_embeddings.weight
@@ -556,14 +575,14 @@ def _fully_shard_root_groups(
         fully_shard(
             [model.model.embeddings, model.decoder],
             mesh=mesh,
-            reshard_after_forward=False,
+            reshard_after_forward=reshard_after_forward,
             **fsdp_kwargs,
         )
     else:
-        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
-    fully_shard(model.head, mesh=mesh, reshard_after_forward=False, **fsdp_kwargs)
+        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    fully_shard(model.head, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _has_nonfinite_tensors(tensors: list[torch.Tensor]) -> bool:
@@ -783,10 +802,41 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
     # swiglu/glu: Wi is h -> 2*ff, Wo is ff -> h => 2*h*2*ff + 2*ff*h = 6*h*ff
     # srelu:      Wi is h -> ff,   Wo is ff -> h => 2*h*ff   + 2*ff*h = 4*h*ff
     if config.mlp_activation == "srelu":
-        mlp_flops_per_layer = 4 * h * ff
+        dense_mlp_flops = 4 * h * ff
     else:
-        mlp_flops_per_layer = 6 * h * ff
-    mlp_flops = n_layers * mlp_flops_per_layer
+        dense_mlp_flops = 6 * h * ff
+
+    no_mlp_first = getattr(config, "no_mlp_on_first_layer", False)
+    use_moe = getattr(config, "use_moe", False)
+    if use_moe:
+        # MoE active FLOPs per token per MoE layer:
+        #  - Router gate: h -> num_experts (2 * h * E)
+        #  - Routed experts: top_k experts, each SwiGLU with ff intermediate
+        #      Wi: h -> 2*ff, Wo: ff -> h => top_k * 6 * h * ff
+        #  - Shared expert: same as one dense MLP => 6 * h * ff (or 4 for srelu)
+        moe_top_k = config.moe_top_k
+        moe_E = config.moe_num_experts
+        router_flops = 2 * h * moe_E
+        routed_flops = moe_top_k * dense_mlp_flops
+        shared_flops = dense_mlp_flops
+        moe_mlp_flops = router_flops + routed_flops + shared_flops
+
+        # Dense layers in MoE mode use the full active intermediate size.
+        dense_ff = config.moe_dense_intermediate_size
+        if config.mlp_activation == "srelu":
+            moe_dense_mlp_flops = 4 * h * dense_ff
+        else:
+            moe_dense_mlp_flops = 6 * h * dense_ff
+
+        moe_flags = config.moe_layer_flags
+        mlp_flops = sum(
+            0 if (no_mlp_first and i == 0) else
+            (moe_mlp_flops if moe_flags[i] else moe_dense_mlp_flops)
+            for i in range(n_layers)
+        )
+    else:
+        n_mlp_layers = (n_layers - 1) if no_mlp_first else n_layers
+        mlp_flops = n_mlp_layers * dense_mlp_flops
 
     # -- LM head (decoder): h -> V --
     # Not counted when tied (it's the same weight as embedding), but the matmul
@@ -857,19 +907,51 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
 
 def _create_optimizer(model, cfg, distributed_mesh=None):
     name = str(cfg.optimizer).lower()
-    if name in {"muon", "normuon"}:
+    if name in {"muon", "normuon", "muonh"}:
         return build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
+    from nanoplm.pretraining.optim import _classify_noble_param
+
     decay, no_decay = [], []
+    noble_wup, noble_M, noble_freq, noble_phase = [], [], [], []
     for p_name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        (decay if _use_weight_decay(p_name, param) else no_decay).append(param)
+        noble_kind = _classify_noble_param(p_name)
+        if noble_kind is not None:
+            {"wup": noble_wup, "M": noble_M,
+             "freq": noble_freq, "phase": noble_phase}[noble_kind].append(param)
+        else:
+            (decay if _use_weight_decay(p_name, param) else no_decay).append(param)
 
     groups = [
         {"params": decay, "weight_decay": float(cfg.adam_weight_decay)},
         {"params": no_decay, "weight_decay": 0.0},
     ]
+
+    # NOBLE param groups with elevated LRs (paper §3.3)
+    noble_total = len(noble_wup) + len(noble_M) + len(noble_freq) + len(noble_phase)
+    if noble_total > 0:
+        raw = model.module if hasattr(model, "module") else model
+        hidden_size = getattr(getattr(raw, "config", None), "hidden_size", None)
+        noble_rank = getattr(getattr(raw, "config", None), "noble_rank", None)
+        if hidden_size is None or noble_rank is None:
+            raise ValueError("Cannot determine hidden_size/noble_rank for NOBLE LR scaling.")
+        base_lr = cfg.noble_base_lr
+        ratio = hidden_size / noble_rank
+        wd = float(cfg.adam_weight_decay)
+        betas = (float(cfg.adam_beta1), float(cfg.adam_beta2))
+        eps = float(cfg.adam_epsilon)
+        for params, lr in [
+            (noble_wup, base_lr * (ratio ** (2 * cfg.noble_lr_gamma))),
+            (noble_M, base_lr * (ratio ** cfg.noble_lr_gamma_M)),
+            (noble_freq, base_lr * cfg.noble_freq_lr_mult),
+            (noble_phase, base_lr * cfg.noble_phase_lr_mult),
+        ]:
+            if params:
+                groups.append({"params": params, "lr": lr, "weight_decay": wd,
+                               "betas": betas, "eps": eps})
+
     kwargs = dict(
         params=groups,
         lr=float(cfg.adam_learning_rate),
@@ -885,7 +967,7 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
             logger.warning("StableAdamW unavailable; falling back to AdamW.")
             return torch.optim.AdamW(**kwargs)
         return cls(**kwargs)
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon]")
+    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon, muonh]")
 
 
 class _SchedulerGroup:
@@ -1195,6 +1277,7 @@ def _save_checkpoint(
     # original pretrain.yaml or dataset directory).
     if model_config is not None:
         cfg_dict = asdict(model_config) if hasattr(model_config, '__dataclass_fields__') else dict(model_config)
+        cfg_dict = json.loads(json.dumps(cfg_dict))  # tuples → lists; avoids !!python/tuple tags
         with open(ckpt / "model_config.yaml", "w") as f:
             yaml.dump(cfg_dict, f, default_flow_style=False, sort_keys=False)
     if manifest is not None:
@@ -1450,7 +1533,7 @@ def _rebuild_scheduler_for_resume(
             pg["lr"] = eff_muon_lr
         for pg in optimizer.adamw.param_groups:
             pg["lr"] = eff_lr
-    elif isinstance(optimizer, (Muon, NorMuon)):
+    elif isinstance(optimizer, (Muon, NorMuon, MuonH) if MuonH is not None else (Muon, NorMuon)):
         # group[0] = muon, group[1+] = adamw / scalar
         optimizer.param_groups[0]["lr"] = eff_muon_lr
         for pg in optimizer.param_groups[1:]:
@@ -1558,6 +1641,13 @@ def run_pure_pretraining(
     use_packing = bool(pretrain_config.use_packing)
     use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
 
+    # MoE guard rails.
+    if getattr(model.config, "use_moe", False):
+        if not use_packing:
+            raise ValueError("MoE requires use_packing=True")
+        if not use_static_inp_size:
+            raise ValueError("MoE requires use_static_inp_size=True")
+
     # ---- Batch sizing ----
     create_dirs(pretrain_config.ckp_dir)
     effective_world_size = _resolve_world_size(pretrain_config)
@@ -1646,6 +1736,7 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         if use_static_inp_size:
             min_tokens_per_seq = max(
@@ -1687,6 +1778,7 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
 
@@ -1720,10 +1812,22 @@ def run_pure_pretraining(
             fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
         fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
+        fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
         for layer in base_model.model.layers:
-            _fully_shard_transformer_layer(layer, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs, sublayer=fsdp_sublayer)
-        _fully_shard_root_groups(base_model, mesh=fsdp_mesh, fsdp_kwargs=fsdp_kwargs)
-        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+            _fully_shard_transformer_layer(
+                layer,
+                mesh=fsdp_mesh,
+                fsdp_kwargs=fsdp_kwargs,
+                reshard_after_forward=fsdp_reshard_after_forward,
+                sublayer=fsdp_sublayer,
+            )
+        _fully_shard_root_groups(
+            base_model,
+            mesh=fsdp_mesh,
+            fsdp_kwargs=fsdp_kwargs,
+            reshard_after_forward=fsdp_reshard_after_forward,
+        )
+        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
         optimizer_dist = fsdp_mesh
 
         # Explicit prefetching for FSDP2
@@ -1797,6 +1901,7 @@ def run_pure_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
+        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
     )
 
     dl_kwargs = dict(
@@ -1937,7 +2042,7 @@ def run_pure_pretraining(
             wandb.init(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
-                config={"pretrain": pretrain_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
@@ -2048,6 +2153,23 @@ def run_pure_pretraining(
     pending_compile_rebuild = False
     pending_compile_target_divisor = mbs_divisor
     accum_loss = torch.zeros((), device=device)
+    # MoE routing bias update state.
+    _moe_layers: list = []
+    _moe_bias_lr = float(getattr(_cfg, "moe_bias_update_rate", 1e-3))
+    if getattr(orig_model.config, "use_moe", False) and getattr(orig_model.config, "moe_use_bias_correction", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        _moe_layers = [
+            m for m in orig_model.modules() if isinstance(m, _MoELayer)
+        ]
+        if _moe_layers:
+            _moe_num_experts = _moe_layers[0].num_experts
+            _moe_count_accum = torch.zeros(
+                len(_moe_layers), _moe_num_experts, device=device,
+            )
+            logger.info(
+                f"MoE routing bias correction enabled: "
+                f"{len(_moe_layers)} MoE layers, {_moe_num_experts} experts"
+            )
     window_loss = torch.zeros((), device=device)
     window_steps = 0
     discard_accumulation = False
@@ -2056,7 +2178,24 @@ def run_pure_pretraining(
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
-
+    debug_layerwise_enabled = bool(getattr(pretrain_config, "debug_layerwise_metrics", False))
+    debug_tracker: LayerwiseDebugTracker | None = None
+    if debug_layerwise_enabled:
+        if is_main:
+            logger.warning(
+                "debug_layerwise_metrics=True: forward hooks will be installed on "
+                "every transformer block and the lm_head. If torch.compile is "
+                "enabled, expect graph breaks at those boundaries (5-20%% throughput "
+                "regression typical)."
+            )
+        debug_tracker = LayerwiseDebugTracker(
+            model=orig_model,
+            log_every=int(getattr(pretrain_config, "debug_layerwise_log_every", 20)),
+            device=device,
+            output_dir=output_dir,
+            is_main=is_main,
+            distributed=bool(distributed and dist.is_initialized()),
+        )
     epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
@@ -2230,7 +2369,7 @@ def run_pure_pretraining(
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
-                        if not torch.isfinite(loss.detach()).all():
+                        if debug_non_finite_params and not torch.isfinite(loss.detach()).all():
                             rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                             logger.error(
                                 "Skipping optimizer step %d due to non-finite loss on rank %d "
@@ -2239,6 +2378,8 @@ def run_pure_pretraining(
                             )
                             optimizer.zero_grad(set_to_none=True)
                             accum_loss.zero_()
+                            if _moe_layers:
+                                _moe_count_accum.zero_()
                             if at_accum_boundary:
                                 accum_micro_count = 0
                             else:
@@ -2253,6 +2394,12 @@ def run_pure_pretraining(
 
                     accum_loss = accum_loss + loss.detach()
 
+                    # Accumulate MoE expert counts for routing bias update.
+                    if _moe_layers:
+                        for j, moe_layer in enumerate(_moe_layers):
+                            if moe_layer.last_expert_counts is not None:
+                                _moe_count_accum[j] += moe_layer.last_expert_counts.float()
+
                     if not at_accum_boundary:
                         continue
 
@@ -2262,6 +2409,8 @@ def run_pure_pretraining(
                             scaler.unscale_(optimizer.adamw)
                         else:
                             scaler.unscale_(optimizer)
+                    if debug_tracker is not None and debug_tracker.should_flush(upcoming_step):
+                        debug_tracker.record_step_boundary()
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         orig_model.parameters(),
                         max_norm=max_grad_norm,
@@ -2293,7 +2442,7 @@ def run_pure_pretraining(
                     if isinstance(optimizer, MuonAdamWGroup):
                         muon_lr = optimizer.muon.param_groups[0]["lr"]
                         learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                    elif isinstance(optimizer, (Muon, NorMuon)):
+                    elif isinstance(optimizer, (Muon, NorMuon, MuonH) if MuonH is not None else (Muon, NorMuon)):
                         muon_lr = optimizer.param_groups[0]["lr"]
                         learning_rate = optimizer.param_groups[1]["lr"]
                     else:
@@ -2303,6 +2452,31 @@ def run_pure_pretraining(
                     if not step_skipped:
                         scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    # MoE routing bias correction: update after each optimizer step.
+                    if _moe_layers:
+                        if not step_skipped:
+                            with torch.no_grad():
+                                # All-reduce counts across ranks for global view.
+                                if distributed and dist.is_initialized():
+                                    dist.all_reduce(_moe_count_accum, op=dist.ReduceOp.SUM)
+                                for j, moe_layer in enumerate(_moe_layers):
+                                    counts_j = _moe_count_accum[j]
+                                    # Keep the update branchless so we never materialize
+                                    # a CUDA scalar on CPU via `if total > 0`.
+                                    total = counts_j.sum().clamp_min(1.0)
+                                    target = total / _moe_num_experts
+                                    # Nudge bias: positive for underused, negative for overused.
+                                    # correction_bias is a registered buffer (not a
+                                    # parameter), so FSDP won't shard it.
+                                    delta = _moe_bias_lr * (target - counts_j) / target
+                                    # Zero-mean: keep bias vector centered (Ling-V2 style).
+                                    # When counts are all zero, this naturally becomes all-zero.
+                                    delta = delta - delta.mean()
+                                    moe_layer.router.correction_bias.add_(
+                                        delta.to(moe_layer.router.correction_bias.device)
+                                    )
+                        _moe_count_accum.zero_()
 
                     global_step += 1
                     profiler_step_cb(global_step)
@@ -2427,6 +2601,14 @@ def run_pure_pretraining(
                                 wandb_enabled = False
                                 logger.warning(f"W&B log failed; disabling. Error: {exc}")
 
+                    if debug_tracker is not None and debug_tracker.should_flush(global_step):
+                        debug_payload = debug_tracker.flush(global_step)
+                        if is_main and debug_payload is not None and wandb_enabled and wandb.run is not None:
+                            try:
+                                wandb.log({**debug_payload, "train/global_step": global_step})
+                            except Exception as exc:
+                                logger.warning(f"W&B debug log failed: {exc}")
+
                     if first_step_of_run:
                         first_step_of_run = False
                         gc.collect(); gc.freeze(); gc.disable()
@@ -2522,6 +2704,9 @@ def run_pure_pretraining(
         total_steps=total_steps, warmup_steps=warmup_steps,
         dataset_fingerprint=_dataset_fingerprint,
     )
+
+    if debug_tracker is not None:
+        debug_tracker.close()
 
     if is_main and wandb_enabled and wandb.run is not None:
         try:

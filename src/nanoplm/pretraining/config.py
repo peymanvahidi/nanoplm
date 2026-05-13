@@ -39,6 +39,10 @@ class PretrainingConfig:
     muon_momentum: float = 0.95
     muon_nesterov: bool = True
     muon_eps: float = 1e-7
+    # MuonH-specific. Only used when optimizer == "muonh".
+    # 'neuron' normalizes along the last axis; 'short_axis' along the shorter
+    # matrix axis. Set to "none" to disable update normalization in MuonH.
+    muonh_normalization: str = "neuron"
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_size: int = 256000
@@ -64,6 +68,8 @@ class PretrainingConfig:
     save_steps: int = 5000
     seed: int = 42
     debug_non_finite_params: bool = True
+    debug_layerwise_metrics: bool = False
+    debug_layerwise_log_every: int = 20
 
     # Data loading
     num_workers: Union[int, str] = "auto"
@@ -107,8 +113,17 @@ class PretrainingConfig:
     # NVLink/SXM); "sublayer" wraps attn & mlp separately (more boundaries, but
     # finer-grained comm/compute overlap — better for slow interconnects like PCIe).
     fsdp_shard_granularity: str = "layer"
+    fsdp_reshard_after_forward: bool = False
     ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
+    run_name: str = "run"
+
+    # NOBLE optimizer LR scaling (paper §3.3, Appendix A)
+    noble_base_lr: float = 3e-4          # independent base LR for NOBLE branch params
+    noble_lr_gamma: float = 0.3          # W_up LR power: actual exponent = 2γ = 0.6
+    noble_lr_gamma_M: float = 0.45       # M mixing matrix LR power
+    noble_freq_lr_mult: float = 3.0      # ω frequency LR multiplier
+    noble_phase_lr_mult: float = 5.0     # φ phase LR multiplier
 
 
 @dataclass

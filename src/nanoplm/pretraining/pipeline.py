@@ -175,6 +175,7 @@ def run_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
+        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
     )
 
     create_dirs(pretrain_config.ckp_dir)
@@ -267,12 +268,12 @@ def run_pretraining(
             betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
             eps=pretrain_config.adam_epsilon,
         )
-    elif optimizer_name in {"muon", "normuon"}:
+    elif optimizer_name in {"muon", "normuon", "muonh"}:
         optimizer = build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
             f"Invalid optimizer: {pretrain_config.optimizer}. "
-            f"Currently supported: [adamw, stable_adamw, muon, normuon]"
+            f"Currently supported: [adamw, stable_adamw, muon, normuon, muonh]"
         )
 
     scheduler = _create_scheduler(

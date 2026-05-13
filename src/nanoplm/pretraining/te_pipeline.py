@@ -16,7 +16,11 @@ import torch
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 import wandb
-from dion import Muon as DionMuon, NorMuon as DionNorMuon
+try:
+    from dion import Muon as DionMuon, NorMuon as DionNorMuon
+except ImportError:
+    class DionMuon: pass      # sentinel – isinstance() safely returns False
+    class DionNorMuon: pass
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -414,9 +418,10 @@ def run_te_pretraining(
                 reduce_dtype=torch.float32,
             )
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
+        fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
         for layer in base_model.model.layers:
-            fully_shard(layer, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
-        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=False, **fsdp_kwargs)
+            fully_shard(layer, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
+        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
         optimizer_dist = fsdp_mesh
 
         # FSDP2 Explicit Prefetching
@@ -462,6 +467,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
         if use_static_inp_size:
             assert tokens_per_micro == pack_tokens_per_micro
@@ -500,6 +506,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
     else:
         train_sampler = RandomSampler(train_ds)
@@ -509,6 +516,7 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
+            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
         )
 
     # Keep orig_model reference for checkpointing/eval.
@@ -533,6 +541,7 @@ def run_te_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
+        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
     )
     dl_kwargs = dict(
         num_workers=num_workers,
@@ -667,6 +676,7 @@ def run_te_pretraining(
                 name=wandb_run_name,
                 config={
                     "pretrain": pretrain_config.__dict__,
+                    "model": model.model_config.__dict__,
                     "total_steps": total_steps,
                     "warmup_steps": warmup_steps,
                 },
@@ -909,7 +919,7 @@ def run_te_pretraining(
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
-                        if not torch.isfinite(loss.detach()).all():
+                        if debug_non_finite_params and not torch.isfinite(loss.detach()).all():
                             rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                             logger.error(
                                 "Skipping optimizer step %d due to non-finite loss on rank %d (epoch=%d data_step=%d sub_batch=%d).",

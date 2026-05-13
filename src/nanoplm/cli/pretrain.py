@@ -25,6 +25,7 @@ import torch
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
+
 _TE_IMPORT_ERROR = None
 try:
     from nanoplm.pretraining.te_pipeline import run_te_pretraining
@@ -36,15 +37,23 @@ except Exception as exc:  # pragma: no cover - depends on TE/FA availability
             "Transformer Engine pretraining requested but unavailable in this environment."
         ) from _TE_IMPORT_ERROR
 
-from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM, ProtModernBertMLMConfig
-from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM, TEProtModernBertMLM
+
+from nanoplm.pretraining.models.modern_bert.model import (
+    ProtModernBertMLM,
+    ProtModernBertMLMConfig,
+)
+from nanoplm.pretraining.models.modern_bert.pure_model import (
+    PureProtModernBertMLM,
+    TEProtModernBertMLM,
+)
 from nanoplm.data.validation import validate_pretrain_dataset
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
+
 def _check_muon_available(optimizer: str) -> None:
     """Abort early when a Muon variant is requested but ``dion`` is not installed."""
-    if optimizer.lower() in {"muon", "normuon"}:
+    if optimizer.lower() in {"muon", "normuon", "muonh"}:
         try:
             import dion  # noqa: F401
         except ImportError:
@@ -52,7 +61,8 @@ def _check_muon_available(optimizer: str) -> None:
                 f"Optimizer '{optimizer}' requires the 'dion' package which is not installed.\n"
                 "Install it with:  pip install nanoplm[cuda]"
             )
-            
+
+
 def _set_seed_for_init(seed: int) -> None:
     """Set seed before model creation so both pipelines start with identical weights."""
     random.seed(seed)
@@ -93,7 +103,9 @@ def _populate_batch_setup(cfg: PretrainingConfig) -> None:
         1,
         math.ceil(cfg.global_batch_size / world_tokens_per_micro_step),
     )
-    achieved_global_batch_tokens = inferred_grad_accum_steps * world_tokens_per_micro_step
+    achieved_global_batch_tokens = (
+        inferred_grad_accum_steps * world_tokens_per_micro_step
+    )
     global_batch_size_samples = (
         inferred_grad_accum_steps * cfg.micro_batch_size * effective_world_size
     )
@@ -126,38 +138,64 @@ def _validate_distributed_mode(
         return
     if cfg.distributed_mode == "ddp" and not cfg.multi_gpu:
         raise click.ClickException("distributed_mode=ddp requires multi_gpu=true.")
+    if cfg.distributed_mode != "fsdp" and cfg.fsdp_reshard_after_forward:
+        raise click.ClickException(
+            "fsdp_reshard_after_forward applies only when distributed_mode=fsdp."
+        )
     if cfg.distributed_mode != "ddp" and cfg.ddp_bucket_cap_mb != 25:
         raise click.ClickException(
             "ddp_bucket_cap_mb applies only when distributed_mode=ddp."
         )
 
+
+def _validate_muonh_wo_init_compat(
+    pretrain_cfg: PretrainingConfig,
+    model_cfg: ProtModernBertMLMConfig,
+) -> None:
+    optimizer = str(pretrain_cfg.optimizer).strip().lower()
+    wo_init = str(getattr(model_cfg, "wo_init", "zero")).strip().lower()
+    if optimizer == "muonh" and wo_init == "zero":
+        raise click.ClickException(
+            "optimizer=muonh is incompatible with model.wo_init='zero'. "
+            "MuonH initializes each matrix hyperball radius from ||W_init||_F, "
+            "so zero-initialized Wo matrices are locked at zero. "
+            "Set model.wo_init='kaiming' (or --wo-init kaiming)."
+        )
+
+
+def _validate_debug_layerwise_metrics_compat(
+    cfg: PretrainingConfig,
+    *,
+    pure_te: bool,
+) -> None:
+    if pure_te and cfg.debug_layerwise_metrics:
+        raise click.ClickException(
+            "debug_layerwise_metrics is not supported with --pure-te / pure_te: true. "
+            "Use the pure-torch path for layerwise debug hooks, or disable debug_layerwise_metrics."
+        )
+
+
 @click.group(name="pretrain")
-@click.help_option(
-    "--help",
-    "-h"
-)
+@click.help_option("--help", "-h")
 def pretrain():
     """Group of commands for model pretraining."""
     pass
 
 
 @pretrain.command("run")
-@click.help_option(
-    "--help",
-    "-h"
-)
+@click.help_option("--help", "-h")
 # Dataset and output
 @click.option(
     "--dataset-dir",
     type=str,
     required=True,
-    help="Path to dataset directory containing .data_manifest (from nanoplm data from-yaml)"
+    help="Path to dataset directory containing .data_manifest (from nanoplm data from-yaml)",
 )
 @click.option(
     "--ckp-dir",
     type=str,
     default="output/pretraining_checkpoints",
-    help="Checkpoint directory"
+    help="Checkpoint directory",
 )
 # Training hyperparameters
 @click.option(
@@ -166,23 +204,18 @@ def pretrain():
     default=64,
     help="Per-device micro-batch size (samples per GPU per forward pass)",
 )
-@click.option(
-    "--num-epochs",
-    type=int,
-    default=10,
-    help="Number of epochs"
-)
+@click.option("--num-epochs", type=int, default=10, help="Number of epochs")
 @click.option(
     "--adam-learning-rate",
     type=float,
     default=1e-4,
-    help="AdamW learning rate (Muon uses --muon-learning-rate)"
+    help="AdamW learning rate (Muon uses --muon-learning-rate)",
 )
 @click.option(
     "--adam-weight-decay",
     type=float,
     default=0.0,
-    help="AdamW weight decay (Muon uses --muon-weight-decay)"
+    help="AdamW weight decay (Muon uses --muon-weight-decay)",
 )
 @click.option(
     "--gradient-clipping/--no-gradient-clipping",
@@ -200,26 +233,26 @@ def pretrain():
     type=int,
     default=None,
     help="Number of optimizer steps before enabling RePO RoPE offsets (pure-torch only). "
-         "If unset, defaults to --warmup-steps.",
+    "If unset, defaults to --warmup-steps.",
 )
 @click.option(
     "--batch-size-warmup-steps",
     type=int,
     default=0,
     help="Optimizer steps to ramp effective batch size from 1/8 to full by reducing "
-         "grad accumulation first, then splitting DataLoader batches when needed.",
+    "grad accumulation first, then splitting DataLoader batches when needed.",
 )
 @click.option(
     "--lr-decay-to-fraction",
     type=float,
     default=0.1,
-    help="Fraction of peak learning rate to decay to"
+    help="Fraction of peak learning rate to decay to",
 )
 @click.option(
     "--lr-schedule",
     type=click.Choice(["linear", "cosine"], case_sensitive=False),
     default="cosine",
-    help="Learning rate schedule to use after warmup"
+    help="Learning rate schedule to use after warmup",
 )
 @click.option(
     "--global-batch-size",
@@ -229,28 +262,15 @@ def pretrain():
 )
 @click.option(
     "--optimizer",
-    type=click.Choice(["adamw", "stable_adamw", "muon", "normuon"], case_sensitive=False),
+    type=click.Choice(
+        ["adamw", "stable_adamw", "muon", "normuon", "muonh"], case_sensitive=False
+    ),
     default="normuon",
-    help="Optimizer to use"
+    help="Optimizer to use",
 )
-@click.option(
-    "--adam-beta1",
-    type=float,
-    default=0.9,
-    help="Adam beta1"
-)
-@click.option(
-    "--adam-beta2",
-    type=float,
-    default=0.999,
-    help="Adam beta2"
-)
-@click.option(
-    "--adam-epsilon",
-    type=float,
-    default=1e-8,
-    help="Adam epsilon"
-)
+@click.option("--adam-beta1", type=float, default=0.9, help="Adam beta1")
+@click.option("--adam-beta2", type=float, default=0.999, help="Adam beta2")
+@click.option("--adam-epsilon", type=float, default=1e-8, help="Adam epsilon")
 @click.option(
     "--muon-learning-rate",
     type=float,
@@ -291,39 +311,43 @@ def pretrain():
     help="Muon epsilon (used only when optimizer=muon or normuon)",
 )
 @click.option(
-    "--mlm-probability",
-    type=float,
-    default=0.3,
-    help="MLM probability"
+    "--muonh-normalization",
+    type=click.Choice(["neuron", "short_axis", "none"], case_sensitive=False),
+    default="neuron",
+    help="MuonH update normalization (used only when optimizer=muonh): "
+    "'neuron' = per-row, 'short_axis' = along the shorter matrix axis, 'none' = disabled.",
+)
+@click.option("--mlm-probability", type=float, default=0.3, help="MLM probability")
+@click.option(
+    "--logging-steps", type=int, default=1, help="Number of steps between log events"
 )
 @click.option(
-    "--logging-steps",
-    type=int,
-    default=1,
-    help="Number of steps between log events"
-)
-@click.option(
-    "--eval-steps",
-    type=int,
-    default=250,
-    help="Number of steps between evaluations"
+    "--eval-steps", type=int, default=250, help="Number of steps between evaluations"
 )
 @click.option(
     "--save-steps",
     type=int,
     default=5000,
-    help="Number of steps between checkpoint saves"
+    help="Number of steps between checkpoint saves",
 )
-@click.option(
-    "--seed",
-    type=int,
-    default=42,
-    help="Random seed"
-)
+@click.option("--seed", type=int, default=42, help="Random seed")
 @click.option(
     "--debug-non-finite-params/--no-debug-non-finite-params",
     default=True,
     help="Check parameters for non-finite values after every optimizer step.",
+)
+@click.option(
+    "--debug-layerwise-metrics/--no-debug-layerwise-metrics",
+    default=False,
+    help="Log per-layer grad/weight norms, residual-stream RMS, and logit stats. "
+    "Has non-trivial overhead; installs forward hooks that may break torch.compile graphs. "
+    "Not supported with --pure-te.",
+)
+@click.option(
+    "--debug-layerwise-log-every",
+    type=int,
+    default=20,
+    help="Log layerwise debug metrics every N optimizer steps.",
 )
 @click.option(
     "--mask-replace-prob",
@@ -335,35 +359,32 @@ def pretrain():
     "--random-token-prob",
     type=float,
     default=0.1,
-    help="Probability of replacing masked tokens with random tokens"
+    help="Probability of replacing masked tokens with random tokens",
 )
 @click.option(
     "--keep-probability",
     type=float,
     default=0.1,
-    help="Probability of leaving masked tokens unchanged"
+    help="Probability of leaving masked tokens unchanged",
 )
 @click.option(
     "--num-workers",
     type=str,
     default="auto",
-    help="Number of DataLoader workers ('auto' or integer)"
+    help="Number of DataLoader workers ('auto' or integer)",
 )
 @click.option(
-    "--prefetch-factor",
-    type=int,
-    default=2,
-    help="DataLoader prefetch factor"
+    "--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor"
 )
 @click.option(
     "--compile/--no-compile",
     default=True,
-    help="Enable torch.compile for faster training (disable for debugging or unsupported hardware)"
+    help="Enable torch.compile for faster training (disable for debugging or unsupported hardware)",
 )
 @click.option(
     "--use-packing/--no-packing",
     default=True,
-    help="Enable sequence packing to eliminate padding waste (requires flash attention)"
+    help="Enable sequence packing to eliminate padding waste (requires flash attention)",
 )
 @click.option(
     "--use-static-inp-size/--no-use-static-inp-size",
@@ -373,12 +394,12 @@ def pretrain():
 @click.option(
     "--bf16/--no-bf16",
     default=True,
-    help="Enable mixed precision training (bf16 if supported, fp16 fallback)"
+    help="Enable mixed precision training (bf16 if supported, fp16 fallback)",
 )
 @click.option(
     "--tf32/--no-tf32",
     default=True,
-    help="Enable TF32 mode on Ampere+ GPUs for faster fp32 matmuls"
+    help="Enable TF32 mode on Ampere+ GPUs for faster fp32 matmuls",
 )
 @click.option(
     "--fp8/--no-fp8",
@@ -386,10 +407,7 @@ def pretrain():
     help="Enable FP8 Linear matmuls in pure-torch/TE paths (CUDA only, best on H100+)",
 )
 @click.option(
-    "--multi-gpu",
-    is_flag=True,
-    default=True,
-    help="Enable multi-GPU training"
+    "--multi-gpu", is_flag=True, default=True, help="Enable multi-GPU training"
 )
 @click.option(
     "--distributed-mode",
@@ -404,13 +422,19 @@ def pretrain():
     default="layer",
     show_default=True,
     help="FSDP2 wrapping granularity. 'layer' = whole transformer blocks (fewer boundaries, "
-         "best for NVLink/SXM). 'sublayer' = attn & mlp separately (finer overlap, best for PCIe).",
+    "best for NVLink/SXM). 'sublayer' = attn & mlp separately (finer overlap, best for PCIe).",
+)
+@click.option(
+    "--fsdp-reshard-after-forward/--no-fsdp-reshard-after-forward",
+    default=False,
+    show_default=True,
+    help="Universal FSDP2 reshard_after_forward setting for all fully_shard groups in pure-torch / pure-te.",
 )
 @click.option(
     "--world-size",
     type=str,
     default="auto",
-    help="Total number of processes for distributed training; use 'auto' to use all available GPUs"
+    help="Total number of processes for distributed training; use 'auto' to use all available GPUs",
 )
 @click.option(
     "--ddp-bucket-cap-mb",
@@ -423,7 +447,13 @@ def pretrain():
     "--project-name",
     type=str,
     default="nanoplm-pretraining",
-    help="Weights & Biases project name (new runs named run-DDMMHHMM, unique)"
+    help="Weights & Biases project name",
+)
+@click.option(
+    "--run-name",
+    type=str,
+    default="run",
+    help=f"Weights & Biases run name under the project name as DDMMHHMM-<run_name>",
 )
 # Resume options
 @click.option(
@@ -484,12 +514,7 @@ def pretrain():
     help="Skip warmup on resume and jump directly to peak LR",
 )
 # Model hyperparameters (ModernBERT)
-@click.option(
-    "--hidden-size",
-    type=int,
-    default=768,
-    help="Model hidden size"
-)
+@click.option("--hidden-size", type=int, default=768, help="Model hidden size")
 @click.option(
     "--intermediate-size",
     type=int,
@@ -518,7 +543,13 @@ def pretrain():
     "--vocab-size",
     type=int,
     default=32,
-    help="Number of the vocabs being used in the model (should be equal to the vocab size in the tokenizer)"
+    help="Number of the vocabs being used in the model (should be equal to the vocab size in the tokenizer)",
+)
+@click.option(
+    "--norm-type",
+    type=click.Choice(["layernorm", "rmsnorm"], case_sensitive=False),
+    default="layernorm",
+    help="Normalization type: layernorm (default) or rmsnorm (slightly faster, no bias)",
 )
 @click.option(
     "--mlp-activation",
@@ -526,35 +557,15 @@ def pretrain():
     default="swiglu",
     help="MLP activation",
 )
-@click.option(
-    "--mlp-dropout",
-    type=float,
-    default=0.0,
-    help="MLP dropout"
-)
-@click.option(
-    "--mlp-bias",
-    is_flag=True,
-    default=False,
-    help="Use MLP bias"
-)
+@click.option("--mlp-dropout", type=float, default=0.0, help="MLP dropout")
+@click.option("--mlp-bias", is_flag=True, default=False, help="Use MLP bias")
 @click.option(
     "--no-mlp-on-first-layer/--mlp-on-first-layer",
     default=True,
     help="Disable the MLP branch in encoder layer 0",
 )
-@click.option(
-    "--attention-bias",
-    is_flag=True,
-    default=False,
-    help="Use attn bias"
-)
-@click.option(
-    "--attention-dropout",
-    type=float,
-    default=0.0,
-    help="Attn dropout"
-)
+@click.option("--attention-bias", is_flag=True, default=False, help="Use attn bias")
+@click.option("--attention-dropout", type=float, default=0.0, help="Attn dropout")
 @click.option(
     "--classifier-activation",
     type=click.Choice(["relu", "gelu", "srelu"], case_sensitive=False),
@@ -626,27 +637,51 @@ def pretrain():
     default="layer",
     show_default=True,
     help="Checkpoint scope. 'layer' checkpoints the whole transformer layer; "
-         "'attn' checkpoints only the attention residual branch (usually the best tradeoff); "
-         "'attn+mlp' checkpoints both attention and MLP branches.",
+    "'attn' checkpoints only the attention residual branch (usually the best tradeoff); "
+    "'attn+mlp' checkpoints both attention and MLP branches.",
+)
+@click.option(
+    "--tie-word-embeddings/--no-tie-word-embeddings",
+    default=True,
+    help="Tie input embedding and output decoder weights (default: enabled).",
 )
 @click.option(
     "--use-diff-attn-v2/--no-use-diff-attn-v2",
     default=False,
     help="Enable Differential Attention V2: doubles query heads, applies differential "
-         "subtraction for noise cancellation in attention (pure-torch only).",
+    "subtraction for noise cancellation in attention (pure-torch only).",
 )
 @click.option(
     "--attn-layer-pattern",
     type=str,
     default=None,
     help="Attention layer pattern string using F (full) and S (sliding), e.g. 'FSS'. "
-         "Tiles to cover all layers. Overrides --global-attn-every-n-layers when set.",
+    "Tiles to cover all layers. Overrides --global-attn-every-n-layers when set.",
+)
+@click.option(
+    "--fused-qkv/--no-fused-qkv",
+    default=True,
+    help="Use a single fused Wqkv projection (default). When disabled, Q/K/V use separate "
+    "linear layers so Muon orthogonalizes each subspace independently.",
+)
+@click.option(
+    "--fused-up-gate/--no-fused-up-gate",
+    default=True,
+    help="Use a single fused Wi projection for SwiGLU/GLU up+gate (default). When disabled, "
+    "up and gate use separate linear layers so Muon orthogonalizes each independently.",
+)
+@click.option(
+    "--wo-init",
+    type=click.Choice(["kaiming", "zero"], case_sensitive=False),
+    default="zero",
+    show_default=True,
+    help="Initialization for residual out-projections (attn.Wo and mlp.Wo).",
 )
 @click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
     default=False,
     help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only). "
-         "Not compatible with --use-resid-lambdas.",
+    "Not compatible with --use-resid-lambdas.",
 )
 @click.option(
     "--mhc-n-streams",
@@ -660,27 +695,27 @@ def pretrain():
     default="layer",
     show_default=True,
     help="mHC-lite wrapping level (pure-torch only): 'layer' wraps the full transformer layer; "
-         "'sublayers' wraps attention and MLP residual branches separately.",
+    "'sublayers' wraps attention and MLP residual branches separately.",
 )
 @click.option(
     "--use-compile-max-autotune/--no-use-compile-max-autotune",
     default=False,
     help="Pure-torch only: compile with torch.compile(mode='max-autotune-no-cudagraphs'). "
-         "May improve throughput, but increases compile time significantly at run start.",
+    "May improve throughput, but increases compile time significantly at run start.",
 )
 @click.option(
     "--compile-triton-persistent-reductions/--no-compile-triton-persistent-reductions",
     default=False,
     help="Pure-torch only: TorchInductor Triton setting. Disable to avoid shared-memory "
-         "resource errors in some fused reduction kernels (e.g. LayerNorm backward at large hidden dims) "
-         "while keeping torch.compile enabled.",
+    "resource errors in some fused reduction kernels (e.g. LayerNorm backward at large hidden dims) "
+    "while keeping torch.compile enabled.",
 )
 @click.option(
     "--compile-triton-mix-order-reduction/--no-compile-triton-mix-order-reduction",
     default=False,
     help="Pure-torch only: TorchInductor Triton setting. Mix-order reductions can generate "
-         "persistent reduction kernels that exceed shared memory limits on some shapes. "
-         "Disable to prefer legacy reductions while keeping torch.compile enabled.",
+    "persistent reduction kernels that exceed shared memory limits on some shapes. "
+    "Disable to prefer legacy reductions while keeping torch.compile enabled.",
 )
 @click.option(
     "--pure-torch",
@@ -721,12 +756,15 @@ def run(
     muon_momentum: float,
     muon_nesterov: bool,
     muon_eps: float,
+    muonh_normalization: str,
     mlm_probability: float,
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
     seed: int,
     debug_non_finite_params: bool,
+    debug_layerwise_metrics: bool,
+    debug_layerwise_log_every: int,
     mask_replace_prob: float,
     random_token_prob: float,
     keep_probability: float,
@@ -744,9 +782,11 @@ def run(
     multi_gpu: bool,
     distributed_mode: str,
     fsdp_shard_granularity: str,
+    fsdp_reshard_after_forward: bool,
     world_size: str,
     ddp_bucket_cap_mb: int,
     project_name: str,
+    run_name: str,
     resume: bool,
     resume_checkpoint_dir: str,
     resume_extra_epochs: Optional[int],
@@ -764,6 +804,7 @@ def run(
     num_attention_heads: int,
     num_kv_heads: Optional[int],
     vocab_size: int,
+    norm_type: str,
     mlp_activation: str,
     mlp_dropout: float,
     mlp_bias: bool,
@@ -783,8 +824,13 @@ def run(
     prores_t: int,
     activation_checkpointing: bool,
     activation_checkpointing_mode: str,
+    tie_word_embeddings: bool,
     use_diff_attn_v2: bool,
+    use_paired_head_attention: bool,
     attn_layer_pattern: Optional[str],
+    fused_qkv: bool,
+    fused_up_gate: bool,
+    wo_init: str,
     use_mhc_lite: bool,
     mhc_n_streams: int,
     mhc_lite_wrapping_level: str,
@@ -821,6 +867,7 @@ def run(
         muon_momentum=muon_momentum,
         muon_nesterov=muon_nesterov,
         muon_eps=muon_eps,
+        muonh_normalization=muonh_normalization,
         mlm_probability=mlm_probability,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
@@ -830,6 +877,8 @@ def run(
         save_steps=save_steps,
         seed=seed,
         debug_non_finite_params=debug_non_finite_params,
+        debug_layerwise_metrics=debug_layerwise_metrics,
+        debug_layerwise_log_every=debug_layerwise_log_every,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
@@ -843,11 +892,13 @@ def run(
         multi_gpu=multi_gpu,
         distributed_mode=distributed_mode,
         fsdp_shard_granularity=fsdp_shard_granularity,
+        fsdp_reshard_after_forward=fsdp_reshard_after_forward,
         world_size=world_size,
         ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         project_name=project_name,
+        run_name=run_name
     )
-    
+
     if pure_torch and pure_te:
         raise click.ClickException("--pure-torch and --pure-te are mutually exclusive.")
     if use_canon_layers and not pure_torch:
@@ -860,12 +911,18 @@ def run(
             "classifier_activation=srelu requires --pure-torch or --pure-te. "
             "The default HF path supports only relu/gelu."
         )
-    if num_kv_heads is not None and num_kv_heads != num_attention_heads and not (pure_torch or pure_te):
+    if (
+        num_kv_heads is not None
+        and num_kv_heads != num_attention_heads
+        and not (pure_torch or pure_te)
+    ):
         raise click.ClickException(
             "GQA requires --pure-torch or --pure-te. "
             "The default HF path does not implement num_kv_heads != num_attention_heads."
         )
-    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not (pure_torch or pure_te):
+    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not (
+        pure_torch or pure_te
+    ):
         raise click.ClickException(
             "mHC-lite requires --pure-torch or --pure-te. "
             "Set one of those modes (or disable mHC-lite settings)."
@@ -881,6 +938,7 @@ def run(
             "resid_lambdas scales the hidden state before each layer, which breaks "
             "mHC-lite's doubly-stochastic stability guarantees."
         )
+    _validate_debug_layerwise_metrics_compat(cfg, pure_te=pure_te)
     _validate_distributed_mode(cfg, pure_torch=pure_torch, pure_te=pure_te)
 
     _populate_batch_setup(cfg)
@@ -892,6 +950,7 @@ def run(
         num_attention_heads=num_attention_heads,
         num_kv_heads=num_kv_heads,
         vocab_size=vocab_size,
+        norm_type=norm_type,
         mlp_activation=mlp_activation,
         mlp_dropout=mlp_dropout,
         mlp_bias=mlp_bias,
@@ -914,15 +973,31 @@ def run(
         use_mhc_lite=use_mhc_lite,
         mhc_n_streams=mhc_n_streams,
         mhc_lite_wrapping_level=mhc_lite_wrapping_level.lower(),
+        tie_word_embeddings=tie_word_embeddings,
         use_diff_attn_v2=use_diff_attn_v2,
+        use_paired_head_attention=use_paired_head_attention,
         attn_layer_pattern=attn_layer_pattern,
+        fused_qkv=fused_qkv,
+        fused_up_gate=fused_up_gate,
+        wo_init=wo_init,
     )
+
+    _validate_muonh_wo_init_compat(cfg, model_cfg)
 
     _set_seed_for_init(seed)
     if use_diff_attn_v2 and not pure_torch:
         raise click.ClickException(
             "use_diff_attn_v2 requires --pure-torch. "
             "Differential Attention V2 is not implemented in HF/TE paths."
+        )
+    if use_paired_head_attention and not pure_torch:
+        raise click.ClickException(
+            "use_paired_head_attention requires --pure-torch. "
+            "Paired head attention is not implemented in HF/TE paths."
+        )
+    if use_paired_head_attention and use_diff_attn_v2:
+        raise click.ClickException(
+            "use_paired_head_attention and use_diff_attn_v2 are mutually exclusive."
         )
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
@@ -933,9 +1008,17 @@ def run(
     else:
         model = ProtModernBertMLM(model_cfg)
 
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
+    if getattr(model_cfg, "use_moe", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        inactive = 0
+        for m in model.modules():
+            if isinstance(m, _MoELayer):
+                inactive += (m.num_experts - m.top_k) * m.Wi.shape[1] * m.Wi.shape[2]
+                inactive += (m.num_experts - m.top_k) * m.Wo.shape[1] * m.Wo.shape[2]
+        logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     resume_cfg = ResumeConfig(
@@ -974,10 +1057,7 @@ def run(
 
 
 @pretrain.command("from-yaml")
-@click.help_option(
-    "--help",
-    "-h"
-)
+@click.help_option("--help", "-h")
 @click.argument(
     "config",
     default="pretrain.yaml",
@@ -1033,9 +1113,15 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
     _check_muon_available(pretrain_config.optimizer)
-    
+
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
+    _validate_muonh_wo_init_compat(pretrain_config, model_config)
+    if getattr(model_config, "use_noble", False) and not pure_torch:
+        raise click.ClickException(
+            "model.use_noble=true requires pure_torch: true (or --pure-torch). "
+            "NOBLE is not implemented in HF/TE paths."
+        )
     if model_config.use_canon_layers and not pure_torch:
         raise click.ClickException(
             "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
@@ -1043,14 +1129,19 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         )
     if (
         model_config.use_mhc_lite
-        or str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower() != "layer"
+        or str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower()
+        != "layer"
     ) and not (pure_torch or pure_te):
         raise click.ClickException(
             "model.use_mhc_lite=true (or model.mhc_lite_wrapping_level != 'layer') "
             "requires pure_torch: true / --pure-torch or pure_te: true / --pure-te. "
             "mHC-lite is not implemented in the HF path."
         )
-    if pure_te and str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower() != "layer":
+    if (
+        pure_te
+        and str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower()
+        != "layer"
+    ):
         raise click.ClickException(
             "Transformer Engine currently supports only layer-level mHC-lite. "
             "Set model.mhc_lite_wrapping_level: layer or use pure_torch: true."
@@ -1066,7 +1157,20 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
             "Differential Attention V2 is not implemented in HF/TE paths."
         )
-    if str(getattr(model_config, "classifier_activation", "gelu")).lower() == "srelu" and not (pure_torch or pure_te):
+    if getattr(model_config, "use_paired_head_attention", False) and not pure_torch:
+        raise click.ClickException(
+            "model.use_paired_head_attention=true requires pure_torch: true (or --pure-torch). "
+            "Paired head attention is not implemented in HF/TE paths."
+        )
+    if getattr(model_config, "use_paired_head_attention", False) and getattr(
+        model_config, "use_diff_attn_v2", False
+    ):
+        raise click.ClickException(
+            "model.use_paired_head_attention=true is not compatible with model.use_diff_attn_v2=true."
+        )
+    if str(
+        getattr(model_config, "classifier_activation", "gelu")
+    ).lower() == "srelu" and not (pure_torch or pure_te):
         raise click.ClickException(
             "model.classifier_activation=srelu requires pure_torch: true / --pure-torch or "
             "pure_te: true / --pure-te. The HF path supports only relu/gelu."
@@ -1080,6 +1184,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
             "model.num_kv_heads != model.num_attention_heads requires pure_torch: true / --pure-torch "
             "or pure_te: true / --pure-te. The HF path does not implement GQA."
         )
+    _validate_debug_layerwise_metrics_compat(pretrain_config, pure_te=pure_te)
     _validate_distributed_mode(
         pretrain_config,
         pure_torch=pure_torch,
@@ -1097,9 +1202,17 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     else:
         model = ProtModernBertMLM(config=model_config)
 
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
     logger.info(f"Total Trainable Parameters: {total_params}")
+    if getattr(model_config, "use_moe", False):
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
+        inactive = 0
+        for m in model.modules():
+            if isinstance(m, _MoELayer):
+                inactive += (m.num_experts - m.top_k) * m.Wi.shape[1] * m.Wi.shape[2]
+                inactive += (m.num_experts - m.top_k) * m.Wo.shape[1] * m.Wo.shape[2]
+        logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
     if pure_te:
@@ -1123,21 +1236,13 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
 
 @pretrain.command("get-yaml")
-@click.help_option(
-    "--help",
-    "-h"
-)
+@click.help_option("--help", "-h")
 @click.argument(
     "output",
     required=False,
-    type=click.Path(dir_okay=True, writable=True, resolve_path=True)
+    type=click.Path(dir_okay=True, writable=True, resolve_path=True),
 )
-@click.option(
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Overwrite if file exists"
-)
+@click.option("--force", is_flag=True, default=False, help="Overwrite if file exists")
 def get_yaml(output: Optional[str], force: bool):
     """Generate a pretraining YAML template.
 
@@ -1173,19 +1278,21 @@ def get_yaml(output: Optional[str], force: bool):
         "  num_attention_heads: 8\n"
         "  # num_kv_heads: 8  # GQA: number of KV heads (default: same as num_attention_heads = MHA)\n"
         "  vocab_size: 32\n"
-        "  mlp_activation: \"swiglu\"\n"
+        '  norm_type: "layernorm"  # layernorm | rmsnorm (rmsnorm is slightly faster, no bias)\n'
+        '  mlp_activation: "swiglu"\n'
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: false\n"
         "  no_mlp_on_first_layer: true\n"
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
-        "  classifier_activation: \"gelu\"  # relu | gelu | srelu (srelu requires pure_torch or pure_te)\n"
+        '  classifier_activation: "gelu"  # relu | gelu | srelu (srelu requires pure_torch or pure_te)\n'
+        "  tie_word_embeddings: true  # tie input embedding and output decoder weights\n"
         "  # The options below only work on pure-torch and TE pipelines unless noted\n"
         "  use_resid_lambdas: false  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
         "  use_canon_layers: false # enables Canon-ABCD local mixing layers (pure_torch only)\n"
-        "  canon_layers_mode: \"ac\"  # subset of Canon sites: A/B/C/D (e.g. \"ac\" for lighter mode)\n"
+        '  canon_layers_mode: "ac"  # subset of Canon sites: A/B/C/D (e.g. "ac" for lighter mode)\n'
         "  canon_layers_kernel_size: 5  # symmetric Canon kernel size (allowed: 3/5/7, default: 5)\n"
         "  use_repo: false  # RePO: learned per-head positions replacing fixed RoPE (pure_torch only)\n"
         "  repo_after_n_layers: 3  # first N layers keep standard RoPE, layers after use RePO\n"
@@ -1196,18 +1303,40 @@ def get_yaml(output: Optional[str], force: bool):
         "  mhc_lite_wrapping_level: \"layer\"  # mHC-lite wrapping: 'layer' or 'sublayers' (pure_torch only)\n"
         "  mhc_triton_fused: true  # use fused Triton kernels for mHC-lite stream ops; first run will start slow due to Triton autotune\n"
         "  use_diff_attn_v2: false  # Differential Attention V2: doubles Q heads with differential subtraction (pure_torch only)\n"
+        "  use_paired_head_attention: false  # pairs adjacent attention heads into a shared softmax (pure_torch only; MHA only; incompatible with diff_attn_v2, RePO, and Canon-B)\n"
+        "  use_noble: false  # NOBLE: nonlinear low-rank branches for linear layers (pure_torch only)\n"
+        "  noble_rank: 64  # NOBLE bottleneck rank (typical: 64-256)\n"
+        "  noble_alpha: 0.01  # NOBLE W_up initialization scale\n"
+        "  noble_half_kaiming: true  # halve main weight init scale for NOBLE layers (paper §3.3)\n"
+        "  noble_targets: all  # which projections get NOBLE: all|attn|ffn|qkv|out\n"
         "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
+        "  fused_qkv: true  # false = separate Wq/Wk/Wv instead of a single Wqkv\n"
+        "  fused_up_gate: true  # false = separate W_up/W_gate instead of a single Wi for SwiGLU/GLU\n"
+        '  wo_init: "zero"  # residual out-projection init for attn.Wo/mlp.Wo: kaiming | zero\n'
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
-        "  activation_checkpointing_mode: \"attn\"  # (layer | attn | attn+mlp), attn mode has highest ROI \n"
+        '  activation_checkpointing_mode: "attn"  # (layer | attn | attn+mlp), attn mode has highest ROI \n'
+        "  # MoE (Mixture-of-Experts) — pure_torch only, requires use_packing + use_static_inp_size\n"
+        "  use_moe: false\n"
+        "  moe_num_experts: 8              # number of routed experts\n"
+        "  moe_top_k: 2                    # experts activated per token\n"
+        "  # one shared expert is always enabled; routing is always sigmoid\n"
+        "  moe_use_bias_correction: true   # expert-bias load balancing (selection-only)\n"
+        "  moe_aux_loss_coef: 0.01         # differentiable balance regularizer over router mass\n"
+        "  moe_z_loss_coef: 5e-5           # router z-loss for small-model MoE stability\n"
+        "  moe_routed_scaling_factor: 1.0  # routed branch output scale; start conservative\n"
+        "  moe_n_group: 1                  # group-limited routing: 1 disables, >1 partitions experts into groups\n"
+        "  moe_topk_group: 1               # with moe_n_group > 1, keep top K groups per token\n"
+        "  moe_bias_update_rate: 1e-3      # expert-bias correction step size\n"
+        "  moe_leading_dense_layers: 1     # first N layers are always dense (DeepSeek uses 1)\n"
         "\n"
         "pretraining:\n"
-        "  dataset_dir: \"output/data/pretrain_data\"\n"
-        "  ckp_dir: \"output/pretraining_checkpoints\"\n"
+        '  dataset_dir: "output/data/pretrain_data"\n'
+        '  ckp_dir: "output/pretraining_checkpoints"\n'
         "  micro_batch_size: 64\n"
         "  global_batch_size: 256000\n"
         "  num_epochs: 10\n"
-        "  optimizer: \"adamw\"\n"
-        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)\n"
+        '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh\n'
+        "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
         "  adam_epsilon: 1e-8\n"
@@ -1217,7 +1346,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  repo_rope_warmup_steps: 302\n"
         "  batch_size_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
         "  lr_decay_to_fraction: 0.1\n"
-        "  lr_schedule: \"cosine\"\n"
+        '  lr_schedule: "cosine"\n'
         "  adam_weight_decay: 0.0\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
@@ -1226,6 +1355,13 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_momentum: 0.95\n"
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
+        '  muonh_normalization: "neuron"  # used only when optimizer=muonh: neuron | short_axis | none\n'
+        "  # NOBLE optimizer LR scaling (only used when model.use_noble=true)\n"
+        "  noble_base_lr: 3e-4  # independent base LR for NOBLE branch params\n"
+        "  noble_lr_gamma: 0.3  # W_up LR power (actual exponent = 2γ = 0.6)\n"
+        "  noble_lr_gamma_M: 0.45  # M mixing matrix LR power\n"
+        "  noble_freq_lr_mult: 3.0  # ω frequency LR multiplier\n"
+        "  noble_phase_lr_mult: 5.0  # φ phase LR multiplier\n"
         "\n"
         "  mlm_probability: 0.3\n"
         "  mask_replace_prob: 0.8\n"
@@ -1236,7 +1372,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  save_steps: 5000\n"
         "  seed: 42\n"
         "  debug_non_finite_params: true  # checks params for NaN/Inf after every optimizer step\n"
-        "  num_workers: \"auto\"\n"
+        "  debug_layerwise_metrics: false  # per-layer grad/weight norms, residual RMS, logit stats (overhead; breaks torch.compile graphs; not supported with pure_te)\n"
+        "  debug_layerwise_log_every: 20  # log layerwise metrics every N optimizer steps\n"
+        '  num_workers: "auto"\n'
         "  prefetch_factor: 2\n"
         "  use_packing: true\n"
         "  use_static_inp_size: true\n"
@@ -1254,11 +1392,13 @@ def get_yaml(output: Optional[str], force: bool):
         "  tf32: true\n"
         "  fp8: false\n"
         "  multi_gpu: true\n"
-        "  distributed_mode: \"fsdp\"  # fsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n"
-        "  fsdp_shard_granularity: \"layer\"  # layer (fewer boundaries, NVLink/SXM) | sublayer (finer overlap, PCIe)\n"
+        '  distributed_mode: "fsdp"  # fsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n'
+        '  fsdp_shard_granularity: "layer"  # layer (fewer boundaries, NVLink/SXM) | sublayer (finer overlap, PCIe)\n'
+        "  fsdp_reshard_after_forward: false  # universal FSDP2 reshard_after_forward setting for pure_torch/pure_te\n"
         "  world_size: 'auto'\n"
         "  ddp_bucket_cap_mb: 25  # only used when distributed_mode: ddp in pure_torch/pure_te; HF path ignores it\n"
-        "  project_name: \"nanoplm-pretraining\"\n"
+        '  project_name: "nanoplm-pretraining"\n'
+        '  run_name: "run" # will be DDMMHHMM-<run_name>\n'
         "  profiler_enabled: false\n"
         "  profiler_start_step: 10\n"
         "  profiler_end_step: 15\n"
@@ -1266,7 +1406,7 @@ def get_yaml(output: Optional[str], force: bool):
         "\n"
         "resume:\n"
         "  is_resume: false\n"
-        "  checkpoint_dir: \"output/pretraining_checkpoints/run-1/checkpoint-1\"\n"
+        '  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"\n'
         "  extra_epochs: 0\n"
         "  warmup_steps: null\n"
         "  learning_rate: null\n"
@@ -1290,6 +1430,7 @@ def get_yaml(output: Optional[str], force: bool):
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
+
 def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
         raise ValueError("Pretraining configuration is required but not found in YAML")
@@ -1310,7 +1451,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         )
 
     # Required key
-    if 'dataset_dir' not in normalized_config or not normalized_config['dataset_dir']:
+    if "dataset_dir" not in normalized_config or not normalized_config["dataset_dir"]:
         raise ValueError("dataset_dir is required in pretraining configuration")
 
     # Classify provided keys in one pass
@@ -1340,6 +1481,11 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_momentum",
         "muon_eps",
         "min_lr",
+        "noble_base_lr",
+        "noble_lr_gamma",
+        "noble_lr_gamma_M",
+        "noble_freq_lr_mult",
+        "noble_phase_lr_mult",
     ]
 
     def _parse_float_like(raw_value: Any, field_name: str) -> float:
@@ -1368,14 +1514,20 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         try:
             return float(raw_value)
         except ValueError as exc:
-            raise ValueError(f"Invalid {field_name} value: {raw_value}. Must be a number.") from exc
+            raise ValueError(
+                f"Invalid {field_name} value: {raw_value}. Must be a number."
+            ) from exc
 
     for field in float_fields:
         if field in kwargs and kwargs[field] is not None:
             kwargs[field] = _parse_float_like(kwargs[field], field)
 
     # Ensure warmup-related fields are ints (YAML may load as int or float).
-    for warmup_key in ("warmup_steps", "repo_rope_warmup_steps", "batch_size_warmup_steps"):
+    for warmup_key in (
+        "warmup_steps",
+        "repo_rope_warmup_steps",
+        "batch_size_warmup_steps",
+    ):
         if warmup_key in kwargs and kwargs[warmup_key] is not None:
             try:
                 kwargs[warmup_key] = int(kwargs[warmup_key])
@@ -1386,64 +1538,47 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
 
     # Handle boolean values
     for bool_key in [
-        'multi_gpu',
-        'bf16',
-        'tf32',
-        'fp8',
-        'muon_nesterov',
-        'muon_cautious_weight_decay',
-        'muon_use_polar_express',
-        'use_packing',
-        'use_static_inp_size',
-        'use_compile_max_autotune',
-        'compile_triton_persistent_reductions',
-        'compile_triton_mix_order_reduction',
-        'profiler_enabled',
-        'debug_non_finite_params',
+        "multi_gpu",
+        "bf16",
+        "tf32",
+        "fp8",
+        "muon_nesterov",
+        "muon_cautious_weight_decay",
+        "muon_use_polar_express",
+        "use_packing",
+        "use_static_inp_size",
+        "use_compile_max_autotune",
+        "compile_triton_persistent_reductions",
+        "compile_triton_mix_order_reduction",
+        "profiler_enabled",
+        "debug_non_finite_params",
+        "debug_layerwise_metrics",
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]
             if isinstance(value, bool):
                 continue
             elif isinstance(value, str):
-                kwargs[bool_key] = value.lower() == 'true'
+                kwargs[bool_key] = value.lower() == "true"
 
     return PretrainingConfig(**kwargs)
+
 
 def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     if config is None:
         raise ValueError("Model configuration is required but not found in YAML")
 
+    config = dict(config)
+
     model_fields = {f.name: f for f in fields(ProtModernBertMLMConfig)}
     expected_keys = set(model_fields.keys())
     present_keys = set(config.keys())
-
-    if "canon_layer_type" in present_keys:
-        legacy_canon_layer_type = config.get("canon_layer_type")
-        if legacy_canon_layer_type is not None:
-            legacy_value = str(legacy_canon_layer_type).strip().lower()
-            if legacy_value == "causal":
-                raise ValueError(
-                    "model.canon_layer_type='causal' is no longer supported. "
-                    "Causal Canon layers were removed. Delete model.canon_layer_type "
-                    "and use the symmetric Canon layer (kernel sizes: 3/5/7)."
-                )
-            if legacy_value != "symmetric":
-                raise ValueError(
-                    f"model.canon_layer_type={legacy_canon_layer_type!r} is no longer supported. "
-                    "Delete model.canon_layer_type; Canon layers are now symmetric-only."
-                )
-        logger.warning(
-            "Ignoring deprecated model.canon_layer_type; Canon layers are now symmetric-only."
-        )
 
     extra = []
     kwargs: Dict[str, Any] = {}
 
     # Classify provided keys in one pass
     for key in present_keys:
-        if key == "canon_layer_type":
-            continue
         if key not in expected_keys:
             extra.append(key)
             continue
@@ -1482,6 +1617,7 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
     except ValueError as exc:
         # Provide a clearer error for common config incompatibilities.
         raise ValueError(f"Invalid model configuration: {exc}") from exc
+
 
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     if config is None:
@@ -1522,7 +1658,9 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
         try:
             return float(raw_value)
         except ValueError as exc:
-            raise ValueError(f"Invalid {field_name} value: {raw_value}. Must be a number.") from exc
+            raise ValueError(
+                f"Invalid {field_name} value: {raw_value}. Must be a number."
+            ) from exc
 
     for key in present_keys:
         if key not in expected_keys:
@@ -1581,11 +1719,10 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             )
 
     if extra:
-        logger.warning(
-            f"Unknown keys in resume config (ignored): {extra}"
-        )
+        logger.warning(f"Unknown keys in resume config (ignored): {extra}")
 
     return ResumeConfig(**kwargs)
+
 
 def _set_seed_for_init(seed: int) -> None:
     """Set seed before model creation so both pipelines start with identical weights."""

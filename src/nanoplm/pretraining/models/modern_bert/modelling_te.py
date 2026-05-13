@@ -88,12 +88,22 @@ class TEModernBertEncoderLayer(nn.Module):
         )
 
         bound = math.sqrt(3.0 / config.hidden_size)
+        wo_init = str(getattr(config, "wo_init", "zero")).strip().lower()
+        if wo_init not in {"kaiming", "zero"}:
+            raise ValueError(
+                f"wo_init must be 'kaiming' or 'zero', got {wo_init!r}"
+            )
 
         def _init(t: torch.Tensor) -> None:
             nn.init.uniform_(t, -bound, bound)
 
         def _output_init(t: torch.Tensor) -> None:
-            nn.init.zeros_(t)
+            if wo_init == "zero":
+                nn.init.zeros_(t)
+            else:
+                fan_in = t.shape[1] if t.ndim >= 2 else config.hidden_size
+                out_bound = math.sqrt(3.0 / fan_in)
+                nn.init.uniform_(t, -out_bound, out_bound)
 
         # Fused LayerNorm + QKV projection + attention + output projection.
         # qkv_format='thd': flat (total_tokens, heads, dim) — required for varlen with

@@ -50,18 +50,22 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         if getattr(self.tokenizer, "mask_token_id", None) is None:
             raise ValueError("Tokenizer must define a mask_token_id for MLM.")
 
-        vocab_ids = list(self.tokenizer.get_vocab().values())
-        special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
-        special_ids.add(self.tokenizer.mask_token_id)
-        if extra_excluded_token_ids:
-            special_ids.update(extra_excluded_token_ids)
-
-        allowed = [tid for tid in vocab_ids if tid not in special_ids]
+        standard_aa_ids = getattr(self.tokenizer, "STANDARD_AA_TOKEN_IDS", None)
+        if standard_aa_ids is not None:
+            allowed = sorted(standard_aa_ids)
+        else:
+            vocab_ids = list(self.tokenizer.get_vocab().values())
+            special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
+            special_ids.add(self.tokenizer.mask_token_id)
+            if extra_excluded_token_ids:
+                special_ids.update(extra_excluded_token_ids)
+            allowed = [tid for tid in vocab_ids if tid not in special_ids]
         if not allowed:
             raise ValueError(
                 "No allowable token ids for random replacement after exclusions."
             )
         self.allowed_random_token_ids = torch.tensor(allowed, dtype=torch.long)
+        self._excluded_token_ids = frozenset(extra_excluded_token_ids) if extra_excluded_token_ids else frozenset()
 
     def torch_mask_tokens(
         self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None,
@@ -139,6 +143,10 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
 
         if "attention_mask" in batch:
             special |= ~batch["attention_mask"].bool()
+
+        if self._excluded_token_ids:
+            for tid in self._excluded_token_ids:
+                special |= (input_ids == tid)
 
         inputs, labels = self.torch_mask_tokens(input_ids, special_tokens_mask=special)
         batch["input_ids"] = inputs
@@ -405,6 +413,9 @@ def _pt_pad_to_multiple_of(batch: Dict[str, Any], pad_to_multiple_of: int, token
         batch["position_ids"] = torch.cat(
             [batch["position_ids"], torch.arange(remainder, dtype=batch["position_ids"].dtype, device=device)], dim=0
         )
+
+    if "max_seqlen" in batch:
+        batch["max_seqlen"] = max(int(batch["max_seqlen"]), int(remainder))
         
     return batch
 
@@ -461,5 +472,8 @@ def _pt_pad_to_fixed_tokens(
             ],
             dim=0,
         )
+
+    if "max_seqlen" in batch:
+        batch["max_seqlen"] = max(int(batch["max_seqlen"]), int(remainder))
 
     return batch

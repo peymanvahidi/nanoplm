@@ -4,7 +4,6 @@ Test suite for the custom ProtDataCollatorForLM to verify it works correctly.
 """
 
 import torch
-import numpy as np
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
@@ -340,6 +339,141 @@ def test_probability_validation():
     print("✓ Probability validation test passed")
 
 
+def test_non_standard_aa_tokens_never_masked():
+    """Test that non-standard AA tokens (X=24) are never selected for masking when excluded."""
+    print("Testing non-standard AA token masking exclusion...")
+
+    tokenizer = ProtModernBertTokenizer()
+    non_standard_ids = tokenizer.NON_STANDARD_AA_TOKEN_IDS
+
+    collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=1.0,  # mask everything eligible
+        mask_token_probability=0.8,
+        random_token_probability=0.1,
+        keep_probability=0.1,
+        extra_excluded_token_ids=non_standard_ids,
+    )
+
+    # Sequence with X tokens: "AXGXMXK" -> [4, 24, 6, 24, 20, 24, 15, 1(eos)]
+    for _ in range(50):
+        seq = "AXGXMXK"
+        tokenized = [{
+            'input_ids': tokenizer(seq, padding=False, return_tensors=None)['input_ids'],
+            'attention_mask': tokenizer(seq, padding=False, return_tensors=None)['attention_mask'],
+        }]
+
+        batch = collator(tokenized)
+        labels = batch['labels'][0]
+        input_ids = batch['input_ids'][0]
+        original = torch.tensor(tokenized[0]['input_ids'])
+
+        # Find X positions in original (token ID 24)
+        x_positions = (original == 24)
+
+        # X positions must ALWAYS have label=-100 (never masked for loss)
+        assert (labels[x_positions] == -100).all(), (
+            f"X token positions should have label=-100 but got {labels[x_positions]}"
+        )
+
+        # X positions must NEVER be replaced in input_ids
+        assert (input_ids[x_positions] == original[x_positions]).all(), (
+            f"X token positions should keep original value but got {input_ids[x_positions]}"
+        )
+
+        # Standard AA positions should still be maskable (mlm_probability=1.0)
+        standard_mask = torch.zeros_like(original, dtype=torch.bool)
+        for sid in tokenizer.STANDARD_AA_TOKEN_IDS:
+            standard_mask |= (original == sid)
+        masked_standard = (labels[standard_mask] != -100)
+        assert masked_standard.any(), "Standard AAs should still be masked (mlm_probability=1.0)"
+
+    print("✓ Non-standard AA token masking exclusion test passed")
+
+
+def test_non_standard_tokens_excluded_from_random_replacement():
+    """Test that non-standard AA tokens are never used as random replacements."""
+    print("Testing non-standard AA token random replacement exclusion...")
+
+    tokenizer = ProtModernBertTokenizer()
+    non_standard_ids = tokenizer.NON_STANDARD_AA_TOKEN_IDS
+
+    collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=1.0,
+        mask_token_probability=0.0,    # no [MASK] replacements
+        random_token_probability=1.0,  # ALL masked tokens get random replacement
+        keep_probability=0.0,
+        extra_excluded_token_ids=non_standard_ids,
+    )
+
+    # Use a long standard-AA-only sequence for many random replacements
+    seq = "MKALCLLLLPVLGLLTGSSGS" * 5
+    tokenized = [{
+        'input_ids': tokenizer(seq, padding=False, return_tensors=None)['input_ids'],
+        'attention_mask': tokenizer(seq, padding=False, return_tensors=None)['attention_mask'],
+    }]
+
+    for _ in range(20):
+        batch = collator(tokenized)
+        input_ids = batch['input_ids'][0]
+        original = torch.tensor(tokenized[0]['input_ids'])
+
+        # Find positions that were changed (random replacements)
+        changed = input_ids != original
+        replaced_tokens = set(input_ids[changed].tolist())
+
+        # None of the replaced tokens should be non-standard AA IDs
+        for tid in replaced_tokens:
+            assert tid not in non_standard_ids, (
+                f"Token ID {tid} is a non-standard AA and should not be used as random replacement"
+            )
+
+    print("✓ Non-standard AA token random replacement exclusion test passed")
+
+
+def test_tokenizer_aa_classification():
+    """Test that tokenizer correctly classifies standard vs non-standard AA token IDs."""
+    print("Testing tokenizer AA classification...")
+
+    tokenizer = ProtModernBertTokenizer()
+    vocab = tokenizer.get_vocab()
+
+    # 20 standard amino acids
+    standard_aas = set("ALGVSREDTIPKFQNYMHWC")
+    expected_standard_ids = frozenset(vocab[aa] for aa in standard_aas)
+    assert tokenizer.STANDARD_AA_TOKEN_IDS == expected_standard_ids, (
+        f"Expected {expected_standard_ids}, got {tokenizer.STANDARD_AA_TOKEN_IDS}"
+    )
+
+    # Non-standard: X, B, O, U, Z
+    non_standard_aas = set("XBOUZ")
+    expected_non_standard_ids = frozenset(vocab[aa] for aa in non_standard_aas)
+    assert tokenizer.NON_STANDARD_AA_TOKEN_IDS == expected_non_standard_ids, (
+        f"Expected {expected_non_standard_ids}, got {tokenizer.NON_STANDARD_AA_TOKEN_IDS}"
+    )
+
+    # No overlap
+    assert tokenizer.STANDARD_AA_TOKEN_IDS.isdisjoint(tokenizer.NON_STANDARD_AA_TOKEN_IDS), (
+        "Standard and non-standard AA IDs should not overlap"
+    )
+
+    # Neither set contains special tokens
+    special_ids = set(tokenizer.all_special_ids)
+    assert tokenizer.STANDARD_AA_TOKEN_IDS.isdisjoint(special_ids), (
+        "Standard AA IDs should not include special tokens"
+    )
+    assert tokenizer.NON_STANDARD_AA_TOKEN_IDS.isdisjoint(special_ids), (
+        "Non-standard AA IDs should not include special tokens"
+    )
+
+    print("  Standard AA IDs:", sorted(tokenizer.STANDARD_AA_TOKEN_IDS))
+    print("  Non-standard AA IDs:", sorted(tokenizer.NON_STANDARD_AA_TOKEN_IDS))
+    print("  Special IDs:", sorted(special_ids))
+
+    print("✓ Tokenizer AA classification test passed")
+
+
 def main():
     """Run all collator tests"""
     print("Running ProtDataCollatorForLM tests...\n")
@@ -365,7 +499,16 @@ def main():
     test_probability_validation()
     print()
 
-    print("🎉 All tests passed! Your collator is working correctly.")
+    test_tokenizer_aa_classification()
+    print()
+
+    test_non_standard_aa_tokens_never_masked()
+    print()
+
+    test_non_standard_tokens_excluded_from_random_replacement()
+    print()
+
+    print("All tests passed!")
 
 
 if __name__ == "__main__":

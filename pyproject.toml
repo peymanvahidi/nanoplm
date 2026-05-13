@@ -61,6 +61,7 @@ nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
 "nanoplm.models.student" = ["*.csv"]
 "nanoplm.pretraining" = ["csrc/*.c"]
 "nanoplm.data" = ["csrc/*.c"]
+"nanoplm.pretraining.models.modern_bert" = ["csrc/*.cpp", "csrc/*.cu"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

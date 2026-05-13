@@ -6,6 +6,15 @@ from tokenizers.processors import TemplateProcessing
 
 
 class ProtModernBertTokenizer(PreTrainedTokenizerFast):
+    # 20 standard amino acid token IDs (A=4 .. C=23)
+    STANDARD_AA_TOKEN_IDS: frozenset = frozenset(range(4, 24))
+    # Non-standard / ambiguous amino acid token IDs (X=24 .. Z=28).
+    # Note: the tokenizer normalizer converts B, O, U, Z -> X before
+    # tokenization, so in practice only X (24) appears in data. IDs 25-28
+    # are included defensively for correctness if input bypasses the
+    # normalizer.
+    NON_STANDARD_AA_TOKEN_IDS: frozenset = frozenset(range(24, 29))
+
     def __init__(
         self,
         unk_token="<unk>",
