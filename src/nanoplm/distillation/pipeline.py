@@ -758,7 +758,7 @@ def run_distillation(
         optimizer = AdamW(
             model.parameters(),
             lr=distill_config.learning_rate,
-            fused=is_cuda,
+            fused=is_cuda and distill_config.distributed_mode != "fsdp",
         )
         logger.info(f"Using AdamW optimizer (lr={distill_config.learning_rate}, fused={is_cuda})")
 
