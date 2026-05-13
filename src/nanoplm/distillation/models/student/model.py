@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Generator, Iterator, List, Tuple, Union
+from typing import Generator, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -266,8 +266,17 @@ class ProtX(ModernBertForMaskedLM):
                         yield seq, seq_embeddings[:actual_length].cpu()
 
     @staticmethod
-    def inspect_checkpoint_architecture(checkpoint_path: str) -> Tuple[int, int, int]:
+    def inspect_checkpoint_architecture(
+        checkpoint_path: str,
+        head_dim: Optional[int] = None,
+    ) -> Tuple[int, int, int]:
         """Inspect model architecture from a safetensors checkpoint.
+
+        Args:
+            checkpoint_path: path to model.safetensors
+            head_dim: required for GQA checkpoints (qkv_dim != 3*embed_dim);
+                ignored otherwise. If omitted on a GQA checkpoint the function
+                raises a clear ValueError naming the parameter.
 
         Returns:
             (embed_dim, num_layers, num_heads)
@@ -319,15 +328,30 @@ class ProtX(ModernBertForMaskedLM):
             if "layers.0.attn.Wqkv.weight" in key:
                 qkv_dim, model_dim = tensor.shape
                 if qkv_dim == 3 * embed_dim:
-                    for head_dim in [64, 32, 128]:
-                        if embed_dim % head_dim == 0:
-                            num_heads = embed_dim // head_dim
+                    # MHA: try common head_dim values, then divisor fallback.
+                    for hd in [64, 32, 128]:
+                        if embed_dim % hd == 0:
+                            num_heads = embed_dim // hd
                             break
                     if num_heads is None:
                         for possible_heads in [8, 12, 16, 20, 24, 32]:
                             if embed_dim % possible_heads == 0:
                                 num_heads = possible_heads
                                 break
+                else:
+                    # GQA: qkv_dim = (num_q_heads + 2*num_kv_heads) * head_dim.
+                    # Need head_dim to solve.
+                    if head_dim is None:
+                        raise ValueError(
+                            f"GQA checkpoint detected (qkv_dim={qkv_dim} != "
+                            f"3 * embed_dim={3 * embed_dim}). Pass head_dim "
+                            f"explicitly to inspect_checkpoint_architecture()."
+                        )
+                    if embed_dim % head_dim != 0:
+                        raise ValueError(
+                            f"head_dim={head_dim} does not divide embed_dim={embed_dim}"
+                        )
+                    num_heads = embed_dim // head_dim
                 break
 
         if num_heads is None:
