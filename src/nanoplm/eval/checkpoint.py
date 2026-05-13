@@ -20,12 +20,6 @@ def _safe_load_checkpoint_yaml(path: Path) -> Any:
         return yaml.safe_load(f)
 
 
-def load_model_config(yaml_path: Union[str, Path] = "pretrain.yaml") -> ProtModernBertMLMConfig:
-    """Build a ProtModernBertMLMConfig from a pretrain.yaml's ``model:`` block."""
-    cfg = _safe_load_checkpoint_yaml(Path(yaml_path))
-    return _model_config_from_dict(cfg["model"])
-
-
 def load_model_config_from_checkpoint(
     checkpoint_dir: Union[str, Path],
 ) -> Optional[ProtModernBertMLMConfig]:
@@ -75,35 +69,9 @@ def _checkpoint_step(checkpoint_dir: Union[str, Path]) -> int:
         return -1
 
 
-def _find_latest_checkpoint(checkpoint_root: Union[str, Path]) -> Path:
-    checkpoint_root = Path(checkpoint_root)
-    if not checkpoint_root.exists():
-        raise FileNotFoundError(f"Checkpoint root not found: {checkpoint_root}")
-
-    checkpoints = [
-        path for path in checkpoint_root.glob("run-*/checkpoint-*")
-        if path.is_dir()
-    ]
-    if not checkpoints:
-        raise FileNotFoundError(
-            f"No checkpoint-* directories found under {checkpoint_root}"
-        )
-
-    return max(
-        checkpoints,
-        key=lambda path: (path.stat().st_mtime, _checkpoint_step(path), str(path)),
-    )
-
-
-def resolve_checkpoint_dir(
-    checkpoint_dir: Union[str, Path],
-    checkpoint_root: Union[str, Path] = "output/pretraining_checkpoints",
-) -> Path:
-    """Resolve 'latest', run-* directories, or explicit checkpoint paths."""
+def resolve_checkpoint_dir(checkpoint_dir: Union[str, Path]) -> Path:
+    """Resolve a checkpoint-* directory or a run-* directory to a concrete checkpoint path."""
     checkpoint_arg = Path(checkpoint_dir)
-
-    if str(checkpoint_dir).strip().lower() == "latest":
-        return _find_latest_checkpoint(checkpoint_root).resolve()
 
     if checkpoint_arg.is_dir() and checkpoint_arg.name.startswith("checkpoint-"):
         return checkpoint_arg.resolve()
@@ -120,8 +88,8 @@ def resolve_checkpoint_dir(
             ).resolve()
 
     raise FileNotFoundError(
-        "Checkpoint directory must be a checkpoint-* directory, a run-* directory, "
-        f"or the keyword 'latest'. Got: {checkpoint_dir}"
+        "Checkpoint directory must be a checkpoint-* directory or a run-* "
+        f"directory containing one. Got: {checkpoint_dir}"
     )
 
 

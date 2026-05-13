@@ -7,22 +7,15 @@ from typing import List, Optional, Union
 
 @dataclass
 class EvalConfig:
-    # Checkpoint path. Accepts a checkpoint-* directory, a run-* directory, or
-    # the keyword 'latest' (which scans checkpoint_root for the newest checkpoint).
+    # Checkpoint path. Accepts a checkpoint-* directory or a run-* directory
+    # (the latest checkpoint inside the run-* is used).
     checkpoint_dir: Union[str, Path]
-
-    # Root searched when checkpoint_dir == 'latest'.
-    checkpoint_root: Union[str, Path] = "output/pretraining_checkpoints"
 
     # Benchmark framework(s) to evaluate on. One or more of: pbc, flip, pgym.
     framework: List[str] = field(default_factory=lambda: ["pbc"])
 
     # Directory where autoeval results, H5 embeddings, and per-task outputs are written.
     output_dir: Union[str, Path] = "autoeval_output"
-
-    # Fallback model config when the checkpoint directory has no model_config.yaml
-    # (older checkpoints). The 'model:' block of this YAML is parsed.
-    config_yaml: Union[str, Path] = "pretrain.yaml"
 
     # Batch size for embedding computation.
     batch_size: int = 16

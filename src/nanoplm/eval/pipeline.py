@@ -12,7 +12,6 @@ import torch
 
 from nanoplm.eval.checkpoint import (
     load_checkpoint,
-    load_model_config,
     load_model_config_from_checkpoint,
     resolve_checkpoint_dir,
 )
@@ -369,26 +368,22 @@ def run_eval(eval_config: EvalConfig) -> None:
 
     biotrainer = _load_biotrainer_symbols()
 
-    checkpoint_dir = resolve_checkpoint_dir(
-        eval_config.checkpoint_dir,
-        eval_config.checkpoint_root,
-    )
+    checkpoint_dir = resolve_checkpoint_dir(eval_config.checkpoint_dir)
     logger.info(f"Resolved checkpoint: {checkpoint_dir}")
 
     device = _resolve_device(eval_config.device)
     logger.info(f"Using device: {device}")
 
-    # Prefer model_config.yaml inside the checkpoint; fall back to pretrain.yaml.
     model_config = load_model_config_from_checkpoint(checkpoint_dir)
-    if model_config is not None:
-        logger.info(
-            f"Loaded model config from checkpoint: {checkpoint_dir}/model_config.yaml"
+    if model_config is None:
+        raise FileNotFoundError(
+            f"No model_config.yaml in checkpoint: {checkpoint_dir}. "
+            "Re-train the checkpoint with a nanoPLM version that writes "
+            "model_config.yaml into the checkpoint directory."
         )
-    else:
-        logger.info(
-            f"No model_config.yaml in checkpoint, falling back to {eval_config.config_yaml}"
-        )
-        model_config = load_model_config(eval_config.config_yaml)
+    logger.info(
+        f"Loaded model config from checkpoint: {checkpoint_dir}/model_config.yaml"
+    )
 
     model = load_checkpoint(checkpoint_dir, model_config, device)
     tokenizer = model.tokenizer

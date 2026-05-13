@@ -124,16 +124,9 @@ def eval():
     type=str,
     required=True,
     help=(
-        "Checkpoint path. Accepts a checkpoint-* directory, a run-* directory, "
-        "or the keyword 'latest'."
+        "Checkpoint path. Accepts a checkpoint-* directory or a run-* directory "
+        "(the latest checkpoint inside the run-* is used)."
     ),
-)
-@click.option(
-    "--checkpoint-root",
-    type=str,
-    default="output/pretraining_checkpoints",
-    help="Root searched when --checkpoint-dir=latest.",
-    show_default=True,
 )
 @click.option(
     "--framework",
@@ -158,13 +151,6 @@ def eval():
     type=str,
     default="autoeval_output",
     help="Directory to save autoeval results.",
-    show_default=True,
-)
-@click.option(
-    "--config-yaml",
-    type=str,
-    default="pretrain.yaml",
-    help="Fallback pretrain.yaml for model config (when checkpoint has no model_config.yaml).",
     show_default=True,
 )
 @click.option(
@@ -228,11 +214,9 @@ def eval():
 )
 def run(
     checkpoint_dir: str,
-    checkpoint_root: str,
     framework: tuple,
     zero_shot_method: str,
     output_dir: str,
-    config_yaml: str,
     batch_size: int,
     min_seq_length: int,
     max_seq_length: int,
@@ -249,10 +233,8 @@ def run(
 
     eval_config = EvalConfig(
         checkpoint_dir=checkpoint_dir,
-        checkpoint_root=checkpoint_root,
         framework=frameworks_list,
         output_dir=output_dir,
-        config_yaml=config_yaml,
         batch_size=batch_size,
         min_seq_length=min_seq_length,
         max_seq_length=max_seq_length,
@@ -340,22 +322,18 @@ def get_yaml(output: Optional[str], force: bool):
         "# Runs biotrainer's autoeval pipeline on a pure-torch nanoPLM checkpoint.\n"
         "# Requires:  pip install nanoplm[eval]\n"
         "#\n"
-        "# The model config is loaded automatically from <checkpoint_dir>/model_config.yaml\n"
-        "# when present, with config_yaml below as a fallback for older checkpoints.\n"
+        "# The model config is loaded from <checkpoint_dir>/model_config.yaml.\n"
+        "# Checkpoints without that file are not supported.\n"
         "\n"
         "eval:\n"
-        "  # Checkpoint path. Accepts a checkpoint-* directory, a run-* directory,\n"
-        "  # or the keyword 'latest'.\n"
+        "  # Checkpoint path. Accepts a checkpoint-* directory or a run-*\n"
+        "  # directory (the latest checkpoint inside the run-* is used).\n"
         '  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"\n'
-        '  checkpoint_root: "output/pretraining_checkpoints"\n'
         "\n"
         "  # One or more of: pbc, flip, pgym. 'pgym' is zero-shot ProteinGym.\n"
         "  framework: [pbc]\n"
         "\n"
         '  output_dir: "autoeval_output"\n'
-        "\n"
-        "  # Fallback model config when the checkpoint has no model_config.yaml.\n"
-        '  config_yaml: "pretrain.yaml"\n'
         "\n"
         "  batch_size: 16\n"
         "  min_seq_length: 0\n"
