@@ -669,6 +669,7 @@ def run_distillation(
         student_tokenizer=student_tokenizer,
         on_the_fly=distill_config.on_the_fly,
         max_seq_len=distill_config.max_seq_len,
+        teacher_preprocess=None,
     )
 
     # Calculate num_training_steps for scheduler using train_sequences from manifest
