@@ -1,9 +1,19 @@
 import os
+
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("TORCHINDUCTOR_PERSISTENT_REDUCTIONS", "0")
+os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
+
 import json
 import shutil
 import time
 import torch
 import wandb
+
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union, Dict, Any
@@ -11,7 +21,6 @@ from pathlib import Path
 
 from torch.utils.data import Dataset
 from torch.optim import AdamW
-from safetensors.torch import load_file
 from transformers import (
     TrainingArguments,
     get_cosine_schedule_with_warmup,
@@ -23,6 +32,7 @@ from transformers import (
 from nanoplm.distillation.collator import DistillDataCollator
 from nanoplm.distillation.trainer import DistillationTrainer
 from nanoplm.distillation.models.student import ProtX, ProtXConfig, ProtXTokenizer
+from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.distillation.dataset import (
     KDDatasetOnTheFly,
@@ -54,6 +64,28 @@ class DistillationConfig:
     learning_rate: float = 1e-3
     gradient_accumulation_steps: int = 1
     warmup_ratio: float = 0.05
+    max_grad_norm: float = float("inf")
+
+    # Optimizer — "adamw" | "muon" | "normuon"
+    # Muon/NorMuon routes 2-D weight matrices through dion.Muon/NorMuon and
+    # biases / embeddings / special zero-init params through fused AdamW,
+    # matching the pretraining optimizer setup.
+    optimizer: str = "adamw"
+    # Muon-specific (ignored when optimizer == "adamw")
+    muon_learning_rate: float = 1e-3
+    muon_weight_decay: float = 0.01
+    muon_cautious_weight_decay: bool = True
+    muon_use_polar_express: bool = True
+    muon_momentum: float = 0.95
+    muon_nesterov: bool = True
+    muon_eps: float = 1e-7
+    # AdamW sub-optimizer used for 1-D / embedding params when optimizer is
+    # muon/normuon, and as the sole optimizer when optimizer == "adamw".
+    adam_learning_rate: float = 1e-4
+    adam_weight_decay: float = 0.0
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    adam_epsilon: float = 1e-8
 
     # Mixed precision
     bf16: bool = True
@@ -86,10 +118,26 @@ class DistillationConfig:
     eval_steps: int = 50
     save_steps: int = 100
 
+    # torch.compile
+    use_compile: bool = False
+    use_compile_max_autotune: bool = False
+    # Disable TorchInductor persistent/mix-order reductions — can exceed
+    # shared-memory limits for large hidden sizes (same flags as pretraining).
+    compile_triton_persistent_reductions: bool = False
+    compile_triton_mix_order_reduction: bool = False
+
     # Distributed
     multi_gpu: bool = False
     world_size: Union[int, str] = 1
+    # "ddp" (default) or "fsdp" (FSDP2 with MixedPrecisionPolicy bf16/fp32)
+    distributed_mode: str = "ddp"
+    fsdp_shard_granularity: str = "layer"  # "layer" | "sublayer"
     seed: int = 42
+
+    # Profiling (rank-0 only)
+    profiler_enabled: bool = False
+    profiler_start_step: int = 10
+    profiler_end_step: int = 15
 
     def __post_init__(self):
         if self.lr_scheduler_kwargs is None:
@@ -456,7 +504,7 @@ def _save_training_config(output_dir: Path, config: Dict[str, Any]):
 
 
 def run_distillation(
-    model_config: ProtXConfig,
+    model_config: ProtModernBertMLMConfig,
     distill_config: DistillationConfig,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
@@ -473,6 +521,8 @@ def run_distillation(
     distill_config = _resolve_config_from_manifest(distill_config)
 
     device = get_device()
+    is_cuda = torch.cuda.is_available() and str(device).startswith("cuda")
+
     model = ProtX(model_config)
     model.to(device)
 
@@ -494,6 +544,74 @@ def run_distillation(
             )
     else:
         effective_world_size = 1
+
+    device_mesh = None
+
+    # FSDP2 wrapping (must happen before torch.compile)
+    if distill_config.distributed_mode == "fsdp" and effective_world_size > 1:
+        import torch.distributed as dist
+        from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+        from torch.distributed.device_mesh import init_device_mesh
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+
+        device_mesh = init_device_mesh("cuda", (effective_world_size,))
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+
+        # Wrap at layer or sublayer granularity, matching pretraining
+        if distill_config.fsdp_shard_granularity == "sublayer":
+            for layer in model.model.layers:
+                # MHCLiteSublayersLayer: .mhc_attn / .mhc_mlp at top level
+                if hasattr(layer, "mhc_attn"):
+                    fully_shard(layer.mhc_attn, mesh=device_mesh, mp_policy=mp_policy)
+                    if hasattr(layer, "mhc_mlp") and layer.mhc_mlp is not None:
+                        fully_shard(layer.mhc_mlp, mesh=device_mesh, mp_policy=mp_policy)
+                # MHCLiteBlock: nested .layer.attn / .layer.mlp
+                elif hasattr(layer, "layer") and hasattr(layer.layer, "attn"):
+                    fully_shard(layer.layer.attn, mesh=device_mesh, mp_policy=mp_policy)
+                    if hasattr(layer.layer, "mlp") and layer.layer.mlp is not None:
+                        fully_shard(layer.layer.mlp, mesh=device_mesh, mp_policy=mp_policy)
+                # Vanilla ModernBertEncoderLayer: .attn / .mlp
+                elif hasattr(layer, "attn"):
+                    fully_shard(layer.attn, mesh=device_mesh, mp_policy=mp_policy)
+                    if hasattr(layer, "mlp") and layer.mlp is not None:
+                        fully_shard(layer.mlp, mesh=device_mesh, mp_policy=mp_policy)
+                else:
+                    logger.warning(
+                        f"FSDP2 sublayer wrap: skipping layer {type(layer).__name__} "
+                        "(no recognized sub-modules)"
+                    )
+        else:  # "layer" — wrap whole transformer blocks
+            for layer in model.model.layers:
+                fully_shard(layer, mesh=device_mesh, mp_policy=mp_policy)
+
+        fully_shard(model, mesh=device_mesh, mp_policy=mp_policy)
+        logger.info(
+            f"FSDP2 enabled: granularity={distill_config.fsdp_shard_granularity}, "
+            f"world_size={effective_world_size}"
+        )
+
+    # torch.compile (applied after FSDP2 wrapping, before optimizer creation)
+    if distill_config.use_compile and is_cuda:
+        if not distill_config.compile_triton_persistent_reductions:
+            torch._inductor.config.triton.persistent_reductions = False
+        os.environ["TORCHINDUCTOR_MIX_ORDER_REDUCTION"] = (
+            "1" if distill_config.compile_triton_mix_order_reduction else "0"
+        )
+        torch._inductor.config.triton.mix_order_reduction = (
+            distill_config.compile_triton_mix_order_reduction
+        )
+        compile_mode = (
+            "max-autotune-no-cudagraphs"
+            if distill_config.use_compile_max_autotune
+            else "default"
+        )
+        model = torch.compile(model, dynamic=True, mode=compile_mode)
+        logger.info(f"torch.compile enabled (mode={compile_mode})")
 
     global_batch_size = (
         distill_config.gradient_accumulation_steps
@@ -538,22 +656,6 @@ def run_distillation(
         global_batch_size=global_batch_size,
     )
 
-    # Load model weights if resuming
-    if is_resuming:
-        checkpoint_path = Path(resume_config.checkpoint_dir)
-        safetensors_path = checkpoint_path / "model.safetensors"
-
-        model_loaded = False
-        if safetensors_path.exists():
-            logger.info(f"Loading model weights from {safetensors_path}")
-            state_dict = load_file(safetensors_path, device=device)
-            model.load_state_dict(state_dict)
-            model_loaded = True
-        if not model_loaded:
-            logger.warning(
-                f"Could not find model weights in {resume_config.checkpoint_dir}. Training from scratch."
-            )
-
     # Save training configuration for future resumes
     if not is_resuming:
         training_config = {
@@ -569,6 +671,8 @@ def run_distillation(
             "lr_scheduler_kwargs": distill_config.lr_scheduler_kwargs,
             "max_seq_len": distill_config.max_seq_len,
             "max_seqs_num": distill_config.max_seqs_num,
+            "train_sequences": distill_config.train_sequences,
+            "val_sequences": distill_config.val_sequences,
             "val_ratio": distill_config.val_ratio,
             "on_the_fly": distill_config.on_the_fly,
             "sharded": distill_config.sharded,
@@ -583,6 +687,7 @@ def run_distillation(
         student_tokenizer=student_tokenizer,
         on_the_fly=distill_config.on_the_fly,
         max_seq_len=distill_config.max_seq_len,
+        teacher_preprocess=None,
     )
 
     # Calculate num_training_steps for scheduler using train_sequences from manifest
@@ -606,9 +711,6 @@ def run_distillation(
     os.environ["WANDB_PROJECT"] = distill_config.project_name
     os.environ["WANDB_NAME"] = wandb_run_name
     os.environ["WANDB_LOG_MODEL"] = "end"
-
-    # Determine if we're using CUDA (for DataLoader optimizations)
-    is_cuda = torch.cuda.is_available() and device.startswith('cuda')
 
     # For on-the-fly mode, use 0 workers to avoid pickling issues with teacher model
     # For pre-computed embeddings, use configured workers
@@ -644,9 +746,10 @@ def run_distillation(
         "bf16": distill_config.bf16 and is_cuda and torch.cuda.is_bf16_supported(),
         "fp16": distill_config.bf16 and ((is_cuda and not torch.cuda.is_bf16_supported()) or device == "mps"),
         "tf32": distill_config.tf32 and is_cuda,
+        "max_grad_norm": distill_config.max_grad_norm,
     }
 
-    if distill_config.multi_gpu:
+    if distill_config.multi_gpu and distill_config.distributed_mode == "ddp":
         training_dict["ddp_backend"] = "nccl" if torch.cuda.is_available() else "gloo"
         training_dict["ddp_find_unused_parameters"] = True
 
@@ -668,7 +771,19 @@ def run_distillation(
         upload_run_source_snapshot()
 
     # Create optimizer
-    optimizer = AdamW(model.parameters(), lr=distill_config.learning_rate)
+    opt_name = distill_config.optimizer.lower()
+    if opt_name in ("muon", "normuon"):
+        from nanoplm.pretraining.optim import build_muon_optimizer
+        optimizer = build_muon_optimizer(model, distill_config, distributed_mesh=device_mesh)
+        logger.info(f"Using {opt_name} optimizer (muon_lr={distill_config.muon_learning_rate}, "
+                    f"adam_lr={distill_config.adam_learning_rate})")
+    else:
+        optimizer = AdamW(
+            model.parameters(),
+            lr=distill_config.learning_rate,
+            fused=is_cuda and distill_config.distributed_mode != "fsdp",
+        )
+        logger.info(f"Using AdamW optimizer (lr={distill_config.learning_rate}, fused={is_cuda})")
 
     # Create scheduler
     scheduler = _get_scheduler(
@@ -745,7 +860,8 @@ def run_distillation(
 
     # Evaluate
     if val_dataset:
-        logger.info(f"Evaluating on {len(val_dataset)} samples")
+        n_val = distill_config.val_sequences or "?"
+        logger.info(f"Evaluating on {n_val} samples") 
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
         trainer.log_metrics("eval", metrics)
