@@ -671,6 +671,8 @@ def run_distillation(
             "lr_scheduler_kwargs": distill_config.lr_scheduler_kwargs,
             "max_seq_len": distill_config.max_seq_len,
             "max_seqs_num": distill_config.max_seqs_num,
+            "train_sequences": distill_config.train_sequences,
+            "val_sequences": distill_config.val_sequences,
             "val_ratio": distill_config.val_ratio,
             "on_the_fly": distill_config.on_the_fly,
             "sharded": distill_config.sharded,
