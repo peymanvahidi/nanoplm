@@ -598,6 +598,14 @@ def save_kd_dataset(
     show_default=True,
     help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
 )
+@click.option(
+    "--register-tokens",
+    default=0,
+    type=click.IntRange(0, 2),
+    show_default=True,
+    help="Number of register tokens (0, 1, or 2) to append after EOS. "
+         "Register tokens act as learnable scratch space for the model.",
+)
 @click.help_option("--help", "-h")
 def save_pretrain_dataset(
     input: str,
@@ -607,7 +615,7 @@ def save_pretrain_dataset(
     samples_per_shard: int,
     force: bool,
     pipeline_backend: str,
-
+    register_tokens: int,
 ):
 
     if samples_per_shard < 1:
@@ -621,8 +629,10 @@ def save_pretrain_dataset(
     output_dir = Path(output)
     create_dirs(output_dir)
 
-    tokenizer = ProtModernBertTokenizer()
+    tokenizer = ProtModernBertTokenizer(num_register_tokens=register_tokens)
 
+    if register_tokens > 0:
+        click.echo(f"Using {register_tokens} register token(s) after EOS")
     click.echo("Creating binary shards for pretraining")
     saver = ShardWriter(
         fasta_path=str(input_path),
@@ -767,6 +777,7 @@ def get_yaml(output: str | None, force: bool):
         "  samples_per_shard: 2000\n"
         "  max_workers: 2  # -1 to use all available CPUs\n"
         "  force: false\n"
+        "  register_tokens: 0  # 0, 1, or 2 learnable scratch tokens appended after EOS\n"
         "\n"
         "# Distillation config (used when pipeline_mode: 'distillation')\n"
         "# A .data_manifest file will be created in output_dir for use by distill pipeline\n"
@@ -1091,8 +1102,11 @@ def from_yaml(
         samples_per_shard = pretrain_config.get("samples_per_shard")
         max_workers = pretrain_config.get("max_workers")
         force = pretrain_config.get("force")
+        register_tokens = pretrain_config.get("register_tokens", 0)
 
-        tokenizer = ProtModernBertTokenizer()
+        tokenizer = ProtModernBertTokenizer(num_register_tokens=register_tokens)
+        if register_tokens > 0:
+            click.echo(f"Using {register_tokens} register token(s) after EOS")
 
         click.echo("Creating binary shards for training dataset...")
         train_start = time.perf_counter()

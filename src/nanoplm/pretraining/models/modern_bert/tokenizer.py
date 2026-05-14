@@ -15,6 +15,9 @@ class ProtModernBertTokenizer(PreTrainedTokenizerFast):
     # normalizer.
     NON_STANDARD_AA_TOKEN_IDS: frozenset = frozenset(range(24, 29))
 
+    REGISTER_TOKENS = ["<unused0>", "<unused1>"]
+    REGISTER_TOKEN_IDS = [30, 31]
+
     def __init__(
         self,
         unk_token="<unk>",
@@ -23,8 +26,14 @@ class ProtModernBertTokenizer(PreTrainedTokenizerFast):
         mask_token="<mask>",
         bos_token="<s>",
         use_bos_token=False,
+        num_register_tokens=0,
         **kwargs,
     ):
+        if num_register_tokens < 0 or num_register_tokens > 2:
+            raise ValueError(
+                f"num_register_tokens must be 0, 1, or 2, got {num_register_tokens}"
+            )
+
         # Default vocabulary mapping: amino acids + special tokens (pad/eos/unk/mask/bos)
         vocab = {
             pad_token: 0, eos_token: 1, unk_token: 2, mask_token: 3,
@@ -38,6 +47,7 @@ class ProtModernBertTokenizer(PreTrainedTokenizerFast):
         }
 
         self.use_bos_token = use_bos_token
+        self.num_register_tokens = num_register_tokens
 
         tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token=unk_token))
 
@@ -50,25 +60,37 @@ class ProtModernBertTokenizer(PreTrainedTokenizerFast):
 
         tokenizer.pre_tokenizer = Split(pattern="", behavior="isolated")
 
+        # Build register token suffix for TemplateProcessing
+        reg_suffix = ""
+        reg_special = []
+        for i in range(num_register_tokens):
+            reg_token = self.REGISTER_TOKENS[i]
+            reg_suffix += f" {reg_token}"
+            reg_special.append((reg_token, vocab[reg_token]))
+
         if use_bos_token:
-            # Format: <bos>seq<eos> for single, <bos>seq<eos><bos>seq<eos> for pair
             tokenizer.post_processor = TemplateProcessing(
-                single=f"{bos_token} $A {eos_token}",
-                pair=f"{bos_token} $A {eos_token} {bos_token}:1 $B:1 {eos_token}:1",
+                single=f"{bos_token} $A {eos_token}{reg_suffix}",
+                pair=f"{bos_token} $A {eos_token}{reg_suffix} {bos_token}:1 $B:1 {eos_token}:1{reg_suffix}",
                 special_tokens=[
                     (bos_token, vocab[bos_token]),
                     (eos_token, vocab[eos_token]),
+                    *reg_special,
                 ],
             )
         else:
-            # Format: seq<eos> for single, seq<eos>seq<eos> for pair
             tokenizer.post_processor = TemplateProcessing(
-                single=f"$A {eos_token}",
-                pair=f"$A {eos_token} $B:1 {eos_token}:1",
+                single=f"$A {eos_token}{reg_suffix}",
+                pair=f"$A {eos_token}{reg_suffix} $B:1 {eos_token}:1{reg_suffix}",
                 special_tokens=[
                     (eos_token, vocab[eos_token]),
+                    *reg_special,
                 ],
             )
+
+        # Register tokens marked as additional_special_tokens so they are
+        # excluded from MLM masking via get_special_tokens_mask.
+        additional_special = self.REGISTER_TOKENS[:num_register_tokens] if num_register_tokens > 0 else None
 
         super().__init__(
             tokenizer_object=tokenizer,
@@ -77,5 +99,6 @@ class ProtModernBertTokenizer(PreTrainedTokenizerFast):
             eos_token=eos_token,
             mask_token=mask_token,
             bos_token=bos_token if use_bos_token else None,
+            additional_special_tokens=additional_special,
             **kwargs,
         )
