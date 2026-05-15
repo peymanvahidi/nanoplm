@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -36,6 +37,68 @@ typedef struct {
 typedef void (*progress_cb_t)(int phase, double progress, long long completed, long long total);
 typedef void (*shuffle_progress_cb_t)(int phase, double progress, long long completed, long long total,
                                       long long aux);
+
+#define NANOPLM_RC_CANCELLED (-2)
+
+static inline int should_cancel(const volatile int *cancel_requested) {
+    return cancel_requested != NULL && *cancel_requested != 0;
+}
+
+/*
+ * SIGINT handling. While a nanoplm_* public function is executing, we install
+ * our own sigaction-based handler so that Ctrl+C is observed synchronously
+ * (Python's signal handler would only run after ctypes returns control, which
+ * is too late). The handler writes 1 to a process-wide flag pointer; the
+ * public function polls that flag inside its loops and bails out cleanly.
+ *
+ * Concurrency note: g_sigint_cancel_flag is a single global, so two nanoplm
+ * operations running in parallel threads in the same process would race on
+ * it. That isn't a supported configuration today.
+ */
+static volatile int *g_sigint_cancel_flag = NULL;
+
+static void nanoplm_sigint_handler(int signum) {
+    (void)signum;
+    volatile int *flag = g_sigint_cancel_flag;
+    if (flag != NULL) {
+        *flag = 1;
+    }
+}
+
+typedef struct {
+    int installed;
+    struct sigaction prev_sa;
+    volatile int *prev_flag;
+} CancelScope;
+
+static void cancel_scope_enter(CancelScope *scope, volatile int *flag) {
+    scope->installed = 0;
+    scope->prev_flag = NULL;
+    if (flag == NULL) {
+        return;
+    }
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = nanoplm_sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    scope->prev_flag = g_sigint_cancel_flag;
+    g_sigint_cancel_flag = flag;
+    if (sigaction(SIGINT, &sa, &scope->prev_sa) == 0) {
+        scope->installed = 1;
+    } else {
+        g_sigint_cancel_flag = scope->prev_flag;
+    }
+}
+
+static void cancel_scope_exit(CancelScope *scope) {
+    if (scope->installed) {
+        sigaction(SIGINT, &scope->prev_sa, NULL);
+        scope->installed = 0;
+    }
+    g_sigint_cancel_flag = scope->prev_flag;
+    scope->prev_flag = NULL;
+}
 
 static uint64_t splitmix64_next(uint64_t *state) {
     uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
@@ -102,7 +165,8 @@ static int collect_fasta_record_starts(
     size_t size,
     uint64_t **out_starts,
     uint64_t *out_count,
-    shuffle_progress_cb_t progress_cb) {
+    shuffle_progress_cb_t progress_cb,
+    const volatile int *cancel_requested) {
     if (!out_starts || !out_count) {
         return -1;
     }
@@ -129,6 +193,10 @@ static int collect_fasta_record_starts(
     }
 
     while (cur < end) {
+        if (should_cancel(cancel_requested)) {
+            free(starts);
+            return NANOPLM_RC_CANCELLED;
+        }
         const void *found = memchr(cur, '>', (size_t)(end - cur));
         if (!found) {
             break;
@@ -324,6 +392,7 @@ API_EXPORT int nanoplm_filter_fasta(
     long long seqs_num,
     long long skip_n,
     progress_cb_t progress_cb,
+    const volatile int *cancel_requested,
     long long *out_processed,
     long long *out_passed,
     char *error_msg,
@@ -345,14 +414,19 @@ API_EXPORT int nanoplm_filter_fasta(
         return -1;
     }
 
+    CancelScope cancel_scope;
+    cancel_scope_enter(&cancel_scope, (volatile int *)cancel_requested);
+
     int in_fd = open(input_path, O_RDONLY);
     if (in_fd < 0) {
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to open input FASTA %s: %s", input_path, strerror(errno));
         return -1;
     }
     struct stat st;
     if (fstat(in_fd, &st) != 0) {
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to stat input FASTA %s: %s", input_path, strerror(errno));
         return -1;
     }
@@ -361,12 +435,14 @@ API_EXPORT int nanoplm_filter_fasta(
     FILE *in = fdopen(in_fd, "rb");
     if (!in) {
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to open input FASTA stream %s: %s", input_path, strerror(errno));
         return -1;
     }
     FILE *out = fopen(output_path, "wb");
     if (!out) {
         fclose(in);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to open output FASTA %s: %s", output_path, strerror(errno));
         return -1;
     }
@@ -381,6 +457,7 @@ API_EXPORT int nanoplm_filter_fasta(
         dynbuf_free(&seq);
         fclose(in);
         fclose(out);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Out of memory");
         return -1;
     }
@@ -399,6 +476,11 @@ API_EXPORT int nanoplm_filter_fasta(
     long long passed = 0;
 
     while ((line_len = getline(&line, &line_cap, in)) != -1) {
+        if (should_cancel(cancel_requested)) {
+            set_error(error_msg, error_cap, "Operation cancelled");
+            status = NANOPLM_RC_CANCELLED;
+            goto cleanup;
+        }
         bytes_read += (long long)line_len;
         if (line_len > 0 && line[0] == '>') {
             if (seen_header) {
@@ -462,6 +544,12 @@ cleanup:
         status = -1;
     }
 
+    if (status == NANOPLM_RC_CANCELLED) {
+        unlink(output_path);
+    }
+
+    cancel_scope_exit(&cancel_scope);
+
     if (status == 0) {
         *out_processed = processed;
         *out_passed = passed;
@@ -475,6 +563,7 @@ API_EXPORT int nanoplm_split_fasta(
     const char *val_path,
     double val_ratio,
     progress_cb_t progress_cb,
+    const volatile int *cancel_requested,
     long long *out_train_size,
     long long *out_val_size,
     char *error_msg,
@@ -488,8 +577,12 @@ API_EXPORT int nanoplm_split_fasta(
         return -1;
     }
 
+    CancelScope cancel_scope;
+    cancel_scope_enter(&cancel_scope, (volatile int *)cancel_requested);
+
     FILE *in = fopen(input_path, "rb");
     if (!in) {
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to open input FASTA %s: %s", input_path, strerror(errno));
         return -1;
     }
@@ -497,6 +590,7 @@ API_EXPORT int nanoplm_split_fasta(
     struct stat st;
     if (fstat(fileno(in), &st) != 0) {
         fclose(in);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to stat input FASTA %s: %s", input_path, strerror(errno));
         return -1;
     }
@@ -509,6 +603,13 @@ API_EXPORT int nanoplm_split_fasta(
     long long bytes_read = 0;
     long long last_reported_percent = -1;
     while ((line_len = getline(&line, &line_cap, in)) != -1) {
+        if (should_cancel(cancel_requested)) {
+            free(line);
+            fclose(in);
+            cancel_scope_exit(&cancel_scope);
+            set_error(error_msg, error_cap, "Operation cancelled");
+            return NANOPLM_RC_CANCELLED;
+        }
         bytes_read += (long long)line_len;
         if (line_len > 0 && line[0] == '>') {
             total++;
@@ -518,6 +619,7 @@ API_EXPORT int nanoplm_split_fasta(
     if (ferror(in)) {
         free(line);
         fclose(in);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Error while counting FASTA records");
         return -1;
     }
@@ -528,6 +630,7 @@ API_EXPORT int nanoplm_split_fasta(
     if (fseek(in, 0, SEEK_SET) != 0) {
         free(line);
         fclose(in);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to rewind input FASTA");
         return -1;
     }
@@ -536,6 +639,7 @@ API_EXPORT int nanoplm_split_fasta(
     if (!train) {
         free(line);
         fclose(in);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to open train FASTA %s: %s", train_path, strerror(errno));
         return -1;
     }
@@ -544,6 +648,7 @@ API_EXPORT int nanoplm_split_fasta(
         free(line);
         fclose(in);
         fclose(train);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to open val FASTA %s: %s", val_path, strerror(errno));
         return -1;
     }
@@ -557,6 +662,11 @@ API_EXPORT int nanoplm_split_fasta(
     bytes_read = 0;
     last_reported_percent = -1;
     while ((line_len = getline(&line, &line_cap, in)) != -1) {
+        if (should_cancel(cancel_requested)) {
+            set_error(error_msg, error_cap, "Operation cancelled");
+            status = NANOPLM_RC_CANCELLED;
+            break;
+        }
         bytes_read += (long long)line_len;
         if (line_len > 0 && line[0] == '>') {
             rec_idx++;
@@ -592,6 +702,13 @@ API_EXPORT int nanoplm_split_fasta(
         status = -1;
     }
 
+    if (status == NANOPLM_RC_CANCELLED) {
+        unlink(train_path);
+        unlink(val_path);
+    }
+
+    cancel_scope_exit(&cancel_scope);
+
     if (status == 0) {
         report_progress(progress_cb, 2, input_size, input_size, &last_reported_percent);
         *out_train_size = train_size;
@@ -607,6 +724,7 @@ API_EXPORT int nanoplm_shuffle_fasta(
     int num_threads,
     long long batch_records,
     shuffle_progress_cb_t progress_cb,
+    const volatile int *cancel_requested,
     long long *out_num_records,
     char *error_msg,
     size_t error_cap) {
@@ -621,8 +739,12 @@ API_EXPORT int nanoplm_shuffle_fasta(
         batch_records = 262144;
     }
 
+    CancelScope cancel_scope;
+    cancel_scope_enter(&cancel_scope, (volatile int *)cancel_requested);
+
     int in_fd = open(input_path, O_RDONLY);
     if (in_fd < 0) {
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to open input FASTA %s: %s", input_path, strerror(errno));
         return -1;
     }
@@ -630,11 +752,13 @@ API_EXPORT int nanoplm_shuffle_fasta(
     struct stat st;
     if (fstat(in_fd, &st) != 0) {
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to stat input FASTA %s: %s", input_path, strerror(errno));
         return -1;
     }
     if (st.st_size <= 0) {
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Input FASTA is empty");
         return -1;
     }
@@ -643,17 +767,28 @@ API_EXPORT int nanoplm_shuffle_fasta(
     unsigned char *in_map = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, in_fd, 0);
     if (in_map == MAP_FAILED) {
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to mmap input FASTA: %s", strerror(errno));
         return -1;
     }
 
     uint64_t num_records = 0;
     uint64_t *starts = NULL;
-    if (collect_fasta_record_starts(in_map, file_size, &starts, &num_records, progress_cb) != 0 ||
-        num_records == 0) {
+    int collect_rc =
+        collect_fasta_record_starts(in_map, file_size, &starts, &num_records, progress_cb, cancel_requested);
+    if (collect_rc == NANOPLM_RC_CANCELLED) {
         free(starts);
         munmap(in_map, file_size);
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
+        set_error(error_msg, error_cap, "Operation cancelled");
+        return NANOPLM_RC_CANCELLED;
+    }
+    if (collect_rc != 0 || num_records == 0) {
+        free(starts);
+        munmap(in_map, file_size);
+        close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "No FASTA records found in input");
         return -1;
     }
@@ -661,6 +796,7 @@ API_EXPORT int nanoplm_shuffle_fasta(
         free(starts);
         munmap(in_map, file_size);
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "FASTA contains too many records for in-memory shuffle");
         return -1;
     }
@@ -673,6 +809,7 @@ API_EXPORT int nanoplm_shuffle_fasta(
         free(perm);
         munmap(in_map, file_size);
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Out of memory while preparing FASTA shuffle");
         return -1;
     }
@@ -699,6 +836,7 @@ API_EXPORT int nanoplm_shuffle_fasta(
         free(tasks);
         munmap(in_map, file_size);
         close(in_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to open output FASTA %s: %s", output_path, strerror(errno));
         return -1;
     }
@@ -709,6 +847,7 @@ API_EXPORT int nanoplm_shuffle_fasta(
         munmap(in_map, file_size);
         close(in_fd);
         close(out_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to size output FASTA %s: %s", output_path, strerror(errno));
         return -1;
     }
@@ -721,6 +860,7 @@ API_EXPORT int nanoplm_shuffle_fasta(
         munmap(in_map, file_size);
         close(in_fd);
         close(out_fd);
+        cancel_scope_exit(&cancel_scope);
         set_error(error_msg, error_cap, "Failed to mmap output FASTA: %s", strerror(errno));
         return -1;
     }
@@ -731,7 +871,13 @@ API_EXPORT int nanoplm_shuffle_fasta(
 
     uint64_t dst_offset = 0;
     long long last_reported_percent = -1;
+    int shuffle_status = 0;
     for (uint64_t batch_start = 0; batch_start < num_records; batch_start += (uint64_t)batch_records) {
+        if (should_cancel(cancel_requested)) {
+            set_error(error_msg, error_cap, "Operation cancelled");
+            shuffle_status = NANOPLM_RC_CANCELLED;
+            break;
+        }
         uint64_t batch_n = num_records - batch_start;
         if (batch_n > (uint64_t)batch_records) {
             batch_n = (uint64_t)batch_records;
@@ -771,11 +917,22 @@ API_EXPORT int nanoplm_shuffle_fasta(
     free(tasks);
     munmap(in_map, file_size);
     close(in_fd);
-    if (close(out_fd) != 0) {
+    if (close(out_fd) != 0 && shuffle_status == 0) {
         set_error(error_msg, error_cap, "Failed to close output FASTA: %s", strerror(errno));
-        return -1;
+        shuffle_status = -1;
     }
 
+    if (shuffle_status == NANOPLM_RC_CANCELLED) {
+        unlink(output_path);
+        cancel_scope_exit(&cancel_scope);
+        return NANOPLM_RC_CANCELLED;
+    }
+    if (shuffle_status != 0) {
+        cancel_scope_exit(&cancel_scope);
+        return shuffle_status;
+    }
+
+    cancel_scope_exit(&cancel_scope);
     *out_num_records = (long long)num_records;
     return 0;
 }
