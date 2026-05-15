@@ -4,6 +4,7 @@ nanoPLM CLI - Distillation subcommands for nanoPLM package
 """
 
 import json
+import typing
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -115,7 +116,7 @@ def distill():
     '--learning-rate',
     type=float,
     default=1e-3,
-    help='Maximum learning rate'
+    help='Learning rate (AdamW) or ignored when optimizer is muon/normuon'
 )
 @click.option(
     '--gradient-accumulation-steps',
@@ -128,6 +129,70 @@ def distill():
     type=float,
     default=0.05,
     help='Ratio of total training steps used for warmup'
+)
+@click.option(
+    '--max-grad-norm',
+    type=float,
+    default=float('inf'),
+    help='Gradient clipping L2 norm threshold (inf = disabled)'
+)
+# Optimizer options
+@click.option(
+    '--optimizer',
+    type=click.Choice(['adamw', 'muon', 'normuon']),
+    default='adamw',
+    help='Optimizer: adamw, muon, or normuon'
+)
+@click.option(
+    '--muon-learning-rate',
+    type=float,
+    default=1e-3,
+    help='Learning rate for Muon/NorMuon (2-D weight matrices)'
+)
+@click.option(
+    '--muon-weight-decay',
+    type=float,
+    default=0.01,
+    help='Muon weight decay (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-cautious-weight-decay/--no-muon-cautious-weight-decay',
+    default=True,
+    help='Enable cautious weight decay in Muon/NorMuon (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-use-polar-express/--no-muon-use-polar-express',
+    default=True,
+    help='Use Polar Express orthogonalization for Muon/NorMuon (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-momentum',
+    type=float,
+    default=0.95,
+    help='Muon momentum (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-nesterov/--no-muon-nesterov',
+    default=True,
+    help='Enable Nesterov in Muon (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--muon-eps',
+    type=float,
+    default=1e-7,
+    help='Muon epsilon (used only when optimizer=muon or normuon)',
+)
+@click.option(
+    '--adam-learning-rate',
+    type=float,
+    default=1e-4,
+    help='Learning rate for AdamW sub-optimizer (embeddings, biases, 1-D params)'
+)
+@click.option(
+    '--adam-weight-decay',
+    type=float,
+    default=0.0,
+    help='AdamW weight decay'
 )
 # LR scheduler options
 @click.option(
@@ -214,6 +279,17 @@ def distill():
     default=True,
     help='Enable TF32 mode on Ampere+ GPUs for faster fp32 matmuls'
 )
+# torch.compile options
+@click.option(
+    '--use-compile/--no-compile',
+    default=False,
+    help='Enable torch.compile on the student model'
+)
+@click.option(
+    '--use-compile-max-autotune/--no-compile-max-autotune',
+    default=False,
+    help='Use max-autotune-no-cudagraphs compile mode (slower start, faster steady state)'
+)
 # Distributed training options
 @click.option(
     '--multi-gpu',
@@ -225,6 +301,18 @@ def distill():
     type=str,
     default='1',
     help='Number of GPUs to use (or "auto" for automatic detection)'
+)
+@click.option(
+    '--distributed-mode',
+    type=click.Choice(['ddp', 'fsdp']),
+    default='ddp',
+    help='Distributed training mode: ddp (default) or fsdp (FSDP2 with bf16)'
+)
+@click.option(
+    '--fsdp-shard-granularity',
+    type=click.Choice(['layer', 'sublayer']),
+    default='layer',
+    help='FSDP2 sharding granularity: layer (whole block) or sublayer (attn+mlp separately)'
 )
 @click.option(
     '--seed',
@@ -240,10 +328,14 @@ def distill():
     help='Path to checkpoint directory to resume training from'
 )
 @click.option(
-    '--extra-epochs',
+    '--resume-epochs',
     type=int,
     default=0,
-    help='Additional epochs to train when resuming (added to num-epochs)'
+    help=(
+        'Number of additional epochs to train from the checkpoint. '
+        '0 (default) continues to the original num_epochs from the distill '
+        'config; N>0 trains for exactly N more epochs from the checkpoint.'
+    ),
 )
 def run(
     dataset_dir: Optional[str],
@@ -263,6 +355,17 @@ def run(
     learning_rate: float,
     gradient_accumulation_steps: int,
     warmup_ratio: float,
+    max_grad_norm: float,
+    optimizer: str,
+    muon_learning_rate: float,
+    muon_weight_decay: float,
+    muon_cautious_weight_decay: bool,
+    muon_use_polar_express: bool,
+    muon_momentum: float,
+    muon_nesterov: bool,
+    muon_eps: float,
+    adam_learning_rate: float,
+    adam_weight_decay: float,
     lr_scheduler: str,
     lr_scheduler_kwargs: str,
     max_open_files: int,
@@ -277,11 +380,15 @@ def run(
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
+    use_compile: bool,
+    use_compile_max_autotune: bool,
     multi_gpu: bool,
     world_size: str,
+    distributed_mode: str,
+    fsdp_shard_granularity: str,
     seed: int,
     resume_from: Optional[str],
-    extra_epochs: int,
+    resume_epochs: int,
 ):
     """Distill the teacher model into a student model.
 
@@ -380,6 +487,17 @@ def run(
         "learning_rate": learning_rate,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "warmup_ratio": warmup_ratio,
+        "max_grad_norm": max_grad_norm,
+        "optimizer": optimizer,
+        "muon_learning_rate": muon_learning_rate,
+        "muon_weight_decay": muon_weight_decay,
+        "muon_cautious_weight_decay": muon_cautious_weight_decay,
+        "muon_use_polar_express": muon_use_polar_express,
+        "muon_momentum": muon_momentum,
+        "muon_nesterov": muon_nesterov,
+        "muon_eps": muon_eps,
+        "adam_learning_rate": adam_learning_rate,
+        "adam_weight_decay": adam_weight_decay,
         "lr_scheduler": lr_scheduler,
         "lr_scheduler_kwargs": lr_scheduler_kwargs_dict,
         "max_open_files": max_open_files,
@@ -394,8 +512,12 @@ def run(
         "logging_steps": logging_steps,
         "eval_steps": eval_steps,
         "save_steps": save_steps,
+        "use_compile": use_compile,
+        "use_compile_max_autotune": use_compile_max_autotune,
         "multi_gpu": multi_gpu,
         "world_size": world_size_value,
+        "distributed_mode": distributed_mode,
+        "fsdp_shard_granularity": fsdp_shard_granularity,
         "seed": seed,
     }
 
@@ -434,10 +556,12 @@ def run(
             raise click.ClickException(
                 f"Resume checkpoint directory does not exist: {resume_from}"
             )
+        if resume_epochs < 0:
+            raise click.ClickException("--resume-epochs must be >= 0")
         resume_config = ResumeConfig(
             is_resume=True,
             checkpoint_dir=resume_from,
-            extra_epochs=extra_epochs if extra_epochs > 0 else None,
+            resume_epochs=resume_epochs if resume_epochs > 0 else None,
         )
 
     # Run distillation
@@ -549,17 +673,35 @@ def get_yaml(output: Optional[str], force: bool):
         "# This will generate a .data_manifest file with the appropriate configuration.\n"
         "\n"
         "model:\n"
+        "  # Core architecture\n"
         "  hidden_size: 512\n"
         "  intermediate_size: 1024\n"
         "  num_hidden_layers: 6\n"
         "  num_attention_heads: 8\n"
+        "  num_kv_heads: null  # GQA: set < num_attention_heads to enable; null = MHA\n"
         "  mlp_activation: \"swiglu\"\n"
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: false\n"
+        "  no_mlp_on_first_layer: true\n"
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         "  classifier_activation: \"gelu\"\n"
         "  projection_layer: true  # Set to false if student hidden_size matches teacher (1024)\n"
+        "\n"
+        "  # Advanced architecture features (pure-torch Triton-fused kernels)\n"
+        "  use_canon_layers: false       # Canon depthwise-conv token-mixing layers\n"
+        "  canon_layers_mode: \"abcd\"\n"
+        "  use_mhc_lite: false           # mHC-lite multi-stream residual mixing\n"
+        "  mhc_n_streams: 4\n"
+        "  mhc_triton_fused: false\n"
+        "  mhc_lite_wrapping_level: \"layer\"\n"
+        "  use_diff_attn_v2: false       # Differential Attention V2\n"
+        "  use_repo: false               # Residual Proportional Output\n"
+        "  use_resid_lambdas: false\n"
+        "  use_x0_lambdas: false\n"
+        "  use_qk_norm: false\n"
+        "  activation_checkpointing: false\n"
+        "  activation_checkpointing_mode: \"layer\"\n"
         "\n"
         "distillation:\n"
         "\n"
@@ -573,9 +715,24 @@ def get_yaml(output: Optional[str], force: bool):
         "  # Training hyperparameters\n"
         "  num_epochs: 10\n"
         "  batch_size: 64\n"
-        "  learning_rate: 1e-3\n"
+        "  learning_rate: 1e-3  # used only when optimizer: adamw\n"
         "  gradient_accumulation_steps: 1\n"
         "  warmup_ratio: 0.05\n"
+        "  max_grad_norm: .inf  # gradient clipping L2 norm (.inf = disabled)\n"
+        "\n"
+        "  # Optimizer: adamw | muon | normuon\n"
+        "  # muon/normuon routes 2-D matrices through Dion Muon/NorMuon and\n"
+        "  # biases/embeddings through fused AdamW (same as pretraining).\n"
+        "  optimizer: \"adamw\"\n"
+        "  muon_learning_rate: 1e-3\n"
+        "  muon_weight_decay: 0.01\n"
+        "  muon_cautious_weight_decay: true\n"
+        "  muon_use_polar_express: true\n"
+        "  muon_momentum: 0.95\n"
+        "  muon_nesterov: true\n"
+        "  muon_eps: 1e-7\n"
+        "  adam_learning_rate: 1e-4\n"
+        "  adam_weight_decay: 0.0\n"
         "\n"
         "  # LR scheduler\n"
         "  lr_scheduler: \"cosine\"  # cosine, linear, polynomial, constant\n"
@@ -604,18 +761,33 @@ def get_yaml(output: Optional[str], force: bool):
         "  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)\n"
         "             # Provides 3x faster fp32 matmuls with negligible precision loss\n"
         "\n"
+        "  # torch.compile (requires CUDA)\n"
+        "  use_compile: false\n"
+        "  use_compile_max_autotune: false  # slower warmup, faster steady-state\n"
+        "  compile_triton_persistent_reductions: false\n"
+        "  compile_triton_mix_order_reduction: false\n"
+        "\n"
         "  # Distributed training\n"
         "  multi_gpu: false\n"
         "  world_size: 1\n"
+        "  distributed_mode: \"ddp\"   # ddp | fsdp (FSDP2 with bf16/fp32 mixed)\n"
+        "  fsdp_shard_granularity: \"layer\"  # layer | sublayer\n"
         "  seed: 42\n"
+        "\n"
+        "  # Profiling (rank-0 only; writes Chrome trace or Nsight profile)\n"
+        "  profiler_enabled: false\n"
+        "  profiler_start_step: 10\n"
+        "  profiler_end_step: 15\n"
         "\n"
         "resume:\n"
         "  # Set is_resume: true to resume training from a checkpoint\n"
         "  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir\n"
-        "  # extra_epochs: adds to 'distillation.num_epochs' to define total epochs.\n"
+        "  # resume_epochs: 0 (or unset) continues to the original 'distillation.num_epochs'.\n"
+        "  # N>0 trains for exactly N more epochs from the checkpoint\n"
+        "  # (i.e., final num_epochs = checkpoint_epoch + N).\n"
         "  is_resume: false\n"
         "  checkpoint_dir: \"output/distillation/run-1/checkpoint-1\"\n"
-        "  extra_epochs: 0\n"
+        "  resume_epochs: 0\n"
     )
 
     # If forcing, remove existing file first
@@ -631,7 +803,10 @@ def _load_model_config(config: Dict[str, Any]) -> ProtXConfig:
     if config is None:
         raise ValueError("Model configuration is required but not found in YAML")
 
-    expected_keys = set(ProtXConfig.__annotations__.keys())
+    # Use get_type_hints() instead of __annotations__ so that inherited fields
+    # from ProtModernBertMLMConfig (Canon, mHC, GQA, DiffAttn, etc.) are
+    # recognised as valid keys.
+    expected_keys = set(typing.get_type_hints(ProtXConfig).keys())
     present_keys = set(config.keys())
 
     extra = []
@@ -694,6 +869,7 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
     # Handle boolean values
     bool_keys = [
         'multi_gpu', 'on_the_fly', 'sharded', 'use_threading', 'bf16', 'tf32',
+        'muon_cautious_weight_decay', 'muon_use_polar_express', 'muon_nesterov',
     ]
     for bool_key in bool_keys:
         if bool_key in kwargs:
@@ -709,7 +885,7 @@ def _load_distill_config(config: Dict[str, Any]) -> DistillationConfig:
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     """Load and validate resume configuration from YAML."""
     if config is None:
-        return ResumeConfig(is_resume=False, checkpoint_dir="", extra_epochs=None)
+        return ResumeConfig(is_resume=False, checkpoint_dir="", resume_epochs=None)
 
     expected_keys = set(ResumeConfig.__annotations__.keys())
     present_keys = set(config.keys())
@@ -724,6 +900,25 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
         value = config.get(key)
         if value is not None:
             kwargs[key] = value
+
+    if extra:
+        raise ValueError(
+            f"Unknown key(s) under 'resume': {sorted(extra)}. "
+            f"Expected: {sorted(expected_keys)}."
+        )
+
+    if "resume_epochs" in kwargs and kwargs["resume_epochs"] is not None:
+        try:
+            kwargs["resume_epochs"] = int(kwargs["resume_epochs"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid resume_epochs value: {kwargs['resume_epochs']}. "
+                f"Must be an integer."
+            ) from exc
+        if kwargs["resume_epochs"] < 0:
+            raise ValueError(
+                f"Invalid resume_epochs value: {kwargs['resume_epochs']}. Must be >= 0."
+            )
 
     checkpoint_dir = kwargs.get("checkpoint_dir", "")
     is_resume = kwargs.get("is_resume", False)

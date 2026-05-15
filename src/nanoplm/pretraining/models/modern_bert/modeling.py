@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Literal, Optional
 
 import torch
@@ -471,12 +471,23 @@ class ModernBertConfig:
             self.moe_layer_flags = [False] * self.num_hidden_layers
             self.moe_dense_intermediate_size = self.intermediate_size
 
+    def to_dict(self) -> dict:
+        """Return a JSON-serialisable dict (required by Transformers/W&B callbacks)."""
+        result = {}
+        for f in fields(self):
+            val = getattr(self, f.name)
+            if isinstance(val, frozenset):
+                val = sorted(val)
+            result[f.name] = val
+        return result
+
 
 def _create_norm(hidden_size: int, eps: float, bias: bool, norm_type: str) -> nn.Module:
     """Create a normalization layer based on norm_type."""
     if norm_type == "rmsnorm":
         return nn.RMSNorm(hidden_size, eps=eps)
     return nn.LayerNorm(hidden_size, eps=eps, bias=bias)
+
 
 
 def _get_activation(name: str):

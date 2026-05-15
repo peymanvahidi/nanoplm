@@ -115,6 +115,7 @@ def _load_native_function():
         ctypes.c_int,  # samples_per_shard
         ctypes.c_int,  # num_threads
         ctypes.c_int,  # use_bos_token
+        ctypes.c_int,  # num_register_tokens
         _PROGRESS_CB,  # progress callback
         ctypes.POINTER(ctypes.c_int),  # out_num_shards
         ctypes.POINTER(ctypes.c_longlong),  # out_num_sequences
@@ -142,6 +143,7 @@ def create_shards_native(
     samples_per_shard: int,
     num_threads: int,
     use_bos_token: bool,
+    num_register_tokens: int = 0,
     progress_cb: Callable[[int, float, int, int], None] | None = None,
 ) -> NativeShardResult:
     if _is_disabled_by_env():
@@ -169,6 +171,7 @@ def create_shards_native(
         int(samples_per_shard),
         int(num_threads),
         int(bool(use_bos_token)),
+        int(num_register_tokens),
         c_progress_cb,
         ctypes.byref(out_num_shards),
         ctypes.byref(out_num_sequences),
