@@ -622,8 +622,7 @@ def run_te_pretraining(
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
-        # Rebuild the LR scheduler from the checkpoint's saved schedule
-        # params (with any explicit overrides from resume config).
+        # Build the resumed LR scheduler (EXTEND or RESET per resume_config).
         scheduler = _rebuild_scheduler_for_resume(
             optimizer=optimizer,
             resume_config=resume_config,
@@ -631,7 +630,6 @@ def run_te_pretraining(
             checkpoint_dir=resume_config.checkpoint_dir,
             start_step=start_step,
             total_steps=total_steps,
-            warmup_steps=warmup_steps,
             is_main=is_main,
         )
         resume_epoch = start_epoch

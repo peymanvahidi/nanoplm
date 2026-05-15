@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import shutil
@@ -141,6 +142,36 @@ def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
         logger.info(f"Archived checkpoints moved to: {archive_dir}")
 
 
+def _read_checkpoint_epoch(checkpoint_dir: Union[str, Path]) -> int:
+    """Read the current epoch from a checkpoint directory.
+
+    Tries the pure-torch / TE format (`training_state.json`) first, then falls
+    back to the HuggingFace Trainer format (`trainer_state.json`).  HF stores
+    `epoch` as a float (e.g. 4.5 mid-epoch); we truncate to the number of
+    completed full epochs.
+
+    Raises FileNotFoundError if neither file exists.
+    """
+    ckp = Path(checkpoint_dir)
+
+    pure_state = ckp / "training_state.json"
+    if pure_state.exists():
+        with open(pure_state, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        return int(state.get("epoch", 0))
+
+    hf_state = ckp / "trainer_state.json"
+    if hf_state.exists():
+        with open(hf_state, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        return int(state.get("epoch", 0))
+
+    raise FileNotFoundError(
+        f"Could not determine checkpoint epoch: neither "
+        f"'{pure_state}' nor '{hf_state}' exists. Cannot honor resume_epochs > 0."
+    )
+
+
 def prepare_run_and_steps(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig],
@@ -228,8 +259,15 @@ def prepare_run_and_steps(
     if resume_config and resume_config.is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
 
-        if resume_config.extra_epochs:
-            num_epochs = pretrain_config.num_epochs + int(resume_config.extra_epochs)
+        if resume_config.resume_epochs and int(resume_config.resume_epochs) > 0:
+            checkpoint_epoch = _read_checkpoint_epoch(resume_config.checkpoint_dir)
+            num_epochs = checkpoint_epoch + int(resume_config.resume_epochs)
+            if num_epochs <= checkpoint_epoch:
+                raise ValueError(
+                    f"resume_epochs would result in zero or negative training: "
+                    f"checkpoint is at epoch {checkpoint_epoch}, requested target "
+                    f"is {num_epochs}."
+                )
         else:
             num_epochs = pretrain_config.num_epochs
 
