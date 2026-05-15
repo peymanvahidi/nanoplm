@@ -5,6 +5,7 @@ import hashlib
 import os
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Callable
 
 
 _ERROR_BUFFER_BYTES = 4096
+_NATIVE_RC_CANCELLED = -2
 _DISABLE_NATIVE_FASTA_OPS_ENV = "NANOPLM_DISABLE_NATIVE_FASTA_OPS"
 _NATIVE_FASTA_BUILD_DIR_ENV = "NANOPLM_NATIVE_FASTA_BUILD_DIR"
 _SHUFFLE_PROGRESS_CB = ctypes.CFUNCTYPE(
@@ -140,6 +142,35 @@ def is_native_fasta_ops_available() -> tuple[bool, str | None]:
         return False, str(exc)
 
 
+@contextmanager
+def _sigint_cancel_flag():
+    """
+    Yield a ctypes.c_int that the native code polls for cancellation.
+
+    The native function installs its own SIGINT handler (via sigaction) for
+    the duration of the call so that Ctrl+C is observed synchronously while
+    ctypes is blocked in the C code. The flag yielded here is the shared
+    target that the handler writes to and the C loops poll. After the call
+    returns, the Python wrapper checks the flag and raises KeyboardInterrupt
+    if cancellation occurred.
+    """
+    yield ctypes.c_int(0)
+
+
+def _wrap_progress_cb(progress_cb, cb_type):
+    """Wrap a user progress callback so exceptions don't crash the C->Py bridge."""
+    if progress_cb is None:
+        return ctypes.cast(None, cb_type)
+
+    def _safe(*args):
+        try:
+            progress_cb(*args)
+        except BaseException:
+            pass
+
+    return cb_type(_safe)
+
+
 def filter_fasta_native(
     input_path: str | Path,
     output_path: str | Path,
@@ -163,6 +194,7 @@ def filter_fasta_native(
         ctypes.c_longlong,  # seqs_num
         ctypes.c_longlong,  # skip_n
         _PROGRESS_CB,  # progress callback
+        ctypes.POINTER(ctypes.c_int),  # cancel_requested
         ctypes.POINTER(ctypes.c_longlong),  # out_processed
         ctypes.POINTER(ctypes.c_longlong),  # out_passed
         ctypes.c_char_p,  # error_msg
@@ -173,25 +205,27 @@ def filter_fasta_native(
     out_processed = ctypes.c_longlong(0)
     out_passed = ctypes.c_longlong(0)
     error_buffer = ctypes.create_string_buffer(_ERROR_BUFFER_BYTES)
-    c_progress_cb = (
-        _PROGRESS_CB(progress_cb)
-        if progress_cb is not None
-        else ctypes.cast(None, _PROGRESS_CB)
-    )
+    c_progress_cb = _wrap_progress_cb(progress_cb, _PROGRESS_CB)
 
-    rc = func(
-        str(Path(input_path)).encode("utf-8"),
-        str(Path(output_path)).encode("utf-8"),
-        int(min_seq_len),
-        int(max_seq_len),
-        int(seqs_num),
-        int(skip_n),
-        c_progress_cb,
-        ctypes.byref(out_processed),
-        ctypes.byref(out_passed),
-        error_buffer,
-        ctypes.c_size_t(_ERROR_BUFFER_BYTES),
-    )
+    with _sigint_cancel_flag() as cancel_flag:
+        rc = func(
+            str(Path(input_path)).encode("utf-8"),
+            str(Path(output_path)).encode("utf-8"),
+            int(min_seq_len),
+            int(max_seq_len),
+            int(seqs_num),
+            int(skip_n),
+            c_progress_cb,
+            ctypes.byref(cancel_flag),
+            ctypes.byref(out_processed),
+            ctypes.byref(out_passed),
+            error_buffer,
+            ctypes.c_size_t(_ERROR_BUFFER_BYTES),
+        )
+        cancelled = cancel_flag.value != 0 or rc == _NATIVE_RC_CANCELLED
+
+    if cancelled:
+        raise KeyboardInterrupt("Native FASTA filter cancelled")
     if rc != 0:
         msg = error_buffer.value.decode("utf-8", errors="replace").strip()
         if not msg:
@@ -223,6 +257,7 @@ def split_fasta_native(
         ctypes.c_char_p,  # val_path
         ctypes.c_double,  # val_ratio
         _PROGRESS_CB,  # progress callback
+        ctypes.POINTER(ctypes.c_int),  # cancel_requested
         ctypes.POINTER(ctypes.c_longlong),  # out_train
         ctypes.POINTER(ctypes.c_longlong),  # out_val
         ctypes.c_char_p,  # error_msg
@@ -233,23 +268,25 @@ def split_fasta_native(
     out_train = ctypes.c_longlong(0)
     out_val = ctypes.c_longlong(0)
     error_buffer = ctypes.create_string_buffer(_ERROR_BUFFER_BYTES)
-    c_progress_cb = (
-        _PROGRESS_CB(progress_cb)
-        if progress_cb is not None
-        else ctypes.cast(None, _PROGRESS_CB)
-    )
+    c_progress_cb = _wrap_progress_cb(progress_cb, _PROGRESS_CB)
 
-    rc = func(
-        str(Path(input_path)).encode("utf-8"),
-        str(Path(train_path)).encode("utf-8"),
-        str(Path(val_path)).encode("utf-8"),
-        float(val_ratio),
-        c_progress_cb,
-        ctypes.byref(out_train),
-        ctypes.byref(out_val),
-        error_buffer,
-        ctypes.c_size_t(_ERROR_BUFFER_BYTES),
-    )
+    with _sigint_cancel_flag() as cancel_flag:
+        rc = func(
+            str(Path(input_path)).encode("utf-8"),
+            str(Path(train_path)).encode("utf-8"),
+            str(Path(val_path)).encode("utf-8"),
+            float(val_ratio),
+            c_progress_cb,
+            ctypes.byref(cancel_flag),
+            ctypes.byref(out_train),
+            ctypes.byref(out_val),
+            error_buffer,
+            ctypes.c_size_t(_ERROR_BUFFER_BYTES),
+        )
+        cancelled = cancel_flag.value != 0 or rc == _NATIVE_RC_CANCELLED
+
+    if cancelled:
+        raise KeyboardInterrupt("Native FASTA split cancelled")
     if rc != 0:
         msg = error_buffer.value.decode("utf-8", errors="replace").strip()
         if not msg:
@@ -283,6 +320,7 @@ def shuffle_fasta_native(
         ctypes.c_int,  # num_threads
         ctypes.c_longlong,  # batch_records
         _SHUFFLE_PROGRESS_CB,  # progress callback
+        ctypes.POINTER(ctypes.c_int),  # cancel_requested
         ctypes.POINTER(ctypes.c_longlong),  # out_num_records
         ctypes.c_char_p,  # error_msg
         ctypes.c_size_t,  # error_cap
@@ -291,23 +329,25 @@ def shuffle_fasta_native(
 
     out_count = ctypes.c_longlong(0)
     error_buffer = ctypes.create_string_buffer(_ERROR_BUFFER_BYTES)
-    c_progress_cb = (
-        _SHUFFLE_PROGRESS_CB(progress_cb)
-        if progress_cb is not None
-        else ctypes.cast(None, _SHUFFLE_PROGRESS_CB)
-    )
+    c_progress_cb = _wrap_progress_cb(progress_cb, _SHUFFLE_PROGRESS_CB)
 
-    rc = func(
-        str(Path(input_path)).encode("utf-8"),
-        str(Path(output_path)).encode("utf-8"),
-        int(seed) & ((1 << 64) - 1),
-        int(num_threads),
-        int(batch_records),
-        c_progress_cb,
-        ctypes.byref(out_count),
-        error_buffer,
-        ctypes.c_size_t(_ERROR_BUFFER_BYTES),
-    )
+    with _sigint_cancel_flag() as cancel_flag:
+        rc = func(
+            str(Path(input_path)).encode("utf-8"),
+            str(Path(output_path)).encode("utf-8"),
+            int(seed) & ((1 << 64) - 1),
+            int(num_threads),
+            int(batch_records),
+            c_progress_cb,
+            ctypes.byref(cancel_flag),
+            ctypes.byref(out_count),
+            error_buffer,
+            ctypes.c_size_t(_ERROR_BUFFER_BYTES),
+        )
+        cancelled = cancel_flag.value != 0 or rc == _NATIVE_RC_CANCELLED
+
+    if cancelled:
+        raise KeyboardInterrupt("Native FASTA shuffle cancelled")
     if rc != 0:
         msg = error_buffer.value.decode("utf-8", errors="replace").strip()
         if not msg:
