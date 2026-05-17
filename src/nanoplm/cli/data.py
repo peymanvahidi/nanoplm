@@ -319,6 +319,12 @@ def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: 
     show_default=True,
     help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
 )
+@click.option(
+    "--exclude-ids",
+    default=None,
+    type=click.Path(exists=False),
+    help="Optional path to a text file with one sequence ID per line; matching sequences are excluded.",
+)
 @click.help_option("--help", "-h")
 def filter(
     input: str,
@@ -328,6 +334,7 @@ def filter(
     seqs_num: int,
     skip_n: int,
     pipeline_backend: str,
+    exclude_ids: str | None,
 ):
     """Filter sequences by length and optional max count."""
     input_path = Path(input)
@@ -345,6 +352,7 @@ def filter(
             min_seq_len=min_seq_len,
             max_seq_len=max_seq_len,
             seqs_num=seqs_num,
+            exclude_ids=Path(exclude_ids) if exclude_ids else None,
         )
         filterer.filter()
         click.echo("Filtering completed successfully")

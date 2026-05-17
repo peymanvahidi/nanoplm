@@ -217,6 +217,7 @@ def filter_fasta_native(
     max_seq_len: int,
     seqs_num: int,
     skip_n: int = 0,
+    exclude_ids: str | Path | None = None,
     progress_cb: Callable[[int, float, int, int], None] | None = None,
 ) -> NativeFilterResult:
     if _is_disabled():
@@ -232,6 +233,7 @@ def filter_fasta_native(
         ctypes.c_int,  # max_seq_len
         ctypes.c_longlong,  # seqs_num
         ctypes.c_longlong,  # skip_n
+        ctypes.c_char_p,  # exclude_ids_path (NEW — may be NULL)
         _PROGRESS_CB,  # progress callback
         ctypes.POINTER(ctypes.c_int),  # cancel_requested
         ctypes.POINTER(ctypes.c_longlong),  # out_processed
@@ -245,6 +247,7 @@ def filter_fasta_native(
     out_passed = ctypes.c_longlong(0)
     error_buffer = ctypes.create_string_buffer(_ERROR_BUFFER_BYTES)
     c_progress_cb = _wrap_progress_cb(progress_cb, _PROGRESS_CB)
+    c_exclude_ids = str(Path(exclude_ids)).encode("utf-8") if exclude_ids is not None else None
 
     with _sigint_cancel_flag() as cancel_flag:
         rc = func(
@@ -254,6 +257,7 @@ def filter_fasta_native(
             int(max_seq_len),
             int(seqs_num),
             int(skip_n),
+            c_exclude_ids,
             c_progress_cb,
             ctypes.byref(cancel_flag),
             ctypes.byref(out_processed),

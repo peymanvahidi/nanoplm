@@ -384,6 +384,69 @@ static int process_filter_record(
     return 0;
 }
 
+/* Forward declarations for helpers defined later in this file. */
+static uint64_t fnv1a(const char *s);
+static char *extract_seq_id(const char *header);
+
+/* --- ExcludeSet: small hash table for exclude_ids lookup --- */
+
+#define EXCL_SLOTS 524288u   /* power-of-2 bucket count */
+#define EXCL_MAX   500000u   /* cap on unique IDs loaded */
+
+typedef struct ExclNode {
+    char *id;
+    struct ExclNode *next;
+} ExclNode;
+
+static ExclNode **excl_set_new(void) {
+    return (ExclNode **)calloc(EXCL_SLOTS, sizeof(ExclNode *));
+}
+
+/* Returns 1 if added, 0 if already present or cap reached, -1 on OOM. */
+static int excl_set_add(ExclNode **ht, unsigned int *count, const char *id) {
+    uint64_t h = fnv1a(id);
+    unsigned int slot = (unsigned int)(h & (EXCL_SLOTS - 1));
+    ExclNode *node = ht[slot];
+    while (node) {
+        if (strcmp(node->id, id) == 0) return 0;  /* already present */
+        node = node->next;
+    }
+    if (*count >= EXCL_MAX) return 0;  /* cap reached */
+    ExclNode *newnode = (ExclNode *)malloc(sizeof(ExclNode));
+    if (!newnode) return -1;
+    newnode->id = strdup(id);
+    if (!newnode->id) { free(newnode); return -1; }
+    newnode->next = ht[slot];
+    ht[slot] = newnode;
+    (*count)++;
+    return 1;
+}
+
+static int excl_set_contains(ExclNode **ht, const char *id) {
+    uint64_t h = fnv1a(id);
+    unsigned int slot = (unsigned int)(h & (EXCL_SLOTS - 1));
+    ExclNode *node = ht[slot];
+    while (node) {
+        if (strcmp(node->id, id) == 0) return 1;
+        node = node->next;
+    }
+    return 0;
+}
+
+static void excl_set_free(ExclNode **ht) {
+    if (!ht) return;
+    for (unsigned int i = 0; i < EXCL_SLOTS; i++) {
+        ExclNode *n = ht[i];
+        while (n) {
+            ExclNode *next = n->next;
+            free(n->id);
+            free(n);
+            n = next;
+        }
+    }
+    free(ht);
+}
+
 API_EXPORT int nanoplm_filter_fasta(
     const char *input_path,
     const char *output_path,
@@ -391,6 +454,7 @@ API_EXPORT int nanoplm_filter_fasta(
     int max_seq_len,
     long long seqs_num,
     long long skip_n,
+    const char *exclude_ids_path,    /* NEW — may be NULL */
     progress_cb_t progress_cb,
     const volatile int *cancel_requested,
     long long *out_processed,
@@ -414,12 +478,51 @@ API_EXPORT int nanoplm_filter_fasta(
         return -1;
     }
 
+    /* --- load exclude_ids --- */
+    ExclNode **excl_ht = NULL;
+    unsigned int excl_count = 0;
+    if (exclude_ids_path != NULL) {
+        FILE *excl_f = fopen(exclude_ids_path, "r");
+        if (!excl_f) {
+            set_error(error_msg, error_cap,
+                      "Failed to open exclude_ids file %s: %s",
+                      exclude_ids_path, strerror(errno));
+            return -1;
+        }
+        excl_ht = excl_set_new();
+        if (!excl_ht) {
+            fclose(excl_f);
+            set_error(error_msg, error_cap, "Out of memory allocating exclude_ids table");
+            return -1;
+        }
+        char *eline = NULL;
+        size_t ecap = 0;
+        ssize_t elen;
+        while ((elen = getline(&eline, &ecap, excl_f)) != -1) {
+            /* strip trailing \r\n */
+            while (elen > 0 && (eline[elen-1] == '\n' || eline[elen-1] == '\r'))
+                eline[--elen] = '\0';
+            if (elen == 0) continue;  /* skip empty lines */
+            int ret = excl_set_add(excl_ht, &excl_count, eline);
+            if (ret == -1) {
+                free(eline);
+                fclose(excl_f);
+                excl_set_free(excl_ht);
+                set_error(error_msg, error_cap, "Out of memory loading exclude_ids");
+                return -1;
+            }
+        }
+        free(eline);
+        fclose(excl_f);
+    }
+
     CancelScope cancel_scope;
     cancel_scope_enter(&cancel_scope, (volatile int *)cancel_requested);
 
     int in_fd = open(input_path, O_RDONLY);
     if (in_fd < 0) {
         cancel_scope_exit(&cancel_scope);
+        excl_set_free(excl_ht);
         set_error(error_msg, error_cap, "Failed to open input FASTA %s: %s", input_path, strerror(errno));
         return -1;
     }
@@ -427,6 +530,7 @@ API_EXPORT int nanoplm_filter_fasta(
     if (fstat(in_fd, &st) != 0) {
         close(in_fd);
         cancel_scope_exit(&cancel_scope);
+        excl_set_free(excl_ht);
         set_error(error_msg, error_cap, "Failed to stat input FASTA %s: %s", input_path, strerror(errno));
         return -1;
     }
@@ -436,6 +540,7 @@ API_EXPORT int nanoplm_filter_fasta(
     if (!in) {
         close(in_fd);
         cancel_scope_exit(&cancel_scope);
+        excl_set_free(excl_ht);
         set_error(error_msg, error_cap, "Failed to open input FASTA stream %s: %s", input_path, strerror(errno));
         return -1;
     }
@@ -443,6 +548,7 @@ API_EXPORT int nanoplm_filter_fasta(
     if (!out) {
         fclose(in);
         cancel_scope_exit(&cancel_scope);
+        excl_set_free(excl_ht);
         set_error(error_msg, error_cap, "Failed to open output FASTA %s: %s", output_path, strerror(errno));
         return -1;
     }
@@ -458,6 +564,7 @@ API_EXPORT int nanoplm_filter_fasta(
         fclose(in);
         fclose(out);
         cancel_scope_exit(&cancel_scope);
+        excl_set_free(excl_ht);
         set_error(error_msg, error_cap, "Out of memory");
         return -1;
     }
@@ -484,14 +591,25 @@ API_EXPORT int nanoplm_filter_fasta(
         bytes_read += (long long)line_len;
         if (line_len > 0 && line[0] == '>') {
             if (seen_header) {
-                if (process_filter_record(
-                        out, &header, &seq, min_seq_len, max_seq_len, seqs_num, skip_n, &skipped,
-                        &processed, &passed, &stop_now, error_msg, error_cap) != 0) {
-                    status = -1;
-                    goto cleanup;
+                /* Check exclude_ids before processing the current record */
+                int excluded = 0;
+                if (excl_ht && header.data) {
+                    char *cur_id = extract_seq_id(header.data);
+                    if (cur_id) {
+                        excluded = excl_set_contains(excl_ht, cur_id);
+                        free(cur_id);
+                    }
                 }
-                if (stop_now) {
-                    break;
+                if (!excluded) {
+                    if (process_filter_record(
+                            out, &header, &seq, min_seq_len, max_seq_len, seqs_num, skip_n, &skipped,
+                            &processed, &passed, &stop_now, error_msg, error_cap) != 0) {
+                        status = -1;
+                        goto cleanup;
+                    }
+                    if (stop_now) {
+                        break;
+                    }
                 }
             }
             if (dynbuf_set_header_from_line(&header, line + 1, (size_t)(line_len - 1)) != 0) {
@@ -515,11 +633,22 @@ API_EXPORT int nanoplm_filter_fasta(
     }
 
     if (status == 0 && seen_header && !stop_now) {
-        if (process_filter_record(
-                out, &header, &seq, min_seq_len, max_seq_len, seqs_num, skip_n, &skipped,
-                &processed, &passed, &stop_now, error_msg, error_cap) != 0) {
-            status = -1;
-            goto cleanup;
+        /* Check exclude_ids for the last record */
+        int excluded = 0;
+        if (excl_ht && header.data) {
+            char *cur_id = extract_seq_id(header.data);
+            if (cur_id) {
+                excluded = excl_set_contains(excl_ht, cur_id);
+                free(cur_id);
+            }
+        }
+        if (!excluded) {
+            if (process_filter_record(
+                    out, &header, &seq, min_seq_len, max_seq_len, seqs_num, skip_n, &skipped,
+                    &processed, &passed, &stop_now, error_msg, error_cap) != 0) {
+                status = -1;
+                goto cleanup;
+            }
         }
     }
     report_progress(progress_cb, 1, input_size, input_size, &last_reported_percent);
@@ -548,6 +677,7 @@ cleanup:
         unlink(output_path);
     }
 
+    excl_set_free(excl_ht);
     cancel_scope_exit(&cancel_scope);
 
     if (status == 0) {

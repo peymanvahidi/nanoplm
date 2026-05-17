@@ -45,9 +45,6 @@ class Filterer:
 
     def filter(self):
         """Apply filters and write passing sequences to output FASTA."""
-        if self.exclude_ids is not None:
-            raise NotImplementedError("exclude_ids requires C support — landed in Phase 10")
-
         logger.info(
             "Filtering sequences with parameters: "
             f"min_length={self.min_seq_len}, max_length={self.max_seq_len}, "
@@ -83,6 +80,7 @@ class Filterer:
                     min_seq_len=self.min_seq_len,
                     max_seq_len=self.max_seq_len,
                     seqs_num=self.seqs_num,
+                    exclude_ids=self.exclude_ids,
                     progress_cb=progress_cb,
                 ),
             )
