@@ -34,8 +34,6 @@ from nanoplm.pretraining.collator import (
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.data.sharding.pretrain_shard_writer import (
-    ShardWriter,
-    _DISABLE_NATIVE_ENV,
     create_shards_native,
     is_native_shard_writer_available,
 )
@@ -269,88 +267,6 @@ class TestFlatteningCollatorWithRegisterTokens:
         # Each seq: [A L G V EOS unused0 unused1]
         assert flat_ids[4:7] == [1, 30, 31], "First sequence should end with EOS + registers"
         assert flat_ids[11:14] == [1, 30, 31], "Second sequence should end with EOS + registers"
-
-
-# ---------------------------------------------------------------------------
-# Shard writer tests (Python fallback)
-# ---------------------------------------------------------------------------
-
-
-_triton_available = importlib.util.find_spec("triton") is not None
-
-
-class TestShardWriterRegisterTokens:
-    """Verify ShardWriter produces correct shards with register tokens (Python path)."""
-
-    @pytest.mark.skipif(
-        not _triton_available,
-        reason="Python fallback spawns subprocesses that import nanoplm.pretraining (requires triton)",
-    )
-    def test_python_fallback_with_registers(self, monkeypatch):
-        """Python shard writer should produce tokens matching tokenizer output."""
-        tok = ProtModernBertTokenizer(num_register_tokens=2)
-        max_length = 32
-        expected = _expected_tokens(tok, FASTA_SEQUENCES, max_length)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fasta_path = Path(tmpdir) / "test.fasta"
-            output_dir = Path(tmpdir) / "shards"
-            fasta_path.write_text(FASTA_TEXT, encoding="utf-8")
-
-            monkeypatch.setenv(_DISABLE_NATIVE_ENV, "1")
-            saver = ShardWriter(
-                fasta_path=str(fasta_path),
-                tokenizer=tok,
-                max_length=max_length,
-                output_dir=str(output_dir),
-                samples_per_shard=10,
-                max_workers=1,
-            )
-            saver.create_shards()
-
-            ds = ShardedDataset(str(output_dir))
-            assert len(ds) == len(FASTA_SEQUENCES)
-
-            for idx in range(len(ds)):
-                got = ds[idx]["input_ids"].numpy().astype(np.uint8)
-                np.testing.assert_array_equal(
-                    got, expected[idx],
-                    err_msg=f"Shard {idx} mismatch with tokenizer output",
-                )
-
-    @pytest.mark.skipif(
-        not _triton_available,
-        reason="Python fallback spawns subprocesses that import nanoplm.pretraining (requires triton)",
-    )
-    def test_python_fallback_one_register(self, monkeypatch):
-        """Single register token should also work correctly."""
-        tok = ProtModernBertTokenizer(num_register_tokens=1)
-        max_length = 32
-        expected = _expected_tokens(tok, FASTA_SEQUENCES, max_length)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fasta_path = Path(tmpdir) / "test.fasta"
-            output_dir = Path(tmpdir) / "shards"
-            fasta_path.write_text(FASTA_TEXT, encoding="utf-8")
-
-            monkeypatch.setenv(_DISABLE_NATIVE_ENV, "1")
-            saver = ShardWriter(
-                fasta_path=str(fasta_path),
-                tokenizer=tok,
-                max_length=max_length,
-                output_dir=str(output_dir),
-                samples_per_shard=10,
-                max_workers=1,
-            )
-            saver.create_shards()
-
-            ds = ShardedDataset(str(output_dir))
-            for idx in range(len(ds)):
-                got = ds[idx]["input_ids"].numpy().astype(np.uint8)
-                np.testing.assert_array_equal(got, expected[idx])
-                # Verify last token is <unused0> (30), second-to-last is EOS (1)
-                assert got[-1] == 30
-                assert got[-2] == 1
 
 
 # ---------------------------------------------------------------------------

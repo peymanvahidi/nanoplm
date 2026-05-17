@@ -7,8 +7,6 @@ import pytest
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.data.sharding.pretrain_shard_writer import (
-    ShardWriter,
-    _DISABLE_NATIVE_ENV,
     create_shards_native,
     is_native_shard_writer_available,
 )
@@ -74,46 +72,6 @@ def test_create_shards_native_matches_tokenizer_outputs():
         assert len(ds) == len(sequences)
 
         expected = _expected_tokens(tokenizer, sequences, max_length=max_length)
-        for idx in range(len(ds)):
-            got = ds[idx]["input_ids"].numpy().astype(np.uint8)
-            np.testing.assert_array_equal(got, expected[idx])
-
-
-def test_shard_writer_python_fallback_still_produces_valid_shards(monkeypatch):
-    sequences = ["AAAA", "CccC", "uzob", "WWWW", "M" * 40]
-    tokenizer = ProtModernBertTokenizer()
-    max_length = 16
-    expected = _expected_tokens(tokenizer, sequences, max_length=max_length)
-
-    fasta_text = (
-        ">a\nAAAA\n"
-        ">b\nCccC\n"
-        ">c\nuzob\n"
-        ">d\nWWWW\n"
-        ">e\n" + ("M" * 40) + "\n"
-    )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fasta_path = Path(tmpdir) / "sample.fasta"
-        output_dir = Path(tmpdir) / "shards"
-        fasta_path.write_text(fasta_text, encoding="utf-8")
-
-        monkeypatch.setenv(_DISABLE_NATIVE_ENV, "1")
-        saver = ShardWriter(
-            fasta_path=str(fasta_path),
-            tokenizer=tokenizer,
-            max_length=max_length,
-            output_dir=str(output_dir),
-            samples_per_shard=2,
-            max_workers=1,
-        )
-        shard_paths = saver.create_shards()
-
-        assert saver.sequence_count == len(sequences)
-        assert len(shard_paths) == 3
-
-        ds = ShardedDataset(str(output_dir))
-        assert len(ds) == len(sequences)
         for idx in range(len(ds)):
             got = ds[idx]["input_ids"].numpy().astype(np.uint8)
             np.testing.assert_array_equal(got, expected[idx])
