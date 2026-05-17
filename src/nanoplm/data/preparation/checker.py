@@ -21,17 +21,20 @@ class Checker:
     Validates a FASTA file. Always writes three sidecar files into output_dir:
       - validation.json   : machine-readable summary
       - invalid.fasta     : full records of problematic sequences
-      - invalid_ids.txt   : one ID per line; empty when drop_invalid=False
+      - invalid_ids.txt   : one ID per line
 
-    When drop_invalid=True, invalid_ids.txt contains the IDs of every invalid
-    sequence (consumed by the filter stage to exclude them). When False, the
-    file is left empty so downstream stages don't accidentally drop anything.
+    By default (drop_invalid=True), invalid_ids.txt is populated with the IDs
+    of every invalid sequence so the downstream filter stage can exclude them.
+    When drop_invalid=False, the file is left empty so downstream stages don't
+    accidentally drop anything; invalid.fasta still contains the problem
+    records for human inspection.
     """
 
     def __init__(
         self,
         input_path: Path,
         output_dir: Path,
+        # Default True: the common case is "tell the next stage to drop these".
         drop_invalid: bool = True,
     ):
         self.input_path = Path(input_path)
