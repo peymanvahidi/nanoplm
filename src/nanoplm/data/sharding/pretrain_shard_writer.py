@@ -275,12 +275,33 @@ class ShardWriter:
     def sequence_count(self, value: int | None) -> None:
         self._sequence_count = value
 
+    def _check_tokenizer_compatible(self) -> None:
+        """
+        The C shard writer hardcodes the 25-token protein vocabulary in
+        fast_fasta_shard_writer.c. Non-matching tokenizers would silently produce
+        wrong tokenization.
+
+        TODO(custom-tokenizers): to support BPE / ESM-style tokenizers either
+          (a) parameterize the C writer with a vocab table passed via ctypes, or
+          (b) bring back a tokenizer-agnostic Python writer path guarded behind
+              an explicit --allow-slow-tokenizer flag.
+        """
+        from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
+        if not isinstance(self.tokenizer, ProtModernBertTokenizer):
+            raise NotImplementedError(
+                f"Native C shard writer only supports the built-in protein 25-token "
+                f"vocabulary (ProtModernBertTokenizer). Got "
+                f"tokenizer={type(self.tokenizer).__name__!r}. "
+                f"See TODO(custom-tokenizers) in pretrain_shard_writer.py."
+            )
+
     def create_shards(self) -> list[Path]:
         """Create binary shards from FASTA sequences using the native C backend.
 
         Returns:
             List of paths to created shard .bin files
         """
+        self._check_tokenizer_compatible()
         # Check if shards already exist
         shards_exist = (
             self.output_dir.exists() and len(list(self.output_dir.glob("*.bin"))) > 0
