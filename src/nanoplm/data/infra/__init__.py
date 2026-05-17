@@ -20,6 +20,7 @@ from nanoplm.data.infra.validation import (
     validate_distillation_dataset,
     ValidationError,
 )
+from nanoplm.data.infra.atomic import atomic_write_path, atomic_write_dir
 
 __all__ = [
     "DataManifest", "DataManifestBase", "PretrainManifest", "DistillationManifest",
@@ -29,4 +30,5 @@ __all__ = [
     "validate_hdf5_shards", "validate_pretrain_shards",
     "validate_pretrain_dataset", "validate_distillation_dataset",
     "ValidationError",
+    "atomic_write_path", "atomic_write_dir",
 ]
