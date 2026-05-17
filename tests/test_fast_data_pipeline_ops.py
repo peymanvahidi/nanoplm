@@ -7,10 +7,10 @@ from pathlib import Path
 import pytest
 from Bio import SeqIO
 
-from nanoplm.data.filterer import Filterer
+from nanoplm.data.preparation.filterer import Filterer
 from nanoplm.data.preparation._native_ops import _DISABLE_NATIVE_FASTA_OPS_ENV
-from nanoplm.data.shuffler import FastaShuffler
-from nanoplm.data.splitor import Splitor
+from nanoplm.data.preparation.shuffler import FastaShuffler
+from nanoplm.data.preparation.splitter import Splitter as Splitor
 
 
 def _parse_fasta(path: Path) -> list[tuple[str, str]]:
@@ -205,7 +205,7 @@ def test_fast_shuffle_legacy_mode_skips_native_probe(monkeypatch):
         input_path.write_text(">a\nACDE\n>b\nFGHI\n", encoding="utf-8")
 
         monkeypatch.setattr(
-            "nanoplm.data.shuffler.is_native_fasta_ops_available",
+            "nanoplm.data.preparation.shuffler.is_native_fasta_ops_available",
             lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
         )
 
@@ -229,7 +229,7 @@ def test_filter_legacy_mode_skips_native_probe(monkeypatch):
         input_path.write_text(">a\nACDE\n>b\nA\n", encoding="utf-8")
 
         monkeypatch.setattr(
-            "nanoplm.data.filterer.is_native_fasta_ops_available",
+            "nanoplm.data.preparation.filterer.is_native_fasta_ops_available",
             lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
         )
 
@@ -255,7 +255,7 @@ def test_split_legacy_mode_skips_native_probe(monkeypatch):
         input_path.write_text(">a\nAAAA\n>b\nBBBB\n>c\nCCCC\n", encoding="utf-8")
 
         monkeypatch.setattr(
-            "nanoplm.data.splitor.is_native_fasta_ops_available",
+            "nanoplm.data.preparation.splitter.is_native_fasta_ops_available",
             lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
         )
 
