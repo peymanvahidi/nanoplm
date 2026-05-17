@@ -1,7 +1,8 @@
 from pathlib import Path
 from typing import Union
 
-from nanoplm.utils import create_dirs, logger
+from nanoplm.data.infra.atomic import atomic_write_path
+from nanoplm.utils import logger
 from nanoplm.utils.common import run_with_heartbeat
 from nanoplm.data.preparation._native_ops import (
     filter_fasta_native,
@@ -47,8 +48,6 @@ class Filterer:
         if self.exclude_ids is not None:
             raise NotImplementedError("exclude_ids requires C support — landed in Phase 10")
 
-        create_dirs(self.output_path.parent)
-
         logger.info(
             "Filtering sequences with parameters: "
             f"min_length={self.min_seq_len}, max_length={self.max_seq_len}, "
@@ -75,17 +74,18 @@ class Filterer:
                 total,
             )
 
-        result = run_with_heartbeat(
-            "Filtering FASTA records (native backend)",
-            lambda: filter_fasta_native(
-                input_path=self.input_path,
-                output_path=self.output_path,
-                min_seq_len=self.min_seq_len,
-                max_seq_len=self.max_seq_len,
-                seqs_num=self.seqs_num,
-                progress_cb=progress_cb,
-            ),
-        )
+        with atomic_write_path(self.output_path) as tmp:
+            result = run_with_heartbeat(
+                "Filtering FASTA records (native backend)",
+                lambda: filter_fasta_native(
+                    input_path=self.input_path,
+                    output_path=tmp,
+                    min_seq_len=self.min_seq_len,
+                    max_seq_len=self.max_seq_len,
+                    seqs_num=self.seqs_num,
+                    progress_cb=progress_cb,
+                ),
+            )
         seq_count = result.processed_seqs
         passed_count = result.passed_seqs
 

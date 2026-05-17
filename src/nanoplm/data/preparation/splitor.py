@@ -1,7 +1,8 @@
 from pathlib import Path
 from typing import Union
 
-from nanoplm.utils import logger, create_dirs
+from nanoplm.data.infra.atomic import atomic_write_path
+from nanoplm.utils import logger
 from nanoplm.utils.common import run_with_heartbeat
 from nanoplm.data.preparation._native_ops import (
     split_fasta_native,
@@ -40,9 +41,6 @@ class Splitor:
         if self.val_ratio < 0.0 or self.val_ratio > 1.0:
             raise SplitError("val_ratio must be in [0.0, 1.0]")
 
-        create_dirs(self.train_file.parent)
-        create_dirs(self.val_file.parent)
-
         logger.info(f"Creating splits with val ratio {self.val_ratio}")
 
         phase_names = {
@@ -66,16 +64,18 @@ class Splitor:
                 total,
             )
 
-        result = run_with_heartbeat(
-            "Splitting FASTA into train/val (native backend)",
-            lambda: split_fasta_native(
-                input_path=self.input_file,
-                train_path=self.train_file,
-                val_path=self.val_file,
-                val_ratio=self.val_ratio,
-                progress_cb=progress_cb,
-            ),
-        )
+        with atomic_write_path(self.train_file) as tmp_train, \
+             atomic_write_path(self.val_file) as tmp_val:
+            result = run_with_heartbeat(
+                "Splitting FASTA into train/val (native backend)",
+                lambda: split_fasta_native(
+                    input_path=self.input_file,
+                    train_path=tmp_train,
+                    val_path=tmp_val,
+                    val_ratio=self.val_ratio,
+                    progress_cb=progress_cb,
+                ),
+            )
         train_size = result.train_size
         val_size = result.val_size
         logger.info(

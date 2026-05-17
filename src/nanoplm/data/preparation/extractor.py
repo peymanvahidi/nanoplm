@@ -2,6 +2,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from nanoplm.data.infra.atomic import atomic_write_path
+
 
 class ExtractionError(Exception):
     pass
@@ -24,22 +26,22 @@ class Extractor:
 
     def _extract_pigz(self) -> None:
         try:
-            with open(self.output_path, "wb") as out:
-                subprocess.check_call(
-                    ["pigz", "-dc", str(self.input_path)],
-                    stdout=out,
-                )
+            with atomic_write_path(self.output_path) as tmp:
+                with open(tmp, "wb") as out:
+                    subprocess.check_call(
+                        ["pigz", "-dc", str(self.input_path)],
+                        stdout=out,
+                    )
         except subprocess.CalledProcessError as e:
-            self.output_path.unlink(missing_ok=True)
             raise ExtractionError(f"pigz extraction failed: {e}") from e
 
     def _extract_isal(self) -> None:
         import isal.igzip as igzip
         from isal.isal_zlib import IsalError
         try:
-            with igzip.open(self.input_path, "rb") as f_in, \
-                 open(self.output_path, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out, length=8 * 1024 * 1024)
+            with atomic_write_path(self.output_path) as tmp:
+                with igzip.open(self.input_path, "rb") as f_in, \
+                     open(tmp, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out, length=8 * 1024 * 1024)
         except (IsalError, EOFError, OSError) as e:
-            self.output_path.unlink(missing_ok=True)
             raise ExtractionError(f"isal extraction failed: {e}") from e

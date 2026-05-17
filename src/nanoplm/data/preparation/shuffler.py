@@ -1,6 +1,7 @@
 import os
 import random
 from pathlib import Path
+from nanoplm.data.infra.atomic import atomic_write_path
 from nanoplm.data.preparation._native_ops import shuffle_fasta_native
 from nanoplm.utils import logger
 
@@ -31,12 +32,13 @@ class FastaShuffler:
                 self._symlink_through()
                 return
             effective_seed = self.seed if self.seed is not None else random.randint(1, 2**31 - 1)
-            shuffle_fasta_native(
-                input_path=self.input_path,
-                output_path=self.output_path,
-                seed=effective_seed,
-                num_threads=_DEFAULT_THREADS,
-            )
+            with atomic_write_path(self.output_path) as tmp:
+                shuffle_fasta_native(
+                    input_path=self.input_path,
+                    output_path=tmp,
+                    seed=effective_seed,
+                    num_threads=_DEFAULT_THREADS,
+                )
         except ShufflingError:
             raise
         except Exception as e:
@@ -46,14 +48,16 @@ class FastaShuffler:
         if self.output_path.exists() or self.output_path.is_symlink():
             self.output_path.unlink()
         try:
-            self.output_path.symlink_to(self.input_path.resolve())
+            with atomic_write_path(self.output_path) as tmp:
+                tmp.symlink_to(self.input_path.resolve())
             logger.info(
                 f"shuffle: do_shuffle=False — symlinked "
                 f"{self.input_path} -> {self.output_path}"
             )
         except OSError:
             import shutil
-            shutil.copy2(self.input_path, self.output_path)
+            with atomic_write_path(self.output_path) as tmp:
+                shutil.copy2(self.input_path, tmp)
             logger.warning(
                 f"shuffle: do_shuffle=False — symlink unsupported, fell back to copy. "
                 f"Content changes to {self.input_path} will not auto-trigger DVC re-run."
