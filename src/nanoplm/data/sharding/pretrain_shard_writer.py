@@ -8,9 +8,10 @@ import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
-from nanoplm.utils import logger
+from nanoplm.utils import logger, create_dirs
+from nanoplm.utils.common import run_with_heartbeat
 
 
 _ERROR_BUFFER_BYTES = 4096
@@ -40,7 +41,7 @@ def _is_disabled_by_env() -> bool:
 
 
 def _native_source_path() -> Path:
-    return Path(__file__).resolve().parent / "csrc" / "fast_fasta_shard_writer.c"
+    return Path(__file__).parent / "csrc" / "fast_fasta_shard_writer.c"
 
 
 def _native_build_dir() -> Path:
@@ -205,3 +206,137 @@ def create_shards_native(
         shard_paths=shard_paths,
         sequence_count=int(out_num_sequences.value),
     )
+
+
+class ShardWriter:
+    """Utility class to tokenize FASTA sequences and save them as flat binary shards.
+
+    This class handles the preprocessing step: reading FASTA, tokenizing sequences,
+    and saving them to binary files (.bin + .idx) for fast loading during training.
+
+    This is NOT a Dataset - it's a preprocessing utility that creates shards.
+
+    Tokenization is performed by the native C backend (fast_fasta_shard_writer).
+    """
+
+    def __init__(
+        self,
+        fasta_path: str,
+        tokenizer,
+        max_length: int,
+        output_dir: str,
+        samples_per_shard: int = 10000,
+        max_workers: int = 2,
+        force: bool = False,
+    ) -> None:
+        """
+        Args:
+            fasta_path: Path to input FASTA file
+            tokenizer: Tokenizer to use (ProtModernBertTokenizer)
+            max_length: Maximum sequence length
+            output_dir: Directory to save binary shards
+            samples_per_shard: Number of sequences per shard file
+            max_workers: Number of parallel worker threads
+            force: If True, overwrite existing shards
+        """
+        self.fasta_path = str(fasta_path)
+        self.tokenizer = tokenizer
+        self.max_length = int(max_length)
+        self.output_dir = Path(output_dir)
+        self.samples_per_shard = int(samples_per_shard)
+        self.max_workers = int(max_workers)
+        self.force = bool(force)
+
+        # Validate that the FASTA file exists and is readable
+        fasta_path_obj = Path(self.fasta_path)
+        if not fasta_path_obj.exists():
+            raise FileNotFoundError(f"FASTA file not found: {self.fasta_path}")
+
+        if not fasta_path_obj.is_file():
+            raise ValueError(f"Path is not a file: {self.fasta_path}")
+
+        if not os.access(self.fasta_path, os.R_OK):
+            raise PermissionError(f"FASTA file is not readable: {self.fasta_path}")
+
+        # Check if the file has any content
+        if fasta_path_obj.stat().st_size == 0:
+            raise ValueError(f"FASTA file is empty: {self.fasta_path}")
+
+        self._sequence_count: Optional[int] = None
+
+        self._use_bos_token = bool(getattr(self.tokenizer, "use_bos_token", False))
+        self._num_register_tokens = int(getattr(self.tokenizer, "num_register_tokens", 0))
+
+    @property
+    def sequence_count(self) -> int | None:
+        return self._sequence_count
+
+    @sequence_count.setter
+    def sequence_count(self, value: int | None) -> None:
+        self._sequence_count = value
+
+    def create_shards(self) -> list[Path]:
+        """Create binary shards from FASTA sequences using the native C backend.
+
+        Returns:
+            List of paths to created shard .bin files
+        """
+        # Check if shards already exist
+        shards_exist = (
+            self.output_dir.exists() and len(list(self.output_dir.glob("*.bin"))) > 0
+        )
+
+        if shards_exist and not self.force:
+            raise FileExistsError(
+                f"Binary shards already exist in {self.output_dir}. "
+                f"Set force=True to overwrite them."
+            )
+
+        if shards_exist and self.force:
+            logger.warning(f"Overwriting existing shards in {self.output_dir}")
+            for shard in self.output_dir.glob("*.bin"):
+                shard.unlink()
+            for shard in self.output_dir.glob("*.idx.npy"):
+                shard.unlink()
+
+        # Create output directory
+        create_dirs(self.output_dir)
+
+        last_percent = -1
+
+        def progress_cb(_phase: int, progress: float, completed: int, total: int) -> None:
+            nonlocal last_percent
+            percent = int(progress * 100.0)
+            if percent < 100 and percent % 5 != 0:
+                return
+            if percent == last_percent:
+                return
+            last_percent = percent
+            logger.info(
+                "Shard writer progress: %d%% (%d/%d bytes)",
+                percent,
+                completed,
+                total,
+            )
+
+        result = run_with_heartbeat(
+            "Tokenizing and writing shards (native backend)",
+            lambda: create_shards_native(
+                fasta_path=self.fasta_path,
+                output_dir=self.output_dir,
+                max_length=self.max_length,
+                samples_per_shard=self.samples_per_shard,
+                num_threads=self.max_workers,
+                use_bos_token=self._use_bos_token,
+                num_register_tokens=self._num_register_tokens,
+                progress_cb=progress_cb,
+            ),
+        )
+        self._sequence_count = result.sequence_count
+        logger.info(
+            "Successfully tokenized %d sequences into %d binary shards in %s (native backend).",
+            self._sequence_count,
+            len(result.shard_paths),
+            self.output_dir,
+        )
+        return result.shard_paths

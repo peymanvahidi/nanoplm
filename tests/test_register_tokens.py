@@ -31,9 +31,10 @@ from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
 )
-from nanoplm.pretraining.dataset import ShardWriter, ShardedDataset
+from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
-from nanoplm.pretraining.native_shard_writer import (
+from nanoplm.data.sharding.pretrain_shard_writer import (
+    ShardWriter,
     _DISABLE_NATIVE_ENV,
     create_shards_native,
     is_native_shard_writer_available,
