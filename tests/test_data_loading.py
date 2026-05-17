@@ -286,7 +286,7 @@ class TestDistillationDataset:
 
     def test_dataset_creation(self, distill_shards):
         """Test that dataset can be created."""
-        from nanoplm.distillation.dataset import LoadKDDataset
+        from nanoplm.data.datasets.distill import LoadKDDataset
 
         dataset = LoadKDDataset(
             h5_path=str(distill_shards),
@@ -298,7 +298,7 @@ class TestDistillationDataset:
 
     def test_item_access(self, distill_shards):
         """Test that items can be accessed."""
-        from nanoplm.distillation.dataset import LoadKDDataset
+        from nanoplm.data.datasets.distill import LoadKDDataset
 
         dataset = LoadKDDataset(
             h5_path=str(distill_shards),

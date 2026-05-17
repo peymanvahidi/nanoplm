@@ -34,7 +34,7 @@ from nanoplm.distillation.trainer import DistillationTrainer
 from nanoplm.distillation.models.student import ProtX, ProtXConfig, ProtXTokenizer
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.distillation.models.teacher import ProtT5
-from nanoplm.distillation.dataset import (
+from nanoplm.data.datasets.distill import (
     KDDatasetOnTheFly,
     LoadKDDataset,
 )
