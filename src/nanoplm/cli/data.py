@@ -676,10 +676,10 @@ def shard(input_file: str, n_shards: int, output_dir: str, total_sequences: int)
 
     Examples:
         # Basic sharding (will count sequences first)
-        protx data shard --input-file train.h5 --n-shards 33
+        nanoplm data shard --input-file train.h5 --n-shards 33
 
         # Fast sharding (skips counting if you know the sequence count)
-        protx data shard --input-file train.h5 --n-shards 33 --total-sequences 12500000
+        nanoplm data shard --input-file train.h5 --n-shards 33 --total-sequences 12500000
 
     This will create train_shard_0.h5, train_shard_1.h5, ..., train_shard_32.h5
     """
@@ -901,7 +901,7 @@ def get_yaml(output: str | None, force: bool):
     dvc_path.write_text(dvc_yaml_template, encoding="utf-8")
 
     click.echo(
-        f"Both files are written to: {output_path} directory.\nEdit the params.yaml file and use `nanoplm data repro` to run the pipeline."
+        f"Both files are written to: {output_path} directory.\nEdit the params.yaml file and use `nanoplm data from-yaml` to run the pipeline."
     )
 
 
@@ -1182,33 +1182,8 @@ def from_yaml(
             train_fasta = _resolve_path(Path(splitted_dir) / "train.fasta", cwd)
             val_fasta = _resolve_path(Path(splitted_dir) / "val.fasta", cwd)
 
-            # Count sequences from FASTA files
-            train_sequences = _count_sequences_in_fasta(train_fasta)
-            val_sequences = _count_sequences_in_fasta(val_fasta)
-
-            manifest = DistillationManifest(
-                pipeline_mode="distillation",
-                seqs_num=train_sequences + val_sequences,
-                min_seq_len=data_params.get("min_seq_len"),
-                max_seq_len=data_params.get("max_seq_len"),
-                val_ratio=data_params.get("val_ratio"),
-                train_dir="train",
-                val_dir="val",
-                train_sequences=train_sequences,
-                val_sequences=val_sequences,
-                teacher_model=distillation_config.get("teacher_model"),
-                on_the_fly=True,
-                train_fasta=str(train_fasta),
-                val_fasta=str(val_fasta),
-            )
-            manifest_path = write_manifest(output_dir, manifest)
-
-            click.echo(
-                f"Distillation manifest created (on-the-fly mode):\n"
-                f"  Train FASTA: {train_fasta} ({train_sequences} sequences)\n"
-                f"  Val FASTA: {val_fasta} ({val_sequences} sequences)\n"
-                f"  Manifest: {manifest_path}\n"
-                f"  Note: Teacher embeddings will be generated during training"
+            raise click.ClickException(
+                "on-the-fly counting temporarily unavailable; will be fixed in Task 28 rewrite"
             )
         else:
             # Pre-computed mode: Create manifest with H5 paths (after DVC pipeline completes)
@@ -1326,17 +1301,3 @@ def _get_h5_prefix(h5_files: list) -> str:
         return first_file
 
 
-def _count_sequences_in_fasta(fasta_path: Path) -> int:
-    """Count sequences in a FASTA file."""
-    from Bio import SeqIO
-
-    count = 0
-    try:
-        with open(fasta_path, "r") as f:
-            for _ in SeqIO.parse(f, "fasta"):
-                count += 1
-    except Exception as e:
-        click.echo(f"Warning: Could not count sequences in {fasta_path}: {e}", err=True)
-        return 0
-
-    return count
