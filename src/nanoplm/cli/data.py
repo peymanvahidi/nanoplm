@@ -17,7 +17,7 @@ from nanoplm.data.preparation.shuffler import FastaShuffler, ShufflingError
 from nanoplm.data.preparation.filterer import Filterer, FilterError
 from nanoplm.data.preparation.splitor import Splitor, SplitError
 from nanoplm.data.infra.manifest import PretrainManifest, DistillationManifest, write_manifest
-from nanoplm.distillation.dataset import SaveKDDataset, shard_h5_file
+from nanoplm.data.sharding.distill_shard_writer import SaveKDDataset, shard_h5_file
 from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.data.sharding.pretrain_shard_writer import ShardWriter
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
