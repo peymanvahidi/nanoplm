@@ -64,6 +64,9 @@ class Splitor:
                 total,
             )
 
+        # Train and val renames are independent: if the val rename succeeds
+        # and the train rename then fails, val is left as an orphaned-but-
+        # correct file. Acceptable; cross-file atomicity would need staging.
         with atomic_write_path(self.train_file) as tmp_train, \
              atomic_write_path(self.val_file) as tmp_val:
             result = run_with_heartbeat(

@@ -22,7 +22,9 @@ def atomic_write_path(target: Path) -> Iterator[Path]:
     target = Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
-    if tmp.exists():
+    # is_symlink covers dangling symlinks (exists() follows the link and may
+    # return False even when the symlink path itself is present).
+    if tmp.is_symlink() or tmp.exists():
         tmp.unlink()
     try:
         yield tmp

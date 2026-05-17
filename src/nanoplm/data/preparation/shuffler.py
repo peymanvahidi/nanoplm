@@ -45,8 +45,6 @@ class FastaShuffler:
             raise ShufflingError(str(e)) from e
 
     def _symlink_through(self) -> None:
-        if self.output_path.exists() or self.output_path.is_symlink():
-            self.output_path.unlink()
         try:
             with atomic_write_path(self.output_path) as tmp:
                 tmp.symlink_to(self.input_path.resolve())
