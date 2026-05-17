@@ -7,6 +7,9 @@ import pytest
 from nanoplm.pretraining.dataset import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.data.sharding.pretrain_shard_writer import (
+    ShardWriter,
+    NativeShardWriterError,
+    _DISABLE_NATIVE_ENV,
     create_shards_native,
     is_native_shard_writer_available,
 )
@@ -75,3 +78,26 @@ def test_create_shards_native_matches_tokenizer_outputs():
         for idx in range(len(ds)):
             got = ds[idx]["input_ids"].numpy().astype(np.uint8)
             np.testing.assert_array_equal(got, expected[idx])
+
+
+def test_shard_writer_raises_when_native_disabled(tmp_path, monkeypatch):
+    """ShardWriter.create_shards must raise NativeShardWriterError when the native
+    backend is disabled by env var (no more Python fallback)."""
+    fasta = tmp_path / "seq.fasta"
+    fasta.write_text(">s1\nMAGV\n>s2\nKVAR\n")
+    out_dir = tmp_path / "shards"
+
+    monkeypatch.setenv(_DISABLE_NATIVE_ENV, "1")
+
+    saver = ShardWriter(
+        fasta_path=str(fasta),
+        tokenizer=ProtModernBertTokenizer(),
+        max_length=8,
+        output_dir=str(out_dir),
+        samples_per_shard=10,
+        max_workers=1,
+        force=True,
+    )
+
+    with pytest.raises(NativeShardWriterError):
+        saver.create_shards()

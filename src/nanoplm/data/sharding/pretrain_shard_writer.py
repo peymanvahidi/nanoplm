@@ -8,7 +8,7 @@ import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 from nanoplm.utils import logger, create_dirs
 from nanoplm.utils.common import run_with_heartbeat
@@ -41,7 +41,7 @@ def _is_disabled_by_env() -> bool:
 
 
 def _native_source_path() -> Path:
-    return Path(__file__).parent / "csrc" / "fast_fasta_shard_writer.c"
+    return Path(__file__).resolve().parent / "csrc" / "fast_fasta_shard_writer.c"
 
 
 def _native_build_dir() -> Path:
@@ -244,7 +244,7 @@ class ShardWriter:
         self.max_length = int(max_length)
         self.output_dir = Path(output_dir)
         self.samples_per_shard = int(samples_per_shard)
-        self.max_workers = int(max_workers)
+        self.max_workers = os.cpu_count() if max_workers == -1 else int(max_workers)
         self.force = bool(force)
 
         # Validate that the FASTA file exists and is readable
@@ -262,7 +262,7 @@ class ShardWriter:
         if fasta_path_obj.stat().st_size == 0:
             raise ValueError(f"FASTA file is empty: {self.fasta_path}")
 
-        self._sequence_count: Optional[int] = None
+        self._sequence_count: int | None = None
 
         self._use_bos_token = bool(getattr(self.tokenizer, "use_bos_token", False))
         self._num_register_tokens = int(getattr(self.tokenizer, "num_register_tokens", 0))
