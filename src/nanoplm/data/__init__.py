@@ -3,11 +3,8 @@ from nanoplm.data.preparation import (
     Extractor, ExtractionError,
     FastaShuffler, ShufflingError,
     Filterer, FilterError,
-    Splitter, SplitError,
+    Splitor, SplitError,
 )
-
-# Backward-compat alias (deprecated)
-Splitor = Splitter
 
 from nanoplm.data.infra import (
     DataManifest,
@@ -37,9 +34,8 @@ __all__ = [
     "ShufflingError",
     "Filterer",
     "FilterError",
-    "Splitter",
-    "SplitError",
     "Splitor",
+    "SplitError",
     "DataManifest",
     "DataManifestBase",
     "PretrainManifest",

@@ -16,7 +16,7 @@ class SplitError(Exception):
     pass
 
 
-class Splitter:
+class Splitor:
     """
     Split a filtered FASTA file into train/val according to a ratio.
     """

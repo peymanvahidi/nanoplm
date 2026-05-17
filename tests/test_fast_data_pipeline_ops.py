@@ -10,7 +10,7 @@ from Bio import SeqIO
 from nanoplm.data.preparation.filterer import Filterer
 from nanoplm.data.preparation._native_ops import _DISABLE_NATIVE_FASTA_OPS_ENV
 from nanoplm.data.preparation.shuffler import FastaShuffler
-from nanoplm.data.preparation.splitter import Splitter as Splitor
+from nanoplm.data.preparation.splitor import Splitor
 
 
 def _parse_fasta(path: Path) -> list[tuple[str, str]]:
@@ -255,7 +255,7 @@ def test_split_legacy_mode_skips_native_probe(monkeypatch):
         input_path.write_text(">a\nAAAA\n>b\nBBBB\n>c\nCCCC\n", encoding="utf-8")
 
         monkeypatch.setattr(
-            "nanoplm.data.preparation.splitter.is_native_fasta_ops_available",
+            "nanoplm.data.preparation.splitor.is_native_fasta_ops_available",
             lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
         )
 
