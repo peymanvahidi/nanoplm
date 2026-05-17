@@ -13,7 +13,7 @@ from Bio import SeqIO
 from tqdm import tqdm
 from nanoplm.utils import logger, get_caller_dir
 from nanoplm.utils.common import run_with_heartbeat
-from nanoplm.data.native_fasta_ops import (
+from nanoplm.data.preparation._native_ops import (
     NativeFastaOpsError,
     is_native_fasta_ops_available,
     shuffle_fasta_native,

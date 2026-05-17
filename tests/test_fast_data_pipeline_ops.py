@@ -8,7 +8,7 @@ import pytest
 from Bio import SeqIO
 
 from nanoplm.data.filterer import Filterer
-from nanoplm.data.native_fasta_ops import _DISABLE_NATIVE_FASTA_OPS_ENV
+from nanoplm.data.preparation._native_ops import _DISABLE_NATIVE_FASTA_OPS_ENV
 from nanoplm.data.shuffler import FastaShuffler
 from nanoplm.data.splitor import Splitor
 
