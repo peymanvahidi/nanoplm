@@ -131,6 +131,10 @@ def get_file(dataset, url, local_fasta, output, force):
     if output_path.exists() and force:
         output_path.unlink()
     if local_fasta:
+        if not Path(local_fasta).exists():
+            raise click.UsageError(
+                f"--local-fasta path does not exist: {local_fasta}"
+            )
         Downloader.link_local(Path(local_fasta), output_path)
         click.echo(f"Linked local file: {local_fasta} -> {output_path}")
         return

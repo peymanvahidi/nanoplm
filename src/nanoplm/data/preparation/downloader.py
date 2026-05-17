@@ -45,7 +45,6 @@ class Downloader:
             pass
         import shutil
         shutil.copy2(src, dst)
-        from nanoplm.utils import logger
         logger.warning(
             f"get-file: symlink/hardlink both unsupported; copied {src} -> {dst}. "
             f"Content changes to {src} will not auto-trigger DVC re-run."

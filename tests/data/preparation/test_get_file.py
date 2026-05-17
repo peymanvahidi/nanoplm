@@ -49,3 +49,16 @@ def test_get_file_errors_when_neither_set(tmp_path):
         ["get-file", "-o", str(tmp_path / "out.gz")],
     )
     assert result.exit_code != 0
+
+
+def test_get_file_errors_when_local_fasta_missing(tmp_path):
+    """A typo'd --local-fasta path should be caught with a clear error, not create a dangling symlink."""
+    runner = CliRunner()
+    out = tmp_path / "out.fasta"
+    result = runner.invoke(
+        data,
+        ["get-file", "--local-fasta", str(tmp_path / "does-not-exist.fasta"), "-o", str(out)],
+    )
+    assert result.exit_code != 0
+    assert "does not exist" in result.output.lower()
+    assert not out.exists()
