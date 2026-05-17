@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import h5py
 import torch
 import numpy as np
@@ -186,6 +187,11 @@ class SaveKDDataset(Dataset):
 
         Each shard is written atomically: data flows to a .h5.tmp sibling and is
         renamed to the final .h5 path only when the shard is fully written.
+
+        Per-shard atomicity (rather than directory-level atomic_write_dir) is
+        used because shards live in a user-chosen output directory shared with
+        unrelated artifacts; an atomic_write_dir of the parent would rmtree
+        those siblings on success.
         """
 
         # Generate shard file names
@@ -240,7 +246,6 @@ class SaveKDDataset(Dataset):
 
         def _close_shard_error():
             nonlocal current_atomic_ctx, current_h5_file
-            import sys
             exc_info = sys.exc_info()
             if current_h5_file is not None:
                 try:
