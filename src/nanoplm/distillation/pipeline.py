@@ -38,8 +38,8 @@ from nanoplm.distillation.dataset import (
     KDDatasetOnTheFly,
     LoadKDDataset,
 )
-from nanoplm.data.manifest import get_dataset_paths
-from nanoplm.data.validation import validate_distillation_dataset, ValidationError
+from nanoplm.data.infra.manifest import get_dataset_paths
+from nanoplm.data.infra.validation import validate_distillation_dataset, ValidationError
 from nanoplm.pretraining.utils import _read_checkpoint_epoch
 from nanoplm.utils import get_device, logger, create_dirs
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot

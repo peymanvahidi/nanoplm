@@ -51,7 +51,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,

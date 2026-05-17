@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from nanoplm.distillation.models.teacher import BaseTeacher
 from nanoplm.utils import logger, get_device, create_dirs
-from nanoplm.data.file_pool import ThreadSafeFileHandlePool, detect_file_limits
+from nanoplm.data.infra.file_pool import ThreadSafeFileHandlePool, detect_file_limits
 
 
 class KDDatasetOnTheFly(IterableDataset):

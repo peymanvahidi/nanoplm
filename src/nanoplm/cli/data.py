@@ -16,7 +16,7 @@ from nanoplm.data.extractor import Extractor, ExtractionError
 from nanoplm.data.shuffler import FastaShuffler, ShufflingError
 from nanoplm.data.filterer import Filterer, FilterError
 from nanoplm.data.splitor import Splitor, SplitError
-from nanoplm.data.manifest import PretrainManifest, DistillationManifest, write_manifest
+from nanoplm.data.infra.manifest import PretrainManifest, DistillationManifest, write_manifest
 from nanoplm.distillation.dataset import SaveKDDataset, shard_h5_file
 from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.pretraining.dataset import ShardWriter

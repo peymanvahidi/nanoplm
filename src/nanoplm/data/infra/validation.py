@@ -18,7 +18,7 @@ from typing import Union, List, Optional
 import numpy as np
 import h5py
 
-from nanoplm.data.manifest import (
+from nanoplm.data.infra.manifest import (
     read_manifest,
     validate_manifest_for_pipeline,
 )
