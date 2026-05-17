@@ -1,3 +1,4 @@
+import os
 import ssl
 import certifi
 import urllib.request
@@ -20,6 +21,35 @@ class Downloader:
     def __init__(self, url: str, output_path: str | Path):
         self.url = url
         self.output_path = Path(output_path)
+
+    @classmethod
+    def link_local(cls, src: Path, dst: Path) -> None:
+        """
+        Make `dst` refer to `src`. Prefers symlink, falls back to hardlink,
+        then copy. Logs a warning on the copy path.
+        """
+        src = Path(src).resolve()
+        dst = Path(dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        try:
+            dst.symlink_to(src)
+            return
+        except OSError:
+            pass
+        try:
+            os.link(src, dst)
+            return
+        except OSError:
+            pass
+        import shutil
+        shutil.copy2(src, dst)
+        from nanoplm.utils import logger
+        logger.warning(
+            f"get-file: symlink/hardlink both unsupported; copied {src} -> {dst}. "
+            f"Content changes to {src} will not auto-trigger DVC re-run."
+        )
 
     def download(self):
         """Download UniRef50 dataset if it doesn't exist."""

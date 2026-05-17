@@ -74,77 +74,72 @@ def data():
     "--url",
     required=False,
     type=str,
-    help="Explicit URL to download from. (can be used if dataset key is not provided).",
-    default=None,
+    default="",
+    help="URL to download (empty string treated as null).",
+)
+@click.option(
+    "--local-fasta",
+    required=False,
+    type=str,
+    default="",
+    help="Local .fasta or .fasta.gz path (empty string treated as null).",
 )
 @click.option(
     "--output",
     "-o",
-    required=False,
-    type=click.Path(exists=False),
-    help="Directory path or file path where the dataset will be saved. If not provided the file name will be taken from the dataset url.",
-    default="downloaded_dataset",
+    required=True,
+    type=click.Path(),
+    help="Directory path or file path where the dataset will be saved.",
 )
 @click.option(
     "--force",
     "-f",
     is_flag=True,
-    help="Flag to force download even if file already exists.",
     default=False,
+    help="Flag to force overwrite if output already exists.",
 )
 @click.help_option("--help", "-h")
-def get_file(dataset: str | None, output: str | None, url: str | None, force: bool):
-    """Download datasets using a dataset key (e.g., uniref50) or --url.
+def get_file(dataset, url, local_fasta, output, force):
+    """Acquire a FASTA source. Pass either a dataset key, --url, or --local-fasta.
 
     Examples:
 
     \b
       nanoplm data get-file uniref50 -o data_directory
       nanoplm data get-file --url https://example.com/data.fasta.gz -o data_directory/mydata.fasta.gz
+      nanoplm data get-file --local-fasta /path/to/local.fasta.gz -o data_directory/local.fasta.gz
     """
-
+    url = url or None
+    local_fasta = local_fasta or None
+    sources = [bool(dataset), bool(url), bool(local_fasta)]
+    if sum(sources) != 1:
+        raise click.UsageError(
+            "Provide exactly one of: dataset key, --url, --local-fasta"
+        )
     output_path = Path(output)
-
-    # Validate arguments
-    if not dataset and not url:
-        raise click.UsageError("Either a dataset key or --url must be provided.")
-
-    if dataset and url:
-        raise click.UsageError("Both a dataset key and --url cannot be provided.")
-
-    # Get dataset URL
-    if dataset:
-        dataset_url = DATASET_URLS[dataset]
-    else:
-        dataset_url = url
-
     create_dirs(output_path)
-
-    # Get output  path
+    # If output is a directory, derive a filename from the source.
     if output_path.is_dir():
-        output_path = output_path / Path(dataset_url).name
-
-    # Check if output path already exists
-    if output_path.exists():
-        if force:
-            output_path.unlink()
-            click.echo(f"Removed existing file: {output_path}")
+        if local_fasta:
+            output_path = output_path / Path(local_fasta).name
         else:
-            click.echo(
-                f"File already exists: {output_path} \nUse --force to overwrite."
-            )
-            return
-
-    # Download dataset
+            chosen_url = DATASET_URLS[dataset] if dataset else url
+            output_path = output_path / Path(chosen_url).name
+    if output_path.exists() and not force:
+        click.echo(f"File already exists: {output_path}. Use --force to overwrite.")
+        return
+    if output_path.exists() and force:
+        output_path.unlink()
+    if local_fasta:
+        Downloader.link_local(Path(local_fasta), output_path)
+        click.echo(f"Linked local file: {local_fasta} -> {output_path}")
+        return
+    chosen_url = DATASET_URLS[dataset] if dataset else url
     try:
-        downloader = Downloader(url=dataset_url, output_path=output_path)
-        downloader.download()
-        click.echo(f"Dataset downloaded to: {output_path}")
-
+        Downloader(url=chosen_url, output_path=output_path).download()
     except DownloadError as e:
         raise click.ClickException(f"Download failed: {e}")
-    except Exception as e:
-        raise click.ClickException(f"An unexpected error occurred during download: {e}")
+    click.echo(f"Downloaded to: {output_path}")
 
 
 @data.command("extract")
