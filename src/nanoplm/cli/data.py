@@ -322,7 +322,7 @@ def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: 
 @click.option(
     "--exclude-ids",
     default=None,
-    type=click.Path(exists=False),
+    type=click.Path(exists=True, dir_okay=False),
     help="Optional path to a text file with one sequence ID per line; matching sequences are excluded.",
 )
 @click.help_option("--help", "-h")

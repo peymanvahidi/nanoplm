@@ -402,7 +402,7 @@ static ExclNode **excl_set_new(void) {
     return (ExclNode **)calloc(EXCL_SLOTS, sizeof(ExclNode *));
 }
 
-/* Returns 1 if added, 0 if already present or cap reached, -1 on OOM. */
+/* Returns 1 if added, 0 if already present, -1 on OOM, -2 if cap reached. */
 static int excl_set_add(ExclNode **ht, unsigned int *count, const char *id) {
     uint64_t h = fnv1a(id);
     unsigned int slot = (unsigned int)(h & (EXCL_SLOTS - 1));
@@ -411,7 +411,7 @@ static int excl_set_add(ExclNode **ht, unsigned int *count, const char *id) {
         if (strcmp(node->id, id) == 0) return 0;  /* already present */
         node = node->next;
     }
-    if (*count >= EXCL_MAX) return 0;  /* cap reached */
+    if (*count >= EXCL_MAX) return -2;  /* cap reached */
     ExclNode *newnode = (ExclNode *)malloc(sizeof(ExclNode));
     if (!newnode) return -1;
     newnode->id = strdup(id);
@@ -498,7 +498,9 @@ API_EXPORT int nanoplm_filter_fasta(
         char *eline = NULL;
         size_t ecap = 0;
         ssize_t elen;
+        long long excl_line_num = 0;
         while ((elen = getline(&eline, &ecap, excl_f)) != -1) {
+            excl_line_num++;
             /* strip trailing \r\n */
             while (elen > 0 && (eline[elen-1] == '\n' || eline[elen-1] == '\r'))
                 eline[--elen] = '\0';
@@ -509,6 +511,17 @@ API_EXPORT int nanoplm_filter_fasta(
                 fclose(excl_f);
                 excl_set_free(excl_ht);
                 set_error(error_msg, error_cap, "Out of memory loading exclude_ids");
+                return -1;
+            }
+            if (ret == -2) {
+                free(eline);
+                fclose(excl_f);
+                excl_set_free(excl_ht);
+                set_error(error_msg, error_cap,
+                          "exclude_ids file %s contains more than %u unique IDs "
+                          "(cap reached at line %lld); split the file or contact a "
+                          "maintainer to raise the cap",
+                          exclude_ids_path, EXCL_MAX, excl_line_num);
                 return -1;
             }
         }

@@ -72,3 +72,27 @@ def test_filter_excluded_ids_count_toward_processed(tmp_path):
     # All 3 sequences were processed; 2 passed (b was excluded).
     assert f.processed_seqs_num == 3
     assert f.num_filtered_seqs == 2
+
+
+def test_filter_missing_exclude_file_errors_at_cli(tmp_path):
+    """CLI should reject a missing --exclude-ids file at parse time, not runtime."""
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    src = tmp_path / "in.fasta"
+    src.write_text(">a\nMAGV\n")
+    out = tmp_path / "out.fasta"
+    runner = CliRunner()
+    result = runner.invoke(
+        data,
+        [
+            "filter",
+            "-i", str(src),
+            "-o", str(out),
+            "--min-seq-len", "1",
+            "--max-seq-len", "100",
+            "--exclude-ids", str(tmp_path / "does-not-exist.txt"),
+        ],
+    )
+    assert result.exit_code != 0
+    # Click's exists=True produces a message containing "does not exist" or similar
+    assert "does not exist" in result.output.lower() or "no such" in result.output.lower()
