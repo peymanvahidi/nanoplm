@@ -63,7 +63,7 @@ def data():
     pass
 
 
-@data.command("download")
+@data.command("get-file")
 @click.argument(
     "dataset",
     required=False,
@@ -93,14 +93,14 @@ def data():
     default=False,
 )
 @click.help_option("--help", "-h")
-def download(dataset: str | None, output: str | None, url: str | None, force: bool):
+def get_file(dataset: str | None, output: str | None, url: str | None, force: bool):
     """Download datasets using a dataset key (e.g., uniref50) or --url.
 
     Examples:
 
     \b
-      nanoplm data download uniref50 -o data_directory
-      nanoplm data download --url https://example.com/data.fasta.gz -o data_directory/mydata.fasta.gz
+      nanoplm data get-file uniref50 -o data_directory
+      nanoplm data get-file --url https://example.com/data.fasta.gz -o data_directory/mydata.fasta.gz
     """
 
     output_path = Path(output)
@@ -470,7 +470,7 @@ def split(
         )
 
 
-@data.command("save-kd-dataset")
+@data.command("kd-embed")
 @click.option(
     "--input",
     "-i",
@@ -530,7 +530,7 @@ def split(
     help="Number of sequences to skip from the beginning of the input FASTA file before processing",
 )
 @click.help_option("--help", "-h")
-def save_kd_dataset(
+def kd_embed(
     input: str,
     output: str,
     teacher_model: str,
@@ -593,7 +593,7 @@ def save_kd_dataset(
         )
 
 
-@data.command("save-pretrain-dataset")
+@data.command("pre-tokenize")
 @click.option(
     "--input",
     "-i",
@@ -649,7 +649,7 @@ def save_kd_dataset(
          "Register tokens act as learnable scratch space for the model.",
 )
 @click.help_option("--help", "-h")
-def save_pretrain_dataset(
+def pre_tokenize(
     input: str,
     output: str,
     max_seq_len: int,
@@ -692,7 +692,7 @@ def save_pretrain_dataset(
         f"  shards: {len(shards)} -> {output_dir}\n"
     )
 
-@data.command("shard")
+@data.command("kd-reshard")
 @click.option(
     "--input-file",
     "-i",
@@ -718,15 +718,15 @@ def save_pretrain_dataset(
     help="Total number of sequences (if known, skips counting for faster start)",
 )
 @click.help_option("--help", "-h")
-def shard(input_file: str, n_shards: int, output_dir: str, total_sequences: int):
+def kd_reshard(input_file: str, n_shards: int, output_dir: str, total_sequences: int):
     """Shard a large H5 file into smaller files for better performance.
 
     Examples:
         # Basic sharding (will count sequences first)
-        nanoplm data shard --input-file train.h5 --n-shards 33
+        nanoplm data kd-reshard --input-file train.h5 --n-shards 33
 
         # Fast sharding (skips counting if you know the sequence count)
-        nanoplm data shard --input-file train.h5 --n-shards 33 --total-sequences 12500000
+        nanoplm data kd-reshard --input-file train.h5 --n-shards 33 --total-sequences 12500000
 
     This will create train_shard_0.h5, train_shard_1.h5, ..., train_shard_32.h5
     """
