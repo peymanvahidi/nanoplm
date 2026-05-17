@@ -356,6 +356,45 @@ def filter(
         )
 
 
+@data.command("check")
+@click.option("--input", "-i", required=True,
+              type=click.Path(exists=True, dir_okay=False), help="Input FASTA file")
+@click.option("--output", "-o", required=True,
+              type=click.Path(file_okay=False),
+              help="Output directory for validation sidecars")
+@click.option("--drop-invalid", default="false",
+              type=click.Choice(["true", "false"], case_sensitive=False),
+              help="If true, exit 0 even with invalid sequences and write invalid_ids.txt")
+@click.help_option("--help", "-h")
+def check(input: str, output: str, drop_invalid: str):
+    """Validate FASTA sequences. Writes validation.json, invalid.fasta, invalid_ids.txt
+    into the output directory. Exits non-zero if invalid sequences are found AND
+    --drop-invalid=false; exits zero otherwise.
+    """
+    from nanoplm.data.preparation.checker import Checker
+
+    drop = drop_invalid.lower() == "true"
+    result = Checker(
+        input_path=Path(input),
+        output_dir=Path(output),
+        drop_invalid=drop,
+    ).check()
+
+    if result.invalid_count > 0:
+        msg = (
+            f"Validation found {result.invalid_count:,} problematic sequence(s).\n"
+            f"  Inspect: {Path(output) / 'invalid.fasta'}\n"
+            f"  Summary: {Path(output) / 'validation.json'}\n"
+        )
+        if not drop:
+            msg += (
+                "\nTo exclude these sequences and continue the pipeline:\n"
+                "    nanoplm data from-yaml --fix\n"
+            )
+            raise click.ClickException(msg)
+        click.echo(msg, err=True)
+
+
 @data.command("split")
 @click.option(
     "--input",
