@@ -955,11 +955,17 @@ API_EXPORT int nanoplm_shuffle_fasta(
  *     first whitespace/newline) was seen before. Duplicates also
  *     count as invalid.
  *
+ * Tolerances (intentional deviations from strict FASTA):
+ *   - Lowercase AA characters are accepted in addition to uppercase
+ *     (e.g. 'a' is treated the same as 'A').
+ *   - Whitespace inside AA lines is silently stripped: a line
+ *     containing "MA G V" is treated as "MAGV".
+ *
  * detect_duplicates: when non-zero, maintains an in-memory hash
  *   table to track seen ids. The table uses 524288 slots (2 MB
  *   pointer array) with chained collision lists. If more than
- *   250000 unique ids are seen, dedup stops and a warning is
- *   appended to err_buf (but the function still succeeds).
+ *   250000 unique ids are seen, dedup stops and dedup_truncated is
+ *   set to true in the JSON report (the function still succeeds).
  *
  * Return codes:
  *   0              success
@@ -1095,14 +1101,18 @@ API_EXPORT int validate_fasta_native(
     /* ---- streaming state ---- */
     DynBuf cur_header, cur_seq;
     int have_record = 0;
-    if (dynbuf_init(&cur_header, 256) != 0 || dynbuf_init(&cur_seq, 1024) != 0) {
-        fclose(fin);
-        fclose(finv_fa);
-        fclose(finv_ids);
-        if (ht) free(ht);
-        set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
-        cancel_scope_exit(&scope);
-        return 1;
+    {
+        int hdr_ok = (dynbuf_init(&cur_header, 256) == 0);
+        int seq_ok = (dynbuf_init(&cur_seq, 1024) == 0);
+        if (!hdr_ok || !seq_ok) {
+            if (hdr_ok) dynbuf_free(&cur_header);
+            if (seq_ok) dynbuf_free(&cur_seq);
+            if (ht) free(ht);
+            set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
+            fclose(fin); fclose(finv_fa); fclose(finv_ids);
+            cancel_scope_exit(&scope);
+            return 1;
+        }
     }
 
     long long total_sequences = 0;
@@ -1274,6 +1284,13 @@ API_EXPORT int validate_fasta_native(
         }
     }
 
+    /* Distinguish clean EOF from a read error */
+    if (ferror(fin)) {
+        set_error(err_buf, err_buf_size, "Error reading input FASTA: %s", strerror(errno));
+        rc = 1;
+        goto cleanup;
+    }
+
     /* Process the final record */
     if (have_record) {
         PROCESS_RECORD();
@@ -1303,6 +1320,7 @@ API_EXPORT int validate_fasta_native(
         fprintf(frep, "  \"duplicate_count\": %lld,\n", duplicate_count);
         fprintf(frep, "  \"first_invalid_id\": ");
         write_json_string(frep, first_invalid_id);
+        fprintf(frep, ",\n  \"dedup_truncated\": %s", dedup_cap_reached ? "true" : "false");
         fprintf(frep, "\n}\n");
         fclose(frep);
     }

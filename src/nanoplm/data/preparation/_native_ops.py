@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -61,6 +62,7 @@ class NativeValidateResult:
     invalid_count: int
     empty_count: int
     duplicate_count: int
+    dedup_truncated: bool
 
 
 def _is_disabled() -> bool:
@@ -401,8 +403,20 @@ def validate_fasta_native(
     report_json_path: Path,
     *,
     detect_duplicates: bool = True,
-    progress_cb=None,  # progress_cb reserved for future use; not yet wired to the C side.
+    progress_cb=None,
 ) -> NativeValidateResult:
+    """Validate a FASTA file via the native C backend.
+
+    Writes invalid records to `invalid_fasta_path`, their IDs to
+    `invalid_ids_path`, and a JSON summary to `report_json_path`.
+
+    progress_cb is reserved for future use and currently ignored;
+    the C function does not surface progress today.
+    """
+    if _is_disabled():
+        raise NativeFastaOpsError(
+            f"Native FASTA ops disabled by env var {_DISABLE_NATIVE_FASTA_OPS_ENV}=1"
+        )
     lib = _load_library()
     fn = lib.validate_fasta_native
     fn.argtypes = [
@@ -436,11 +450,16 @@ def validate_fasta_native(
             err_buf.value.decode(errors="replace") or "validate_fasta_native failed"
         )
 
-    import json
-    report = json.loads(Path(report_json_path).read_text())
-    return NativeValidateResult(
-        total_sequences=report["total_sequences"],
-        invalid_count=report["invalid_count"],
-        empty_count=report["empty_count"],
-        duplicate_count=report["duplicate_count"],
-    )
+    try:
+        report = json.loads(Path(report_json_path).read_text())
+        return NativeValidateResult(
+            total_sequences=report["total_sequences"],
+            invalid_count=report["invalid_count"],
+            empty_count=report["empty_count"],
+            duplicate_count=report["duplicate_count"],
+            dedup_truncated=bool(report.get("dedup_truncated", False)),
+        )
+    except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
+        raise NativeFastaOpsError(
+            f"validate_fasta_native: malformed report at {report_json_path}: {exc}"
+        ) from exc
