@@ -637,7 +637,6 @@ def save_pretrain_dataset(
         samples_per_shard=samples_per_shard,
         max_workers=max_workers,
         force=force,
-        use_native=_use_native_backend(pipeline_backend),
     )
     shards = saver.create_shards()
 
@@ -1113,7 +1112,6 @@ def from_yaml(
             samples_per_shard=samples_per_shard,
             max_workers=max_workers,
             force=force,
-            use_native=_use_native_backend(selected_pipeline_backend),
         )
         train_shards = train_saver.create_shards()
         train_sequences = train_saver.sequence_count
@@ -1135,7 +1133,6 @@ def from_yaml(
             samples_per_shard=samples_per_shard,
             max_workers=max_workers,
             force=force,
-            use_native=_use_native_backend(selected_pipeline_backend),
         )
         val_shards = val_saver.create_shards()
         val_sequences = val_saver.sequence_count
