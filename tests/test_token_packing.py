@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import pickle
 from torch.utils.data import Dataset, DataLoader, SequentialSampler
-from nanoplm.pretraining.dataset import TokenPackingDataset
+from nanoplm.data.datasets.pretrain import TokenPackingDataset
 from nanoplm.pretraining.collator import DataCollatorWithFlattening, ProtDataCollatorForLM
 
 class MockDataset(Dataset):

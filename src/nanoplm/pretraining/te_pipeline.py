@@ -34,7 +34,7 @@ from nanoplm.pretraining.collator import (
     ProtDataCollatorForLM,
     build_power_of_two_buckets,
 )
-from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.models.modern_bert.modeling import MHCLiteBlock
 from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM

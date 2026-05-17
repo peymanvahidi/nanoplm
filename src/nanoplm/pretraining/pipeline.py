@@ -16,7 +16,7 @@ from transformers import (
 
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
-from nanoplm.pretraining.dataset import ShardedDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset
 from nanoplm.pretraining.collator import ProtDataCollatorForLM
 from torch.optim.lr_scheduler import LambdaLR
 

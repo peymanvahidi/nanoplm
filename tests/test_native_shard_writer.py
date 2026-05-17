@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nanoplm.pretraining.dataset import ShardedDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 from nanoplm.data.sharding.pretrain_shard_writer import (
     ShardWriter,

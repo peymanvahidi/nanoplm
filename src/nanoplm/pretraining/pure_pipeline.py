@@ -57,7 +57,7 @@ from nanoplm.pretraining.collator import (
     ProtDataCollatorForLM,
     build_power_of_two_buckets,
 )
-from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.fp8 import (
     Float8Linear,
     Float8LinearConfig,
