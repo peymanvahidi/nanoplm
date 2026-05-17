@@ -172,11 +172,16 @@ def is_native_fasta_ops_available() -> tuple[bool, str | None]:
 @contextmanager
 def _sigint_cancel_flag():
     """
-    Provides a c_int flag the C library polls during long operations.
-    The flag starts at 0; the C side sets it to 1 when it observes SIGINT
-    via its own signal handling (registered at compile time).
-    The Python side does NOT install a signal.signal handler — this context
-    manager only allocates and yields the flag.
+    Yield a c_int flag that the C library polls for cooperative cancellation.
+
+    The flag is initialized to 0. On entry to each native call the C side
+    installs its own sigaction-based SIGINT handler (see cancel_scope_enter
+    in fast_fasta_ops.c) so Ctrl+C is observed synchronously while ctypes
+    is blocked in C; that handler sets the flag to 1. The C loops poll the
+    flag and exit cleanly on cancellation.
+
+    Python does NOT install a signal.signal handler here — this context
+    manager only allocates and yields the flag the C side will write to.
     """
     yield ctypes.c_int(0)
 
