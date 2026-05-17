@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Union, List, Optional
 from torch.utils.data import Dataset
 
 from nanoplm.utils import logger, get_device, create_dirs
+from nanoplm.data.infra.atomic import atomic_write_path
 
 if TYPE_CHECKING:
     from nanoplm.distillation.models.teacher import BaseTeacher
@@ -135,54 +136,57 @@ class SaveKDDataset(Dataset):
 
         batch = []
 
-        if self.output_path.exists():
-            if self.force:
-                logger.info(
-                    f"Found existing HDF5 file at {self.output_path}. Will overwrite existing file."
-                )
-                self.output_path.unlink()
-            else:
-                raise FileExistsError(
-                    f"Found existing HDF5 file at {self.output_path}. Use --force to overwrite existing file."
-                )
+        if self.output_path.exists() and not self.force:
+            raise FileExistsError(
+                f"Found existing HDF5 file at {self.output_path}. Use --force to overwrite existing file."
+            )
+        if self.output_path.exists() and self.force:
+            logger.info(
+                f"Found existing HDF5 file at {self.output_path}. Will overwrite existing file."
+            )
+            # No manual unlink — atomic_write_path.replace will overwrite atomically.
         else:
             logger.info(
                 f"No existing HDF5 file at {self.output_path}. Creating new file."
             )
 
         processed_sequences = 0
-        with h5py.File(self.output_path, "w") as h5f:
+        with atomic_write_path(self.output_path) as tmp_path:
+            with h5py.File(tmp_path, "w") as h5f:
+                with tqdm(
+                    total=self.__len__(), desc="Generating embeddings", unit="seq"
+                ) as pbar:
+                    for _, sequence in self.data_gen:
+                        teacher_seq = self.teacher.preprocess(sequence)
+                        batch.append(teacher_seq)
 
-            with tqdm(
-                total=self.__len__(), desc="Generating embeddings", unit="seq"
-            ) as pbar:
-                for _, sequence in self.data_gen:
-                    teacher_seq = self.teacher.preprocess(sequence)
-                    batch.append(teacher_seq)
+                        # Process the batch if it's full
+                        if len(batch) == self.batch_size:
+                            self._process_and_save_batch(
+                                h5f=h5f, batch=batch, start_index=processed_sequences
+                            )
+                            processed_sequences += len(batch)
+                            pbar.update(len(batch))
+                            batch = []
 
-                    # Process the batch if it's full
-                    if len(batch) == self.batch_size:
+                    # Process any remaining sequences in the last batch
+                    if batch:
                         self._process_and_save_batch(
                             h5f=h5f, batch=batch, start_index=processed_sequences
                         )
                         processed_sequences += len(batch)
                         pbar.update(len(batch))
-                        batch = []
-
-                # Process any remaining sequences in the last batch
-                if batch:
-                    self._process_and_save_batch(
-                        h5f=h5f, batch=batch, start_index=processed_sequences
-                    )
-                    processed_sequences += len(batch)
-                    pbar.update(len(batch))
 
         logger.info(f"Processed and saved {processed_sequences} new sequences.")
         logger.info(f"Dataset: {self.output_path}.")
         return self.output_path
 
     def _process_dataset_sharded(self) -> List[Path]:
-        """Process dataset into multiple sharded H5 files based on samples_per_shard"""
+        """Process dataset into multiple sharded H5 files based on samples_per_shard.
+
+        Each shard is written atomically: data flows to a .h5.tmp sibling and is
+        renamed to the final .h5 path only when the shard is fully written.
+        """
 
         # Generate shard file names
         base_name = self.output_path.stem
@@ -191,67 +195,88 @@ class SaveKDDataset(Dataset):
             output_dir / f"{base_name}_shard_{i}.h5" for i in range(self.n_files)
         ]
 
-        # Check for existing files and handle them
+        # Check for existing files and handle them (before touching any files)
         for shard_path in shard_paths:
-            if shard_path.exists():
-                if self.force:
-                    logger.info(
-                        f"Found existing sharded file at {shard_path}. Will overwrite existing file."
-                    )
-                    shard_path.unlink()
-                else:
-                    raise FileExistsError(
-                        f"Found existing sharded file at {shard_path}. Use --force to overwrite existing file."
-                    )
+            if shard_path.exists() and not self.force:
+                raise FileExistsError(
+                    f"Found existing sharded file at {shard_path}. Use --force to overwrite existing file."
+                )
+
+        for shard_path in shard_paths:
+            if shard_path.exists() and self.force:
+                logger.info(
+                    f"Found existing sharded file at {shard_path}. Will overwrite existing file."
+                )
+                # No manual unlink — atomic_write_path replaces atomically on success.
             else:
                 logger.info(f"Creating new shard file: {shard_path.name}")
 
-        # Process sequences and write to one shard file at a time
-        batch = []
+        # Process sequences and write to one shard at a time, atomically.
+        # State for the open shard:
+        batch: List = []
         current_shard_idx = 0
         current_shard_count = 0
         processed_sequences = 0
+        # Per-shard atomic context and h5 file handle — managed explicitly.
+        current_atomic_ctx = None
         current_h5_file = None
+
+        def _open_shard(idx: int):
+            nonlocal current_atomic_ctx, current_h5_file
+            current_atomic_ctx = atomic_write_path(shard_paths[idx])
+            tmp_path = current_atomic_ctx.__enter__()
+            current_h5_file = h5py.File(tmp_path, "w")
+            logger.info(f"Opened shard file: {shard_paths[idx].name}")
+
+        def _close_shard_success(idx: int):
+            nonlocal current_atomic_ctx, current_h5_file
+            if current_h5_file is not None:
+                current_h5_file.close()
+                current_h5_file = None
+            if current_atomic_ctx is not None:
+                current_atomic_ctx.__exit__(None, None, None)
+                current_atomic_ctx = None
+            logger.info(f"Committed shard file: {shard_paths[idx].name} with {current_shard_count} sequences")
+
+        def _close_shard_error():
+            nonlocal current_atomic_ctx, current_h5_file
+            import sys
+            exc_info = sys.exc_info()
+            if current_h5_file is not None:
+                try:
+                    current_h5_file.close()
+                except Exception:
+                    pass
+                current_h5_file = None
+            if current_atomic_ctx is not None:
+                current_atomic_ctx.__exit__(*exc_info)
+                current_atomic_ctx = None
 
         try:
             with tqdm(
                 total=self.__len__(), desc="Generating sharded embeddings", unit="seq"
             ) as pbar:
                 for _, sequence in self.data_gen:
-                    # Check if we need to open the first file
+                    # Open the first shard on first iteration
                     if current_h5_file is None:
-                        current_h5_file = h5py.File(shard_paths[current_shard_idx], "w")
-                        logger.info(
-                            f"Opened shard file: {shard_paths[current_shard_idx].name}"
-                        )
+                        _open_shard(current_shard_idx)
 
                     teacher_seq = self.teacher.preprocess(sequence)
                     batch.append(teacher_seq)
 
                     if len(batch) == self.batch_size:
-                        # Check if current shard is full and we're not on the last shard
+                        # Roll over to the next shard if the current one is full
+                        # and we haven't reached the last shard yet.
                         if (
                             current_shard_count + len(batch) > self.samples_per_shard
                             and current_shard_idx < self.n_files - 1
                         ):
-                            # Close current file and move to next
-                            current_h5_file.close()
-                            logger.info(
-                                f"Closed shard file: {shard_paths[current_shard_idx].name} with {current_shard_count} sequences"
-                            )
-
+                            _close_shard_success(current_shard_idx)
                             current_shard_idx += 1
                             current_shard_count = 0
+                            _open_shard(current_shard_idx)
 
-                            # Open next shard file
-                            current_h5_file = h5py.File(
-                                shard_paths[current_shard_idx], "w"
-                            )
-                            logger.info(
-                                f"Opened shard file: {shard_paths[current_shard_idx].name}"
-                            )
-
-                        # Process the batch
+                        # Write the batch into the current shard
                         self._process_and_save_batch(
                             h5f=current_h5_file,
                             batch=batch,
@@ -262,7 +287,7 @@ class SaveKDDataset(Dataset):
                         pbar.update(len(batch))
                         batch = []
 
-                # Process any remaining sequences in the last batch
+                # Flush any remaining sequences into the last open shard
                 if batch:
                     self._process_and_save_batch(
                         h5f=current_h5_file,
@@ -272,13 +297,13 @@ class SaveKDDataset(Dataset):
                     processed_sequences += len(batch)
                     pbar.update(len(batch))
 
-        finally:
-            # Close the currently open file
+            # Commit the final shard
             if current_h5_file is not None:
-                current_h5_file.close()
-                logger.info(
-                    f"Closed final shard file: {shard_paths[current_shard_idx].name}"
-                )
+                _close_shard_success(current_shard_idx)
+
+        except BaseException:
+            _close_shard_error()
+            raise
 
         # Log shard information with progress summary
         logger.info("Sharded processing completed! Summary:")

@@ -12,6 +12,7 @@ from typing import Callable
 
 from nanoplm.utils import logger, create_dirs
 from nanoplm.utils.common import run_with_heartbeat
+from nanoplm.data.infra.atomic import atomic_write_dir
 
 
 _ERROR_BUFFER_BYTES = 4096
@@ -302,7 +303,7 @@ class ShardWriter:
             List of paths to created shard .bin files
         """
         self._check_tokenizer_compatible()
-        # Check if shards already exist
+        # Check if shards already exist (against the final target dir)
         shards_exist = (
             self.output_dir.exists() and len(list(self.output_dir.glob("*.bin"))) > 0
         )
@@ -315,13 +316,8 @@ class ShardWriter:
 
         if shards_exist and self.force:
             logger.warning(f"Overwriting existing shards in {self.output_dir}")
-            for shard in self.output_dir.glob("*.bin"):
-                shard.unlink()
-            for shard in self.output_dir.glob("*.idx.npy"):
-                shard.unlink()
-
-        # Create output directory
-        create_dirs(self.output_dir)
+            # No need to manually unlink — atomic_write_dir will rmtree the
+            # existing target before renaming the tmp dir into place.
 
         last_percent = -1
 
@@ -340,24 +336,30 @@ class ShardWriter:
                 total,
             )
 
-        result = run_with_heartbeat(
-            "Tokenizing and writing shards (native backend)",
-            lambda: create_shards_native(
-                fasta_path=self.fasta_path,
-                output_dir=self.output_dir,
-                max_length=self.max_length,
-                samples_per_shard=self.samples_per_shard,
-                num_threads=self.max_workers,
-                use_bos_token=self._use_bos_token,
-                num_register_tokens=self._num_register_tokens,
-                progress_cb=progress_cb,
-            ),
-        )
+        with atomic_write_dir(self.output_dir) as tmp_dir:
+            result = run_with_heartbeat(
+                "Tokenizing and writing shards (native backend)",
+                lambda: create_shards_native(
+                    fasta_path=self.fasta_path,
+                    output_dir=tmp_dir,
+                    max_length=self.max_length,
+                    samples_per_shard=self.samples_per_shard,
+                    num_threads=self.max_workers,
+                    use_bos_token=self._use_bos_token,
+                    num_register_tokens=self._num_register_tokens,
+                    progress_cb=progress_cb,
+                ),
+            )
+        # On context exit, tmp_dir is renamed to self.output_dir atomically.
+        # result.shard_paths point at tmp_dir which no longer exists — recompute
+        # from the final target directory.
+        final_shard_paths = sorted(self.output_dir.glob("shard_*.bin"))
+
         self._sequence_count = result.sequence_count
         logger.info(
             "Successfully tokenized %d sequences into %d binary shards in %s (native backend).",
             self._sequence_count,
-            len(result.shard_paths),
+            len(final_shard_paths),
             self.output_dir,
         )
-        return result.shard_paths
+        return final_shard_paths
