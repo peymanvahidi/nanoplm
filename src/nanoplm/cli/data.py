@@ -262,9 +262,7 @@ def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: 
         shuffler = FastaShuffler(
             input_path=input_path,
             output_path=output_path,
-            backend=backend,
             seed=seed,
-            use_native_fast=_use_native_backend(pipeline_backend),
         )
         shuffler.shuffle()
     except ShufflingError as e:
@@ -347,8 +345,6 @@ def filter(
             min_seq_len=min_seq_len,
             max_seq_len=max_seq_len,
             seqs_num=seqs_num,
-            skip_n=skip_n,
-            use_native=_use_native_backend(pipeline_backend),
         )
         filterer.filter()
         click.echo("Filtering completed successfully")
@@ -413,7 +409,6 @@ def split(
             train_file=train_file_path,
             val_file=val_file_path,
             val_ratio=val_ratio,
-            use_native=_use_native_backend(pipeline_backend),
         )
         train_size, val_size = splitor.split()
         click.echo(

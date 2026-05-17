@@ -1,4 +1,5 @@
 import os
+import random
 from pathlib import Path
 from nanoplm.data.preparation._native_ops import shuffle_fasta_native
 from nanoplm.utils import logger
@@ -25,16 +26,19 @@ class FastaShuffler:
         self.do_shuffle = do_shuffle
 
     def shuffle(self) -> None:
-        if not self.do_shuffle:
-            self._symlink_through()
-            return
         try:
+            if not self.do_shuffle:
+                self._symlink_through()
+                return
+            effective_seed = self.seed if self.seed is not None else random.randint(1, 2**31 - 1)
             shuffle_fasta_native(
                 input_path=self.input_path,
                 output_path=self.output_path,
-                seed=self.seed if self.seed is not None else 0,
+                seed=effective_seed,
                 num_threads=_DEFAULT_THREADS,
             )
+        except ShufflingError:
+            raise
         except Exception as e:
             raise ShufflingError(str(e)) from e
 
