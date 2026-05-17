@@ -600,7 +600,9 @@ API_EXPORT int nanoplm_filter_fasta(
                         free(cur_id);
                     }
                 }
-                if (!excluded) {
+                if (excluded) {
+                    processed++;
+                } else {
                     if (process_filter_record(
                             out, &header, &seq, min_seq_len, max_seq_len, seqs_num, skip_n, &skipped,
                             &processed, &passed, &stop_now, error_msg, error_cap) != 0) {
@@ -642,7 +644,9 @@ API_EXPORT int nanoplm_filter_fasta(
                 free(cur_id);
             }
         }
-        if (!excluded) {
+        if (excluded) {
+            processed++;
+        } else {
             if (process_filter_record(
                     out, &header, &seq, min_seq_len, max_seq_len, seqs_num, skip_n, &skipped,
                     &processed, &passed, &stop_now, error_msg, error_cap) != 0) {
