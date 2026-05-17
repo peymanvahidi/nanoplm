@@ -55,6 +55,14 @@ class NativeShuffleResult:
     record_count: int
 
 
+@dataclass(frozen=True)
+class NativeValidateResult:
+    total_sequences: int
+    invalid_count: int
+    empty_count: int
+    duplicate_count: int
+
+
 def _is_disabled() -> bool:
     return os.environ.get(_DISABLE_NATIVE_FASTA_OPS_ENV, "").strip().lower() in {
         "1",
@@ -384,3 +392,55 @@ def shuffle_fasta_native(
         raise NativeFastaOpsError(msg)
 
     return NativeShuffleResult(record_count=int(out_count.value))
+
+
+def validate_fasta_native(
+    input_path: Path,
+    invalid_fasta_path: Path,
+    invalid_ids_path: Path,
+    report_json_path: Path,
+    *,
+    detect_duplicates: bool = True,
+    progress_cb=None,  # progress_cb reserved for future use; not yet wired to the C side.
+) -> NativeValidateResult:
+    lib = _load_library()
+    fn = lib.validate_fasta_native
+    fn.argtypes = [
+        ctypes.c_char_p,               # input_path
+        ctypes.c_char_p,               # invalid_fasta_path
+        ctypes.c_char_p,               # invalid_ids_path
+        ctypes.c_char_p,               # report_json_path
+        ctypes.c_int,                  # detect_duplicates
+        ctypes.POINTER(ctypes.c_int),  # cancel_flag
+        ctypes.c_char_p,               # err_buf
+        ctypes.c_size_t,               # err_buf_size
+    ]
+    fn.restype = ctypes.c_int
+
+    err_buf = ctypes.create_string_buffer(_ERROR_BUFFER_BYTES)
+    with _sigint_cancel_flag() as cancel_flag:
+        rc = fn(
+            str(input_path).encode(),
+            str(invalid_fasta_path).encode(),
+            str(invalid_ids_path).encode(),
+            str(report_json_path).encode(),
+            1 if detect_duplicates else 0,
+            ctypes.byref(cancel_flag),
+            err_buf,
+            _ERROR_BUFFER_BYTES,
+        )
+    if rc == _NATIVE_RC_CANCELLED:
+        raise KeyboardInterrupt()
+    if rc != 0:
+        raise NativeFastaOpsError(
+            err_buf.value.decode(errors="replace") or "validate_fasta_native failed"
+        )
+
+    import json
+    report = json.loads(Path(report_json_path).read_text())
+    return NativeValidateResult(
+        total_sequences=report["total_sequences"],
+        invalid_count=report["invalid_count"],
+        empty_count=report["empty_count"],
+        duplicate_count=report["duplicate_count"],
+    )

@@ -936,3 +936,408 @@ API_EXPORT int nanoplm_shuffle_fasta(
     *out_num_records = (long long)num_records;
     return 0;
 }
+
+/* ============================================================
+ * validate_fasta_native
+ *
+ * Streams through a FASTA file and emits:
+ *   - invalid_fasta_path : records that failed validation
+ *   - invalid_ids_path   : just the sequence ids (one per line)
+ *   - report_json_path   : summary JSON with counts
+ *
+ * Validation rules:
+ *   - Allowed AA alphabet: ACDEFGHIKLMNPQRSTVWY (standard 20)
+ *                          BJOUXZ (ambiguous) * (stop codon)
+ *   - A sequence is "empty"   if it has no AA characters.
+ *   - A sequence is "invalid" if any AA character is outside the
+ *     allowed alphabet, OR if the sequence is empty.
+ *   - A sequence is "duplicate" if its id (bytes after '>' up to
+ *     first whitespace/newline) was seen before. Duplicates also
+ *     count as invalid.
+ *
+ * detect_duplicates: when non-zero, maintains an in-memory hash
+ *   table to track seen ids. The table uses 524288 slots (2 MB
+ *   pointer array) with chained collision lists. If more than
+ *   250000 unique ids are seen, dedup stops and a warning is
+ *   appended to err_buf (but the function still succeeds).
+ *
+ * Return codes:
+ *   0              success
+ *   NANOPLM_RC_CANCELLED (-2)  cancelled via cancel_flag
+ *   other non-zero  error (err_buf populated)
+ * ============================================================ */
+
+/* Allowed amino-acid alphabet (27 chars incl. stop codon). */
+static const char VALID_AA_CHARS[] = "ACDEFGHIKLMNPQRSTVWYBJOUXZacdefghiklmnpqrstvwybjouxz*";
+
+static int is_valid_aa_char(unsigned char c) {
+    /* Use a 256-entry lookup table built once. */
+    static int table_ready = 0;
+    static unsigned char table[256];
+    if (!table_ready) {
+        memset(table, 0, sizeof(table));
+        for (const char *p = VALID_AA_CHARS; *p; p++) {
+            table[(unsigned char)*p] = 1;
+        }
+        table_ready = 1;
+    }
+    return table[c];
+}
+
+/* FNV-1a hash for a NUL-terminated string. */
+static uint64_t fnv1a(const char *s) {
+    uint64_t h = 14695981039346656037ULL;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+#define DEDUP_SLOTS 524288u   /* power-of-2 bucket count; ~2 MB pointer array */
+#define DEDUP_MAX   250000u   /* stop dedup-checking after this many unique ids */
+
+typedef struct DedupeNode {
+    char *id;
+    struct DedupeNode *next;
+} DedupeNode;
+
+/* Extract the sequence id from a header string (after '>').
+ * id = bytes up to first whitespace or '\0'.
+ * Caller must free the returned string. Returns NULL on alloc failure. */
+static char *extract_seq_id(const char *header) {
+    size_t n = 0;
+    while (header[n] && header[n] != ' ' && header[n] != '\t' &&
+           header[n] != '\r' && header[n] != '\n') {
+        n++;
+    }
+    char *id = (char *)malloc(n + 1);
+    if (!id) return NULL;
+    memcpy(id, header, n);
+    id[n] = '\0';
+    return id;
+}
+
+/* Write a JSON string value with minimal escaping (", \, control chars). */
+static void write_json_string(FILE *f, const char *s) {
+    fputc('"', f);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"') {
+            fputs("\\\"", f);
+        } else if (c == '\\') {
+            fputs("\\\\", f);
+        } else if (c < 0x20) {
+            fprintf(f, "\\u%04x", (unsigned)c);
+        } else {
+            fputc((char)c, f);
+        }
+    }
+    fputc('"', f);
+}
+
+API_EXPORT int validate_fasta_native(
+    const char *input_path,
+    const char *invalid_fasta_path,
+    const char *invalid_ids_path,
+    const char *report_json_path,
+    int detect_duplicates,
+    int *cancel_flag,
+    char *err_buf,
+    size_t err_buf_size)
+{
+    CancelScope scope;
+    cancel_scope_enter(&scope, (volatile int *)cancel_flag);
+
+    /* ---- open input ---- */
+    FILE *fin = fopen(input_path, "r");
+    if (!fin) {
+        set_error(err_buf, err_buf_size,
+                  "validate_fasta_native: cannot open input '%s': %s",
+                  input_path, strerror(errno));
+        cancel_scope_exit(&scope);
+        return 1;
+    }
+
+    /* ---- open outputs ---- */
+    FILE *finv_fa = fopen(invalid_fasta_path, "w");
+    if (!finv_fa) {
+        fclose(fin);
+        set_error(err_buf, err_buf_size,
+                  "validate_fasta_native: cannot open invalid_fasta '%s': %s",
+                  invalid_fasta_path, strerror(errno));
+        cancel_scope_exit(&scope);
+        return 1;
+    }
+    FILE *finv_ids = fopen(invalid_ids_path, "w");
+    if (!finv_ids) {
+        fclose(fin);
+        fclose(finv_fa);
+        set_error(err_buf, err_buf_size,
+                  "validate_fasta_native: cannot open invalid_ids '%s': %s",
+                  invalid_ids_path, strerror(errno));
+        cancel_scope_exit(&scope);
+        return 1;
+    }
+
+    /* ---- dedup hash table ---- */
+    DedupeNode **ht = NULL;
+    unsigned int dedup_count = 0;
+    int dedup_cap_reached = 0;
+    if (detect_duplicates) {
+        ht = (DedupeNode **)calloc(DEDUP_SLOTS, sizeof(DedupeNode *));
+        /* if alloc fails, silently disable dedup */
+        if (!ht) {
+            detect_duplicates = 0;
+        }
+    }
+
+    /* ---- streaming state ---- */
+    DynBuf cur_header, cur_seq;
+    int have_record = 0;
+    if (dynbuf_init(&cur_header, 256) != 0 || dynbuf_init(&cur_seq, 1024) != 0) {
+        fclose(fin);
+        fclose(finv_fa);
+        fclose(finv_ids);
+        if (ht) free(ht);
+        set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
+        cancel_scope_exit(&scope);
+        return 1;
+    }
+
+    long long total_sequences = 0;
+    long long invalid_count  = 0;
+    long long empty_count    = 0;
+    long long duplicate_count = 0;
+    char first_invalid_id[201];
+    first_invalid_id[0] = '\0';
+
+    char *linebuf = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    int rc = 0;
+    long long seq_checked = 0; /* for cancel polling */
+
+    /* Helper: emit the current record as invalid and update counters.
+     * reason: 0=bad_chars 1=empty 2=duplicate */
+    #define EMIT_INVALID(reason) do { \
+        invalid_count++; \
+        if ((reason) == 1) empty_count++; \
+        /* extract id for output */ \
+        char *_sid = extract_seq_id(cur_header.data ? cur_header.data : ""); \
+        if (_sid) { \
+            if (first_invalid_id[0] == '\0') { \
+                strncpy(first_invalid_id, _sid, 200); \
+                first_invalid_id[200] = '\0'; \
+            } \
+            fputs(_sid, finv_ids); \
+            fputc('\n', finv_ids); \
+            free(_sid); \
+        } \
+        /* write record to invalid_fasta */ \
+        fputc('>', finv_fa); \
+        if (cur_header.data && cur_header.len > 0) \
+            fwrite(cur_header.data, 1, cur_header.len, finv_fa); \
+        fputc('\n', finv_fa); \
+        if (cur_seq.data && cur_seq.len > 0) \
+            fwrite(cur_seq.data, 1, cur_seq.len, finv_fa); \
+        fputc('\n', finv_fa); \
+    } while (0)
+
+    /* Helper: check and potentially record a duplicate. */
+    #define CHECK_DEDUP(_is_dup_out) do { \
+        (_is_dup_out) = 0; \
+        if (detect_duplicates && ht && !dedup_cap_reached) { \
+            char *_sid2 = extract_seq_id(cur_header.data ? cur_header.data : ""); \
+            if (_sid2) { \
+                uint64_t _h = fnv1a(_sid2); \
+                unsigned int _slot = (unsigned int)(_h & (DEDUP_SLOTS - 1)); \
+                DedupeNode *_node = ht[_slot]; \
+                while (_node) { \
+                    if (strcmp(_node->id, _sid2) == 0) { \
+                        (_is_dup_out) = 1; \
+                        break; \
+                    } \
+                    _node = _node->next; \
+                } \
+                if (!(_is_dup_out)) { \
+                    if (dedup_count < DEDUP_MAX) { \
+                        DedupeNode *_new = (DedupeNode *)malloc(sizeof(DedupeNode)); \
+                        if (_new) { \
+                            _new->id   = _sid2; \
+                            _sid2      = NULL; \
+                            _new->next = ht[_slot]; \
+                            ht[_slot]  = _new; \
+                            dedup_count++; \
+                        } \
+                    } else { \
+                        dedup_cap_reached = 1; \
+                    } \
+                } \
+                free(_sid2); \
+            } \
+        } \
+    } while (0)
+
+    /* Process a complete record (cur_header + cur_seq). */
+    #define PROCESS_RECORD() do { \
+        total_sequences++; \
+        seq_checked++; \
+        /* Check for empty sequence */ \
+        if (cur_seq.len == 0) { \
+            empty_count++; \
+            invalid_count++; \
+            char *_sid3 = extract_seq_id(cur_header.data ? cur_header.data : ""); \
+            if (_sid3) { \
+                if (first_invalid_id[0] == '\0') { \
+                    strncpy(first_invalid_id, _sid3, 200); \
+                    first_invalid_id[200] = '\0'; \
+                } \
+                fputs(_sid3, finv_ids); \
+                fputc('\n', finv_ids); \
+                free(_sid3); \
+            } \
+            fputc('>', finv_fa); \
+            if (cur_header.data && cur_header.len > 0) \
+                fwrite(cur_header.data, 1, cur_header.len, finv_fa); \
+            fputc('\n', finv_fa); \
+            fputc('\n', finv_fa); \
+        } else { \
+            /* Check for invalid AA chars */ \
+            int _bad = 0; \
+            for (size_t _i = 0; _i < cur_seq.len; _i++) { \
+                if (!is_valid_aa_char((unsigned char)cur_seq.data[_i])) { \
+                    _bad = 1; \
+                    break; \
+                } \
+            } \
+            if (!_bad) { \
+                /* Check duplicate (only for valid sequences) */ \
+                int _is_dup = 0; \
+                CHECK_DEDUP(_is_dup); \
+                if (_is_dup) { \
+                    duplicate_count++; \
+                    EMIT_INVALID(2); \
+                } \
+            } else { \
+                EMIT_INVALID(0); \
+            } \
+        } \
+    } while (0)
+
+    while ((linelen = getline(&linebuf, &linecap, fin)) != -1) {
+        /* periodic cancel check (every 10000 sequences) */
+        if (seq_checked > 0 && seq_checked % 10000 == 0) {
+            if (should_cancel((volatile int *)cancel_flag)) {
+                rc = NANOPLM_RC_CANCELLED;
+                goto cleanup;
+            }
+        }
+
+        if (linelen > 0 && linebuf[0] == '>') {
+            /* New header — process previous record if any */
+            if (have_record) {
+                PROCESS_RECORD();
+            }
+            /* Store new header (strip '>' and trailing whitespace) */
+            const char *hstart = linebuf + 1;
+            ssize_t hlen = linelen - 1;
+            while (hlen > 0 && (linebuf[hlen] == '\n' || linebuf[hlen] == '\r' ||
+                                 linebuf[hlen] == ' '  || linebuf[hlen] == '\t')) {
+                hlen--;
+            }
+            if (dynbuf_reserve(&cur_header, (size_t)hlen + 1) != 0) {
+                set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
+                rc = 1;
+                goto cleanup;
+            }
+            if (hlen > 0) memcpy(cur_header.data, hstart, (size_t)hlen);
+            cur_header.len = (size_t)hlen;
+            cur_header.data[cur_header.len] = '\0';
+            /* Reset sequence buffer */
+            cur_seq.len = 0;
+            if (cur_seq.data) cur_seq.data[0] = '\0';
+            have_record = 1;
+        } else if (have_record) {
+            /* Sequence line — accumulate (skip whitespace) */
+            for (ssize_t _i = 0; _i < linelen; _i++) {
+                unsigned char _c = (unsigned char)linebuf[_i];
+                if (_c == '\n' || _c == '\r' || _c == ' ' || _c == '\t') continue;
+                if (dynbuf_reserve(&cur_seq, cur_seq.len + 2) != 0) {
+                    set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
+                    rc = 1;
+                    goto cleanup;
+                }
+                cur_seq.data[cur_seq.len++] = (char)_c;
+                cur_seq.data[cur_seq.len]   = '\0';
+            }
+        }
+    }
+
+    /* Process the final record */
+    if (have_record) {
+        PROCESS_RECORD();
+    }
+
+    /* Warn if dedup cap was reached */
+    if (dedup_cap_reached && err_buf && err_buf_size > 0 && err_buf[0] == '\0') {
+        snprintf(err_buf, err_buf_size,
+                 "warning: dedup hash table full after %u unique ids; "
+                 "remaining ids not checked for duplicates", DEDUP_MAX);
+    }
+
+    /* ---- write JSON report ---- */
+    {
+        FILE *frep = fopen(report_json_path, "w");
+        if (!frep) {
+            set_error(err_buf, err_buf_size,
+                      "validate_fasta_native: cannot open report '%s': %s",
+                      report_json_path, strerror(errno));
+            rc = 1;
+            goto cleanup;
+        }
+        fprintf(frep, "{\n");
+        fprintf(frep, "  \"total_sequences\": %lld,\n", total_sequences);
+        fprintf(frep, "  \"invalid_count\": %lld,\n",  invalid_count);
+        fprintf(frep, "  \"empty_count\": %lld,\n",    empty_count);
+        fprintf(frep, "  \"duplicate_count\": %lld,\n", duplicate_count);
+        fprintf(frep, "  \"first_invalid_id\": ");
+        write_json_string(frep, first_invalid_id);
+        fprintf(frep, "\n}\n");
+        fclose(frep);
+    }
+    rc = 0;
+
+cleanup:
+    free(linebuf);
+    dynbuf_free(&cur_header);
+    dynbuf_free(&cur_seq);
+    fclose(fin);
+    fclose(finv_fa);
+    fclose(finv_ids);
+
+    /* free dedup hash table */
+    if (ht) {
+        for (unsigned int _i = 0; _i < DEDUP_SLOTS; _i++) {
+            DedupeNode *_n = ht[_i];
+            while (_n) {
+                DedupeNode *_next = _n->next;
+                free(_n->id);
+                free(_n);
+                _n = _next;
+            }
+        }
+        free(ht);
+    }
+
+    #undef EMIT_INVALID
+    #undef CHECK_DEDUP
+    #undef PROCESS_RECORD
+
+    if (rc == NANOPLM_RC_CANCELLED) {
+        cancel_scope_exit(&scope);
+        return NANOPLM_RC_CANCELLED;
+    }
+    cancel_scope_exit(&scope);
+    return rc;
+}
