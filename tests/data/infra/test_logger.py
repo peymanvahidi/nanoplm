@@ -34,3 +34,17 @@ def test_log_filename_is_timestamped_per_pid(tmp_path, monkeypatch):
     assert len(files) == 1
     pattern = re.compile(r"nanoplm_\d{8}_\d{6}_\d+\.log")
     assert pattern.match(files[0].name), f"unexpected filename: {files[0].name}"
+
+
+def test_handlers_are_idempotent_across_reimports(tmp_path, monkeypatch):
+    """Re-importing the logger module must not accumulate duplicate handlers."""
+    monkeypatch.chdir(tmp_path)
+    import sys
+    sys.modules.pop("nanoplm.utils.logger", None)
+    from nanoplm.utils.logger import logger as l1
+    initial = len(l1.handlers)
+    sys.modules.pop("nanoplm.utils.logger", None)
+    from nanoplm.utils.logger import logger as l2
+    # Same global Logger instance + same handler count
+    assert l1 is l2
+    assert len(l2.handlers) == initial

@@ -23,10 +23,10 @@ class _LazyFileHandler(logging.FileHandler):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.baseFilename = str(log_dir / f"nanoplm_{ts}_{os.getpid()}.log")
         self.mode = "a"
-        self.encoding = None
+        self.encoding = "utf-8"
         self.delay = False
         self.errors = None
-        self.stream = open(self.baseFilename, "a", encoding=None)
+        self.stream = open(self.baseFilename, "a", encoding="utf-8")
         self._initialized = True
 
     def emit(self, record):
@@ -39,16 +39,29 @@ class _LazyFileHandler(logging.FileHandler):
 file_handler = _LazyFileHandler()
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+file_handler._nanoplm_role = "file"  # sentinel for idempotency check across re-imports
 
 # Console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter("%(message)s"))
+console_handler._nanoplm_role = "console"  # sentinel for idempotency check across re-imports
 
 logger = logging.getLogger("nanoplm")
 logger.setLevel(logging.INFO)
+# Idempotent: avoid accumulating duplicate handlers across re-imports.
+# (logging.getLogger returns a process-global singleton; isinstance checks
+# cannot be used here because sys.modules.pop re-creates the class object,
+# making old instances appear as a different type to the new import.)
+# For the file handler, replace any existing one so each import starts fresh
+# (the lazy handler is uninitialized and will resolve its path on first emit).
+for _h in list(logger.handlers):
+    if getattr(_h, "_nanoplm_role", None) == "file":
+        logger.removeHandler(_h)
+        break
 logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+if not any(getattr(h, "_nanoplm_role", None) == "console" for h in logger.handlers):
+    logger.addHandler(console_handler)
 logger.propagate = False
 
 
