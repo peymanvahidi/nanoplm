@@ -1,33 +1,67 @@
 import logging
+import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
-# Create logs directory if it doesn't exist
-(Path("output") / "logs").mkdir(parents=True, exist_ok=True)
 
-# Set up file handler for all logs in a unique file per run with timestamp
-log_file = f'output/logs/pipeline.log'
-file_handler = logging.FileHandler(log_file)
+class _LazyFileHandler(logging.FileHandler):
+    """FileHandler that defers opening the file (and creating its directory)
+    until the first emit() call. Avoids creating output/logs/ at import time.
+    """
+
+    def __init__(self):
+        # Defer parent __init__ until first emit
+        logging.Handler.__init__(self)
+        self.baseFilename = None
+        self.stream = None
+        self._initialized = False
+
+    def _initialize(self) -> None:
+        log_dir = Path("output") / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.baseFilename = str(log_dir / f"nanoplm_{ts}_{os.getpid()}.log")
+        self.mode = "a"
+        self.encoding = None
+        self.delay = False
+        self.errors = None
+        self.stream = open(self.baseFilename, "a", encoding=None)
+        self._initialized = True
+
+    def emit(self, record):
+        if not self._initialized:
+            self._initialize()
+        super().emit(record)
+
+
+# File handler (lazy)
+file_handler = _LazyFileHandler()
 file_handler.setLevel(logging.INFO)
-file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(file_formatter)
+file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
-# Set up console handler with a standard formatter
+# Console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
-console_formatter = logging.Formatter('%(message)s')
-console_handler.setFormatter(console_formatter)
+console_handler.setFormatter(logging.Formatter("%(message)s"))
 
-# Configure the logger
-logger = logging.getLogger("myplm")
+logger = logging.getLogger("nanoplm")
 logger.setLevel(logging.INFO)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
-
-# Prevent propagation to avoid duplicate logs
 logger.propagate = False
 
-# Add a helper method to log stage separators
-def log_stage(stage_name):
-    separator = "="*20
+
+def log_stage(stage_name: str) -> None:
+    separator = "=" * 20
     logger.info(f"{separator}STAGE: {stage_name}{separator}")
+
+
+def set_log_level(level: str) -> None:
+    """Set the logger level by string ('debug'|'info'|'warning'|'error')."""
+    numeric = getattr(logging, level.upper(), None)
+    if numeric is None:
+        raise ValueError(f"Unknown log level: {level}")
+    logger.setLevel(numeric)
+    for h in logger.handlers:
+        h.setLevel(numeric)
