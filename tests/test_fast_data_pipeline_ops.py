@@ -1,5 +1,3 @@
-import shutil
-import tempfile
 import time
 import os
 from pathlib import Path
@@ -8,7 +6,6 @@ import pytest
 from Bio import SeqIO
 
 from nanoplm.data.preparation.filterer import Filterer
-from nanoplm.data.preparation._native_ops import _DISABLE_NATIVE_FASTA_OPS_ENV
 from nanoplm.data.preparation.shuffler import FastaShuffler
 from nanoplm.data.preparation.splitor import Splitor
 
@@ -34,36 +31,61 @@ def _first_header(path: Path) -> bytes:
     return b""
 
 
-def _reference_filter(
-    records: list[tuple[str, str]],
-    min_seq_len: int,
-    max_seq_len: int,
-    seqs_num: int,
-    skip_n: int,
-) -> tuple[list[tuple[str, str]], int, int]:
-    out: list[tuple[str, str]] = []
-    skipped = 0
-    processed = 0
-    passed = 0
+def test_fast_shuffle_backend_preserves_records_and_seed(tmp_path):
+    input_path = tmp_path / "input.fasta"
+    out1 = tmp_path / "out1.fasta"
+    out2 = tmp_path / "out2.fasta"
 
-    for rec in records:
-        if skipped < skip_n:
-            skipped += 1
-            continue
+    with open(input_path, "w", encoding="utf-8") as f:
+        for i in range(40):
+            f.write(f">s{i}\n")
+            f.write(f"ACDEFGHIKLMNPQRSTVWY{i % 10}\n")
 
-        processed += 1
-        if seqs_num != -1 and passed >= seqs_num:
-            break
+    original = _parse_fasta(input_path)
+    original_ids = [x[0] for x in original]
 
-        seq_len = len(rec[1])
-        if min_seq_len <= seq_len <= max_seq_len:
-            out.append(rec)
-            passed += 1
+    sh1 = FastaShuffler(
+        input_path=input_path,
+        output_path=out1,
+        seed=777,
+    )
+    sh1.shuffle()
 
-    return out, processed, passed
+    sh2 = FastaShuffler(
+        input_path=input_path,
+        output_path=out2,
+        seed=777,
+    )
+    sh2.shuffle()
+
+    out1_records = _parse_fasta(out1)
+    out2_records = _parse_fasta(out2)
+
+    assert out1_records == out2_records
+    assert sorted(x[0] for x in out1_records) == sorted(original_ids)
+    assert [x[0] for x in out1_records] != original_ids
 
 
-def test_filterer_native_and_python_fallback_match_reference(monkeypatch):
+def test_shuffle_noop_symlink(tmp_path):
+    """do_shuffle=False should create a symlink (or copy) rather than shuffling."""
+    input_path = tmp_path / "input.fasta"
+    output_path = tmp_path / "out.fasta"
+    input_path.write_text(">a\nACDE\n>b\nFGHI\n", encoding="utf-8")
+
+    shuffler = FastaShuffler(
+        input_path=input_path,
+        output_path=output_path,
+        do_shuffle=False,
+    )
+    shuffler.shuffle()
+
+    assert output_path.exists()
+    # Content must be identical to input
+    assert _parse_fasta(output_path) == _parse_fasta(input_path)
+
+
+def test_filterer_native_filters_by_length(tmp_path):
+    """Native filter path: only sequences in [min_seq_len, max_seq_len] are kept."""
     fasta_text = (
         ">s0\nAAAA\n"
         ">s1\nA\n"
@@ -72,44 +94,54 @@ def test_filterer_native_and_python_fallback_match_reference(monkeypatch):
         ">s4\nCCCCC\n"
         ">s5\nTTTT\n"
     )
-    params = dict(min_seq_len=3, max_seq_len=6, seqs_num=2, skip_n=1)
+    input_path = tmp_path / "input.fasta"
+    output_path = tmp_path / "filtered.fasta"
+    input_path.write_text(fasta_text, encoding="utf-8")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / "input.fasta"
-        native_output = tmpdir / "filtered_native.fasta"
-        py_output = tmpdir / "filtered_py.fasta"
-        input_path.write_text(fasta_text, encoding="utf-8")
+    filterer = Filterer(
+        input_path=input_path,
+        output_path=output_path,
+        min_seq_len=4,
+        max_seq_len=6,
+        seqs_num=-1,
+    )
+    filterer.filter()
 
-        records = _parse_fasta(input_path)
-        expected_records, expected_processed, expected_passed = _reference_filter(
-            records, **params
-        )
-
-        monkeypatch.delenv(_DISABLE_NATIVE_FASTA_OPS_ENV, raising=False)
-        native_filterer = Filterer(
-            input_path=input_path,
-            output_path=native_output,
-            **params,
-        )
-        native_filterer.filter()
-        assert _parse_fasta(native_output) == expected_records
-        assert native_filterer.processed_seqs_num == expected_processed
-        assert native_filterer.num_filtered_seqs == expected_passed
-
-        monkeypatch.setenv(_DISABLE_NATIVE_FASTA_OPS_ENV, "1")
-        py_filterer = Filterer(
-            input_path=input_path,
-            output_path=py_output,
-            **params,
-        )
-        py_filterer.filter()
-        assert _parse_fasta(py_output) == expected_records
-        assert py_filterer.processed_seqs_num == expected_processed
-        assert py_filterer.num_filtered_seqs == expected_passed
+    result = _parse_fasta(output_path)
+    result_ids = [r[0] for r in result]
+    # s1 (len=1) and s3 (len=7) should be filtered out
+    assert "s1" not in result_ids
+    assert "s3" not in result_ids
+    # s0 (len=4), s2 (len=6), s4 (len=5), s5 (len=4) should pass
+    assert "s0" in result_ids
+    assert "s2" in result_ids
+    assert "s4" in result_ids
+    assert "s5" in result_ids
+    assert filterer.num_filtered_seqs == len(result)
 
 
-def test_splitter_native_and_python_fallback_preserve_order(monkeypatch):
+def test_filterer_exclude_ids_raises_not_implemented(tmp_path):
+    """exclude_ids raises NotImplementedError until Phase 10."""
+    input_path = tmp_path / "input.fasta"
+    output_path = tmp_path / "filtered.fasta"
+    input_path.write_text(">a\nACDE\n", encoding="utf-8")
+    exclude_ids = tmp_path / "exclude.txt"
+    exclude_ids.write_text("a\n")
+
+    filterer = Filterer(
+        input_path=input_path,
+        output_path=output_path,
+        min_seq_len=1,
+        max_seq_len=100,
+        seqs_num=-1,
+        exclude_ids=exclude_ids,
+    )
+    with pytest.raises(NotImplementedError, match="exclude_ids"):
+        filterer.filter()
+
+
+def test_splitor_native_preserves_order(tmp_path):
+    """Native split path: train + val concatenation equals original in order."""
     fasta_text = (
         ">s0\nAAAA\n"
         ">s1\nCCCC\n"
@@ -117,167 +149,27 @@ def test_splitter_native_and_python_fallback_preserve_order(monkeypatch):
         ">s3\nEEEE\n"
         ">s4\nFFFF\n"
     )
+    input_path = tmp_path / "input.fasta"
+    input_path.write_text(fasta_text, encoding="utf-8")
+    original = _parse_fasta(input_path)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / "input.fasta"
-        input_path.write_text(fasta_text, encoding="utf-8")
-        original = _parse_fasta(input_path)
+    train_path = tmp_path / "train.fasta"
+    val_path = tmp_path / "val.fasta"
 
-        native_train = tmpdir / "train_native.fasta"
-        native_val = tmpdir / "val_native.fasta"
-        py_train = tmpdir / "train_py.fasta"
-        py_val = tmpdir / "val_py.fasta"
+    splitor = Splitor(
+        input_file=input_path,
+        train_file=train_path,
+        val_file=val_path,
+        val_ratio=0.4,
+    )
+    train_size, val_size = splitor.split()
 
-        monkeypatch.delenv(_DISABLE_NATIVE_FASTA_OPS_ENV, raising=False)
-        native_splitter = Splitor(
-            input_file=input_path,
-            train_file=native_train,
-            val_file=native_val,
-            val_ratio=0.4,
-        )
-        native_train_size, native_val_size = native_splitter.split()
+    expected_val = int(len(original) * 0.4)
+    expected_train = len(original) - expected_val
+    assert (train_size, val_size) == (expected_train, expected_val)
 
-        monkeypatch.setenv(_DISABLE_NATIVE_FASTA_OPS_ENV, "1")
-        py_splitter = Splitor(
-            input_file=input_path,
-            train_file=py_train,
-            val_file=py_val,
-            val_ratio=0.4,
-        )
-        py_train_size, py_val_size = py_splitter.split()
-
-        expected_val = int(len(original) * 0.4)
-        expected_train = len(original) - expected_val
-        assert (native_train_size, native_val_size) == (expected_train, expected_val)
-        assert (py_train_size, py_val_size) == (expected_train, expected_val)
-
-        native_concat = _parse_fasta(native_train) + _parse_fasta(native_val)
-        py_concat = _parse_fasta(py_train) + _parse_fasta(py_val)
-        assert native_concat == original
-        assert py_concat == original
-
-
-def test_fast_shuffle_backend_preserves_records_and_seed():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / "input.fasta"
-        out1 = tmpdir / "out1.fasta"
-        out2 = tmpdir / "out2.fasta"
-
-        with open(input_path, "w", encoding="utf-8") as f:
-            for i in range(40):
-                f.write(f">s{i}\n")
-                f.write(f"ACDEFGHIKLMNPQRSTVWY{i % 10}\n")
-
-        original = _parse_fasta(input_path)
-        original_ids = [x[0] for x in original]
-
-        sh1 = FastaShuffler(
-            input_path=input_path,
-            output_path=out1,
-            backend="fast",
-            seed=777,
-        )
-        sh1.shuffle()
-
-        sh2 = FastaShuffler(
-            input_path=input_path,
-            output_path=out2,
-            backend="fast",
-            seed=777,
-        )
-        sh2.shuffle()
-
-        out1_records = _parse_fasta(out1)
-        out2_records = _parse_fasta(out2)
-
-        assert out1_records == out2_records
-        assert sorted(x[0] for x in out1_records) == sorted(original_ids)
-        assert [x[0] for x in out1_records] != original_ids
-
-
-def test_fast_shuffle_legacy_mode_skips_native_probe(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / "input.fasta"
-        output_path = tmpdir / "out.fasta"
-        input_path.write_text(">a\nACDE\n>b\nFGHI\n", encoding="utf-8")
-
-        monkeypatch.setattr(
-            "nanoplm.data.preparation.shuffler.is_native_fasta_ops_available",
-            lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
-        )
-
-        shuffler = FastaShuffler(
-            input_path=input_path,
-            output_path=output_path,
-            backend="fast",
-            seed=7,
-            use_native_fast=False,
-        )
-        shuffler.shuffle()
-        assert output_path.exists()
-        assert sorted(_parse_fasta(output_path)) == sorted(_parse_fasta(input_path))
-
-
-def test_filter_legacy_mode_skips_native_probe(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / "input.fasta"
-        output_path = tmpdir / "filtered.fasta"
-        input_path.write_text(">a\nACDE\n>b\nA\n", encoding="utf-8")
-
-        monkeypatch.setattr(
-            "nanoplm.data.preparation.filterer.is_native_fasta_ops_available",
-            lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
-        )
-
-        filterer = Filterer(
-            input_path=input_path,
-            output_path=output_path,
-            min_seq_len=2,
-            max_seq_len=10,
-            seqs_num=-1,
-            skip_n=0,
-            use_native=False,
-        )
-        filterer.filter()
-        assert _parse_fasta(output_path) == [("a", "ACDE")]
-
-
-def test_split_legacy_mode_skips_native_probe(monkeypatch):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        input_path = tmpdir / "input.fasta"
-        train_path = tmpdir / "train.fasta"
-        val_path = tmpdir / "val.fasta"
-        input_path.write_text(">a\nAAAA\n>b\nBBBB\n>c\nCCCC\n", encoding="utf-8")
-
-        monkeypatch.setattr(
-            "nanoplm.data.preparation.splitor.is_native_fasta_ops_available",
-            lambda: (_ for _ in ()).throw(AssertionError("native probe should be skipped")),
-        )
-
-        splitter = Splitor(
-            input_file=input_path,
-            train_file=train_path,
-            val_file=val_path,
-            val_ratio=1 / 3,
-            use_native=False,
-        )
-        train_size, val_size = splitter.split()
-        assert (train_size, val_size) == (2, 1)
-        assert _parse_fasta(train_path) + _parse_fasta(val_path) == _parse_fasta(input_path)
-
-
-def test_auto_shuffle_backend_selection():
-    shuffler = FastaShuffler("in.fasta", "out.fasta", backend="auto")
-    selected = shuffler._choose_backend()
-    if shutil.which("seqkit"):
-        assert selected == "seqkit"
-    else:
-        assert selected == "fast"
+    concat = _parse_fasta(train_path) + _parse_fasta(val_path)
+    assert concat == original
 
 
 @pytest.mark.slow
@@ -296,7 +188,6 @@ def test_fast_shuffle_benchmark_5m_records(tmp_path, capsys):
     shuffler = FastaShuffler(
         input_path=input_path,
         output_path=output_path,
-        backend="fast",
         seed=777,
     )
 
@@ -317,7 +208,7 @@ def test_fast_shuffle_benchmark_5m_records(tmp_path, capsys):
     benchmark_line = (
         f"fast shuffle benchmark: records={records:,} "
         f"elapsed={elapsed:.3f}s rate={records_per_sec:,.0f} rec/s "
-        f"threads={shuffler.threads} input_size={input_path.stat().st_size / (1024 ** 2):.1f} MiB"
+        f"input_size={input_path.stat().st_size / (1024 ** 2):.1f} MiB"
     )
     print(benchmark_line)
     if captured.out:
