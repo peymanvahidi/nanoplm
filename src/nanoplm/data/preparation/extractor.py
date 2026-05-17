@@ -30,6 +30,7 @@ class Extractor:
                     stdout=out,
                 )
         except subprocess.CalledProcessError as e:
+            self.output_path.unlink(missing_ok=True)
             raise ExtractionError(f"pigz extraction failed: {e}") from e
 
     def _extract_isal(self) -> None:
@@ -40,4 +41,5 @@ class Extractor:
                  open(self.output_path, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out, length=8 * 1024 * 1024)
         except (IsalError, EOFError, OSError) as e:
+            self.output_path.unlink(missing_ok=True)
             raise ExtractionError(f"isal extraction failed: {e}") from e

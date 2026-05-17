@@ -37,3 +37,13 @@ def test_raises_on_corrupt_gz(tmp_path):
     dst = tmp_path / "out.fasta"
     with pytest.raises(ExtractionError):
         Extractor(input_path=src, output_path=dst).extract()
+
+
+def test_no_partial_output_on_corrupt_gz(tmp_path):
+    """ExtractionError must not leave a partial output file behind."""
+    src = tmp_path / "corrupt.fasta.gz"
+    src.write_bytes(b"not a real gzip file")
+    dst = tmp_path / "out.fasta"
+    with pytest.raises(ExtractionError):
+        Extractor(input_path=src, output_path=dst).extract()
+    assert not dst.exists()
