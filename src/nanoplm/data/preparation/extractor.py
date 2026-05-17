@@ -1,39 +1,43 @@
-import gzip
-from tqdm import tqdm
+import shutil
+import subprocess
 from pathlib import Path
-from typing import Union
-
-from nanoplm.utils import logger
 
 
 class ExtractionError(Exception):
-    """Raised when an extraction operation fails."""
     pass
 
 
 class Extractor:
-    """Class for extracting dataset files."""
-
-    def __init__(self, input_path: Union[str, Path], output_path: Union[str, Path]):
+    def __init__(self, input_path: Path, output_path: Path):
         self.input_path = Path(input_path)
         self.output_path = Path(output_path)
 
-    def extract(self):
-        chunk_size = 8 * 1024 * 1024
+    def extract(self) -> None:
+        if not str(self.input_path).endswith(".gz"):
+            raise ExtractionError(
+                f"Input must be .gz; got {self.input_path}"
+            )
+        if shutil.which("pigz"):
+            self._extract_pigz()
+        else:
+            self._extract_isal()
 
+    def _extract_pigz(self) -> None:
         try:
-            with tqdm(
-                unit="B", unit_scale=True, desc="Extracting FASTA"
-            ) as pbar:
-                with gzip.open(self.input_path, "rb") as f_in:
-                    with open(self.output_path, "wb") as f_out:
-                        while True:
-                            chunk = f_in.read(chunk_size)
-                            if not chunk:
-                                break
-                            f_out.write(chunk)
-                            pbar.update(len(chunk))
-        except gzip.BadGzipFile:
-            raise ExtractionError("File is not gzipped")
-        except EOFError:
-            raise ExtractionError("Corrupted or incomplete gzip file - file ended before the end-of-stream marker was reached")
+            with open(self.output_path, "wb") as out:
+                subprocess.check_call(
+                    ["pigz", "-dc", str(self.input_path)],
+                    stdout=out,
+                )
+        except subprocess.CalledProcessError as e:
+            raise ExtractionError(f"pigz extraction failed: {e}") from e
+
+    def _extract_isal(self) -> None:
+        import isal.igzip as igzip
+        from isal.isal_zlib import IsalError
+        try:
+            with igzip.open(self.input_path, "rb") as f_in, \
+                 open(self.output_path, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out, length=8 * 1024 * 1024)
+        except (IsalError, EOFError, OSError) as e:
+            raise ExtractionError(f"isal extraction failed: {e}") from e
