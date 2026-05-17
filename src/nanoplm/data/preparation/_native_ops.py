@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import shutil
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -81,10 +82,29 @@ def _library_path() -> Path:
     return _build_dir() / f"libnanoplm_fast_fasta_ops_{source_id}.so"
 
 
+_INSTALL_HINT = (
+    "Install a C compiler:\n"
+    "  Debian/Ubuntu:  apt install build-essential\n"
+    "  RHEL/CentOS:    dnf install gcc\n"
+    "  macOS:          xcode-select --install\n"
+    "  conda:          conda install -c conda-forge gcc\n"
+)
+
+
 def _compile_library() -> Path:
     source = _source_path()
     if not source.exists():
         raise NativeFastaOpsError(f"Native FASTA ops source file not found: {source}")
+
+    # Check for compiler before consulting the on-disk cache so that a missing
+    # compiler always produces an actionable error even when a stale .so exists.
+    cc = os.environ.get("CC", "gcc")
+    if shutil.which(cc) is None:
+        raise NativeFastaOpsError(
+            f"Native FASTA backend requires a C compiler. Compilation failed:\n"
+            f"  FileNotFoundError: compiler '{cc}' not found on PATH\n\n"
+            + _INSTALL_HINT
+        )
 
     out_path = _library_path()
     if out_path.exists() and out_path.stat().st_mtime >= source.stat().st_mtime:
@@ -92,7 +112,7 @@ def _compile_library() -> Path:
 
     tmp_out = out_path.with_suffix(f".{os.getpid()}.tmp.so")
     base_cmd = [
-        "gcc",
+        cc,
         "-O3",
         "-march=native",
         "-fPIC",
@@ -106,7 +126,14 @@ def _compile_library() -> Path:
     errors: list[str] = []
 
     for cmd in attempts:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise NativeFastaOpsError(
+                f"Native FASTA backend requires a C compiler. Compilation failed:\n"
+                f"  {type(e).__name__}: {e}\n\n"
+                + _INSTALL_HINT
+            ) from e
         if proc.returncode == 0:
             tmp_out.replace(out_path)
             return out_path
