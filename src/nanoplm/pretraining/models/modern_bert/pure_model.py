@@ -36,7 +36,9 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
     """Pure-torch ``ProtModernBertMLM`` (no HF ``transformers`` dependency)."""
 
     def __init__(self, config: ProtModernBertMLMConfig):
-        self.tokenizer = ProtModernBertTokenizer()
+        self.tokenizer = ProtModernBertTokenizer(
+            num_register_tokens=config.num_register_tokens
+        )
         # Keep the original high-level config for checkpoint serialization.
         self.model_config = config
 
@@ -165,7 +167,9 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
                 "Use --pure-torch with fused_up_gate=false."
             )
 
-        self.tokenizer = ProtModernBertTokenizer()
+        self.tokenizer = ProtModernBertTokenizer(
+            num_register_tokens=config.num_register_tokens
+        )
         # Keep the original high-level config for checkpoint serialization.
         self.model_config = config
 

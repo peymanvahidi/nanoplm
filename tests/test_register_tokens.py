@@ -462,3 +462,23 @@ class TestNativeShardWriterRegisterTokens:
                 # Verify structure: BOS ... EOS unused0 unused1
                 assert got[0] == 29, "First token should be BOS"
                 assert got[-3:].tolist() == [1, 30, 31]
+
+
+def test_pure_model_config_propagates_register_tokens_to_tokenizer():
+    """Constructing PureProtModernBertMLM with num_register_tokens=2 must
+    yield a tokenizer that appends two register tokens after EOS."""
+    from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
+    from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
+
+    cfg = ProtModernBertMLMConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_register_tokens=2,
+    )
+    model = PureProtModernBertMLM(cfg)
+    assert model.tokenizer.num_register_tokens == 2
+    encoded = model.tokenizer("ALG", add_special_tokens=True)
+    # Tail must be: ..., EOS(1), <unused0>(30), <unused1>(31)
+    assert encoded["input_ids"][-3:] == [1, 30, 31]

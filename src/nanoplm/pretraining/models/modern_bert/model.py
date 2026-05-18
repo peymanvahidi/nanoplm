@@ -46,6 +46,7 @@ class ProtModernBertMLMConfig:
         None  # GQA: K,V head count (None = same as num_attention_heads = MHA)
     )
     vocab_size: int = 32
+    num_register_tokens: int = 0  # 0, 1, or 2 — appended after EOS during tokenization
     norm_type: str = "layernorm"  # layernorm | rmsnorm
     mlp_activation: str = "swiglu"
     mlp_dropout: float = 0.0
@@ -147,7 +148,9 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
                 "Use --pure-torch or disable use_paired_head_attention."
             )
 
-        self.tokenizer = ProtModernBertTokenizer()
+        self.tokenizer = ProtModernBertTokenizer(
+            num_register_tokens=config.num_register_tokens
+        )
         # Keep the original high-level config for checkpoint serialization.
         self.model_config = config
 
