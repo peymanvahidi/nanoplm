@@ -227,3 +227,37 @@ def test_from_yaml_plain_local_omits_compressed_fasta_ok(tmp_path, monkeypatch):
     runner = CliRunner()
     result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
     assert result.exit_code == 0, result.output
+
+
+def test_from_yaml_plain_local_dryrun_emits_pipeline_without_extract(tmp_path, monkeypatch):
+    """Smoke: from-yaml in plain-.fasta mode produces a dvc.yaml that:
+      - has no `extract` stage,
+      - has all downstream stages,
+      - has get_file writing extracted_fasta directly.
+    """
+    import yaml as _yaml
+    # Materialize a plain-fasta local file
+    fasta = tmp_path / "tiny.fasta"
+    fasta.write_text(">a\nMAGVAGM\n>b\nVVAGM\n")
+    cfg = _make_cfg(
+        tmp_path,
+        url=None,
+        local_fasta=str(fasta),
+        compressed_fasta=None,
+    )
+    # Stub DVC subprocess — we only need from-yaml to write dvc.yaml.
+    monkeypatch.setattr("subprocess.run",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
+    assert result.exit_code == 0, result.output
+
+    dvc = _yaml.safe_load((tmp_path / "dvc.yaml").read_text())
+    stages = dvc["stages"]
+    assert "extract" not in stages
+    for required in ("get_file", "check", "shuffle", "filter", "split",
+                     "pre-tokenize", "write_manifest"):
+        assert required in stages, f"missing stage: {required}"
+    assert stages["get_file"]["outs"] == ["${data_dirs.extracted_fasta}"]
+    assert "${data_dirs.local_fasta}" in stages["get_file"]["deps"]
