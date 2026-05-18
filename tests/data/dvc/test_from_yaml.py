@@ -19,7 +19,7 @@ def test_from_yaml_errors_when_both_url_and_local_fasta(tmp_path):
     cfg_text = """\
 data_dirs:
   url: "https://x.com/a.gz"
-  local_fasta: "/tmp/x.gz"
+  local_fasta: "/tmp/x.fasta.gz"
   compressed_fasta: "out.gz"
   extracted_fasta: "out.fasta"
   validation_dir: "val"
