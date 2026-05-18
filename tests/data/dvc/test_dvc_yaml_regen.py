@@ -1,6 +1,7 @@
 # tests/data/dvc/test_dvc_yaml_regen.py
+import pytest
 import yaml
-from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
+from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml, _source_is_compressed
 
 
 PRETRAIN_URL_CONFIG = {
@@ -111,3 +112,24 @@ def test_distillation_uses_distillation_yaml_filename():
     # params: references distillation_data.yaml not data.yaml
     pre_filter = parsed["stages"]["filter"]
     assert any("distillation_data.yaml" in str(p) for p in pre_filter["params"])
+
+
+@pytest.mark.parametrize("source,expected", [
+    # Local paths
+    ("/path/to/file.fasta", False),
+    ("/path/to/file.fasta.gz", True),
+    ("relative/path.fasta", False),
+    ("relative/path.fasta.gz", True),
+    # URLs without query strings
+    ("https://example.com/x.fasta", False),
+    ("https://example.com/x.fasta.gz", True),
+    ("http://example.com/x.fasta.gz", True),
+    # URLs with query strings (key: strip ?query before suffix check)
+    ("https://example.com/x.fasta.gz?token=abc", True),
+    ("https://example.com/x.fasta?token=abc", False),
+    # URLs with fragments
+    ("https://example.com/x.fasta.gz#section", True),
+    ("https://example.com/x.fasta#section", False),
+])
+def test_source_is_compressed(source, expected):
+    assert _source_is_compressed(source) is expected

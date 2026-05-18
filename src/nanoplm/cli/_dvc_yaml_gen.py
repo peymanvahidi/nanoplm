@@ -8,6 +8,23 @@ from typing import Any
 import yaml
 import nanoplm as _nanoplm
 from pathlib import Path as _Path
+from urllib.parse import urlparse as _urlparse
+
+
+def _source_is_compressed(source: str) -> bool:
+    """Return True if *source* points at a gzipped FASTA, False if plain.
+
+    - URLs (anything containing '://') are parsed so query/fragment don't break the suffix check.
+    - Local paths are checked directly.
+    Detection is extension-only; misnamed files (e.g. gzipped bytes in a .fasta
+    file) are out of scope.
+    """
+    if "://" in source:
+        path = _urlparse(source).path
+    else:
+        path = source
+    return path.endswith(".gz")
+
 
 _NANOPLM_PKG_DIR = _Path(_nanoplm.__file__).resolve().parent
 
