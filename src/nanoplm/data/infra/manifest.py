@@ -36,6 +36,11 @@ class DataManifestBase:
     train_sequences: int
     val_sequences: int
 
+    # Tokenization
+    # Register tokens (0/1/2) appended after EOS during shard tokenization.
+    # Must match the model's tokenizer at pretraining and inference time.
+    num_register_tokens: int = 0
+
     # Metadata
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
 
