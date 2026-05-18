@@ -56,10 +56,46 @@ def _pipeline_backend_env(pipeline_backend: str) -> dict[str, str]:
     return env
 
 
-@click.group(name="data")
+class _GroupedDataCommand(click.Group):
+    _GROUPS = [
+        ("Main commands (most users only need these — they orchestrate the rest "
+         "of the pipeline through DVC under the hood):",
+         ["get-yaml", "from-yaml"]),
+        ("Pipeline stages (invoked by 'from-yaml' via DVC; can also be run "
+         "directly for debugging):",
+         ["get-file", "extract", "check", "shuffle", "filter", "split"]),
+        ("Pretraining-specific:",
+         ["pre-tokenize"]),
+        ("Knowledge-distillation-specific:",
+         ["kd-embed", "kd-reshard"]),
+    ]
+
+    def format_commands(self, ctx, formatter):
+        registered = {c: self.get_command(ctx, c) for c in self.list_commands(ctx)}
+        seen = set()
+        for header, names in self._GROUPS:
+            rows = []
+            for name in names:
+                cmd = registered.get(name)
+                if cmd is None or cmd.hidden:
+                    continue
+                rows.append((name, cmd.get_short_help_str() or ""))
+                seen.add(name)
+            if rows:
+                with formatter.section(header):
+                    formatter.write_dl(rows)
+        # Any commands not in a group (shouldn't be visible normally)
+        leftover = [(n, c) for n, c in registered.items()
+                    if n not in seen and not (c and c.hidden)]
+        if leftover:
+            with formatter.section("Other"):
+                formatter.write_dl([(n, c.get_short_help_str() or "") for n, c in leftover])
+
+
+@click.group(name="data", cls=_GroupedDataCommand)
 @click.help_option("--help", "-h")
 def data():
-    """Group of commands for managing datasets."""
+    """Manage protein datasets for nanoPLM pretraining and distillation."""
     pass
 
 
