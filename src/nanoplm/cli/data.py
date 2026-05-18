@@ -1119,6 +1119,89 @@ def from_yaml(
         click.echo("Data preparation complete (pipeline_mode: 'none')")
 
 
+@data.command("write-manifest", hidden=True)
+@click.option("--kind", required=True, type=click.Choice(["pretrain", "distillation"]))
+@click.option("--output", "-o", required=True, type=click.Path(file_okay=False))
+@click.option("--min-seq-len", required=True, type=int)
+@click.option("--max-seq-len", required=True, type=int)
+@click.option("--val-ratio", required=True, type=float)
+@click.option("--samples-per-shard", required=True, type=int)
+@click.option("--register-tokens", type=int, default=0)
+@click.option("--teacher-model", type=str, default=None)
+@click.help_option("--help", "-h")
+def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
+                       samples_per_shard, register_tokens, teacher_model):
+    """Internal: write .data_manifest after shard generation."""
+    output_dir = Path(output)
+    if kind == "pretrain":
+        train_count = _count_pretrain_shard_sequences(output_dir / "train")
+        val_count = _count_pretrain_shard_sequences(output_dir / "val")
+    else:
+        train_count = _count_distill_h5_sequences(output_dir / "train")
+        val_count = _count_distill_h5_sequences(output_dir / "val")
+
+    if kind == "pretrain":
+        manifest = PretrainManifest(
+            pipeline_mode="pretrain",
+            seqs_num=train_count + val_count,
+            min_seq_len=min_seq_len,
+            max_seq_len=max_seq_len,
+            val_ratio=val_ratio,
+            train_dir="train",
+            val_dir="val",
+            train_sequences=train_count,
+            val_sequences=val_count,
+            sharded=True,
+            samples_per_shard=samples_per_shard,
+        )
+    else:
+        # Pre-computed distillation mode requires train_h5_prefix and val_h5_prefix.
+        # Derive them from files present in the shard dirs.
+        train_h5_files = list((output_dir / "train").glob("*.h5"))
+        val_h5_files = list((output_dir / "val").glob("*.h5"))
+        train_h5_prefix = _get_h5_prefix(train_h5_files) if train_h5_files else "train_kd_dataset.h5"
+        val_h5_prefix = _get_h5_prefix(val_h5_files) if val_h5_files else "val_kd_dataset.h5"
+        manifest = DistillationManifest(
+            pipeline_mode="distillation",
+            seqs_num=train_count + val_count,
+            min_seq_len=min_seq_len,
+            max_seq_len=max_seq_len,
+            val_ratio=val_ratio,
+            train_dir="train",
+            val_dir="val",
+            train_sequences=train_count,
+            val_sequences=val_count,
+            sharded=samples_per_shard > 0,
+            samples_per_shard=samples_per_shard,
+            teacher_model=teacher_model or "",
+            train_h5_prefix=train_h5_prefix,
+            val_h5_prefix=val_h5_prefix,
+            on_the_fly=False,
+        )
+    write_manifest(output_dir, manifest)
+    click.echo(f"Wrote manifest: {output_dir / '.data_manifest'}")
+
+
+def _count_pretrain_shard_sequences(shard_dir: Path) -> int:
+    """Sum sequence counts from each .idx.npy in the dir."""
+    import numpy as np
+    total = 0
+    for idx_path in sorted(shard_dir.glob("shard_*.idx.npy")):
+        arr = np.load(idx_path)
+        total += len(arr) - 1  # convention: idx has N+1 offsets for N sequences
+    return total
+
+
+def _count_distill_h5_sequences(shard_dir: Path) -> int:
+    """Sum group counts across all H5 files in the dir."""
+    import h5py
+    total = 0
+    for h5_path in sorted(shard_dir.glob("*.h5")):
+        with h5py.File(h5_path, "r") as f:
+            total += sum(1 for k in f.keys() if k.isdigit())
+    return total
+
+
 def _resolve_path(path_value: str | Path, cwd: Path) -> Path:
     path = Path(path_value)
     if not path.is_absolute():
