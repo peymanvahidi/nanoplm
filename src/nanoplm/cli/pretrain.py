@@ -47,6 +47,7 @@ from nanoplm.pretraining.models.modern_bert.pure_model import (
     TEProtModernBertMLM,
 )
 from nanoplm.data.infra.validation import validate_pretrain_dataset
+from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
@@ -1000,6 +1001,7 @@ def run(
         raise click.ClickException(
             "use_paired_head_attention and use_diff_attn_v2 are mutually exclusive."
         )
+    manifest = _load_manifest_and_inject(cfg, model_cfg)
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
         model = TEProtModernBertMLM(model_cfg)
@@ -1044,18 +1046,21 @@ def run(
         run_te_pretraining(
             model=model,
             pretrain_config=cfg,
+            manifest=manifest,
             resume_config=resume_cfg if resume_cfg.is_resume else None,
         )
     elif pure_torch:
         run_pure_pretraining(
             model=model,
             pretrain_config=cfg,
+            manifest=manifest,
             resume_config=resume_cfg if resume_cfg.is_resume else None,
         )
     else:
         run_pretraining(
             model=model,
             pretrain_config=cfg,
+            manifest=manifest,
             resume_config=resume_cfg if resume_cfg.is_resume else None,
         )
 
@@ -1197,6 +1202,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     )
     _populate_batch_setup(pretrain_config)
 
+    manifest = _load_manifest_and_inject(pretrain_config, model_config)
     _set_seed_for_init(pretrain_config.seed)
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
@@ -1224,18 +1230,21 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         run_te_pretraining(
             model=model,
             pretrain_config=pretrain_config,
+            manifest=manifest,
             resume_config=resume_config if resume_config.is_resume else None,
         )
     elif pure_torch:
         run_pure_pretraining(
             model=model,
             pretrain_config=pretrain_config,
+            manifest=manifest,
             resume_config=resume_config if resume_config.is_resume else None,
         )
     else:
         run_pretraining(
             model=model,
             pretrain_config=pretrain_config,
+            manifest=manifest,
             resume_config=resume_config if resume_config.is_resume else None,
         )
 
@@ -1577,6 +1586,26 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
                 kwargs[bool_key] = value.lower() == "true"
 
     return PretrainingConfig(**kwargs)
+
+
+def _load_manifest_and_inject(
+    pretrain_config: PretrainingConfig,
+    model_config: ProtModernBertMLMConfig,
+):
+    """Read the dataset manifest, validate pipeline mode, and inject
+    num_register_tokens into the model config so the tokenizer is built
+    with the same value used at data-prep time.
+
+    Returns the manifest so it can be passed to the pipeline entry point.
+    """
+    manifest = read_manifest(pretrain_config.dataset_dir)
+    validate_manifest_for_pipeline(manifest, expected_mode="pretrain")
+    model_config.num_register_tokens = manifest.num_register_tokens
+    logger.info(
+        f"Injected manifest.num_register_tokens = {manifest.num_register_tokens} "
+        "into model_config"
+    )
+    return manifest
 
 
 def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
