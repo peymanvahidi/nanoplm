@@ -1098,21 +1098,16 @@ API_EXPORT int nanoplm_shuffle_fasta(
  *   - A sequence is "empty"   if it has no AA characters.
  *   - A sequence is "invalid" if any AA character is outside the
  *     allowed alphabet, OR if the sequence is empty.
- *   - A sequence is "duplicate" if its id (bytes after '>' up to
- *     first whitespace/newline) was seen before. Duplicates also
- *     count as invalid.
+ *
+ * Duplicate IDs are NOT checked: the caller is responsible for
+ * ensuring input uniqueness, since a hash-table check costs too
+ * much memory at dataset sizes we care about (tens of millions).
  *
  * Tolerances (intentional deviations from strict FASTA):
  *   - Lowercase AA characters are accepted in addition to uppercase
  *     (e.g. 'a' is treated the same as 'A').
  *   - Whitespace inside AA lines is silently stripped: a line
  *     containing "MA G V" is treated as "MAGV".
- *
- * detect_duplicates: when non-zero, maintains an in-memory hash
- *   table to track seen ids. The table uses 524288 slots (2 MB
- *   pointer array) with chained collision lists. If more than
- *   250000 unique ids are seen, dedup stops and dedup_truncated is
- *   set to true in the JSON report (the function still succeeds).
  *
  * Return codes:
  *   0              success
@@ -1146,14 +1141,6 @@ static uint64_t fnv1a(const char *s) {
     }
     return h;
 }
-
-#define DEDUP_SLOTS 524288u   /* power-of-2 bucket count; ~2 MB pointer array */
-#define DEDUP_MAX   250000u   /* stop dedup-checking after this many unique ids */
-
-typedef struct DedupeNode {
-    char *id;
-    struct DedupeNode *next;
-} DedupeNode;
 
 /* Extract the sequence id from a header string (after '>').
  * id = bytes up to first whitespace or '\0'.
@@ -1194,7 +1181,6 @@ API_EXPORT int validate_fasta_native(
     const char *invalid_fasta_path,
     const char *invalid_ids_path,
     const char *report_json_path,
-    int detect_duplicates,
     int *cancel_flag,
     char *err_buf,
     size_t err_buf_size)
@@ -1233,18 +1219,6 @@ API_EXPORT int validate_fasta_native(
         return 1;
     }
 
-    /* ---- dedup hash table ---- */
-    DedupeNode **ht = NULL;
-    unsigned int dedup_count = 0;
-    int dedup_cap_reached = 0;
-    if (detect_duplicates) {
-        ht = (DedupeNode **)calloc(DEDUP_SLOTS, sizeof(DedupeNode *));
-        /* if alloc fails, silently disable dedup */
-        if (!ht) {
-            detect_duplicates = 0;
-        }
-    }
-
     /* ---- streaming state ---- */
     DynBuf cur_header, cur_seq;
     int have_record = 0;
@@ -1254,7 +1228,6 @@ API_EXPORT int validate_fasta_native(
         if (!hdr_ok || !seq_ok) {
             if (hdr_ok) dynbuf_free(&cur_header);
             if (seq_ok) dynbuf_free(&cur_seq);
-            if (ht) free(ht);
             set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
             fclose(fin); fclose(finv_fa); fclose(finv_ids);
             cancel_scope_exit(&scope);
@@ -1265,7 +1238,6 @@ API_EXPORT int validate_fasta_native(
     long long total_sequences = 0;
     long long invalid_count  = 0;
     long long empty_count    = 0;
-    long long duplicate_count = 0;
     char first_invalid_id[201];
     first_invalid_id[0] = '\0';
 
@@ -1275,11 +1247,9 @@ API_EXPORT int validate_fasta_native(
     int rc = 0;
     long long seq_checked = 0; /* for cancel polling */
 
-    /* Helper: emit the current record as invalid and update counters.
-     * reason: 0=bad_chars 1=empty 2=duplicate */
-    #define EMIT_INVALID(reason) do { \
+    /* Helper: emit the current record as invalid and update counters. */
+    #define EMIT_INVALID() do { \
         invalid_count++; \
-        if ((reason) == 1) empty_count++; \
         /* extract id for output */ \
         char *_sid = extract_seq_id(cur_header.data ? cur_header.data : ""); \
         if (_sid) { \
@@ -1299,41 +1269,6 @@ API_EXPORT int validate_fasta_native(
         if (cur_seq.data && cur_seq.len > 0) \
             fwrite(cur_seq.data, 1, cur_seq.len, finv_fa); \
         fputc('\n', finv_fa); \
-    } while (0)
-
-    /* Helper: check and potentially record a duplicate. */
-    #define CHECK_DEDUP(_is_dup_out) do { \
-        (_is_dup_out) = 0; \
-        if (detect_duplicates && ht && !dedup_cap_reached) { \
-            char *_sid2 = extract_seq_id(cur_header.data ? cur_header.data : ""); \
-            if (_sid2) { \
-                uint64_t _h = fnv1a(_sid2); \
-                unsigned int _slot = (unsigned int)(_h & (DEDUP_SLOTS - 1)); \
-                DedupeNode *_node = ht[_slot]; \
-                while (_node) { \
-                    if (strcmp(_node->id, _sid2) == 0) { \
-                        (_is_dup_out) = 1; \
-                        break; \
-                    } \
-                    _node = _node->next; \
-                } \
-                if (!(_is_dup_out)) { \
-                    if (dedup_count < DEDUP_MAX) { \
-                        DedupeNode *_new = (DedupeNode *)malloc(sizeof(DedupeNode)); \
-                        if (_new) { \
-                            _new->id   = _sid2; \
-                            _sid2      = NULL; \
-                            _new->next = ht[_slot]; \
-                            ht[_slot]  = _new; \
-                            dedup_count++; \
-                        } \
-                    } else { \
-                        dedup_cap_reached = 1; \
-                    } \
-                } \
-                free(_sid2); \
-            } \
-        } \
     } while (0)
 
     /* Process a complete record (cur_header + cur_seq). */
@@ -1368,17 +1303,7 @@ API_EXPORT int validate_fasta_native(
                     break; \
                 } \
             } \
-            if (!_bad) { \
-                /* Check duplicate (only for valid sequences) */ \
-                int _is_dup = 0; \
-                CHECK_DEDUP(_is_dup); \
-                if (_is_dup) { \
-                    duplicate_count++; \
-                    EMIT_INVALID(2); \
-                } \
-            } else { \
-                EMIT_INVALID(0); \
-            } \
+            if (_bad) EMIT_INVALID(); \
         } \
     } while (0)
 
@@ -1443,13 +1368,6 @@ API_EXPORT int validate_fasta_native(
         PROCESS_RECORD();
     }
 
-    /* Warn if dedup cap was reached */
-    if (dedup_cap_reached && err_buf && err_buf_size > 0 && err_buf[0] == '\0') {
-        snprintf(err_buf, err_buf_size,
-                 "warning: dedup hash table full after %u unique ids; "
-                 "remaining ids not checked for duplicates", DEDUP_MAX);
-    }
-
     /* ---- write JSON report ---- */
     {
         FILE *frep = fopen(report_json_path, "w");
@@ -1464,10 +1382,8 @@ API_EXPORT int validate_fasta_native(
         fprintf(frep, "  \"total_sequences\": %lld,\n", total_sequences);
         fprintf(frep, "  \"invalid_count\": %lld,\n",  invalid_count);
         fprintf(frep, "  \"empty_count\": %lld,\n",    empty_count);
-        fprintf(frep, "  \"duplicate_count\": %lld,\n", duplicate_count);
         fprintf(frep, "  \"first_invalid_id\": ");
         write_json_string(frep, first_invalid_id);
-        fprintf(frep, ",\n  \"dedup_truncated\": %s", dedup_cap_reached ? "true" : "false");
         fprintf(frep, "\n}\n");
         fclose(frep);
     }
@@ -1481,22 +1397,7 @@ cleanup:
     fclose(finv_fa);
     fclose(finv_ids);
 
-    /* free dedup hash table */
-    if (ht) {
-        for (unsigned int _i = 0; _i < DEDUP_SLOTS; _i++) {
-            DedupeNode *_n = ht[_i];
-            while (_n) {
-                DedupeNode *_next = _n->next;
-                free(_n->id);
-                free(_n);
-                _n = _next;
-            }
-        }
-        free(ht);
-    }
-
     #undef EMIT_INVALID
-    #undef CHECK_DEDUP
     #undef PROCESS_RECORD
 
     if (rc == NANOPLM_RC_CANCELLED) {

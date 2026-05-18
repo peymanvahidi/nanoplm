@@ -61,8 +61,6 @@ class NativeValidateResult:
     total_sequences: int
     invalid_count: int
     empty_count: int
-    duplicate_count: int
-    dedup_truncated: bool
 
 
 def _is_disabled() -> bool:
@@ -406,7 +404,6 @@ def validate_fasta_native(
     invalid_ids_path: Path,
     report_json_path: Path,
     *,
-    detect_duplicates: bool = True,
     progress_cb=None,
 ) -> NativeValidateResult:
     """Validate a FASTA file via the native C backend.
@@ -428,7 +425,6 @@ def validate_fasta_native(
         ctypes.c_char_p,               # invalid_fasta_path
         ctypes.c_char_p,               # invalid_ids_path
         ctypes.c_char_p,               # report_json_path
-        ctypes.c_int,                  # detect_duplicates
         ctypes.POINTER(ctypes.c_int),  # cancel_flag
         ctypes.c_char_p,               # err_buf
         ctypes.c_size_t,               # err_buf_size
@@ -442,7 +438,6 @@ def validate_fasta_native(
             str(invalid_fasta_path).encode(),
             str(invalid_ids_path).encode(),
             str(report_json_path).encode(),
-            1 if detect_duplicates else 0,
             ctypes.byref(cancel_flag),
             err_buf,
             _ERROR_BUFFER_BYTES,
@@ -460,8 +455,6 @@ def validate_fasta_native(
             total_sequences=report["total_sequences"],
             invalid_count=report["invalid_count"],
             empty_count=report["empty_count"],
-            duplicate_count=report["duplicate_count"],
-            dedup_truncated=bool(report.get("dedup_truncated", False)),
         )
     except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
         raise NativeFastaOpsError(

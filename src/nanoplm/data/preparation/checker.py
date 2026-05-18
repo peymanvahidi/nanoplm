@@ -13,7 +13,6 @@ class CheckResult:
     total_sequences: int
     invalid_count: int
     empty_count: int
-    duplicate_count: int
 
 
 class Checker:
@@ -64,7 +63,6 @@ class Checker:
             total_sequences=native_result.total_sequences,
             invalid_count=native_result.invalid_count,
             empty_count=native_result.empty_count,
-            duplicate_count=native_result.duplicate_count,
         )
 
         if result.invalid_count > 0:
