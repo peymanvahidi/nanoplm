@@ -1133,12 +1133,20 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
                        samples_per_shard, register_tokens, teacher_model):
     """Internal: write .data_manifest after shard generation."""
     output_dir = Path(output)
+    train_dir = output_dir / "train"
+    val_dir = output_dir / "val"
+    for d, name in [(train_dir, "train"), (val_dir, "val")]:
+        if not d.is_dir():
+            raise click.ClickException(
+                f"write-manifest: expected shard directory not found: {d}. "
+                f"Run the shard-writing stage before write-manifest."
+            )
     if kind == "pretrain":
-        train_count = _count_pretrain_shard_sequences(output_dir / "train")
-        val_count = _count_pretrain_shard_sequences(output_dir / "val")
+        train_count = _count_pretrain_shard_sequences(train_dir)
+        val_count = _count_pretrain_shard_sequences(val_dir)
     else:
-        train_count = _count_distill_h5_sequences(output_dir / "train")
-        val_count = _count_distill_h5_sequences(output_dir / "val")
+        train_count = _count_distill_h5_sequences(train_dir)
+        val_count = _count_distill_h5_sequences(val_dir)
 
     if kind == "pretrain":
         manifest = PretrainManifest(
@@ -1157,8 +1165,8 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
     else:
         # Pre-computed distillation mode requires train_h5_prefix and val_h5_prefix.
         # Derive them from files present in the shard dirs.
-        train_h5_files = list((output_dir / "train").glob("*.h5"))
-        val_h5_files = list((output_dir / "val").glob("*.h5"))
+        train_h5_files = list(train_dir.glob("*.h5"))
+        val_h5_files = list(val_dir.glob("*.h5"))
         train_h5_prefix = _get_h5_prefix(train_h5_files) if train_h5_files else "train_kd_dataset.h5"
         val_h5_prefix = _get_h5_prefix(val_h5_files) if val_h5_files else "val_kd_dataset.h5"
         manifest = DistillationManifest(
@@ -1183,12 +1191,17 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
 
 
 def _count_pretrain_shard_sequences(shard_dir: Path) -> int:
-    """Sum sequence counts from each .idx.npy in the dir."""
+    """Sum sequence counts from each .idx.npy in the dir.
+
+    Each shard's .idx.npy is an int32 array of per-sequence sizes (length N
+    for N sequences), per the C writer (fast_fasta_shard_writer.c) and the
+    ShardedDataset loader.
+    """
     import numpy as np
     total = 0
     for idx_path in sorted(shard_dir.glob("shard_*.idx.npy")):
         arr = np.load(idx_path)
-        total += len(arr) - 1  # convention: idx has N+1 offsets for N sequences
+        total += len(arr)
     return total
 
 

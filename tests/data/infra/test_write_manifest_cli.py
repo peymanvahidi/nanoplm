@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import yaml
 import numpy as np
 from click.testing import CliRunner
 from nanoplm.cli.data import data
@@ -8,14 +9,14 @@ from nanoplm.cli.data import data
 def _make_pretrain_shard_dir(d: Path, sequence_counts: list[int]) -> None:
     """Create N shards under d, each with the given sequence count.
 
-    Convention: `shard_0000.idx.npy` is a numpy int64 array of N+1 offsets
-    for N sequences. `_count_pretrain_shard_sequences` returns `len(arr)-1`.
+    Each shard's .idx.npy is a length-N int32 array of per-sequence sizes,
+    matching the C writer's actual on-disk format.
     """
     d.mkdir(parents=True, exist_ok=True)
     for i, n in enumerate(sequence_counts):
         (d / f"shard_{i:04d}.bin").write_bytes(b"\x00" * 10)
-        offsets = np.zeros(n + 1, dtype=np.int64)
-        np.save(d / f"shard_{i:04d}.idx.npy", offsets)
+        sizes = np.zeros(n, dtype=np.int32)
+        np.save(d / f"shard_{i:04d}.idx.npy", sizes)
 
 
 def test_write_manifest_pretrain(tmp_path):
@@ -34,3 +35,24 @@ def test_write_manifest_pretrain(tmp_path):
     assert result.exit_code == 0, result.output
     manifest_path = tmp_path / ".data_manifest"
     assert manifest_path.exists()
+
+    manifest = yaml.safe_load(manifest_path.read_text())
+    assert manifest["train_sequences"] == 200
+    assert manifest["val_sequences"] == 25
+    assert manifest["seqs_num"] == 225
+
+
+def test_write_manifest_errors_when_train_dir_missing(tmp_path):
+    val_dir = tmp_path / "val"
+    _make_pretrain_shard_dir(val_dir, [25])
+    # train/ deliberately omitted
+
+    runner = CliRunner()
+    result = runner.invoke(data, [
+        "write-manifest", "--kind", "pretrain", "-o", str(tmp_path),
+        "--min-seq-len", "20", "--max-seq-len", "512",
+        "--val-ratio", "0.1", "--samples-per-shard", "100",
+        "--register-tokens", "0",
+    ])
+    assert result.exit_code != 0
+    assert "train" in result.output.lower()
