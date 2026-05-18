@@ -68,6 +68,31 @@ def test_pretrain_uses_foreach_for_tokenize():
     assert "do" in pre_tok
 
 
+def test_generated_deps_are_absolute_and_exist():
+    """Source-file deps in dvc.yaml must be absolute on-disk paths so DVC works
+    when invoked from a separate data directory (not the nanoplm repo root)."""
+    from pathlib import Path
+    out = generate_dvc_yaml(PRETRAIN_URL_CONFIG, kind="pretrain", params_filename="data.yaml")
+    parsed = yaml.safe_load(out)
+    for stage_name, stage in parsed["stages"].items():
+        if "foreach" in stage:
+            deps = stage["do"].get("deps", [])
+        else:
+            deps = stage.get("deps", [])
+        for dep in deps:
+            # Skip ${...} interpolation refs (DVC-resolved at run time)
+            if "${" in dep:
+                continue
+            assert Path(dep).is_absolute(), (
+                f"Stage {stage_name!r}: dep {dep!r} is relative; "
+                f"generated dvc.yaml must use absolute source-file paths "
+                f"so it works from any cwd."
+            )
+            assert Path(dep).exists(), (
+                f"Stage {stage_name!r}: absolute dep {dep!r} does not exist on disk."
+            )
+
+
 def test_distillation_uses_distillation_yaml_filename():
     cfg = {
         "data_dirs": {**PRETRAIN_URL_CONFIG["data_dirs"]},
