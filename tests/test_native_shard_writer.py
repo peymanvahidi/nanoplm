@@ -4,9 +4,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nanoplm.pretraining.dataset import ShardWriter, ShardedDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
-from nanoplm.pretraining.native_shard_writer import (
+from nanoplm.data.sharding.pretrain_shard_writer import (
+    ShardWriter,
+    NativeShardWriterError,
     _DISABLE_NATIVE_ENV,
     create_shards_native,
     is_native_shard_writer_available,
@@ -78,41 +80,24 @@ def test_create_shards_native_matches_tokenizer_outputs():
             np.testing.assert_array_equal(got, expected[idx])
 
 
-def test_shard_writer_python_fallback_still_produces_valid_shards(monkeypatch):
-    sequences = ["AAAA", "CccC", "uzob", "WWWW", "M" * 40]
-    tokenizer = ProtModernBertTokenizer()
-    max_length = 16
-    expected = _expected_tokens(tokenizer, sequences, max_length=max_length)
+def test_shard_writer_raises_when_native_disabled(tmp_path, monkeypatch):
+    """ShardWriter.create_shards must raise NativeShardWriterError when the native
+    backend is disabled by env var (no more Python fallback)."""
+    fasta = tmp_path / "seq.fasta"
+    fasta.write_text(">s1\nMAGV\n>s2\nKVAR\n")
+    out_dir = tmp_path / "shards"
 
-    fasta_text = (
-        ">a\nAAAA\n"
-        ">b\nCccC\n"
-        ">c\nuzob\n"
-        ">d\nWWWW\n"
-        ">e\n" + ("M" * 40) + "\n"
+    monkeypatch.setenv(_DISABLE_NATIVE_ENV, "1")
+
+    saver = ShardWriter(
+        fasta_path=str(fasta),
+        tokenizer=ProtModernBertTokenizer(),
+        max_length=8,
+        output_dir=str(out_dir),
+        samples_per_shard=10,
+        max_workers=1,
+        force=True,
     )
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        fasta_path = Path(tmpdir) / "sample.fasta"
-        output_dir = Path(tmpdir) / "shards"
-        fasta_path.write_text(fasta_text, encoding="utf-8")
-
-        monkeypatch.setenv(_DISABLE_NATIVE_ENV, "1")
-        saver = ShardWriter(
-            fasta_path=str(fasta_path),
-            tokenizer=tokenizer,
-            max_length=max_length,
-            output_dir=str(output_dir),
-            samples_per_shard=2,
-            max_workers=1,
-        )
-        shard_paths = saver.create_shards()
-
-        assert saver.sequence_count == len(sequences)
-        assert len(shard_paths) == 3
-
-        ds = ShardedDataset(str(output_dir))
-        assert len(ds) == len(sequences)
-        for idx in range(len(ds)):
-            got = ds[idx]["input_ids"].numpy().astype(np.uint8)
-            np.testing.assert_array_equal(got, expected[idx])
+    with pytest.raises(NativeShardWriterError):
+        saver.create_shards()

@@ -5,11 +5,9 @@ import torch
 import numpy as np
 from pathlib import Path
 
-from nanoplm.pretraining.dataset import (
-    LazyFastaDataset,
-    ShardWriter,
-    ShardedDataset,
-)
+from nanoplm.pretraining.dataset import LazyFastaDataset  # noqa: F401
+from nanoplm.data.sharding.pretrain_shard_writer import ShardWriter
+from nanoplm.data.datasets.pretrain import ShardedDataset
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 

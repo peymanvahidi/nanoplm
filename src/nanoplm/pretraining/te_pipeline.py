@@ -28,13 +28,13 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
     build_power_of_two_buckets,
 )
-from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.models.modern_bert.modeling import MHCLiteBlock
 from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
