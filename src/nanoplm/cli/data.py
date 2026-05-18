@@ -842,8 +842,8 @@ def get_yaml(output, distillation, force):
 )
 @click.option(
     "--log-level",
-    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
-    default="INFO",
+    type=click.Choice(["debug", "info", "warning", "error"], case_sensitive=False),
+    default="info",
     help="Log level for nanoplm output.",
 )
 def from_yaml(
@@ -884,6 +884,7 @@ def from_yaml(
 
     if fix:
         _flip_drop_invalid(config_path, True)
+        click.echo(f"Set {config_path.name}: data_params.drop_invalid_sequences=true")
         # Re-read after flip so dvc.yaml is generated with updated value
         params = read_yaml(str(config_path))
         data_params = params.get("data_params", {})
@@ -896,6 +897,7 @@ def from_yaml(
         params_filename=config_path.name,
     )
     dvc_yaml_path.write_text(dvc_content, encoding="utf-8")
+    logger.info(f"Regenerated {dvc_yaml_path}")
     click.echo(f"Regenerated dvc.yaml in {cwd}")
 
     dvc_dir = cwd / ".dvc"
@@ -1016,43 +1018,39 @@ def _detect_kind(data_params: dict, filename: str) -> str:
 
 
 def _flip_drop_invalid(config_path: Path, value: bool) -> None:
-    """Overwrite data_params.drop_invalid_sequences in the YAML file."""
-    import yaml as _yaml
-    text = config_path.read_text(encoding="utf-8")
-    parsed = _yaml.safe_load(text)
-    if "data_params" not in parsed:
-        parsed["data_params"] = {}
-    parsed["data_params"]["drop_invalid_sequences"] = value
-    config_path.write_text(
-        _yaml.dump(parsed, default_flow_style=False, allow_unicode=True),
-        encoding="utf-8",
-    )
-    click.echo(f"Set data_params.drop_invalid_sequences={value} in {config_path.name}")
+    """Edit a single key in YAML preserving file structure as best as we can."""
+    import re
+    text = config_path.read_text()
+    new_val = "true" if value else "false"
+    pattern = re.compile(r"^(\s*drop_invalid_sequences\s*:\s*)(true|false)(\s*(?:#.*)?)$", re.M)
+    new_text, n = pattern.subn(rf"\g<1>{new_val}\g<3>", text)
+    if n == 0:
+        raise click.ClickException(
+            "Couldn't find drop_invalid_sequences in config to flip."
+        )
+    config_path.write_text(new_text)
 
 
 def _print_summary(cwd: Path, params: dict, kind: str) -> None:
     """Print a human-readable summary using .data_manifest if present."""
-    data_dirs = params.get("data_dirs", {})
-    output_dir_rel = data_dirs.get("output_dir", "")
-    output_dir = (cwd / output_dir_rel).resolve() if output_dir_rel else cwd
-    manifest_path = output_dir / ".data_manifest"
-    if manifest_path.exists():
-        try:
-            import json
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            train_seqs = manifest.get("train_sequences", "?")
-            val_seqs = manifest.get("val_sequences", "?")
-            click.echo(
-                f"Pipeline complete ({kind}):\n"
-                f"  Train sequences : {train_seqs}\n"
-                f"  Val sequences   : {val_seqs}\n"
-                f"  Output dir      : {output_dir}\n"
-                f"  Manifest        : {manifest_path}"
-            )
-        except Exception:
-            click.echo(f"Pipeline complete. Manifest: {manifest_path}")
-    else:
-        click.echo(f"Pipeline complete ({kind}). Output: {output_dir}")
+    import yaml as _yaml
+    output_dir = Path(params["data_dirs"]["output_dir"])
+    manifest_path = (cwd / output_dir / ".data_manifest") if not output_dir.is_absolute() \
+        else (output_dir / ".data_manifest")
+    if not manifest_path.exists():
+        click.echo("Pipeline completed (no manifest found).")
+        return
+    m = _yaml.safe_load(manifest_path.read_text())
+    title = "Pretraining" if kind == "pretrain" else "Distillation"
+    src = params["data_dirs"].get("url") or params["data_dirs"].get("local_fasta")
+    click.echo(
+        f"\n{title} data pipeline complete.\n\n"
+        f"  Source:          {src}\n"
+        f"  Total sequences: {m.get('seqs_num')}\n"
+        f"    Train:         {m.get('train_sequences')}\n"
+        f"    Val:           {m.get('val_sequences')}\n"
+        f"  Manifest:        {manifest_path}\n"
+    )
 
 
 @data.command("write-manifest", hidden=True)
