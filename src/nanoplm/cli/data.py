@@ -518,9 +518,10 @@ def split(
 )
 @click.option(
     "--device",
-    default="auto",
+    default=lambda: os.environ.get("NANOPLM_DEVICE", "auto"),
     type=click.Choice(["auto", "cuda", "mps", "cpu"]),
-    help="Device to use",
+    show_default="$NANOPLM_DEVICE or auto",
+    help="Device for teacher embedding computation.",
 )
 @click.option(
     "--skip-n",
@@ -615,9 +616,10 @@ def kd_embed(
 )
 @click.option(
     "--max-workers",
-    default=2,
+    default=lambda: int(os.environ.get("NANOPLM_MAX_WORKERS", "2")),
     type=int,
-    help="Number of CPUs. Use --max-workers -1 to use all available CPUs",
+    show_default="$NANOPLM_MAX_WORKERS or 2",
+    help="Number of parallel worker threads.",
 )
 @click.option(
     "--samples-per-shard",
