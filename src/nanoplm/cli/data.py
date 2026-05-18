@@ -25,36 +25,6 @@ from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertToken
 from nanoplm.utils import create_dirs
 from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml, is_flash_attention_available
 
-_PIPELINE_BACKEND_CHOICES = ("legacy", "fast")
-_DISABLE_NATIVE_FASTA_OPS_ENV = "NANOPLM_DISABLE_NATIVE_FASTA_OPS"
-_DISABLE_NATIVE_SHARD_WRITER_ENV = "NANOPLM_DISABLE_NATIVE_SHARD_WRITER"
-
-
-def _use_native_backend(pipeline_backend: str) -> bool:
-    return pipeline_backend == "fast"
-
-
-def _resolve_pipeline_backend(selected: str | None, from_params: str | None = None) -> str:
-    backend = selected or from_params or "legacy"
-    backend = str(backend).strip().lower()
-    if backend not in _PIPELINE_BACKEND_CHOICES:
-        raise click.ClickException(
-            f"Invalid pipeline_backend: '{backend}'. "
-            f"Must be one of: {', '.join(_PIPELINE_BACKEND_CHOICES)}"
-        )
-    return backend
-
-
-def _pipeline_backend_env(pipeline_backend: str) -> dict[str, str]:
-    env = dict(os.environ)
-    if _use_native_backend(pipeline_backend):
-        env.pop(_DISABLE_NATIVE_FASTA_OPS_ENV, None)
-        env.pop(_DISABLE_NATIVE_SHARD_WRITER_ENV, None)
-    else:
-        env[_DISABLE_NATIVE_FASTA_OPS_ENV] = "1"
-        env[_DISABLE_NATIVE_SHARD_WRITER_ENV] = "1"
-    return env
-
 
 class _GroupedDataCommand(click.Group):
     _GROUPS = [
@@ -277,15 +247,8 @@ def extract(input: str, output: str, force: bool):
     type=click.Choice(["true", "false"], case_sensitive=False),
     help="If false, skip shuffling and symlink (or copy) input to output.",
 )
-@click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    default="legacy",
-    show_default=True,
-    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
-)
 @click.help_option("--help", "-h")
-def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str, pipeline_backend: str):
+def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str):
     """Shuffle sequences in a FASTA file."""
     # Check if the input file is a .fasta file
     if not input.endswith(".fasta"):
@@ -358,13 +321,6 @@ def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str,
     help="Number of sequences to skip from the beginning of the input FASTA file",
 )
 @click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    default="legacy",
-    show_default=True,
-    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
-)
-@click.option(
     "--exclude-ids",
     default=None,
     type=click.Path(exists=True, dir_okay=False),
@@ -378,7 +334,6 @@ def filter(
     max_seq_len: int,
     seqs_num: int,
     skip_n: int,
-    pipeline_backend: str,
     exclude_ids: str | None,
 ):
     """Filter sequences by length and optional max count."""
@@ -469,19 +424,11 @@ def check(input: str, output: str, drop_invalid: str):
     type=float,
     help="Validation ratio",
 )
-@click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    default="legacy",
-    show_default=True,
-    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
-)
 @click.help_option("--help", "-h")
 def split(
     input: str,
     output: str,
     val_ratio: float,
-    pipeline_backend: str,
 ):
     """Split a filtered FASTA into train/val sets."""
     input_path = Path(input)
@@ -681,13 +628,6 @@ def kd_embed(
     default=False,
 )
 @click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    default="legacy",
-    show_default=True,
-    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
-)
-@click.option(
     "--register-tokens",
     default=0,
     type=click.IntRange(0, 2),
@@ -703,7 +643,6 @@ def pre_tokenize(
     max_workers: int,
     samples_per_shard: int,
     force: bool,
-    pipeline_backend: str,
     register_tokens: int,
 ):
 
