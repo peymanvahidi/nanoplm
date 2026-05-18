@@ -47,7 +47,7 @@ from nanoplm.pretraining.models.modern_bert.pure_model import (
     TEProtModernBertMLM,
 )
 from nanoplm.data.infra.validation import validate_pretrain_dataset
-from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline, DataManifest
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 
@@ -1591,7 +1591,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
 def _load_manifest_and_inject(
     pretrain_config: PretrainingConfig,
     model_config: ProtModernBertMLMConfig,
-):
+) -> DataManifest:
     """Read the dataset manifest, validate pipeline mode, and inject
     num_register_tokens into the model config so the tokenizer is built
     with the same value used at data-prep time.
