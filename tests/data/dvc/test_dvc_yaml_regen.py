@@ -50,15 +50,6 @@ def test_pretrain_url_mode_dvc_yaml(tmp_path):
     assert "/local/path" not in str(deps)
 
 
-def test_pretrain_local_mode_dvc_yaml():
-    out = generate_dvc_yaml(PRETRAIN_LOCAL_CONFIG, kind="pretrain", params_filename="data.yaml")
-    parsed = yaml.safe_load(out)
-    stages = parsed["stages"]
-    deps = stages["get_file"].get("deps", [])
-    # Local mode: get_file has local_fasta in deps
-    assert any("local_fasta" in str(d) or "/local/path" in str(d) for d in deps)
-
-
 def test_pretrain_uses_foreach_for_tokenize():
     out = generate_dvc_yaml(PRETRAIN_URL_CONFIG, kind="pretrain", params_filename="data.yaml")
     parsed = yaml.safe_load(out)
@@ -169,6 +160,11 @@ def test_dvc_yaml_extract_stage_matches_compression(config, is_compressed):
         # Downstream stages must still reference extracted_fasta unchanged
         assert "${data_dirs.extracted_fasta}" in stages["check"]["deps"]
         assert "${data_dirs.extracted_fasta}" in stages["shuffle"]["deps"]
+
+    # Local-mode invariant: local_fasta appears in get_file.deps (was previously
+    # covered by the removed test_pretrain_local_mode_dvc_yaml).
+    if config["data_dirs"].get("local_fasta"):
+        assert "${data_dirs.local_fasta}" in stages["get_file"]["deps"]
 
 
 def test_dvc_yaml_plain_get_file_params_omit_compressed_fasta():
