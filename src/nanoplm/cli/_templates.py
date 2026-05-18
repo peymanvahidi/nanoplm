@@ -13,7 +13,7 @@ data_dirs:
   # uniref90:  "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"
   # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"
 
-  compressed_fasta:   "output/data/raw/uniref50.fasta.gz"
+  compressed_fasta:   "output/data/raw/uniref50.fasta.gz"  # unused if source is a plain .fasta (URL or local_fasta)
   extracted_fasta:    "output/data/raw/uniref50.fasta"
   validation_dir:     "output/data/validation"
   shuffled_fasta:     "output/data/raw/uniref50_shuffled.fasta"
@@ -47,7 +47,7 @@ data_dirs:
   # uniref90:  "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"
   # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"
 
-  compressed_fasta:   "output/data/raw/uniref50.fasta.gz"
+  compressed_fasta:   "output/data/raw/uniref50.fasta.gz"  # unused if source is a plain .fasta (URL or local_fasta)
   extracted_fasta:    "output/data/raw/uniref50.fasta"
   validation_dir:     "output/data/validation"
   shuffled_fasta:     "output/data/raw/uniref50_shuffled.fasta"
