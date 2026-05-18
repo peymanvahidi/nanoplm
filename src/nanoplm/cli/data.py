@@ -743,211 +743,53 @@ def kd_reshard(input_file: str, n_shards: int, output_dir: str, total_sequences:
 
 
 @data.command("get-yaml")
+@click.argument("output", required=False,
+                type=click.Path(file_okay=False, writable=True, resolve_path=True))
+@click.option("--distillation", is_flag=True, default=False,
+              help="Emit distillation_data.yaml instead of data.yaml")
+@click.option("--force", is_flag=True, default=False,
+              help="Overwrite existing files")
 @click.help_option("--help", "-h")
-@click.argument(
-    "output",
-    required=False,
-    type=click.Path(dir_okay=True, writable=True, resolve_path=True),
-)
-@click.option(
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Overwrite if file exists",
-)
-def get_yaml(output: str | None, force: bool):
-    """Generate a DVC params.yaml and dvc.yaml template for data pipeline.
+def get_yaml(output, distillation, force):
+    """Generate template data.yaml + dvc.yaml for the data pipeline."""
+    from nanoplm.cli._templates import PRETRAIN_DATA_YAML, DISTILL_DATA_YAML
+    from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
+    import yaml
 
-    If OUTPUT is omitted, writes ./params.yaml and ./dvc.yaml in the current directory.
-    If OUTPUT is a directory, writes params.yaml and dvc.yaml inside it.
-    """
-
-    if output is None:
-        output_path = Path.cwd()
-    else:
-        output_path = Path(output)
-
+    output_path = Path(output) if output else Path.cwd()
     create_dirs(output_path)
 
-    if not output_path.is_dir():
-        raise click.ClickException(
-            f"OUTPUT must be a directory, not a file: {output_path}"
-        )
+    if distillation:
+        params_filename = "distillation_data.yaml"
+        params_content = DISTILL_DATA_YAML
+        kind = "distillation"
+    else:
+        params_filename = "data.yaml"
+        params_content = PRETRAIN_DATA_YAML
+        kind = "pretrain"
 
-    params_path = output_path / "params.yaml"
+    params_path = output_path / params_filename
     dvc_path = output_path / "dvc.yaml"
 
     if not force:
-        existing = []
-        if params_path.exists():
-            existing.append(str(params_path))
-        if dvc_path.exists():
-            existing.append(str(dvc_path))
+        existing = [p for p in (params_path, dvc_path) if p.exists()]
         if existing:
             raise click.ClickException(
-                "File(s) already exist: "
-                + ", ".join(existing)
+                "File(s) already exist: " + ", ".join(str(p) for p in existing)
                 + ". Use --force to overwrite."
             )
 
-    template = (
-        "data_params:\n"
-        "  # Pipeline mode: 'pretrain', 'distillation', or 'none'\n"
-        "  # - 'pretrain': Generate HDF5 shards for MLM pretraining\n"
-        "  # - 'distillation': Generate teacher embeddings for knowledge distillation\n"
-        "  # - 'none': Only run data preparation (download, filter, split)\n"
-        '  pipeline_mode: "pretrain"\n'
-        "\n"
-        "  seqs_num: 20000\n"
-        "  min_seq_len: 20\n"
-        "  max_seq_len: 512\n"
-        "  val_ratio: 0.1\n"
-        '  device: "auto"\n'
-        "\n"
-        '  shuffle_backend: "auto"  # auto -> seqkit if available, else fast\n'
-        '  pipeline_backend: "legacy"  # legacy -> older Python/seqkit pipeline, fast -> native C pipeline\n'
-        "  shuffle: true\n"
-        "  shuffle_seed: 24\n"
-        "  filter_skip_n: 0\n"
-        "\n"
-        "# Pretrain config (used when pipeline_mode: 'pretrain')\n"
-        "# A .data_manifest file will be created in output_dir for use by pretrain pipeline\n"
-        "pretrain_config:\n"
-        '  output_dir: "output/data/pretrain_data"  # Will contain train/ and val/ subdirs\n'
-        "  samples_per_shard: 2000\n"
-        "  max_workers: 2  # -1 to use all available CPUs\n"
-        "  force: false\n"
-        "  register_tokens: 0  # 0, 1, or 2 learnable scratch tokens appended after EOS\n"
-        "\n"
-        "# Distillation config (used when pipeline_mode: 'distillation')\n"
-        "# A .data_manifest file will be created in output_dir for use by distill pipeline\n"
-        "distillation_config:\n"
-        '  output_dir: "output/data/distillation_data"  # Will contain train/ and val/ subdirs\n'
-        "  on_the_fly: false  # If true, skip embedding generation (embeddings computed during training)\n"
-        "  samples_per_shard: 2000  # -1 for single file (no sharding)\n"
-        '  teacher_model: "prott5"\n'
-        "  embed_calc_batch_size: 4\n"
-        "\n"
-        "# Data directories\n"
-        "data_dirs:\n"
-        '  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"\n'
-        '  # swissprot: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"\n'
-        '  # trembl: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz"\n'
-        '  # uniref50: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"\n'
-        '  # uniref90: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"\n'
-        '  # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"\n'
-        '  compressed_fasta: "output/data/raw/uniref50.fasta.gz"\n'
-        '  extracted_fasta: "output/data/raw/uniref50.fasta"\n'
-        '  shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"\n'
-        '  filtered_fasta: "output/data/filter/uniref50_filtered.fasta"\n'
-        '  splitted_fasta_dir: "output/data/split"\n'
+    params_path.write_text(params_content, encoding="utf-8")
+    parsed = yaml.safe_load(params_content)
+    dvc_content = generate_dvc_yaml(
+        config=parsed,
+        kind=kind,
+        params_filename=params_filename,
     )
-
-    if force and params_path.exists():
-        params_path.unlink()
-
-    params_path.write_text(template, encoding="utf-8")
-
-    dvc_yaml_template = (
-        "# This is a template for a DVC pipeline for the data pipeline.\n"
-        "# DO NOT EDIT THIS FILE, IT IS AUTO-GENERATED.\n"
-        "# The KD stages are only run when pipeline_mode is 'distillation'.\n"
-        "stages:\n"
-        "\n"
-        "  download:\n"
-        "    cmd: nanoplm data download --url ${data_dirs.url} -o ${data_dirs.compressed_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.url\n"
-        "      - data_dirs.compressed_fasta\n"
-        "    outs:\n"
-        "      - ${data_dirs.compressed_fasta}\n"
-        "\n"
-        "  extract:\n"
-        "    cmd: nanoplm data extract -i ${data_dirs.compressed_fasta} -o ${data_dirs.extracted_fasta}\n"
-        "    deps:\n"
-        "      - ${data_dirs.compressed_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.compressed_fasta\n"
-        "      - data_dirs.extracted_fasta\n"
-        "    outs:\n"
-        "      - ${data_dirs.extracted_fasta}\n"
-        "\n"
-        "  shuffle:\n"
-        "    cmd: nanoplm data shuffle -i ${data_dirs.extracted_fasta} -o ${data_dirs.shuffled_fasta} --backend ${data_params.shuffle_backend} --seed ${data_params.shuffle_seed} --pipeline-backend ${data_params.pipeline_backend}\n"
-        "    deps:\n"
-        "      - ${data_dirs.extracted_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.shuffled_fasta\n"
-        "      - data_params.shuffle_backend\n"
-        "      - data_params.shuffle_seed\n"
-        "      - data_params.pipeline_backend\n"
-        "    outs:\n"
-        "      - ${data_dirs.shuffled_fasta}\n"
-        "\n"
-        "  filter:\n"
-        "    cmd: nanoplm data filter -i ${data_dirs.shuffled_fasta} -o ${data_dirs.filtered_fasta} --min-seq-len ${data_params.min_seq_len} --max-seq-len ${data_params.max_seq_len} --seqs-num ${data_params.seqs_num} --skip-n ${data_params.filter_skip_n} --pipeline-backend ${data_params.pipeline_backend}\n"
-        "    deps:\n"
-        "      - ${data_dirs.shuffled_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.shuffled_fasta\n"
-        "      - data_params.min_seq_len\n"
-        "      - data_params.max_seq_len\n"
-        "      - data_params.seqs_num\n"
-        "      - data_params.filter_skip_n\n"
-        "      - data_params.pipeline_backend\n"
-        "    outs:\n"
-        "      - ${data_dirs.filtered_fasta}\n"
-        "\n"
-        "  split:\n"
-        "    cmd: nanoplm data split -i ${data_dirs.filtered_fasta} -o ${data_dirs.splitted_fasta_dir} --val-ratio ${data_params.val_ratio} --pipeline-backend ${data_params.pipeline_backend}\n"
-        "    deps:\n"
-        "      - ${data_dirs.filtered_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.filtered_fasta\n"
-        "      - data_dirs.splitted_fasta_dir\n"
-        "      - data_params.val_ratio\n"
-        "      - data_params.pipeline_backend\n"
-        "    outs:\n"
-        "      - ${data_dirs.splitted_fasta_dir}\n"
-        "\n"
-        "  save_kd_train_dataset:\n"
-        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/train.fasta -o ${distillation_config.output_dir}/train --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
-        "    deps:\n"
-        "      - ${data_dirs.splitted_fasta_dir}/train.fasta\n"
-        "    params:\n"
-        "      - data_dirs.splitted_fasta_dir\n"
-        "      - distillation_config.output_dir\n"
-        "      - distillation_config.teacher_model\n"
-        "      - distillation_config.samples_per_shard\n"
-        "      - distillation_config.embed_calc_batch_size\n"
-        "      - data_params.max_seq_len\n"
-        "      - data_params.filter_skip_n\n"
-        "    outs:\n"
-        "      - ${distillation_config.output_dir}/train\n"
-        "\n"
-        "  save_kd_val_dataset:\n"
-        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/val.fasta -o ${distillation_config.output_dir}/val --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
-        "    deps:\n"
-        "      - ${data_dirs.splitted_fasta_dir}/val.fasta\n"
-        "    params:\n"
-        "      - data_dirs.splitted_fasta_dir\n"
-        "      - distillation_config.output_dir\n"
-        "      - distillation_config.teacher_model\n"
-        "      - distillation_config.samples_per_shard\n"
-        "      - distillation_config.embed_calc_batch_size\n"
-        "      - data_params.max_seq_len\n"
-        "      - data_params.filter_skip_n\n"
-        "    outs:\n"
-        "      - ${distillation_config.output_dir}/val\n"
-    )
-
-    if force and dvc_path.exists():
-        dvc_path.unlink()
-
-    dvc_path.write_text(dvc_yaml_template, encoding="utf-8")
-
+    dvc_path.write_text(dvc_content, encoding="utf-8")
     click.echo(
-        f"Both files are written to: {output_path} directory.\nEdit the params.yaml file and use `nanoplm data from-yaml` to run the pipeline."
+        f"Wrote {params_filename} and dvc.yaml in {output_path}.\n"
+        f"Edit {params_filename} and run `nanoplm data from-yaml` to execute."
     )
 
 
