@@ -46,7 +46,7 @@ from nanoplm.pretraining.models.modern_bert.pure_model import (
     PureProtModernBertMLM,
     TEProtModernBertMLM,
 )
-from nanoplm.data.validation import validate_pretrain_dataset
+from nanoplm.data.infra.validation import validate_pretrain_dataset
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.utils.logger import logger
 

@@ -11,59 +11,65 @@ import time
 
 from nanoplm.config.datasets import DATASET_URLS
 
-from nanoplm.data.downloader import Downloader, DownloadError
-from nanoplm.data.extractor import Extractor, ExtractionError
-from nanoplm.data.shuffler import FastaShuffler, ShufflingError
-from nanoplm.data.filterer import Filterer, FilterError
-from nanoplm.data.splitor import Splitor, SplitError
-from nanoplm.data.manifest import PretrainManifest, DistillationManifest, write_manifest
-from nanoplm.distillation.dataset import SaveKDDataset, shard_h5_file
+from nanoplm.data.preparation.downloader import Downloader, DownloadError
+from nanoplm.data.preparation.extractor import Extractor, ExtractionError
+from nanoplm.data.preparation.shuffler import FastaShuffler, ShufflingError
+from nanoplm.data.preparation.filterer import Filterer, FilterError
+from nanoplm.data.preparation.splitor import Splitor, SplitError
+from nanoplm.data.infra.manifest import PretrainManifest, DistillationManifest, write_manifest
+from nanoplm.data.sharding.distill_shard_writer import SaveKDDataset, shard_h5_file
 from nanoplm.distillation.models.teacher import ProtT5
-from nanoplm.pretraining.dataset import ShardWriter
+from nanoplm.data.sharding.pretrain_shard_writer import ShardWriter
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 from nanoplm.utils import create_dirs
 from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml, is_flash_attention_available
 
-_PIPELINE_BACKEND_CHOICES = ("legacy", "fast")
-_DISABLE_NATIVE_FASTA_OPS_ENV = "NANOPLM_DISABLE_NATIVE_FASTA_OPS"
-_DISABLE_NATIVE_SHARD_WRITER_ENV = "NANOPLM_DISABLE_NATIVE_SHARD_WRITER"
+
+class _GroupedDataCommand(click.Group):
+    _GROUPS = [
+        ("Main commands (most users only need these — they orchestrate the rest "
+         "of the pipeline through DVC under the hood):",
+         ["get-yaml", "from-yaml"]),
+        ("Pipeline stages (invoked by 'from-yaml' via DVC; can also be run "
+         "directly for debugging):",
+         ["get-file", "extract", "check", "shuffle", "filter", "split"]),
+        ("Pretraining-specific:",
+         ["pre-tokenize"]),
+        ("Knowledge-distillation-specific:",
+         ["kd-embed", "kd-reshard"]),
+    ]
+
+    def format_commands(self, ctx, formatter):
+        registered = {c: self.get_command(ctx, c) for c in self.list_commands(ctx)}
+        seen = set()
+        for header, names in self._GROUPS:
+            rows = []
+            for name in names:
+                cmd = registered.get(name)
+                if cmd is None or cmd.hidden:
+                    continue
+                rows.append((name, cmd.get_short_help_str() or ""))
+                seen.add(name)
+            if rows:
+                with formatter.section(header):
+                    formatter.write_dl(rows)
+        # Any commands not in a group (shouldn't be visible normally)
+        leftover = [(n, c) for n, c in registered.items()
+                    if n not in seen and not (c and c.hidden)]
+        if leftover:
+            with formatter.section("Other"):
+                formatter.write_dl([(n, c.get_short_help_str() or "") for n, c in leftover])
 
 
-def _use_native_backend(pipeline_backend: str) -> bool:
-    return pipeline_backend == "fast"
-
-
-def _resolve_pipeline_backend(selected: str | None, from_params: str | None = None) -> str:
-    backend = selected or from_params or "legacy"
-    backend = str(backend).strip().lower()
-    if backend not in _PIPELINE_BACKEND_CHOICES:
-        raise click.ClickException(
-            f"Invalid pipeline_backend: '{backend}'. "
-            f"Must be one of: {', '.join(_PIPELINE_BACKEND_CHOICES)}"
-        )
-    return backend
-
-
-def _pipeline_backend_env(pipeline_backend: str) -> dict[str, str]:
-    env = dict(os.environ)
-    if _use_native_backend(pipeline_backend):
-        env.pop(_DISABLE_NATIVE_FASTA_OPS_ENV, None)
-        env.pop(_DISABLE_NATIVE_SHARD_WRITER_ENV, None)
-    else:
-        env[_DISABLE_NATIVE_FASTA_OPS_ENV] = "1"
-        env[_DISABLE_NATIVE_SHARD_WRITER_ENV] = "1"
-    return env
-
-
-@click.group(name="data")
+@click.group(name="data", cls=_GroupedDataCommand)
 @click.help_option("--help", "-h")
 def data():
-    """Group of commands for managing datasets."""
+    """Manage protein datasets for nanoPLM pretraining and distillation."""
     pass
 
 
-@data.command("download")
+@data.command("get-file")
 @click.argument(
     "dataset",
     required=False,
@@ -74,77 +80,76 @@ def data():
     "--url",
     required=False,
     type=str,
-    help="Explicit URL to download from. (can be used if dataset key is not provided).",
-    default=None,
+    default="",
+    help="URL to download (empty string treated as null).",
+)
+@click.option(
+    "--local-fasta",
+    required=False,
+    type=str,
+    default="",
+    help="Local .fasta or .fasta.gz path (empty string treated as null).",
 )
 @click.option(
     "--output",
     "-o",
-    required=False,
-    type=click.Path(exists=False),
-    help="Directory path or file path where the dataset will be saved. If not provided the file name will be taken from the dataset url.",
-    default="downloaded_dataset",
+    required=True,
+    type=click.Path(),
+    help="Directory path or file path where the dataset will be saved.",
 )
 @click.option(
     "--force",
     "-f",
     is_flag=True,
-    help="Flag to force download even if file already exists.",
     default=False,
+    help="Flag to force overwrite if output already exists.",
 )
 @click.help_option("--help", "-h")
-def download(dataset: str | None, output: str | None, url: str | None, force: bool):
-    """Download datasets using a dataset key (e.g., uniref50) or --url.
+def get_file(dataset, url, local_fasta, output, force):
+    """Acquire a FASTA source. Pass either a dataset key, --url, or --local-fasta.
 
     Examples:
 
     \b
-      nanoplm data download uniref50 -o data_directory
-      nanoplm data download --url https://example.com/data.fasta.gz -o data_directory/mydata.fasta.gz
+      nanoplm data get-file uniref50 -o data_directory
+      nanoplm data get-file --url https://example.com/data.fasta.gz -o data_directory/mydata.fasta.gz
+      nanoplm data get-file --local-fasta /path/to/local.fasta.gz -o data_directory/local.fasta.gz
     """
-
+    url = url or None
+    local_fasta = local_fasta or None
+    sources = [bool(dataset), bool(url), bool(local_fasta)]
+    if sum(sources) != 1:
+        raise click.UsageError(
+            "Provide exactly one of: dataset key, --url, --local-fasta"
+        )
     output_path = Path(output)
-
-    # Validate arguments
-    if not dataset and not url:
-        raise click.UsageError("Either a dataset key or --url must be provided.")
-
-    if dataset and url:
-        raise click.UsageError("Both a dataset key and --url cannot be provided.")
-
-    # Get dataset URL
-    if dataset:
-        dataset_url = DATASET_URLS[dataset]
-    else:
-        dataset_url = url
-
     create_dirs(output_path)
-
-    # Get output  path
+    # If output is a directory, derive a filename from the source.
     if output_path.is_dir():
-        output_path = output_path / Path(dataset_url).name
-
-    # Check if output path already exists
-    if output_path.exists():
-        if force:
-            output_path.unlink()
-            click.echo(f"Removed existing file: {output_path}")
+        if local_fasta:
+            output_path = output_path / Path(local_fasta).name
         else:
-            click.echo(
-                f"File already exists: {output_path} \nUse --force to overwrite."
+            chosen_url = DATASET_URLS[dataset] if dataset else url
+            output_path = output_path / Path(chosen_url).name
+    if output_path.exists() and not force:
+        click.echo(f"File already exists: {output_path}. Use --force to overwrite.")
+        return
+    if output_path.exists() and force:
+        output_path.unlink()
+    if local_fasta:
+        if not Path(local_fasta).exists():
+            raise click.UsageError(
+                f"--local-fasta path does not exist: {local_fasta}"
             )
-            return
-
-    # Download dataset
+        Downloader.link_local(Path(local_fasta), output_path)
+        click.echo(f"Linked local file: {local_fasta} -> {output_path}")
+        return
+    chosen_url = DATASET_URLS[dataset] if dataset else url
     try:
-        downloader = Downloader(url=dataset_url, output_path=output_path)
-        downloader.download()
-        click.echo(f"Dataset downloaded to: {output_path}")
-
+        Downloader(url=chosen_url, output_path=output_path).download()
     except DownloadError as e:
         raise click.ClickException(f"Download failed: {e}")
-    except Exception as e:
-        raise click.ClickException(f"An unexpected error occurred during download: {e}")
+    click.echo(f"Downloaded to: {output_path}")
 
 
 @data.command("extract")
@@ -236,14 +241,14 @@ def extract(input: str, output: str, force: bool):
     "--seed", type=int, default=None, help="Random seed for shuffling (optional)"
 )
 @click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    default="legacy",
-    show_default=True,
-    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
+    "--shuffle",
+    "shuffle_flag",
+    default="true",
+    type=click.Choice(["true", "false"], case_sensitive=False),
+    help="If false, skip shuffling and symlink (or copy) input to output.",
 )
 @click.help_option("--help", "-h")
-def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: str):
+def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str):
     """Shuffle sequences in a FASTA file."""
     # Check if the input file is a .fasta file
     if not input.endswith(".fasta"):
@@ -258,13 +263,14 @@ def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: 
         # replace .fasta with _shuffled.fasta
         output_path = output_path / input_path.name.replace(".fasta", "_shuffled.fasta")
 
+    do_shuffle = shuffle_flag.lower() == "true"
+
     try:
         shuffler = FastaShuffler(
             input_path=input_path,
             output_path=output_path,
-            backend=backend,
             seed=seed,
-            use_native_fast=_use_native_backend(pipeline_backend),
+            do_shuffle=do_shuffle,
         )
         shuffler.shuffle()
     except ShufflingError as e:
@@ -315,11 +321,10 @@ def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: 
     help="Number of sequences to skip from the beginning of the input FASTA file",
 )
 @click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    default="legacy",
-    show_default=True,
-    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
+    "--exclude-ids",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Optional path to a text file with one sequence ID per line; matching sequences are excluded.",
 )
 @click.help_option("--help", "-h")
 def filter(
@@ -329,7 +334,7 @@ def filter(
     max_seq_len: int,
     seqs_num: int,
     skip_n: int,
-    pipeline_backend: str,
+    exclude_ids: str | None,
 ):
     """Filter sequences by length and optional max count."""
     input_path = Path(input)
@@ -347,8 +352,7 @@ def filter(
             min_seq_len=min_seq_len,
             max_seq_len=max_seq_len,
             seqs_num=seqs_num,
-            skip_n=skip_n,
-            use_native=_use_native_backend(pipeline_backend),
+            exclude_ids=Path(exclude_ids) if exclude_ids else None,
         )
         filterer.filter()
         click.echo("Filtering completed successfully")
@@ -358,6 +362,45 @@ def filter(
         raise click.ClickException(
             f"An unexpected error occurred during filtering: {e}"
         )
+
+
+@data.command("check")
+@click.option("--input", "-i", required=True,
+              type=click.Path(exists=True, dir_okay=False), help="Input FASTA file")
+@click.option("--output", "-o", required=True,
+              type=click.Path(file_okay=False),
+              help="Output directory for validation sidecars")
+@click.option("--drop-invalid", default="false",
+              type=click.Choice(["true", "false"], case_sensitive=False),
+              help="If true, exit 0 even with invalid sequences and write invalid_ids.txt")
+@click.help_option("--help", "-h")
+def check(input: str, output: str, drop_invalid: str):
+    """Validate FASTA sequences. Writes validation.json, invalid.fasta, invalid_ids.txt
+    into the output directory. Exits non-zero if invalid sequences are found AND
+    --drop-invalid=false; exits zero otherwise.
+    """
+    from nanoplm.data.preparation.checker import Checker
+
+    drop = drop_invalid.lower() == "true"
+    result = Checker(
+        input_path=Path(input),
+        output_dir=Path(output),
+        drop_invalid=drop,
+    ).check()
+
+    if result.invalid_count > 0:
+        msg = (
+            f"Validation found {result.invalid_count:,} problematic sequence(s).\n"
+            f"  Inspect: {Path(output) / 'invalid.fasta'}\n"
+            f"  Summary: {Path(output) / 'validation.json'}\n"
+        )
+        if not drop:
+            msg += (
+                "\nTo exclude these sequences and continue the pipeline:\n"
+                "    nanoplm data from-yaml --fix\n"
+            )
+            raise click.ClickException(msg)
+        click.echo(msg, err=True)
 
 
 @data.command("split")
@@ -381,19 +424,11 @@ def filter(
     type=float,
     help="Validation ratio",
 )
-@click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    default="legacy",
-    show_default=True,
-    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
-)
 @click.help_option("--help", "-h")
 def split(
     input: str,
     output: str,
     val_ratio: float,
-    pipeline_backend: str,
 ):
     """Split a filtered FASTA into train/val sets."""
     input_path = Path(input)
@@ -413,7 +448,6 @@ def split(
             train_file=train_file_path,
             val_file=val_file_path,
             val_ratio=val_ratio,
-            use_native=_use_native_backend(pipeline_backend),
         )
         train_size, val_size = splitor.split()
         click.echo(
@@ -428,7 +462,7 @@ def split(
         )
 
 
-@data.command("save-kd-dataset")
+@data.command("kd-embed")
 @click.option(
     "--input",
     "-i",
@@ -477,9 +511,10 @@ def split(
 )
 @click.option(
     "--device",
-    default="auto",
+    default=lambda: os.environ.get("NANOPLM_DEVICE", "auto"),
     type=click.Choice(["auto", "cuda", "mps", "cpu"]),
-    help="Device to use",
+    show_default="$NANOPLM_DEVICE or auto",
+    help="Device for teacher embedding computation.",
 )
 @click.option(
     "--skip-n",
@@ -488,7 +523,7 @@ def split(
     help="Number of sequences to skip from the beginning of the input FASTA file before processing",
 )
 @click.help_option("--help", "-h")
-def save_kd_dataset(
+def kd_embed(
     input: str,
     output: str,
     teacher_model: str,
@@ -551,7 +586,7 @@ def save_kd_dataset(
         )
 
 
-@data.command("save-pretrain-dataset")
+@data.command("pre-tokenize")
 @click.option(
     "--input",
     "-i",
@@ -574,9 +609,10 @@ def save_kd_dataset(
 )
 @click.option(
     "--max-workers",
-    default=2,
+    default=lambda: int(os.environ.get("NANOPLM_MAX_WORKERS", "2")),
     type=int,
-    help="Number of CPUs. Use --max-workers -1 to use all available CPUs",
+    show_default="$NANOPLM_MAX_WORKERS or 2",
+    help="Number of parallel worker threads.",
 )
 @click.option(
     "--samples-per-shard",
@@ -592,13 +628,6 @@ def save_kd_dataset(
     default=False,
 )
 @click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    default="legacy",
-    show_default=True,
-    help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
-)
-@click.option(
     "--register-tokens",
     default=0,
     type=click.IntRange(0, 2),
@@ -607,14 +636,13 @@ def save_kd_dataset(
          "Register tokens act as learnable scratch space for the model.",
 )
 @click.help_option("--help", "-h")
-def save_pretrain_dataset(
+def pre_tokenize(
     input: str,
     output: str,
     max_seq_len: int,
     max_workers: int,
     samples_per_shard: int,
     force: bool,
-    pipeline_backend: str,
     register_tokens: int,
 ):
 
@@ -642,7 +670,6 @@ def save_pretrain_dataset(
         samples_per_shard=samples_per_shard,
         max_workers=max_workers,
         force=force,
-        use_native=_use_native_backend(pipeline_backend),
     )
     shards = saver.create_shards()
 
@@ -651,7 +678,7 @@ def save_pretrain_dataset(
         f"  shards: {len(shards)} -> {output_dir}\n"
     )
 
-@data.command("shard")
+@data.command("kd-reshard")
 @click.option(
     "--input-file",
     "-i",
@@ -677,15 +704,15 @@ def save_pretrain_dataset(
     help="Total number of sequences (if known, skips counting for faster start)",
 )
 @click.help_option("--help", "-h")
-def shard(input_file: str, n_shards: int, output_dir: str, total_sequences: int):
+def kd_reshard(input_file: str, n_shards: int, output_dir: str, total_sequences: int):
     """Shard a large H5 file into smaller files for better performance.
 
     Examples:
         # Basic sharding (will count sequences first)
-        protx data shard --input-file train.h5 --n-shards 33
+        nanoplm data kd-reshard --input-file train.h5 --n-shards 33
 
         # Fast sharding (skips counting if you know the sequence count)
-        protx data shard --input-file train.h5 --n-shards 33 --total-sequences 12500000
+        nanoplm data kd-reshard --input-file train.h5 --n-shards 33 --total-sequences 12500000
 
     This will create train_shard_0.h5, train_shard_1.h5, ..., train_shard_32.h5
     """
@@ -703,211 +730,53 @@ def shard(input_file: str, n_shards: int, output_dir: str, total_sequences: int)
 
 
 @data.command("get-yaml")
+@click.argument("output", required=False,
+                type=click.Path(file_okay=False, writable=True, resolve_path=True))
+@click.option("--distillation", is_flag=True, default=False,
+              help="Emit distillation_data.yaml instead of data.yaml")
+@click.option("--force", is_flag=True, default=False,
+              help="Overwrite existing files")
 @click.help_option("--help", "-h")
-@click.argument(
-    "output",
-    required=False,
-    type=click.Path(dir_okay=True, writable=True, resolve_path=True),
-)
-@click.option(
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Overwrite if file exists",
-)
-def get_yaml(output: str | None, force: bool):
-    """Generate a DVC params.yaml and dvc.yaml template for data pipeline.
+def get_yaml(output, distillation, force):
+    """Generate template data.yaml + dvc.yaml for the data pipeline."""
+    from nanoplm.cli._templates import PRETRAIN_DATA_YAML, DISTILL_DATA_YAML
+    from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
+    import yaml
 
-    If OUTPUT is omitted, writes ./params.yaml and ./dvc.yaml in the current directory.
-    If OUTPUT is a directory, writes params.yaml and dvc.yaml inside it.
-    """
-
-    if output is None:
-        output_path = Path.cwd()
-    else:
-        output_path = Path(output)
-
+    output_path = Path(output) if output else Path.cwd()
     create_dirs(output_path)
 
-    if not output_path.is_dir():
-        raise click.ClickException(
-            f"OUTPUT must be a directory, not a file: {output_path}"
-        )
+    if distillation:
+        params_filename = "distillation_data.yaml"
+        params_content = DISTILL_DATA_YAML
+        kind = "distillation"
+    else:
+        params_filename = "data.yaml"
+        params_content = PRETRAIN_DATA_YAML
+        kind = "pretrain"
 
-    params_path = output_path / "params.yaml"
+    params_path = output_path / params_filename
     dvc_path = output_path / "dvc.yaml"
 
     if not force:
-        existing = []
-        if params_path.exists():
-            existing.append(str(params_path))
-        if dvc_path.exists():
-            existing.append(str(dvc_path))
+        existing = [p for p in (params_path, dvc_path) if p.exists()]
         if existing:
             raise click.ClickException(
-                "File(s) already exist: "
-                + ", ".join(existing)
+                "File(s) already exist: " + ", ".join(str(p) for p in existing)
                 + ". Use --force to overwrite."
             )
 
-    template = (
-        "data_params:\n"
-        "  # Pipeline mode: 'pretrain', 'distillation', or 'none'\n"
-        "  # - 'pretrain': Generate HDF5 shards for MLM pretraining\n"
-        "  # - 'distillation': Generate teacher embeddings for knowledge distillation\n"
-        "  # - 'none': Only run data preparation (download, filter, split)\n"
-        '  pipeline_mode: "pretrain"\n'
-        "\n"
-        "  seqs_num: 20000\n"
-        "  min_seq_len: 20\n"
-        "  max_seq_len: 512\n"
-        "  val_ratio: 0.1\n"
-        '  device: "auto"\n'
-        "\n"
-        '  shuffle_backend: "auto"  # auto -> seqkit if available, else fast\n'
-        '  pipeline_backend: "legacy"  # legacy -> older Python/seqkit pipeline, fast -> native C pipeline\n'
-        "  shuffle: true\n"
-        "  shuffle_seed: 24\n"
-        "  filter_skip_n: 0\n"
-        "\n"
-        "# Pretrain config (used when pipeline_mode: 'pretrain')\n"
-        "# A .data_manifest file will be created in output_dir for use by pretrain pipeline\n"
-        "pretrain_config:\n"
-        '  output_dir: "output/data/pretrain_data"  # Will contain train/ and val/ subdirs\n'
-        "  samples_per_shard: 2000\n"
-        "  max_workers: 2  # -1 to use all available CPUs\n"
-        "  force: false\n"
-        "  register_tokens: 0  # 0, 1, or 2 learnable scratch tokens appended after EOS\n"
-        "\n"
-        "# Distillation config (used when pipeline_mode: 'distillation')\n"
-        "# A .data_manifest file will be created in output_dir for use by distill pipeline\n"
-        "distillation_config:\n"
-        '  output_dir: "output/data/distillation_data"  # Will contain train/ and val/ subdirs\n'
-        "  on_the_fly: false  # If true, skip embedding generation (embeddings computed during training)\n"
-        "  samples_per_shard: 2000  # -1 for single file (no sharding)\n"
-        '  teacher_model: "prott5"\n'
-        "  embed_calc_batch_size: 4\n"
-        "\n"
-        "# Data directories\n"
-        "data_dirs:\n"
-        '  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"\n'
-        '  # swissprot: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"\n'
-        '  # trembl: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz"\n'
-        '  # uniref50: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"\n'
-        '  # uniref90: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"\n'
-        '  # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"\n'
-        '  compressed_fasta: "output/data/raw/uniref50.fasta.gz"\n'
-        '  extracted_fasta: "output/data/raw/uniref50.fasta"\n'
-        '  shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"\n'
-        '  filtered_fasta: "output/data/filter/uniref50_filtered.fasta"\n'
-        '  splitted_fasta_dir: "output/data/split"\n'
+    params_path.write_text(params_content, encoding="utf-8")
+    parsed = yaml.safe_load(params_content)
+    dvc_content = generate_dvc_yaml(
+        config=parsed,
+        kind=kind,
+        params_filename=params_filename,
     )
-
-    if force and params_path.exists():
-        params_path.unlink()
-
-    params_path.write_text(template, encoding="utf-8")
-
-    dvc_yaml_template = (
-        "# This is a template for a DVC pipeline for the data pipeline.\n"
-        "# DO NOT EDIT THIS FILE, IT IS AUTO-GENERATED.\n"
-        "# The KD stages are only run when pipeline_mode is 'distillation'.\n"
-        "stages:\n"
-        "\n"
-        "  download:\n"
-        "    cmd: nanoplm data download --url ${data_dirs.url} -o ${data_dirs.compressed_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.url\n"
-        "      - data_dirs.compressed_fasta\n"
-        "    outs:\n"
-        "      - ${data_dirs.compressed_fasta}\n"
-        "\n"
-        "  extract:\n"
-        "    cmd: nanoplm data extract -i ${data_dirs.compressed_fasta} -o ${data_dirs.extracted_fasta}\n"
-        "    deps:\n"
-        "      - ${data_dirs.compressed_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.compressed_fasta\n"
-        "      - data_dirs.extracted_fasta\n"
-        "    outs:\n"
-        "      - ${data_dirs.extracted_fasta}\n"
-        "\n"
-        "  shuffle:\n"
-        "    cmd: nanoplm data shuffle -i ${data_dirs.extracted_fasta} -o ${data_dirs.shuffled_fasta} --backend ${data_params.shuffle_backend} --seed ${data_params.shuffle_seed} --pipeline-backend ${data_params.pipeline_backend}\n"
-        "    deps:\n"
-        "      - ${data_dirs.extracted_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.shuffled_fasta\n"
-        "      - data_params.shuffle_backend\n"
-        "      - data_params.shuffle_seed\n"
-        "      - data_params.pipeline_backend\n"
-        "    outs:\n"
-        "      - ${data_dirs.shuffled_fasta}\n"
-        "\n"
-        "  filter:\n"
-        "    cmd: nanoplm data filter -i ${data_dirs.shuffled_fasta} -o ${data_dirs.filtered_fasta} --min-seq-len ${data_params.min_seq_len} --max-seq-len ${data_params.max_seq_len} --seqs-num ${data_params.seqs_num} --skip-n ${data_params.filter_skip_n} --pipeline-backend ${data_params.pipeline_backend}\n"
-        "    deps:\n"
-        "      - ${data_dirs.shuffled_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.shuffled_fasta\n"
-        "      - data_params.min_seq_len\n"
-        "      - data_params.max_seq_len\n"
-        "      - data_params.seqs_num\n"
-        "      - data_params.filter_skip_n\n"
-        "      - data_params.pipeline_backend\n"
-        "    outs:\n"
-        "      - ${data_dirs.filtered_fasta}\n"
-        "\n"
-        "  split:\n"
-        "    cmd: nanoplm data split -i ${data_dirs.filtered_fasta} -o ${data_dirs.splitted_fasta_dir} --val-ratio ${data_params.val_ratio} --pipeline-backend ${data_params.pipeline_backend}\n"
-        "    deps:\n"
-        "      - ${data_dirs.filtered_fasta}\n"
-        "    params:\n"
-        "      - data_dirs.filtered_fasta\n"
-        "      - data_dirs.splitted_fasta_dir\n"
-        "      - data_params.val_ratio\n"
-        "      - data_params.pipeline_backend\n"
-        "    outs:\n"
-        "      - ${data_dirs.splitted_fasta_dir}\n"
-        "\n"
-        "  save_kd_train_dataset:\n"
-        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/train.fasta -o ${distillation_config.output_dir}/train --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
-        "    deps:\n"
-        "      - ${data_dirs.splitted_fasta_dir}/train.fasta\n"
-        "    params:\n"
-        "      - data_dirs.splitted_fasta_dir\n"
-        "      - distillation_config.output_dir\n"
-        "      - distillation_config.teacher_model\n"
-        "      - distillation_config.samples_per_shard\n"
-        "      - distillation_config.embed_calc_batch_size\n"
-        "      - data_params.max_seq_len\n"
-        "      - data_params.filter_skip_n\n"
-        "    outs:\n"
-        "      - ${distillation_config.output_dir}/train\n"
-        "\n"
-        "  save_kd_val_dataset:\n"
-        "    cmd: nanoplm data save-kd-dataset -i ${data_dirs.splitted_fasta_dir}/val.fasta -o ${distillation_config.output_dir}/val --teacher-model ${distillation_config.teacher_model} --max-seq-len ${data_params.max_seq_len} --samples-per-shard ${distillation_config.samples_per_shard} --batch-size ${distillation_config.embed_calc_batch_size} --device ${data_params.device} --skip-n ${data_params.filter_skip_n}\n"
-        "    deps:\n"
-        "      - ${data_dirs.splitted_fasta_dir}/val.fasta\n"
-        "    params:\n"
-        "      - data_dirs.splitted_fasta_dir\n"
-        "      - distillation_config.output_dir\n"
-        "      - distillation_config.teacher_model\n"
-        "      - distillation_config.samples_per_shard\n"
-        "      - distillation_config.embed_calc_batch_size\n"
-        "      - data_params.max_seq_len\n"
-        "      - data_params.filter_skip_n\n"
-        "    outs:\n"
-        "      - ${distillation_config.output_dir}/val\n"
-    )
-
-    if force and dvc_path.exists():
-        dvc_path.unlink()
-
-    dvc_path.write_text(dvc_yaml_template, encoding="utf-8")
-
+    dvc_path.write_text(dvc_content, encoding="utf-8")
     click.echo(
-        f"Both files are written to: {output_path} directory.\nEdit the params.yaml file and use `nanoplm data repro` to run the pipeline."
+        f"Wrote {params_filename} and dvc.yaml in {output_path}.\n"
+        f"Edit {params_filename} and run `nanoplm data from-yaml` to execute."
     )
 
 
@@ -915,14 +784,16 @@ def get_yaml(output: str | None, force: bool):
 @click.help_option("--help", "-h")
 @click.argument(
     "config",
-    default="params.yaml",
-    type=click.Path(exists=True, dir_okay=False, readable=True),
+    default=None,
+    required=False,
+    type=click.Path(dir_okay=False, readable=True),
 )
 @click.option(
     "--target",
     type=str,
     required=False,
-    help="DVC stage to reproduce (e.g., split). Overrides pipeline_mode if specified.",
+    default=None,
+    help="DVC stage to run (e.g., split). Defaults to full pipeline.",
 )
 @click.option(
     "--no-auto-init",
@@ -939,124 +810,116 @@ def get_yaml(output: str | None, force: bool):
 )
 @click.option(
     "--verbose",
-    "verbose",
     is_flag=True,
     default=False,
     help="Run 'dvc repro' with -v for verbose output.",
 )
 @click.option(
-    "--pipeline-backend",
-    type=click.Choice(_PIPELINE_BACKEND_CHOICES),
-    required=False,
-    default=None,
-    help="Override data_params.pipeline_backend from params.yaml.",
+    "--fix",
+    is_flag=True,
+    default=False,
+    help="Set drop_invalid_sequences=true in config before running.",
+)
+@click.option(
+    "--dry-run",
+    "dry_run",
+    is_flag=True,
+    default=False,
+    help="Print the DVC plan without executing (dvc repro --dry --allow-missing).",
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(["debug", "info", "warning", "error"], case_sensitive=False),
+    default="info",
+    help="Log level for nanoplm output.",
 )
 def from_yaml(
-    config: str,
+    config: str | None,
     target: str | None,
     no_auto_init: bool,
     force_repro: bool,
     verbose: bool,
-    pipeline_backend: str | None,
+    fix: bool,
+    dry_run: bool,
+    log_level: str,
 ):
-    """Run the DVC data pipeline from a YAML file.
+    """Regenerate dvc.yaml from config and run the DVC data pipeline.
 
-    The pipeline_mode in params.yaml controls what dataset is generated:
-    - 'none': Only run data preparation (download, filter, split)
-    - 'pretrain': Generate HDF5 shards for MLM pretraining
-    - 'distillation': Generate teacher embeddings for knowledge distillation
-
-    This will:
-    - Optionally initialize DVC in the current directory.
-    - Run `dvc repro` for the appropriate stages based on pipeline_mode.
+    Reads data.yaml (or distillation_data.yaml), validates the config,
+    regenerates dvc.yaml to match the current settings, then runs dvc repro.
     """
+    import yaml as _yaml
+    from nanoplm.utils import set_log_level, logger
+    from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
 
-    config = Path(config)
+    set_log_level(log_level)
 
-    if config.is_absolute():
-        cwd = config.parent
-        params_yaml = config
-    else:
-        params_yaml = Path.cwd() / config
-        cwd = params_yaml.parent
+    config_path = _resolve_config_path(config)
+    cwd = config_path.parent
 
-    dvc_yaml = cwd / "dvc.yaml"
-    dvc_dir = cwd / ".dvc"
-
-    if not dvc_yaml.exists():
-        raise click.ClickException(
-            f"dvc.yaml not found in {cwd}."
-            "\nUse `nanoplm data get-yaml` to generate a dvc.yaml file."
-        )
-
-    if not params_yaml.exists():
-        raise click.ClickException(
-            f"params.yaml not found in {cwd}."
-            "\nUse `nanoplm data get-yaml` to generate a params.yaml file."
-        )
-
-    # Read params early to get pipeline_mode
     try:
-        params = read_yaml(str(params_yaml))
-    except FileNotFoundError as e:
-        raise click.ClickException(str(e)) from e
+        params = read_yaml(str(config_path))
     except Exception as e:
-        raise click.ClickException(f"Failed to read params.yaml: {e}") from e
+        raise click.ClickException(f"Failed to read {config_path}: {e}") from e
 
     data_params = params.get("data_params", {})
-    pipeline_mode = data_params.get("pipeline_mode", "pretrain")
-    selected_pipeline_backend = _resolve_pipeline_backend(
-        pipeline_backend,
-        data_params.get("pipeline_backend"),
+
+    _reject_legacy_pipeline_mode(data_params)
+    _validate_source_fields(params.get("data_dirs", {}))
+
+    kind = _detect_kind(data_params, config_path.name)
+
+    if fix:
+        _flip_drop_invalid(config_path, True)
+        click.echo(f"Set {config_path.name}: data_params.drop_invalid_sequences=true")
+        # Re-read after flip so dvc.yaml is generated with updated value
+        params = read_yaml(str(config_path))
+        data_params = params.get("data_params", {})
+
+    # Regenerate dvc.yaml BEFORE any DVC subprocess call
+    dvc_yaml_path = cwd / "dvc.yaml"
+    dvc_content = generate_dvc_yaml(
+        config=params,
+        kind=kind,
+        params_filename=config_path.name,
     )
-    repro_env = _pipeline_backend_env(selected_pipeline_backend)
+    dvc_yaml_path.write_text(dvc_content, encoding="utf-8")
+    logger.info(f"Regenerated {dvc_yaml_path}")
+    click.echo(f"Regenerated dvc.yaml in {cwd}")
 
-    # Validate pipeline_mode
-    valid_modes = {"none", "pretrain", "distillation"}
-    if pipeline_mode not in valid_modes:
-        raise click.ClickException(
-            f"Invalid pipeline_mode: '{pipeline_mode}'. Must be one of: {', '.join(sorted(valid_modes))}"
-        )
-
+    dvc_dir = cwd / ".dvc"
     if not dvc_dir.exists():
-        if not no_auto_init:
-            try:
-                init_cmd = ["dvc", "init", "-q"]
-                if not inside_git_repo(cwd):
-                    init_cmd.append("--no-scm")
-                elif is_git_subdir(cwd):
-                    init_cmd.append("--subdir")
-                subprocess.run(init_cmd, cwd=str(cwd), check=True)
-                click.echo(f"Initialized DVC repository in: {cwd}")
-            except (subprocess.CalledProcessError, FileNotFoundError) as e:
-                raise click.ClickException(
-                    f"Failed to initialize DVC in {cwd}. Ensure DVC is installed and on PATH. Details: {e}"
-                )
-        else:
+        if no_auto_init:
             raise click.ClickException(
-                f"DVC is not initialized in {cwd}. Run 'dvc init' first."
+                f"DVC is not initialized in {cwd}. Run 'dvc init' first or omit --no-auto-init."
+            )
+        try:
+            init_cmd = ["dvc", "init", "-q"]
+            if not inside_git_repo(cwd):
+                init_cmd.append("--no-scm")
+            elif is_git_subdir(cwd):
+                init_cmd.append("--subdir")
+            subprocess.run(init_cmd, cwd=str(cwd), check=True)
+            click.echo(f"Initialized DVC repository in: {cwd}")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            raise click.ClickException(
+                f"Failed to initialize DVC in {cwd}. Ensure DVC is installed. Details: {e}"
             )
 
-    # Check if on_the_fly mode is enabled for distillation
-    distillation_config = params.get("distillation_config", {})
-    on_the_fly = distillation_config.get("on_the_fly", False)
-
-    # Determine the target stage based on pipeline_mode
-    if target is None:
-        if pipeline_mode == "distillation" and not on_the_fly:
-            # Run full DVC pipeline including KD stages
-            target = None  # No target means run all stages
-            click.echo("Running full pipeline for distillation (pipeline_mode: 'distillation', on_the_fly: false)")
-        else:
-            # For 'none', 'pretrain', and 'distillation' with on_the_fly, only run up to split stage
-            target = "split"
-            if pipeline_mode == "distillation" and on_the_fly:
-                click.echo(f"Running pipeline up to 'split' stage (pipeline_mode: 'distillation', on_the_fly: true)")
-            else:
-                click.echo(f"Running pipeline up to 'split' stage (pipeline_mode: '{pipeline_mode}')")
+    # Build environment for repro
+    max_workers = data_params.get("max_workers")
+    device = data_params.get("device")
+    repro_env = dict(os.environ)
+    if max_workers is not None:
+        repro_env["NANOPLM_MAX_WORKERS"] = str(max_workers)
+    if device is not None:
+        repro_env["NANOPLM_DEVICE"] = str(device)
 
     # Build repro command
-    cmd: list[str] = ["dvc", "repro"]
+    if dry_run:
+        cmd: list[str] = ["dvc", "repro", "--dry", "--allow-missing"]
+    else:
+        cmd = ["dvc", "repro"]
     if verbose:
         cmd.append("-v")
     if force_repro:
@@ -1065,203 +928,247 @@ def from_yaml(
         cmd.append(target)
 
     repro_target_desc = target if target else "full pipeline"
-    click.echo(f"Using data pipeline backend: '{selected_pipeline_backend}'")
-    click.echo(f"Starting DVC reproduction ({repro_target_desc})...")
-    repro_start = time.perf_counter()
+    click.echo(f"Running dvc repro ({repro_target_desc}){'  [dry-run]' if dry_run else ''}...")
     try:
-        subprocess.run(cmd, cwd=str(cwd), check=True, env=repro_env)
+        result = subprocess.run(cmd, cwd=str(cwd), env=repro_env)
+        if result.returncode != 0:
+            raise click.ClickException(f"dvc repro exited with code {result.returncode}")
     except FileNotFoundError:
         raise click.ClickException(
             "'dvc' command not found. Please install DVC (pip install dvc)."
         )
-    except subprocess.CalledProcessError as e:
-        raise click.ClickException(f"dvc repro failed with exit code {e.returncode}")
-    repro_elapsed = time.perf_counter() - repro_start
-    click.echo(f"DVC reproduction completed in {repro_elapsed:.1f}s")
 
-    # Generate pretraining shards if pipeline_mode is 'pretrain'
-    if pipeline_mode == "pretrain":
-        data_dirs = params.get("data_dirs", {})
-        pretrain_config = params.get("pretrain_config", {})
+    if not dry_run:
+        _print_summary(cwd, params, kind)
 
-        splitted_dir = data_dirs.get("splitted_fasta_dir")
-        if not splitted_dir:
-            raise click.ClickException("data_dirs.splitted_fasta_dir is required for pretrain mode")
 
-        train_fasta = _resolve_path(Path(splitted_dir) / "train.fasta", cwd)
-        val_fasta = _resolve_path(Path(splitted_dir) / "val.fasta", cwd)
+# ---------------------------------------------------------------------------
+# Private helpers for from-yaml
+# ---------------------------------------------------------------------------
 
-        # Use output_dir with train/ and val/ subdirectories
-        output_dir = _resolve_path(pretrain_config.get("output_dir", "output/data/pretrain_shards"), cwd)
-        train_data_dir = output_dir / "train"
-        val_data_dir = output_dir / "val"
-        create_dirs(train_data_dir)
-        create_dirs(val_data_dir)
+def _resolve_config_path(config: str | None) -> Path:
+    """Resolve the config argument to an absolute Path.
 
-        max_seq_len = data_params.get("max_seq_len")
-        samples_per_shard = pretrain_config.get("samples_per_shard")
-        max_workers = pretrain_config.get("max_workers")
-        force = pretrain_config.get("force")
-        register_tokens = pretrain_config.get("register_tokens", 0)
+    Resolution order:
+    1. If *config* is given and absolute → use as-is.
+    2. If *config* is given and relative → resolve against cwd.
+    3. If *config* is None → look for data.yaml then distillation_data.yaml in cwd.
+    """
+    cwd = Path.cwd()
+    if config is not None:
+        p = Path(config)
+        if not p.is_absolute():
+            p = (cwd / p).resolve()
+        if not p.exists():
+            raise click.ClickException(f"Config file not found: {p}")
+        return p
+    for candidate in ("data.yaml", "distillation_data.yaml"):
+        p = cwd / candidate
+        if p.exists():
+            return p
+    raise click.ClickException(
+        "No config file found in current directory. "
+        "Pass the path explicitly or run 'nanoplm data get-yaml' first."
+    )
 
-        tokenizer = ProtModernBertTokenizer(num_register_tokens=register_tokens)
-        if register_tokens > 0:
-            click.echo(f"Using {register_tokens} register token(s) after EOS")
 
-        click.echo("Creating binary shards for training dataset...")
-        train_start = time.perf_counter()
-        train_saver = ShardWriter(
-            fasta_path=str(train_fasta),
-            tokenizer=tokenizer,
-            max_length=max_seq_len,
-            output_dir=str(train_data_dir),
-            samples_per_shard=samples_per_shard,
-            max_workers=max_workers,
-            force=force,
-            use_native=_use_native_backend(selected_pipeline_backend),
+def _reject_legacy_pipeline_mode(data_params: dict) -> None:
+    """Raise ClickException if the legacy pipeline_mode key is present."""
+    if "pipeline_mode" in data_params:
+        raise click.ClickException(
+            "The 'pipeline_mode' field is no longer supported. "
+            "Remove 'data_params.pipeline_mode' from your config file."
         )
-        train_shards = train_saver.create_shards()
-        train_sequences = train_saver.sequence_count
-        if train_sequences is None:
+
+
+def _validate_source_fields(data_dirs: dict) -> None:
+    """Validate data_dirs source/output fields.
+
+    - Exactly one of url / local_fasta must be set.
+    - The chosen source must end with .fasta or .fasta.gz.
+    - extracted_fasta is always required.
+    - compressed_fasta is required only when the source is gzipped.
+      In plain-.fasta mode it is optional; warn if it's set anyway.
+    """
+    from nanoplm.cli._dvc_yaml_gen import _source_is_compressed
+    from nanoplm.utils.logger import logger
+
+    url = data_dirs.get("url") or None
+    local_fasta = data_dirs.get("local_fasta") or None
+    if url and local_fasta:
+        raise click.ClickException(
+            "Set either data_dirs.url or data_dirs.local_fasta, not both."
+        )
+    if not url and not local_fasta:
+        raise click.ClickException(
+            "Either data_dirs.url or data_dirs.local_fasta must be set."
+        )
+
+    source = url if url else local_fasta
+    is_compressed = _source_is_compressed(source)
+    # Extension whitelist: must end in .fasta or .fasta.gz (after stripping URL query/fragment).
+    from urllib.parse import urlparse
+    suffix_target = urlparse(source).path if "://" in source else source
+    if not (suffix_target.endswith(".fasta") or suffix_target.endswith(".fasta.gz")):
+        raise click.ClickException(
+            f"url/local_fasta must end with .fasta or .fasta.gz, got: {source}"
+        )
+
+    extracted = data_dirs.get("extracted_fasta") or None
+    if not extracted:
+        raise click.ClickException("data_dirs.extracted_fasta is required.")
+
+    compressed = data_dirs.get("compressed_fasta") or None
+    if is_compressed and not compressed:
+        raise click.ClickException(
+            "data_dirs.compressed_fasta is required when source is a .gz file."
+        )
+    if (not is_compressed) and compressed:
+        logger.warning(
+            "data_dirs.compressed_fasta is unused when source is a plain .fasta file; "
+            "it can be removed."
+        )
+
+
+def _detect_kind(data_params: dict, filename: str) -> str:
+    """Detect pipeline kind from the config filename or data_params keys."""
+    if "distillation" in filename:
+        return "distillation"
+    if "teacher_model" in data_params or "embed_calc_batch_size" in data_params:
+        return "distillation"
+    return "pretrain"
+
+
+def _flip_drop_invalid(config_path: Path, value: bool) -> None:
+    """Edit a single key in YAML preserving file structure as best as we can."""
+    import re
+    text = config_path.read_text()
+    new_val = "true" if value else "false"
+    pattern = re.compile(r"^(\s*drop_invalid_sequences\s*:\s*)(true|false)(\s*(?:#.*)?)$", re.M)
+    new_text, n = pattern.subn(rf"\g<1>{new_val}\g<3>", text)
+    if n == 0:
+        raise click.ClickException(
+            "Couldn't find drop_invalid_sequences in config to flip."
+        )
+    config_path.write_text(new_text)
+
+
+def _print_summary(cwd: Path, params: dict, kind: str) -> None:
+    """Print a human-readable summary using .data_manifest if present."""
+    import yaml as _yaml
+    output_dir = Path(params["data_dirs"]["output_dir"])
+    manifest_path = (cwd / output_dir / ".data_manifest") if not output_dir.is_absolute() \
+        else (output_dir / ".data_manifest")
+    if not manifest_path.exists():
+        click.echo("Pipeline completed (no manifest found).")
+        return
+    m = _yaml.safe_load(manifest_path.read_text())
+    title = "Pretraining" if kind == "pretrain" else "Distillation"
+    src = params["data_dirs"].get("url") or params["data_dirs"].get("local_fasta")
+    click.echo(
+        f"\n{title} data pipeline complete.\n\n"
+        f"  Source:          {src}\n"
+        f"  Total sequences: {m.get('seqs_num')}\n"
+        f"    Train:         {m.get('train_sequences')}\n"
+        f"    Val:           {m.get('val_sequences')}\n"
+        f"  Manifest:        {manifest_path}\n"
+    )
+
+
+@data.command("write-manifest", hidden=True)
+@click.option("--kind", required=True, type=click.Choice(["pretrain", "distillation"]))
+@click.option("--output", "-o", required=True, type=click.Path(file_okay=False))
+@click.option("--min-seq-len", required=True, type=int)
+@click.option("--max-seq-len", required=True, type=int)
+@click.option("--val-ratio", required=True, type=float)
+@click.option("--samples-per-shard", required=True, type=int)
+@click.option("--register-tokens", type=int, default=0)
+@click.option("--teacher-model", type=str, default=None)
+@click.help_option("--help", "-h")
+def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
+                       samples_per_shard, register_tokens, teacher_model):
+    """Internal: write .data_manifest after shard generation."""
+    output_dir = Path(output)
+    train_dir = output_dir / "train"
+    val_dir = output_dir / "val"
+    for d, name in [(train_dir, "train"), (val_dir, "val")]:
+        if not d.is_dir():
             raise click.ClickException(
-                "Failed to determine training sequence count after shard generation."
+                f"write-manifest: expected shard directory not found: {d}. "
+                f"Run the shard-writing stage before write-manifest."
             )
-        click.echo(
-            f"Training shard generation completed in {time.perf_counter() - train_start:.1f}s"
-        )
+    if kind == "pretrain":
+        train_count = _count_pretrain_shard_sequences(train_dir)
+        val_count = _count_pretrain_shard_sequences(val_dir)
+    else:
+        train_count = _count_distill_h5_sequences(train_dir)
+        val_count = _count_distill_h5_sequences(val_dir)
 
-        click.echo("Creating binary shards for validation dataset...")
-        val_start = time.perf_counter()
-        val_saver = ShardWriter(
-            fasta_path=str(val_fasta),
-            tokenizer=tokenizer,
-            max_length=max_seq_len,
-            output_dir=str(val_data_dir),
-            samples_per_shard=samples_per_shard,
-            max_workers=max_workers,
-            force=force,
-            use_native=_use_native_backend(selected_pipeline_backend),
-        )
-        val_shards = val_saver.create_shards()
-        val_sequences = val_saver.sequence_count
-        if val_sequences is None:
-            raise click.ClickException(
-                "Failed to determine validation sequence count after shard generation."
-            )
-        click.echo(
-            f"Validation shard generation completed in {time.perf_counter() - val_start:.1f}s"
-        )
-
-        # Write manifest
+    if kind == "pretrain":
         manifest = PretrainManifest(
             pipeline_mode="pretrain",
-            seqs_num=train_sequences + val_sequences,
-            min_seq_len=data_params.get("min_seq_len"),
+            seqs_num=train_count + val_count,
+            min_seq_len=min_seq_len,
             max_seq_len=max_seq_len,
-            val_ratio=data_params.get("val_ratio"),
+            val_ratio=val_ratio,
             train_dir="train",
             val_dir="val",
-            train_sequences=train_sequences,
-            val_sequences=val_sequences,
+            train_sequences=train_count,
+            val_sequences=val_count,
             sharded=True,
             samples_per_shard=samples_per_shard,
         )
-        manifest_path = write_manifest(output_dir, manifest)
-
-        click.echo(
-            "Pretraining shard generation complete:\n"
-            f"  Train shards: {len(train_shards)} ({train_sequences} sequences) -> {train_data_dir}\n"
-            f"  Val shards:   {len(val_shards)} ({val_sequences} sequences) -> {val_data_dir}\n"
-            f"  Manifest: {manifest_path}"
-        )
-    elif pipeline_mode == "distillation":
-        # Write manifest for distillation
-        distillation_config = params.get("distillation_config", {})
-        output_dir = _resolve_path(distillation_config.get("output_dir", "output/data/kd_dataset"), cwd)
-        on_the_fly = distillation_config.get("on_the_fly", False)
-
-        if on_the_fly:
-            # On-the-fly mode: Create manifest with FASTA paths (no embedding generation)
-            data_dirs = params.get("data_dirs", {})
-            splitted_dir = data_dirs.get("splitted_fasta_dir")
-            if not splitted_dir:
-                raise click.ClickException("data_dirs.splitted_fasta_dir is required for distillation mode")
-
-            train_fasta = _resolve_path(Path(splitted_dir) / "train.fasta", cwd)
-            val_fasta = _resolve_path(Path(splitted_dir) / "val.fasta", cwd)
-
-            # Count sequences from FASTA files
-            train_sequences = _count_sequences_in_fasta(train_fasta)
-            val_sequences = _count_sequences_in_fasta(val_fasta)
-
-            manifest = DistillationManifest(
-                pipeline_mode="distillation",
-                seqs_num=train_sequences + val_sequences,
-                min_seq_len=data_params.get("min_seq_len"),
-                max_seq_len=data_params.get("max_seq_len"),
-                val_ratio=data_params.get("val_ratio"),
-                train_dir="train",
-                val_dir="val",
-                train_sequences=train_sequences,
-                val_sequences=val_sequences,
-                teacher_model=distillation_config.get("teacher_model"),
-                on_the_fly=True,
-                train_fasta=str(train_fasta),
-                val_fasta=str(val_fasta),
-            )
-            manifest_path = write_manifest(output_dir, manifest)
-
-            click.echo(
-                f"Distillation manifest created (on-the-fly mode):\n"
-                f"  Train FASTA: {train_fasta} ({train_sequences} sequences)\n"
-                f"  Val FASTA: {val_fasta} ({val_sequences} sequences)\n"
-                f"  Manifest: {manifest_path}\n"
-                f"  Note: Teacher embeddings will be generated during training"
-            )
-        else:
-            # Pre-computed mode: Create manifest with H5 paths (after DVC pipeline completes)
-            # Count sequences from generated files
-            train_sequences = _count_sequences_in_dir(output_dir / "train")
-            val_sequences = _count_sequences_in_dir(output_dir / "val")
-
-            # Determine H5 prefix names
-            train_h5_files = list((output_dir / "train").glob("*.h5"))
-            val_h5_files = list((output_dir / "val").glob("*.h5"))
-
-            # Get the base prefix (e.g., "train_kd_dataset.h5" from "train_kd_dataset_shard_0000.h5")
-            train_h5_prefix = _get_h5_prefix(train_h5_files) if train_h5_files else "train_kd_dataset.h5"
-            val_h5_prefix = _get_h5_prefix(val_h5_files) if val_h5_files else "val_kd_dataset.h5"
-
-            samples_per_shard = distillation_config.get("samples_per_shard")
-            sharded = samples_per_shard > 0
-
-            manifest = DistillationManifest(
-                pipeline_mode="distillation",
-                seqs_num=train_sequences + val_sequences,
-                min_seq_len=data_params.get("min_seq_len"),
-                max_seq_len=data_params.get("max_seq_len"),
-                val_ratio=data_params.get("val_ratio"),
-                train_dir="train",
-                val_dir="val",
-                train_sequences=train_sequences,
-                val_sequences=val_sequences,
-                sharded=sharded,
-                samples_per_shard=samples_per_shard,
-                teacher_model=distillation_config.get("teacher_model"),
-                train_h5_prefix=train_h5_prefix,
-                val_h5_prefix=val_h5_prefix,
-                on_the_fly=False,
-            )
-            manifest_path = write_manifest(output_dir, manifest)
-
-            click.echo(
-                f"Distillation dataset generation complete:\n"
-                f"  Train: {train_sequences} sequences -> {output_dir / 'train'}\n"
-                f"  Val: {val_sequences} sequences -> {output_dir / 'val'}\n"
-                f"  Manifest: {manifest_path}"
-            )
     else:
-        click.echo("Data preparation complete (pipeline_mode: 'none')")
+        # Pre-computed distillation mode requires train_h5_prefix and val_h5_prefix.
+        # Derive them from files present in the shard dirs.
+        train_h5_files = list(train_dir.glob("*.h5"))
+        val_h5_files = list(val_dir.glob("*.h5"))
+        train_h5_prefix = _get_h5_prefix(train_h5_files) if train_h5_files else "train_kd_dataset.h5"
+        val_h5_prefix = _get_h5_prefix(val_h5_files) if val_h5_files else "val_kd_dataset.h5"
+        manifest = DistillationManifest(
+            pipeline_mode="distillation",
+            seqs_num=train_count + val_count,
+            min_seq_len=min_seq_len,
+            max_seq_len=max_seq_len,
+            val_ratio=val_ratio,
+            train_dir="train",
+            val_dir="val",
+            train_sequences=train_count,
+            val_sequences=val_count,
+            sharded=samples_per_shard > 0,
+            samples_per_shard=samples_per_shard,
+            teacher_model=teacher_model or "",
+            train_h5_prefix=train_h5_prefix,
+            val_h5_prefix=val_h5_prefix,
+            on_the_fly=False,
+        )
+    write_manifest(output_dir, manifest)
+    click.echo(f"Wrote manifest: {output_dir / '.data_manifest'}")
+
+
+def _count_pretrain_shard_sequences(shard_dir: Path) -> int:
+    """Sum sequence counts from each .idx.npy in the dir.
+
+    Each shard's .idx.npy is an int32 array of per-sequence sizes (length N
+    for N sequences), per the C writer (fast_fasta_shard_writer.c) and the
+    ShardedDataset loader.
+    """
+    import numpy as np
+    total = 0
+    for idx_path in sorted(shard_dir.glob("shard_*.idx.npy")):
+        arr = np.load(idx_path)
+        total += len(arr)
+    return total
+
+
+def _count_distill_h5_sequences(shard_dir: Path) -> int:
+    """Sum group counts across all H5 files in the dir."""
+    import h5py
+    total = 0
+    for h5_path in sorted(shard_dir.glob("*.h5")):
+        with h5py.File(h5_path, "r") as f:
+            total += sum(1 for k in f.keys() if k.isdigit())
+    return total
 
 
 def _resolve_path(path_value: str | Path, cwd: Path) -> Path:
@@ -1270,48 +1177,6 @@ def _resolve_path(path_value: str | Path, cwd: Path) -> Path:
         path = (cwd / path).resolve()
     return path
 
-
-def _count_sequences_in_dir(directory: Path) -> int:
-    """Count total sequences in all H5 files in a directory.
-    This is to handle these two scenarios (otherwise we could have calcualted these using max_seq_num and val_ratio)
-    1. If you request 20,000 sequences but the file ends after finding only 15,000 valid ones, it stops there. In this case, using the calculation would be wrong (you'd mistakenly think you have 20,000).
-    2. If you use seqs_num: -1 (the default for "use everything"), you don't know the final count until the process finishes.
-
-    Supports two formats:
-    1. KD dataset format: each sequence is a numbered group (e.g., "0", "1", "2")
-    2. Array format: sequences stored as arrays in datasets like "input_ids", "embeddings", etc.
-    """
-    import h5py
-
-    total = 0
-    h5_files = list(directory.glob("*.h5"))
-
-    for h5_file in h5_files:
-        try:
-            with h5py.File(h5_file, "r") as f:
-                # Try to count groups first (KD dataset format)
-                # Groups are named with string integers like "0", "1", "2"
-                group_count = 0
-                for key in f.keys():
-                    if key.isdigit():
-                        group_count += 1
-
-                if group_count > 0:
-                    total += group_count
-                else:
-                    # Fall back to common dataset names (array format)
-                    if "input_ids" in f:
-                        total += len(f["input_ids"])
-                    elif "sequences" in f:
-                        total += len(f["sequences"])
-                    elif "embeddings" in f:
-                        total += len(f["embeddings"])
-                    elif "teacher_embeddings" in f:
-                        total += len(f["teacher_embeddings"])
-        except Exception:
-            pass
-
-    return total
 
 
 def _get_h5_prefix(h5_files: list) -> str:
@@ -1334,17 +1199,3 @@ def _get_h5_prefix(h5_files: list) -> str:
         return first_file
 
 
-def _count_sequences_in_fasta(fasta_path: Path) -> int:
-    """Count sequences in a FASTA file."""
-    from Bio import SeqIO
-
-    count = 0
-    try:
-        with open(fasta_path, "r") as f:
-            for _ in SeqIO.parse(f, "fasta"):
-                count += 1
-    except Exception as e:
-        click.echo(f"Warning: Could not count sequences in {fasta_path}: {e}", err=True)
-        return 0
-
-    return count

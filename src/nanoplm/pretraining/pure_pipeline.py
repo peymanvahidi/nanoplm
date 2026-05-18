@@ -51,13 +51,13 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from nanoplm.data.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline
 from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
     build_power_of_two_buckets,
 )
-from nanoplm.pretraining.dataset import ShardedDataset, TokenPackingDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.fp8 import (
     Float8Linear,
     Float8LinearConfig,

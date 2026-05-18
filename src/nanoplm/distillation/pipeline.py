@@ -34,12 +34,12 @@ from nanoplm.distillation.trainer import DistillationTrainer
 from nanoplm.distillation.models.student import ProtX, ProtXConfig, ProtXTokenizer
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.distillation.models.teacher import ProtT5
-from nanoplm.distillation.dataset import (
+from nanoplm.data.datasets.distill import (
     KDDatasetOnTheFly,
     LoadKDDataset,
 )
-from nanoplm.data.manifest import get_dataset_paths
-from nanoplm.data.validation import validate_distillation_dataset, ValidationError
+from nanoplm.data.infra.manifest import get_dataset_paths
+from nanoplm.data.infra.validation import validate_distillation_dataset, ValidationError
 from nanoplm.pretraining.utils import _read_checkpoint_epoch
 from nanoplm.utils import get_device, logger, create_dirs
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
@@ -319,6 +319,9 @@ def _prepare_run_and_steps(
 def _resolve_config_from_manifest(distill_config: DistillationConfig) -> DistillationConfig:
     """Resolve config values from manifest if dataset_dir is provided.
 
+    Accepts both PretrainManifest (forces on-the-fly KD) and DistillationManifest
+    (existing behaviour unchanged).
+
     Args:
         distill_config: The distillation configuration
 
@@ -328,7 +331,66 @@ def _resolve_config_from_manifest(distill_config: DistillationConfig) -> Distill
     if distill_config.dataset_dir is None:
         return distill_config
 
+    from nanoplm.data.infra.manifest import (
+        PretrainManifest,
+        DistillationManifest,
+        read_manifest,
+    )
+
     dataset_dir = Path(distill_config.dataset_dir)
+    manifest = read_manifest(dataset_dir)
+
+    if isinstance(manifest, PretrainManifest):
+        return _resolve_from_pretrain_manifest(distill_config, manifest, dataset_dir)
+
+    if isinstance(manifest, DistillationManifest):
+        return _resolve_from_distillation_manifest(distill_config, dataset_dir)
+
+    raise ValueError(
+        f"Unsupported manifest type at {dataset_dir}: {type(manifest).__name__}"
+    )
+
+
+def _resolve_from_pretrain_manifest(
+    distill_config: DistillationConfig,
+    manifest,  # PretrainManifest
+    dataset_dir: Path,
+) -> DistillationConfig:
+    """Use a PretrainManifest for on-the-fly KD.
+
+    The pretrain manifest records only shard directories, not FASTA splits, so
+    the caller must supply train_fasta/val_fasta explicitly via DistillationConfig.
+    """
+    logger.info(
+        f"Pretrain manifest at {dataset_dir} — using on-the-fly KD. "
+        f"train_fasta/val_fasta must be set explicitly."
+    )
+    if not distill_config.train_fasta or not distill_config.val_fasta:
+        raise ValueError(
+            "Pretrain manifest does not record FASTA paths. Set train_fasta "
+            "and val_fasta on DistillationConfig (typically pointing at the "
+            "splitted FASTA files used to build the pretrain shards)."
+        )
+    distill_config.on_the_fly = True
+    if not distill_config.max_seq_len:
+        distill_config.max_seq_len = manifest.max_seq_len
+    if not distill_config.max_seqs_num:
+        distill_config.max_seqs_num = manifest.train_sequences + manifest.val_sequences
+    if distill_config.val_ratio is None:
+        distill_config.val_ratio = manifest.val_ratio
+    distill_config.train_sequences = manifest.train_sequences
+    distill_config.val_sequences = manifest.val_sequences
+    logger.info(f"  train_fasta: {distill_config.train_fasta}")
+    logger.info(f"  val_fasta: {distill_config.val_fasta}")
+    logger.info(f"  max_seq_len: {distill_config.max_seq_len}")
+    return distill_config
+
+
+def _resolve_from_distillation_manifest(
+    distill_config: DistillationConfig,
+    dataset_dir: Path,
+) -> DistillationConfig:
+    """Existing distillation manifest handling (unchanged behaviour)."""
 
     # Validate dataset before starting training (reads + validates manifest and data files)
     logger.info(f"Validating distillation dataset at {dataset_dir}...")

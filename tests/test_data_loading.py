@@ -98,7 +98,7 @@ class TestFileHandlePool:
 
     def test_detect_file_limits(self):
         """Test that file limit detection returns reasonable values."""
-        from nanoplm.data.file_pool import detect_file_limits
+        from nanoplm.data.infra.file_pool import detect_file_limits
 
         limit = detect_file_limits(num_workers=4)
         assert limit >= 5, "Should return at least 5 files per worker"
@@ -107,7 +107,7 @@ class TestFileHandlePool:
 
     def test_lru_eviction(self, temp_dir):
         """Test that LRU eviction works when pool is full."""
-        from nanoplm.data.file_pool import ThreadSafeFileHandlePool
+        from nanoplm.data.infra.file_pool import ThreadSafeFileHandlePool
 
         # Create test files
         for i in range(5):
@@ -128,7 +128,7 @@ class TestFileHandlePool:
 
     def test_cache_hit(self, temp_dir):
         """Test that repeated access uses cache."""
-        from nanoplm.data.file_pool import ThreadSafeFileHandlePool
+        from nanoplm.data.infra.file_pool import ThreadSafeFileHandlePool
 
         with h5py.File(temp_dir / 'test.h5', 'w') as f:
             f.create_dataset('data', data=np.arange(10))
@@ -149,7 +149,7 @@ class TestFileHandlePool:
     def test_pickle_support(self, temp_dir):
         """Test that pool can be pickled (for DataLoader workers)."""
         import pickle
-        from nanoplm.data.file_pool import ThreadSafeFileHandlePool
+        from nanoplm.data.infra.file_pool import ThreadSafeFileHandlePool
 
         with h5py.File(temp_dir / 'test.h5', 'w') as f:
             f.create_dataset('data', data=np.arange(10))
@@ -175,7 +175,7 @@ class TestValidation:
 
     def test_missing_manifest_error(self, temp_dir):
         """Test that missing manifest gives helpful error."""
-        from nanoplm.data.validation import validate_dataset_manifest
+        from nanoplm.data.infra.validation import validate_dataset_manifest
 
         with pytest.raises(FileNotFoundError) as exc_info:
             validate_dataset_manifest(temp_dir / '.data_manifest')
@@ -184,7 +184,7 @@ class TestValidation:
 
     def test_valid_manifest_parsing(self, pretrain_manifest):
         """Test that valid manifest is parsed correctly."""
-        from nanoplm.data.validation import validate_dataset_manifest
+        from nanoplm.data.infra.validation import validate_dataset_manifest
 
         result = validate_dataset_manifest(pretrain_manifest)
         assert result['pipeline_mode'] == 'pretrain'
@@ -192,14 +192,14 @@ class TestValidation:
 
     def test_shard_validation_success(self, pretrain_shards):
         """Test that valid shards pass validation."""
-        from nanoplm.data.validation import validate_shard_files
+        from nanoplm.data.infra.validation import validate_shard_files
 
         paths = validate_shard_files(pretrain_shards)
         assert len(paths) == 5
 
     def test_shard_validation_missing_file(self, pretrain_shards):
         """Test that missing shard is detected."""
-        from nanoplm.data.validation import validate_shard_files, ValidationError
+        from nanoplm.data.infra.validation import validate_shard_files, ValidationError
 
         # Remove one shard
         (pretrain_shards / 'shard_0002.h5').unlink()
@@ -214,7 +214,7 @@ class TestValidation:
 
     def test_shard_validation_empty_dataset(self, temp_dir):
         """Test that empty shard is detected."""
-        from nanoplm.data.validation import validate_shard_files, ValidationError
+        from nanoplm.data.infra.validation import validate_shard_files, ValidationError
 
         # Create shard with empty dataset
         with h5py.File(temp_dir / 'shard_0000.h5', 'w') as f:
@@ -286,7 +286,7 @@ class TestDistillationDataset:
 
     def test_dataset_creation(self, distill_shards):
         """Test that dataset can be created."""
-        from nanoplm.distillation.dataset import LoadKDDataset
+        from nanoplm.data.datasets.distill import LoadKDDataset
 
         dataset = LoadKDDataset(
             h5_path=str(distill_shards),
@@ -298,7 +298,7 @@ class TestDistillationDataset:
 
     def test_item_access(self, distill_shards):
         """Test that items can be accessed."""
-        from nanoplm.distillation.dataset import LoadKDDataset
+        from nanoplm.data.datasets.distill import LoadKDDataset
 
         dataset = LoadKDDataset(
             h5_path=str(distill_shards),
