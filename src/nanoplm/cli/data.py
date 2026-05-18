@@ -271,6 +271,13 @@ def extract(input: str, output: str, force: bool):
     "--seed", type=int, default=None, help="Random seed for shuffling (optional)"
 )
 @click.option(
+    "--shuffle",
+    "shuffle_flag",
+    default="true",
+    type=click.Choice(["true", "false"], case_sensitive=False),
+    help="If false, skip shuffling and symlink (or copy) input to output.",
+)
+@click.option(
     "--pipeline-backend",
     type=click.Choice(_PIPELINE_BACKEND_CHOICES),
     default="legacy",
@@ -278,7 +285,7 @@ def extract(input: str, output: str, force: bool):
     help="Pipeline backend: legacy disables native C path, fast enables native C path when available.",
 )
 @click.help_option("--help", "-h")
-def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: str):
+def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str, pipeline_backend: str):
     """Shuffle sequences in a FASTA file."""
     # Check if the input file is a .fasta file
     if not input.endswith(".fasta"):
@@ -293,11 +300,14 @@ def shuffle(input: str, output: str, backend: str, seed: int, pipeline_backend: 
         # replace .fasta with _shuffled.fasta
         output_path = output_path / input_path.name.replace(".fasta", "_shuffled.fasta")
 
+    do_shuffle = shuffle_flag.lower() == "true"
+
     try:
         shuffler = FastaShuffler(
             input_path=input_path,
             output_path=output_path,
             seed=seed,
+            do_shuffle=do_shuffle,
         )
         shuffler.shuffle()
     except ShufflingError as e:
