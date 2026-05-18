@@ -128,3 +128,102 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     after = cfg.read_text()
     assert "# swissprot:" in after
     assert "drop_invalid_sequences: true" in after
+
+
+def _make_cfg(tmp_path, **overrides):
+    """Build a minimal data.yaml. Pass overrides for data_dirs fields."""
+    import yaml as _yaml
+    data_dirs = {
+        "url": None,
+        "local_fasta": None,
+        "compressed_fasta": "out/raw/x.fasta.gz",
+        "extracted_fasta": "out/raw/x.fasta",
+        "validation_dir": "out/val",
+        "shuffled_fasta": "out/s.fasta",
+        "filtered_fasta": "out/f.fasta",
+        "splitted_fasta_dir": "out/split",
+        "output_dir": "out/pretrain",
+    }
+    data_dirs.update(overrides)
+    cfg = {
+        "data_dirs": data_dirs,
+        "data_params": {
+            "seqs_num": 100, "min_seq_len": 1, "max_seq_len": 100,
+            "val_ratio": 0.1, "shuffle": True, "shuffle_seed": 24,
+            "drop_invalid_sequences": False,
+            "samples_per_shard": 10, "max_workers": 1, "register_tokens": 0,
+        },
+    }
+    p = tmp_path / "data.yaml"
+    p.write_text(_yaml.safe_dump(cfg))
+    return p
+
+
+def test_from_yaml_rejects_bad_local_fasta_extension(tmp_path):
+    cfg = _make_cfg(tmp_path, local_fasta="data.txt")
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg)])
+    assert result.exit_code != 0
+    assert ".fasta" in result.output
+
+
+def test_from_yaml_rejects_bad_url_extension(tmp_path):
+    cfg = _make_cfg(tmp_path, url="https://example.com/data.zip")
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg)])
+    assert result.exit_code != 0
+    assert ".fasta" in result.output
+
+
+def test_from_yaml_requires_compressed_fasta_in_gz_mode(tmp_path):
+    cfg = _make_cfg(tmp_path, url="https://example.com/x.fasta.gz",
+                    compressed_fasta=None)
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg)])
+    assert result.exit_code != 0
+    assert "compressed_fasta" in result.output
+
+
+def test_from_yaml_requires_extracted_fasta(tmp_path):
+    cfg = _make_cfg(tmp_path, url="https://example.com/x.fasta.gz",
+                    extracted_fasta=None)
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg)])
+    assert result.exit_code != 0
+    assert "extracted_fasta" in result.output
+
+
+def test_from_yaml_warns_when_compressed_fasta_set_in_plain_mode(tmp_path, monkeypatch):
+    """Plain .fasta source + compressed_fasta set => succeeds with warning."""
+    cfg = _make_cfg(tmp_path,
+                    local_fasta=str(tmp_path / "x.fasta"),
+                    compressed_fasta="out/raw/x.fasta.gz")
+    (tmp_path / "x.fasta").write_text(">a\nMAGV\n")
+    monkeypatch.setattr("subprocess.run",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+    monkeypatch.chdir(tmp_path)
+
+    # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
+    warnings_seen = []
+    from nanoplm.utils.logger import logger as _nplm_logger
+    monkeypatch.setattr(_nplm_logger, "warning",
+                        lambda msg, *a, **k: warnings_seen.append(msg))
+
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert any("unused" in w for w in warnings_seen)
+
+
+def test_from_yaml_plain_local_omits_compressed_fasta_ok(tmp_path, monkeypatch):
+    """Plain .fasta source with compressed_fasta missing => succeeds (it's optional here)."""
+    cfg = _make_cfg(tmp_path,
+                    local_fasta=str(tmp_path / "x.fasta"),
+                    compressed_fasta=None)
+    (tmp_path / "x.fasta").write_text(">a\nMAGV\n")
+    monkeypatch.setattr("subprocess.run",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
+    assert result.exit_code == 0, result.output

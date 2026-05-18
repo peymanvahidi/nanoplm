@@ -1033,7 +1033,17 @@ def _reject_legacy_pipeline_mode(data_params: dict) -> None:
 
 
 def _validate_source_fields(data_dirs: dict) -> None:
-    """Ensure exactly one of url / local_fasta is set (not both, not neither)."""
+    """Validate data_dirs source/output fields.
+
+    - Exactly one of url / local_fasta must be set.
+    - The chosen source must end with .fasta or .fasta.gz.
+    - extracted_fasta is always required.
+    - compressed_fasta is required only when the source is gzipped.
+      In plain-.fasta mode it is optional; warn if it's set anyway.
+    """
+    from nanoplm.cli._dvc_yaml_gen import _source_is_compressed
+    from nanoplm.utils.logger import logger
+
     url = data_dirs.get("url") or None
     local_fasta = data_dirs.get("local_fasta") or None
     if url and local_fasta:
@@ -1043,6 +1053,31 @@ def _validate_source_fields(data_dirs: dict) -> None:
     if not url and not local_fasta:
         raise click.ClickException(
             "Either data_dirs.url or data_dirs.local_fasta must be set."
+        )
+
+    source = url if url else local_fasta
+    is_compressed = _source_is_compressed(source)
+    # Extension whitelist: must end in .fasta or .fasta.gz (after stripping URL query/fragment).
+    from urllib.parse import urlparse
+    suffix_target = urlparse(source).path if "://" in source else source
+    if not (suffix_target.endswith(".fasta") or suffix_target.endswith(".fasta.gz")):
+        raise click.ClickException(
+            f"url/local_fasta must end with .fasta or .fasta.gz, got: {source}"
+        )
+
+    extracted = data_dirs.get("extracted_fasta") or None
+    if not extracted:
+        raise click.ClickException("data_dirs.extracted_fasta is required.")
+
+    compressed = data_dirs.get("compressed_fasta") or None
+    if is_compressed and not compressed:
+        raise click.ClickException(
+            "data_dirs.compressed_fasta is required when source is a .gz file."
+        )
+    if (not is_compressed) and compressed:
+        logger.warning(
+            "data_dirs.compressed_fasta is unused when source is a plain .fasta file; "
+            "it can be removed."
         )
 
 
