@@ -55,39 +55,49 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str) -> str:
         raise ValueError(f"kind must be pretrain or distillation, got {kind}")
 
     data_dirs = config["data_dirs"]
+    url = data_dirs.get("url")
     local_fasta = data_dirs.get("local_fasta")
+    source = url if url else local_fasta
+    # If both source fields are empty, the validator (_validate_source_fields)
+    # would have already rejected the config; the `else True` is a defensive
+    # default and the actual stage shape doesn't matter in that case.
+    is_compressed = _source_is_compressed(source) if source else True
 
     stages: dict[str, Any] = {}
 
-    # get_file
+    # get_file — output target depends on whether the source is compressed.
+    get_file_outs_field = "compressed_fasta" if is_compressed else "extracted_fasta"
     get_file_stage: dict[str, Any] = {
         "deps": [_resolve_pkg_dep("src/nanoplm/data/preparation/downloader.py")],
-        "params": [{params_filename: ["data_dirs.url", "data_dirs.compressed_fasta"]}],
-        "outs": ["${data_dirs.compressed_fasta}"],
+        "outs": [f"${{data_dirs.{get_file_outs_field}}}"],
     }
     if local_fasta:
         get_file_stage["cmd"] = (
             f"nanoplm data get-file --local-fasta \"${{data_dirs.local_fasta}}\" "
-            f"-o ${{data_dirs.compressed_fasta}}"
+            f"-o ${{data_dirs.{get_file_outs_field}}}"
         )
         get_file_stage["deps"].insert(0, "${data_dirs.local_fasta}")
         get_file_stage["params"] = [
-            {params_filename: ["data_dirs.local_fasta", "data_dirs.compressed_fasta"]}
+            {params_filename: ["data_dirs.local_fasta", f"data_dirs.{get_file_outs_field}"]}
         ]
     else:
         get_file_stage["cmd"] = (
             f"nanoplm data get-file --url \"${{data_dirs.url}}\" "
-            f"-o ${{data_dirs.compressed_fasta}}"
+            f"-o ${{data_dirs.{get_file_outs_field}}}"
         )
+        get_file_stage["params"] = [
+            {params_filename: ["data_dirs.url", f"data_dirs.{get_file_outs_field}"]}
+        ]
     stages["get_file"] = get_file_stage
 
-    # extract
-    stages["extract"] = {
-        "cmd": "nanoplm data extract -i ${data_dirs.compressed_fasta} -o ${data_dirs.extracted_fasta}",
-        "deps": ["${data_dirs.compressed_fasta}", _resolve_pkg_dep("src/nanoplm/data/preparation/extractor.py")],
-        "params": [{params_filename: ["data_dirs.extracted_fasta"]}],
-        "outs": ["${data_dirs.extracted_fasta}"],
-    }
+    # extract — only emitted when the source is compressed.
+    if is_compressed:
+        stages["extract"] = {
+            "cmd": "nanoplm data extract -i ${data_dirs.compressed_fasta} -o ${data_dirs.extracted_fasta}",
+            "deps": ["${data_dirs.compressed_fasta}", _resolve_pkg_dep("src/nanoplm/data/preparation/extractor.py")],
+            "params": [{params_filename: ["data_dirs.extracted_fasta"]}],
+            "outs": ["${data_dirs.extracted_fasta}"],
+        }
 
     # check
     stages["check"] = {

@@ -133,3 +133,53 @@ def test_distillation_uses_distillation_yaml_filename():
 ])
 def test_source_is_compressed(source, expected):
     assert _source_is_compressed(source) is expected
+
+
+PLAIN_LOCAL_CONFIG = {
+    **PRETRAIN_URL_CONFIG,
+    "data_dirs": {**PRETRAIN_URL_CONFIG["data_dirs"], "url": None,
+                  "local_fasta": "/local/path/x.fasta"},
+}
+
+PLAIN_URL_CONFIG = {
+    **PRETRAIN_URL_CONFIG,
+    "data_dirs": {**PRETRAIN_URL_CONFIG["data_dirs"],
+                  "url": "https://example.com/x.fasta"},
+}
+
+
+@pytest.mark.parametrize("config,is_compressed", [
+    (PRETRAIN_URL_CONFIG, True),        # .fasta.gz URL
+    (PRETRAIN_LOCAL_CONFIG, True),      # .fasta.gz local
+    (PLAIN_URL_CONFIG, False),          # plain .fasta URL
+    (PLAIN_LOCAL_CONFIG, False),        # plain .fasta local
+])
+def test_dvc_yaml_extract_stage_matches_compression(config, is_compressed):
+    out = generate_dvc_yaml(config, kind="pretrain", params_filename="data.yaml")
+    parsed = yaml.safe_load(out)
+    stages = parsed["stages"]
+
+    if is_compressed:
+        assert "extract" in stages
+        assert stages["get_file"]["outs"] == ["${data_dirs.compressed_fasta}"]
+    else:
+        assert "extract" not in stages
+        # When source is plain, get_file writes the extracted file directly
+        assert stages["get_file"]["outs"] == ["${data_dirs.extracted_fasta}"]
+        # Downstream stages must still reference extracted_fasta unchanged
+        assert "${data_dirs.extracted_fasta}" in stages["check"]["deps"]
+        assert "${data_dirs.extracted_fasta}" in stages["shuffle"]["deps"]
+
+
+def test_dvc_yaml_plain_get_file_params_omit_compressed_fasta():
+    """In plain mode, get_file's params: must not reference compressed_fasta
+    (the field may be missing from data.yaml entirely)."""
+    out = generate_dvc_yaml(PLAIN_LOCAL_CONFIG, kind="pretrain", params_filename="data.yaml")
+    parsed = yaml.safe_load(out)
+    params = parsed["stages"]["get_file"]["params"]
+    flat = []
+    for p in params:
+        if isinstance(p, dict):
+            for v in p.values():
+                flat.extend(v)
+    assert "data_dirs.compressed_fasta" not in flat
