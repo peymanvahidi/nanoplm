@@ -22,6 +22,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, unwrap_model, MuonAdamWGroup
 from nanoplm.data.infra.validation import validate_pretrain_dataset
+from nanoplm.data.infra.manifest import DataManifest
 from nanoplm.pretraining.utils import compute_batch_setup, get_num_workers, prepare_run_and_steps
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
@@ -171,6 +172,7 @@ def _warn_unsupported_resume_fields_on_hf(
 def run_pretraining(
     model: ProtModernBertMLM,
     pretrain_config: PretrainingConfig,
+    manifest: DataManifest,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
 
@@ -181,10 +183,10 @@ def run_pretraining(
     tokenizer = model.tokenizer
     model.to(device)
 
-    # Validate dataset: manifest + shard files
+    # Validate dataset: shard files (manifest is passed in from the CLI)
     dataset_dir = Path(pretrain_config.dataset_dir)
-    validation_result = validate_pretrain_dataset(dataset_dir)
-    manifest = validation_result['manifest']
+    validation_result = validate_pretrain_dataset(dataset_dir, manifest=manifest)
+    # validation_result['manifest'] is the same object we passed in
 
     # Get data from typed manifest
     train_shard_dir = dataset_dir / manifest.train_dir

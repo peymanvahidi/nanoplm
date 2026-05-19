@@ -51,7 +51,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.infra.manifest import validate_manifest_for_pipeline, DataManifest
 from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
@@ -1596,6 +1596,7 @@ def _rebuild_scheduler_for_resume(
 def run_pure_pretraining(
     model: PureProtModernBertMLM,
     pretrain_config: PretrainingConfig,
+    manifest: DataManifest,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
 
@@ -1615,7 +1616,6 @@ def run_pure_pretraining(
 
     # ---- Dataset ----
     dataset_dir = Path(pretrain_config.dataset_dir)
-    manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
     if manifest.max_seq_len <= 0:
         raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")

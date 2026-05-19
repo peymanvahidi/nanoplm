@@ -28,7 +28,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline
+from nanoplm.data.infra.manifest import validate_manifest_for_pipeline, DataManifest
 from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
@@ -234,6 +234,7 @@ def _make_te_profiler(pretrain_config: PretrainingConfig, output_dir: str, is_ma
 def run_te_pretraining(
     model: TEProtModernBertMLM,
     pretrain_config: PretrainingConfig,
+    manifest: DataManifest,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
     _set_seed(pretrain_config.seed)
@@ -241,8 +242,6 @@ def run_te_pretraining(
     device = torch.device(get_device())
 
     dataset_dir = Path(pretrain_config.dataset_dir)
-
-    manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(manifest=manifest, expected_mode="pretrain")
     if manifest.max_seq_len <= 0:
         raise ValueError(f"Invalid manifest max_seq_len: {manifest.max_seq_len}")

@@ -56,3 +56,22 @@ def test_write_manifest_errors_when_train_dir_missing(tmp_path):
     ])
     assert result.exit_code != 0
     assert "train" in result.output.lower()
+
+
+def test_write_manifest_pretrain_records_register_tokens(tmp_path):
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "val"
+    _make_pretrain_shard_dir(train_dir, [10])
+    _make_pretrain_shard_dir(val_dir, [5])
+
+    runner = CliRunner()
+    result = runner.invoke(data, [
+        "write-manifest", "--kind", "pretrain", "-o", str(tmp_path),
+        "--min-seq-len", "20", "--max-seq-len", "512",
+        "--val-ratio", "0.1", "--samples-per-shard", "10",
+        "--register-tokens", "2",
+    ])
+    assert result.exit_code == 0, result.output
+
+    manifest = yaml.safe_load((tmp_path / ".data_manifest").read_text())
+    assert manifest["num_register_tokens"] == 2

@@ -19,6 +19,7 @@ import numpy as np
 import h5py
 
 from nanoplm.data.infra.manifest import (
+    DataManifest,
     read_manifest,
     validate_manifest_for_pipeline,
 )
@@ -295,7 +296,10 @@ def validate_pretrain_shards(
     return bin_files
 
 
-def validate_pretrain_dataset(dataset_dir: Union[str, Path]) -> dict:
+def validate_pretrain_dataset(
+    dataset_dir: Union[str, Path],
+    manifest: Optional[DataManifest] = None,
+) -> dict:
     """
     Validate complete pretraining dataset (manifest + binary shards).
 
@@ -304,6 +308,9 @@ def validate_pretrain_dataset(dataset_dir: Union[str, Path]) -> dict:
 
     Args:
         dataset_dir: Root directory containing .data_manifest and train/val subdirs
+        manifest: Optional pre-loaded manifest. When provided, skips the
+            internal ``read_manifest`` call. The caller is responsible for
+            ensuring it matches ``dataset_dir``.
 
     Returns:
         dict: Validation results including:
@@ -326,7 +333,8 @@ def validate_pretrain_dataset(dataset_dir: Union[str, Path]) -> dict:
     logger.info(f"Validating pretraining dataset: {dataset_dir}")
 
     # Read and validate manifest (typed dataclass with __post_init__ validation)
-    manifest = read_manifest(dataset_dir)
+    if manifest is None:
+        manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(manifest, expected_mode="pretrain")
 
     # Get shard directories from typed manifest
