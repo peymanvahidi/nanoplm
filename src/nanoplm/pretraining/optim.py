@@ -115,8 +115,9 @@ def _is_zero_init_fragile_param(name: str) -> bool:
 def _classify_noble_param(name: str) -> str | None:
     """Classify a NOBLE param for optimizer routing.
 
-    Returns one of: 'wup', 'M', 'freq', 'phase', or None (not a NOBLE param).
-    W_down is intentionally NOT matched — it stays in Muon.
+    Returns one of: 'wup', 'wdown', 'M', 'freq', 'phase', or None (not a NOBLE
+    param). Per paper §3.3, W_down uses the base learning rate (AdamW at
+    noble_base_lr), not Muon.
     """
     if ".cosnet.M" in name:
         return "M"
@@ -126,6 +127,8 @@ def _classify_noble_param(name: str) -> str | None:
         return "phase"
     if name.endswith(".noble_w_up.weight"):
         return "wup"
+    if name.endswith(".W_down.weight"):
+        return "wdown"
     return None
 
 
@@ -152,6 +155,7 @@ def build_muon_optimizer(
     x0_params: list[torch.nn.Parameter] = []
     # NOBLE param groups (separate LR each)
     noble_wup_params: list[torch.nn.Parameter] = []
+    noble_wdown_params: list[torch.nn.Parameter] = []
     noble_M_params: list[torch.nn.Parameter] = []
     noble_freq_params: list[torch.nn.Parameter] = []
     noble_phase_params: list[torch.nn.Parameter] = []
@@ -168,10 +172,12 @@ def build_muon_optimizer(
         elif lname.endswith("x0_lambdas") or ".x0_lambdas" in lname:
             x0_params.append(param)
         # NOBLE routing (must come before generic ndim checks).
-        # W_down is NOT matched — falls through to Muon as a normal 2D weight.
+        # Per paper §3.3: W_down uses the base learning rate (AdamW at
+        # noble_base_lr), the cosnet/W_up params get elevated LRs.
         elif (noble_kind := _classify_noble_param(name)) is not None:
-            {"wup": noble_wup_params, "M": noble_M_params,
-             "freq": noble_freq_params, "phase": noble_phase_params}[noble_kind].append(param)
+            {"wup": noble_wup_params, "wdown": noble_wdown_params,
+             "M": noble_M_params, "freq": noble_freq_params,
+             "phase": noble_phase_params}[noble_kind].append(param)
         elif param.ndim == 1 or _is_embedding_or_unembedding_param(name):
             adamw_params.append(param)
         elif param.ndim == 2:
@@ -196,9 +202,13 @@ def build_muon_optimizer(
     adamw_numel = sum(p.numel() for p in adamw_params)
     resid_numel = sum(p.numel() for p in resid_params)
     x0_numel = sum(p.numel() for p in x0_params)
-    noble_total = len(noble_wup_params) + len(noble_M_params) + len(noble_freq_params) + len(noble_phase_params)
+    noble_total = (
+        len(noble_wup_params) + len(noble_wdown_params) + len(noble_M_params)
+        + len(noble_freq_params) + len(noble_phase_params)
+    )
     noble_numel = (
         sum(p.numel() for p in noble_wup_params)
+        + sum(p.numel() for p in noble_wdown_params)
         + sum(p.numel() for p in noble_M_params)
         + sum(p.numel() for p in noble_freq_params)
         + sum(p.numel() for p in noble_phase_params)
@@ -211,6 +221,7 @@ def build_muon_optimizer(
         f"muon_numel={muon_numel:,}, adamw_numel={adamw_numel:,}, "
         f"resid_numel={resid_numel:,}, x0_numel={x0_numel:,}"
         + (f", noble_params={noble_total} tensors (wup={len(noble_wup_params)}, "
+           f"wdown={len(noble_wdown_params)}, "
            f"M={len(noble_M_params)}, freq={len(noble_freq_params)}, "
            f"phase={len(noble_phase_params)}, noble_numel={noble_numel:,})" if noble_total > 0 else "")
     )
@@ -235,13 +246,15 @@ def build_muon_optimizer(
         ratio = hidden_size / noble_rank
         noble_lrs = {
             "wup": base_lr * (ratio ** (2 * pretrain_config.noble_lr_gamma)),
+            "wdown": base_lr,
             "M": base_lr * (ratio ** pretrain_config.noble_lr_gamma_M),
             "freq": base_lr * pretrain_config.noble_freq_lr_mult,
             "phase": base_lr * pretrain_config.noble_phase_lr_mult,
         }
         logger.info(
             f"NOBLE LR scaling: ratio={ratio:.1f}, "
-            f"wup_lr={noble_lrs['wup']:.6f}, M_lr={noble_lrs['M']:.6f}, "
+            f"wup_lr={noble_lrs['wup']:.6f}, wdown_lr={noble_lrs['wdown']:.6f}, "
+            f"M_lr={noble_lrs['M']:.6f}, "
             f"freq_lr={noble_lrs['freq']:.6f}, phase_lr={noble_lrs['phase']:.6f}"
         )
 
@@ -251,6 +264,7 @@ def build_muon_optimizer(
         resid_params=resid_params,
         x0_params=x0_params,
         noble_wup_params=noble_wup_params,
+        noble_wdown_params=noble_wdown_params,
         noble_M_params=noble_M_params,
         noble_freq_params=noble_freq_params,
         noble_phase_params=noble_phase_params,
@@ -322,6 +336,7 @@ def build_optimizer(
     resid_params: list[torch.nn.Parameter] | None = None,
     x0_params: list[torch.nn.Parameter] | None = None,
     noble_wup_params: list[torch.nn.Parameter] | None = None,
+    noble_wdown_params: list[torch.nn.Parameter] | None = None,
     noble_M_params: list[torch.nn.Parameter] | None = None,
     noble_freq_params: list[torch.nn.Parameter] | None = None,
     noble_phase_params: list[torch.nn.Parameter] | None = None,
@@ -336,10 +351,14 @@ def build_optimizer(
     resid_params = resid_params or []
     x0_params = x0_params or []
     noble_wup_params = noble_wup_params or []
+    noble_wdown_params = noble_wdown_params or []
     noble_M_params = noble_M_params or []
     noble_freq_params = noble_freq_params or []
     noble_phase_params = noble_phase_params or []
-    has_adamw = adamw_params or resid_params or x0_params or noble_wup_params
+    has_adamw = (
+        adamw_params or resid_params or x0_params
+        or noble_wup_params or noble_wdown_params
+    )
     if not has_adamw:
         raise ValueError("Muon optimizer requires at least one AdamW/scalar parameter.")
 
@@ -435,11 +454,20 @@ def build_optimizer(
             betas=NANOCHAT_X0_BETAS,
             eps=NANOCHAT_SCALAR_EPS,
         ))
-    # NOBLE param groups with elevated LRs (paper §3.3)
+    # NOBLE param groups with paper-prescribed LRs (paper §3.3).
+    # W_down uses the base LR (no scaling); W_up, M, freq, phase get elevated.
     if noble_wup_params and noble_lrs:
         adamw_groups.append(dict(
             params=noble_wup_params,
             lr=noble_lrs["wup"],
+            weight_decay=float(adamw_weight_decay),
+            betas=adamw_betas,
+            eps=float(adamw_epsilon),
+        ))
+    if noble_wdown_params and noble_lrs:
+        adamw_groups.append(dict(
+            params=noble_wdown_params,
+            lr=noble_lrs["wdown"],
             weight_decay=float(adamw_weight_decay),
             betas=adamw_betas,
             eps=float(adamw_epsilon),
