@@ -99,17 +99,21 @@ class ProtModernBertMLMConfig:
     moe_topk_group: int = 1  # group-limited routing: number of groups kept per token
     moe_bias_update_rate: float = 1e-3  # Ling-style expert-bias update rate
     moe_leading_dense_layers: int = 0
-    # ALBERT-style weight-tied looping: apply the L-layer stack T times with tied weights.
-    # num_loops=1 is the standard non-looped model. Pure-torch path only.
-    num_loops: int = 1
+    # Huginn-style recycling (pure-torch path only). See ModernBertConfig for field semantics.
+    recycling_num_prelude_layers: int = 0
+    recycling_num_coda_layers: int = 0
+    recycling_loop_count: int = 1
+    recycling_adapter_bias: bool = False
+    recycling_s0_noise_sigma: float = 0.6324555320336759
+    recycling_use_takase_init: bool = True
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
     def __init__(self, config: ProtModernBertMLMConfig):
-        if config.num_loops != 1:
+        if config.recycling_loop_count != 1:
             raise ValueError(
-                "num_loops > 1 is implemented only in the pure-torch path. "
-                "Use --pure-torch with num_loops>1."
+                "Huginn-style recycling (recycling_loop_count > 1) is implemented only "
+                "in the pure-torch path. Use --pure-torch with recycling_loop_count>1."
             )
         if config.use_noble:
             raise ValueError(
