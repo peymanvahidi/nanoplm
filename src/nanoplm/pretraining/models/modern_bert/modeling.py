@@ -2613,6 +2613,23 @@ class ModernBertModel(nn.Module):
         ]
         self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
 
+    def _recurrent_step(
+        self,
+        e: torch.Tensor,
+        s_prev: torch.Tensor,
+        run_layer,
+    ) -> torch.Tensor:
+        """One iteration of the recurrent block.
+
+        run_layer(layer, x, layer_idx) is a closure built by forward() that
+        applies a single transformer block with the correct path-specific kwargs.
+        """
+        u = self.adapter(torch.cat([s_prev, e], dim=-1))
+        P = self.config.recycling_num_prelude_layers
+        for i, layer in enumerate(self.recurrent_layers):
+            u = run_layer(layer, u, P + i)
+        return u
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -2620,6 +2637,8 @@ class ModernBertModel(nn.Module):
         _cu_seqlens: Optional[torch.Tensor] = None,
         _max_seqlen: Optional[int] = None,
         _position_ids: Optional[torch.Tensor] = None,
+        recycling_loop_count: Optional[int] = None,
+        recycling_bptt: Optional[int] = None,
     ) -> torch.Tensor:
         # ---- varlen (flash-attention) path --------------------------------
         if _cu_seqlens is not None:
@@ -2679,63 +2698,106 @@ class ModernBertModel(nn.Module):
             repo_active = self.repo_active
             prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
-            for i, layer in enumerate(self.layers):
-                if self.resid_lambdas is not None:
-                    x = self.resid_lambdas[i] * x
-                if self.x0_lambdas is not None:
-                    x = x + self.x0_lambdas[i] * x0
-                alpha = prores_alphas[i]
-                lt = layer.attention_type
-                if (
-                    self.config.activation_checkpointing
-                    and self.training
-                    and str(self.config.activation_checkpointing_mode).strip().lower()
-                    == "layer"
-                ):
-                    cos_sin = rope[lt]
-                    cu_seqlens = _cu_seqlens
-                    max_seqlen = _max_seqlen
-                    window_size = windows[lt]
-                    position_ids = _position_ids
+            _recycle = (
+                self.config.recycling_loop_count > 1 or recycling_loop_count is not None
+            )
+            if _recycle:
+                r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
+                K = recycling_bptt if recycling_bptt is not None else 8
 
-                    def _layer_forward(
-                        x_in: torch.Tensor,
-                        *,
-                        _layer: nn.Module = layer,
-                        _cos_sin=cos_sin,
-                        _cu_seqlens=cu_seqlens,
-                        _max_seqlen=max_seqlen,
-                        _window_size=window_size,
-                        _position_ids=position_ids,
-                        _repo_active: bool = repo_active,
-                        _prores_alpha=alpha,
-                    ) -> torch.Tensor:
-                        return _layer(
-                            x_in,
-                            cos_sin=_cos_sin,
+            def _run_layer_varlen(layer, x_in, layer_idx, _rope=rope, _windows=windows):
+                lt = layer.attention_type
+                return layer(
+                    x_in,
+                    cos_sin=_rope[lt],
+                    cu_seqlens=_cu_seqlens,
+                    max_seqlen=_max_seqlen,
+                    window_size=_windows[lt],
+                    position_ids=_position_ids,
+                    repo_active=repo_active,
+                    prores_alpha=prores_alphas[layer_idx],
+                )
+
+            if _recycle:
+                h_pre = x
+                for i, layer in enumerate(self.prelude_layers):
+                    h_pre = _run_layer_varlen(layer, h_pre, i)
+                e = h_pre
+
+                s = torch.randn_like(e) * self.config.recycling_s0_noise_sigma
+
+                no_grad_steps = max(0, r - K)
+                with torch.no_grad():
+                    for _ in range(no_grad_steps):
+                        s = self._recurrent_step(e, s, _run_layer_varlen)
+                if no_grad_steps > 0:
+                    s = s.detach()
+                for _ in range(r - no_grad_steps):
+                    s = self._recurrent_step(e, s, _run_layer_varlen)
+
+                P_count = self.config.recycling_num_prelude_layers
+                R_count = len(self.recurrent_layers)
+                for i, layer in enumerate(self.coda_layers):
+                    s = _run_layer_varlen(layer, s, P_count + R_count + i)
+                x = s
+            else:
+                for i, layer in enumerate(self.layers):
+                    if self.resid_lambdas is not None:
+                        x = self.resid_lambdas[i] * x
+                    if self.x0_lambdas is not None:
+                        x = x + self.x0_lambdas[i] * x0
+                    alpha = prores_alphas[i]
+                    lt = layer.attention_type
+                    if (
+                        self.config.activation_checkpointing
+                        and self.training
+                        and str(self.config.activation_checkpointing_mode).strip().lower()
+                        == "layer"
+                    ):
+                        cos_sin = rope[lt]
+                        cu_seqlens = _cu_seqlens
+                        max_seqlen = _max_seqlen
+                        window_size = windows[lt]
+                        position_ids = _position_ids
+
+                        def _layer_forward(
+                            x_in: torch.Tensor,
+                            *,
+                            _layer: nn.Module = layer,
+                            _cos_sin=cos_sin,
+                            _cu_seqlens=cu_seqlens,
+                            _max_seqlen=max_seqlen,
+                            _window_size=window_size,
+                            _position_ids=position_ids,
+                            _repo_active: bool = repo_active,
+                            _prores_alpha=alpha,
+                        ) -> torch.Tensor:
+                            return _layer(
+                                x_in,
+                                cos_sin=_cos_sin,
+                                cu_seqlens=_cu_seqlens,
+                                max_seqlen=_max_seqlen,
+                                window_size=_window_size,
+                                position_ids=_position_ids,
+                                repo_active=_repo_active,
+                                prores_alpha=_prores_alpha,
+                            )
+
+                        try:
+                            x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                        except TypeError:  # older torch checkpoint API
+                            x = _checkpoint(_layer_forward, x)
+                    else:
+                        x = layer(
+                            x,
+                            cos_sin=rope[lt],
                             cu_seqlens=_cu_seqlens,
                             max_seqlen=_max_seqlen,
-                            window_size=_window_size,
+                            window_size=windows[lt],
                             position_ids=_position_ids,
-                            repo_active=_repo_active,
-                            prores_alpha=_prores_alpha,
+                            repo_active=repo_active,
+                            prores_alpha=alpha,
                         )
-
-                    try:
-                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                    except TypeError:  # older torch checkpoint API
-                        x = _checkpoint(_layer_forward, x)
-                else:
-                    x = layer(
-                        x,
-                        cos_sin=rope[lt],
-                        cu_seqlens=_cu_seqlens,
-                        max_seqlen=_max_seqlen,
-                        window_size=windows[lt],
-                        position_ids=_position_ids,
-                        repo_active=repo_active,
-                        prores_alpha=alpha,
-                    )
 
             if self.config.use_mhc_lite:
                 x = x[..., 0, :]  # compress: take stream 0
@@ -2801,61 +2863,112 @@ class ModernBertModel(nn.Module):
         repo_active = self.repo_active
         prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
-        for i, layer in enumerate(self.layers):
-            if self.resid_lambdas is not None:
-                x = self.resid_lambdas[i] * x
-            if self.x0_lambdas is not None:
-                x = x + self.x0_lambdas[i] * x0
-            alpha = prores_alphas[i]
-            layer_type = layer.attention_type
-            if (
-                self.config.activation_checkpointing
-                and self.training
-                and str(self.config.activation_checkpointing_mode).strip().lower()
-                == "layer"
-            ):
-                attn_mask = attn_masks[layer_type]
-                cos_sin = rope[layer_type]
-                token_mask = attention_mask
+        _recycle = (
+            self.config.recycling_loop_count > 1 or recycling_loop_count is not None
+        )
+        if _recycle:
+            r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
+            K = recycling_bptt if recycling_bptt is not None else 8
 
-                def _layer_forward(
-                    x_in: torch.Tensor,
-                    *,
-                    _layer: nn.Module = layer,
-                    _attn_mask=attn_mask,
-                    _cos_sin=cos_sin,
-                    _token_mask=token_mask,
-                    _repo_active: bool = repo_active,
-                    _prores_alpha=alpha,
-                ) -> torch.Tensor:
-                    return _layer(
-                        x_in,
-                        attn_mask=_attn_mask,
-                        cos_sin=_cos_sin,
+        def _run_layer_sdpa(layer, x_in, layer_idx, _attn_masks=attn_masks, _rope=rope):
+            lt = layer.attention_type
+            return layer(
+                x_in,
+                attn_mask=_attn_masks[lt],
+                cos_sin=_rope[lt],
+                position_ids=None,
+                token_mask=attention_mask,
+                repo_active=repo_active,
+                prores_alpha=prores_alphas[layer_idx],
+            )
+
+        if _recycle:
+            h_pre = x
+            for i, layer in enumerate(self.prelude_layers):
+                h_pre = _run_layer_sdpa(layer, h_pre, i)
+            e = h_pre
+
+            s = torch.randn_like(e) * self.config.recycling_s0_noise_sigma
+
+            no_grad_steps = max(0, r - K)
+            with torch.no_grad():
+                for _ in range(no_grad_steps):
+                    s = self._recurrent_step(e, s, _run_layer_sdpa)
+            if no_grad_steps > 0:
+                s = s.detach()
+            for _ in range(r - no_grad_steps):
+                s = self._recurrent_step(e, s, _run_layer_sdpa)
+
+            P_count = self.config.recycling_num_prelude_layers
+            R_count = len(self.recurrent_layers)
+            for i, layer in enumerate(self.coda_layers):
+                s = _run_layer_sdpa(layer, s, P_count + R_count + i)
+            x = s
+        else:
+            for i, layer in enumerate(self.layers):
+                if self.resid_lambdas is not None:
+                    x = self.resid_lambdas[i] * x
+                if self.x0_lambdas is not None:
+                    x = x + self.x0_lambdas[i] * x0
+                alpha = prores_alphas[i]
+                layer_type = layer.attention_type
+                if (
+                    self.config.activation_checkpointing
+                    and self.training
+                    and str(self.config.activation_checkpointing_mode).strip().lower()
+                    == "layer"
+                ):
+                    attn_mask = attn_masks[layer_type]
+                    cos_sin = rope[layer_type]
+                    token_mask = attention_mask
+
+                    def _layer_forward(
+                        x_in: torch.Tensor,
+                        *,
+                        _layer: nn.Module = layer,
+                        _attn_mask=attn_mask,
+                        _cos_sin=cos_sin,
+                        _token_mask=token_mask,
+                        _repo_active: bool = repo_active,
+                        _prores_alpha=alpha,
+                    ) -> torch.Tensor:
+                        return _layer(
+                            x_in,
+                            attn_mask=_attn_mask,
+                            cos_sin=_cos_sin,
+                            position_ids=None,
+                            token_mask=_token_mask,
+                            repo_active=_repo_active,
+                            prores_alpha=_prores_alpha,
+                        )
+
+                    try:
+                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                    except TypeError:  # older torch checkpoint API
+                        x = _checkpoint(_layer_forward, x)
+                else:
+                    x = layer(
+                        x,
+                        attn_mask=attn_masks[layer_type],
+                        cos_sin=rope[layer_type],
                         position_ids=None,
-                        token_mask=_token_mask,
-                        repo_active=_repo_active,
-                        prores_alpha=_prores_alpha,
+                        token_mask=attention_mask,
+                        repo_active=repo_active,
+                        prores_alpha=alpha,
                     )
-
-                try:
-                    x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                except TypeError:  # older torch checkpoint API
-                    x = _checkpoint(_layer_forward, x)
-            else:
-                x = layer(
-                    x,
-                    attn_mask=attn_masks[layer_type],
-                    cos_sin=rope[layer_type],
-                    position_ids=None,
-                    token_mask=attention_mask,
-                    repo_active=repo_active,
-                    prores_alpha=alpha,
-                )
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]  # compress: take stream 0
         return self.final_norm(x)
+
+
+@dataclass
+class MLMOutput:
+    loss: Optional[torch.Tensor]
+    logits: torch.Tensor
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
 
 
 class ModernBertPredictionHead(nn.Module):
@@ -3108,7 +3221,9 @@ class ModernBertForMaskedLM(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         position_ids: Optional[torch.Tensor] = None,
-    ) -> dict[str, Optional[torch.Tensor]]:
+        recycling_loop_count: Optional[int] = None,
+        recycling_bptt: Optional[int] = None,
+    ) -> MLMOutput:
         # ---- static packed path (pre-flattened by collator) ---------------
         # When both cu_seqlens and position_ids are provided and input_ids is
         # already 1-D (flat), the collator has done all unpadding / position-id
@@ -3124,6 +3239,8 @@ class ModernBertForMaskedLM(nn.Module):
                 _cu_seqlens=cu_seqlens,
                 _max_seqlen=max_seqlen,  # pass int directly — no tensor
                 _position_ids=position_ids,
+                recycling_loop_count=recycling_loop_count,
+                recycling_bptt=recycling_bptt,
             )
             # x: (F, hidden) where F is fixed flat length
 
@@ -3149,7 +3266,7 @@ class ModernBertForMaskedLM(nn.Module):
                 logits = self.decoder(self.head(x))
                 loss = None
 
-            return {"loss": loss, "logits": logits}
+            return MLMOutput(loss=loss, logits=logits)
 
         use_varlen = (
             _HAS_FLASH_VARLEN and input_ids.is_cuda and attention_mask is not None
@@ -3182,6 +3299,8 @@ class ModernBertForMaskedLM(nn.Module):
                 _cu_seqlens=cu_seqlens,
                 _max_seqlen=max_seqlen_t,
                 _position_ids=position_ids,
+                recycling_loop_count=recycling_loop_count,
+                recycling_bptt=recycling_bptt,
             )
             # x: (total_tokens, hidden) — flat, no padding
 
@@ -3203,10 +3322,15 @@ class ModernBertForMaskedLM(nn.Module):
                 logits = _pad_output(logits, indices, batch, seq_len)
                 loss = None
 
-            return {"loss": loss, "logits": logits}
+            return MLMOutput(loss=loss, logits=logits)
 
         # ---- SDPA (fallback) path -----------------------------------------
-        x = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        x = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            recycling_loop_count=recycling_loop_count,
+            recycling_bptt=recycling_bptt,
+        )
 
         if self.sparse_prediction and labels is not None:
             flat_labels = labels.view(-1)
@@ -3230,7 +3354,7 @@ class ModernBertForMaskedLM(nn.Module):
                     ignore_index=self.sparse_pred_ignore_index,
                 )
 
-        return {"loss": loss, "logits": logits}
+        return MLMOutput(loss=loss, logits=logits)
 
     def num_parameters(self, only_trainable: bool = True) -> int:
         return sum(
