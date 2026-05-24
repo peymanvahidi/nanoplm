@@ -890,15 +890,20 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
             proj_flops + perm_mix_flops + pre_map_flops + post_res_flops
         )
 
-    # ALBERT-style weight-tied looping: every per-layer term runs num_loops times
-    # per forward pass. head_flops and pred_head_flops run once after the layer
-    # stack, so they do NOT scale. Without this multiplier W&B MFU and
-    # tokens/sec metrics silently halve for looped runs.
-    num_loops = max(1, int(getattr(config, "num_loops", 1)))
-    per_layer_flops = (
-        attn_proj_flops + attn_flops + mlp_flops + canon_flops + mhc_flops
-    )
-    forward_flops = num_loops * per_layer_flops + head_flops + pred_head_flops
+    # Huginn-style recycling: prelude (P, runs once) + recurrent (R, runs r_bar times) + coda
+    # (C, runs once). head_flops + pred_head_flops fire once after the stack and do NOT scale.
+    # Without the recycling_scale multiplier W&B MFU and tokens/sec silently undercount for
+    # recycled runs. r_bar = max(1, loop_count - 1) matches the Takase effective-depth
+    # convention used by ModernBertModel._apply_takase_init.
+    stack_flops = attn_proj_flops + attn_flops + mlp_flops + canon_flops + mhc_flops
+    P = max(0, int(getattr(config, "recycling_num_prelude_layers", 0)))
+    C = max(0, int(getattr(config, "recycling_num_coda_layers", 0)))
+    loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
+    R = n_layers - P - C
+    r_bar = max(1, loop_count - 1) if loop_count > 1 else 1
+    effective_layer_count = P + r_bar * R + C  # collapses to n_layers when loop_count == 1
+    recycling_scale = effective_layer_count / max(1, n_layers)
+    forward_flops = recycling_scale * stack_flops + head_flops + pred_head_flops
     return 3 * forward_flops
 
 

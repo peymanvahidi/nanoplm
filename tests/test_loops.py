@@ -11,6 +11,11 @@ These tests verify:
 import pytest
 import torch
 
+pytestmark = pytest.mark.skip(
+    reason="num_loops removed; superseded by test_recycling_forward.py. "
+    "File is deleted in Phase 5 Task 5.2 of the Huginn-style recycling plan."
+)
+
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.modeling import ModernBertConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
