@@ -2633,6 +2633,59 @@ class ModernBertModel(nn.Module):
             u = run_layer(layer, u, P + i)
         return u
 
+    def _apply_takase_init(self) -> None:
+        """Huginn §4.1 Takase spike init applied to the recurrent block + adapter.
+
+        Effective depth l = P + r_bar * R + C with r_bar = max(1, loop_count - 1).
+        Recurrent residual out-projections: std = sqrt(1 / (5 * h * l))
+        Recurrent non-residual linears + adapter: std = sqrt(2 / (5 * h))
+        All draws from truncated normal at ±3σ.
+
+        Only runs when config.recycling_use_takase_init AND config.recycling_loop_count > 1.
+        Prelude/coda layers are NOT touched; they keep whatever wo_init produced.
+        """
+        cfg = self.config
+        if not cfg.recycling_use_takase_init or cfg.recycling_loop_count <= 1:
+            return
+
+        h = cfg.hidden_size
+        P = cfg.recycling_num_prelude_layers
+        C = cfg.recycling_num_coda_layers
+        L = cfg.num_hidden_layers
+        R = L - P - C
+        r_bar = max(1, cfg.recycling_loop_count - 1)
+        l = P + r_bar * R + C
+
+        std_general = math.sqrt(2.0 / (5.0 * h))
+        std_out = math.sqrt(1.0 / (5.0 * h * l))
+
+        def _trunc_init(tensor: torch.Tensor, std: float) -> None:
+            torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+        for layer in self.recurrent_layers:
+            if hasattr(layer, "attn"):
+                if hasattr(layer.attn, "Wo") and layer.attn.Wo is not None:
+                    _trunc_init(layer.attn.Wo.weight, std_out)
+                if hasattr(layer.attn, "Wqkv") and layer.attn.Wqkv is not None:
+                    _trunc_init(layer.attn.Wqkv.weight, std_general)
+            if hasattr(layer, "mlp"):
+                if hasattr(layer.mlp, "Wo") and layer.mlp.Wo is not None:
+                    _trunc_init(layer.mlp.Wo.weight, std_out)
+                if hasattr(layer.mlp, "Wi") and layer.mlp.Wi is not None:
+                    _trunc_init(layer.mlp.Wi.weight, std_general)
+
+        if self.adapter is not None:
+            _trunc_init(self.adapter.weight, std_general)
+            if self.adapter.bias is not None:
+                torch.nn.init.zeros_(self.adapter.bias)
+
+        from nanoplm.utils.logger import logger
+        logger.info(
+            "[recycling] Takase spike init applied: l=%d (P=%d, r_bar=%d, R=%d, C=%d), "
+            "std_general=%.6f, std_out=%.6f",
+            l, P, r_bar, R, C, std_general, std_out,
+        )
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -3223,6 +3276,7 @@ class ModernBertForMaskedLM(nn.Module):
             self.model.resid_lambdas.fill_(self.config.resid_lambda_init)
         if self.model.x0_lambdas is not None:
             self.model.x0_lambdas.fill_(self.config.x0_lambda_init)
+        self.model._apply_takase_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embeddings.tok_embeddings
