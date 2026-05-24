@@ -14,7 +14,6 @@ framework will be needed; tracked as a separate GitHub issue.
 
 from __future__ import annotations
 
-import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -65,17 +64,19 @@ def _check_pipeline_flags(pipeline_config, matrix: dict[str, Any]) -> None:
     for entry in pipeline_section.get("reject", []):
         flag = entry["flag"]
         value = getattr(pipeline_config, flag, None)
-        condition = entry.get("condition", "")
-        if "is True" in condition and value is True:
+        # Explicit per-flag predicate matches the model-side pattern.
+        # The yaml `condition:` string stays as human-readable doc only.
+        if flag == "pure_te" and value is True:
             raise ValueError(f"recycling: incompatible pipeline flag '{flag}'. {entry['reason']}")
-        if "is False" in condition and value is False:
+        if flag == "pure_torch" and value is False:
             raise ValueError(f"recycling: incompatible pipeline flag '{flag}'. {entry['reason']}")
 
     for entry in pipeline_section.get("allow_with_caveat", []):
         flag = entry["flag"]
         value = getattr(pipeline_config, flag, None)
-        condition = entry.get("condition", "")
-        if "is True" in condition and value is True:
+        if flag == "fp8" and value is True:
+            _logger.warning("recycling: %s — %s", flag, entry["message"])
+        elif flag == "use_compile_max_autotune" and value is True:
             _logger.warning("recycling: %s — %s", flag, entry["message"])
 
 

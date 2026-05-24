@@ -5,7 +5,6 @@ can be combined with recycling. It's called from ModernBertConfig.__post_init__
 (model_flags only) and from pure_pipeline.py at startup (full check).
 """
 
-import logging
 import pytest
 
 from nanoplm.config.recycling_compatibility import (
@@ -29,6 +28,23 @@ def _model_cfg(**kwargs):
     )
     base.update(kwargs)
     return ModernBertConfig(**base)
+
+
+def _pipeline_model_cfg(**kwargs):
+    """SimpleNamespace stand-in for pipeline tests.
+
+    Bypasses ModernBertConfig so pipeline-flag tests pass before Batch B
+    adds the recycling_* fields to ModernBertConfig.
+    """
+    from types import SimpleNamespace
+    base = dict(
+        recycling_loop_count=2,
+        recycling_num_prelude_layers=1,
+        recycling_num_coda_layers=1,
+        num_hidden_layers=4,
+    )
+    base.update(kwargs)
+    return SimpleNamespace(**base)
 
 
 def test_matrix_loads_with_expected_top_level_keys():
@@ -69,24 +85,32 @@ def test_allow_use_qk_norm_silently():
     validate_recycling_compatibility(cfg)
 
 
-def test_repo_inside_recurrent_block_emits_warning(caplog):
+def test_repo_inside_recurrent_block_emits_warning(monkeypatch):
     # repo_after_n_layers=1 falls in [P=1, P+R-1=2] for a 4-layer model
     # with (P, R, C) = (1, 2, 1), so RePO is inside the recurrent block.
     cfg = _model_cfg(use_repo=True, repo_after_n_layers=1)
-    with caplog.at_level(logging.WARNING, logger="nanoplm"):
-        validate_recycling_compatibility(cfg)
-    assert any("RePO" in record.message for record in caplog.records)
+    # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
+    warnings_seen = []
+    from nanoplm.utils.logger import logger as _nplm_logger
+    monkeypatch.setattr(_nplm_logger, "warning",
+                        lambda msg, *a, **k: warnings_seen.append(msg % a if a else msg))
+    validate_recycling_compatibility(cfg)
+    assert any("RePO" in w for w in warnings_seen)
 
 
-def test_repo_outside_recurrent_block_no_warning(caplog):
+def test_repo_outside_recurrent_block_no_warning(monkeypatch):
     cfg = _model_cfg(use_repo=True, repo_after_n_layers=3)
-    with caplog.at_level(logging.WARNING, logger="nanoplm"):
-        validate_recycling_compatibility(cfg)
-    assert not any("RePO" in record.message for record in caplog.records)
+    # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
+    warnings_seen = []
+    from nanoplm.utils.logger import logger as _nplm_logger
+    monkeypatch.setattr(_nplm_logger, "warning",
+                        lambda msg, *a, **k: warnings_seen.append(msg % a if a else msg))
+    validate_recycling_compatibility(cfg)
+    assert not any("RePO" in w for w in warnings_seen)
 
 
 def test_pipeline_flag_rejects_pure_te():
-    cfg = _model_cfg()
+    cfg = _pipeline_model_cfg()
     from types import SimpleNamespace
     pipeline_cfg = SimpleNamespace(pure_te=True, pure_torch=True, fp8=False, use_compile_max_autotune=False)
     with pytest.raises(ValueError, match="te_pipeline"):
@@ -94,17 +118,21 @@ def test_pipeline_flag_rejects_pure_te():
 
 
 def test_pipeline_flag_rejects_hf_path():
-    cfg = _model_cfg()
+    cfg = _pipeline_model_cfg()
     from types import SimpleNamespace
     pipeline_cfg = SimpleNamespace(pure_te=False, pure_torch=False, fp8=False, use_compile_max_autotune=False)
     with pytest.raises(ValueError, match="HF path"):
         validate_recycling_compatibility(cfg, pipeline_cfg)
 
 
-def test_pipeline_flag_warns_on_fp8(caplog):
-    cfg = _model_cfg()
+def test_pipeline_flag_warns_on_fp8(monkeypatch):
+    cfg = _pipeline_model_cfg()
     from types import SimpleNamespace
     pipeline_cfg = SimpleNamespace(pure_te=False, pure_torch=True, fp8=True, use_compile_max_autotune=False)
-    with caplog.at_level(logging.WARNING, logger="nanoplm"):
-        validate_recycling_compatibility(cfg, pipeline_cfg)
-    assert any("fp8" in record.message for record in caplog.records)
+    # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
+    warnings_seen = []
+    from nanoplm.utils.logger import logger as _nplm_logger
+    monkeypatch.setattr(_nplm_logger, "warning",
+                        lambda msg, *a, **k: warnings_seen.append(msg % a if a else msg))
+    validate_recycling_compatibility(cfg, pipeline_cfg)
+    assert any("fp8" in w for w in warnings_seen)
