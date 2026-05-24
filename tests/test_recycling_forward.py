@@ -9,7 +9,6 @@ Covers:
   - recycling_loop_count=1 produces identical output to non-recycled
 """
 
-import pytest
 import torch
 
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
@@ -36,13 +35,46 @@ def _recycling_cfg(tokenizer, **overrides):
 def test_layer_split_creates_three_module_lists(tokenizer):
     cfg = _recycling_cfg(tokenizer)
     model = PureProtModernBertMLM(cfg)
-    inner = model.model  # the ModernBertModel inside PureProtModernBertMLM
+    inner = model.model
     assert len(inner.prelude_layers) == 1
-    assert len(inner.recurrent_layers) == 4 - 1 - 1  # L - P - C = 2
+    assert len(inner.recurrent_layers) == 4 - 1 - 1
     assert len(inner.coda_layers) == 1
-    # And the old flat `layers` should no longer be the canonical list
-    # (kept for compat? no — should be replaced)
-    # If you keep .layers as a property aggregating the three, that's fine; test below.
+
+
+def test_split_groupings_share_modules_with_self_layers(tokenizer):
+    """The three groupings must reference the SAME module instances as self.layers;
+    otherwise state_dict would carry duplicate keys."""
+    cfg = _recycling_cfg(tokenizer)
+    inner = PureProtModernBertMLM(cfg).model
+    P, C, L = cfg.recycling_num_prelude_layers, cfg.recycling_num_coda_layers, cfg.num_hidden_layers
+    assert inner.prelude_layers[0] is inner.layers[0]
+    assert inner.recurrent_layers[0] is inner.layers[P]
+    assert inner.coda_layers[0] is inner.layers[L - C]
+
+    sd = inner.state_dict()
+    assert not any(k.startswith("prelude_layers.") for k in sd), \
+        "prelude_layers must not appear in state_dict (would duplicate self.layers keys)"
+    assert not any(k.startswith("recurrent_layers.") for k in sd), \
+        "recurrent_layers must not appear in state_dict (would duplicate self.layers keys)"
+    assert not any(k.startswith("coda_layers.") for k in sd), \
+        "coda_layers must not appear in state_dict (would duplicate self.layers keys)"
+
+
+def test_adapter_none_raises_on_forward_kwarg_override(tokenizer, device):
+    """Building with recycling_loop_count=1 leaves adapter=None; passing
+    recycling_loop_count>1 via forward kwarg must raise a clean ValueError,
+    not crash inside _recurrent_step with TypeError(NoneType not callable)."""
+    cfg = _recycling_cfg(
+        tokenizer,
+        recycling_loop_count=1,
+        recycling_num_prelude_layers=0,
+        recycling_num_coda_layers=0,
+    )
+    model = PureProtModernBertMLM(cfg).to(device)
+    input_ids = torch.randint(0, tokenizer.vocab_size, (1, 8), device=device)
+    import pytest
+    with pytest.raises(ValueError, match="adapter is None"):
+        model(input_ids=input_ids, recycling_loop_count=4, recycling_bptt=2)
 
 
 def test_adapter_module_shape_and_bias(tokenizer):

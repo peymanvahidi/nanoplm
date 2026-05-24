@@ -2557,15 +2557,18 @@ class ModernBertModel(nn.Module):
                 ]
             )
         # ---- Huginn-style recycling: split into prelude/recurrent/coda ----
+        # Plain Python lists, NOT ModuleLists: the modules already live in
+        # self.layers and are registered there. Re-registering them under
+        # ModuleLists would double every key in state_dict (e.g.
+        # `layers.0.attn.Wo.weight` AND `prelude_layers.0.attn.Wo.weight`
+        # pointing to the same tensor), bloating checkpoints and breaking
+        # strict load_state_dict.
         P = config.recycling_num_prelude_layers
         C = config.recycling_num_coda_layers
         L = config.num_hidden_layers
-        # Index-slice into self.layers so the three lists SHARE the same Module
-        # instances — preserves init flow + checkpoint compat. Mutating a layer
-        # via any of the three lists is reflected in self.layers and vice versa.
-        self.prelude_layers = nn.ModuleList(list(self.layers[:P]))
-        self.recurrent_layers = nn.ModuleList(list(self.layers[P:L - C])) if (L - P - C) > 0 else nn.ModuleList()
-        self.coda_layers = nn.ModuleList(list(self.layers[L - C:])) if C > 0 else nn.ModuleList()
+        self.prelude_layers: list[nn.Module] = list(self.layers[:P])
+        self.recurrent_layers: list[nn.Module] = list(self.layers[P:L - C]) if (L - P - C) > 0 else []
+        self.coda_layers: list[nn.Module] = list(self.layers[L - C:]) if C > 0 else []
 
         # Adapter only when recycling is active.
         if config.recycling_loop_count > 1:
@@ -2702,6 +2705,13 @@ class ModernBertModel(nn.Module):
                 self.config.recycling_loop_count > 1 or recycling_loop_count is not None
             )
             if _recycle:
+                if self.adapter is None:
+                    raise ValueError(
+                        "Recycling forward requested (recycling_loop_count > 1) but the "
+                        "adapter is None — the model was constructed with "
+                        "config.recycling_loop_count == 1. Rebuild the model with "
+                        "config.recycling_loop_count > 1 before passing the kwarg."
+                    )
                 r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
                 K = recycling_bptt if recycling_bptt is not None else 8
 
@@ -2867,6 +2877,13 @@ class ModernBertModel(nn.Module):
             self.config.recycling_loop_count > 1 or recycling_loop_count is not None
         )
         if _recycle:
+            if self.adapter is None:
+                raise ValueError(
+                    "Recycling forward requested (recycling_loop_count > 1) but the "
+                    "adapter is None — the model was constructed with "
+                    "config.recycling_loop_count == 1. Rebuild the model with "
+                    "config.recycling_loop_count > 1 before passing the kwarg."
+                )
             r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
             K = recycling_bptt if recycling_bptt is not None else 8
 
