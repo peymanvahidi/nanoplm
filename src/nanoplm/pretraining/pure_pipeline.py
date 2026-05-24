@@ -1124,7 +1124,11 @@ def _sync_train_loader_len(
 
 @torch.compiler.disable
 @torch.inference_mode()
-def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
+def _evaluate(
+    model, eval_loader, device, distributed, amp_dtype,
+    recycling_loop_count: int | None = None,
+    recycling_bptt: int | None = None,
+) -> float:
     # Eval intentionally stays eager. The eval loader uses the padded path
     # (no cu_seqlens/max_seqlen), which differs from packed training and can
     # otherwise trigger Dynamo recompiles of helper submodules.
@@ -1135,11 +1139,15 @@ def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
         batch = _move_batch_to_device(batch, device)
         ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
         with ctx:
-            out = model(
+            fwd_kwargs = dict(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
+            if recycling_loop_count is not None:
+                fwd_kwargs["recycling_loop_count"] = recycling_loop_count
+                fwd_kwargs["recycling_bptt"] = recycling_bptt
+            out = model(**fwd_kwargs)
         loss = out["loss"] if isinstance(out, dict) else out.loss
         bs = batch["input_ids"].size(0)
         total_loss += loss.item() * bs
@@ -1630,6 +1638,9 @@ def run_pure_pretraining(
     _model_config = getattr(model, "model_config", None)
     _manifest = manifest
 
+    from nanoplm.config.recycling_compatibility import validate_recycling_compatibility
+    validate_recycling_compatibility(model.model_config, pretrain_config)
+
     model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
     if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
         raise ValueError(
@@ -1948,6 +1959,21 @@ def run_pure_pretraining(
     steps_per_epoch = max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
     total_steps = epoch_start_steps[-1]
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+
+    # ---- Recycling scheduler (no-op when recycling_loop_count == 1) ----
+    from nanoplm.pretraining.recycling import RecyclingScheduler
+    from nanoplm.pretraining.recycling.logging import RecyclingMetricsBuffer
+    recycling_scheduler = None
+    recycling_rng = None
+    recycling_metrics_buffer = None
+    if model.model_config.recycling_loop_count > 1:
+        recycling_scheduler = RecyclingScheduler(
+            pretrain_config,
+            target_loop_count=model.model_config.recycling_loop_count,
+            total_training_steps=total_steps,
+        )
+        recycling_rng = torch.Generator(device=device).manual_seed(int(pretrain_config.seed) + 999)
+        recycling_metrics_buffer = RecyclingMetricsBuffer(window=100)
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
         pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
@@ -2407,6 +2433,23 @@ def run_pure_pretraining(
                         token_count += batch["input_ids"].numel()
                         raw_token_count += batch["input_ids"].numel()
 
+                    # Sample r for this micro-step (locked-step across DP workers)
+                    sampled_r = None
+                    curriculum_k_t = None
+                    if recycling_scheduler is not None:
+                        if is_main:
+                            r_t_tensor = torch.tensor(
+                                [recycling_scheduler.sample(global_step, device, recycling_rng)],
+                                dtype=torch.int64, device=device,
+                            )
+                        else:
+                            r_t_tensor = torch.zeros(1, dtype=torch.int64, device=device)
+                        if distributed and dist.is_initialized():
+                            dist.broadcast(r_t_tensor, src=0)
+                        sampled_r = int(r_t_tensor.item())
+                        curriculum_k_t = recycling_scheduler.current_mean(global_step)
+                        recycling_metrics_buffer.record_step(sampled_r)
+
                     sync_ctx = _ddp_sync_context(model, distributed_mode=distributed_mode, sync=sync)
                     amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
                     with sync_ctx:
@@ -2421,6 +2464,9 @@ def run_pure_pretraining(
                                 fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
                             if "position_ids" in batch:
                                 fwd_kwargs["position_ids"] = batch["position_ids"]
+                            if sampled_r is not None:
+                                fwd_kwargs["recycling_loop_count"] = sampled_r
+                                fwd_kwargs["recycling_bptt"] = pretrain_config.recycling_bptt
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
@@ -2649,6 +2695,13 @@ def run_pure_pretraining(
                         }
                         if muon_lr is not None:
                             payload["train/muon_lr"] = muon_lr
+                        if recycling_scheduler is not None and sampled_r is not None:
+                            from nanoplm.pretraining.recycling.logging import per_step_payload
+                            payload.update(per_step_payload(sampled_r, curriculum_k_t))
+                        if recycling_scheduler is not None and should_log:
+                            from nanoplm.pretraining.recycling.logging import logging_steps_payload
+                            adapter = getattr(orig_model.model, "adapter", None) if hasattr(orig_model, "model") else None
+                            payload.update(logging_steps_payload(adapter, recycling_metrics_buffer))
                         if wandb_enabled and wandb.run is not None:
                             try:
                                 wandb.log(payload)
@@ -2675,15 +2728,48 @@ def run_pure_pretraining(
                         window_steps = 0
 
                     if global_step % eval_steps == 0:
-                        eval_loss = _evaluate(orig_model, eval_loader, device, distributed, amp_dtype)
+                        if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
+                            eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
+                        elif recycling_scheduler is not None:
+                            eval_loop_counts = [model.model_config.recycling_loop_count]
+                        else:
+                            eval_loop_counts = [None]
+
+                        losses_by_r: dict[int, float] = {}
+                        eval_loss = None
+                        for r_value in eval_loop_counts:
+                            eval_loss = _evaluate(
+                                orig_model, eval_loader, device, distributed, amp_dtype,
+                                recycling_loop_count=r_value,
+                                recycling_bptt=pretrain_config.recycling_bptt if r_value is not None else None,
+                            )
+                            if r_value is not None:
+                                losses_by_r[r_value] = eval_loss
+
                         if is_main:
-                            logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
-                            if wandb_enabled and wandb.run is not None:
-                                try:
-                                    wandb.log({"train/global_step": global_step, "eval/loss": eval_loss})
-                                except Exception as exc:
-                                    wandb_enabled = False
-                                    logger.warning(f"W&B log failed; disabling. Error: {exc}")
+                            if losses_by_r:
+                                losses_str = ", ".join(f"r={r}: {l:.4f}" for r, l in sorted(losses_by_r.items()))
+                                logger.info(f"[step {global_step}] in-loop eval {losses_str}")
+                                if wandb_enabled and wandb.run is not None:
+                                    from nanoplm.pretraining.recycling.logging import inloop_eval_payload
+                                    p = {"train/global_step": global_step}
+                                    p.update(inloop_eval_payload(losses_by_r))
+                                    target = model.model_config.recycling_loop_count
+                                    if target in losses_by_r:
+                                        p["eval/loss"] = losses_by_r[target]
+                                    try:
+                                        wandb.log(p)
+                                    except Exception as exc:
+                                        wandb_enabled = False
+                                        logger.warning(f"W&B log failed; disabling. Error: {exc}")
+                            else:
+                                logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
+                                if wandb_enabled and wandb.run is not None:
+                                    try:
+                                        wandb.log({"train/global_step": global_step, "eval/loss": eval_loss})
+                                    except Exception as exc:
+                                        wandb_enabled = False
+                                        logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
                     if global_step % save_steps == 0:
