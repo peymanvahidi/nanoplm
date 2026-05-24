@@ -2556,6 +2556,27 @@ class ModernBertModel(nn.Module):
                     for i in range(config.num_hidden_layers)
                 ]
             )
+        # ---- Huginn-style recycling: split into prelude/recurrent/coda ----
+        P = config.recycling_num_prelude_layers
+        C = config.recycling_num_coda_layers
+        L = config.num_hidden_layers
+        # Index-slice into self.layers so the three lists SHARE the same Module
+        # instances — preserves init flow + checkpoint compat. Mutating a layer
+        # via any of the three lists is reflected in self.layers and vice versa.
+        self.prelude_layers = nn.ModuleList(list(self.layers[:P]))
+        self.recurrent_layers = nn.ModuleList(list(self.layers[P:L - C])) if (L - P - C) > 0 else nn.ModuleList()
+        self.coda_layers = nn.ModuleList(list(self.layers[L - C:])) if C > 0 else nn.ModuleList()
+
+        # Adapter only when recycling is active.
+        if config.recycling_loop_count > 1:
+            self.adapter = nn.Linear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=config.recycling_adapter_bias,
+            )
+        else:
+            self.adapter = None
+
         if config.use_resid_lambdas:
             self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
         else:
