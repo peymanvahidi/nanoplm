@@ -221,9 +221,16 @@ class ModernBertConfig:
     moe_topk_group: int = 1
     moe_bias_update_rate: float = 1e-3
     moe_leading_dense_layers: int = 0  # first N layers are always dense (DeepSeek uses 1)
-    # ALBERT-style weight-tied looping: re-apply the L-layer stack T times with
-    # tied parameters. num_loops=1 is the standard non-looped forward.
-    num_loops: int = 1
+    # Huginn-style recycling: split the L-layer stack into prelude/recurrent/coda
+    # regions. The recurrent block (R = L - P - C layers) is weight-tied and
+    # looped recycling_loop_count times per forward pass. See docs/superpowers/
+    # specs/2026-05-24-huggin-style-recycling-design.md.
+    recycling_num_prelude_layers: int = 0     # P; first P layers, run once
+    recycling_num_coda_layers: int = 0        # C; last C layers, run once
+    recycling_loop_count: int = 1             # inference loop count; target mean at training. 1 = recycling off
+    recycling_adapter_bias: bool = False      # Linear(2h, h) adapter bias (Huginn: no bias)
+    recycling_s0_noise_sigma: float = 0.6324555320336759  # sqrt(2/5), Huginn σ²_s = 2/5
+    recycling_use_takase_init: bool = True    # Overrides wo_init for recurrent block; rescales Wo by sqrt(1/(5·h·l))
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -239,33 +246,36 @@ class ModernBertConfig:
                 "hidden_size must be divisible by num_attention_heads: "
                 f"{self.hidden_size} vs {self.num_attention_heads}"
             )
-        if not isinstance(self.num_loops, int) or self.num_loops < 1:
+        # Recycling validation
+        if not isinstance(self.recycling_loop_count, int) or self.recycling_loop_count < 1:
             raise ValueError(
-                f"num_loops must be int >= 1, got {self.num_loops!r}"
+                f"recycling_loop_count must be int >= 1, got {self.recycling_loop_count!r}"
             )
-        if self.num_loops > 1:
-            if self.use_moe:
+        if not isinstance(self.recycling_num_prelude_layers, int) or self.recycling_num_prelude_layers < 0:
+            raise ValueError(
+                f"recycling_num_prelude_layers must be int >= 0, got {self.recycling_num_prelude_layers!r}"
+            )
+        if not isinstance(self.recycling_num_coda_layers, int) or self.recycling_num_coda_layers < 0:
+            raise ValueError(
+                f"recycling_num_coda_layers must be int >= 0, got {self.recycling_num_coda_layers!r}"
+            )
+        if self.recycling_loop_count == 1:
+            if self.recycling_num_prelude_layers != 0 or self.recycling_num_coda_layers != 0:
                 raise ValueError(
-                    "use_moe=True with num_loops>1 is unsupported: per-MoE-layer "
-                    "state (last_expert_counts at moe.py, last_aux_loss at moe.py:305) "
-                    "is overwritten on every forward call, so pure_pipeline's "
-                    "expert-bias correction and aux-loss aggregation would only see "
-                    "the final loop iteration's routing decisions."
+                    "recycling_loop_count=1 disables recycling; "
+                    "recycling_num_prelude_layers and recycling_num_coda_layers must both be 0."
                 )
-            if self.use_x0_lambdas:
+        else:
+            R = self.num_hidden_layers - self.recycling_num_prelude_layers - self.recycling_num_coda_layers
+            if R < 1:
                 raise ValueError(
-                    "use_x0_lambdas=True with num_loops>1 is unsupported in this "
-                    "implementation: x0 is captured once before the loop, and "
-                    "per-physical-layer x0_lambdas[i] would be re-applied on every "
-                    "loop iteration with semantics that have not been validated."
+                    f"recycling_num_prelude_layers ({self.recycling_num_prelude_layers}) + "
+                    f"recycling_num_coda_layers ({self.recycling_num_coda_layers}) must be < "
+                    f"num_hidden_layers ({self.num_hidden_layers}); got recurrent block size {R}."
                 )
-            if self.use_resid_lambdas:
-                raise ValueError(
-                    "use_resid_lambdas=True with num_loops>1 is unsupported in this "
-                    "implementation: per-physical-layer resid_lambdas[i] would be "
-                    "re-applied on every loop iteration with semantics that have not "
-                    "been validated."
-                )
+            # Delegate flag-compat checks to the YAML-driven validator.
+            from nanoplm.config.recycling_compatibility import validate_recycling_compatibility
+            validate_recycling_compatibility(self)
         # GQA: resolve num_kv_heads (None = MHA, i.e. same as num_attention_heads).
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_attention_heads
@@ -2648,64 +2658,63 @@ class ModernBertModel(nn.Module):
             repo_active = self.repo_active
             prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
-            for _loop_iter in range(self.config.num_loops):
-                for i, layer in enumerate(self.layers):
-                    if self.resid_lambdas is not None:
-                        x = self.resid_lambdas[i] * x
-                    if self.x0_lambdas is not None:
-                        x = x + self.x0_lambdas[i] * x0
-                    alpha = prores_alphas[i]
-                    lt = layer.attention_type
-                    if (
-                        self.config.activation_checkpointing
-                        and self.training
-                        and str(self.config.activation_checkpointing_mode).strip().lower()
-                        == "layer"
-                    ):
-                        cos_sin = rope[lt]
-                        cu_seqlens = _cu_seqlens
-                        max_seqlen = _max_seqlen
-                        window_size = windows[lt]
-                        position_ids = _position_ids
+            for i, layer in enumerate(self.layers):
+                if self.resid_lambdas is not None:
+                    x = self.resid_lambdas[i] * x
+                if self.x0_lambdas is not None:
+                    x = x + self.x0_lambdas[i] * x0
+                alpha = prores_alphas[i]
+                lt = layer.attention_type
+                if (
+                    self.config.activation_checkpointing
+                    and self.training
+                    and str(self.config.activation_checkpointing_mode).strip().lower()
+                    == "layer"
+                ):
+                    cos_sin = rope[lt]
+                    cu_seqlens = _cu_seqlens
+                    max_seqlen = _max_seqlen
+                    window_size = windows[lt]
+                    position_ids = _position_ids
 
-                        def _layer_forward(
-                            x_in: torch.Tensor,
-                            *,
-                            _layer: nn.Module = layer,
-                            _cos_sin=cos_sin,
-                            _cu_seqlens=cu_seqlens,
-                            _max_seqlen=max_seqlen,
-                            _window_size=window_size,
-                            _position_ids=position_ids,
-                            _repo_active: bool = repo_active,
-                            _prores_alpha=alpha,
-                        ) -> torch.Tensor:
-                            return _layer(
-                                x_in,
-                                cos_sin=_cos_sin,
-                                cu_seqlens=_cu_seqlens,
-                                max_seqlen=_max_seqlen,
-                                window_size=_window_size,
-                                position_ids=_position_ids,
-                                repo_active=_repo_active,
-                                prores_alpha=_prores_alpha,
-                            )
-
-                        try:
-                            x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                        except TypeError:  # older torch checkpoint API
-                            x = _checkpoint(_layer_forward, x)
-                    else:
-                        x = layer(
-                            x,
-                            cos_sin=rope[lt],
+                    def _layer_forward(
+                        x_in: torch.Tensor,
+                        *,
+                        _layer: nn.Module = layer,
+                        _cos_sin=cos_sin,
+                        _cu_seqlens=cu_seqlens,
+                        _max_seqlen=max_seqlen,
+                        _window_size=window_size,
+                        _position_ids=position_ids,
+                        _repo_active: bool = repo_active,
+                        _prores_alpha=alpha,
+                    ) -> torch.Tensor:
+                        return _layer(
+                            x_in,
+                            cos_sin=_cos_sin,
                             cu_seqlens=_cu_seqlens,
                             max_seqlen=_max_seqlen,
-                            window_size=windows[lt],
+                            window_size=_window_size,
                             position_ids=_position_ids,
-                            repo_active=repo_active,
-                            prores_alpha=alpha,
+                            repo_active=_repo_active,
+                            prores_alpha=_prores_alpha,
                         )
+
+                    try:
+                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                    except TypeError:  # older torch checkpoint API
+                        x = _checkpoint(_layer_forward, x)
+                else:
+                    x = layer(
+                        x,
+                        cos_sin=rope[lt],
+                        cu_seqlens=_cu_seqlens,
+                        max_seqlen=_max_seqlen,
+                        window_size=windows[lt],
+                        position_ids=_position_ids,
+                        repo_active=repo_active,
+                        prores_alpha=alpha,
+                    )
 
             if self.config.use_mhc_lite:
                 x = x[..., 0, :]  # compress: take stream 0
@@ -2771,58 +2780,57 @@ class ModernBertModel(nn.Module):
         repo_active = self.repo_active
         prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
-        for _loop_iter in range(self.config.num_loops):
-            for i, layer in enumerate(self.layers):
-                if self.resid_lambdas is not None:
-                    x = self.resid_lambdas[i] * x
-                if self.x0_lambdas is not None:
-                    x = x + self.x0_lambdas[i] * x0
-                alpha = prores_alphas[i]
-                layer_type = layer.attention_type
-                if (
-                    self.config.activation_checkpointing
-                    and self.training
-                    and str(self.config.activation_checkpointing_mode).strip().lower()
-                    == "layer"
-                ):
-                    attn_mask = attn_masks[layer_type]
-                    cos_sin = rope[layer_type]
-                    token_mask = attention_mask
+        for i, layer in enumerate(self.layers):
+            if self.resid_lambdas is not None:
+                x = self.resid_lambdas[i] * x
+            if self.x0_lambdas is not None:
+                x = x + self.x0_lambdas[i] * x0
+            alpha = prores_alphas[i]
+            layer_type = layer.attention_type
+            if (
+                self.config.activation_checkpointing
+                and self.training
+                and str(self.config.activation_checkpointing_mode).strip().lower()
+                == "layer"
+            ):
+                attn_mask = attn_masks[layer_type]
+                cos_sin = rope[layer_type]
+                token_mask = attention_mask
 
-                    def _layer_forward(
-                        x_in: torch.Tensor,
-                        *,
-                        _layer: nn.Module = layer,
-                        _attn_mask=attn_mask,
-                        _cos_sin=cos_sin,
-                        _token_mask=token_mask,
-                        _repo_active: bool = repo_active,
-                        _prores_alpha=alpha,
-                    ) -> torch.Tensor:
-                        return _layer(
-                            x_in,
-                            attn_mask=_attn_mask,
-                            cos_sin=_cos_sin,
-                            position_ids=None,
-                            token_mask=_token_mask,
-                            repo_active=_repo_active,
-                            prores_alpha=_prores_alpha,
-                        )
-
-                    try:
-                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                    except TypeError:  # older torch checkpoint API
-                        x = _checkpoint(_layer_forward, x)
-                else:
-                    x = layer(
-                        x,
-                        attn_mask=attn_masks[layer_type],
-                        cos_sin=rope[layer_type],
+                def _layer_forward(
+                    x_in: torch.Tensor,
+                    *,
+                    _layer: nn.Module = layer,
+                    _attn_mask=attn_mask,
+                    _cos_sin=cos_sin,
+                    _token_mask=token_mask,
+                    _repo_active: bool = repo_active,
+                    _prores_alpha=alpha,
+                ) -> torch.Tensor:
+                    return _layer(
+                        x_in,
+                        attn_mask=_attn_mask,
+                        cos_sin=_cos_sin,
                         position_ids=None,
-                        token_mask=attention_mask,
-                        repo_active=repo_active,
-                        prores_alpha=alpha,
+                        token_mask=_token_mask,
+                        repo_active=_repo_active,
+                        prores_alpha=_prores_alpha,
                     )
+
+                try:
+                    x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                except TypeError:  # older torch checkpoint API
+                    x = _checkpoint(_layer_forward, x)
+            else:
+                x = layer(
+                    x,
+                    attn_mask=attn_masks[layer_type],
+                    cos_sin=rope[layer_type],
+                    position_ids=None,
+                    token_mask=attention_mask,
+                    repo_active=repo_active,
+                    prores_alpha=alpha,
+                )
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]  # compress: take stream 0
