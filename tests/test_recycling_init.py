@@ -10,7 +10,7 @@ l = P + r_bar * R + C where r_bar = max(1, recycling_loop_count - 1).
 """
 
 import math
-import pytest
+
 import torch
 
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
@@ -91,3 +91,36 @@ def test_takase_disabled_when_flag_off(tokenizer):
     inner = model.model
     wo_attn = inner.recurrent_layers[0].attn.Wo.weight
     assert wo_attn.abs().sum().item() == 0.0
+
+
+def test_recurrent_mlp_wo_std_matches_takase(tokenizer):
+    """MLP Wo must get the same std_out spike as attention Wo."""
+    cfg = _cfg(tokenizer)
+    inner = PureProtModernBertMLM(cfg).model
+    h, P, C, L = cfg.hidden_size, cfg.recycling_num_prelude_layers, cfg.recycling_num_coda_layers, cfg.num_hidden_layers
+    l = P + max(1, cfg.recycling_loop_count - 1) * (L - P - C) + C
+    expected_std = math.sqrt(1.0 / (5.0 * h * l))
+    mlp_wo = inner.recurrent_layers[0].mlp.Wo.weight
+    actual = mlp_wo.std().item()
+    assert expected_std / 3 < actual < expected_std * 3, \
+        f"recurrent mlp.Wo std {actual:.6f} vs expected {expected_std:.6f}"
+
+
+def test_recurrent_attn_wqkv_std_matches_takase_general(tokenizer):
+    """Attention Wqkv (fused) must get std_general."""
+    cfg = _cfg(tokenizer)
+    inner = PureProtModernBertMLM(cfg).model
+    h = cfg.hidden_size
+    expected_std = math.sqrt(2.0 / (5.0 * h))
+    wqkv = inner.recurrent_layers[0].attn.Wqkv.weight
+    actual = wqkv.std().item()
+    assert expected_std / 3 < actual < expected_std * 3, \
+        f"recurrent attn.Wqkv std {actual:.6f} vs expected {expected_std:.6f}"
+
+
+def test_coda_wo_unchanged_by_takase(tokenizer):
+    """Coda layers must NOT be Takase-touched; wo_init='zero' leaves their Wo at zero."""
+    cfg = _cfg(tokenizer, wo_init="zero")
+    inner = PureProtModernBertMLM(cfg).model
+    if len(inner.coda_layers) > 0:
+        assert inner.coda_layers[0].attn.Wo.weight.abs().sum().item() == 0.0

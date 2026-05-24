@@ -2663,16 +2663,33 @@ class ModernBertModel(nn.Module):
             torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
         for layer in self.recurrent_layers:
-            if hasattr(layer, "attn"):
-                if hasattr(layer.attn, "Wo") and layer.attn.Wo is not None:
-                    _trunc_init(layer.attn.Wo.weight, std_out)
-                if hasattr(layer.attn, "Wqkv") and layer.attn.Wqkv is not None:
-                    _trunc_init(layer.attn.Wqkv.weight, std_general)
-            if hasattr(layer, "mlp"):
-                if hasattr(layer.mlp, "Wo") and layer.mlp.Wo is not None:
-                    _trunc_init(layer.mlp.Wo.weight, std_out)
-                if hasattr(layer.mlp, "Wi") and layer.mlp.Wi is not None:
-                    _trunc_init(layer.mlp.Wi.weight, std_general)
+            attn = getattr(layer, "attn", None)
+            if attn is not None:
+                if getattr(attn, "Wo", None) is not None:
+                    _trunc_init(attn.Wo.weight, std_out)
+                # Attention input projections: fused Wqkv OR separate Wq/Wq2/Wk/Wv
+                if getattr(attn, "Wqkv", None) is not None:
+                    _trunc_init(attn.Wqkv.weight, std_general)
+                else:
+                    for name in ("Wq", "Wq2", "Wk", "Wv"):
+                        proj = getattr(attn, name, None)
+                        if proj is not None:
+                            _trunc_init(proj.weight, std_general)
+
+            mlp = getattr(layer, "mlp", None)
+            if mlp is not None:
+                # MLP input projections: fused Wi OR separate W_up/W_gate
+                if getattr(mlp, "Wi", None) is not None:
+                    _trunc_init(mlp.Wi.weight, std_general)
+                elif getattr(mlp, "W_up", None) is not None:
+                    _trunc_init(mlp.W_up.weight, std_general)
+                    if getattr(mlp, "W_gate", None) is not None:
+                        _trunc_init(mlp.W_gate.weight, std_general)
+                # MLP output: Linear `Wo` OR raw Parameter `Wo_weight` (SReLU MLP)
+                if getattr(mlp, "Wo", None) is not None:
+                    _trunc_init(mlp.Wo.weight, std_out)
+                elif getattr(mlp, "Wo_weight", None) is not None:
+                    _trunc_init(mlp.Wo_weight, std_out)
 
         if self.adapter is not None:
             _trunc_init(self.adapter.weight, std_general)
