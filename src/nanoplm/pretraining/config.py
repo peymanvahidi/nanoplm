@@ -125,6 +125,15 @@ class PretrainingConfig:
     noble_freq_lr_mult: float = 3.0      # ω frequency LR multiplier
     noble_phase_lr_mult: float = 5.0     # φ phase LR multiplier
 
+    # Huginn-style recycling — see docs/superpowers/specs/2026-05-24-huggin-style-recycling-design.md §2.
+    # All inactive when model.recycling_loop_count == 1.
+    recycling_bptt: int = 8                                   # truncated BPTT depth K
+    recycling_loop_count_sampling: str = "lognormal_poisson"  # "fixed" | "lognormal_poisson"
+    recycling_loop_count_sigma: float = 0.5                   # log-normal std (Huginn value)
+    recycling_loop_count_curriculum: str = "1_sqrt"           # "none" | "linear" | "1_sqrt"
+    recycling_loop_count_curriculum_steps: int = -1           # -1 = auto (25% of total training steps)
+    recycling_pretraining_eval_loop_counts: Optional[list[int]] = None  # None = single r at target mean
+
 
 @dataclass
 class ResumeConfig:
