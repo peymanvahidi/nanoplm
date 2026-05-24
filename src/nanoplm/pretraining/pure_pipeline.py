@@ -890,18 +890,19 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
             proj_flops + perm_mix_flops + pre_map_flops + post_res_flops
         )
 
-    # Huginn-style recycling: prelude (P, runs once) + recurrent (R, runs r_bar times) + coda
-    # (C, runs once). head_flops + pred_head_flops fire once after the stack and do NOT scale.
-    # Without the recycling_scale multiplier W&B MFU and tokens/sec silently undercount for
-    # recycled runs. r_bar = max(1, loop_count - 1) matches the Takase effective-depth
-    # convention used by ModernBertModel._apply_takase_init.
+    # Huginn-style recycling: prelude (P, runs once) + recurrent (R, runs loop_count times) +
+    # coda (C, runs once). head_flops + pred_head_flops fire once after the stack and do NOT
+    # scale. We use loop_count (not r_bar = loop_count - 1) because at inference R runs exactly
+    # loop_count times, and at training E[r] = loop_count by construction of the log-normal
+    # Poisson sampler (Poisson(λ)+1 with E[λ]=loop_count-1 ⇒ E[r]=loop_count). The Takase
+    # init formula in _apply_takase_init uses r_bar by paper convention; that's a separate
+    # quantity for variance scaling, not actual compute.
     stack_flops = attn_proj_flops + attn_flops + mlp_flops + canon_flops + mhc_flops
     P = max(0, int(getattr(config, "recycling_num_prelude_layers", 0)))
     C = max(0, int(getattr(config, "recycling_num_coda_layers", 0)))
     loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
     R = n_layers - P - C
-    r_bar = max(1, loop_count - 1) if loop_count > 1 else 1
-    effective_layer_count = P + r_bar * R + C  # collapses to n_layers when loop_count == 1
+    effective_layer_count = P + loop_count * R + C  # collapses to n_layers when loop_count == 1
     recycling_scale = effective_layer_count / max(1, n_layers)
     forward_flops = recycling_scale * stack_flops + head_flops + pred_head_flops
     return 3 * forward_flops
