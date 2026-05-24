@@ -1,0 +1,31 @@
+{
+  "name": "nanoplm-recycling-preset",
+  "description": "Preset workspace for Huginn-style recycling runs. Auto-groups recycling/* metrics into training / diagnostics / eval_inloop sections.",
+  "sections": [
+    {
+      "name": "Recycling — Training",
+      "panel_keys": [
+        "recycling/training/sampled_r",
+        "recycling/training/curriculum_k_t",
+        "recycling/training/r_distribution"
+      ]
+    },
+    {
+      "name": "Recycling — Diagnostics",
+      "panel_keys": [
+        "recycling/diagnostics/adapter_w_rms",
+        "recycling/diagnostics/adapter_w_grad_rms",
+        "recycling/diagnostics/s_convergence_at_r",
+        "recycling/diagnostics/s_norm_final"
+      ]
+    },
+    {
+      "name": "Recycling — In-Loop Eval",
+      "panel_keys": [
+        "recycling/eval_inloop/inloop_eval_loss_vs_r"
+      ],
+      "panel_keys_wildcard": "recycling/eval_inloop/inloop_eval_loss_at_r*"
+    }
+  ],
+  "import_instructions": "In the wandb UI, open your recycling run's project workspace, click 'Auto Generate' > 'Import config' and paste this JSON."
+}

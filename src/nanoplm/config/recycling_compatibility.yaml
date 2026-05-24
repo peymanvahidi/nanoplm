@@ -2,6 +2,11 @@
 # Source of truth — loaded by src/nanoplm/config/recycling_compatibility.py
 # and consulted by ModernBertConfig.__post_init__ and pure_pipeline.py startup.
 # Only activates when model.recycling_loop_count > 1.
+#
+# Sibling files in this directory:
+#   recycling_compatibility.yaml   — flag compatibility matrix (this file)
+#   recycling_compatibility.py     — validator
+#   recycling_wandb_dashboard.json — preset wandb workspace config
 
 schema_version: 1
 feature: huggin_style_recycling
