@@ -1962,7 +1962,12 @@ def run_pure_pretraining(
 
     # ---- Recycling scheduler (no-op when recycling_loop_count == 1) ----
     from nanoplm.pretraining.recycling import RecyclingScheduler
-    from nanoplm.pretraining.recycling.logging import RecyclingMetricsBuffer
+    from nanoplm.pretraining.recycling.logging import (
+        RecyclingMetricsBuffer,
+        per_step_payload,
+        logging_steps_payload,
+        inloop_eval_payload,
+    )
     recycling_scheduler = None
     recycling_rng = None
     recycling_metrics_buffer = None
@@ -1972,6 +1977,8 @@ def run_pure_pretraining(
             target_loop_count=model.model_config.recycling_loop_count,
             total_training_steps=total_steps,
         )
+        # +999 offset keeps the r-sampling RNG stream distinct from the seed
+        # used elsewhere (model init, data shuffling, dropout).
         recycling_rng = torch.Generator(device=device).manual_seed(int(pretrain_config.seed) + 999)
         recycling_metrics_buffer = RecyclingMetricsBuffer(window=100)
     scheduler = _create_scheduler(
@@ -2695,15 +2702,13 @@ def run_pure_pretraining(
                         }
                         if muon_lr is not None:
                             payload["train/muon_lr"] = muon_lr
-                        if recycling_scheduler is not None and sampled_r is not None:
-                            from nanoplm.pretraining.recycling.logging import per_step_payload
-                            payload.update(per_step_payload(sampled_r, curriculum_k_t))
-                        if recycling_scheduler is not None and should_log:
-                            from nanoplm.pretraining.recycling.logging import logging_steps_payload
-                            adapter = getattr(orig_model.model, "adapter", None) if hasattr(orig_model, "model") else None
-                            payload.update(logging_steps_payload(adapter, recycling_metrics_buffer))
                         if wandb_enabled and wandb.run is not None:
                             try:
+                                if recycling_scheduler is not None and sampled_r is not None:
+                                    payload.update(per_step_payload(sampled_r, curriculum_k_t))
+                                if recycling_scheduler is not None and should_log:
+                                    adapter = getattr(orig_model.model, "adapter", None) if hasattr(orig_model, "model") else None
+                                    payload.update(logging_steps_payload(adapter, recycling_metrics_buffer))
                                 wandb.log(payload)
                             except Exception as exc:
                                 wandb_enabled = False
@@ -2751,13 +2756,12 @@ def run_pure_pretraining(
                                 losses_str = ", ".join(f"r={r}: {l:.4f}" for r, l in sorted(losses_by_r.items()))
                                 logger.info(f"[step {global_step}] in-loop eval {losses_str}")
                                 if wandb_enabled and wandb.run is not None:
-                                    from nanoplm.pretraining.recycling.logging import inloop_eval_payload
-                                    p = {"train/global_step": global_step}
-                                    p.update(inloop_eval_payload(losses_by_r))
-                                    target = model.model_config.recycling_loop_count
-                                    if target in losses_by_r:
-                                        p["eval/loss"] = losses_by_r[target]
                                     try:
+                                        p = {"train/global_step": global_step}
+                                        p.update(inloop_eval_payload(losses_by_r))
+                                        target = model.model_config.recycling_loop_count
+                                        if target in losses_by_r:
+                                            p["eval/loss"] = losses_by_r[target]
                                         wandb.log(p)
                                     except Exception as exc:
                                         wandb_enabled = False
