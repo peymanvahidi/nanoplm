@@ -2749,20 +2749,6 @@ class ModernBertModel(nn.Module):
         """
         r = int(r.item()) if isinstance(r, torch.Tensor) else int(r)
         K = int(K.item()) if isinstance(K, torch.Tensor) else int(K)
-        # --- DIAG: first few calls log r/K and types so we can confirm in
-        # the training log that the eager driver is actually being entered
-        # and the kwargs arrive as expected. Remove after diagnosis.
-        _dbg = getattr(self, "_drive_recurrence_dbg_count", 0)
-        if _dbg < 6:
-            print(
-                f"[DIAG _drive_recurrence] call #{_dbg}: r={r} K={K} "
-                f"no_grad_steps={max(0, r-K)} grad_steps={min(r, K)} "
-                f"training={self.training} "
-                f"e.shape={tuple(e.shape)} e.requires_grad={e.requires_grad} "
-                f"s.shape={tuple(s.shape)} s.requires_grad={s.requires_grad}",
-                flush=True,
-            )
-            self._drive_recurrence_dbg_count = _dbg + 1
         no_grad_steps = max(0, r - K)
         with torch.no_grad():
             for _ in range(no_grad_steps):
