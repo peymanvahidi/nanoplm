@@ -756,8 +756,15 @@ def _make_pure_profiler(
 # FLOPs estimation
 # ---------------------------------------------------------------------------
 
-def _estimate_model_flops_per_token(config, seq_len: int) -> int:
-    """Training FLOPs per token (forward + backward ≈ 3× forward).
+def _recycling_flops_components(config, seq_len: int):
+    """Decompose training FLOPs/token into recycling-scalable + fixed parts.
+
+    Returns ``(stack_flops, tail_flops, P, R, C, n_layers)``. ``stack_flops`` is
+    the per-forward-pass cost of the full transformer stack; under recycling the
+    recurrent block (R layers) repeats that work ``loop_count`` times while
+    prelude (P) and coda (C) run once. ``tail_flops`` (lm-head + prediction head)
+    fires once and does NOT scale with the loop count. Feed these to
+    ``_recycling_flops_per_token`` to get FLOPs/token at a given loop count.
 
     Each matmul contributes 2 FLOPs per element (multiply + accumulate) in forward.
     Backward is ~2× forward for matmuls => total 6 FLOPs per matmul element.
@@ -890,22 +897,56 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
             proj_flops + perm_mix_flops + pre_map_flops + post_res_flops
         )
 
-    # Huginn-style recycling: prelude (P, runs once) + recurrent (R, runs loop_count times) +
-    # coda (C, runs once). head_flops + pred_head_flops fire once after the stack and do NOT
-    # scale. We use loop_count (not r_bar = loop_count - 1) because at inference R runs exactly
-    # loop_count times, and at training E[r] = loop_count by construction of the log-normal
-    # Poisson sampler (Poisson(λ)+1 with E[λ]=loop_count-1 ⇒ E[r]=loop_count). The Takase
-    # init formula in _apply_takase_init uses r_bar by paper convention; that's a separate
-    # quantity for variance scaling, not actual compute.
+    # Huginn-style recycling: prelude (P, runs once) + recurrent (R, looped) + coda
+    # (C, runs once). head_flops + pred_head_flops fire once after the stack and do
+    # NOT scale with the loop count -> they go into tail_flops. The loop count is
+    # supplied by the caller: the target recycling_loop_count for the startup
+    # estimate, or the *actual* sampled r per step for live MFU (the two differ
+    # while the recycling curriculum ramps the mean loop count up from 1).
     stack_flops = attn_proj_flops + attn_flops + mlp_flops + canon_flops + mhc_flops
+    tail_flops = head_flops + pred_head_flops
     P = max(0, int(getattr(config, "recycling_num_prelude_layers", 0)))
     C = max(0, int(getattr(config, "recycling_num_coda_layers", 0)))
-    loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
     R = n_layers - P - C
-    effective_layer_count = P + loop_count * R + C  # collapses to n_layers when loop_count == 1
-    recycling_scale = effective_layer_count / max(1, n_layers)
-    forward_flops = recycling_scale * stack_flops + head_flops + pred_head_flops
-    return 3 * forward_flops
+    return stack_flops, tail_flops, P, R, C, n_layers
+
+
+def _recycling_flops_per_token(components, loop_count: int, bptt: int | None = None) -> float:
+    """Training FLOPs/token (forward + truncated-BPTT backward) at a loop count.
+
+    ``components`` is the tuple from ``_recycling_flops_components``. The recurrent
+    block (R layers) runs ``loop_count`` times in the forward pass; prelude/coda run
+    once; the tail (lm-head + prediction head) fires once. Collapses to the dense
+    n_layers cost when ``loop_count == 1`` (i.e. recycling disabled).
+
+    Backward cost reflects truncated BPTT: ``_drive_recurrence`` runs the first
+    ``loop_count - K`` recurrent iters under ``torch.no_grad()`` and retains a graph
+    only for the last ``K = bptt`` iters (prelude/coda always differentiate, since
+    ``e`` is not detached). So the hardware backward is ~2× the forward of the
+    *differentiated* subgraph (P + K·R + C + tail), NOT 2× the full forward. Charging
+    2× the full forward (the old ``3× forward``) overcounts backward FLOPs by
+    ``2·(loop_count − K)·R`` layer-equivalents and inflates MFU for r > K.
+
+    ``bptt=None`` (or ``bptt >= loop_count``) means full BPTT and recovers ``3× forward``.
+    """
+    stack_flops, tail_flops, P, R, C, n_layers = components
+    loop_count = max(1, int(loop_count))
+    K = loop_count if bptt is None else max(1, min(int(bptt), loop_count))
+
+    def _forward(loops: int) -> float:
+        effective_layer_count = P + loops * R + C  # == n_layers when loops == 1
+        return (effective_layer_count / max(1, n_layers)) * stack_flops + tail_flops
+
+    forward_flops = _forward(loop_count)   # all loop_count iters run forward
+    backward_flops = 2.0 * _forward(K)     # backward retained only for last K iters
+    return forward_flops + backward_flops
+
+
+def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = None) -> int:
+    """Training FLOPs/token at the TARGET recycling loop count (startup estimate)."""
+    components = _recycling_flops_components(config, seq_len)
+    loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
+    return _recycling_flops_per_token(components, loop_count, bptt=bptt)
 
 
 # ---------------------------------------------------------------------------
@@ -2129,6 +2170,7 @@ def run_pure_pretraining(
     if is_main:
         try:
             wandb.init(
+                mode="offline",
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
@@ -2163,7 +2205,15 @@ def run_pure_pretraining(
     # ---- MFU estimation ----
     _raw = orig_model
     _cfg = _raw.config
-    _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len)
+    # Truncated-BPTT depth K: backward is retained only for the last K recurrent
+    # iters (see _drive_recurrence / _recycling_flops_per_token), so the FLOPs
+    # estimator must know K or it overcounts backward and inflates MFU for r > K.
+    _bptt = max(1, int(getattr(pretrain_config, "recycling_bptt", 1)))
+    _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len, bptt=_bptt)
+    # Components for per-step FLOPs at the *actual* loop count (curriculum-accurate
+    # MFU). _flops_per_token above is the nominal estimate at the target loop count.
+    _flops_components = _recycling_flops_components(_cfg, manifest.max_seq_len)
+    _static_loop_count = max(1, int(getattr(_cfg, "recycling_loop_count", 1)))
     _peak_flops = H100_PEAK_TFLOPS * 1e12
     logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
 
@@ -2264,6 +2314,10 @@ def run_pure_pretraining(
     discard_accumulation = False
     token_count = torch.zeros((), dtype=torch.long, device=device)
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
+    # Sum over the logging window of flops_per_token(actual r) * valid_tokens, so
+    # MFU reflects the real compute done under the recycling curriculum rather than
+    # the target loop count. float64 to hold ~1e15+ FLOPs/window without precision loss.
+    window_flops = torch.zeros((), dtype=torch.float64, device=device)
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
@@ -2432,14 +2486,15 @@ def run_pure_pretraining(
                         model.set_requires_gradient_sync(sync)
 
                     if "num_valid_tokens" in batch:
-                        token_count += batch["num_valid_tokens"]
+                        microstep_tokens = batch["num_valid_tokens"]
                         raw_token_count += batch["input_ids"].numel()
                     elif "attention_mask" in batch:
-                        token_count += batch["attention_mask"].sum()
+                        microstep_tokens = batch["attention_mask"].sum()
                         raw_token_count += batch["attention_mask"].numel()
                     else:
-                        token_count += batch["input_ids"].numel()
+                        microstep_tokens = batch["input_ids"].numel()
                         raw_token_count += batch["input_ids"].numel()
+                    token_count += microstep_tokens
 
                     # Sample r for this micro-step (locked-step across DP workers)
                     sampled_r = None
@@ -2458,6 +2513,15 @@ def run_pure_pretraining(
                         curriculum_k_t = recycling_scheduler.current_mean(global_step)
                         recycling_metrics_buffer.record_step(sampled_r)
 
+                    # Charge FLOPs at the loop count actually executed this micro-step
+                    # (sampled_r under the curriculum), not the target loop count.
+                    # Cast tokens to float64 first so float32 never truncates the ~1e9
+                    # FLOPs/token product (no host sync — sampled_r already synced above).
+                    _loop_for_flops = sampled_r if sampled_r is not None else _static_loop_count
+                    _fpt = _recycling_flops_per_token(_flops_components, _loop_for_flops, bptt=_bptt)
+                    _mt64 = microstep_tokens.double() if torch.is_tensor(microstep_tokens) else float(microstep_tokens)
+                    window_flops += _fpt * _mt64
+
                     sync_ctx = _ddp_sync_context(model, distributed_mode=distributed_mode, sync=sync)
                     amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
                     with sync_ctx:
@@ -2473,8 +2537,21 @@ def run_pure_pretraining(
                             if "position_ids" in batch:
                                 fwd_kwargs["position_ids"] = batch["position_ids"]
                             if sampled_r is not None:
-                                fwd_kwargs["recycling_loop_count"] = sampled_r
-                                fwd_kwargs["recycling_bptt"] = pretrain_config.recycling_bptt
+                                # Pass as 0-d int tensors (not Python ints) so
+                                # Dynamo does NOT install a value guard at the
+                                # _drive_recurrence disable boundary. With Python
+                                # ints the compiled segment that calls the eager
+                                # driver recompiles for every unique sampled r,
+                                # thrashing the compile cache under Poisson
+                                # sampling.
+                                fwd_kwargs["recycling_loop_count"] = torch.tensor(
+                                    sampled_r, dtype=torch.int64, device=device
+                                )
+                                fwd_kwargs["recycling_bptt"] = torch.tensor(
+                                    pretrain_config.recycling_bptt,
+                                    dtype=torch.int64,
+                                    device=device,
+                                )
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
@@ -2648,23 +2725,32 @@ def run_pure_pretraining(
                         log_vals = log_buf.cpu()
                         avg_loss = float(log_vals[0])
                         grad_norm_val = float(log_vals[1])
-                        tok = float(token_count.item())
-                        raw_tok = float(raw_token_count.item())
+                        # Reduce valid tokens, raw tokens, and the actual-loop-count
+                        # FLOPs for this window in a single collective. window_flops
+                        # already weights each micro-step by its sampled loop count,
+                        # so MFU = achieved FLOP/s / peak reflects real compute — not
+                        # the target loop count, which overstates MFU early in the
+                        # recycling curriculum (when r is still ~1).
+                        reduce_buf = torch.stack([
+                            token_count.double(),
+                            raw_token_count.double(),
+                            window_flops,
+                        ])
                         if distributed and dist.is_initialized():
-                            tok_buf = torch.tensor([tok, raw_tok], device=device)
-                            dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
-                            tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
+                            dist.all_reduce(reduce_buf, op=dist.ReduceOp.SUM)
+                        tok = float(reduce_buf[0].item())
+                        raw_tok = float(reduce_buf[1].item())
+                        window_flops_total = float(reduce_buf[2].item())
                         tps = int(raw_tok / window_dt)
                         step_tok = tok / max(1, window_steps)
                         step_raw_tok = raw_tok / max(1, window_steps)
                         real_tps = tok / window_dt
                         real_tps_log = int(real_tps)
-                        mfu = (
-                            _flops_per_token * real_tps
-                        ) / (_peak_flops * max(effective_world_size, 1))
+                        mfu = window_flops_total / window_dt / (_peak_flops * max(effective_world_size, 1))
 
                         token_count.zero_()
                         raw_token_count.zero_()
+                        window_flops.zero_()
 
                         if global_step % eval_steps == 0:
                             vram_log = _format_vram_for_log(
@@ -2829,6 +2915,7 @@ def run_pure_pretraining(
             discard_accumulation = False
             token_count.zero_()
             raw_token_count.zero_()
+            window_flops.zero_()
             window_loss.zero_()
             window_steps = 0
 

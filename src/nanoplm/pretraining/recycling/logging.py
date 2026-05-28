@@ -44,16 +44,40 @@ def per_step_payload(sampled_r: int, curriculum_k_t: int) -> dict:
     }
 
 
+def _local_shard(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a parameter's *local* shard without communication.
+
+    Under FSDP2 the adapter weight is a sharded ``DTensor``. Reducing over the
+    full DTensor (``.mean()``) issues a collective. This payload is built on
+    rank 0 only (the caller gates it behind ``if should_log and is_main:``), so
+    that collective has no peers on the other ranks: it shifts rank 0's NCCL
+    sequence by one and every later collective is then matched to the wrong op
+    (ALLREDUCE vs BROADCAST), ending in a watchdog timeout one step after the
+    first logged step. Reading ``to_local()`` keeps the diagnostic rank-local
+    and collective-free (plain tensors — DDP / single-GPU — have no ``to_local``
+    and pass through unchanged).
+    """
+    to_local = getattr(tensor, "to_local", None)
+    return to_local() if callable(to_local) else tensor
+
+
 def logging_steps_payload(adapter: Optional[torch.nn.Module],
                           buffer: RecyclingMetricsBuffer) -> dict:
-    """Per-logging-steps payload: adapter RMS + grad RMS + r histogram."""
+    """Per-logging-steps payload: adapter RMS + grad RMS + r histogram.
+
+    The adapter weight is an FSDP2-sharded ``DTensor``; we read its local shard
+    (see ``_local_shard``) so this stays collective-free — computing the RMS
+    over the full DTensor here would desync NCCL across ranks. The local-shard
+    RMS tracks the same scale as the global RMS for this diagnostic.
+    """
     payload: dict = {}
     if adapter is not None:
-        w_rms = adapter.weight.detach().float().pow(2).mean().sqrt().item()
-        payload["recycling/diagnostics/adapter_w_rms"] = w_rms
-        if adapter.weight.grad is not None:
-            g_rms = adapter.weight.grad.detach().float().pow(2).mean().sqrt().item()
-            payload["recycling/diagnostics/adapter_w_grad_rms"] = g_rms
+        w = _local_shard(adapter.weight.detach())
+        payload["recycling/diagnostics/adapter_w_rms"] = w.float().pow(2).mean().sqrt().item()
+        grad = adapter.weight.grad
+        if grad is not None:
+            g = _local_shard(grad.detach())
+            payload["recycling/diagnostics/adapter_w_grad_rms"] = g.float().pow(2).mean().sqrt().item()
     hist = buffer.histogram()
     if hist is not None:
         payload["recycling/training/r_distribution"] = hist

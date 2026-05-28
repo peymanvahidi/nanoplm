@@ -2616,22 +2616,162 @@ class ModernBertModel(nn.Module):
         ]
         self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
 
-    def _recurrent_step(
+    def _recurrent_step_varlen(
         self,
         e: torch.Tensor,
         s_prev: torch.Tensor,
-        run_layer,
+        *,
+        rope_full,
+        rope_sliding,
+        cu_seqlens: torch.Tensor,
+        max_seqlen,
+        window_full,
+        window_sliding,
+        position_ids: torch.Tensor,
+        repo_active: bool,
+        prores_alphas: torch.Tensor,
     ) -> torch.Tensor:
-        """One iteration of the recurrent block.
+        """One iteration of the recurrent block (varlen / flash path).
 
-        run_layer(layer, x, layer_idx) is a closure built by forward() that
-        applies a single transformer block with the correct path-specific kwargs.
+        Inlines the per-layer call so the for-loop unrolls inside a single
+        compiled frame instead of dispatching through a closure (which would
+        re-enter Dynamo once per layer and specialize on ``layer_idx``,
+        blowing ``cache_size_limit`` for R > cache_size). All path-specific
+        tensors arrive as explicit kwargs — no closure capture — so
+        ``torch.compile`` guards stay stable across calls.
         """
-        u = self.adapter(torch.cat([s_prev, e], dim=-1))
         P = self.config.recycling_num_prelude_layers
+        u = self.adapter(torch.cat([s_prev, e], dim=-1))
         for i, layer in enumerate(self.recurrent_layers):
-            u = run_layer(layer, u, P + i)
+            lt = layer.attention_type  # str, constant per layer
+            if lt == "full_attention":
+                cos_sin = rope_full
+                window_size = window_full
+            else:
+                cos_sin = rope_sliding
+                window_size = window_sliding
+            u = layer(
+                u,
+                cos_sin=cos_sin,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                window_size=window_size,
+                position_ids=position_ids,
+                repo_active=repo_active,
+                prores_alpha=prores_alphas[P + i],
+            )
         return u
+
+    def _recurrent_step_sdpa(
+        self,
+        e: torch.Tensor,
+        s_prev: torch.Tensor,
+        *,
+        rope_full,
+        rope_sliding,
+        attn_mask_full,
+        attn_mask_sliding,
+        token_mask: torch.Tensor,
+        repo_active: bool,
+        prores_alphas: torch.Tensor,
+    ) -> torch.Tensor:
+        """One iteration of the recurrent block (SDPA fallback path).
+
+        Same no-closure design as ``_recurrent_step_varlen`` — see that
+        docstring for rationale.
+        """
+        P = self.config.recycling_num_prelude_layers
+        u = self.adapter(torch.cat([s_prev, e], dim=-1))
+        for i, layer in enumerate(self.recurrent_layers):
+            lt = layer.attention_type
+            if lt == "full_attention":
+                cos_sin = rope_full
+                attn_mask = attn_mask_full
+            else:
+                cos_sin = rope_sliding
+                attn_mask = attn_mask_sliding
+            u = layer(
+                u,
+                attn_mask=attn_mask,
+                cos_sin=cos_sin,
+                position_ids=None,
+                token_mask=token_mask,
+                repo_active=repo_active,
+                prores_alpha=prores_alphas[P + i],
+            )
+        return u
+
+    @torch._dynamo.disable(recursive=False)
+    def _drive_recurrence(
+        self,
+        e: torch.Tensor,
+        s: torch.Tensor,
+        r,
+        K,
+        step_fn,
+    ) -> torch.Tensor:
+        """Run r iterations of the recurrent block in eager Python.
+
+        Why: the trip count r is sampled per micro-step (Poisson). Without
+        this disable, r would flow into ``for _ in range(r):`` inside a
+        torch.compile-traced graph; Dynamo specializes on Python-int loop
+        bounds, so every unique r causes a guard miss + fresh trace +
+        autotune pass, thrashing the compile cache and stalling training.
+        Disabling Dynamo here keeps the variable trip count confined to
+        eager Python while the shape-stable prelude and coda regions still
+        compile normally on either side of this call (graph break).
+
+        Decorator is ``@torch._dynamo.disable(recursive=False)``: the
+        driver body itself runs eager (so ``range(r)`` stays in Python),
+        but each ``step_fn(e, s)`` call re-enters Dynamo and compiles the
+        shape-stable recurrent step as its own cached graph. This recovers
+        torch.compile fusion on the recurrent block (~75% of compute) —
+        matching Huginn's reference (seal-rg/recurrent-pretraining
+        ``model_dynamic.iterate_forward``).
+
+        Critical precondition: ``step_fn`` must call a method that does NOT
+        dispatch per-layer through a closure with an int ``layer_idx`` arg.
+        We tried that and it produced R separately-traced frames (one per
+        ``layer_idx`` value) that blow ``cache_size_limit`` when R > 8.
+        Instead, ``_recurrent_step_varlen`` / ``_recurrent_step_sdpa``
+        inline the per-layer call directly — the for-loop unrolls inside
+        one compiled frame.
+
+        r and K may arrive as Python ints (eager callers) or as 0-d int
+        tensors (compiled training loop — passing tensors prevents Dynamo
+        from installing an equality guard on the int value at the
+        graph-break boundary, which would also force a recompile per r).
+
+        Splits into a no-grad outer phase (r - K iterations) and an in-graph
+        phase (K iterations) so truncated BPTT only retains gradients for
+        the last K iters. ``e`` is NOT detached so prelude params still
+        receive gradients through the in-graph iters.
+        """
+        r = int(r.item()) if isinstance(r, torch.Tensor) else int(r)
+        K = int(K.item()) if isinstance(K, torch.Tensor) else int(K)
+        # --- DIAG: first few calls log r/K and types so we can confirm in
+        # the training log that the eager driver is actually being entered
+        # and the kwargs arrive as expected. Remove after diagnosis.
+        _dbg = getattr(self, "_drive_recurrence_dbg_count", 0)
+        if _dbg < 6:
+            print(
+                f"[DIAG _drive_recurrence] call #{_dbg}: r={r} K={K} "
+                f"no_grad_steps={max(0, r-K)} grad_steps={min(r, K)} "
+                f"training={self.training} "
+                f"e.shape={tuple(e.shape)} e.requires_grad={e.requires_grad} "
+                f"s.shape={tuple(s.shape)} s.requires_grad={s.requires_grad}",
+                flush=True,
+            )
+            self._drive_recurrence_dbg_count = _dbg + 1
+        no_grad_steps = max(0, r - K)
+        with torch.no_grad():
+            for _ in range(no_grad_steps):
+                s = step_fn(e, s)
+        if no_grad_steps > 0:
+            s = s.detach()
+        for _ in range(r - no_grad_steps):
+            s = step_fn(e, s)
+        return s
 
     def _apply_takase_init(self) -> None:
         """Huginn §4.1 Takase spike init applied to the recurrent block + adapter.
@@ -2785,40 +2925,79 @@ class ModernBertModel(nn.Module):
                 r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
                 K = recycling_bptt if recycling_bptt is not None else 8
 
-            def _run_layer_varlen(layer, x_in, layer_idx, _rope=rope, _windows=windows):
-                lt = layer.attention_type
-                return layer(
-                    x_in,
-                    cos_sin=_rope[lt],
-                    cu_seqlens=_cu_seqlens,
-                    max_seqlen=_max_seqlen,
-                    window_size=_windows[lt],
-                    position_ids=_position_ids,
-                    repo_active=repo_active,
-                    prores_alpha=prores_alphas[layer_idx],
-                )
+            # Path-specific tensors hoisted once per forward so the unrolled
+            # prelude/coda loops below see the same captures Dynamo can
+            # constant-fold; no per-call closure means no layer_idx guard.
+            _rope_full = rope["full_attention"]
+            _rope_sliding = rope["sliding_attention"]
+            _window_full = windows["full_attention"]
+            _window_sliding = windows["sliding_attention"]
 
             if _recycle:
                 h_pre = x
+                # Inlined prelude: per-layer call directly in the unrolled
+                # for-loop. The previous _run_layer_varlen closure made
+                # Dynamo trace this as a separate frame and specialize on
+                # layer_idx (P specializations).
                 for i, layer in enumerate(self.prelude_layers):
-                    h_pre = _run_layer_varlen(layer, h_pre, i)
+                    lt = layer.attention_type
+                    if lt == "full_attention":
+                        _cos_sin = _rope_full
+                        _window_size = _window_full
+                    else:
+                        _cos_sin = _rope_sliding
+                        _window_size = _window_sliding
+                    h_pre = layer(
+                        h_pre,
+                        cos_sin=_cos_sin,
+                        cu_seqlens=_cu_seqlens,
+                        max_seqlen=_max_seqlen,
+                        window_size=_window_size,
+                        position_ids=_position_ids,
+                        repo_active=repo_active,
+                        prores_alpha=prores_alphas[i],
+                    )
                 e = h_pre
 
                 s = torch.randn_like(e) * self.config.recycling_s0_noise_sigma
 
-                no_grad_steps = max(0, r - K)
-                with torch.no_grad():
-                    for _ in range(no_grad_steps):
-                        s = self._recurrent_step(e, s, _run_layer_varlen)
-                if no_grad_steps > 0:
-                    s = s.detach()
-                for _ in range(r - no_grad_steps):
-                    s = self._recurrent_step(e, s, _run_layer_varlen)
+                def _step_varlen(e_in, s_in):
+                    return self._recurrent_step_varlen(
+                        e_in,
+                        s_in,
+                        rope_full=_rope_full,
+                        rope_sliding=_rope_sliding,
+                        cu_seqlens=_cu_seqlens,
+                        max_seqlen=_max_seqlen,
+                        window_full=_window_full,
+                        window_sliding=_window_sliding,
+                        position_ids=_position_ids,
+                        repo_active=repo_active,
+                        prores_alphas=prores_alphas,
+                    )
+                s = self._drive_recurrence(e, s, r, K, _step_varlen)
 
                 P_count = self.config.recycling_num_prelude_layers
                 R_count = len(self.recurrent_layers)
+                # Inlined coda — same reason as the prelude block above.
                 for i, layer in enumerate(self.coda_layers):
-                    s = _run_layer_varlen(layer, s, P_count + R_count + i)
+                    lt = layer.attention_type
+                    if lt == "full_attention":
+                        _cos_sin = _rope_full
+                        _window_size = _window_full
+                    else:
+                        _cos_sin = _rope_sliding
+                        _window_size = _window_sliding
+                    s = layer(
+                        s,
+                        cos_sin=_cos_sin,
+                        cu_seqlens=_cu_seqlens,
+                        max_seqlen=_max_seqlen,
+                        window_size=_window_size,
+                        position_ids=_position_ids,
+                        repo_active=repo_active,
+                        prores_alpha=prores_alphas[P_count + R_count + i],
+                    )
                 x = s
             else:
                 for i, layer in enumerate(self.layers):
@@ -2957,39 +3136,71 @@ class ModernBertModel(nn.Module):
             r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
             K = recycling_bptt if recycling_bptt is not None else 8
 
-        def _run_layer_sdpa(layer, x_in, layer_idx, _attn_masks=attn_masks, _rope=rope):
-            lt = layer.attention_type
-            return layer(
-                x_in,
-                attn_mask=_attn_masks[lt],
-                cos_sin=_rope[lt],
-                position_ids=None,
-                token_mask=attention_mask,
-                repo_active=repo_active,
-                prores_alpha=prores_alphas[layer_idx],
-            )
+        # Path-specific tensors hoisted once per forward — see varlen path
+        # for the rationale (avoids per-layer closure -> layer_idx guard).
+        _rope_full = rope["full_attention"]
+        _rope_sliding = rope["sliding_attention"]
+        _attn_mask_full = attn_masks["full_attention"]
+        _attn_mask_sliding = attn_masks["sliding_attention"]
 
         if _recycle:
             h_pre = x
+            # Inlined prelude.
             for i, layer in enumerate(self.prelude_layers):
-                h_pre = _run_layer_sdpa(layer, h_pre, i)
+                lt = layer.attention_type
+                if lt == "full_attention":
+                    _cos_sin = _rope_full
+                    _attn_mask = _attn_mask_full
+                else:
+                    _cos_sin = _rope_sliding
+                    _attn_mask = _attn_mask_sliding
+                h_pre = layer(
+                    h_pre,
+                    attn_mask=_attn_mask,
+                    cos_sin=_cos_sin,
+                    position_ids=None,
+                    token_mask=attention_mask,
+                    repo_active=repo_active,
+                    prores_alpha=prores_alphas[i],
+                )
             e = h_pre
 
             s = torch.randn_like(e) * self.config.recycling_s0_noise_sigma
 
-            no_grad_steps = max(0, r - K)
-            with torch.no_grad():
-                for _ in range(no_grad_steps):
-                    s = self._recurrent_step(e, s, _run_layer_sdpa)
-            if no_grad_steps > 0:
-                s = s.detach()
-            for _ in range(r - no_grad_steps):
-                s = self._recurrent_step(e, s, _run_layer_sdpa)
+            def _step_sdpa(e_in, s_in):
+                return self._recurrent_step_sdpa(
+                    e_in,
+                    s_in,
+                    rope_full=_rope_full,
+                    rope_sliding=_rope_sliding,
+                    attn_mask_full=_attn_mask_full,
+                    attn_mask_sliding=_attn_mask_sliding,
+                    token_mask=attention_mask,
+                    repo_active=repo_active,
+                    prores_alphas=prores_alphas,
+                )
+            s = self._drive_recurrence(e, s, r, K, _step_sdpa)
 
             P_count = self.config.recycling_num_prelude_layers
             R_count = len(self.recurrent_layers)
+            # Inlined coda.
             for i, layer in enumerate(self.coda_layers):
-                s = _run_layer_sdpa(layer, s, P_count + R_count + i)
+                lt = layer.attention_type
+                if lt == "full_attention":
+                    _cos_sin = _rope_full
+                    _attn_mask = _attn_mask_full
+                else:
+                    _cos_sin = _rope_sliding
+                    _attn_mask = _attn_mask_sliding
+                s = layer(
+                    s,
+                    attn_mask=_attn_mask,
+                    cos_sin=_cos_sin,
+                    position_ids=None,
+                    token_mask=attention_mask,
+                    repo_active=repo_active,
+                    prores_alpha=prores_alphas[P_count + R_count + i],
+                )
             x = s
         else:
             for i, layer in enumerate(self.layers):
