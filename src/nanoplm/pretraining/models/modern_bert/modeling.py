@@ -372,6 +372,7 @@ class ModernBertAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.use_qk_norm = config.use_qk_norm
+        self.reorder_RoPE_QKNorm = config.reorder_RoPE_QKNorm
         self.dropout = config.attention_dropout
         self.scale = self.head_dim**-0.5
         self.use_diff_attn_v2 = config.use_diff_attn_v2
@@ -576,13 +577,16 @@ class ModernBertAttention(nn.Module):
         k = k.view(total, self.num_kv_heads, self.head_dim)
         v = v.view(total, self.num_kv_heads, self.head_dim)
 
+        if self.use_qk_norm and self.reorder_RoPE_QKNorm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
         if self.repo is not None and repo_active:
             positions = self.repo(x)  # (T, num_heads)
             q, k = _apply_rope_repo(q, k, positions, self.repo_inv_freq)
         elif not self.use_paired_head_attention:
             cos, sin = cos_sin
             q, k = _apply_rope(q, k, cos, sin)
-        if self.use_qk_norm:
+        if self.use_qk_norm and not self.reorder_RoPE_QKNorm:
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
 
@@ -681,13 +685,16 @@ class ModernBertAttention(nn.Module):
         k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
+        if self.use_qk_norm and self.reorder_RoPE_QKNorm:
+            q = F.rms_norm(q, (self.head_dim,))
+            k = F.rms_norm(k, (self.head_dim,))
         if self.repo is not None and repo_active:
             positions = self.repo(x)  # (B, S, num_heads)
             q, k = _apply_rope_repo_sdpa(q, k, positions, self.repo_inv_freq)
         elif not self.use_paired_head_attention:
             cos, sin = cos_sin
             q, k = _apply_rope(q, k, cos, sin)
-        if self.use_qk_norm:
+        if self.use_qk_norm and not self.reorder_RoPE_QKNorm:
             q = F.rms_norm(q, (self.head_dim,))
             k = F.rms_norm(k, (self.head_dim,))
 

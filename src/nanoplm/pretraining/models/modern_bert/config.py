@@ -107,6 +107,7 @@ class ModernBertConfig:
     use_resid_lambdas: bool = False
     use_x0_lambdas: bool = False
     use_qk_norm: bool = False
+    reorder_RoPE_QKNorm: bool = False  # True = QK norm BEFORE RoPE (LLaMA-style); False = RoPE first (original)
     use_canon_layers: bool = False
     canon_layers_mode: str = "abcd"
     canon_layers_kernel_size: Optional[int] = None
