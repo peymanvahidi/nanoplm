@@ -1884,7 +1884,17 @@ def run_pure_pretraining(
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
         fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
         fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
-        for layer in base_model.model.layers:
+                
+        _encoder = base_model.model
+        _recycling_active = int(getattr(_encoder.config, "recycling_loop_count", 1) or 1) > 1
+        _recurrent_ids = (
+            {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
+            if _recycling_active
+            else set()
+        )
+        for layer in _encoder.layers:
+            if id(layer) in _recurrent_ids:
+                continue
             _fully_shard_transformer_layer(
                 layer,
                 mesh=fsdp_mesh,
