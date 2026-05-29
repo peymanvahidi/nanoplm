@@ -68,3 +68,5 @@ docs/
 
 # Local extension build cache
 .cache/
+agent_space/
+CLAUDE.md
