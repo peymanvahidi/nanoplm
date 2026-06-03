@@ -114,6 +114,12 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             moe_topk_group=config.moe_topk_group,
             moe_bias_update_rate=config.moe_bias_update_rate,
             moe_leading_dense_layers=config.moe_leading_dense_layers,
+            recycling_num_prelude_layers=config.recycling_num_prelude_layers,
+            recycling_num_coda_layers=config.recycling_num_coda_layers,
+            recycling_loop_count=config.recycling_loop_count,
+            recycling_adapter_bias=config.recycling_adapter_bias,
+            recycling_s0_noise_sigma=config.recycling_s0_noise_sigma,
+            recycling_use_takase_init=config.recycling_use_takase_init,
         )
 
         super().__init__(mb_config)
@@ -123,6 +129,11 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
     """Transformer-Engine ``ProtModernBertMLM`` wrapper."""
 
     def __init__(self, config: ProtModernBertMLMConfig):
+        if config.recycling_loop_count != 1:
+            raise ValueError(
+                "Huginn-style recycling (recycling_loop_count > 1) is implemented only "
+                "in the pure-torch path. Use --pure-torch with recycling_loop_count>1."
+            )
         if config.use_noble:
             raise ValueError(
                 "NOBLE is currently implemented only in the pure-torch path. "

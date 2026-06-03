@@ -756,8 +756,15 @@ def _make_pure_profiler(
 # FLOPs estimation
 # ---------------------------------------------------------------------------
 
-def _estimate_model_flops_per_token(config, seq_len: int) -> int:
-    """Training FLOPs per token (forward + backward ≈ 3× forward).
+def _recycling_flops_components(config, seq_len: int):
+    """Decompose training FLOPs/token into recycling-scalable + fixed parts.
+
+    Returns ``(stack_flops, tail_flops, P, R, C, n_layers)``. ``stack_flops`` is
+    the per-forward-pass cost of the full transformer stack; under recycling the
+    recurrent block (R layers) repeats that work ``loop_count`` times while
+    prelude (P) and coda (C) run once. ``tail_flops`` (lm-head + prediction head)
+    fires once and does NOT scale with the loop count. Feed these to
+    ``_recycling_flops_per_token`` to get FLOPs/token at a given loop count.
 
     Each matmul contributes 2 FLOPs per element (multiply + accumulate) in forward.
     Backward is ~2× forward for matmuls => total 6 FLOPs per matmul element.
@@ -890,16 +897,56 @@ def _estimate_model_flops_per_token(config, seq_len: int) -> int:
             proj_flops + perm_mix_flops + pre_map_flops + post_res_flops
         )
 
-    forward_flops = (
-        attn_proj_flops
-        + attn_flops
-        + mlp_flops
-        + head_flops
-        + pred_head_flops
-        + canon_flops
-        + mhc_flops
-    )
-    return 3 * forward_flops
+    # Huginn-style recycling: prelude (P, runs once) + recurrent (R, looped) + coda
+    # (C, runs once). head_flops + pred_head_flops fire once after the stack and do
+    # NOT scale with the loop count -> they go into tail_flops. The loop count is
+    # supplied by the caller: the target recycling_loop_count for the startup
+    # estimate, or the *actual* sampled r per step for live MFU (the two differ
+    # while the recycling curriculum ramps the mean loop count up from 1).
+    stack_flops = attn_proj_flops + attn_flops + mlp_flops + canon_flops + mhc_flops
+    tail_flops = head_flops + pred_head_flops
+    P = max(0, int(getattr(config, "recycling_num_prelude_layers", 0)))
+    C = max(0, int(getattr(config, "recycling_num_coda_layers", 0)))
+    R = n_layers - P - C
+    return stack_flops, tail_flops, P, R, C, n_layers
+
+
+def _recycling_flops_per_token(components, loop_count: int, bptt: int | None = None) -> float:
+    """Training FLOPs/token (forward + truncated-BPTT backward) at a loop count.
+
+    ``components`` is the tuple from ``_recycling_flops_components``. The recurrent
+    block (R layers) runs ``loop_count`` times in the forward pass; prelude/coda run
+    once; the tail (lm-head + prediction head) fires once. Collapses to the dense
+    n_layers cost when ``loop_count == 1`` (i.e. recycling disabled).
+
+    Backward cost reflects truncated BPTT: ``_drive_recurrence`` runs the first
+    ``loop_count - K`` recurrent iters under ``torch.no_grad()`` and retains a graph
+    only for the last ``K = bptt`` iters (prelude/coda always differentiate, since
+    ``e`` is not detached). So the hardware backward is ~2× the forward of the
+    *differentiated* subgraph (P + K·R + C + tail), NOT 2× the full forward. Charging
+    2× the full forward (the old ``3× forward``) overcounts backward FLOPs by
+    ``2·(loop_count − K)·R`` layer-equivalents and inflates MFU for r > K.
+
+    ``bptt=None`` (or ``bptt >= loop_count``) means full BPTT and recovers ``3× forward``.
+    """
+    stack_flops, tail_flops, P, R, C, n_layers = components
+    loop_count = max(1, int(loop_count))
+    K = loop_count if bptt is None else max(1, min(int(bptt), loop_count))
+
+    def _forward(loops: int) -> float:
+        effective_layer_count = P + loops * R + C  # == n_layers when loops == 1
+        return (effective_layer_count / max(1, n_layers)) * stack_flops + tail_flops
+
+    forward_flops = _forward(loop_count)   # all loop_count iters run forward
+    backward_flops = 2.0 * _forward(K)     # backward retained only for last K iters
+    return forward_flops + backward_flops
+
+
+def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = None) -> int:
+    """Training FLOPs/token at the TARGET recycling loop count (startup estimate)."""
+    components = _recycling_flops_components(config, seq_len)
+    loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
+    return _recycling_flops_per_token(components, loop_count, bptt=bptt)
 
 
 # ---------------------------------------------------------------------------
@@ -1119,7 +1166,11 @@ def _sync_train_loader_len(
 
 @torch.compiler.disable
 @torch.inference_mode()
-def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
+def _evaluate(
+    model, eval_loader, device, distributed, amp_dtype,
+    recycling_loop_count: int | None = None,
+    recycling_bptt: int | None = None,
+) -> float:
     # Eval intentionally stays eager. The eval loader uses the padded path
     # (no cu_seqlens/max_seqlen), which differs from packed training and can
     # otherwise trigger Dynamo recompiles of helper submodules.
@@ -1130,11 +1181,15 @@ def _evaluate(model, eval_loader, device, distributed, amp_dtype) -> float:
         batch = _move_batch_to_device(batch, device)
         ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
         with ctx:
-            out = model(
+            fwd_kwargs = dict(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
+            if recycling_loop_count is not None:
+                fwd_kwargs["recycling_loop_count"] = recycling_loop_count
+                fwd_kwargs["recycling_bptt"] = recycling_bptt
+            out = model(**fwd_kwargs)
         loss = out["loss"] if isinstance(out, dict) else out.loss
         bs = batch["input_ids"].size(0)
         total_loss += loss.item() * bs
@@ -1625,6 +1680,9 @@ def run_pure_pretraining(
     _model_config = getattr(model, "model_config", None)
     _manifest = manifest
 
+    from nanoplm.config.recycling_compatibility import validate_recycling_compatibility
+    validate_recycling_compatibility(model.model_config, pretrain_config)
+
     model_max_pos = int(getattr(model.config, "max_position_embeddings", 0))
     if model_max_pos > 0 and manifest.max_seq_len > model_max_pos:
         raise ValueError(
@@ -1826,7 +1884,17 @@ def run_pure_pretraining(
         fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
         fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
         fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
-        for layer in base_model.model.layers:
+                
+        _encoder = base_model.model
+        _recycling_active = int(getattr(_encoder.config, "recycling_loop_count", 1) or 1) > 1
+        _recurrent_ids = (
+            {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
+            if _recycling_active
+            else set()
+        )
+        for layer in _encoder.layers:
+            if id(layer) in _recurrent_ids:
+                continue
             _fully_shard_transformer_layer(
                 layer,
                 mesh=fsdp_mesh,
@@ -1943,6 +2011,28 @@ def run_pure_pretraining(
     steps_per_epoch = max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
     total_steps = epoch_start_steps[-1]
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+
+    # ---- Recycling scheduler (no-op when recycling_loop_count == 1) ----
+    from nanoplm.pretraining.recycling import RecyclingScheduler
+    from nanoplm.pretraining.recycling.logging import (
+        RecyclingMetricsBuffer,
+        per_step_payload,
+        logging_steps_payload,
+        inloop_eval_payload,
+    )
+    recycling_scheduler = None
+    recycling_rng = None
+    recycling_metrics_buffer = None
+    if model.model_config.recycling_loop_count > 1:
+        recycling_scheduler = RecyclingScheduler(
+            pretrain_config,
+            target_loop_count=model.model_config.recycling_loop_count,
+            total_training_steps=total_steps,
+        )
+        # +999 offset keeps the r-sampling RNG stream distinct from the seed
+        # used elsewhere (model init, data shuffling, dropout).
+        recycling_rng = torch.Generator(device=device).manual_seed(int(pretrain_config.seed) + 999)
+        recycling_metrics_buffer = RecyclingMetricsBuffer(window=100)
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
         pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
@@ -2090,6 +2180,7 @@ def run_pure_pretraining(
     if is_main:
         try:
             wandb.init(
+                mode="offline",
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
@@ -2124,7 +2215,15 @@ def run_pure_pretraining(
     # ---- MFU estimation ----
     _raw = orig_model
     _cfg = _raw.config
-    _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len)
+    # Truncated-BPTT depth K: backward is retained only for the last K recurrent
+    # iters (see _drive_recurrence / _recycling_flops_per_token), so the FLOPs
+    # estimator must know K or it overcounts backward and inflates MFU for r > K.
+    _bptt = max(1, int(getattr(pretrain_config, "recycling_bptt", 1)))
+    _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len, bptt=_bptt)
+    # Components for per-step FLOPs at the *actual* loop count (curriculum-accurate
+    # MFU). _flops_per_token above is the nominal estimate at the target loop count.
+    _flops_components = _recycling_flops_components(_cfg, manifest.max_seq_len)
+    _static_loop_count = max(1, int(getattr(_cfg, "recycling_loop_count", 1)))
     _peak_flops = H100_PEAK_TFLOPS * 1e12
     logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
 
@@ -2225,6 +2324,10 @@ def run_pure_pretraining(
     discard_accumulation = False
     token_count = torch.zeros((), dtype=torch.long, device=device)
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
+    # Sum over the logging window of flops_per_token(actual r) * valid_tokens, so
+    # MFU reflects the real compute done under the recycling curriculum rather than
+    # the target loop count. float64 to hold ~1e15+ FLOPs/window without precision loss.
+    window_flops = torch.zeros((), dtype=torch.float64, device=device)
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
@@ -2393,14 +2496,41 @@ def run_pure_pretraining(
                         model.set_requires_gradient_sync(sync)
 
                     if "num_valid_tokens" in batch:
-                        token_count += batch["num_valid_tokens"]
+                        microstep_tokens = batch["num_valid_tokens"]
                         raw_token_count += batch["input_ids"].numel()
                     elif "attention_mask" in batch:
-                        token_count += batch["attention_mask"].sum()
+                        microstep_tokens = batch["attention_mask"].sum()
                         raw_token_count += batch["attention_mask"].numel()
                     else:
-                        token_count += batch["input_ids"].numel()
+                        microstep_tokens = batch["input_ids"].numel()
                         raw_token_count += batch["input_ids"].numel()
+                    token_count += microstep_tokens
+
+                    # Sample r for this micro-step (locked-step across DP workers)
+                    sampled_r = None
+                    curriculum_k_t = None
+                    if recycling_scheduler is not None:
+                        if is_main:
+                            r_t_tensor = torch.tensor(
+                                [recycling_scheduler.sample(global_step, device, recycling_rng)],
+                                dtype=torch.int64, device=device,
+                            )
+                        else:
+                            r_t_tensor = torch.zeros(1, dtype=torch.int64, device=device)
+                        if distributed and dist.is_initialized():
+                            dist.broadcast(r_t_tensor, src=0)
+                        sampled_r = int(r_t_tensor.item())
+                        curriculum_k_t = recycling_scheduler.current_mean(global_step)
+                        recycling_metrics_buffer.record_step(sampled_r)
+
+                    # Charge FLOPs at the loop count actually executed this micro-step
+                    # (sampled_r under the curriculum), not the target loop count.
+                    # Cast tokens to float64 first so float32 never truncates the ~1e9
+                    # FLOPs/token product (no host sync — sampled_r already synced above).
+                    _loop_for_flops = sampled_r if sampled_r is not None else _static_loop_count
+                    _fpt = _recycling_flops_per_token(_flops_components, _loop_for_flops, bptt=_bptt)
+                    _mt64 = microstep_tokens.double() if torch.is_tensor(microstep_tokens) else float(microstep_tokens)
+                    window_flops += _fpt * _mt64
 
                     sync_ctx = _ddp_sync_context(model, distributed_mode=distributed_mode, sync=sync)
                     amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
@@ -2416,6 +2546,22 @@ def run_pure_pretraining(
                                 fwd_kwargs["max_seqlen"] = batch["max_seqlen"]
                             if "position_ids" in batch:
                                 fwd_kwargs["position_ids"] = batch["position_ids"]
+                            if sampled_r is not None:
+                                # Pass as 0-d int tensors (not Python ints) so
+                                # Dynamo does NOT install a value guard at the
+                                # _drive_recurrence disable boundary. With Python
+                                # ints the compiled segment that calls the eager
+                                # driver recompiles for every unique sampled r,
+                                # thrashing the compile cache under Poisson
+                                # sampling.
+                                fwd_kwargs["recycling_loop_count"] = torch.tensor(
+                                    sampled_r, dtype=torch.int64, device=device
+                                )
+                                fwd_kwargs["recycling_bptt"] = torch.tensor(
+                                    pretrain_config.recycling_bptt,
+                                    dtype=torch.int64,
+                                    device=device,
+                                )
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
@@ -2589,23 +2735,32 @@ def run_pure_pretraining(
                         log_vals = log_buf.cpu()
                         avg_loss = float(log_vals[0])
                         grad_norm_val = float(log_vals[1])
-                        tok = float(token_count.item())
-                        raw_tok = float(raw_token_count.item())
+                        # Reduce valid tokens, raw tokens, and the actual-loop-count
+                        # FLOPs for this window in a single collective. window_flops
+                        # already weights each micro-step by its sampled loop count,
+                        # so MFU = achieved FLOP/s / peak reflects real compute — not
+                        # the target loop count, which overstates MFU early in the
+                        # recycling curriculum (when r is still ~1).
+                        reduce_buf = torch.stack([
+                            token_count.double(),
+                            raw_token_count.double(),
+                            window_flops,
+                        ])
                         if distributed and dist.is_initialized():
-                            tok_buf = torch.tensor([tok, raw_tok], device=device)
-                            dist.all_reduce(tok_buf, op=dist.ReduceOp.SUM)
-                            tok, raw_tok = float(tok_buf[0].item()), float(tok_buf[1].item())
+                            dist.all_reduce(reduce_buf, op=dist.ReduceOp.SUM)
+                        tok = float(reduce_buf[0].item())
+                        raw_tok = float(reduce_buf[1].item())
+                        window_flops_total = float(reduce_buf[2].item())
                         tps = int(raw_tok / window_dt)
                         step_tok = tok / max(1, window_steps)
                         step_raw_tok = raw_tok / max(1, window_steps)
                         real_tps = tok / window_dt
                         real_tps_log = int(real_tps)
-                        mfu = (
-                            _flops_per_token * real_tps
-                        ) / (_peak_flops * max(effective_world_size, 1))
+                        mfu = window_flops_total / window_dt / (_peak_flops * max(effective_world_size, 1))
 
                         token_count.zero_()
                         raw_token_count.zero_()
+                        window_flops.zero_()
 
                         if global_step % eval_steps == 0:
                             vram_log = _format_vram_for_log(
@@ -2646,6 +2801,11 @@ def run_pure_pretraining(
                             payload["train/muon_lr"] = muon_lr
                         if wandb_enabled and wandb.run is not None:
                             try:
+                                if recycling_scheduler is not None and sampled_r is not None:
+                                    payload.update(per_step_payload(sampled_r, curriculum_k_t))
+                                if recycling_scheduler is not None and should_log:
+                                    adapter = getattr(orig_model.model, "adapter", None) if hasattr(orig_model, "model") else None
+                                    payload.update(logging_steps_payload(adapter, recycling_metrics_buffer))
                                 wandb.log(payload)
                             except Exception as exc:
                                 wandb_enabled = False
@@ -2670,15 +2830,47 @@ def run_pure_pretraining(
                         window_steps = 0
 
                     if global_step % eval_steps == 0:
-                        eval_loss = _evaluate(orig_model, eval_loader, device, distributed, amp_dtype)
+                        if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
+                            eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
+                        elif recycling_scheduler is not None:
+                            eval_loop_counts = [model.model_config.recycling_loop_count]
+                        else:
+                            eval_loop_counts = [None]
+
+                        losses_by_r: dict[int, float] = {}
+                        eval_loss = None
+                        for r_value in eval_loop_counts:
+                            eval_loss = _evaluate(
+                                orig_model, eval_loader, device, distributed, amp_dtype,
+                                recycling_loop_count=r_value,
+                                recycling_bptt=pretrain_config.recycling_bptt if r_value is not None else None,
+                            )
+                            if r_value is not None:
+                                losses_by_r[r_value] = eval_loss
+
                         if is_main:
-                            logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
-                            if wandb_enabled and wandb.run is not None:
-                                try:
-                                    wandb.log({"train/global_step": global_step, "eval/loss": eval_loss})
-                                except Exception as exc:
-                                    wandb_enabled = False
-                                    logger.warning(f"W&B log failed; disabling. Error: {exc}")
+                            if losses_by_r:
+                                losses_str = ", ".join(f"r={r}: {l:.4f}" for r, l in sorted(losses_by_r.items()))
+                                logger.info(f"[step {global_step}] in-loop eval {losses_str}")
+                                if wandb_enabled and wandb.run is not None:
+                                    try:
+                                        p = {"train/global_step": global_step}
+                                        p.update(inloop_eval_payload(losses_by_r))
+                                        target = model.model_config.recycling_loop_count
+                                        if target in losses_by_r:
+                                            p["eval/loss"] = losses_by_r[target]
+                                        wandb.log(p)
+                                    except Exception as exc:
+                                        wandb_enabled = False
+                                        logger.warning(f"W&B log failed; disabling. Error: {exc}")
+                            else:
+                                logger.info(f"[step {global_step}] eval_loss={eval_loss:.4f}")
+                                if wandb_enabled and wandb.run is not None:
+                                    try:
+                                        wandb.log({"train/global_step": global_step, "eval/loss": eval_loss})
+                                    except Exception as exc:
+                                        wandb_enabled = False
+                                        logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
                     if global_step % save_steps == 0:
@@ -2733,6 +2925,7 @@ def run_pure_pretraining(
             discard_accumulation = False
             token_count.zero_()
             raw_token_count.zero_()
+            window_flops.zero_()
             window_loss.zero_()
             window_steps = 0
 

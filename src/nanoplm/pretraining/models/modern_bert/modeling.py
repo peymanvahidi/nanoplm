@@ -221,6 +221,16 @@ class ModernBertConfig:
     moe_topk_group: int = 1
     moe_bias_update_rate: float = 1e-3
     moe_leading_dense_layers: int = 0  # first N layers are always dense (DeepSeek uses 1)
+    # Huginn-style recycling: split the L-layer stack into prelude/recurrent/coda
+    # regions. The recurrent block (R = L - P - C layers) is weight-tied and
+    # looped recycling_loop_count times per forward pass. See docs/superpowers/
+    # specs/2026-05-24-huggin-style-recycling-design.md.
+    recycling_num_prelude_layers: int = 0     # P; first P layers, run once
+    recycling_num_coda_layers: int = 0        # C; last C layers, run once
+    recycling_loop_count: int = 1             # inference loop count; target mean at training. 1 = recycling off
+    recycling_adapter_bias: bool = False      # Linear(2h, h) adapter bias (Huginn: no bias)
+    recycling_s0_noise_sigma: float = 0.6324555320336759  # sqrt(2/5), Huginn σ²_s = 2/5
+    recycling_use_takase_init: bool = True    # Overrides wo_init for recurrent block; rescales Wo by sqrt(1/(5·h·l))
 
     head_dim: int = field(init=False)
     sliding_window: int = field(init=False)
@@ -236,6 +246,36 @@ class ModernBertConfig:
                 "hidden_size must be divisible by num_attention_heads: "
                 f"{self.hidden_size} vs {self.num_attention_heads}"
             )
+        # Recycling validation
+        if not isinstance(self.recycling_loop_count, int) or self.recycling_loop_count < 1:
+            raise ValueError(
+                f"recycling_loop_count must be int >= 1, got {self.recycling_loop_count!r}"
+            )
+        if not isinstance(self.recycling_num_prelude_layers, int) or self.recycling_num_prelude_layers < 0:
+            raise ValueError(
+                f"recycling_num_prelude_layers must be int >= 0, got {self.recycling_num_prelude_layers!r}"
+            )
+        if not isinstance(self.recycling_num_coda_layers, int) or self.recycling_num_coda_layers < 0:
+            raise ValueError(
+                f"recycling_num_coda_layers must be int >= 0, got {self.recycling_num_coda_layers!r}"
+            )
+        if self.recycling_loop_count == 1:
+            if self.recycling_num_prelude_layers != 0 or self.recycling_num_coda_layers != 0:
+                raise ValueError(
+                    "recycling_loop_count=1 disables recycling; "
+                    "recycling_num_prelude_layers and recycling_num_coda_layers must both be 0."
+                )
+        else:
+            R = self.num_hidden_layers - self.recycling_num_prelude_layers - self.recycling_num_coda_layers
+            if R < 1:
+                raise ValueError(
+                    f"recycling_num_prelude_layers ({self.recycling_num_prelude_layers}) + "
+                    f"recycling_num_coda_layers ({self.recycling_num_coda_layers}) must be < "
+                    f"num_hidden_layers ({self.num_hidden_layers}); got recurrent block size {R}."
+                )
+            # Delegate flag-compat checks to the YAML-driven validator.
+            from nanoplm.config.recycling_compatibility import validate_recycling_compatibility
+            validate_recycling_compatibility(self)
         # GQA: resolve num_kv_heads (None = MHA, i.e. same as num_attention_heads).
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_attention_heads
@@ -2516,6 +2556,30 @@ class ModernBertModel(nn.Module):
                     for i in range(config.num_hidden_layers)
                 ]
             )
+        # ---- Huginn-style recycling: split into prelude/recurrent/coda ----
+        # Plain Python lists, NOT ModuleLists: the modules already live in
+        # self.layers and are registered there. Re-registering them under
+        # ModuleLists would double every key in state_dict (e.g.
+        # `layers.0.attn.Wo.weight` AND `prelude_layers.0.attn.Wo.weight`
+        # pointing to the same tensor), bloating checkpoints and breaking
+        # strict load_state_dict.
+        P = config.recycling_num_prelude_layers
+        C = config.recycling_num_coda_layers
+        L = config.num_hidden_layers
+        self.prelude_layers: list[nn.Module] = list(self.layers[:P])
+        self.recurrent_layers: list[nn.Module] = list(self.layers[P:L - C]) if (L - P - C) > 0 else []
+        self.coda_layers: list[nn.Module] = list(self.layers[L - C:]) if C > 0 else []
+
+        # Adapter only when recycling is active.
+        if config.recycling_loop_count > 1:
+            self.adapter = nn.Linear(
+                2 * config.hidden_size,
+                config.hidden_size,
+                bias=config.recycling_adapter_bias,
+            )
+        else:
+            self.adapter = None
+
         if config.use_resid_lambdas:
             self.resid_lambdas = nn.Parameter(torch.ones(config.num_hidden_layers))
         else:
@@ -2552,6 +2616,219 @@ class ModernBertModel(nn.Module):
         ]
         self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
 
+    def _recurrent_step_varlen(
+        self,
+        e: torch.Tensor,
+        s_prev: torch.Tensor,
+        *,
+        rope_full,
+        rope_sliding,
+        cu_seqlens: torch.Tensor,
+        max_seqlen,
+        window_full,
+        window_sliding,
+        position_ids: torch.Tensor,
+        repo_active: bool,
+        prores_alphas: torch.Tensor,
+    ) -> torch.Tensor:
+        """One iteration of the recurrent block (varlen / flash path).
+
+        Inlines the per-layer call so the for-loop unrolls inside a single
+        compiled frame instead of dispatching through a closure (which would
+        re-enter Dynamo once per layer and specialize on ``layer_idx``,
+        blowing ``cache_size_limit`` for R > cache_size). All path-specific
+        tensors arrive as explicit kwargs — no closure capture — so
+        ``torch.compile`` guards stay stable across calls.
+        """
+        P = self.config.recycling_num_prelude_layers
+        u = self.adapter(torch.cat([s_prev, e], dim=-1))
+        for i, layer in enumerate(self.recurrent_layers):
+            lt = layer.attention_type  # str, constant per layer
+            if lt == "full_attention":
+                cos_sin = rope_full
+                window_size = window_full
+            else:
+                cos_sin = rope_sliding
+                window_size = window_sliding
+            u = layer(
+                u,
+                cos_sin=cos_sin,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                window_size=window_size,
+                position_ids=position_ids,
+                repo_active=repo_active,
+                prores_alpha=prores_alphas[P + i],
+            )
+        return u
+
+    def _recurrent_step_sdpa(
+        self,
+        e: torch.Tensor,
+        s_prev: torch.Tensor,
+        *,
+        rope_full,
+        rope_sliding,
+        attn_mask_full,
+        attn_mask_sliding,
+        token_mask: torch.Tensor,
+        repo_active: bool,
+        prores_alphas: torch.Tensor,
+    ) -> torch.Tensor:
+        """One iteration of the recurrent block (SDPA fallback path).
+
+        Same no-closure design as ``_recurrent_step_varlen`` — see that
+        docstring for rationale.
+        """
+        P = self.config.recycling_num_prelude_layers
+        u = self.adapter(torch.cat([s_prev, e], dim=-1))
+        for i, layer in enumerate(self.recurrent_layers):
+            lt = layer.attention_type
+            if lt == "full_attention":
+                cos_sin = rope_full
+                attn_mask = attn_mask_full
+            else:
+                cos_sin = rope_sliding
+                attn_mask = attn_mask_sliding
+            u = layer(
+                u,
+                attn_mask=attn_mask,
+                cos_sin=cos_sin,
+                position_ids=None,
+                token_mask=token_mask,
+                repo_active=repo_active,
+                prores_alpha=prores_alphas[P + i],
+            )
+        return u
+
+    @torch._dynamo.disable(recursive=False)
+    def _drive_recurrence(
+        self,
+        e: torch.Tensor,
+        s: torch.Tensor,
+        r,
+        K,
+        step_fn,
+    ) -> torch.Tensor:
+        """Run r iterations of the recurrent block in eager Python.
+
+        Why: the trip count r is sampled per micro-step (Poisson). Without
+        this disable, r would flow into ``for _ in range(r):`` inside a
+        torch.compile-traced graph; Dynamo specializes on Python-int loop
+        bounds, so every unique r causes a guard miss + fresh trace +
+        autotune pass, thrashing the compile cache and stalling training.
+        Disabling Dynamo here keeps the variable trip count confined to
+        eager Python while the shape-stable prelude and coda regions still
+        compile normally on either side of this call (graph break).
+
+        Decorator is ``@torch._dynamo.disable(recursive=False)``: the
+        driver body itself runs eager (so ``range(r)`` stays in Python),
+        but each ``step_fn(e, s)`` call re-enters Dynamo and compiles the
+        shape-stable recurrent step as its own cached graph. This recovers
+        torch.compile fusion on the recurrent block (~75% of compute) —
+        matching Huginn's reference (seal-rg/recurrent-pretraining
+        ``model_dynamic.iterate_forward``).
+
+        Critical precondition: ``step_fn`` must call a method that does NOT
+        dispatch per-layer through a closure with an int ``layer_idx`` arg.
+        We tried that and it produced R separately-traced frames (one per
+        ``layer_idx`` value) that blow ``cache_size_limit`` when R > 8.
+        Instead, ``_recurrent_step_varlen`` / ``_recurrent_step_sdpa``
+        inline the per-layer call directly — the for-loop unrolls inside
+        one compiled frame.
+
+        r and K may arrive as Python ints (eager callers) or as 0-d int
+        tensors (compiled training loop — passing tensors prevents Dynamo
+        from installing an equality guard on the int value at the
+        graph-break boundary, which would also force a recompile per r).
+
+        Splits into a no-grad outer phase (r - K iterations) and an in-graph
+        phase (K iterations) so truncated BPTT only retains gradients for
+        the last K iters. ``e`` is NOT detached so prelude params still
+        receive gradients through the in-graph iters.
+        """
+        r = int(r.item()) if isinstance(r, torch.Tensor) else int(r)
+        K = int(K.item()) if isinstance(K, torch.Tensor) else int(K)
+        no_grad_steps = max(0, r - K)
+        with torch.no_grad():
+            for _ in range(no_grad_steps):
+                s = step_fn(e, s)
+        if no_grad_steps > 0:
+            s = s.detach()
+        for _ in range(r - no_grad_steps):
+            s = step_fn(e, s)
+        return s
+
+    def _apply_takase_init(self) -> None:
+        """Huginn §4.1 Takase spike init applied to the recurrent block + adapter.
+
+        Effective depth l = P + r_bar * R + C with r_bar = max(1, loop_count - 1).
+        Recurrent residual out-projections: std = sqrt(1 / (5 * h * l))
+        Recurrent non-residual linears + adapter: std = sqrt(2 / (5 * h))
+        All draws from truncated normal at ±3σ.
+
+        Only runs when config.recycling_use_takase_init AND config.recycling_loop_count > 1.
+        Prelude/coda layers are NOT touched; they keep whatever wo_init produced.
+        """
+        cfg = self.config
+        if not cfg.recycling_use_takase_init or cfg.recycling_loop_count <= 1:
+            return
+
+        h = cfg.hidden_size
+        P = cfg.recycling_num_prelude_layers
+        C = cfg.recycling_num_coda_layers
+        L = cfg.num_hidden_layers
+        R = L - P - C
+        r_bar = max(1, cfg.recycling_loop_count - 1)
+        l = P + r_bar * R + C
+
+        std_general = math.sqrt(2.0 / (5.0 * h))
+        std_out = math.sqrt(1.0 / (5.0 * h * l))
+
+        def _trunc_init(tensor: torch.Tensor, std: float) -> None:
+            torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-3 * std, b=3 * std)
+
+        for layer in self.recurrent_layers:
+            attn = getattr(layer, "attn", None)
+            if attn is not None:
+                if getattr(attn, "Wo", None) is not None:
+                    _trunc_init(attn.Wo.weight, std_out)
+                # Attention input projections: fused Wqkv OR separate Wq/Wq2/Wk/Wv
+                if getattr(attn, "Wqkv", None) is not None:
+                    _trunc_init(attn.Wqkv.weight, std_general)
+                else:
+                    for name in ("Wq", "Wq2", "Wk", "Wv"):
+                        proj = getattr(attn, name, None)
+                        if proj is not None:
+                            _trunc_init(proj.weight, std_general)
+
+            mlp = getattr(layer, "mlp", None)
+            if mlp is not None:
+                # MLP input projections: fused Wi OR separate W_up/W_gate
+                if getattr(mlp, "Wi", None) is not None:
+                    _trunc_init(mlp.Wi.weight, std_general)
+                elif getattr(mlp, "W_up", None) is not None:
+                    _trunc_init(mlp.W_up.weight, std_general)
+                    if getattr(mlp, "W_gate", None) is not None:
+                        _trunc_init(mlp.W_gate.weight, std_general)
+                # MLP output: Linear `Wo` OR raw Parameter `Wo_weight` (SReLU MLP)
+                if getattr(mlp, "Wo", None) is not None:
+                    _trunc_init(mlp.Wo.weight, std_out)
+                elif getattr(mlp, "Wo_weight", None) is not None:
+                    _trunc_init(mlp.Wo_weight, std_out)
+
+        if self.adapter is not None:
+            _trunc_init(self.adapter.weight, std_general)
+            if self.adapter.bias is not None:
+                torch.nn.init.zeros_(self.adapter.bias)
+
+        from nanoplm.utils.logger import logger
+        logger.info(
+            "[recycling] Takase spike init applied: l=%d (P=%d, r_bar=%d, R=%d, C=%d), "
+            "std_general=%.6f, std_out=%.6f",
+            l, P, r_bar, R, C, std_general, std_out,
+        )
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -2559,6 +2836,8 @@ class ModernBertModel(nn.Module):
         _cu_seqlens: Optional[torch.Tensor] = None,
         _max_seqlen: Optional[int] = None,
         _position_ids: Optional[torch.Tensor] = None,
+        recycling_loop_count: Optional[int] = None,
+        recycling_bptt: Optional[int] = None,
     ) -> torch.Tensor:
         # ---- varlen (flash-attention) path --------------------------------
         if _cu_seqlens is not None:
@@ -2618,63 +2897,152 @@ class ModernBertModel(nn.Module):
             repo_active = self.repo_active
             prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
-            for i, layer in enumerate(self.layers):
-                if self.resid_lambdas is not None:
-                    x = self.resid_lambdas[i] * x
-                if self.x0_lambdas is not None:
-                    x = x + self.x0_lambdas[i] * x0
-                alpha = prores_alphas[i]
-                lt = layer.attention_type
-                if (
-                    self.config.activation_checkpointing
-                    and self.training
-                    and str(self.config.activation_checkpointing_mode).strip().lower()
-                    == "layer"
-                ):
-                    cos_sin = rope[lt]
-                    cu_seqlens = _cu_seqlens
-                    max_seqlen = _max_seqlen
-                    window_size = windows[lt]
-                    position_ids = _position_ids
+            _recycle = (
+                self.config.recycling_loop_count > 1 or recycling_loop_count is not None
+            )
+            if _recycle:
+                if self.adapter is None:
+                    raise ValueError(
+                        "Recycling forward requested (recycling_loop_count > 1) but the "
+                        "adapter is None — the model was constructed with "
+                        "config.recycling_loop_count == 1. Rebuild the model with "
+                        "config.recycling_loop_count > 1 before passing the kwarg."
+                    )
+                r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
+                K = recycling_bptt if recycling_bptt is not None else 8
 
-                    def _layer_forward(
-                        x_in: torch.Tensor,
-                        *,
-                        _layer: nn.Module = layer,
-                        _cos_sin=cos_sin,
-                        _cu_seqlens=cu_seqlens,
-                        _max_seqlen=max_seqlen,
-                        _window_size=window_size,
-                        _position_ids=position_ids,
-                        _repo_active: bool = repo_active,
-                        _prores_alpha=alpha,
-                    ) -> torch.Tensor:
-                        return _layer(
-                            x_in,
-                            cos_sin=_cos_sin,
-                            cu_seqlens=_cu_seqlens,
-                            max_seqlen=_max_seqlen,
-                            window_size=_window_size,
-                            position_ids=_position_ids,
-                            repo_active=_repo_active,
-                            prores_alpha=_prores_alpha,
-                        )
+            # Path-specific tensors hoisted once per forward so the unrolled
+            # prelude/coda loops below see the same captures Dynamo can
+            # constant-fold; no per-call closure means no layer_idx guard.
+            _rope_full = rope["full_attention"]
+            _rope_sliding = rope["sliding_attention"]
+            _window_full = windows["full_attention"]
+            _window_sliding = windows["sliding_attention"]
 
-                    try:
-                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                    except TypeError:  # older torch checkpoint API
-                        x = _checkpoint(_layer_forward, x)
-                else:
-                    x = layer(
-                        x,
-                        cos_sin=rope[lt],
+            if _recycle:
+                h_pre = x
+                # Inlined prelude: per-layer call directly in the unrolled
+                # for-loop. The previous _run_layer_varlen closure made
+                # Dynamo trace this as a separate frame and specialize on
+                # layer_idx (P specializations).
+                for i, layer in enumerate(self.prelude_layers):
+                    lt = layer.attention_type
+                    if lt == "full_attention":
+                        _cos_sin = _rope_full
+                        _window_size = _window_full
+                    else:
+                        _cos_sin = _rope_sliding
+                        _window_size = _window_sliding
+                    h_pre = layer(
+                        h_pre,
+                        cos_sin=_cos_sin,
                         cu_seqlens=_cu_seqlens,
                         max_seqlen=_max_seqlen,
-                        window_size=windows[lt],
+                        window_size=_window_size,
                         position_ids=_position_ids,
                         repo_active=repo_active,
-                        prores_alpha=alpha,
+                        prores_alpha=prores_alphas[i],
                     )
+                e = h_pre
+
+                s = torch.randn_like(e) * self.config.recycling_s0_noise_sigma
+
+                def _step_varlen(e_in, s_in):
+                    return self._recurrent_step_varlen(
+                        e_in,
+                        s_in,
+                        rope_full=_rope_full,
+                        rope_sliding=_rope_sliding,
+                        cu_seqlens=_cu_seqlens,
+                        max_seqlen=_max_seqlen,
+                        window_full=_window_full,
+                        window_sliding=_window_sliding,
+                        position_ids=_position_ids,
+                        repo_active=repo_active,
+                        prores_alphas=prores_alphas,
+                    )
+                s = self._drive_recurrence(e, s, r, K, _step_varlen)
+
+                P_count = self.config.recycling_num_prelude_layers
+                R_count = len(self.recurrent_layers)
+                # Inlined coda — same reason as the prelude block above.
+                for i, layer in enumerate(self.coda_layers):
+                    lt = layer.attention_type
+                    if lt == "full_attention":
+                        _cos_sin = _rope_full
+                        _window_size = _window_full
+                    else:
+                        _cos_sin = _rope_sliding
+                        _window_size = _window_sliding
+                    s = layer(
+                        s,
+                        cos_sin=_cos_sin,
+                        cu_seqlens=_cu_seqlens,
+                        max_seqlen=_max_seqlen,
+                        window_size=_window_size,
+                        position_ids=_position_ids,
+                        repo_active=repo_active,
+                        prores_alpha=prores_alphas[P_count + R_count + i],
+                    )
+                x = s
+            else:
+                for i, layer in enumerate(self.layers):
+                    if self.resid_lambdas is not None:
+                        x = self.resid_lambdas[i] * x
+                    if self.x0_lambdas is not None:
+                        x = x + self.x0_lambdas[i] * x0
+                    alpha = prores_alphas[i]
+                    lt = layer.attention_type
+                    if (
+                        self.config.activation_checkpointing
+                        and self.training
+                        and str(self.config.activation_checkpointing_mode).strip().lower()
+                        == "layer"
+                    ):
+                        cos_sin = rope[lt]
+                        cu_seqlens = _cu_seqlens
+                        max_seqlen = _max_seqlen
+                        window_size = windows[lt]
+                        position_ids = _position_ids
+
+                        def _layer_forward(
+                            x_in: torch.Tensor,
+                            *,
+                            _layer: nn.Module = layer,
+                            _cos_sin=cos_sin,
+                            _cu_seqlens=cu_seqlens,
+                            _max_seqlen=max_seqlen,
+                            _window_size=window_size,
+                            _position_ids=position_ids,
+                            _repo_active: bool = repo_active,
+                            _prores_alpha=alpha,
+                        ) -> torch.Tensor:
+                            return _layer(
+                                x_in,
+                                cos_sin=_cos_sin,
+                                cu_seqlens=_cu_seqlens,
+                                max_seqlen=_max_seqlen,
+                                window_size=_window_size,
+                                position_ids=_position_ids,
+                                repo_active=_repo_active,
+                                prores_alpha=_prores_alpha,
+                            )
+
+                        try:
+                            x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                        except TypeError:  # older torch checkpoint API
+                            x = _checkpoint(_layer_forward, x)
+                    else:
+                        x = layer(
+                            x,
+                            cos_sin=rope[lt],
+                            cu_seqlens=_cu_seqlens,
+                            max_seqlen=_max_seqlen,
+                            window_size=windows[lt],
+                            position_ids=_position_ids,
+                            repo_active=repo_active,
+                            prores_alpha=alpha,
+                        )
 
             if self.config.use_mhc_lite:
                 x = x[..., 0, :]  # compress: take stream 0
@@ -2740,61 +3108,151 @@ class ModernBertModel(nn.Module):
         repo_active = self.repo_active
         prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
 
-        for i, layer in enumerate(self.layers):
-            if self.resid_lambdas is not None:
-                x = self.resid_lambdas[i] * x
-            if self.x0_lambdas is not None:
-                x = x + self.x0_lambdas[i] * x0
-            alpha = prores_alphas[i]
-            layer_type = layer.attention_type
-            if (
-                self.config.activation_checkpointing
-                and self.training
-                and str(self.config.activation_checkpointing_mode).strip().lower()
-                == "layer"
-            ):
-                attn_mask = attn_masks[layer_type]
-                cos_sin = rope[layer_type]
-                token_mask = attention_mask
+        _recycle = (
+            self.config.recycling_loop_count > 1 or recycling_loop_count is not None
+        )
+        if _recycle:
+            if self.adapter is None:
+                raise ValueError(
+                    "Recycling forward requested (recycling_loop_count > 1) but the "
+                    "adapter is None — the model was constructed with "
+                    "config.recycling_loop_count == 1. Rebuild the model with "
+                    "config.recycling_loop_count > 1 before passing the kwarg."
+                )
+            r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
+            K = recycling_bptt if recycling_bptt is not None else 8
 
-                def _layer_forward(
-                    x_in: torch.Tensor,
-                    *,
-                    _layer: nn.Module = layer,
-                    _attn_mask=attn_mask,
-                    _cos_sin=cos_sin,
-                    _token_mask=token_mask,
-                    _repo_active: bool = repo_active,
-                    _prores_alpha=alpha,
-                ) -> torch.Tensor:
-                    return _layer(
-                        x_in,
-                        attn_mask=_attn_mask,
-                        cos_sin=_cos_sin,
-                        position_ids=None,
-                        token_mask=_token_mask,
-                        repo_active=_repo_active,
-                        prores_alpha=_prores_alpha,
-                    )
+        # Path-specific tensors hoisted once per forward — see varlen path
+        # for the rationale (avoids per-layer closure -> layer_idx guard).
+        _rope_full = rope["full_attention"]
+        _rope_sliding = rope["sliding_attention"]
+        _attn_mask_full = attn_masks["full_attention"]
+        _attn_mask_sliding = attn_masks["sliding_attention"]
 
-                try:
-                    x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                except TypeError:  # older torch checkpoint API
-                    x = _checkpoint(_layer_forward, x)
-            else:
-                x = layer(
-                    x,
-                    attn_mask=attn_masks[layer_type],
-                    cos_sin=rope[layer_type],
+        if _recycle:
+            h_pre = x
+            # Inlined prelude.
+            for i, layer in enumerate(self.prelude_layers):
+                lt = layer.attention_type
+                if lt == "full_attention":
+                    _cos_sin = _rope_full
+                    _attn_mask = _attn_mask_full
+                else:
+                    _cos_sin = _rope_sliding
+                    _attn_mask = _attn_mask_sliding
+                h_pre = layer(
+                    h_pre,
+                    attn_mask=_attn_mask,
+                    cos_sin=_cos_sin,
                     position_ids=None,
                     token_mask=attention_mask,
                     repo_active=repo_active,
-                    prores_alpha=alpha,
+                    prores_alpha=prores_alphas[i],
                 )
+            e = h_pre
+
+            s = torch.randn_like(e) * self.config.recycling_s0_noise_sigma
+
+            def _step_sdpa(e_in, s_in):
+                return self._recurrent_step_sdpa(
+                    e_in,
+                    s_in,
+                    rope_full=_rope_full,
+                    rope_sliding=_rope_sliding,
+                    attn_mask_full=_attn_mask_full,
+                    attn_mask_sliding=_attn_mask_sliding,
+                    token_mask=attention_mask,
+                    repo_active=repo_active,
+                    prores_alphas=prores_alphas,
+                )
+            s = self._drive_recurrence(e, s, r, K, _step_sdpa)
+
+            P_count = self.config.recycling_num_prelude_layers
+            R_count = len(self.recurrent_layers)
+            # Inlined coda.
+            for i, layer in enumerate(self.coda_layers):
+                lt = layer.attention_type
+                if lt == "full_attention":
+                    _cos_sin = _rope_full
+                    _attn_mask = _attn_mask_full
+                else:
+                    _cos_sin = _rope_sliding
+                    _attn_mask = _attn_mask_sliding
+                s = layer(
+                    s,
+                    attn_mask=_attn_mask,
+                    cos_sin=_cos_sin,
+                    position_ids=None,
+                    token_mask=attention_mask,
+                    repo_active=repo_active,
+                    prores_alpha=prores_alphas[P_count + R_count + i],
+                )
+            x = s
+        else:
+            for i, layer in enumerate(self.layers):
+                if self.resid_lambdas is not None:
+                    x = self.resid_lambdas[i] * x
+                if self.x0_lambdas is not None:
+                    x = x + self.x0_lambdas[i] * x0
+                alpha = prores_alphas[i]
+                layer_type = layer.attention_type
+                if (
+                    self.config.activation_checkpointing
+                    and self.training
+                    and str(self.config.activation_checkpointing_mode).strip().lower()
+                    == "layer"
+                ):
+                    attn_mask = attn_masks[layer_type]
+                    cos_sin = rope[layer_type]
+                    token_mask = attention_mask
+
+                    def _layer_forward(
+                        x_in: torch.Tensor,
+                        *,
+                        _layer: nn.Module = layer,
+                        _attn_mask=attn_mask,
+                        _cos_sin=cos_sin,
+                        _token_mask=token_mask,
+                        _repo_active: bool = repo_active,
+                        _prores_alpha=alpha,
+                    ) -> torch.Tensor:
+                        return _layer(
+                            x_in,
+                            attn_mask=_attn_mask,
+                            cos_sin=_cos_sin,
+                            position_ids=None,
+                            token_mask=_token_mask,
+                            repo_active=_repo_active,
+                            prores_alpha=_prores_alpha,
+                        )
+
+                    try:
+                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                    except TypeError:  # older torch checkpoint API
+                        x = _checkpoint(_layer_forward, x)
+                else:
+                    x = layer(
+                        x,
+                        attn_mask=attn_masks[layer_type],
+                        cos_sin=rope[layer_type],
+                        position_ids=None,
+                        token_mask=attention_mask,
+                        repo_active=repo_active,
+                        prores_alpha=alpha,
+                    )
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]  # compress: take stream 0
         return self.final_norm(x)
+
+
+@dataclass
+class MLMOutput:
+    loss: Optional[torch.Tensor]
+    logits: torch.Tensor
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
 
 
 class ModernBertPredictionHead(nn.Module):
@@ -3032,6 +3490,7 @@ class ModernBertForMaskedLM(nn.Module):
             self.model.resid_lambdas.fill_(self.config.resid_lambda_init)
         if self.model.x0_lambdas is not None:
             self.model.x0_lambdas.fill_(self.config.x0_lambda_init)
+        self.model._apply_takase_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embeddings.tok_embeddings
@@ -3047,7 +3506,9 @@ class ModernBertForMaskedLM(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         position_ids: Optional[torch.Tensor] = None,
-    ) -> dict[str, Optional[torch.Tensor]]:
+        recycling_loop_count: Optional[int] = None,
+        recycling_bptt: Optional[int] = None,
+    ) -> MLMOutput:
         # ---- static packed path (pre-flattened by collator) ---------------
         # When both cu_seqlens and position_ids are provided and input_ids is
         # already 1-D (flat), the collator has done all unpadding / position-id
@@ -3063,6 +3524,8 @@ class ModernBertForMaskedLM(nn.Module):
                 _cu_seqlens=cu_seqlens,
                 _max_seqlen=max_seqlen,  # pass int directly — no tensor
                 _position_ids=position_ids,
+                recycling_loop_count=recycling_loop_count,
+                recycling_bptt=recycling_bptt,
             )
             # x: (F, hidden) where F is fixed flat length
 
@@ -3088,7 +3551,7 @@ class ModernBertForMaskedLM(nn.Module):
                 logits = self.decoder(self.head(x))
                 loss = None
 
-            return {"loss": loss, "logits": logits}
+            return MLMOutput(loss=loss, logits=logits)
 
         use_varlen = (
             _HAS_FLASH_VARLEN and input_ids.is_cuda and attention_mask is not None
@@ -3121,6 +3584,8 @@ class ModernBertForMaskedLM(nn.Module):
                 _cu_seqlens=cu_seqlens,
                 _max_seqlen=max_seqlen_t,
                 _position_ids=position_ids,
+                recycling_loop_count=recycling_loop_count,
+                recycling_bptt=recycling_bptt,
             )
             # x: (total_tokens, hidden) — flat, no padding
 
@@ -3142,10 +3607,15 @@ class ModernBertForMaskedLM(nn.Module):
                 logits = _pad_output(logits, indices, batch, seq_len)
                 loss = None
 
-            return {"loss": loss, "logits": logits}
+            return MLMOutput(loss=loss, logits=logits)
 
         # ---- SDPA (fallback) path -----------------------------------------
-        x = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        x = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            recycling_loop_count=recycling_loop_count,
+            recycling_bptt=recycling_bptt,
+        )
 
         if self.sparse_prediction and labels is not None:
             flat_labels = labels.view(-1)
@@ -3169,7 +3639,7 @@ class ModernBertForMaskedLM(nn.Module):
                     ignore_index=self.sparse_pred_ignore_index,
                 )
 
-        return {"loss": loss, "logits": logits}
+        return MLMOutput(loss=loss, logits=logits)
 
     def num_parameters(self, only_trainable: bool = True) -> int:
         return sum(
