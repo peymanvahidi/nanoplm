@@ -255,6 +255,8 @@ def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch):
     # is meaningless, so assert it explicitly.
     a_stable = _load_final_weights(_find_checkpoint(run_a_dir, "stable-end"))
     b_trunk = _load_final_weights(_find_checkpoint(run_b_dir, "stable-end"))
+    assert len(a_stable) > 0, "stable-end checkpoint has no weights"
+    assert set(a_stable.keys()) == set(b_trunk.keys())
     for k in a_stable:
         assert torch.allclose(a_stable[k], b_trunk[k], atol=1e-5), (
             f"stable trunk weight {k} diverged between wsd and warmup_stable"
@@ -281,6 +283,7 @@ def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch):
     # ---- Compare the two post-decay checkpoints ----
     a = _load_final_weights(_find_checkpoint(run_a_dir, "final"))
     b = _load_final_weights(_find_checkpoint(run_b_dir, "final"))
+    assert len(a) > 0, "final checkpoint has no weights"
     assert set(a.keys()) == set(b.keys())
     for k in a:
         assert torch.allclose(a[k], b[k], atol=1e-5), f"weight {k} diverged"
