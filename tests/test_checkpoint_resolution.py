@@ -77,3 +77,22 @@ def test_archive_includes_role_dirs(tmp_path):
     archive_dir = archive_dirs[0]
     moved = {p.name for p in archive_dir.iterdir()}
     assert moved == {"checkpoint-200", "checkpoint-stable-end", "checkpoint-final"}
+
+
+def test_unresolvable_role_dir_is_not_archived(tmp_path):
+    """A role dir whose step can't be resolved (no training_state.json) must
+    yield step -1 and be LEFT in place — never mistaken for a future step.
+    A numbered dir at exactly resume_step must also be kept (> not >=)."""
+    run_dir = tmp_path / "run-xyz"
+    run_dir.mkdir()
+    (run_dir / "checkpoint-stable-end").mkdir()  # no training_state.json -> step -1
+    _make_ckpt(run_dir, "checkpoint-150", 150)   # exactly at resume_step
+    _make_ckpt(run_dir, "checkpoint-300", 300)   # above -> archived
+
+    assert _checkpoint_step(run_dir / "checkpoint-stable-end") == -1
+
+    _archive_future_checkpoints(run_dir, resume_step=150)
+
+    assert (run_dir / "checkpoint-stable-end").is_dir()  # -1 step: kept
+    assert (run_dir / "checkpoint-150").is_dir()          # == resume_step: kept
+    assert not (run_dir / "checkpoint-300").exists()      # > resume_step: archived

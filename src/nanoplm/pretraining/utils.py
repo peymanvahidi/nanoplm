@@ -308,16 +308,20 @@ def prepare_run_and_steps(
         wandb_run_name = f"{run_name}-re{resume_counter}"
         logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
 
-        # Archive any future checkpoints to prevent conflicts (rank 0 only)
+        # Archive any future checkpoints to prevent conflicts (rank 0 only).
+        # Use checkpoint_step so resuming from a role-named dir (e.g.
+        # checkpoint-stable-end) resolves its true step from training_state.json
+        # instead of failing to parse the name.
         resume_step = None
         if is_local_main:
-            try:
-                resume_step = int(checkpoint_path.name.split("-")[1])
-                _archive_future_checkpoints(run_root, resume_step)
-            except (IndexError, ValueError) as e:
+            step = checkpoint_step(checkpoint_path)
+            if step >= 0:
+                resume_step = step
+                _archive_future_checkpoints(run_root, step)
+            else:
                 logger.warning(
-                    f"Could not extract step number from checkpoint path: {checkpoint_path.name}. "
-                    f"Skipping future checkpoint archival. Error: {e}"
+                    f"Could not determine step for checkpoint path: {checkpoint_path.name}. "
+                    f"Skipping future checkpoint archival."
                 )
     else:
         slurm_job_id = os.environ.get("SLURM_JOB_ID")
