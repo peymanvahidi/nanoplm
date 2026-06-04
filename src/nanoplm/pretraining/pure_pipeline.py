@@ -2055,6 +2055,11 @@ def run_pure_pretraining(
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
+    if synced_len == 0:
+        raise RuntimeError(
+            "train_loader is empty (synced_len=0); cannot satisfy the token budget. "
+            "Check the dataset/manifest and per-rank sharding."
+        )
 
     # ---- Training horizon (token budget -> optimizer steps) ----
     # total_steps comes from the configured token/step budget, NOT from epochs.

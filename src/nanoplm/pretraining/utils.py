@@ -81,6 +81,7 @@ def tokens_to_steps(target_tokens: int, achieved_global_batch_tokens: int) -> in
 
 @dataclass
 class StepHorizon:
+    """Resolved optimizer-step horizon: total_steps, plus stable_steps/decay_steps for wsd."""
     total_steps: int
     stable_steps: Optional[int] = None   # wsd only
     decay_steps: Optional[int] = None    # wsd only
