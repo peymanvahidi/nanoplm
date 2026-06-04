@@ -64,6 +64,21 @@ def compute_batch_setup(
     )
 
 
+def tokens_to_steps(target_tokens: int, achieved_global_batch_tokens: int) -> int:
+    """Optimizer steps needed to process `target_tokens`.
+
+    Ceil so the budget is met (overshoot < one optimizer step of tokens). The
+    same value drives both the loop stop condition and the LR-schedule horizon.
+    """
+    if target_tokens <= 0:
+        raise ValueError(f"target token budget must be > 0, got {target_tokens}")
+    if achieved_global_batch_tokens <= 0:
+        raise ValueError(
+            f"achieved_global_batch_tokens must be > 0, got {achieved_global_batch_tokens}"
+        )
+    return max(1, math.ceil(target_tokens / achieved_global_batch_tokens))
+
+
 def get_num_workers(user_value: Union[int, str], world_size: int) -> int:
 
     if isinstance(user_value, str) and user_value == "auto":
