@@ -1,4 +1,10 @@
-from nanoplm.pretraining.pure_pipeline import _checkpoint_dir_name
+import json
+from pathlib import Path
+
+import torch
+
+from nanoplm.pretraining.pure_pipeline import _checkpoint_dir_name, _save_checkpoint
+from nanoplm.pretraining.config import PretrainingConfig
 
 
 class TestCheckpointDirName:
@@ -10,12 +16,6 @@ class TestCheckpointDirName:
 
     def test_final_role(self):
         assert _checkpoint_dir_name(global_step=40, phase="final") == "checkpoint-final"
-
-
-import json, torch
-from pathlib import Path
-from nanoplm.pretraining.pure_pipeline import _save_checkpoint
-from nanoplm.pretraining.config import PretrainingConfig
 
 
 def test_training_state_carries_schedule_descriptor(tmp_path):

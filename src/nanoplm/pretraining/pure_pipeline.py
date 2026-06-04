@@ -2396,6 +2396,25 @@ def run_pure_pretraining(
     # until the token-budget total_steps is reached. The horizon is driven by
     # global_step, not a fixed epoch count.
     epoch = start_epoch
+
+    # Single entry point for every checkpoint write. The common kwargs are
+    # captured by reference (resolved at call time); per-call-site differences
+    # (phase, and the resume data-position fields) are passed via **over.
+    def _save(phase, **over):
+        _save_checkpoint(
+            orig_model, optimizer, scheduler, global_step, epoch, output_dir,
+            logging_steps, eval_steps, save_steps,
+            distributed=distributed, is_main=is_main, distributed_mode=distributed_mode,
+            model_config=_model_config, manifest=_manifest, pretrain_config=pretrain_config,
+            total_steps=total_steps, warmup_steps=warmup_steps,
+            dataset_fingerprint=_dataset_fingerprint,
+            tokens_seen=tokens_seen,
+            achieved_global_batch_tokens=achieved_global_batch_tokens,
+            stable_steps=horizon.stable_steps, decay_steps=horizon.decay_steps,
+            phase=phase,
+            **over,
+        )
+
     with profiler_ctx:
         while global_step < total_steps:
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
@@ -2877,22 +2896,19 @@ def run_pure_pretraining(
                     # once by the post-loop save below; the in-loop branch only
                     # handles the intermediate wsd stable-end.
                     _sched = pretrain_config.lr_schedule.lower()
-                    at_stable_end = (
-                        (_sched == "wsd" and horizon.stable_steps is not None
-                         and global_step == horizon.stable_steps)
-                        or (_sched == "warmup_stable" and global_step == total_steps)
+                    # The wsd intermediate stable-end fires in-loop at stable_steps
+                    # (always < total_steps, pre-decay). Every schedule's TERMINAL
+                    # checkpoint (at total_steps) is the post-loop save's
+                    # responsibility, so the in-loop booleans are wsd-intermediate
+                    # only.
+                    at_wsd_stable_end = (
+                        _sched == "wsd" and horizon.stable_steps is not None
+                        and global_step == horizon.stable_steps
                     )
-                    at_final = (_sched in ("wsd", "cosine", "linear")
-                                and global_step == total_steps)
-                    do_periodic = bool(save_steps) and (global_step % save_steps == 0)
-                    # Only the wsd intermediate stable-end is forced in-loop; the
-                    # terminal (final / warmup_stable stable-end) is the post-loop
-                    # save's responsibility.
-                    force_stable_end_inloop = (
-                        _sched == "wsd" and at_stable_end and not at_final
-                    )
+                    at_terminal = (global_step == total_steps)
+                    do_periodic = global_step % save_steps == 0
 
-                    if global_step % eval_steps == 0 or force_stable_end_inloop:
+                    if global_step % eval_steps == 0 or at_wsd_stable_end:
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
                             eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
                         elif recycling_scheduler is not None:
@@ -2937,10 +2953,10 @@ def run_pure_pretraining(
                         model.train()
 
                     # In-loop saves: the forced wsd stable-end boundary and the
-                    # periodic save_steps cadence. The terminal checkpoint (at
-                    # total_steps) is written once by the post-loop save, so we
-                    # skip the periodic save when it would collide with it.
-                    if force_stable_end_inloop or (do_periodic and not at_final):
+                    # periodic save_steps cadence. Skip the periodic save at the
+                    # terminal step -- the post-loop save writes the role-named
+                    # terminal checkpoint there for every schedule.
+                    if at_wsd_stable_end or (do_periodic and not at_terminal):
                         next_data_step = micro_step
                         next_sub_batch_step = sub_batch_idx + 1
                         next_batch_split_divisor = batch_split_divisor
@@ -2948,45 +2964,17 @@ def run_pure_pretraining(
                             next_data_step = micro_step + 1
                             next_sub_batch_step = 0
                             next_batch_split_divisor = mbs_divisor
-                        _save_phase = "stable-end" if force_stable_end_inloop else "periodic"
-                        _save_checkpoint(
-                            orig_model, optimizer, scheduler, global_step, epoch,
-                            output_dir, logging_steps, eval_steps, save_steps,
-                            distributed, is_main, distributed_mode=distributed_mode,
-                            model_config=_model_config, manifest=_manifest,
-                            pretrain_config=pretrain_config,
-                            total_steps=total_steps, warmup_steps=warmup_steps,
-                            dataset_fingerprint=_dataset_fingerprint,
+                        _pos = dict(
                             epoch_data_step=next_data_step,
                             epoch_sub_batch_step=next_sub_batch_step,
                             batch_split_divisor=next_batch_split_divisor,
-                            phase=_save_phase,
-                            tokens_seen=tokens_seen,
-                            achieved_global_batch_tokens=achieved_global_batch_tokens,
-                            stable_steps=horizon.stable_steps,
-                            decay_steps=horizon.decay_steps,
                         )
+                        _save("stable-end" if at_wsd_stable_end else "periodic", **_pos)
                         # When the wsd stable-end coincides with the periodic
                         # cadence, also write the periodic checkpoint so the
                         # save_steps trail is unbroken.
-                        if force_stable_end_inloop and do_periodic:
-                            _save_checkpoint(
-                                orig_model, optimizer, scheduler, global_step, epoch,
-                                output_dir, logging_steps, eval_steps, save_steps,
-                                distributed, is_main, distributed_mode=distributed_mode,
-                                model_config=_model_config, manifest=_manifest,
-                                pretrain_config=pretrain_config,
-                                total_steps=total_steps, warmup_steps=warmup_steps,
-                                dataset_fingerprint=_dataset_fingerprint,
-                                epoch_data_step=next_data_step,
-                                epoch_sub_batch_step=next_sub_batch_step,
-                                batch_split_divisor=next_batch_split_divisor,
-                                phase="periodic",
-                                tokens_seen=tokens_seen,
-                                achieved_global_batch_tokens=achieved_global_batch_tokens,
-                                stable_steps=horizon.stable_steps,
-                                decay_steps=horizon.decay_steps,
-                            )
+                        if at_wsd_stable_end and do_periodic:
+                            _save("periodic", **_pos)
 
                 if epoch == resume_epoch and micro_step == resume_data_step:
                     resume_data_step = 0
@@ -3051,20 +3039,7 @@ def run_pure_pretraining(
         if pretrain_config.lr_schedule.lower() == "warmup_stable"
         else "final"
     )
-    _save_checkpoint(
-        orig_model, optimizer, scheduler, global_step, epoch,
-        output_dir, logging_steps, eval_steps, save_steps,
-        distributed, is_main, distributed_mode=distributed_mode,
-        model_config=_model_config, manifest=_manifest,
-        pretrain_config=pretrain_config,
-        total_steps=total_steps, warmup_steps=warmup_steps,
-        dataset_fingerprint=_dataset_fingerprint,
-        phase=_terminal_phase,
-        tokens_seen=tokens_seen,
-        achieved_global_batch_tokens=achieved_global_batch_tokens,
-        stable_steps=horizon.stable_steps,
-        decay_steps=horizon.decay_steps,
-    )
+    _save(_terminal_phase)
 
     if debug_tracker is not None:
         debug_tracker.close()
