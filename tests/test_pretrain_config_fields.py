@@ -1,4 +1,3 @@
-import pytest
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 
 

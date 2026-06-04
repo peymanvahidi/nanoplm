@@ -23,13 +23,14 @@ class PretrainingConfig:
     lr_schedule: str = "wsd"            # wsd | warmup_stable | cosine | linear
     decay_shape: str = "1-sqrt"         # 1-sqrt | linear (wsd/decay only)
     # Duration as a TOKEN budget (primary). Exactly one unit per phase.
+    # (Mutual-exclusivity/precedence is ENFORCED later by duration-precedence validation at config load, not by this dataclass.)
     stable_tokens: Optional[int] = None   # wsd: tokens up to the pre-decay checkpoint (warmup incl.)
     decay_tokens: Optional[int] = None    # wsd: additional anneal tokens
     train_tokens: Optional[int] = None    # warmup_stable | cosine | linear: single budget
     # Advanced step overrides (mutually exclusive with their *_tokens counterpart):
     stable_steps: Optional[int] = None
     decay_steps: Optional[int] = None
-    max_steps: Optional[int] = None
+    max_steps: Optional[int] = None    # ↔ train_tokens (single-phase step override)
     optimizer: str = "normuon"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
