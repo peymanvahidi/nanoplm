@@ -2089,10 +2089,26 @@ def run_pure_pretraining(
     recycling_rng = None
     recycling_metrics_buffer = None
     if model.model_config.recycling_loop_count > 1:
+        # Resume semantics for the loop-count curriculum (spec §17):
+        #   - `continue` keeps the curriculum on the ORIGINAL horizon, read from
+        #     the checkpoint's training_state.json (not the locally recomputed
+        #     total_steps), so the loop-count ramp does not shift on resume.
+        #   - `decay` anneals a trunk that already finished the curriculum, so it
+        #     runs at the TARGET loop count from step 0 (curriculum_complete).
+        _is_resume = bool(resume_config and resume_config.is_resume)
+        _resume_mode = (resume_config.mode or "continue").lower() if _is_resume else None
+        _curriculum_complete = _is_resume and _resume_mode == "decay"
+        if _is_resume and _resume_mode == "continue":
+            _recycling_total_steps = int(
+                _read_training_state(resume_config.checkpoint_dir).get("total_steps", total_steps)
+            )
+        else:
+            _recycling_total_steps = total_steps
         recycling_scheduler = RecyclingScheduler(
             pretrain_config,
             target_loop_count=model.model_config.recycling_loop_count,
-            total_training_steps=total_steps,
+            total_training_steps=_recycling_total_steps,
+            curriculum_complete=_curriculum_complete,
         )
         # +999 offset keeps the r-sampling RNG stream distinct from the seed
         # used elsewhere (model init, data shuffling, dropout).

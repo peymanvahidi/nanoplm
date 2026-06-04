@@ -23,13 +23,20 @@ class RecyclingScheduler:
         The model's recycling_loop_count (target mean for sampling).
     total_training_steps :
         Used to resolve `curriculum_steps == -1` to 25% of total.
+    curriculum_complete :
+        When True, the curriculum is treated as already finished and
+        `current_mean` pins the loop-count mean at `target` from step 0.
+        Used by `decay` resumes that anneal a trunk which already ran the
+        full curriculum.
     """
 
-    def __init__(self, pretraining_config, target_loop_count: int, total_training_steps: int):
+    def __init__(self, pretraining_config, target_loop_count: int,
+                 total_training_steps: int, *, curriculum_complete: bool = False):
         self.sampling = pretraining_config.recycling_loop_count_sampling
         self.sigma = pretraining_config.recycling_loop_count_sigma
         self.curriculum = pretraining_config.recycling_loop_count_curriculum
         self.target = max(1, int(target_loop_count))
+        self.curriculum_complete = bool(curriculum_complete)
 
         cs = pretraining_config.recycling_loop_count_curriculum_steps
         if cs == -1:
@@ -50,7 +57,7 @@ class RecyclingScheduler:
 
     def current_mean(self, step: int) -> int:
         """Curriculum-scaled target mean k_t at the given step."""
-        if self.curriculum == "none":
+        if self.curriculum_complete or self.curriculum == "none":
             return self.target
         T_c = self.curriculum_steps
         if step >= T_c:
