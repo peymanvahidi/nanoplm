@@ -589,6 +589,12 @@ def run_te_pretraining(
     horizon = resolve_total_steps(pretrain_config, achieved_global_batch_tokens)
     total_steps = horizon.total_steps
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+    # Clamp the raw logging/eval/save intervals to the token-budget horizon so a
+    # tiny budget (total_steps < save_steps/eval_steps) still gets at least one
+    # periodic eval/checkpoint instead of none (mirrors pure_pipeline).
+    logging_steps = max(1, min(total_steps, logging_steps))
+    eval_steps = max(1, min(total_steps, eval_steps))
+    save_steps = max(1, min(total_steps, save_steps))
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
         pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
