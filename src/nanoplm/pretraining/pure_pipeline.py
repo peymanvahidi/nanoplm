@@ -1312,6 +1312,14 @@ def _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer):
         _shard_sub(opt_sd, optimizer)
 
 
+def _checkpoint_dir_name(global_step: int, phase: str = "periodic") -> str:
+    if phase == "stable-end":
+        return "checkpoint-stable-end"
+    if phase == "final":
+        return "checkpoint-final"
+    return f"checkpoint-{global_step}"
+
+
 def _save_checkpoint(
     model, optimizer, scheduler, global_step, epoch,
     output_dir, logging_steps, eval_steps, save_steps,
@@ -1322,8 +1330,13 @@ def _save_checkpoint(
     epoch_data_step: Optional[int] = None,
     epoch_sub_batch_step: Optional[int] = None,
     batch_split_divisor: Optional[int] = None,
+    phase: str = "periodic",
+    tokens_seen: Optional[int] = None,
+    achieved_global_batch_tokens: Optional[int] = None,
+    stable_steps: Optional[int] = None,
+    decay_steps: Optional[int] = None,
 ) -> None:
-    ckpt = Path(output_dir) / f"checkpoint-{global_step}"
+    ckpt = Path(output_dir) / _checkpoint_dir_name(global_step, phase)
 
     if distributed and distributed_mode == "fsdp":
         _fsdp_opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -1377,6 +1390,21 @@ def _save_checkpoint(
         training_state["epoch_sub_batch_step"] = int(epoch_sub_batch_step)
     if batch_split_divisor is not None:
         training_state["batch_split_divisor"] = int(batch_split_divisor)
+    # Schedule descriptor: lets resume reconstruct/validate the LR curve and
+    # lets eval/resume target a role (stable-end/final) instead of a step number.
+    training_state["phase"] = phase
+    if pretrain_config is not None:
+        training_state["lr_schedule"] = pretrain_config.lr_schedule
+        training_state["decay_shape"] = pretrain_config.decay_shape
+        training_state["lr_decay_to_fraction"] = pretrain_config.lr_decay_to_fraction
+    if tokens_seen is not None:
+        training_state["tokens_seen"] = int(tokens_seen)
+    if achieved_global_batch_tokens is not None:
+        training_state["achieved_global_batch_tokens"] = int(achieved_global_batch_tokens)
+    if stable_steps is not None:
+        training_state["stable_steps"] = int(stable_steps)
+    if decay_steps is not None:
+        training_state["decay_steps"] = int(decay_steps)
     (ckpt / "training_state.json").write_text(
         json.dumps(training_state, indent=2),
         encoding="utf-8",
@@ -2288,6 +2316,12 @@ def run_pure_pretraining(
     optimizer.zero_grad(set_to_none=True)
 
     global_step = start_step
+    # Running token counter for the schedule descriptor in training_state.json.
+    # Anchored at start_step so resume stays consistent. When
+    # global_batch_warmup_steps > 0 the per-step token count ramps; we use the
+    # steady-state achieved_global_batch_tokens here, so tokens_seen is an
+    # approximation in that regime (noted in the warmup log above).
+    tokens_seen = int(start_step) * int(achieved_global_batch_tokens)
     accum_micro_count = 0
     effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
         global_step,
@@ -2677,6 +2711,7 @@ def run_pure_pretraining(
                         _moe_count_accum.zero_()
 
                     global_step += 1
+                    tokens_seen += int(achieved_global_batch_tokens)
                     profiler_step_cb(global_step)
 
                     if _prores_model is not None:
@@ -2831,7 +2866,33 @@ def run_pure_pretraining(
                         window_loss.zero_()
                         window_steps = 0
 
-                    if global_step % eval_steps == 0:
+                    # ---- Phase-boundary detection (role-named checkpoints) ----
+                    # Terminal role per schedule (spec §6):
+                    #   wsd            -> stable-end at stable_steps (intermediate,
+                    #                     pre-decay) + final at total_steps.
+                    #   warmup_stable  -> stable-end at total_steps (the reusable
+                    #                     trunk; no separate final).
+                    #   cosine/linear  -> final at total_steps.
+                    # The terminal checkpoint (at total_steps) is written exactly
+                    # once by the post-loop save below; the in-loop branch only
+                    # handles the intermediate wsd stable-end.
+                    _sched = pretrain_config.lr_schedule.lower()
+                    at_stable_end = (
+                        (_sched == "wsd" and horizon.stable_steps is not None
+                         and global_step == horizon.stable_steps)
+                        or (_sched == "warmup_stable" and global_step == total_steps)
+                    )
+                    at_final = (_sched in ("wsd", "cosine", "linear")
+                                and global_step == total_steps)
+                    do_periodic = bool(save_steps) and (global_step % save_steps == 0)
+                    # Only the wsd intermediate stable-end is forced in-loop; the
+                    # terminal (final / warmup_stable stable-end) is the post-loop
+                    # save's responsibility.
+                    force_stable_end_inloop = (
+                        _sched == "wsd" and at_stable_end and not at_final
+                    )
+
+                    if global_step % eval_steps == 0 or force_stable_end_inloop:
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
                             eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
                         elif recycling_scheduler is not None:
@@ -2875,7 +2936,11 @@ def run_pure_pretraining(
                                         logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
-                    if global_step % save_steps == 0:
+                    # In-loop saves: the forced wsd stable-end boundary and the
+                    # periodic save_steps cadence. The terminal checkpoint (at
+                    # total_steps) is written once by the post-loop save, so we
+                    # skip the periodic save when it would collide with it.
+                    if force_stable_end_inloop or (do_periodic and not at_final):
                         next_data_step = micro_step
                         next_sub_batch_step = sub_batch_idx + 1
                         next_batch_split_divisor = batch_split_divisor
@@ -2883,6 +2948,7 @@ def run_pure_pretraining(
                             next_data_step = micro_step + 1
                             next_sub_batch_step = 0
                             next_batch_split_divisor = mbs_divisor
+                        _save_phase = "stable-end" if force_stable_end_inloop else "periodic"
                         _save_checkpoint(
                             orig_model, optimizer, scheduler, global_step, epoch,
                             output_dir, logging_steps, eval_steps, save_steps,
@@ -2894,7 +2960,33 @@ def run_pure_pretraining(
                             epoch_data_step=next_data_step,
                             epoch_sub_batch_step=next_sub_batch_step,
                             batch_split_divisor=next_batch_split_divisor,
+                            phase=_save_phase,
+                            tokens_seen=tokens_seen,
+                            achieved_global_batch_tokens=achieved_global_batch_tokens,
+                            stable_steps=horizon.stable_steps,
+                            decay_steps=horizon.decay_steps,
                         )
+                        # When the wsd stable-end coincides with the periodic
+                        # cadence, also write the periodic checkpoint so the
+                        # save_steps trail is unbroken.
+                        if force_stable_end_inloop and do_periodic:
+                            _save_checkpoint(
+                                orig_model, optimizer, scheduler, global_step, epoch,
+                                output_dir, logging_steps, eval_steps, save_steps,
+                                distributed, is_main, distributed_mode=distributed_mode,
+                                model_config=_model_config, manifest=_manifest,
+                                pretrain_config=pretrain_config,
+                                total_steps=total_steps, warmup_steps=warmup_steps,
+                                dataset_fingerprint=_dataset_fingerprint,
+                                epoch_data_step=next_data_step,
+                                epoch_sub_batch_step=next_sub_batch_step,
+                                batch_split_divisor=next_batch_split_divisor,
+                                phase="periodic",
+                                tokens_seen=tokens_seen,
+                                achieved_global_batch_tokens=achieved_global_batch_tokens,
+                                stable_steps=horizon.stable_steps,
+                                decay_steps=horizon.decay_steps,
+                            )
 
                 if epoch == resume_epoch and micro_step == resume_data_step:
                     resume_data_step = 0
@@ -2951,6 +3043,14 @@ def run_pure_pretraining(
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
+    # Terminal role checkpoint, written exactly once at total_steps:
+    #   warmup_stable -> stable-end (the reusable trunk a later run anneals)
+    #   wsd / cosine / linear -> final
+    _terminal_phase = (
+        "stable-end"
+        if pretrain_config.lr_schedule.lower() == "warmup_stable"
+        else "final"
+    )
     _save_checkpoint(
         orig_model, optimizer, scheduler, global_step, epoch,
         output_dir, logging_steps, eval_steps, save_steps,
@@ -2959,6 +3059,11 @@ def run_pure_pretraining(
         pretrain_config=pretrain_config,
         total_steps=total_steps, warmup_steps=warmup_steps,
         dataset_fingerprint=_dataset_fingerprint,
+        phase=_terminal_phase,
+        tokens_seen=tokens_seen,
+        achieved_global_batch_tokens=achieved_global_batch_tokens,
+        stable_steps=horizon.stable_steps,
+        decay_steps=horizon.decay_steps,
     )
 
     if debug_tracker is not None:
