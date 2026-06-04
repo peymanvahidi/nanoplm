@@ -1581,11 +1581,19 @@ def _read_training_state(checkpoint_dir: str) -> dict:
     """Load ``training_state.json`` from a checkpoint directory.
 
     Returns an empty dict if the file is missing (pre-upgrade checkpoint).
+    Raises ValueError (with the offending path) if the file exists but is not
+    valid JSON, e.g. a checkpoint truncated by a crash mid-write.
     """
     state_path = Path(checkpoint_dir) / "training_state.json"
     if not state_path.exists():
         return {}
-    return json.loads(state_path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Could not parse training state at {state_path}: {exc}. "
+            "The checkpoint may be corrupt (e.g. truncated by a crash mid-write)."
+        ) from exc
 
 
 def _rebuild_scheduler_for_resume(

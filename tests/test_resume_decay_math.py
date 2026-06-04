@@ -3,7 +3,7 @@ from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.pure_pipeline import _rebuild_scheduler_for_resume
 
 
-def _trunk_ckpt(tmp_path, lr=1e-4):
+def _trunk_ckpt(tmp_path):
     ckp = tmp_path / "checkpoint-stable-end"
     ckp.mkdir()
     (ckp / "training_state.json").write_text(json.dumps({
@@ -19,7 +19,7 @@ def _opt(lr):
 
 class TestResumeDecayMath:
     def test_decay_starts_at_checkpoint_lr_and_reaches_floor(self, tmp_path):
-        ckp = _trunk_ckpt(tmp_path, lr=1e-4)
+        ckp = _trunk_ckpt(tmp_path)
         rcfg = ResumeConfig(is_resume=True, checkpoint_dir=ckp, mode="decay",
                             decay_steps=4, decay_shape="linear", lr_decay_to_fraction=0.1)
         opt = _opt(1e-4)  # the trunk's stable LR
