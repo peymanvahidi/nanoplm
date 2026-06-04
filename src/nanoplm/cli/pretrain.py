@@ -1197,6 +1197,13 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     )
     _populate_batch_setup(pretrain_config)
 
+    # Fail fast before any heavy model instantiation: only pure_torch/pure_te
+    # pipelines are supported, and wsd/decay require pure_torch.
+    _check_pipeline_supported(
+        pure_torch, pure_te, pretrain_config.lr_schedule,
+        resume_config.mode if resume_config.is_resume else None,
+    )
+
     manifest = _load_manifest_and_inject(pretrain_config, model_config)
     _set_seed_for_init(pretrain_config.seed)
     if pure_te:
@@ -1205,8 +1212,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     elif pure_torch:
         logger.info("Using pure-torch model and training loop")
         model = PureProtModernBertMLM(config=model_config)
-    else:
-        model = ProtModernBertMLM(config=model_config)
 
     model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
@@ -1220,11 +1225,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
                 inactive += (m.num_experts - m.top_k) * m.Wo.shape[1] * m.Wo.shape[2]
         logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
-
-    _check_pipeline_supported(
-        pure_torch, pure_te, pretrain_config.lr_schedule,
-        resume_config.mode if (resume_config and resume_config.is_resume) else None,
-    )
 
     if pure_te:
         run_te_pretraining(
