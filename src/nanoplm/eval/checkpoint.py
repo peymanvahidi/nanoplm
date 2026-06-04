@@ -12,6 +12,7 @@ import yaml
 
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
+from nanoplm.pretraining.utils import checkpoint_step as _checkpoint_step
 from nanoplm.utils.logger import logger
 
 
@@ -57,16 +58,6 @@ def _model_config_from_dict(m: dict) -> ProtModernBertMLMConfig:
         )
 
     return ProtModernBertMLMConfig(**kwargs)
-
-
-def _checkpoint_step(checkpoint_dir: Union[str, Path]) -> int:
-    name = Path(checkpoint_dir).name
-    if not name.startswith("checkpoint-"):
-        return -1
-    try:
-        return int(name.split("-", 1)[1])
-    except ValueError:
-        return -1
 
 
 def resolve_checkpoint_dir(checkpoint_dir: Union[str, Path]) -> Path:

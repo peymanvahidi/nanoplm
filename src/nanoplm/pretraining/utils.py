@@ -153,6 +153,33 @@ def get_num_workers(user_value: Union[int, str], world_size: int) -> int:
         )
 
 
+def checkpoint_step(checkpoint_dir: Union[str, Path]) -> int:
+    """Resolve the optimizer step for a ``checkpoint-*`` directory.
+
+    Numbered dirs (``checkpoint-<N>``) parse the step from the name. Role-named
+    dirs (``checkpoint-final``, ``checkpoint-stable-end``) have no numeric
+    suffix, so the step is read from ``training_state.json["global_step"]``
+    (``checkpoint-final`` carries ``total_steps``, ``checkpoint-stable-end``
+    carries ``stable_steps``). Returns ``-1`` for non-checkpoint names or when
+    the role dir's step cannot be determined.
+    """
+    path = Path(checkpoint_dir)
+    name = path.name
+    if not name.startswith("checkpoint-"):
+        return -1
+    try:
+        return int(name.split("-", 1)[1])
+    except ValueError:
+        pass
+
+    state_path = path / "training_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        return int(state["global_step"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return -1
+
+
 def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
     """Archive checkpoints with steps greater than resume_step.
 
@@ -167,12 +194,12 @@ def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
     checkpoints_to_archive = []
 
     for ckpt_dir in run_dir.glob("checkpoint-*"):
-        try:
-            step = int(ckpt_dir.name.split("-")[1])
-            if step > resume_step:
-                checkpoints_to_archive.append((step, ckpt_dir))
-        except (IndexError, ValueError):
+        if not ckpt_dir.is_dir():
             continue
+        step = checkpoint_step(ckpt_dir)
+        # step == -1 (unresolvable) must NOT be treated as future work.
+        if step > resume_step:
+            checkpoints_to_archive.append((step, ckpt_dir))
 
     if checkpoints_to_archive:
         checkpoints_to_archive.sort()
