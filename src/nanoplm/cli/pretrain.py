@@ -1348,9 +1348,22 @@ def get_yaml(output: Optional[str], force: bool):
         "pretraining:\n"
         '  dataset_dir: "output/data/pretrain_data"\n'
         '  ckp_dir: "output/pretraining_checkpoints"\n'
+        "  # Batch sizing (token-budget surface)\n"
         "  micro_batch_seqs: 64\n"
         "  global_batch_tokens: 256000\n"
-        "  num_epochs: 10\n"
+        "  global_batch_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
+        "  # Duration + LR schedule (token-budget surface)\n"
+        '  lr_schedule: "wsd"  # wsd | warmup_stable | cosine | linear\n'
+        "  warmup_steps: 1000\n"
+        "  stable_tokens: 9000000   # wsd: tokens up to the pre-decay checkpoint (warmup included)\n"
+        "  decay_tokens: 1000000    # wsd: additional anneal tokens\n"
+        '  decay_shape: "1-sqrt"  # 1-sqrt | linear\n'
+        "  lr_decay_to_fraction: 0.1\n"
+        "  # train_tokens: 10000000  # single-phase budget for warmup_stable | cosine | linear (NOT used with wsd)\n"
+        "  # Advanced step overrides (each replaces its *_tokens counterpart; never set both):\n"
+        "  # stable_steps:  # ↔ stable_tokens (wsd)\n"
+        "  # decay_steps:   # ↔ decay_tokens (wsd/decay)\n"
+        "  # max_steps:     # ↔ train_tokens (warmup_stable | cosine | linear)\n"
         '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh\n'
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"
         "  adam_beta1: 0.9\n"
@@ -1358,11 +1371,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_epsilon: 1e-8\n"
         "  adam_learning_rate: 1e-4\n"
         "  max_grad_norm: .inf\n"
-        "  warmup_steps: 302\n"
-        "  repo_rope_warmup_steps: 302\n"
-        "  global_batch_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
-        "  lr_decay_to_fraction: 0.1\n"
-        '  lr_schedule: "cosine"\n'
+        "  repo_rope_warmup_steps: 1000\n"
         "  adam_weight_decay: 0.0\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
@@ -1431,18 +1440,17 @@ def get_yaml(output: Optional[str], force: bool):
         "  is_resume: false\n"
         '  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"\n'
         "  # Two resume modes:\n"
-        "  # continue - finish the original token/step budget from the checkpoint.\n"
-        "  #   Take no decay_* fields; the schedule is inherited from the original run.\n"
-        "  # decay - anneal a trunk checkpoint over an additional budget.\n"
+        "  # continue - finish the original token/step budget from the checkpoint\n"
+        "  #   with the original schedule. Takes NO decay_* fields.\n"
+        "  # decay - anneal a stable-end trunk checkpoint over an additional budget.\n"
         "  #   Set exactly one of decay_tokens / decay_steps. decay_shape and\n"
         "  #   lr_decay_to_fraction are OPTIONAL overrides; leave null to fall\n"
         "  #   back to the schedule defaults.\n"
-        '  mode: "continue"\n'
-        "  # decay-only fields (leave null for mode: continue):\n"
-        "  decay_tokens: null\n"
-        "  decay_steps: null\n"
-        '  decay_shape: null  # 1-sqrt | linear\n'
-        "  lr_decay_to_fraction: null\n"
+        '  mode: "decay"  # continue | decay\n'
+        "  # decay-mode fields (leave null / omit for mode: continue):\n"
+        "  decay_tokens: 1000000  # additional anneal tokens (or use decay_steps)\n"
+        '  decay_shape: "1-sqrt"  # 1-sqrt | linear\n'
+        "  lr_decay_to_fraction: 0.1\n"
         "\n"
         "# pure_torch: false\n"
         "# pure_te: false\n"
