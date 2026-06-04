@@ -469,52 +469,37 @@ def pretrain():
     help="Checkpoint directory to resume from",
 )
 @click.option(
-    "--resume-epochs",
-    type=int,
-    default=None,
+    "--resume-mode",
+    type=click.Choice(["continue", "decay"], case_sensitive=False),
+    default="continue",
     help=(
-        "Number of additional epochs to train from the checkpoint. "
-        "0 (or unset) continues to the original num_epochs from the pretrain "
-        "config; N>0 trains for exactly N more epochs from the checkpoint."
+        "continue: finish the original token/step budget from the checkpoint. "
+        "decay: anneal a trunk checkpoint over an additional decay budget."
     ),
 )
 @click.option(
-    "--resume-warmup-steps",
+    "--resume-decay-tokens",
     type=int,
     default=None,
-    help="Override warmup steps for resumed training",
+    help="(mode=decay) Additional anneal token budget from the checkpoint.",
 )
 @click.option(
-    "--resume-learning-rate",
-    type=float,
+    "--resume-decay-steps",
+    type=int,
     default=None,
-    help="Override AdamW learning rate when resuming",
+    help="(mode=decay) Additional anneal step budget (mutually exclusive with --resume-decay-tokens).",
 )
 @click.option(
-    "--resume-muon-learning-rate",
-    type=float,
+    "--resume-decay-shape",
+    type=click.Choice(["1-sqrt", "linear"], case_sensitive=False),
     default=None,
-    help="Override Muon learning rate when resuming",
-)
-@click.option(
-    "--resume-lr-schedule",
-    type=click.Choice(["linear", "cosine"], case_sensitive=False),
-    default=None,
-    help="Override LR schedule when resuming",
+    help="(mode=decay) Anneal shape: 1-sqrt | linear.",
 )
 @click.option(
     "--resume-lr-decay-to-fraction",
     type=float,
     default=None,
-    help="Override LR decay floor fraction when resuming",
-)
-@click.option(
-    "--resume-reset-scheduler/--no-resume-reset-scheduler",
-    default=False,
-    help=(
-        "Reset (true) builds a fresh LR curve from a new peak; default (false) "
-        "extends smoothly from the checkpoint's current LR."
-    ),
+    help="(mode=decay) LR decay floor fraction for the anneal.",
 )
 # Model hyperparameters (ModernBERT)
 @click.option("--hidden-size", type=int, default=768, help="Model hidden size")
@@ -792,13 +777,11 @@ def run(
     run_name: str,
     resume: bool,
     resume_checkpoint_dir: str,
-    resume_epochs: Optional[int],
-    resume_warmup_steps: Optional[int],
-    resume_learning_rate: Optional[float],
-    resume_muon_learning_rate: Optional[float],
-    resume_lr_schedule: Optional[str],
+    resume_mode: str,
+    resume_decay_tokens: Optional[int],
+    resume_decay_steps: Optional[int],
+    resume_decay_shape: Optional[str],
     resume_lr_decay_to_fraction: Optional[float],
-    resume_reset_scheduler: bool,
     # model hp
     hidden_size: int,
     intermediate_size: int,
@@ -1024,23 +1007,18 @@ def run(
         logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    if resume_epochs is not None and resume_epochs < 0:
-        raise click.ClickException("--resume-epochs must be >= 0")
-
     resume_cfg = ResumeConfig(
         is_resume=resume,
         checkpoint_dir=resume_checkpoint_dir,
-        resume_epochs=resume_epochs,
-        warmup_steps=resume_warmup_steps,
-        learning_rate=resume_learning_rate,
-        muon_learning_rate=resume_muon_learning_rate,
-        lr_schedule=resume_lr_schedule,
+        mode=resume_mode,
+        decay_tokens=resume_decay_tokens,
+        decay_steps=resume_decay_steps,
+        decay_shape=resume_decay_shape,
         lr_decay_to_fraction=resume_lr_decay_to_fraction,
-        reset_scheduler=resume_reset_scheduler,
     )
     if resume_cfg.is_resume and not resume_cfg.checkpoint_dir:
         raise click.ClickException("--resume requires --resume-checkpoint-dir")
-    _validate_resume_config_modes(resume_cfg, optimizer)
+    _validate_resume_config_modes(resume_cfg)
 
     if pure_te:
         run_te_pretraining(
@@ -1125,7 +1103,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
-    _validate_resume_config_modes(resume_config, pretrain_config.optimizer)
+    _validate_resume_config_modes(resume_config)
     _validate_muonh_wo_init_compat(pretrain_config, model_config)
     if getattr(model_config, "use_noble", False) and not pure_torch:
         raise click.ClickException(
@@ -1437,23 +1415,17 @@ def get_yaml(output: Optional[str], force: bool):
         "resume:\n"
         "  is_resume: false\n"
         '  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"\n'
-        "  # resume_epochs: 0 (or unset) continues to the original 'pretraining.num_epochs'.\n"
-        "  # N>0 trains for exactly N more epochs from the checkpoint\n"
-        "  resume_epochs: 0\n"
-        "  # warmup_steps: null/0 = no warmup at resume; positive int = fresh ramp from 0 to peak\n"
-        "  warmup_steps: null\n"
-        "  # Two LR modes:\n"
-        "  # EXTEND (reset_scheduler: false) - continue smoothly from checkpoint's current LR.\n"
-        "  #   learning_rate / muon_learning_rate MUST be null.\n"
-        "  #   lr_schedule / lr_decay_to_fraction may be null (inherit -> end at original final LR)\n"
-        "  #   or set to override.\n"
-        "  # RESET (reset_scheduler: true) - fresh curve from a new peak.\n"
-        "  #   lr_schedule, lr_decay_to_fraction, learning_rate are REQUIRED.\n"
-        "  #   muon_learning_rate is REQUIRED when optimizer is muon/normuon/muonh.\n"
-        "  reset_scheduler: false\n"
-        "  learning_rate: null\n"
-        "  muon_learning_rate: null\n"
-        "  lr_schedule: null\n"
+        "  # Two resume modes:\n"
+        "  # continue - finish the original token/step budget from the checkpoint.\n"
+        "  #   Take no decay_* fields; the schedule is inherited from the original run.\n"
+        "  # decay - anneal a trunk checkpoint over an additional budget.\n"
+        "  #   Set exactly one of decay_tokens / decay_steps, plus decay_shape and\n"
+        "  #   lr_decay_to_fraction.\n"
+        '  mode: "continue"\n'
+        "  # decay-only fields (leave null for mode: continue):\n"
+        "  decay_tokens: null\n"
+        "  decay_steps: null\n"
+        '  decay_shape: null  # 1-sqrt | linear\n'
         "  lr_decay_to_fraction: null\n"
         "\n"
         "# pure_torch: false\n"
@@ -1715,18 +1687,27 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         raise ValueError(f"Invalid model configuration: {exc}") from exc
 
 
+_RESUME_ALLOWED_KEYS = {
+    "is_resume",
+    "checkpoint_dir",
+    "mode",
+    "decay_tokens",
+    "decay_steps",
+    "decay_shape",
+    "lr_decay_to_fraction",
+}
+
+
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     if config is None:
         return ResumeConfig(is_resume=False, checkpoint_dir="")
 
-    expected_keys = set(ResumeConfig.__annotations__.keys())
     present_keys = set(config.keys())
-
-    extra = []
-    kwargs: Dict[str, Any] = {
-        "is_resume": False,
-        "checkpoint_dir": "",
-    }
+    extra = sorted(present_keys - _RESUME_ALLOWED_KEYS)
+    if extra:
+        raise ValueError(
+            f"Unexpected resume configuration keys: {', '.join(extra)}"
+        )
 
     def _parse_float_like(raw_value: Any, field_name: str) -> float:
         if not isinstance(raw_value, str):
@@ -1758,10 +1739,11 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
                 f"Invalid {field_name} value: {raw_value}. Must be a number."
             ) from exc
 
+    kwargs: Dict[str, Any] = {
+        "is_resume": False,
+        "checkpoint_dir": "",
+    }
     for key in present_keys:
-        if key not in expected_keys:
-            extra.append(key)
-            continue
         value = config.get(key)
         # Keep None values for Optional fields — they mean "use default /
         # inherit from checkpoint".  Only skip None for required fields
@@ -1770,7 +1752,7 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             continue
         kwargs[key] = value
 
-    for int_key in ("resume_epochs", "warmup_steps"):
+    for int_key in ("decay_tokens", "decay_steps"):
         if int_key in kwargs and kwargs[int_key] is not None:
             try:
                 kwargs[int_key] = int(kwargs[int_key])
@@ -1779,30 +1761,26 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
                     f"Invalid {int_key} value: {kwargs[int_key]}. Must be an integer."
                 ) from exc
 
-    if kwargs.get("resume_epochs") is not None and kwargs["resume_epochs"] < 0:
-        raise ValueError(
-            f"Invalid resume_epochs value: {kwargs['resume_epochs']}. Must be >= 0."
+    if "lr_decay_to_fraction" in kwargs and kwargs["lr_decay_to_fraction"] is not None:
+        kwargs["lr_decay_to_fraction"] = _parse_float_like(
+            kwargs["lr_decay_to_fraction"], "lr_decay_to_fraction"
         )
 
-    for float_key in ("learning_rate", "muon_learning_rate", "lr_decay_to_fraction"):
-        if float_key in kwargs and kwargs[float_key] is not None:
-            kwargs[float_key] = _parse_float_like(kwargs[float_key], float_key)
-
-    if "lr_schedule" in kwargs and kwargs["lr_schedule"] is not None:
-        lr_schedule = str(kwargs["lr_schedule"]).strip().lower()
-        if lr_schedule not in {"linear", "cosine"}:
+    if "decay_shape" in kwargs and kwargs["decay_shape"] is not None:
+        decay_shape = str(kwargs["decay_shape"]).strip().lower()
+        if decay_shape not in {"1-sqrt", "linear"}:
             raise ValueError(
-                f"Invalid lr_schedule value: {kwargs['lr_schedule']}. Must be one of: linear, cosine."
+                f"Invalid decay_shape value: {kwargs['decay_shape']}. Must be one of: 1-sqrt, linear."
             )
-        kwargs["lr_schedule"] = lr_schedule
+        kwargs["decay_shape"] = decay_shape
 
-    for bool_key in ("is_resume", "reset_scheduler"):
-        if bool_key in kwargs:
-            value = kwargs[bool_key]
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, str):
-                kwargs[bool_key] = value.lower() == "true"
+    if "mode" in kwargs and kwargs["mode"] is not None:
+        kwargs["mode"] = str(kwargs["mode"]).strip().lower()
+
+    if "is_resume" in kwargs:
+        value = kwargs["is_resume"]
+        if isinstance(value, str):
+            kwargs["is_resume"] = value.lower() == "true"
 
     checkpoint_dir = kwargs.get("checkpoint_dir")
     is_resume = kwargs.get("is_resume", False)
@@ -1819,80 +1797,28 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
                 f"Checkpoint directory does not exist: {checkpoint_dir}"
             )
 
-    if extra:
-        raise ValueError(
-            f"Unexpected resume configuration keys: {', '.join(sorted(extra))}"
-        )
-
     return ResumeConfig(**kwargs)
 
 
-_MUON_OPTIMIZER_NAMES = {"muon", "normuon", "muonh"}
-
-
-def _validate_resume_config_modes(
-    resume_config: ResumeConfig,
-    optimizer: str,
-) -> None:
-    """Enforce the EXTEND vs RESET contract on a loaded ResumeConfig.
-
-    Raises ``ValueError`` if the user's resume block mixes the two modes
-    incoherently — peak LR overrides without ``reset_scheduler``, or a
-    reset that's missing required fields.
-    """
+def _validate_resume_config_modes(resume_config) -> None:
+    """Validate the continue/decay resume contract (spec section 7)."""
     if not resume_config.is_resume:
         return
-
-    is_muon = str(optimizer).strip().lower() in _MUON_OPTIMIZER_NAMES
-    has_lr = resume_config.learning_rate is not None
-    has_muon_lr = resume_config.muon_learning_rate is not None
-
-    if not resume_config.reset_scheduler:
-        # EXTEND mode: peak LR overrides are forbidden.
-        offending = []
-        if has_lr:
-            offending.append("learning_rate")
-        if has_muon_lr:
-            offending.append("muon_learning_rate")
-        if offending:
-            raise ValueError(
-                "resume.{} can only be set when resume.reset_scheduler=true. "
-                "Leave them null on the EXTEND path; the peak LR comes from "
-                "the checkpoint's optimizer state.".format(
-                    " and resume.".join(offending)
-                )
-            )
+    mode = (resume_config.mode or "").lower()
+    if mode not in {"continue", "decay"}:
+        raise ValueError(f"resume.mode must be 'continue' or 'decay', got {resume_config.mode!r}")
+    has_tok = resume_config.decay_tokens is not None
+    has_stp = resume_config.decay_steps is not None
+    if mode == "continue":
+        if has_tok or has_stp or resume_config.decay_shape is not None \
+                or resume_config.lr_decay_to_fraction is not None:
+            raise ValueError("resume.mode=continue takes no decay_* fields (they belong to mode=decay).")
         return
-
-    # RESET mode: lr_schedule, lr_decay_to_fraction, learning_rate(s) required.
-    missing = []
-    if resume_config.lr_schedule is None:
-        missing.append("lr_schedule")
-    if resume_config.lr_decay_to_fraction is None:
-        missing.append("lr_decay_to_fraction")
-    if not has_lr:
-        missing.append("learning_rate")
-    if is_muon and not has_muon_lr:
-        missing.append("muon_learning_rate")
-    if missing:
-        raise ValueError(
-            "resume.reset_scheduler=true requires explicit values for: "
-            f"{', '.join(missing)}."
-        )
-
-    # Both LR fields must be coherent with the optimizer:
-    if is_muon:
-        if has_lr != has_muon_lr:
-            raise ValueError(
-                "Optimizer is a Muon variant: resume.learning_rate and "
-                "resume.muon_learning_rate must both be set."
-            )
-    else:
-        if has_muon_lr:
-            raise ValueError(
-                "resume.muon_learning_rate is only valid when optimizer is "
-                f"muon/normuon/muonh (current optimizer: {optimizer})."
-            )
+    # mode == "decay"
+    if has_tok and has_stp:
+        raise ValueError("resume decay: set exactly one of decay_tokens or decay_steps, not both.")
+    if not has_tok and not has_stp:
+        raise ValueError("resume.mode=decay requires a budget: set decay_tokens or decay_steps.")
 
 
 def _set_seed_for_init(seed: int) -> None:
