@@ -23,7 +23,6 @@ os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
 import torch
 
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
-from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 
 _TE_IMPORT_ERROR = None
@@ -222,7 +221,6 @@ def pretrain():
     default=64,
     help="Sequences per GPU per micro-step (forward pass)",
 )
-@click.option("--num-epochs", type=int, default=10, help="Number of epochs")
 @click.option(
     "--adam-learning-rate",
     type=float,
@@ -740,7 +738,6 @@ def run(
     ckp_dir: str,
     # training hp
     micro_batch_seqs: int,
-    num_epochs: int,
     adam_learning_rate: float,
     adam_weight_decay: float,
     gradient_clipping: bool,
@@ -848,7 +845,6 @@ def run(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
         micro_batch_seqs=micro_batch_seqs,
-        num_epochs=num_epochs,
         adam_learning_rate=adam_learning_rate,
         adam_weight_decay=adam_weight_decay,
         max_grad_norm=1.0 if gradient_clipping else float("inf"),
@@ -1037,6 +1033,16 @@ def run(
         raise click.ClickException("--resume requires --resume-checkpoint-dir")
     _validate_resume_config_modes(resume_cfg)
 
+    # Fail fast: only pure_torch/pure_te pipelines are supported, and wsd/decay
+    # require pure_torch. The HF Trainer pretraining path is no longer supported.
+    try:
+        _check_pipeline_supported(
+            pure_torch, pure_te, cfg.lr_schedule,
+            resume_cfg.mode if resume_cfg.is_resume else None,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     if pure_te:
         run_te_pretraining(
             model=model,
@@ -1046,13 +1052,6 @@ def run(
         )
     elif pure_torch:
         run_pure_pretraining(
-            model=model,
-            pretrain_config=cfg,
-            manifest=manifest,
-            resume_config=resume_cfg if resume_cfg.is_resume else None,
-        )
-    else:
-        run_pretraining(
             model=model,
             pretrain_config=cfg,
             manifest=manifest,

@@ -249,7 +249,7 @@ def prepare_run_and_steps(
 
     Returns a tuple: (run_name, wandb_run_name, output_dir, None,
                       logging_steps, eval_steps, save_steps, resume_step).
-    The 4th slot (previously ``num_epochs``) is always ``None``: the horizon is
+    The 4th return slot is always ``None`` (now unused): the horizon is
     token-budget driven and resolved by the caller.
     """
     ckp_root = Path(pretrain_config.ckp_dir)
@@ -343,5 +343,5 @@ def prepare_run_and_steps(
                 # Fall back to the raw configured intervals computed above.
                 pass
 
-    # 4th slot (previously num_epochs) is None: horizon is token-budget driven.
+    # 4th return slot (now unused) is None: horizon is token-budget driven.
     return run_name, wandb_run_name, output_dir, None, logging_steps, eval_steps, save_steps, resume_step

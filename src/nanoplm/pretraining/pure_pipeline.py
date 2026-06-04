@@ -294,115 +294,6 @@ def _split_batch(
     return _split_standard_batch(batch, n_splits=n_splits)
 
 
-def _estimate_steps_for_epoch(
-    *,
-    train_loader_len: int,
-    start_global_step: int,
-    full_grad_accum: int,
-    full_micro_batch: int,
-    global_batch_warmup_steps: int,
-) -> int:
-    """Simulate optimizer steps produced by one epoch of DataLoader batches."""
-    if train_loader_len <= 0:
-        return 1
-
-    global_step = int(start_global_step)
-    accum_micro_count = 0
-    effective_grad_accum, _, mbs_divisor = _get_batch_warmup_params(
-        global_step,
-        full_grad_accum,
-        full_micro_batch,
-        global_batch_warmup_steps,
-    )
-    for _ in range(train_loader_len):
-        batch_split_divisor = mbs_divisor
-        for _ in range(batch_split_divisor):
-            accum_micro_count += 1
-            if accum_micro_count < effective_grad_accum:
-                continue
-            global_step += 1
-            accum_micro_count = 0
-            effective_grad_accum, _, mbs_divisor = _get_batch_warmup_params(
-                global_step,
-                full_grad_accum,
-                full_micro_batch,
-                global_batch_warmup_steps,
-            )
-    return max(1, global_step - int(start_global_step))
-
-
-def _compute_epoch_start_steps(
-    *,
-    num_epochs: int,
-    train_loader_len: int,
-    full_grad_accum: int,
-    full_micro_batch: int,
-    global_batch_warmup_steps: int,
-) -> list[int]:
-    """Return global-step offsets at the start of each epoch plus the final end step."""
-    epoch_start_steps = [0]
-    global_step = 0
-    for _ in range(num_epochs):
-        global_step += _estimate_steps_for_epoch(
-            train_loader_len=train_loader_len,
-            start_global_step=global_step,
-            full_grad_accum=full_grad_accum,
-            full_micro_batch=full_micro_batch,
-            global_batch_warmup_steps=global_batch_warmup_steps,
-        )
-        epoch_start_steps.append(global_step)
-    return epoch_start_steps
-
-
-def _locate_resume_position_in_epoch(
-    *,
-    train_loader_len: int,
-    epoch_start_step: int,
-    resume_global_step: int,
-    full_grad_accum: int,
-    full_micro_batch: int,
-    global_batch_warmup_steps: int,
-) -> tuple[int, int, int]:
-    """Map an optimizer-step checkpoint to (data_step, sub_batch_step, split_divisor)."""
-    if train_loader_len <= 0 or resume_global_step <= epoch_start_step:
-        _, _, split_divisor = _get_batch_warmup_params(
-            epoch_start_step,
-            full_grad_accum,
-            full_micro_batch,
-            global_batch_warmup_steps,
-        )
-        return 0, 0, split_divisor
-
-    global_step = int(epoch_start_step)
-    accum_micro_count = 0
-    effective_grad_accum, _, mbs_divisor = _get_batch_warmup_params(
-        global_step,
-        full_grad_accum,
-        full_micro_batch,
-        global_batch_warmup_steps,
-    )
-    for data_step in range(train_loader_len):
-        batch_split_divisor = mbs_divisor
-        for sub_batch_step in range(batch_split_divisor):
-            accum_micro_count += 1
-            if accum_micro_count < effective_grad_accum:
-                continue
-            global_step += 1
-            accum_micro_count = 0
-            effective_grad_accum, _, mbs_divisor = _get_batch_warmup_params(
-                global_step,
-                full_grad_accum,
-                full_micro_batch,
-                global_batch_warmup_steps,
-            )
-            if global_step >= resume_global_step:
-                next_sub_batch_step = sub_batch_step + 1
-                if next_sub_batch_step >= batch_split_divisor:
-                    return data_step + 1, 0, mbs_divisor
-                return data_step, next_sub_batch_step, batch_split_divisor
-    return train_loader_len, 0, mbs_divisor
-
-
 def _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps: int) -> None:
     """Increase Dynamo cache room when warmup introduces a few extra static shapes."""
     if int(global_batch_warmup_steps) <= 0:
@@ -1166,27 +1057,6 @@ def _resolve_world_size(cfg: PretrainingConfig) -> int:
     return int(cfg.world_size) if cfg.world_size else 1
 
 
-def _num_update_steps_per_epoch(
-    train_loader_len: int,
-    grad_accum: int,
-    *,
-    micro_batch_seqs: Optional[int] = None,
-    global_batch_warmup_steps: int = 0,
-    start_global_step: int = 0,
-) -> int:
-    if train_loader_len <= 0:
-        return 1
-    if int(global_batch_warmup_steps) > 0 and micro_batch_seqs is not None:
-        return _estimate_steps_for_epoch(
-            train_loader_len=train_loader_len,
-            start_global_step=start_global_step,
-            full_grad_accum=grad_accum,
-            full_micro_batch=micro_batch_seqs,
-            global_batch_warmup_steps=global_batch_warmup_steps,
-        )
-    return max(1, math.ceil(train_loader_len / max(1, grad_accum)))
-
-
 def _sync_train_loader_len(
     train_loader_len: int, distributed: bool, device: torch.device
 ) -> int:
@@ -1797,7 +1667,7 @@ def run_pure_pretraining(
         _run_name,
         wandb_run_name,
         output_dir,
-        _num_epochs,  # always None now: horizon is token-budget driven
+        _,  # 4th slot is always None: horizon is token-budget driven
         logging_steps,
         eval_steps,
         save_steps,
