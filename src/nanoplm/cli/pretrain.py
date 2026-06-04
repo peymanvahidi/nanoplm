@@ -266,9 +266,61 @@ def pretrain():
 )
 @click.option(
     "--lr-schedule",
-    type=click.Choice(["linear", "cosine"], case_sensitive=False),
-    default="cosine",
-    help="Learning rate schedule to use after warmup",
+    type=click.Choice(
+        ["wsd", "warmup_stable", "cosine", "linear"], case_sensitive=False
+    ),
+    default="wsd",
+    help="LR schedule after warmup. wsd: warmup->stable->decay (use --stable-tokens/"
+    "--decay-tokens); warmup_stable/cosine/linear: single phase (use --train-tokens).",
+)
+@click.option(
+    "--train-tokens",
+    type=int,
+    default=None,
+    help="Single-phase token budget (warmup_stable/cosine/linear). "
+    "Set exactly one of --train-tokens or --max-steps for the training budget.",
+)
+@click.option(
+    "--stable-tokens",
+    type=int,
+    default=None,
+    help="wsd only: tokens up to the pre-decay checkpoint (warmup included). "
+    "Set exactly one of --stable-tokens or --stable-steps for the stable budget.",
+)
+@click.option(
+    "--decay-tokens",
+    type=int,
+    default=None,
+    help="wsd only: additional anneal token budget. "
+    "Set exactly one of --decay-tokens or --decay-steps for the decay budget.",
+)
+@click.option(
+    "--max-steps",
+    type=int,
+    default=None,
+    help="Single-phase step override for --train-tokens (warmup_stable/cosine/linear). "
+    "Set exactly one of --train-tokens or --max-steps for the training budget.",
+)
+@click.option(
+    "--stable-steps",
+    type=int,
+    default=None,
+    help="wsd only: step override for --stable-tokens. "
+    "Set exactly one of --stable-tokens or --stable-steps for the stable budget.",
+)
+@click.option(
+    "--decay-steps",
+    type=int,
+    default=None,
+    help="wsd only: step override for --decay-tokens. "
+    "Set exactly one of --decay-tokens or --decay-steps for the decay budget.",
+)
+@click.option(
+    "--decay-shape",
+    type=click.Choice(["1-sqrt", "linear"], case_sensitive=False),
+    default="1-sqrt",
+    show_default=True,
+    help="wsd/decay anneal shape: 1-sqrt | linear.",
 )
 @click.option(
     "--global-batch-tokens",
@@ -655,6 +707,12 @@ def pretrain():
     "subtraction for noise cancellation in attention (pure-torch only).",
 )
 @click.option(
+    "--use-paired-head-attention/--no-use-paired-head-attention",
+    default=False,
+    help="Enable paired-head attention (pure-torch only). "
+    "Mutually exclusive with --use-diff-attn-v2.",
+)
+@click.option(
     "--attn-layer-pattern",
     type=str,
     default=None,
@@ -746,6 +804,13 @@ def run(
     global_batch_warmup_steps: int,
     lr_decay_to_fraction: float,
     lr_schedule: str,
+    train_tokens: Optional[int],
+    stable_tokens: Optional[int],
+    decay_tokens: Optional[int],
+    max_steps: Optional[int],
+    stable_steps: Optional[int],
+    decay_steps: Optional[int],
+    decay_shape: str,
     global_batch_tokens: int,
     optimizer: str,
     adam_beta1: float,
@@ -853,6 +918,13 @@ def run(
         global_batch_warmup_steps=global_batch_warmup_steps,
         lr_decay_to_fraction=lr_decay_to_fraction,
         lr_schedule=lr_schedule,
+        train_tokens=train_tokens,
+        stable_tokens=stable_tokens,
+        decay_tokens=decay_tokens,
+        max_steps=max_steps,
+        stable_steps=stable_steps,
+        decay_steps=decay_steps,
+        decay_shape=decay_shape,
         global_batch_tokens=global_batch_tokens,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
@@ -1005,6 +1077,11 @@ def run(
             pure_torch, pure_te, cfg.lr_schedule,
             resume_mode if resume else None,
         )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        _validate_duration_config(cfg)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
