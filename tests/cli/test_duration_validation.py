@@ -36,3 +36,23 @@ class TestDurationValidation:
     def test_unknown_schedule_raises(self):
         with pytest.raises(ValueError, match="lr_schedule"):
             _validate_duration_config(_cfg(lr_schedule="bogus", train_tokens=1))
+
+    def test_wsd_neither_budget_set_raises(self):
+        with pytest.raises(ValueError, match="stable"):
+            _validate_duration_config(_cfg())  # wsd, nothing set
+
+    def test_single_phase_neither_set_raises(self):
+        with pytest.raises(ValueError, match="training"):
+            _validate_duration_config(_cfg(lr_schedule="cosine"))
+
+    def test_single_phase_max_steps_ok(self):
+        _validate_duration_config(_cfg(lr_schedule="warmup_stable", max_steps=500))
+
+    def test_wsd_with_train_tokens_raises(self):
+        with pytest.raises(ValueError, match="train_tokens|max_steps"):
+            _validate_duration_config(_cfg(stable_tokens=9_000_000, decay_tokens=1_000_000,
+                                           train_tokens=5_000_000))
+
+    def test_zero_budget_raises(self):
+        with pytest.raises(ValueError, match="positive"):
+            _validate_duration_config(_cfg(stable_tokens=0, decay_tokens=1_000_000))

@@ -1471,7 +1471,7 @@ def get_yaml(output: Optional[str], force: bool):
     click.echo(f"Template written to: {output_path}")
 
 
-def _validate_duration_config(cfg) -> None:
+def _validate_duration_config(cfg: PretrainingConfig) -> None:
     """Validate schedule <-> duration-budget consistency (spec section 12)."""
     sched = (cfg.lr_schedule or "").lower()
     valid = {"wsd", "warmup_stable", "cosine", "linear"}
@@ -1481,6 +1481,9 @@ def _validate_duration_config(cfg) -> None:
     def _one(token_field, step_field, label):
         tok = getattr(cfg, token_field)
         stp = getattr(cfg, step_field)
+        for field, value in ((token_field, tok), (step_field, stp)):
+            if value is not None and value <= 0:
+                raise ValueError(f"{field} must be a positive integer, got {value}")
         if tok is not None and stp is not None:
             raise ValueError(
                 f"Set exactly one of {token_field} or {step_field} for the {label} budget, not both."
