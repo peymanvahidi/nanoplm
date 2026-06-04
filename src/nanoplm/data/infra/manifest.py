@@ -60,6 +60,10 @@ class PretrainManifest(DataManifestBase):
     sharded: bool = True
     samples_per_shard: int = 0
 
+    # Exact total residue-token count across the train shards.
+    # Default 0 so older manifests without this field still load.
+    total_train_tokens: int = 0
+
     def __post_init__(self):
         """Set pipeline mode and validate."""
         self.pipeline_mode = "pretrain"
