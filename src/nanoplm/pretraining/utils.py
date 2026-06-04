@@ -79,6 +79,31 @@ def tokens_to_steps(target_tokens: int, achieved_global_batch_tokens: int) -> in
     return max(1, math.ceil(target_tokens / achieved_global_batch_tokens))
 
 
+@dataclass
+class StepHorizon:
+    total_steps: int
+    stable_steps: Optional[int] = None   # wsd only
+    decay_steps: Optional[int] = None    # wsd only
+
+
+def resolve_total_steps(cfg, achieved_global_batch_tokens: int) -> StepHorizon:
+    """Map the configured token/step budget to optimizer steps (spec sections 4-5)."""
+    sched = (cfg.lr_schedule or "").lower()
+
+    def _steps(token_field, step_field):
+        stp = getattr(cfg, step_field)
+        if stp is not None:
+            return max(1, int(stp))
+        return tokens_to_steps(getattr(cfg, token_field), achieved_global_batch_tokens)
+
+    if sched == "wsd":
+        S = _steps("stable_tokens", "stable_steps")
+        Dd = _steps("decay_tokens", "decay_steps")
+        return StepHorizon(total_steps=S + Dd, stable_steps=S, decay_steps=Dd)
+    total = _steps("train_tokens", "max_steps")
+    return StepHorizon(total_steps=total)
+
+
 def get_num_workers(user_value: Union[int, str], world_size: int) -> int:
 
     if isinstance(user_value, str) and user_value == "auto":
@@ -192,17 +217,27 @@ def prepare_run_and_steps(
     resume_config: Optional[ResumeConfig],
     train_samples: int,
     global_batch_seqs: int,
-) -> Tuple[str, str, str, int, int, int, int, Optional[int]]:
-    """Prepare run naming/dirs and compute epochs & step intervals.
+) -> Tuple[str, str, str, None, int, int, int, Optional[int]]:
+    """Prepare run naming/dirs and resolve the raw logging/eval/save intervals.
+
+    The training horizon (total_steps) is no longer derived from epochs here:
+    it comes from the token budget and is computed by the caller via
+    ``resolve_total_steps``. This helper therefore returns the *raw* configured
+    intervals (un-clamped); the caller clamps them to the token-budget
+    total_steps once the horizon is known.
 
     Args:
         pretrain_config: Pretraining configuration
         resume_config: Resume configuration (if resuming)
-        train_samples: Number of training samples (from manifest)
-        global_batch_seqs: Effective samples per optimizer step
+        train_samples: Number of training samples (from manifest) [unused for
+            horizon now; kept for signature stability]
+        global_batch_seqs: Effective samples per optimizer step [unused for
+            horizon now; kept for signature stability]
 
-    Returns a tuple: (run_name, wandb_run_name, output_dir, num_epochs,
-                      logging_steps, eval_steps, save_steps, resume_step)
+    Returns a tuple: (run_name, wandb_run_name, output_dir, None,
+                      logging_steps, eval_steps, save_steps, resume_step).
+    The 4th slot (previously ``num_epochs``) is always ``None``: the horizon is
+    token-budget driven and resolved by the caller.
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
@@ -270,23 +305,18 @@ def prepare_run_and_steps(
         except Exception:
             pass
 
-    # Compute epochs and step intervals
+    # Resolve raw logging/eval/save intervals. The token-budget total_steps is
+    # computed by the caller (run_pure_pretraining via resolve_total_steps);
+    # the caller clamps these intervals to it once the horizon is known.
+    logging_steps = max(1, pretrain_config.logging_steps)
+    eval_steps = max(1, pretrain_config.eval_steps)
+    save_steps = max(1, pretrain_config.save_steps)
+
+    # On resume, preserve the original logging/eval/save intervals recorded in
+    # the checkpoint's training_args.bin when available, so cadence is stable
+    # across resume sessions.
     if resume_config and resume_config.is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
-
-        if resume_config.resume_epochs and int(resume_config.resume_epochs) > 0:
-            checkpoint_epoch = _read_checkpoint_epoch(resume_config.checkpoint_dir)
-            num_epochs = checkpoint_epoch + int(resume_config.resume_epochs)
-            if num_epochs <= checkpoint_epoch:
-                raise ValueError(
-                    f"resume_epochs would result in zero or negative training: "
-                    f"checkpoint is at epoch {checkpoint_epoch}, requested target "
-                    f"is {num_epochs}."
-                )
-        else:
-            num_epochs = pretrain_config.num_epochs
-
-        # Preserve original logging/eval/save intervals when available
         if training_args_path.exists():
             try:
                 original_args = torch.load(training_args_path, weights_only=False)
@@ -297,29 +327,8 @@ def prepare_run_and_steps(
                     f"Resuming with preserved intervals: save_steps={save_steps}, eval_steps={eval_steps}"
                 )
             except Exception:
-                # Use ceiling division to ensure at least 1 step per epoch
-                steps_per_epoch = (train_samples + global_batch_seqs - 1) // global_batch_seqs
-                total_steps = num_epochs * steps_per_epoch
-                # Use direct step counts from config (clamped to valid range)
-                logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-                eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-                save_steps = max(1, min(total_steps, pretrain_config.save_steps))
-        else:
-            # Use ceiling division to ensure at least 1 step per epoch
-            steps_per_epoch = (train_samples + global_batch_seqs - 1) // global_batch_seqs
-            total_steps = num_epochs * steps_per_epoch
-            # Use direct step counts from config (clamped to valid range)
-            logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-            eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-            save_steps = max(1, min(total_steps, pretrain_config.save_steps))
-    else:
-        num_epochs = pretrain_config.num_epochs
-        # Use ceiling division to ensure at least 1 step per epoch
-        steps_per_epoch = (train_samples + global_batch_seqs - 1) // global_batch_seqs
-        total_steps = num_epochs * steps_per_epoch
-        # Use direct step counts from config (clamped to valid range)
-        logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-        eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-        save_steps = max(1, min(total_steps, pretrain_config.save_steps))
+                # Fall back to the raw configured intervals computed above.
+                pass
 
-    return run_name, wandb_run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps, resume_step
+    # 4th slot (previously num_epochs) is None: horizon is token-budget driven.
+    return run_name, wandb_run_name, output_dir, None, logging_steps, eval_steps, save_steps, resume_step

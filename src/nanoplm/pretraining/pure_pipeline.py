@@ -75,6 +75,7 @@ from nanoplm.pretraining.utils import (
     compute_batch_setup,
     get_num_workers,
     prepare_run_and_steps,
+    resolve_total_steps,
 )
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
@@ -1800,7 +1801,7 @@ def run_pure_pretraining(
         _run_name,
         wandb_run_name,
         output_dir,
-        num_epochs,
+        _num_epochs,  # always None now: horizon is token-budget driven
         logging_steps,
         eval_steps,
         save_steps,
@@ -2054,16 +2055,27 @@ def run_pure_pretraining(
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
-    epoch_start_steps = _compute_epoch_start_steps(
-        num_epochs=num_epochs,
-        train_loader_len=synced_len,
-        full_grad_accum=inferred_grad_accum_steps,
-        full_micro_batch=pretrain_config.micro_batch_seqs,
-        global_batch_warmup_steps=global_batch_warmup_steps,
-    )
-    steps_per_epoch = max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
-    total_steps = epoch_start_steps[-1]
+
+    # ---- Training horizon (token budget -> optimizer steps) ----
+    # total_steps comes from the configured token/step budget, NOT from epochs.
+    # The DataLoader is repeated as many times as needed to meet the budget.
+    horizon = resolve_total_steps(pretrain_config, achieved_global_batch_tokens)
+    total_steps = horizon.total_steps
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+
+    # Clamp the raw logging/eval/save intervals (from prepare_run_and_steps) to
+    # the token-budget total_steps now that the horizon is known.
+    logging_steps = max(1, min(total_steps, logging_steps))
+    eval_steps = max(1, min(total_steps, eval_steps))
+    save_steps = max(1, min(total_steps, save_steps))
+
+    if global_batch_warmup_steps > 0:
+        logger.warning(
+            "global_batch_warmup_steps=%d > 0: the token budget is approximate "
+            "under batch-size warmup (the ceil token->step conversion slightly "
+            "undercounts steps during the ramp).",
+            global_batch_warmup_steps,
+        )
 
     # ---- Recycling scheduler (no-op when recycling_loop_count == 1) ----
     from nanoplm.pretraining.recycling import RecyclingScheduler
@@ -2086,10 +2098,14 @@ def run_pure_pretraining(
         # used elsewhere (model init, data shuffling, dropout).
         recycling_rng = torch.Generator(device=device).manual_seed(int(pretrain_config.seed) + 999)
         recycling_metrics_buffer = RecyclingMetricsBuffer(window=100)
+    _is_wsd = pretrain_config.lr_schedule.lower() == "wsd"
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
         pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
         pretrain_config.lr_schedule,
+        stable_steps=horizon.stable_steps if _is_wsd else None,
+        decay_steps=horizon.decay_steps if _is_wsd else None,
+        decay_shape=pretrain_config.decay_shape,
     )
 
     # ---- Resume ----
@@ -2137,96 +2153,18 @@ def run_pure_pretraining(
                     "Assuming same dataset for dataloader positioning."
                 )
 
+        # TODO(Task 12): continue/decay resume reconstruction + dataloader
+        # fast-forward. The previous epoch<->step remapping (epoch_start_steps,
+        # _compute_epoch_start_steps, _locate_resume_position_in_epoch) and the
+        # resume_epochs num_epochs-bump were removed when the horizon became
+        # token-budget driven. For now the step-driven while-loop simply resumes
+        # from global_step = start_step with the full DataLoader replayed from
+        # the top (no within-epoch fast-forward). Task 12 will restore correct
+        # data-position fast-forward and the continue/decay scheduler horizon.
         resume_epoch = start_epoch
-        if not _dataset_changed:
-            if _ckp_state is not None and "epoch_data_step" in _ckp_state:
-                resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
-                resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
-                resume_batch_split_divisor = max(1, int(_ckp_state.get("batch_split_divisor", 1)))
-            else:
-                epoch_start_step = epoch_start_steps[min(start_epoch, len(epoch_start_steps) - 1)]
-                resume_data_step, resume_sub_batch_step, resume_batch_split_divisor = _locate_resume_position_in_epoch(
-                    train_loader_len=synced_len,
-                    epoch_start_step=epoch_start_step,
-                    resume_global_step=start_step,
-                    full_grad_accum=inferred_grad_accum_steps,
-                    full_micro_batch=pretrain_config.micro_batch_seqs,
-                    global_batch_warmup_steps=global_batch_warmup_steps,
-                )
-        if resume_data_step >= synced_len:
-            resume_data_step = 0
-            resume_sub_batch_step = 0
-            resume_batch_split_divisor = 1
-            _pre_adjust_start_epoch = start_epoch
-            start_epoch = min(start_epoch + 1, num_epochs)
-            resume_epoch = start_epoch
-            # If the +1 advanced past a fully-consumed epoch boundary AND the
-            # user asked for a bounded resume (resume_epochs > 0), num_epochs
-            # was set to checkpoint_epoch + resume_epochs; the +1 would now
-            # leave range(start_epoch, num_epochs) empty.  Bump num_epochs by
-            # the same amount and rebuild the scheduler so we run exactly
-            # resume_epochs full epochs from the new start_epoch.
-            if (
-                start_epoch > _pre_adjust_start_epoch
-                and resume_config.resume_epochs is not None
-                and int(resume_config.resume_epochs) > 0
-            ):
-                num_epochs = start_epoch + int(resume_config.resume_epochs)
-                epoch_start_steps = _compute_epoch_start_steps(
-                    num_epochs=num_epochs,
-                    train_loader_len=synced_len,
-                    full_grad_accum=inferred_grad_accum_steps,
-                    full_micro_batch=pretrain_config.micro_batch_seqs,
-                    global_batch_warmup_steps=global_batch_warmup_steps,
-                )
-                steps_per_epoch = (
-                    max(1, epoch_start_steps[1] - epoch_start_steps[0])
-                    if num_epochs > 0 else 1
-                )
-                total_steps = epoch_start_steps[-1]
-                warmup_steps = min(pretrain_config.warmup_steps, total_steps)
-                scheduler = _rebuild_scheduler_for_resume(
-                    optimizer=optimizer,
-                    resume_config=resume_config,
-                    pretrain_config=pretrain_config,
-                    checkpoint_dir=resume_config.checkpoint_dir,
-                    start_step=start_step,
-                    total_steps=total_steps,
-                    is_main=is_main,
-                )
-                logger.info(
-                    f"Mid-epoch resume detected; bumped num_epochs to {num_epochs} "
-                    f"and rebuilt scheduler with total_steps={total_steps}."
-                )
-        elif resume_data_step > 0 and resume_sub_batch_step == 0:
-            if use_packing and hasattr(train_ds, "fast_forward"):
-                logger.info(
-                    f"Fast-forwarding dataloader by {resume_data_step} packed batches "
-                    f"(index-only, no data I/O)..."
-                )
-                skipped_samples = train_ds.fast_forward(
-                    resume_data_step,
-                    epoch=resume_epoch,
-                )
-                logger.info(
-                    f"Fast-forward complete: will skip {skipped_samples} underlying samples "
-                    f"to resume at data_step {resume_data_step}"
-                )
-                # Reset resume_data_step so the training loop doesn't also
-                # try to iterate-and-skip through the DataLoader.
-                resume_data_step = 0
-            else:
-                logger.info(
-                    f"Skipping {resume_data_step} DataLoader batch(es) in resumed epoch {resume_epoch}"
-                )
-        elif resume_data_step > 0 or resume_sub_batch_step > 0:
-            logger.info(
-                "Resuming inside epoch %d at data_step=%d sub_batch=%d/%d",
-                resume_epoch,
-                resume_data_step,
-                resume_sub_batch_step,
-                resume_batch_split_divisor,
-            )
+        resume_data_step = 0
+        resume_sub_batch_step = 0
+        resume_batch_split_divisor = 1
 
     # ---- W&B ----
     wandb_enabled = False
@@ -2282,7 +2220,7 @@ def run_pure_pretraining(
 
     _run_t0 = time.perf_counter()
     logger.info(
-        f"Starting pure-torch training: epochs={num_epochs}, total_steps={total_steps}, "
+        f"Starting pure-torch training: total_steps={total_steps} (token-budget driven), "
         f"warmup_steps={warmup_steps}, global_batch_warmup_steps={global_batch_warmup_steps}, "
         f"grad_accum={inferred_grad_accum_steps}, "
         f"achieved_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
@@ -2415,11 +2353,17 @@ def run_pure_pretraining(
             mbs_divisor,
         )
 
+    # Step-driven outer loop: repeat the DataLoader (one pass == one "epoch")
+    # until the token-budget total_steps is reached. The horizon is driven by
+    # global_step, not a fixed epoch count.
+    epoch = start_epoch
     with profiler_ctx:
-        for epoch in range(start_epoch, num_epochs):
+        while global_step < total_steps:
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
                 epoch_setter.set_epoch(epoch)
-            epoch_start_step = epoch_start_steps[min(epoch, len(epoch_start_steps) - 1)]
+            # global_step at the start of this pass — used only for the
+            # per-pass "optimizer steps" log line below.
+            epoch_start_step = global_step
 
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
@@ -2952,6 +2896,11 @@ def run_pure_pretraining(
                     resume_sub_batch_step = 0
                     resume_batch_split_divisor = 1
 
+                # Token-budget horizon reached: stop after the current
+                # optimizer step's logging/eval/save have fired.
+                if global_step >= total_steps:
+                    break
+
             # ---- Epoch boundary cleanup ----
             # When the inner loop ends (either by exhausting synced_len or
             # breaking early via the all_reduce exhaustion check), there may
@@ -2966,8 +2915,8 @@ def run_pure_pretraining(
             partial_discarded = accum_micro_count
             if is_main:
                 logger.info(
-                    "Epoch %d/%d complete: %d effective micro-steps, %d optimizer steps%s",
-                    epoch + 1, num_epochs, epoch_fwd_count,
+                    "Data pass %d complete (global_step %d/%d): %d effective micro-steps, %d optimizer steps%s",
+                    epoch + 1, global_step, total_steps, epoch_fwd_count,
                     global_step - epoch_start_step,
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
                     if partial_discarded else "",
@@ -2987,12 +2936,18 @@ def run_pure_pretraining(
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
 
+            # Stop once the token-budget horizon is met; otherwise replay the
+            # DataLoader for another pass.
+            if global_step >= total_steps:
+                break
+            epoch += 1
+
     # ---- Finalize ----
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
     _save_checkpoint(
-        orig_model, optimizer, scheduler, global_step, num_epochs,
+        orig_model, optimizer, scheduler, global_step, epoch,
         output_dir, logging_steps, eval_steps, save_steps,
         distributed, is_main, distributed_mode=distributed_mode,
         model_config=_model_config, manifest=_manifest,
