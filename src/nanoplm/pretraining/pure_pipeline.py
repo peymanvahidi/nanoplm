@@ -76,6 +76,8 @@ from nanoplm.pretraining.utils import (
     get_num_workers,
     prepare_run_and_steps,
     resolve_total_steps,
+    tokens_to_steps,
+    StepHorizon,
 )
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
@@ -1566,164 +1568,121 @@ def _load_checkpoint(
     return 0, 0
 
 
+def _iter_param_groups(optimizer):
+    """Yield param groups across plain optimizers and MuonAdamWGroup."""
+    if isinstance(optimizer, MuonAdamWGroup):
+        yield from optimizer.muon.param_groups
+        yield from optimizer.adamw.param_groups
+    else:
+        yield from optimizer.param_groups
+
+
+def _read_training_state(checkpoint_dir: str) -> dict:
+    """Load ``training_state.json`` from a checkpoint directory.
+
+    Returns an empty dict if the file is missing (pre-upgrade checkpoint).
+    """
+    state_path = Path(checkpoint_dir) / "training_state.json"
+    if not state_path.exists():
+        return {}
+    return json.loads(state_path.read_text(encoding="utf-8"))
+
+
 def _rebuild_scheduler_for_resume(
+    *,
     optimizer,
     resume_config: "ResumeConfig",
     pretrain_config: "PretrainingConfig",
     checkpoint_dir: str,
-    start_step: int,
-    total_steps: int,
+    decay_steps: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    start_step: Optional[int] = None,
+    stable_steps: Optional[int] = None,
+    decay_shape: Optional[str] = None,
     is_main: bool = True,
 ):
-    """Build a fresh LR scheduler for a resumed run.
+    """Build a fresh LR scheduler for a resumed run (spec §7).
 
-    Two modes (validated at YAML load time by ``_validate_resume_config_modes``):
+    Two intent-named modes (validated at YAML load by
+    ``_validate_resume_config_modes``):
 
-    EXTEND (``reset_scheduler=False``, default):
-        Per-group peak LR is read from the optimizer's loaded state
-        (``optimizer.pt``).  When ``resume.lr_decay_to_fraction`` is set,
-        each group decays to ``peak * fraction``.  When null, decay
-        targets the original final LR (``saved_base_lr * saved_decay``)
-        so crash-recovery preserves the original endpoint.
+    ``continue``
+        Finish an interrupted run to its original budget with the exact
+        original schedule. The original schedule descriptor is read back from
+        the checkpoint's ``training_state.json`` and the schedule is
+        fast-forwarded via ``last_epoch = global_step`` so the LR curve picks
+        up exactly where it left off.
 
-    RESET (``reset_scheduler=True``):
-        Per-group peak LR is overwritten with ``resume.learning_rate``
-        (and ``resume.muon_learning_rate`` for Muon-side groups).  Decay
-        shape and fraction come directly from ``resume_config``.
-
-    Warmup at resume is controlled solely by ``resume_config.warmup_steps``
-    (null/0 = none, positive int = fresh ramp over the first N resumed steps).
-
-    The new schedule is anchored at ``start_step``: warmup (if any) ramps
-    over the first ``resume.warmup_steps`` resumed steps, then decay runs
-    over the rest of the ``[start_step, eff_total]`` window.
+    ``decay``
+        Anneal a saved ``checkpoint-stable-end`` trunk. The peak LR is the
+        checkpoint's current (stable) LR already loaded into the optimizer; a
+        ``lr_schedule="decay"`` scheduler with no warmup runs ``decay_steps``
+        from that peak down to ``lr_decay_to_fraction``. With ``last_epoch=-1``
+        ``_create_scheduler`` captures each group's loaded ``lr`` as its
+        ``initial_lr``, so decay anneals from the checkpoint LR.
     """
-    ckp = Path(checkpoint_dir)
+    mode = (resume_config.mode or "continue").lower()
 
-    # ---- Inheritance defaults from checkpoint's pretrain_config.yaml -----
-    saved_base_lr = float(pretrain_config.adam_learning_rate)
-    saved_muon_lr = float(pretrain_config.muon_learning_rate)
-    saved_decay = float(pretrain_config.lr_decay_to_fraction)
-    saved_schedule = str(pretrain_config.lr_schedule)
-
-    saved_config_path = ckp / "pretrain_config.yaml"
-    if saved_config_path.exists():
-        with open(saved_config_path) as f:
-            saved_cfg = yaml.safe_load(f) or {}
-        saved_base_lr = float(saved_cfg.get("adam_learning_rate", saved_base_lr))
-        saved_muon_lr = float(saved_cfg.get("muon_learning_rate", saved_muon_lr))
-        saved_decay = float(saved_cfg.get("lr_decay_to_fraction", saved_decay))
-        saved_schedule = str(saved_cfg.get("lr_schedule", saved_schedule))
-    elif is_main:
-        logger.info(
-            "No pretrain_config.yaml in checkpoint (pre-upgrade checkpoint). "
-            "Using current YAML schedule params as inheritance base."
-        )
-
-    # ---- Resolve effective totals / warmup / shape -----------------------
-    eff_total = int(total_steps)
-    eff_warmup = int(resume_config.warmup_steps) if resume_config.warmup_steps else 0
-    if eff_total <= start_step:
-        raise ValueError(
-            f"Resume cannot proceed: eff_total ({eff_total}) <= start_step "
-            f"({start_step}). Increase resume_epochs to extend training."
-        )
-
-    eff_schedule = (resume_config.lr_schedule or saved_schedule or "cosine").lower()
-    if eff_schedule not in {"linear", "cosine"}:
-        raise ValueError(f"Invalid lr_schedule: {eff_schedule}")
-
-    # ---- Per-group peak + fraction resolution ----------------------------
-    def _peak_and_fraction(pg, side: str):
-        """Compute (peak_lr, fraction) for one param group.
-
-        side: "muon" or "adamw" -- selects which RESET peak to use and which
-        saved base LR drives the EXTEND auto-fraction default.
-        """
-        if resume_config.reset_scheduler:
-            peak = float(
-                resume_config.muon_learning_rate if side == "muon"
-                else resume_config.learning_rate
+    if mode == "decay":
+        floor = resume_config.lr_decay_to_fraction
+        if floor is None:
+            raise ValueError("resume decay requires lr_decay_to_fraction")
+        shape = (decay_shape or resume_config.decay_shape or "1-sqrt")
+        if decay_steps is None or decay_steps <= 0:
+            raise ValueError(
+                f"resume decay needs a positive decay_steps, got {decay_steps}"
             )
-            pg["lr"] = peak  # overwrite the loaded LR
-            fraction = float(resume_config.lr_decay_to_fraction)
-        else:
-            peak = float(pg["lr"])
-            if peak < 1e-10 and is_main:
-                logger.warning(
-                    f"Resume EXTEND: {side} group LR is near zero "
-                    f"({peak:.2e}); decay-from-current is effectively a no-op."
-                )
-            if resume_config.lr_decay_to_fraction is not None:
-                fraction = float(resume_config.lr_decay_to_fraction)
-            else:
-                # Q4(b): default end LR = original final LR.
-                base_for_side = saved_muon_lr if side == "muon" else saved_base_lr
-                target_end = base_for_side * saved_decay
-                if peak > 0:
-                    fraction = max(0.0, min(1.0, target_end / peak))
-                else:
-                    fraction = 1.0
-        pg["initial_lr"] = peak
-        return peak, fraction
-
-    # ---- Lambda factory anchored at start_step ---------------------------
-    decay_steps = max(1, (eff_total - start_step) - eff_warmup)
-    eff_warmup_local = eff_warmup  # capture for closure clarity
-
-    def _make_lambda(fraction: float):
-        # Capture fraction via default arg to avoid late-binding in loops.
-        def lr_lambda(step: int, fraction=fraction) -> float:
-            local = step - start_step
-            if local < eff_warmup_local:
-                return local / max(1, eff_warmup_local) if local >= 0 else 0.0
-            progress = min(1.0, (local - eff_warmup_local) / decay_steps)
-            if eff_schedule == "cosine":
-                return fraction + 0.5 * (1.0 - fraction) * (
-                    1.0 + math.cos(math.pi * progress)
-                )
-            return max(fraction, 1.0 - (1.0 - fraction) * progress)
-        return lr_lambda
-
-    last_epoch = max(-1, start_step - 1)
-
-    def _build_inner(inner_opt, sides):
-        """Build a LambdaLR for a flat optimizer with per-group sides."""
-        lambdas = []
-        peaks = []
-        for pg, side in zip(inner_opt.param_groups, sides):
-            peak, fraction = _peak_and_fraction(pg, side)
-            lambdas.append(_make_lambda(fraction))
-            peaks.append(peak)
-        return LambdaLR(inner_opt, lambdas, last_epoch=last_epoch), peaks
-
-    # ---- Wire the new scheduler ------------------------------------------
-    if isinstance(optimizer, MuonAdamWGroup):
-        muon_sched, muon_peaks = _build_inner(
-            optimizer.muon, ["muon"] * len(optimizer.muon.param_groups)
+        if is_main:
+            peaks = [f"{pg['lr']:.2e}" for pg in _iter_param_groups(optimizer)]
+            logger.info(
+                f"Resume schedule built [decay]: decay_steps={decay_steps}, "
+                f"floor={floor}, shape={shape}, peaks={peaks}"
+            )
+        # Peak = checkpoint's current (stable) LR, already loaded into the
+        # optimizer; last_epoch=-1 captures it as initial_lr.
+        return _create_scheduler(
+            optimizer,
+            warmup_steps=0,
+            total_steps=int(decay_steps),
+            learning_rate=0.0,
+            lr_decay_to_fraction=float(floor),
+            lr_schedule="decay",
+            last_epoch=-1,
+            decay_shape=shape,
         )
-        adamw_sched, adamw_peaks = _build_inner(
-            optimizer.adamw, ["adamw"] * len(optimizer.adamw.param_groups)
-        )
-        scheduler = _SchedulerGroup(muon_sched, adamw_sched)
-        peaks = muon_peaks + adamw_peaks
-    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
-        # DION layout: group[0] = muon-algorithm, group[1+] = adamw / scalar.
-        sides = ["muon"] + ["adamw"] * (len(optimizer.param_groups) - 1)
-        scheduler, peaks = _build_inner(optimizer, sides)
-    else:
-        sides = ["adamw"] * len(optimizer.param_groups)
-        scheduler, peaks = _build_inner(optimizer, sides)
 
+    # mode == "continue": reconstruct the ORIGINAL schedule and fast-forward.
+    sd = _read_training_state(checkpoint_dir)
+    sched_name = sd.get("lr_schedule", pretrain_config.lr_schedule)
+    eff_total = total_steps if total_steps is not None else sd.get("total_steps")
+    if eff_total is None:
+        raise ValueError(
+            "resume continue requires total_steps (none provided and the "
+            "checkpoint's training_state.json has no 'total_steps')"
+        )
+    eff_last_epoch = (
+        start_step if start_step is not None else int(sd.get("global_step", 0))
+    )
+    eff_stable = stable_steps if stable_steps is not None else sd.get("stable_steps")
+    eff_decay = decay_steps if decay_steps is not None else sd.get("decay_steps")
     if is_main:
-        mode = "RESET" if resume_config.reset_scheduler else "EXTEND"
+        peaks = [f"{pg['lr']:.2e}" for pg in _iter_param_groups(optimizer)]
         logger.info(
-            f"Resume schedule built [{mode}]: start_step={start_step}, "
-            f"eff_total={eff_total}, warmup={eff_warmup}, "
-            f"schedule={eff_schedule}, peaks={[f'{p:.2e}' for p in peaks]}"
+            f"Resume schedule built [continue]: start_step={eff_last_epoch}, "
+            f"total_steps={eff_total}, schedule={sched_name}, peaks={peaks}"
         )
-
-    return scheduler
+    return _create_scheduler(
+        optimizer,
+        warmup_steps=int(sd.get("warmup_steps", 0)),
+        total_steps=int(eff_total),
+        learning_rate=0.0,
+        lr_decay_to_fraction=float(sd.get("lr_decay_to_fraction", 0.1)),
+        lr_schedule=sched_name,
+        last_epoch=int(eff_last_epoch),
+        stable_steps=int(eff_stable) if eff_stable is not None else None,
+        decay_steps=int(eff_decay) if eff_decay is not None else None,
+        decay_shape=sd.get("decay_shape", "1-sqrt"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2146,24 +2105,21 @@ def run_pure_pretraining(
     resume_data_step, resume_sub_batch_step = 0, 0
     resume_batch_split_divisor = 1
     resume_epoch = 0
+    # When a `decay` resume anneals a `warmup_stable` trunk, the loaded
+    # pretrain_config still says lr_schedule="warmup_stable", which would make
+    # the terminal save write "stable-end". Force "final" for decay resumes.
+    resume_force_final = False
     if resume_config and resume_config.is_resume:
-        logger.info(f"Resuming from checkpoint: {resume_config.checkpoint_dir}")
+        _resume_mode = (resume_config.mode or "continue").lower()
+        logger.info(
+            f"Resuming from checkpoint: {resume_config.checkpoint_dir} "
+            f"(mode={_resume_mode})"
+        )
         start_step, start_epoch = _load_checkpoint(
             orig_model, optimizer, scheduler, resume_config.checkpoint_dir,
             device, distributed, load_scheduler=False, distributed_mode=distributed_mode,
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
-
-        # Build the resumed LR scheduler (EXTEND or RESET per resume_config).
-        scheduler = _rebuild_scheduler_for_resume(
-            optimizer=optimizer,
-            resume_config=resume_config,
-            pretrain_config=pretrain_config,
-            checkpoint_dir=resume_config.checkpoint_dir,
-            start_step=start_step,
-            total_steps=total_steps,
-            is_main=is_main,
-        )
 
         # Detect dataset change: if the current dataset differs from the
         # checkpoint's dataset, start from batch 0 instead of fast-forwarding.
@@ -2186,18 +2142,103 @@ def run_pure_pretraining(
                     "Assuming same dataset for dataloader positioning."
                 )
 
-        # TODO(Task 12): continue/decay resume reconstruction + dataloader
-        # fast-forward. The previous epoch<->step remapping (epoch_start_steps,
-        # _compute_epoch_start_steps, _locate_resume_position_in_epoch) and the
-        # resume_epochs num_epochs-bump were removed when the horizon became
-        # token-budget driven. For now the step-driven while-loop simply resumes
-        # from global_step = start_step with the full DataLoader replayed from
-        # the top (no within-epoch fast-forward). Task 12 will restore correct
-        # data-position fast-forward and the continue/decay scheduler horizon.
-        resume_epoch = start_epoch
-        resume_data_step = 0
-        resume_sub_batch_step = 0
-        resume_batch_split_divisor = 1
+        if _resume_mode == "decay":
+            # Anneal a saved trunk: the decay phase is a fresh, short run from
+            # global_step 0 over `decay_steps`. Peak LR is the checkpoint's
+            # current (stable) LR already loaded into the optimizer.
+            if resume_config.decay_steps is not None:
+                resume_decay_steps = max(1, int(resume_config.decay_steps))
+            elif resume_config.decay_tokens is not None:
+                resume_decay_steps = tokens_to_steps(
+                    int(resume_config.decay_tokens), achieved_global_batch_tokens
+                )
+            else:
+                raise ValueError(
+                    "resume mode='decay' requires decay_tokens or decay_steps"
+                )
+            scheduler = _rebuild_scheduler_for_resume(
+                optimizer=optimizer,
+                resume_config=resume_config,
+                pretrain_config=pretrain_config,
+                checkpoint_dir=resume_config.checkpoint_dir,
+                decay_steps=resume_decay_steps,
+                is_main=is_main,
+            )
+            # The decay phase runs from step 0 to `decay_steps`; override the
+            # loop horizon so `while global_step < total_steps` runs exactly the
+            # decay, and reset the start so global_step/tokens_seen anchor at 0.
+            total_steps = resume_decay_steps
+            warmup_steps = 0
+            start_step = 0
+            start_epoch = 0
+            horizon = StepHorizon(total_steps=resume_decay_steps)
+            resume_force_final = True
+            # Re-clamp logging/eval/save to the (shorter) decay horizon.
+            logging_steps = max(1, min(total_steps, logging_steps))
+            eval_steps = max(1, min(total_steps, eval_steps))
+            save_steps = max(1, min(total_steps, save_steps))
+            # Fresh phase: no dataloader fast-forward.
+            resume_epoch = 0
+            resume_data_step = 0
+            resume_sub_batch_step = 0
+            resume_batch_split_divisor = 1
+            if is_main:
+                logger.info(
+                    "Resume decay: total_steps=%d (decay), peak LR from checkpoint, "
+                    "warmup=0, terminal checkpoint -> checkpoint-final",
+                    total_steps,
+                )
+        else:
+            # continue: finish to the ORIGINAL budget with the ORIGINAL schedule,
+            # fast-forwarding the dataloader from the saved within-epoch position.
+            scheduler = _rebuild_scheduler_for_resume(
+                optimizer=optimizer,
+                resume_config=resume_config,
+                pretrain_config=pretrain_config,
+                checkpoint_dir=resume_config.checkpoint_dir,
+                start_step=start_step,
+                total_steps=total_steps,
+                stable_steps=horizon.stable_steps,
+                decay_steps=horizon.decay_steps,
+                is_main=is_main,
+            )
+            resume_epoch = start_epoch
+            if (
+                not _dataset_changed
+                and _ckp_state is not None
+                and "epoch_data_step" in _ckp_state
+            ):
+                # Restore the exact within-pass position saved at checkpoint time.
+                # (Boundary/periodic saves persist epoch_data_step/sub_batch/
+                # divisor; the dataloader fast-forwards to this point.)
+                resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
+                resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
+                resume_batch_split_divisor = max(
+                    1, int(_ckp_state.get("batch_split_divisor", 1))
+                )
+            else:
+                # Dataset changed, pre-upgrade checkpoint, or a terminal/role
+                # checkpoint without a saved within-pass position: replay the
+                # DataLoader from the top of the current pass (spec §11 honest
+                # fallback). The LR schedule still fast-forwards via global_step.
+                resume_data_step = 0
+                resume_sub_batch_step = 0
+                resume_batch_split_divisor = 1
+            if resume_data_step >= synced_len:
+                # Saved position lands at/after the end of a pass; start the next
+                # pass cleanly from the top.
+                resume_data_step = 0
+                resume_sub_batch_step = 0
+                resume_batch_split_divisor = 1
+                resume_epoch = start_epoch + 1
+                start_epoch = resume_epoch
+            if is_main:
+                logger.info(
+                    "Resume continue: total_steps=%d, start_step=%d, "
+                    "fast-forward to epoch=%d data_step=%d sub_batch=%d divisor=%d",
+                    total_steps, start_step, resume_epoch, resume_data_step,
+                    resume_sub_batch_step, resume_batch_split_divisor,
+                )
 
     # ---- W&B ----
     wandb_enabled = False
@@ -3032,12 +3073,17 @@ def run_pure_pretraining(
         _dist_barrier(local_rank)
 
     # Terminal role checkpoint, written exactly once at total_steps:
+    #   resume decay  -> final (anneal output; overrides the trunk's schedule)
     #   warmup_stable -> stable-end (the reusable trunk a later run anneals)
     #   wsd / cosine / linear -> final
     _terminal_phase = (
-        "stable-end"
-        if pretrain_config.lr_schedule.lower() == "warmup_stable"
-        else "final"
+        "final"
+        if resume_force_final
+        else (
+            "stable-end"
+            if pretrain_config.lr_schedule.lower() == "warmup_stable"
+            else "final"
+        )
     )
     _save(_terminal_phase)
 
