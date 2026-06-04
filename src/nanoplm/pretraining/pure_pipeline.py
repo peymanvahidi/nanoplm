@@ -1078,15 +1078,38 @@ def _create_scheduler(
     a single LambdaLR.
 
     Args:
+        stable_steps: (wsd only) absolute step at which the constant phase ends
+            and decay begins. Required for ``wsd``.
+        decay_steps: (wsd only) number of steps over which the decay phase runs,
+            starting at ``stable_steps``. Required for ``wsd``.
+        decay_shape: Shape of the decay phase, one of {"1-sqrt", "linear"}
+            (case-insensitive). Used by ``wsd`` and ``decay``.
         last_epoch: If >= 0 the scheduler is positioned at that step
             (useful when reconstructing the schedule on resume).
             ``initial_lr`` is injected into param groups automatically.
+
+    Note:
+        For ``wsd`` the floor (``lr_decay_to_fraction``) is the value AT step
+        ``stable_steps + decay_steps`` (== total_steps), so the last executed
+        step (total_steps - 1) sits just above the floor. This is by design and
+        matches the schedule spec.
     """
     sched = lr_schedule.lower()
 
+    if sched == "wsd" and (stable_steps is None or decay_steps is None):
+        raise ValueError(
+            "lr_schedule='wsd' requires stable_steps and decay_steps to be set"
+        )
+
+    shape = (decay_shape or "1-sqrt").lower()
+    if shape not in {"1-sqrt", "linear"}:
+        raise ValueError(
+            f"decay_shape must be '1-sqrt' or 'linear', got {decay_shape!r}"
+        )
+
     def _decay_factor(progress: float) -> float:
         progress = min(1.0, max(0.0, progress))
-        shaped = math.sqrt(progress) if decay_shape == "1-sqrt" else progress
+        shaped = math.sqrt(progress) if shape == "1-sqrt" else progress
         return lr_decay_to_fraction + (1.0 - lr_decay_to_fraction) * (1.0 - shaped)
 
     def lr_lambda(step: int) -> float:
