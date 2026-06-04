@@ -200,10 +200,10 @@ def pretrain():
 )
 # Training hyperparameters
 @click.option(
-    "--micro-batch-size",
+    "--micro-batch-seqs",
     type=int,
     default=64,
-    help="Per-device micro-batch size (samples per GPU per forward pass)",
+    help="Sequences per GPU per micro-step (forward pass)",
 )
 @click.option("--num-epochs", type=int, default=10, help="Number of epochs")
 @click.option(
@@ -237,11 +237,11 @@ def pretrain():
     "If unset, defaults to --warmup-steps.",
 )
 @click.option(
-    "--batch-size-warmup-steps",
+    "--global-batch-warmup-steps",
     type=int,
     default=0,
-    help="Optimizer steps to ramp effective batch size from 1/8 to full by reducing "
-    "grad accumulation first, then splitting DataLoader batches when needed.",
+    help="Optimizer steps to ramp the global batch from 1/8 to full (1/8 -> 1/4 -> 1/2 -> full). "
+    "Default 0: no batch-size warmup.",
 )
 @click.option(
     "--lr-decay-to-fraction",
@@ -256,7 +256,7 @@ def pretrain():
     help="Learning rate schedule to use after warmup",
 )
 @click.option(
-    "--global-batch-size",
+    "--global-batch-tokens",
     type=int,
     default=256000,
     help="Target tokens per optimizer step (grad_accum inferred automatically)",
