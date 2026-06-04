@@ -997,6 +997,17 @@ def run(
         raise click.ClickException(
             "use_paired_head_attention and use_diff_attn_v2 are mutually exclusive."
         )
+    # Fail fast before any heavy manifest/model instantiation: only
+    # pure_torch/pure_te pipelines are supported, and wsd/decay require
+    # pure_torch. The HF Trainer pretraining path is no longer supported.
+    try:
+        _check_pipeline_supported(
+            pure_torch, pure_te, cfg.lr_schedule,
+            resume_mode if resume else None,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     manifest = _load_manifest_and_inject(cfg, model_cfg)
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
@@ -1032,16 +1043,6 @@ def run(
     if resume_cfg.is_resume and not resume_cfg.checkpoint_dir:
         raise click.ClickException("--resume requires --resume-checkpoint-dir")
     _validate_resume_config_modes(resume_cfg)
-
-    # Fail fast: only pure_torch/pure_te pipelines are supported, and wsd/decay
-    # require pure_torch. The HF Trainer pretraining path is no longer supported.
-    try:
-        _check_pipeline_supported(
-            pure_torch, pure_te, cfg.lr_schedule,
-            resume_cfg.mode if resume_cfg.is_resume else None,
-        )
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
 
     if pure_te:
         run_te_pretraining(
