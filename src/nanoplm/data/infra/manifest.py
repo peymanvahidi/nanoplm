@@ -60,7 +60,7 @@ class PretrainManifest(DataManifestBase):
     sharded: bool = True
     samples_per_shard: int = 0
 
-    # Exact total residue-token count across the train shards.
+    # Exact total encoded token count (incl. BOS/EOS/register tokens) across the train shards.
     # Default 0 so older manifests without this field still load.
     total_train_tokens: int = 0
 

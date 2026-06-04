@@ -1,5 +1,6 @@
 import numpy as np
 from nanoplm.cli.data import _count_pretrain_shard_sequences, _sum_pretrain_shard_tokens
+from nanoplm.data.infra.manifest import PretrainManifest
 
 
 def _write_shard(dirpath, name, sizes):
@@ -19,9 +20,6 @@ def test_sum_tokens_empty_dir_is_zero(tmp_path):
     d = tmp_path / "train"
     d.mkdir()
     assert _sum_pretrain_shard_tokens(d) == 0
-
-
-from nanoplm.data.infra.manifest import PretrainManifest
 
 
 def test_manifest_round_trips_total_train_tokens():

@@ -1166,11 +1166,13 @@ def _count_pretrain_shard_sequences(shard_dir: Path) -> int:
 
 
 def _sum_pretrain_shard_tokens(shard_dir: Path) -> int:
-    """Sum all per-sequence residue lengths across a dir's .idx.npy shards.
+    """Sum all per-sequence encoded token lengths across a dir's .idx.npy shards.
 
     The .idx.npy arrays (already loaded to count sequences) are int32 arrays of
-    per-sequence sizes, so summing them is the exact real-token total — no extra
-    I/O or extra pass over the data.
+    per-sequence encoded lengths from the C writer's encoded_length() — i.e.
+    used residues plus BOS/EOS/register tokens. Summing them is therefore the
+    exact total encoded token count (the correct unit for a training token
+    budget) — no extra I/O or extra pass over the data.
     """
     import numpy as np
     total = 0
