@@ -73,6 +73,7 @@ from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, M
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
+    format_passes_hint,
     get_num_workers,
     prepare_run_and_steps,
     resolve_total_steps,
@@ -2062,6 +2063,18 @@ def run_pure_pretraining(
     horizon = resolve_total_steps(pretrain_config, achieved_global_batch_tokens)
     total_steps = horizon.total_steps
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+
+    # ---- Epochs-equivalent startup hint (passes over the train set) ----
+    if is_main:
+        _approx = manifest.train_sequences * (manifest.min_seq_len + manifest.max_seq_len) // 2
+        if pretrain_config.lr_schedule.lower() == "wsd":
+            for label, steps in (("stable", horizon.stable_steps), ("decay", horizon.decay_steps),
+                                 ("total", horizon.total_steps)):
+                toks = steps * achieved_global_batch_tokens
+                logger.info(f"[{label}] " + format_passes_hint(toks, manifest.total_train_tokens, _approx))
+        else:
+            toks = horizon.total_steps * achieved_global_batch_tokens
+            logger.info(format_passes_hint(toks, manifest.total_train_tokens, _approx))
 
     # Clamp the raw logging/eval/save intervals (from prepare_run_and_steps) to
     # the token-budget total_steps now that the horizon is known.

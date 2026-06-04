@@ -105,6 +105,18 @@ def resolve_total_steps(cfg, achieved_global_batch_tokens: int) -> StepHorizon:
     return StepHorizon(total_steps=total)
 
 
+def format_passes_hint(budget_tokens: int, total_train_tokens: int,
+                       approx_total: Optional[int] = None) -> str:
+    """One-line 'passes over the train set' hint for a token budget."""
+    denom = total_train_tokens if total_train_tokens and total_train_tokens > 0 else approx_total
+    if not denom:
+        return f"Budget: {budget_tokens:,} tokens (dataset token count unknown)"
+    passes = budget_tokens / denom
+    tag = "" if (total_train_tokens and total_train_tokens > 0) else " (approx)"
+    return (f"Budget: {budget_tokens:,} tokens → ≈{passes:.1f} passes over the "
+            f"train set (each sample seen ~{passes:.1f}×){tag}")
+
+
 def get_num_workers(user_value: Union[int, str], world_size: int) -> int:
 
     if isinstance(user_value, str) and user_value == "auto":
