@@ -1419,8 +1419,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  # continue - finish the original token/step budget from the checkpoint.\n"
         "  #   Take no decay_* fields; the schedule is inherited from the original run.\n"
         "  # decay - anneal a trunk checkpoint over an additional budget.\n"
-        "  #   Set exactly one of decay_tokens / decay_steps, plus decay_shape and\n"
-        "  #   lr_decay_to_fraction.\n"
+        "  #   Set exactly one of decay_tokens / decay_steps. decay_shape and\n"
+        "  #   lr_decay_to_fraction are OPTIONAL overrides; leave null to fall\n"
+        "  #   back to the schedule defaults.\n"
         '  mode: "continue"\n'
         "  # decay-only fields (leave null for mode: continue):\n"
         "  decay_tokens: null\n"
@@ -1800,7 +1801,7 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     return ResumeConfig(**kwargs)
 
 
-def _validate_resume_config_modes(resume_config) -> None:
+def _validate_resume_config_modes(resume_config: ResumeConfig) -> None:
     """Validate the continue/decay resume contract (spec section 7)."""
     if not resume_config.is_resume:
         return
@@ -1810,9 +1811,16 @@ def _validate_resume_config_modes(resume_config) -> None:
     has_tok = resume_config.decay_tokens is not None
     has_stp = resume_config.decay_steps is not None
     if mode == "continue":
-        if has_tok or has_stp or resume_config.decay_shape is not None \
-                or resume_config.lr_decay_to_fraction is not None:
-            raise ValueError("resume.mode=continue takes no decay_* fields (they belong to mode=decay).")
+        set_fields = [
+            name
+            for name in ("decay_tokens", "decay_steps", "decay_shape", "lr_decay_to_fraction")
+            if getattr(resume_config, name) is not None
+        ]
+        if set_fields:
+            raise ValueError(
+                f"resume.mode=continue takes no decay_* fields, but got: "
+                f"{', '.join(set_fields)} (they belong to mode=decay)."
+            )
         return
     # mode == "decay"
     if has_tok and has_stp:

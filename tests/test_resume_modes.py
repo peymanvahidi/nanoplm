@@ -52,3 +52,21 @@ class TestResumeLoadStrictKeys:
             "decay_tokens": 1_000_000, "decay_shape": "1-sqrt", "lr_decay_to_fraction": 0.1,
         })
         assert rc.mode == "decay" and rc.decay_tokens == 1_000_000
+
+    def test_decay_shape_invalid_rejected(self):
+        from nanoplm.cli.pretrain import _load_resume_config
+        with pytest.raises(ValueError, match="decay_shape"):
+            _load_resume_config({"is_resume": True, "checkpoint_dir": ".", "mode": "decay",
+                                 "decay_tokens": 1000, "decay_shape": "bogus"})
+
+    def test_mode_case_normalized(self):
+        from nanoplm.cli.pretrain import _load_resume_config
+        rc = _load_resume_config({"is_resume": True, "checkpoint_dir": ".", "mode": "Decay",
+                                  "decay_tokens": 1000})
+        assert rc.mode == "decay"
+
+    def test_decay_tokens_string_coerced_to_int(self):
+        from nanoplm.cli.pretrain import _load_resume_config
+        rc = _load_resume_config({"is_resume": True, "checkpoint_dir": ".", "mode": "decay",
+                                  "decay_tokens": "1000"})
+        assert rc.decay_tokens == 1000 and isinstance(rc.decay_tokens, int)
