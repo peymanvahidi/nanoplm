@@ -1446,6 +1446,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  #   Set exactly one of decay_tokens / decay_steps. decay_shape and\n"
         "  #   lr_decay_to_fraction are OPTIONAL overrides; leave null to fall\n"
         "  #   back to the schedule defaults.\n"
+        "  #   NOTE: decay restarts the dataloader from the start of a pass, so a\n"
+        "  #   resume-decay matches a single-run wsd decay bit-for-bit only when the\n"
+        "  #   trunk's stable->decay boundary is data-pass aligned; keep\n"
+        "  #   global_batch_tokens / world_size identical to the trunk's run.\n"
         '  mode: "decay"  # continue | decay\n'
         "  # decay-mode fields (leave null / omit for mode: continue):\n"
         "  decay_tokens: 1000000  # additional anneal tokens (or use decay_steps)\n"

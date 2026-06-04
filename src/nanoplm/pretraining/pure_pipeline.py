@@ -1320,8 +1320,8 @@ def _load_checkpoint(
 
     Args:
         load_scheduler: When *False* the scheduler state dict is **not**
-            loaded.  This is used by the resume-override path which
-            rebuilds the scheduler from saved/overridden schedule params
+            loaded.  This is used by the continue/decay resume path which
+            rebuilds the scheduler from the saved schedule descriptor
             instead of relying on the pickled ``lr_lambda``.
     """
     ckp = Path(checkpoint_dir)
@@ -1933,6 +1933,12 @@ def run_pure_pretraining(
     horizon = resolve_total_steps(pretrain_config, achieved_global_batch_tokens)
     total_steps = horizon.total_steps
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+    if is_main and warmup_steps < pretrain_config.warmup_steps:
+        logger.warning(
+            "warmup_steps clamped from %d to %d (the token budget resolves to only "
+            "%d optimizer steps).",
+            pretrain_config.warmup_steps, warmup_steps, total_steps,
+        )
 
     # ---- Epochs-equivalent startup hint (passes over the train set) ----
     if is_main:
@@ -2062,6 +2068,28 @@ def run_pure_pretraining(
             else:
                 raise ValueError(
                     "resume mode='decay' requires decay_tokens or decay_steps"
+                )
+            # decay_steps (hence the LR curve) depends on the achieved per-step
+            # token throughput. If this resume reconfigured batch size / world
+            # size vs the trunk, the decay won't match a single-run wsd decay.
+            _trunk_gbt = (_ckp_state or {}).get("achieved_global_batch_tokens")
+            if (
+                is_main and _trunk_gbt is not None
+                and int(_trunk_gbt) != int(achieved_global_batch_tokens)
+            ):
+                logger.warning(
+                    "Decay resume: achieved_global_batch_tokens changed since the trunk "
+                    "(%d -> %d); decay_steps and the LR curve will differ from a "
+                    "single-run wsd decay.",
+                    int(_trunk_gbt), int(achieved_global_batch_tokens),
+                )
+            if is_main:
+                logger.info(
+                    "Resume decay anneals the trunk over %d steps. NOTE: the decay phase "
+                    "restarts the dataloader from the start of a pass, so weight "
+                    "equivalence with a single-run wsd decay holds only when the "
+                    "stable->decay boundary is data-pass aligned (spec sections 7/13).",
+                    resume_decay_steps,
                 )
             scheduler = _rebuild_scheduler_for_resume(
                 optimizer=optimizer,
