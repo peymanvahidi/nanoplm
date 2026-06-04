@@ -1059,8 +1059,19 @@ def _create_scheduler(
     lr_decay_to_fraction: float,
     lr_schedule: str = "Linear",
     last_epoch: int = -1,
+    *,
+    stable_steps: Optional[int] = None,
+    decay_steps: Optional[int] = None,
+    decay_shape: str = "1-sqrt",
 ):
-    """Build a LambdaLR scheduler with warmup + cosine/linear decay.
+    """Warmup + (wsd | warmup_stable | cosine | linear | decay) scheduler.
+
+    wsd:           warmup -> constant over [warmup, stable_steps) -> decay over
+                   [stable_steps, stable_steps+decay_steps) to lr_decay_to_fraction.
+    warmup_stable: warmup -> constant for the rest (no decay).
+    decay:         no warmup; decay 1.0 -> lr_decay_to_fraction over total_steps
+                   (resume anneal from the checkpoint's current LR).
+    cosine/linear: unchanged single-phase warmup -> decay over total_steps.
 
     For MuonAdamWGroup, returns a _SchedulerGroup wrapping two LambdaLR
     schedulers (one per inner optimizer). For plain optimizers, returns
@@ -1071,15 +1082,34 @@ def _create_scheduler(
             (useful when reconstructing the schedule on resume).
             ``initial_lr`` is injected into param groups automatically.
     """
+    sched = lr_schedule.lower()
+
+    def _decay_factor(progress: float) -> float:
+        progress = min(1.0, max(0.0, progress))
+        shaped = math.sqrt(progress) if decay_shape == "1-sqrt" else progress
+        return lr_decay_to_fraction + (1.0 - lr_decay_to_fraction) * (1.0 - shaped)
+
     def lr_lambda(step: int) -> float:
+        if sched == "wsd":
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            if step < stable_steps:
+                return 1.0
+            return _decay_factor((step - stable_steps) / max(1, decay_steps))
+        if sched == "warmup_stable":
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            return 1.0
+        if sched == "decay":
+            return _decay_factor(step / max(1, total_steps))
+        # cosine / linear (unchanged single-phase behaviour)
         if step < warmup_steps:
             return step / max(1, warmup_steps)
-        decay_steps = max(1, total_steps - warmup_steps)
-        progress = min(1.0, (step - warmup_steps) / decay_steps)
-        if lr_schedule.lower() == "cosine":
+        decay_window = max(1, total_steps - warmup_steps)
+        progress = min(1.0, (step - warmup_steps) / decay_window)
+        if sched == "cosine":
             return lr_decay_to_fraction + 0.5 * (1.0 - lr_decay_to_fraction) * (1.0 + math.cos(math.pi * progress))
-        else:
-            return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
+        return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
 
     def _make_scheduler(opt, last_ep):
         if last_ep >= 0:
