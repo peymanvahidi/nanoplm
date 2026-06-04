@@ -88,31 +88,31 @@ def _populate_batch_setup(cfg: PretrainingConfig) -> None:
     manifest = validation_result["manifest"]
 
     effective_world_size = _resolve_effective_world_size(cfg)
-    if cfg.global_batch_size <= 0:
-        raise ValueError(f"global_batch_size must be > 0, got {cfg.global_batch_size}")
+    if cfg.global_batch_tokens <= 0:
+        raise ValueError(f"global_batch_tokens must be > 0, got {cfg.global_batch_tokens}")
 
     world_tokens_per_micro_step = (
-        cfg.micro_batch_size * manifest.max_seq_len * effective_world_size
+        cfg.micro_batch_seqs * manifest.max_seq_len * effective_world_size
     )
     if world_tokens_per_micro_step <= 0:
         raise ValueError(
             f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check micro_batch_size, max_seq_len, and world_size."
+            "Check micro_batch_seqs, max_seq_len, and world_size."
         )
 
     inferred_grad_accum_steps = max(
         1,
-        math.ceil(cfg.global_batch_size / world_tokens_per_micro_step),
+        math.ceil(cfg.global_batch_tokens / world_tokens_per_micro_step),
     )
     achieved_global_batch_tokens = (
         inferred_grad_accum_steps * world_tokens_per_micro_step
     )
-    global_batch_size_samples = (
-        inferred_grad_accum_steps * cfg.micro_batch_size * effective_world_size
+    global_batch_seqs = (
+        inferred_grad_accum_steps * cfg.micro_batch_seqs * effective_world_size
     )
 
     cfg.inferred_grad_accum_steps = inferred_grad_accum_steps
-    cfg.global_batch_size_samples = global_batch_size_samples
+    cfg.global_batch_seqs = global_batch_seqs
     cfg.achieved_global_batch_tokens = achieved_global_batch_tokens
 
 
@@ -737,17 +737,17 @@ def run(
     dataset_dir: str,
     ckp_dir: str,
     # training hp
-    micro_batch_size: int,
+    micro_batch_seqs: int,
     num_epochs: int,
     adam_learning_rate: float,
     adam_weight_decay: float,
     gradient_clipping: bool,
     warmup_steps: int,
     repo_rope_warmup_steps: Optional[int],
-    batch_size_warmup_steps: int,
+    global_batch_warmup_steps: int,
     lr_decay_to_fraction: float,
     lr_schedule: str,
-    global_batch_size: int,
+    global_batch_tokens: int,
     optimizer: str,
     adam_beta1: float,
     adam_beta2: float,
@@ -847,17 +847,17 @@ def run(
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
-        micro_batch_size=micro_batch_size,
+        micro_batch_seqs=micro_batch_seqs,
         num_epochs=num_epochs,
         adam_learning_rate=adam_learning_rate,
         adam_weight_decay=adam_weight_decay,
         max_grad_norm=1.0 if gradient_clipping else float("inf"),
         warmup_steps=warmup_steps,
         repo_rope_warmup_steps=repo_rope_warmup_steps,
-        batch_size_warmup_steps=batch_size_warmup_steps,
+        global_batch_warmup_steps=global_batch_warmup_steps,
         lr_decay_to_fraction=lr_decay_to_fraction,
         lr_schedule=lr_schedule,
-        global_batch_size=global_batch_size,
+        global_batch_tokens=global_batch_tokens,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
@@ -1355,8 +1355,8 @@ def get_yaml(output: Optional[str], force: bool):
         "pretraining:\n"
         '  dataset_dir: "output/data/pretrain_data"\n'
         '  ckp_dir: "output/pretraining_checkpoints"\n'
-        "  micro_batch_size: 64\n"
-        "  global_batch_size: 256000\n"
+        "  micro_batch_seqs: 64\n"
+        "  global_batch_tokens: 256000\n"
         "  num_epochs: 10\n"
         '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh\n'
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"
@@ -1367,7 +1367,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  max_grad_norm: .inf\n"
         "  warmup_steps: 302\n"
         "  repo_rope_warmup_steps: 302\n"
-        "  batch_size_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
+        "  global_batch_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
         "  lr_decay_to_fraction: 0.1\n"
         '  lr_schedule: "cosine"\n'
         "  adam_weight_decay: 0.0\n"
@@ -1486,7 +1486,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if "gradient_accumulation_steps" in present_keys:
         raise ValueError(
             "gradient_accumulation_steps is inferred automatically from "
-            "global_batch_size, micro_batch_size, max_seq_len, and world_size. "
+            "global_batch_tokens, micro_batch_seqs, max_seq_len, and world_size. "
             "Remove gradient_accumulation_steps from your pretraining config."
         )
 
@@ -1566,7 +1566,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     for warmup_key in (
         "warmup_steps",
         "repo_rope_warmup_steps",
-        "batch_size_warmup_steps",
+        "global_batch_warmup_steps",
     ):
         if warmup_key in kwargs and kwargs[warmup_key] is not None:
             try:

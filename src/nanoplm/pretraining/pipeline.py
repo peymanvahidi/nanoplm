@@ -224,7 +224,7 @@ def run_pretraining(
     batch = compute_batch_setup(pretrain_config, manifest.max_seq_len, effective_world_size)
 
     inferred_grad_accum_steps = batch.grad_accum_steps
-    global_batch_size_samples = batch.global_batch_size_samples
+    global_batch_seqs = batch.global_batch_seqs
 
     # Prepare run info and step intervals in a single place
     (
@@ -240,10 +240,10 @@ def run_pretraining(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
-        global_batch_size_samples=global_batch_size_samples,
+        global_batch_seqs=global_batch_seqs,
     )
 
-    steps_per_epoch = (train_sequences + global_batch_size_samples - 1) // global_batch_size_samples
+    steps_per_epoch = (train_sequences + global_batch_seqs - 1) // global_batch_seqs
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
 
@@ -255,8 +255,8 @@ def run_pretraining(
 
     training_dict = {
         "output_dir": output_dir,
-        "per_device_train_batch_size": pretrain_config.micro_batch_size,
-        "per_device_eval_batch_size": pretrain_config.micro_batch_size,
+        "per_device_train_batch_size": pretrain_config.micro_batch_seqs,
+        "per_device_eval_batch_size": pretrain_config.micro_batch_seqs,
         "gradient_accumulation_steps": inferred_grad_accum_steps,
         "num_train_epochs": num_epochs,
         "learning_rate": pretrain_config.adam_learning_rate,

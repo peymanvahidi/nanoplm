@@ -14,7 +14,7 @@ class PretrainingConfig:
     ckp_dir: str = "output/pretraining"
 
     # Training hyperparameters
-    micro_batch_size: int = 64
+    micro_batch_seqs: int = 64
     num_epochs: int = 10
     warmup_steps: int = 302
     # RePO activation warmup (optimizer-step based) for pure-torch path.
@@ -45,11 +45,11 @@ class PretrainingConfig:
     muonh_normalization: str = "neuron"
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
-    global_batch_size: int = 256000
+    global_batch_tokens: int = 256000
     inferred_grad_accum_steps: Optional[int] = None
-    global_batch_size_samples: Optional[int] = None
+    global_batch_seqs: Optional[int] = None
     achieved_global_batch_tokens: Optional[int] = None
-    batch_size_warmup_steps: int = 0
+    global_batch_warmup_steps: int = 0
 
     # Mixed precision
     bf16: bool = True

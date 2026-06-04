@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 class BatchSetup:
     """Derived batch parameters inferred from PretrainingConfig at runtime."""
     grad_accum_steps: int
-    global_batch_size_samples: int
+    global_batch_seqs: int
     achieved_global_batch_tokens: int
 
 
@@ -32,26 +32,26 @@ def compute_batch_setup(
     max_seq_len: int,
     effective_world_size: int,
 ) -> BatchSetup:
-    """Infer grad_accum and effective batch sizes from global_batch_size."""
-    if cfg.global_batch_size <= 0:
-        raise ValueError(f"global_batch_size must be > 0, got {cfg.global_batch_size}")
+    """Infer grad_accum and effective batch sizes from global_batch_tokens."""
+    if cfg.global_batch_tokens <= 0:
+        raise ValueError(f"global_batch_tokens must be > 0, got {cfg.global_batch_tokens}")
 
     world_tokens_per_micro_step = (
-        cfg.micro_batch_size * max_seq_len * effective_world_size
+        cfg.micro_batch_seqs * max_seq_len * effective_world_size
     )
     if world_tokens_per_micro_step <= 0:
         raise ValueError(
             f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check micro_batch_size, max_seq_len, and world_size."
+            "Check micro_batch_seqs, max_seq_len, and world_size."
         )
 
-    grad_accum = max(1, math.ceil(cfg.global_batch_size / world_tokens_per_micro_step))
+    grad_accum = max(1, math.ceil(cfg.global_batch_tokens / world_tokens_per_micro_step))
     achieved_tokens = grad_accum * world_tokens_per_micro_step
-    batch_samples = grad_accum * cfg.micro_batch_size * effective_world_size
+    batch_samples = grad_accum * cfg.micro_batch_seqs * effective_world_size
 
     logger.info(
         f"Batch setup: "
-        f"target={cfg.global_batch_size:,} tok, "
+        f"target={cfg.global_batch_tokens:,} tok, "
         f"micro_step={world_tokens_per_micro_step:,} tok, "
         f"grad_accum={grad_accum}, "
         f"achieved={achieved_tokens:,} tok"
@@ -59,7 +59,7 @@ def compute_batch_setup(
 
     return BatchSetup(
         grad_accum_steps=grad_accum,
-        global_batch_size_samples=batch_samples,
+        global_batch_seqs=batch_samples,
         achieved_global_batch_tokens=achieved_tokens,
     )
 
@@ -191,7 +191,7 @@ def prepare_run_and_steps(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig],
     train_samples: int,
-    global_batch_size_samples: int,
+    global_batch_seqs: int,
 ) -> Tuple[str, str, str, int, int, int, int, Optional[int]]:
     """Prepare run naming/dirs and compute epochs & step intervals.
 
@@ -199,7 +199,7 @@ def prepare_run_and_steps(
         pretrain_config: Pretraining configuration
         resume_config: Resume configuration (if resuming)
         train_samples: Number of training samples (from manifest)
-        global_batch_size_samples: Effective samples per optimizer step
+        global_batch_seqs: Effective samples per optimizer step
 
     Returns a tuple: (run_name, wandb_run_name, output_dir, num_epochs,
                       logging_steps, eval_steps, save_steps, resume_step)
@@ -298,7 +298,7 @@ def prepare_run_and_steps(
                 )
             except Exception:
                 # Use ceiling division to ensure at least 1 step per epoch
-                steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
+                steps_per_epoch = (train_samples + global_batch_seqs - 1) // global_batch_seqs
                 total_steps = num_epochs * steps_per_epoch
                 # Use direct step counts from config (clamped to valid range)
                 logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
@@ -306,7 +306,7 @@ def prepare_run_and_steps(
                 save_steps = max(1, min(total_steps, pretrain_config.save_steps))
         else:
             # Use ceiling division to ensure at least 1 step per epoch
-            steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
+            steps_per_epoch = (train_samples + global_batch_seqs - 1) // global_batch_seqs
             total_steps = num_epochs * steps_per_epoch
             # Use direct step counts from config (clamped to valid range)
             logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
@@ -315,7 +315,7 @@ def prepare_run_and_steps(
     else:
         num_epochs = pretrain_config.num_epochs
         # Use ceiling division to ensure at least 1 step per epoch
-        steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
+        steps_per_epoch = (train_samples + global_batch_seqs - 1) // global_batch_seqs
         total_steps = num_epochs * steps_per_epoch
         # Use direct step counts from config (clamped to valid range)
         logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))

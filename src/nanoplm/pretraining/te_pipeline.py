@@ -290,7 +290,7 @@ def run_te_pretraining(
     seq_count_buckets = None
     max_seqlen_buckets = None
     if use_static_inp_size:
-        pack_tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
+        pack_tokens_per_micro = pretrain_config.micro_batch_seqs * manifest.max_seq_len
         min_tokens_per_seq = max(
             1,
             int(manifest.min_seq_len) + int(tokenizer.num_special_tokens_to_add(pair=False)),
@@ -304,16 +304,16 @@ def run_te_pretraining(
     effective_world_size = _resolve_world_size(pretrain_config)
 
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
-    global_batch_size_samples = pretrain_config.global_batch_size_samples
+    global_batch_seqs = pretrain_config.global_batch_seqs
     achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
-    batch_size_warmup_steps = max(
+    global_batch_warmup_steps = max(
         0,
-        int(getattr(pretrain_config, "batch_size_warmup_steps", 0)),
+        int(getattr(pretrain_config, "global_batch_warmup_steps", 0)),
     )
 
     if (
         inferred_grad_accum_steps is None
-        or global_batch_size_samples is None
+        or global_batch_seqs is None
         or achieved_global_batch_tokens is None
     ):
         raise ValueError(
@@ -324,13 +324,13 @@ def run_te_pretraining(
     world_tokens_per_micro_step = achieved_global_batch_tokens // max(
         1, inferred_grad_accum_steps
     )
-    tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
+    tokens_per_micro = pretrain_config.micro_batch_seqs * manifest.max_seq_len
     logger.info(
         "Batch setup: "
-        f"target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
+        f"target_global_batch_tokens={pretrain_config.global_batch_tokens:,} tokens, "
         f"micro_step_tokens={world_tokens_per_micro_step:,}, "
         f"grad_accum_steps={inferred_grad_accum_steps}, "
-        f"effective_global_batch_size={achieved_global_batch_tokens:,} tokens"
+        f"effective_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
 
     (
@@ -346,7 +346,7 @@ def run_te_pretraining(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
-        global_batch_size_samples=global_batch_size_samples,
+        global_batch_seqs=global_batch_seqs,
     )
 
     num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
@@ -380,7 +380,7 @@ def run_te_pretraining(
         if getattr(pretrain_config, "use_compile_max_autotune", False)
         else None
     )
-    _maybe_expand_dynamo_cache_for_batch_warmup(batch_size_warmup_steps)
+    _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps)
     if model.model.config.use_mhc_lite:
         _compile_te_mhc_blocks(
             model,
@@ -564,7 +564,7 @@ def run_te_pretraining(
         train_loader = DataLoader(
             train_ds,
             sampler=train_sampler,
-            batch_size=pretrain_config.micro_batch_size,
+            batch_size=pretrain_config.micro_batch_seqs,
             collate_fn=collator,
             drop_last=False,
             **dl_kwargs,
@@ -572,7 +572,7 @@ def run_te_pretraining(
     eval_loader = DataLoader(
         val_ds,
         sampler=eval_sampler,
-        batch_size=pretrain_config.micro_batch_size,
+        batch_size=pretrain_config.micro_batch_seqs,
         collate_fn=eval_collator,
         drop_last=False,
         **dl_kwargs,
@@ -589,8 +589,8 @@ def run_te_pretraining(
         num_epochs=num_epochs,
         train_loader_len=synced_train_loader_len,
         full_grad_accum=inferred_grad_accum_steps,
-        full_micro_batch=pretrain_config.micro_batch_size,
-        batch_size_warmup_steps=batch_size_warmup_steps,
+        full_micro_batch=pretrain_config.micro_batch_seqs,
+        global_batch_warmup_steps=global_batch_warmup_steps,
     )
     steps_per_epoch = max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
     total_steps = epoch_start_steps[-1]
@@ -647,8 +647,8 @@ def run_te_pretraining(
                 epoch_start_step=epoch_start_step,
                 resume_global_step=start_step,
                 full_grad_accum=inferred_grad_accum_steps,
-                full_micro_batch=pretrain_config.micro_batch_size,
-                batch_size_warmup_steps=batch_size_warmup_steps,
+                full_micro_batch=pretrain_config.micro_batch_seqs,
+                global_batch_warmup_steps=global_batch_warmup_steps,
             )
         if resume_data_step >= synced_train_loader_len:
             resume_data_step = 0
@@ -719,9 +719,9 @@ def run_te_pretraining(
     logger.info(
         "Starting Transformer Engine training: "
         f"epochs={num_epochs}, total_steps={total_steps}, warmup_steps={warmup_steps}, "
-        f"batch_size_warmup_steps={batch_size_warmup_steps}, "
+        f"global_batch_warmup_steps={global_batch_warmup_steps}, "
         f"grad_accum={inferred_grad_accum_steps}, "
-        f"achieved_global_batch_size={achieved_global_batch_tokens:,} tokens"
+        f"achieved_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
@@ -766,8 +766,8 @@ def run_te_pretraining(
     effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
         global_step,
         inferred_grad_accum_steps,
-        pretrain_config.micro_batch_size,
-        batch_size_warmup_steps,
+        pretrain_config.micro_batch_seqs,
+        global_batch_warmup_steps,
     )
     accum_loss = torch.zeros((), device=device)
     window_loss = torch.zeros((), device=device)
@@ -785,10 +785,10 @@ def run_te_pretraining(
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
 
     profiler_ctx, profiler_step_cb = _make_te_profiler(pretrain_config, output_dir, is_main)
-    if batch_size_warmup_steps > 0 and is_main:
+    if global_batch_warmup_steps > 0 and is_main:
         logger.info(
             "Batch-size warmup active: steps=%d, initial_grad_accum=%d, initial_micro_batch=%d, split_divisor=%d",
-            batch_size_warmup_steps,
+            global_batch_warmup_steps,
             effective_grad_accum,
             effective_micro_batch,
             mbs_divisor,
@@ -873,8 +873,8 @@ def run_te_pretraining(
                             effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
                                 global_step,
                                 inferred_grad_accum_steps,
-                                pretrain_config.micro_batch_size,
-                                batch_size_warmup_steps,
+                                pretrain_config.micro_batch_seqs,
+                                global_batch_warmup_steps,
                             )
                         continue
 
@@ -1018,11 +1018,11 @@ def run_te_pretraining(
                     effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
                         global_step,
                         inferred_grad_accum_steps,
-                        pretrain_config.micro_batch_size,
-                        batch_size_warmup_steps,
+                        pretrain_config.micro_batch_seqs,
+                        global_batch_warmup_steps,
                     )
                     if (
-                        batch_size_warmup_steps > 0
+                        global_batch_warmup_steps > 0
                         and is_main
                         and prev_warmup_state != (effective_grad_accum, effective_micro_batch, mbs_divisor)
                     ):
