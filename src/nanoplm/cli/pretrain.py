@@ -1362,7 +1362,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  # train_tokens: 10000000  # single-phase budget for warmup_stable | cosine | linear (NOT used with wsd)\n"
         "  # Advanced step overrides (each replaces its *_tokens counterpart; never set both):\n"
         "  # stable_steps:  # ↔ stable_tokens (wsd)\n"
-        "  # decay_steps:   # ↔ decay_tokens (wsd/decay)\n"
+        "  # decay_steps:   # ↔ decay_tokens (wsd / resume-decay)\n"
         "  # max_steps:     # ↔ train_tokens (warmup_stable | cosine | linear)\n"
         '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh\n'
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"

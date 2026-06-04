@@ -25,6 +25,9 @@ class TestGetYamlTemplate:
         assert p["micro_batch_seqs"] == 64
         assert p["global_batch_tokens"] == 256000
         assert p["global_batch_warmup_steps"] == 0
+        # advanced/alternative fields must stay COMMENTED (absent as active keys)
+        for k in ("train_tokens", "stable_steps", "decay_steps", "max_steps"):
+            assert k not in p, f"{k} should remain a commented alternative, not active"
 
     def test_resume_block_uses_modes(self, tmp_path):
         doc = _emit(tmp_path)
@@ -33,3 +36,4 @@ class TestGetYamlTemplate:
         assert "resume_epochs" not in r and "reset_scheduler" not in r
         assert r["decay_tokens"] == 1_000_000
         assert r["decay_shape"] == "1-sqrt"
+        assert "decay_steps" not in r, "decay_steps should remain a commented alternative"
