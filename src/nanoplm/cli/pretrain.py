@@ -1471,6 +1471,37 @@ def get_yaml(output: Optional[str], force: bool):
     click.echo(f"Template written to: {output_path}")
 
 
+def _validate_duration_config(cfg) -> None:
+    """Validate schedule <-> duration-budget consistency (spec section 12)."""
+    sched = (cfg.lr_schedule or "").lower()
+    valid = {"wsd", "warmup_stable", "cosine", "linear"}
+    if sched not in valid:
+        raise ValueError(f"lr_schedule must be one of {sorted(valid)}, got {cfg.lr_schedule!r}")
+
+    def _one(token_field, step_field, label):
+        tok = getattr(cfg, token_field)
+        stp = getattr(cfg, step_field)
+        if tok is not None and stp is not None:
+            raise ValueError(
+                f"Set exactly one of {token_field} or {step_field} for the {label} budget, not both."
+            )
+        if tok is None and stp is None:
+            raise ValueError(
+                f"{sched} requires a {label} budget: set {token_field} (tokens) or {step_field} (steps)."
+            )
+
+    if sched == "wsd":
+        _one("stable_tokens", "stable_steps", "stable")
+        _one("decay_tokens", "decay_steps", "decay")
+        if (cfg.train_tokens is not None) or (cfg.max_steps is not None):
+            raise ValueError("wsd uses stable_*/decay_* budgets; remove train_tokens/max_steps.")
+    else:
+        _one("train_tokens", "max_steps", "training")
+        if any(getattr(cfg, f) is not None for f in
+               ("stable_tokens", "decay_tokens", "stable_steps", "decay_steps")):
+            raise ValueError(f"{sched} uses train_tokens/max_steps; remove stable_*/decay_* budgets.")
+
+
 def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if config is None:
         raise ValueError("Pretraining configuration is required but not found in YAML")
@@ -1601,7 +1632,9 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             elif isinstance(value, str):
                 kwargs[bool_key] = value.lower() == "true"
 
-    return PretrainingConfig(**kwargs)
+    cfg = PretrainingConfig(**kwargs)
+    _validate_duration_config(cfg)
+    return cfg
 
 
 def _load_manifest_and_inject(
