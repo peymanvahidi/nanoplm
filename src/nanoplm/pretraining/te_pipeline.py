@@ -582,6 +582,11 @@ def run_te_pretraining(
         distributed=distributed,
         device=device,
     )
+    if synced_train_loader_len == 0:
+        raise RuntimeError(
+            "train_loader is empty (synced_len=0); cannot satisfy the token budget. "
+            "Check the dataset/manifest and per-rank sharding."
+        )
     # ---- Training horizon (token budget -> optimizer steps) ----
     # total_steps comes from the configured token/step budget, NOT from epochs.
     # TE only ever sees warmup_stable/cosine/linear, so stable_steps/decay_steps
