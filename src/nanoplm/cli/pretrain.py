@@ -176,6 +176,23 @@ def _validate_debug_layerwise_metrics_compat(
         )
 
 
+def _check_pipeline_supported(pure_torch: bool, pure_te: bool,
+                              lr_schedule: str, resume_mode) -> None:
+    """Pretraining requires pure_torch or pure_te; wsd/decay require pure_torch (spec section 14)."""
+    if not (pure_torch or pure_te):
+        raise ValueError(
+            "Pretraining requires pure_torch: true or pure_te: true. "
+            "The HF Trainer pretraining path is no longer supported."
+        )
+    sched = (lr_schedule or "").lower()
+    mode = (resume_mode or "").lower() if resume_mode else None
+    if not pure_torch and (sched == "wsd" or mode == "decay"):
+        raise ValueError(
+            "lr_schedule: wsd and resume mode: decay require pure_torch: true "
+            "(TE supports warmup_stable/cosine/linear + continue only)."
+        )
+
+
 @click.group(name="pretrain")
 @click.help_option("--help", "-h")
 def pretrain():
@@ -1204,6 +1221,11 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
+    _check_pipeline_supported(
+        pure_torch, pure_te, pretrain_config.lr_schedule,
+        resume_config.mode if (resume_config and resume_config.is_resume) else None,
+    )
+
     if pure_te:
         run_te_pretraining(
             model=model,
@@ -1213,13 +1235,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         )
     elif pure_torch:
         run_pure_pretraining(
-            model=model,
-            pretrain_config=pretrain_config,
-            manifest=manifest,
-            resume_config=resume_config if resume_config.is_resume else None,
-        )
-    else:
-        run_pretraining(
             model=model,
             pretrain_config=pretrain_config,
             manifest=manifest,
