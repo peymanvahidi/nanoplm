@@ -2180,7 +2180,6 @@ def run_pure_pretraining(
     if is_main:
         try:
             wandb.init(
-                mode="offline",
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
