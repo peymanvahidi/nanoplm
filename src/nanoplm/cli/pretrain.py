@@ -53,13 +53,19 @@ from nanoplm.utils.logger import logger
 
 def _check_muon_available(optimizer: str) -> None:
     """Abort early when a Muon variant is requested but ``dion`` is not installed."""
-    if optimizer.lower() in {"muon", "normuon", "muonh"}:
+    optimizer_name = optimizer.lower()
+    if optimizer_name in {"muon", "normuon", "muonh", "aurora"}:
         try:
-            import dion  # noqa: F401
+            import dion
         except ImportError:
             raise click.ClickException(
                 f"Optimizer '{optimizer}' requires the 'dion' package which is not installed.\n"
                 "Install it with:  pip install nanoplm[cuda]"
+            )
+        required_class = {"muon": "Muon", "normuon": "NorMuon", "muonh": "MuonH", "aurora": "Aurora"}[optimizer_name]
+        if not hasattr(dion, required_class):
+            raise click.ClickException(
+                f"Optimizer '{optimizer}' requires dion.{required_class}, but this Dion build does not expose it."
             )
 
 
@@ -331,7 +337,7 @@ def pretrain():
 @click.option(
     "--optimizer",
     type=click.Choice(
-        ["adamw", "stable_adamw", "muon", "normuon", "muonh"], case_sensitive=False
+        ["adamw", "stable_adamw", "muon", "normuon", "muonh", "aurora"], case_sensitive=False
     ),
     default="normuon",
     help="Optimizer to use",
@@ -343,40 +349,40 @@ def pretrain():
     "--muon-learning-rate",
     type=float,
     default=1e-3,
-    help="Muon LR (used only when optimizer=muon or normuon; learning-rate remains AdamW LR)",
+    help="Muon-family LR (used when optimizer=muon, normuon, muonh, or aurora; learning-rate remains AdamW LR)",
 )
 @click.option(
     "--muon-weight-decay",
     type=float,
     default=0.01,
-    help="Muon weight decay (used only when optimizer=muon or normuon)",
+    help="Muon-family matrix weight decay (used when optimizer=muon, normuon, muonh, or aurora)",
 )
 @click.option(
     "--muon-cautious-weight-decay/--no-muon-cautious-weight-decay",
     default=True,
-    help="Enable cautious weight decay in Muon/NorMuon (used only when optimizer=muon or normuon)",
+    help="Enable cautious weight decay where supported by the selected Muon-family optimizer",
 )
 @click.option(
     "--muon-use-polar-express/--no-muon-use-polar-express",
     default=True,
-    help="Use Polar Express orthogonalization for Muon/NorMuon (used only when optimizer=muon or normuon)",
+    help="Use Polar Express orthogonalization for Muon-family optimizers where supported",
 )
 @click.option(
     "--muon-momentum",
     type=float,
     default=0.95,
-    help="Muon momentum (used only when optimizer=muon or normuon)",
+    help="Muon-family momentum",
 )
 @click.option(
     "--muon-nesterov/--no-muon-nesterov",
     default=True,
-    help="Enable Nesterov in Muon (used only when optimizer=muon or normuon)",
+    help="Enable Nesterov in Muon-family optimizers",
 )
 @click.option(
     "--muon-eps",
     type=float,
     default=1e-7,
-    help="Muon epsilon (used only when optimizer=muon or normuon)",
+    help="Muon-family epsilon",
 )
 @click.option(
     "--muonh-normalization",
@@ -386,6 +392,37 @@ def pretrain():
     "'neuron' = per-row, 'short_axis' = along the shorter matrix axis, 'none' = disabled.",
 )
 @click.option("--mlm-probability", type=float, default=0.3, help="MLM probability")
+@click.option(
+    "--mlm-masking-strategy",
+    type=click.Choice(["token", "span"], case_sensitive=False),
+    default="token",
+    show_default=True,
+    help="MLM position sampling strategy: independent token masking or contiguous span masking.",
+)
+@click.option(
+    "--mlm-span-mean-length",
+    type=click.FloatRange(min=0.0, min_open=True),
+    default=3.0,
+    show_default=True,
+    help="Mean span length for --mlm-masking-strategy span. Values <=1 produce length-1 spans.",
+)
+@click.option(
+    "--mlm-span-max-length",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Maximum span length for --mlm-masking-strategy span.",
+)
+@click.option(
+    "--mlm-standard-amino-acids-only/--mlm-all-non-special-tokens",
+    default=True,
+    help=(
+        "Current behavior: supervise MLM only on the 20 standard amino acids "
+        "and draw random replacements from those same tokens. Use "
+        "--mlm-all-non-special-tokens to reproduce the legacy all-non-special "
+        "token behavior."
+    ),
+)
 @click.option(
     "--logging-steps", type=int, default=1, help="Number of steps between log events"
 )
@@ -473,6 +510,50 @@ def pretrain():
     "--fp8/--no-fp8",
     default=False,
     help="Enable FP8 Linear matmuls in pure-torch/TE paths (CUDA only, best on H100+)",
+)
+@click.option(
+    "--fp8-target",
+    type=str,
+    default="mlp",
+    show_default=True,
+    help=(
+        "Pure-torch FP8 target(s): mlp, attn_wqkv, attn_wo. "
+        "Combine with commas, e.g. attn_wqkv,attn_wo."
+    ),
+)
+@click.option(
+    "--fp8-skip-last-n-layers",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Pure-torch FP8: leave the final N transformer layers in bf16.",
+)
+@click.option(
+    "--fp8-recipe",
+    type=click.Choice(["delayed", "current", "block", "mxfp8", "nvfp4"], case_sensitive=False),
+    default="delayed",
+    show_default=True,
+    help="Transformer Engine FP8 recipe. mxfp8 and nvfp4 require Blackwell+ GPUs.",
+)
+@click.option(
+    "--fp8-format",
+    type=click.Choice(["hybrid", "e4m3"], case_sensitive=False),
+    default="hybrid",
+    show_default=True,
+    help="Transformer Engine FP8 format for recipes that accept one.",
+)
+@click.option(
+    "--fp8-amax-history-len",
+    type=int,
+    default=64,
+    show_default=True,
+    help="Transformer Engine DelayedScaling amax history length.",
+)
+@click.option(
+    "--fp8-reduce-amax/--no-fp8-reduce-amax",
+    default=True,
+    show_default=True,
+    help="Transformer Engine DelayedScaling: synchronize amax across the FP8 reduction group.",
 )
 @click.option(
     "--multi-gpu", is_flag=True, default=True, help="Enable multi-GPU training"
@@ -608,7 +689,7 @@ def pretrain():
 )
 @click.option(
     "--mlp-activation",
-    type=click.Choice(["swiglu"], case_sensitive=False),
+    type=click.Choice(["swiglu", "glu", "srelu"], case_sensitive=False),
     default="swiglu",
     help="MLP activation",
 )
@@ -722,8 +803,7 @@ def pretrain():
 @click.option(
     "--fused-qkv/--no-fused-qkv",
     default=True,
-    help="Use a single fused Wqkv projection (default). When disabled, Q/K/V use separate "
-    "linear layers so Muon orthogonalizes each subspace independently.",
+    help="Use a single fused Wqkv projection (default). When disabled, Q/K/V run as separate matmuls.",
 )
 @click.option(
     "--fused-up-gate/--no-fused-up-gate",
@@ -825,6 +905,10 @@ def run(
     muon_eps: float,
     muonh_normalization: str,
     mlm_probability: float,
+    mlm_masking_strategy: str,
+    mlm_span_mean_length: float,
+    mlm_span_max_length: int,
+    mlm_standard_amino_acids_only: bool,
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
@@ -846,6 +930,12 @@ def run(
     bf16: bool,
     tf32: bool,
     fp8: bool,
+    fp8_target: str,
+    fp8_skip_last_n_layers: int,
+    fp8_recipe: str,
+    fp8_format: str,
+    fp8_amax_history_len: int,
+    fp8_reduce_amax: bool,
     multi_gpu: bool,
     distributed_mode: str,
     fsdp_shard_granularity: str,
@@ -939,6 +1029,10 @@ def run(
         muon_eps=muon_eps,
         muonh_normalization=muonh_normalization,
         mlm_probability=mlm_probability,
+        mlm_masking_strategy=mlm_masking_strategy,
+        mlm_span_mean_length=mlm_span_mean_length,
+        mlm_span_max_length=mlm_span_max_length,
+        mlm_standard_amino_acids_only=mlm_standard_amino_acids_only,
         mask_replace_prob=mask_replace_prob,
         random_token_prob=random_token_prob,
         keep_probability=keep_probability,
@@ -959,6 +1053,12 @@ def run(
         bf16=bf16,
         tf32=tf32,
         fp8=fp8,
+        fp8_target=fp8_target,
+        fp8_skip_last_n_layers=fp8_skip_last_n_layers,
+        fp8_recipe=fp8_recipe,
+        fp8_format=fp8_format,
+        fp8_amax_history_len=fp8_amax_history_len,
+        fp8_reduce_amax=fp8_reduce_amax,
         multi_gpu=multi_gpu,
         distributed_mode=distributed_mode,
         fsdp_shard_granularity=fsdp_shard_granularity,
@@ -1363,7 +1463,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  # num_kv_heads: 8  # GQA: number of KV heads (default: same as num_attention_heads = MHA)\n"
         "  vocab_size: 32\n"
         '  norm_type: "layernorm"  # layernorm | rmsnorm (rmsnorm is slightly faster, no bias)\n'
-        '  mlp_activation: "swiglu"\n'
+        '  mlp_activation: "swiglu"  # swiglu | glu | srelu\n'
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: false\n"
         "  no_mlp_on_first_layer: true\n"
@@ -1375,6 +1475,9 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_resid_lambdas: false  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
+        "  global_rope_theta: 160000.0  # RoPE base for full-attention layers; lower (e.g. 10000-40000) suits short max_seq_len\n"
+        "  local_rope_theta: 10000.0  # RoPE base for sliding-window layers\n"
+        "  rope_dim_fraction: 1.0  # fraction of head_dim to apply RoPE (e.g. 0.25 = 25% rotary + 75% NoPE content dims)\n"
         "  use_canon_layers: false # enables Canon-ABCD local mixing layers (pure_torch only)\n"
         '  canon_layers_mode: "ac"  # subset of Canon sites: A/B/C/D (e.g. "ac" for lighter mode)\n'
         "  canon_layers_kernel_size: 5  # symmetric Canon kernel size (allowed: 3/5/7, default: 5)\n"
@@ -1473,9 +1576,13 @@ def get_yaml(output: Optional[str], force: bool):
         "  recycling_pretraining_eval_loop_counts: null     # null = single r at target mean; e.g. [1, 4] for in-loop eval sweep\n"
         "\n"
         "  mlm_probability: 0.3\n"
+        '  mlm_masking_strategy: "token"  # token=current independent masking; span=BERT-style contiguous span masking\n'
+        "  mlm_span_mean_length: 3.0  # used only when mlm_masking_strategy=span\n"
+        "  mlm_span_max_length: 10  # used only when mlm_masking_strategy=span\n"
         "  mask_replace_prob: 0.8\n"
         "  random_token_prob: 0.1\n"
         "  keep_probability: 0.1\n"
+        "  mlm_standard_amino_acids_only: true  # true=current: MLM targets/random replacements use only 20 standard AAs; false=legacy all non-special tokens\n"
         "  logging_steps: 1\n"
         "  eval_steps: 250\n"
         "  save_steps: 5000\n"
@@ -1500,6 +1607,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  bf16: true\n"
         "  tf32: true\n"
         "  fp8: false\n"
+        '  fp8_target: "mlp"  # pure_torch FP8 target(s): mlp | attn_wqkv | mlp_wi; combine as "attn_wqkv,mlp" or YAML list\n'
+        "  fp8_skip_last_n_layers: 0  # pure_torch FP8 only: keep final N transformer layers in bf16 for stability\n"
+        '  fp8_recipe: "delayed"  # TE only: delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 are Blackwell+ only)\n'
+        '  fp8_format: "hybrid"  # TE only: hybrid | e4m3; ignored by nvfp4\n'
+        "  fp8_amax_history_len: 64  # TE DelayedScaling only; amax history window length\n"
+        "  fp8_reduce_amax: true  # TE DelayedScaling only; true synchronizes amax across the FP8 reduction group\n"
         "  multi_gpu: true\n"
         '  distributed_mode: "fsdp"  # fsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n'
         '  fsdp_shard_granularity: "layer"  # layer (fewer boundaries, NVLink/SXM) | sublayer (finer overlap, PCIe)\n'
@@ -1637,6 +1750,11 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "noble_lr_gamma_M",
         "noble_freq_lr_mult",
         "noble_phase_lr_mult",
+        "mlm_probability",
+        "mask_replace_prob",
+        "random_token_prob",
+        "keep_probability",
+        "mlm_span_mean_length",
     ]
 
     def _parse_float_like(raw_value: Any, field_name: str) -> float:
@@ -1673,18 +1791,21 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         if field in kwargs and kwargs[field] is not None:
             kwargs[field] = _parse_float_like(kwargs[field], field)
 
-    # Ensure warmup-related fields are ints (YAML may load as int or float).
-    for warmup_key in (
+    # Ensure integer-like fields are ints (YAML may load as int, float, or str).
+    for int_key in (
         "warmup_steps",
         "repo_rope_warmup_steps",
         "global_batch_warmup_steps",
+        "fp8_amax_history_len",
+        "fp8_skip_last_n_layers",
+        "mlm_span_max_length",
     ):
-        if warmup_key in kwargs and kwargs[warmup_key] is not None:
+        if int_key in kwargs and kwargs[int_key] is not None:
             try:
-                kwargs[warmup_key] = int(kwargs[warmup_key])
+                kwargs[int_key] = int(kwargs[int_key])
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"Invalid {warmup_key} value: {kwargs[warmup_key]}. Must be an integer."
+                    f"Invalid {int_key} value: {kwargs[int_key]}. Must be an integer."
                 ) from exc
 
     # Handle boolean values
@@ -1693,6 +1814,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "bf16",
         "tf32",
         "fp8",
+        "fp8_reduce_amax",
         "muon_nesterov",
         "muon_cautious_weight_decay",
         "muon_use_polar_express",
@@ -1704,6 +1826,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "profiler_enabled",
         "debug_non_finite_params",
         "debug_layerwise_metrics",
+        "mlm_standard_amino_acids_only",
     ]:
         if bool_key in kwargs:
             value = kwargs[bool_key]

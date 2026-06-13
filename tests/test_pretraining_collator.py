@@ -4,7 +4,7 @@ Test suite for the custom ProtDataCollatorForLM to verify it works correctly.
 """
 
 import torch
-from nanoplm.pretraining.collator import ProtDataCollatorForLM
+from nanoplm.pretraining.collator import DataCollatorWithFlattening, ProtDataCollatorForLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
 
@@ -391,6 +391,58 @@ def test_non_standard_aa_tokens_never_masked():
     print("✓ Non-standard AA token masking exclusion test passed")
 
 
+def test_mlm_token_policy_current_vs_legacy():
+    """Test the AB-test switch for current vs legacy MLM token policy."""
+    print("Testing current vs legacy MLM token policy...")
+
+    tokenizer = ProtModernBertTokenizer()
+    seq = "AXGX"
+    tokenized = [{
+        'input_ids': tokenizer(seq, padding=False, return_tensors=None)['input_ids'],
+        'attention_mask': tokenizer(seq, padding=False, return_tensors=None)['attention_mask'],
+    }]
+    original = torch.tensor(tokenized[0]['input_ids'])
+    x_positions = original == tokenizer.get_vocab()["X"]
+
+    current_collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=1.0,
+        mask_token_probability=1.0,
+        random_token_probability=0.0,
+        keep_probability=0.0,
+    )
+    current_batch = current_collator(tokenized)
+
+    assert current_collator.standard_amino_acids_only is True
+    assert set(current_collator.allowed_random_token_ids.tolist()) == set(
+        tokenizer.STANDARD_AA_TOKEN_IDS
+    )
+    assert (current_batch['labels'][0][x_positions] == -100).all(), (
+        "Current MLM policy should not supervise non-standard AA tokens"
+    )
+    assert (
+        current_batch['input_ids'][0][x_positions] == original[x_positions]
+    ).all(), "Current MLM policy should not replace non-standard AA tokens"
+
+    legacy_collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=1.0,
+        mask_token_probability=1.0,
+        random_token_probability=0.0,
+        keep_probability=0.0,
+        standard_amino_acids_only=False,
+    )
+    legacy_batch = legacy_collator(tokenized)
+
+    assert legacy_collator.standard_amino_acids_only is False
+    assert tokenizer.get_vocab()["X"] in legacy_collator.allowed_random_token_ids.tolist()
+    assert (
+        legacy_batch['labels'][0][x_positions] == original[x_positions]
+    ).all(), "Legacy MLM policy should supervise non-standard AA tokens"
+
+    print("✓ Current vs legacy MLM token policy test passed")
+
+
 def test_non_standard_tokens_excluded_from_random_replacement():
     """Test that non-standard AA tokens are never used as random replacements."""
     print("Testing non-standard AA token random replacement exclusion...")
@@ -474,6 +526,130 @@ def test_tokenizer_aa_classification():
     print("✓ Tokenizer AA classification test passed")
 
 
+def test_span_masking_zero_probability_labels_none():
+    """Span masking with mlm_probability=0.0 should not supervise any token."""
+    tokenizer = ProtModernBertTokenizer()
+    collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=0.0,
+        mask_token_probability=1.0,
+        random_token_probability=0.0,
+        keep_probability=0.0,
+        masking_strategy="span",
+    )
+    enc = tokenizer("MKALCL", padding=False, return_tensors=None)
+    batch = collator([{"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}])
+
+    assert (batch["labels"] == -100).all()
+
+
+def test_span_masking_full_probability_labels_only_eligible_tokens():
+    """Span masking with mlm_probability=1.0 should supervise every eligible AA only."""
+    tokenizer = ProtModernBertTokenizer(num_register_tokens=2)
+    collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=1.0,
+        mask_token_probability=1.0,
+        random_token_probability=0.0,
+        keep_probability=0.0,
+        masking_strategy="span",
+    )
+    enc = tokenizer("MKALCL", padding=False, return_tensors=None)
+    original = torch.tensor(enc["input_ids"])
+    batch = collator([{"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}])
+    labels = batch["labels"][0]
+
+    eligible = torch.zeros_like(original, dtype=torch.bool)
+    for tid in tokenizer.STANDARD_AA_TOKEN_IDS:
+        eligible |= original == tid
+
+    assert (labels[eligible] == original[eligible]).all()
+    assert (labels[~eligible] == -100).all()
+    assert (batch["input_ids"][0][~eligible] == original[~eligible]).all()
+
+
+def test_span_masking_fractional_target_count_floor_or_ceil():
+    """Span mode should preserve the expected masked fraction at row level."""
+    torch.manual_seed(123)
+    tokenizer = ProtModernBertTokenizer()
+    collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=0.33,
+        mask_token_probability=1.0,
+        random_token_probability=0.0,
+        keep_probability=0.0,
+        masking_strategy="span",
+        span_mean_length=3.0,
+        span_max_length=10,
+    )
+    seq = "MKALCLLLLPVLGLLTGSSG"  # 20 standard AAs + EOS
+    enc = tokenizer(seq, padding=False, return_tensors=None)
+    batch = collator([{"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}])
+
+    supervised_count = int((batch["labels"][0] != -100).sum().item())
+    assert supervised_count in {6, 7}
+
+
+def test_span_masking_respects_non_standard_padding_and_register_boundaries():
+    """Excluded tokens and specials must not be swallowed by spans."""
+    tokenizer = ProtModernBertTokenizer(num_register_tokens=2)
+    collator = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=1.0,
+        mask_token_probability=1.0,
+        random_token_probability=0.0,
+        keep_probability=0.0,
+        masking_strategy="span",
+        standard_amino_acids_only=True,
+    )
+    encoded = []
+    originals = []
+    for seq in ["AXGXMXK", "M"]:
+        enc = tokenizer(seq, padding=False, return_tensors=None)
+        encoded.append({"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]})
+        originals.append(torch.tensor(enc["input_ids"]))
+
+    batch = collator(encoded)
+    for row_idx, original in enumerate(originals):
+        labels = batch["labels"][row_idx, : original.numel()]
+        input_ids = batch["input_ids"][row_idx, : original.numel()]
+
+        standard = torch.zeros_like(original, dtype=torch.bool)
+        for tid in tokenizer.STANDARD_AA_TOKEN_IDS:
+            standard |= original == tid
+
+        assert (labels[standard] == original[standard]).all()
+        assert (labels[~standard] == -100).all()
+        assert (input_ids[~standard] == original[~standard]).all()
+
+    padding_positions = ~batch["attention_mask"].bool()
+    assert (batch["labels"][padding_positions] == -100).all()
+
+
+def test_span_masking_flattening_padding_labels_ignored():
+    """Flattened fixed-size padding must keep labels ignored under span masking."""
+    tokenizer = ProtModernBertTokenizer()
+    inner = ProtDataCollatorForLM(
+        tokenizer=tokenizer,
+        mlm_probability=1.0,
+        mask_token_probability=1.0,
+        random_token_probability=0.0,
+        keep_probability=0.0,
+        masking_strategy="span",
+    )
+    collator = DataCollatorWithFlattening(collator=inner, pad_to_multiple_of=8)
+    encoded = []
+    for seq in ["AAA", "LL"]:
+        enc = tokenizer(seq, padding=False, return_tensors=None)
+        encoded.append({"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]})
+
+    batch = collator(encoded)
+
+    assert batch["input_ids"].shape[0] == 8
+    assert int((batch["labels"] != -100).sum().item()) == 5
+    assert batch["labels"][-1].item() == -100
+
+
 def main():
     """Run all collator tests"""
     print("Running ProtDataCollatorForLM tests...\n")
@@ -502,10 +678,28 @@ def main():
     test_tokenizer_aa_classification()
     print()
 
+    test_mlm_token_policy_current_vs_legacy()
+    print()
+
     test_non_standard_aa_tokens_never_masked()
     print()
 
     test_non_standard_tokens_excluded_from_random_replacement()
+    print()
+
+    test_span_masking_zero_probability_labels_none()
+    print()
+
+    test_span_masking_full_probability_labels_only_eligible_tokens()
+    print()
+
+    test_span_masking_fractional_target_count_floor_or_ceil()
+    print()
+
+    test_span_masking_respects_non_standard_padding_and_register_boundaries()
+    print()
+
+    test_span_masking_flattening_padding_labels_ignored()
     print()
 
     print("All tests passed!")

@@ -5,6 +5,48 @@ from pathlib import Path
 from typing import Optional, Union
 
 
+def _normalize_fp8_targets(raw_targets) -> str | list[str]:
+    aliases = {
+        "mlp": "mlp",
+        "attn_wqkv": "attn_wqkv",
+        "attn-wqkv": "attn_wqkv",
+        "attention_wqkv": "attn_wqkv",
+        "attention-wqkv": "attn_wqkv",
+        "qkv": "attn_wqkv",
+        "attn_wo": "attn_wo",
+        "attn-wo": "attn_wo",
+        "attention_wo": "attn_wo",
+        "attention-wo": "attn_wo",
+        "wo": "attn_wo",
+    }
+    if isinstance(raw_targets, str):
+        pieces = raw_targets.replace("+", ",").split(",")
+    elif isinstance(raw_targets, (list, tuple)):
+        pieces = []
+        for item in raw_targets:
+            pieces.extend(str(item).replace("+", ",").split(","))
+    else:
+        pieces = [str(raw_targets)]
+
+    targets: list[str] = []
+    for piece in pieces:
+        key = str(piece).strip().lower()
+        if not key:
+            continue
+        if key not in aliases:
+            raise ValueError(
+                "fp8_target must contain only: mlp, attn_wqkv, attn_wo "
+                f"(got {raw_targets!r})"
+            )
+        target = aliases[key]
+        if target not in targets:
+            targets.append(target)
+
+    if not targets:
+        raise ValueError("fp8_target must not be empty.")
+    return targets[0] if len(targets) == 1 else targets
+
+
 @dataclass
 class PretrainingConfig:
     # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
@@ -39,7 +81,7 @@ class PretrainingConfig:
     adam_weight_decay: float = 0.0
     # Gradient clipping threshold (L2 norm). Set float("inf") to disable clipping.
     max_grad_norm: float = float("inf")
-    # Muon-specific hyperparameters (used only when optimizer == "muon" or "normuon").
+    # Muon-family hyperparameters (used when optimizer is muon/normuon/muonh/aurora).
     # adam_* fields are used for the AdamW sub-optimizer.
     muon_learning_rate: float = 1e-3
     muon_weight_decay: float = 0.01
@@ -52,6 +94,10 @@ class PretrainingConfig:
     # 'neuron' normalizes along the last axis; 'short_axis' along the shorter
     # matrix axis. Set to "none" to disable update normalization in MuonH.
     muonh_normalization: str = "neuron"
+    # Hyperball optimizer scope for experiments: "all" applies MuonH/Aurora to
+    # all eligible matrix params; "mlp" applies MuonH/Aurora only to MLP
+    # matrices and keeps other matrices on NorMuon.
+    muonh_scope: str = "all"
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_tokens: int = 256000
@@ -64,12 +110,33 @@ class PretrainingConfig:
     bf16: bool = True
     tf32: bool = True
     fp8: bool = False
-
+    # Pure-torch FP8 conversion target(s): mlp | attn_wqkv | attn_wo.
+    # Any combination, as a comma-separated string or YAML list.
+    fp8_target: Union[str, list[str]] = "mlp"
+    # Pure-torch FP8 only: keep the final N transformer layers in bf16.
+    fp8_skip_last_n_layers: int = 0
+    # Transformer Engine FP8 recipe. Supported names:
+    # delayed | current | block | mxfp8 | nvfp4
+    fp8_recipe: str = "delayed"
+    # TE FP8 format for recipes that accept it: hybrid | e4m3.
+    # NVFP4 ignores this and uses its fixed FP4/FP8 formats.
+    fp8_format: str = "hybrid"
+    # DelayedScaling only: amax history window length.
+    fp8_amax_history_len: int = 64
+    # DelayedScaling only: synchronize amax across the FP8 reduction group.
+    fp8_reduce_amax: bool = True
     # MLM settings
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
     random_token_prob: float = 0.1
     keep_probability: float = 0.1
+    mlm_masking_strategy: str = "token"  # token | span
+    mlm_span_mean_length: float = 3.0
+    mlm_span_max_length: int = 10
+    # Current behavior: only the 20 standard amino acids are MLM targets and
+    # random replacements. Set false to reproduce the legacy all-non-special
+    # token behavior.
+    mlm_standard_amino_acids_only: bool = True
 
     # Logging/checkpointing
     logging_steps: int = 1
@@ -142,6 +209,117 @@ class PretrainingConfig:
     recycling_loop_count_curriculum: str = "1_sqrt"           # "none" | "linear" | "1_sqrt"
     recycling_loop_count_curriculum_steps: int = -1           # -1 = auto (25% of total training steps)
     recycling_pretraining_eval_loop_counts: Optional[list[int]] = None  # None = single r at target mean
+    def __post_init__(self) -> None:
+        for name in (
+            "mlm_probability",
+            "mask_replace_prob",
+            "random_token_prob",
+            "keep_probability",
+            "mlm_span_mean_length",
+        ):
+            setattr(self, name, float(getattr(self, name)))
+
+        strategy = str(self.mlm_masking_strategy).strip().lower()
+        if strategy not in {"token", "span"}:
+            raise ValueError(
+                "mlm_masking_strategy must be one of: token, span "
+                f"(got {self.mlm_masking_strategy!r})"
+            )
+        self.mlm_masking_strategy = strategy
+
+        if self.mlm_span_mean_length <= 0:
+            raise ValueError(
+                f"mlm_span_mean_length must be > 0, got {self.mlm_span_mean_length}"
+            )
+
+        try:
+            self.mlm_span_max_length = int(self.mlm_span_max_length)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"mlm_span_max_length must be an integer, got {self.mlm_span_max_length!r}"
+            ) from exc
+        if self.mlm_span_max_length < 1:
+            raise ValueError(
+                f"mlm_span_max_length must be >= 1, got {self.mlm_span_max_length}"
+            )
+
+        fp8_recipe_aliases = {
+            "delayed": "delayed",
+            "delayed-scaling": "delayed",
+            "delayed_scaling": "delayed",
+            "current": "current",
+            "current-scaling": "current",
+            "current_scaling": "current",
+            "float8-current": "current",
+            "float8_current": "current",
+            "block": "block",
+            "block-scaling": "block",
+            "block_scaling": "block",
+            "float8-block": "block",
+            "float8_block": "block",
+            "mxfp8": "mxfp8",
+            "mx-fp8": "mxfp8",
+            "mxfp8-block": "mxfp8",
+            "mxfp8_block": "mxfp8",
+            "nvfp4": "nvfp4",
+            "nv-fp4": "nvfp4",
+            "nvfp4-block": "nvfp4",
+            "nvfp4_block": "nvfp4",
+        }
+        fp8_recipe = str(self.fp8_recipe).strip().lower()
+        if fp8_recipe not in fp8_recipe_aliases:
+            raise ValueError(
+                "fp8_recipe must be one of: delayed, current, block, mxfp8, nvfp4 "
+                f"(got {self.fp8_recipe!r})"
+            )
+        self.fp8_recipe = fp8_recipe_aliases[fp8_recipe]
+
+        fp8_format_aliases = {
+            "hybrid": "hybrid",
+            "e4m3": "e4m3",
+        }
+        fp8_format = str(self.fp8_format).strip().lower()
+        if fp8_format not in fp8_format_aliases:
+            raise ValueError(
+                "fp8_format must be one of: hybrid, e4m3 "
+                f"(got {self.fp8_format!r})"
+            )
+        self.fp8_format = fp8_format_aliases[fp8_format]
+
+        try:
+            self.fp8_amax_history_len = int(self.fp8_amax_history_len)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "fp8_amax_history_len must be an integer, "
+                f"got {self.fp8_amax_history_len!r}"
+            ) from exc
+        if self.fp8_amax_history_len < 1:
+            raise ValueError(
+                "fp8_amax_history_len must be >= 1, "
+                f"got {self.fp8_amax_history_len}"
+            )
+
+        try:
+            self.fp8_skip_last_n_layers = int(self.fp8_skip_last_n_layers)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "fp8_skip_last_n_layers must be an integer, "
+                f"got {self.fp8_skip_last_n_layers!r}"
+            ) from exc
+        if self.fp8_skip_last_n_layers < 0:
+            raise ValueError(
+                "fp8_skip_last_n_layers must be >= 0, "
+                f"got {self.fp8_skip_last_n_layers}"
+            )
+
+        self.fp8_target = _normalize_fp8_targets(self.fp8_target)
+
+        self.muonh_scope = str(self.muonh_scope).strip().lower()
+        if self.muonh_scope not in {"all", "mlp"}:
+            raise ValueError(
+                "muonh_scope must be one of: all, mlp "
+                f"(got {self.muonh_scope!r})"
+            )
 
 
 @dataclass

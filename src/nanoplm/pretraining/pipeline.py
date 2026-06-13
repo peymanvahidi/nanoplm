@@ -17,7 +17,10 @@ from transformers import (
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.data.datasets.pretrain import ShardedDataset
-from nanoplm.pretraining.collator import ProtDataCollatorForLM
+from nanoplm.pretraining.collator import (
+    ProtDataCollatorForLM,
+    mlm_masking_kwargs_from_config,
+)
 from torch.optim.lr_scheduler import LambdaLR
 
 from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, unwrap_model, MuonAdamWGroup
@@ -27,6 +30,12 @@ from nanoplm.pretraining.utils import compute_batch_setup, get_num_workers, prep
 from nanoplm.utils.logger import logger
 from nanoplm.utils.common import get_device, create_dirs, resolve_world_size
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
+
+
+def _mlm_extra_excluded_token_ids(tokenizer, cfg):
+    if bool(getattr(cfg, "mlm_standard_amino_acids_only", True)):
+        return getattr(tokenizer, "NON_STANDARD_AA_TOKEN_IDS", None)
+    return None
 
 
 def _create_scheduler(optimizer, warmup_steps: int, total_steps: int, learning_rate: float, lr_decay_to_fraction: float, lr_schedule: str = "Linear"):
@@ -177,8 +186,32 @@ def run_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
-        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
+        standard_amino_acids_only=bool(
+            getattr(pretrain_config, "mlm_standard_amino_acids_only", True)
+        ),
+        extra_excluded_token_ids=_mlm_extra_excluded_token_ids(
+            tokenizer, pretrain_config
+        ),
+        **mlm_masking_kwargs_from_config(pretrain_config),
     )
+    mlm_token_policy = (
+        "standard amino acids only"
+        if bool(getattr(pretrain_config, "mlm_standard_amino_acids_only", True))
+        else "legacy all non-special tokens"
+    )
+    logger.info(
+        "MLM token policy: %s",
+        mlm_token_policy,
+    )
+    if getattr(pretrain_config, "mlm_masking_strategy", "token") == "span":
+        logger.info(
+            "MLM masking strategy: span (mean_length=%s, max_length=%s, token_policy=%s)",
+            pretrain_config.mlm_span_mean_length,
+            pretrain_config.mlm_span_max_length,
+            mlm_token_policy,
+        )
+    else:
+        logger.info("MLM masking strategy: token")
 
     create_dirs(pretrain_config.ckp_dir)
 

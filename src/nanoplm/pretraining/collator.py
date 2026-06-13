@@ -6,12 +6,21 @@ Key classes:
 """
 
 import logging
+import math
 import torch
 from dataclasses import dataclass
 from typing import Iterable, Optional, List, Any, Dict, Union
 from transformers import DataCollatorForLanguageModeling
 
 logger = logging.getLogger(__name__)
+
+
+def mlm_masking_kwargs_from_config(cfg) -> Dict[str, Any]:
+    return {
+        "masking_strategy": getattr(cfg, "mlm_masking_strategy", "token"),
+        "span_mean_length": getattr(cfg, "mlm_span_mean_length", 3.0),
+        "span_max_length": getattr(cfg, "mlm_span_max_length", 10),
+    }
 
 
 # -------------------------------------------------------------------- #
@@ -23,8 +32,10 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
     """Protein-aware MLM collator.
 
     - Custom (mask, random, keep) proportions.
-    - Random replacements drawn only from non-special tokens.
+    - Random replacements drawn from standard amino acids by default, or all
+      non-special tokens in legacy mode.
     - Never masks at padding (``attention_mask == 0``).
+    - Supports independent token masking or BERT-style contiguous span masking.
     """
 
     def __init__(
@@ -35,12 +46,36 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         random_token_probability: float = 0.10,
         keep_probability: float = 0.10,
         *,
+        standard_amino_acids_only: bool = True,
         extra_excluded_token_ids: Optional[Iterable[int]] = None,
+        masking_strategy: str = "token",
+        span_mean_length: float = 3.0,
+        span_max_length: int = 10,
         **kwargs,
     ):
         super().__init__(
             tokenizer=tokenizer, mlm=True, mlm_probability=mlm_probability, **kwargs,
         )
+
+        masking_strategy = str(masking_strategy).strip().lower()
+        if masking_strategy not in {"token", "span"}:
+            raise ValueError(
+                "masking_strategy must be one of: token, span "
+                f"(got {masking_strategy!r})"
+            )
+        span_mean_length = float(span_mean_length)
+        if span_mean_length <= 0:
+            raise ValueError(
+                f"span_mean_length must be > 0, got {span_mean_length}"
+            )
+        span_max_length = int(span_max_length)
+        if span_max_length < 1:
+            raise ValueError(
+                f"span_max_length must be >= 1, got {span_max_length}"
+            )
+        self.masking_strategy = masking_strategy
+        self.span_mean_length = span_mean_length
+        self.span_max_length = span_max_length
 
         total = mask_token_probability + random_token_probability + keep_probability
         self.p_mask = mask_token_probability / total
@@ -51,21 +86,94 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
             raise ValueError("Tokenizer must define a mask_token_id for MLM.")
 
         standard_aa_ids = getattr(self.tokenizer, "STANDARD_AA_TOKEN_IDS", None)
-        if standard_aa_ids is not None:
+        standard_amino_acids_only = bool(standard_amino_acids_only)
+        excluded_token_ids = set(extra_excluded_token_ids or ())
+        if standard_amino_acids_only:
+            excluded_token_ids.update(
+                getattr(self.tokenizer, "NON_STANDARD_AA_TOKEN_IDS", ()) or ()
+            )
+
+        if standard_amino_acids_only and standard_aa_ids is not None:
             allowed = sorted(standard_aa_ids)
         else:
             vocab_ids = list(self.tokenizer.get_vocab().values())
             special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
             special_ids.add(self.tokenizer.mask_token_id)
-            if extra_excluded_token_ids:
-                special_ids.update(extra_excluded_token_ids)
+            special_ids.update(excluded_token_ids)
             allowed = [tid for tid in vocab_ids if tid not in special_ids]
         if not allowed:
             raise ValueError(
                 "No allowable token ids for random replacement after exclusions."
             )
         self.allowed_random_token_ids = torch.tensor(allowed, dtype=torch.long)
-        self._excluded_token_ids = frozenset(extra_excluded_token_ids) if extra_excluded_token_ids else frozenset()
+        self.standard_amino_acids_only = standard_amino_acids_only
+        self._excluded_token_ids = frozenset(excluded_token_ids)
+
+    def _sample_span_length(self, device: torch.device) -> int:
+        if self.span_max_length <= 1 or self.span_mean_length <= 1.0:
+            return 1
+
+        p = min(1.0, 1.0 / self.span_mean_length)
+        if p >= 1.0:
+            return 1
+
+        u = float(torch.rand((), device=device).item())
+        u = min(max(u, 1e-12), 1.0 - 1e-12)
+        length = math.ceil(math.log1p(-u) / math.log1p(-p))
+        return max(1, min(self.span_max_length, int(length)))
+
+    def _sample_span_mask(self, candidate_mask: torch.Tensor) -> torch.Tensor:
+        masked_indices = torch.zeros_like(candidate_mask, dtype=torch.bool)
+        mlm_probability = float(self.mlm_probability)
+        if mlm_probability <= 0.0:
+            return masked_indices
+
+        for row_idx in range(candidate_mask.size(0)):
+            eligible = candidate_mask[row_idx]
+            n_eligible = int(eligible.sum().item())
+            if n_eligible == 0:
+                continue
+            if mlm_probability >= 1.0:
+                masked_indices[row_idx] = eligible
+                continue
+
+            expected = mlm_probability * n_eligible
+            target = int(math.floor(expected))
+            if float(torch.rand((), device=candidate_mask.device).item()) < (
+                expected - target
+            ):
+                target += 1
+            target = max(0, min(n_eligible, target))
+            if target == 0:
+                continue
+
+            selected = masked_indices[row_idx]
+            selected_count = 0
+            while selected_count < target:
+                remaining = torch.nonzero(eligible & ~selected, as_tuple=False).flatten()
+                if remaining.numel() == 0:
+                    break
+
+                start = int(
+                    remaining[
+                        torch.randint(
+                            low=0,
+                            high=remaining.numel(),
+                            size=(1,),
+                            device=candidate_mask.device,
+                        ).item()
+                    ].item()
+                )
+                span_len = self._sample_span_length(candidate_mask.device)
+                for pos in range(start, candidate_mask.size(1)):
+                    if not bool(eligible[pos].item()) or bool(selected[pos].item()):
+                        break
+                    selected[pos] = True
+                    selected_count += 1
+                    if selected_count >= target or (pos - start + 1) >= span_len:
+                        break
+
+        return masked_indices
 
     def torch_mask_tokens(
         self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None,
@@ -90,7 +198,10 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
 
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
 
-        masked_indices = torch.bernoulli(probability_matrix).to(torch.bool)
+        if self.masking_strategy == "span":
+            masked_indices = self._sample_span_mask(~special_tokens_mask)
+        else:
+            masked_indices = torch.bernoulli(probability_matrix).to(torch.bool)
         labels[~masked_indices] = -100
 
         if masked_indices.any():
