@@ -724,6 +724,12 @@ def pretrain():
     help="Enable NanoChat-style RMS QK normalization in attention",
 )
 @click.option(
+    "--reorder-rope-qknorm/--no-reorder-rope-qknorm",
+    default=False,
+    help="Apply QK norm BEFORE RoPE (LLaMA-style, better kernel fusion) instead of after. "
+    "Only has effect when --use-qk-norm is set.",
+)
+@click.option(
     "--use-canon-layers/--no-use-canon-layers",
     default=True,
     help="Enable bidirectional Canon-ABCD local mixing layers (pure-torch path only)",
@@ -969,6 +975,7 @@ def run(
     use_resid_lambdas: bool,
     use_x0_lambdas: bool,
     use_qk_norm: bool,
+    reorder_rope_qknorm: bool,
     use_canon_layers: bool,
     canon_layers_mode: str,
     canon_layers_kernel_size: Optional[int],
@@ -1131,6 +1138,7 @@ def run(
         use_resid_lambdas=use_resid_lambdas,
         use_x0_lambdas=use_x0_lambdas,
         use_qk_norm=use_qk_norm,
+        reorder_RoPE_QKNorm=reorder_rope_qknorm,
         use_canon_layers=use_canon_layers,
         canon_layers_mode=canon_layers_mode,
         canon_layers_kernel_size=canon_layers_kernel_size,
@@ -1475,6 +1483,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  use_resid_lambdas: false  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
+        "  reorder_RoPE_QKNorm: false  # true = QK norm BEFORE RoPE (LLaMA-style, better fusion); needs use_qk_norm\n"
         "  global_rope_theta: 160000.0  # RoPE base for full-attention layers; lower (e.g. 10000-40000) suits short max_seq_len\n"
         "  local_rope_theta: 10000.0  # RoPE base for sliding-window layers\n"
         "  rope_dim_fraction: 1.0  # fraction of head_dim to apply RoPE (e.g. 0.25 = 25% rotary + 75% NoPE content dims)\n"
