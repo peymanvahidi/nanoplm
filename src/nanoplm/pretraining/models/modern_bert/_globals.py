@@ -18,9 +18,28 @@ if torch.cuda.is_available():
     from .canon_ops import varlen_canon_conv as _varlen_canon_conv
     from .canon_ops import varlen_ln_canon_conv as _varlen_ln_canon_conv
     from .canon_ops import varlen_rms_canon_conv as _varlen_rms_canon_conv
+
+    # CuTeDSL backend for the RMS+Canon and plain canon paths (sm90, bf16,
+    # C in 512-3072 with C%256==0, K=7).
+    # NANOPLM_CANON_BACKEND=triton disables it; =cute requires it; default
+    # "auto" uses it whenever `canon_cute_ops.is_compatible()` holds.
+    import os as _os
+
+    _CANON_BACKEND = _os.getenv("NANOPLM_CANON_BACKEND", "auto").strip().lower()
+    _canon_cute_ops = None
+    if _CANON_BACKEND in ("auto", "cute"):
+        try:
+            if torch.cuda.get_device_capability() == (9, 0):
+                from . import canon_cute_ops as _canon_cute_ops
+        except Exception:
+            if _CANON_BACKEND == "cute":
+                raise
+            _canon_cute_ops = None
 else:
     _mhc_triton_ops = None  # type: ignore[assignment]
     _canon_ops = None  # type: ignore[assignment]
+    _canon_cute_ops = None  # type: ignore[assignment]
+    _CANON_BACKEND = "triton"
     _varlen_canon_conv = None  # type: ignore[assignment]
     _varlen_ln_canon_conv = None  # type: ignore[assignment]
     _varlen_rms_canon_conv = None  # type: ignore[assignment]

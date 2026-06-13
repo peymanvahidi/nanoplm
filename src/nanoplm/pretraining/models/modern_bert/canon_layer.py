@@ -7,6 +7,7 @@ LayerNorm+Conv Triton, and fused RMSNorm+Conv Triton kernels.
 
 from __future__ import annotations
 
+import weakref
 from contextlib import nullcontext
 from typing import Optional
 
@@ -17,6 +18,7 @@ from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from ._globals import (
     USE_ACTIVATION_CHECKPOINTING_CANON,
+    _canon_cute_ops,
     _canon_ops,
     _varlen_canon_conv,
     _varlen_ln_canon_conv,
@@ -38,6 +40,52 @@ def _canon_accum_dtype(x: torch.Tensor) -> torch.dtype:
     if x.dtype in (torch.float16, torch.bfloat16):
         return torch.float32
     return x.dtype
+
+
+# seq_id is identical for every canon site in a micro-batch (all layers get
+# the same cu_seqlens tensor object), but used to be re-derived per call --
+# 2-3 kernel launches x num_layers x sites per forward, a real cost on
+# power-capped CPUs. Cache it per cu_seqlens *object identity*; the
+# weakref.finalize evicts the entry when the tensor is collected, before its
+# id() can be reused. This is safe where (data_ptr, _version) keying is not:
+# allocator address reuse creates a new python object with a fresh id only
+# after the old entry is gone. (Not a WeakKeyDictionary: weakref.ref.__eq__
+# compares referents with `==`, which is elementwise for tensors.)
+_seq_id_cache: dict = {}
+
+
+def _derive_seq_id(cu_seqlens: torch.Tensor, T: int) -> torch.Tensor:
+    """Per-token sequence index via binary search over cu_seqlens.
+
+    Deliberately NOT the cumsum-of-resets over position_ids: inductor fuses
+    that cumsum into a split-scan (decoupled-lookback) Triton kernel that
+    intermittently triggers illegal memory accesses in training
+    (torch 2.12 + max-autotune, sm90).
+    """
+    if torch.compiler.is_compiling():
+        # No caching under torch.compile: dynamo guards on the cache/weakref
+        # internals (tracing weakref.finalize even guards on the length of
+        # its class-level _registry, which the call itself mutates -> hard
+        # "guard failed on the same frame" error). Inside a compiled graph
+        # the two ops are fused and launch-free anyway.
+        positions = torch.arange(
+            T, device=cu_seqlens.device, dtype=cu_seqlens.dtype
+        )
+        return torch.searchsorted(
+            cu_seqlens[1:], positions, right=True, out_int32=True
+        )
+    key = id(cu_seqlens)
+    cached = _seq_id_cache.get(key)
+    if cached is not None and cached.shape[0] == T:
+        return cached
+    positions = torch.arange(T, device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+    seq_id = torch.searchsorted(
+        cu_seqlens[1:], positions, right=True, out_int32=True
+    )
+    if key not in _seq_id_cache:
+        weakref.finalize(cu_seqlens, _seq_id_cache.pop, key, None)
+    _seq_id_cache[key] = seq_id
+    return seq_id
 
 
 class ModernBertCanonLayer(nn.Module):
@@ -82,16 +130,16 @@ class ModernBertCanonLayer(nn.Module):
             )
             return x + mixed
 
-        if position_ids is not None and position_ids.shape[0] == T:
-            seq_start = (position_ids == 0).to(dtype=cu_seqlens.dtype)
-            seq_start = seq_start.clone()
-            seq_start[0] = 1
-            seq_id = torch.cumsum(seq_start, dim=0) - 1
-        else:
-            positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
-            seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+        seq_id = _derive_seq_id(cu_seqlens, T)
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
+        # CuTeDSL backend (sm90, bf16, C in 512-3072, K=7); returns x + conv(x).
+        if _canon_cute_ops is not None and _canon_cute_ops.is_compatible(
+            x, self.radius
+        ):
+            return _canon_cute_ops.varlen_canon_conv_residual(
+                x, seq_id, weight, bias, self.radius
+            )
         mixed = _varlen_canon_conv(x, seq_id, weight, bias, self.radius)
         return x + mixed
 
@@ -155,14 +203,7 @@ class ModernBertCanonLayer(nn.Module):
             )
             return (ln_out + mixed).to(dtype=x.dtype)
 
-        if position_ids is not None and position_ids.shape[0] == T:
-            seq_start = (position_ids == 0).to(dtype=cu_seqlens.dtype)
-            seq_start = seq_start.clone()
-            seq_start[0] = 1
-            seq_id = torch.cumsum(seq_start, dim=0) - 1
-        else:
-            positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
-            seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+        seq_id = _derive_seq_id(cu_seqlens, T)
 
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
@@ -203,17 +244,17 @@ class ModernBertCanonLayer(nn.Module):
             )
             return (rms_out + mixed).to(dtype=x.dtype)
 
-        if position_ids is not None and position_ids.shape[0] == T:
-            seq_start = (position_ids == 0).to(dtype=cu_seqlens.dtype)
-            seq_start = seq_start.clone()
-            seq_start[0] = 1
-            seq_id = torch.cumsum(seq_start, dim=0) - 1
-        else:
-            positions = torch.arange(T, device=x.device, dtype=cu_seqlens.dtype)
-            seq_id = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+        seq_id = _derive_seq_id(cu_seqlens, T)
 
         weight = self.conv.weight[:, 0, :]
         bias = self.conv.bias
+        # CuTeDSL backend (sm90, bf16, C in 512-3072, K=7) — ~2-4x the Triton kernels.
+        if _canon_cute_ops is not None and _canon_cute_ops.is_compatible(
+            x, self.radius
+        ):
+            return _canon_cute_ops.varlen_rms_canon_conv(
+                x, seq_id, rms_weight, rms_eps, weight, bias, self.radius
+            )
         return _varlen_rms_canon_conv(
             x, seq_id, rms_weight, rms_eps, weight, bias, self.radius
         )
