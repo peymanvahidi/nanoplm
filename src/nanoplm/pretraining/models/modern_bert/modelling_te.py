@@ -215,10 +215,10 @@ class TEModernBertModel(nn.Module):
             self.register_parameter("x0_lambdas", None)
         self.final_norm = te.RMSNorm(config.hidden_size, eps=config.norm_eps)
         self._rope_full_emb = te_attention.RotaryPositionEmbedding(
-            config.head_dim, rotary_base=config.global_rope_theta
+            config.rope_dim, rotary_base=config.global_rope_theta
         )
         self._rope_sliding_emb = te_attention.RotaryPositionEmbedding(
-            config.head_dim, rotary_base=config.local_rope_theta
+            config.rope_dim, rotary_base=config.local_rope_theta
         )
         self._max_pos = config.max_position_embeddings
         # Lazily cached on first forward (needs CUDA device).

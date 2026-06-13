@@ -474,10 +474,11 @@ class ModernBertAttention(nn.Module):
                 if config.layer_types[layer_idx] == "full_attention"
                 else config.local_rope_theta
             )
-            channel = torch.arange(0, config.head_dim, 2, dtype=torch.float32)
+            rope_dim = config.rope_dim
+            channel = torch.arange(0, rope_dim, 2, dtype=torch.float32)
             self.register_buffer(
                 "repo_inv_freq",
-                1.0 / (theta ** (channel / config.head_dim)),
+                1.0 / (theta ** (channel / rope_dim)),
                 persistent=False,
             )
 

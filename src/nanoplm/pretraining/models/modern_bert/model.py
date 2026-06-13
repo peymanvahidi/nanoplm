@@ -59,6 +59,9 @@ class ProtModernBertMLMConfig:
     use_x0_lambdas: bool = False
     use_qk_norm: bool = False
     reorder_RoPE_QKNorm: bool = False  # True = QK norm BEFORE RoPE
+    global_rope_theta: float = 160_000.0  # RoPE base for full-attention layers
+    local_rope_theta: float = 10_000.0  # RoPE base for sliding-window layers
+    rope_dim_fraction: float = 1.0  # fraction of head_dim to apply RoPE (rest are NoPE content dims)
     use_canon_layers: bool = False
     canon_layers_mode: str = "abcd"
     canon_layers_kernel_size: Optional[int] = None
@@ -188,6 +191,8 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
             unk_token_id=self.tokenizer.unk_token_id,
             mask_token_id=self.tokenizer.mask_token_id,
             tie_word_embeddings=config.tie_word_embeddings,
+            global_rope_theta=config.global_rope_theta,
+            local_rope_theta=config.local_rope_theta,
             loss_type="ForMaskedLM",
         )
 

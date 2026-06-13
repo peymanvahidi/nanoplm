@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields
 from typing import Literal, Optional
 
@@ -104,6 +105,7 @@ class ModernBertConfig:
     tie_word_embeddings: bool = True
     global_rope_theta: float = 160_000.0
     local_rope_theta: float = 10_000.0
+    rope_dim_fraction: float = 1.0  # fraction of head_dim to apply RoPE; remainder are NoPE content dims
     use_resid_lambdas: bool = False
     use_x0_lambdas: bool = False
     use_qk_norm: bool = False
@@ -126,11 +128,8 @@ class ModernBertConfig:
     use_diff_attn_v2: bool = False
     use_paired_head_attention: bool = False
     attn_layer_pattern: Optional[str] = None
-    # When False, Q/K/V projections use separate nn.Linear modules instead of a
-    # single fused Wqkv.  Separate projections give Muon's Newton-Schulz
-    # orthogonalization independent subspaces for each head group, which is the
-    # mathematically correct formulation.  Fused (True) is faster due to wider
-    # matmuls but couples the orthogonalization across Q, K, and V.
+    # When False, Q/K/V use separate nn.Linear modules instead of a single Wqkv.
+    # This keeps Muon orthogonalization independent per subspace.
     fused_qkv: bool = True
     # When False, SwiGLU/GLU up and gate projections use separate nn.Linear
     # modules instead of a single fused Wi.  Same Muon rationale as fused_qkv:
@@ -170,6 +169,7 @@ class ModernBertConfig:
     recycling_use_takase_init: bool = True    # Overrides wo_init for recurrent block; rescales Wo by sqrt(1/(5·h·l))
 
     head_dim: int = field(init=False)
+    rope_dim: int = field(init=False)
     sliding_window: int = field(init=False)
     layer_types: list[str] = field(init=False)
     canon_layer_set: frozenset[str] = field(init=False)
@@ -263,11 +263,23 @@ class ModernBertConfig:
                 "Paired head attention requires an even head_dim. "
                 f"Got head_dim={self.head_dim}."
             )
+        # Partial RoPE: compute rope_dim from fraction.
+        self.rope_dim_fraction = float(self.rope_dim_fraction)
+        if not (0.0 < self.rope_dim_fraction <= 1.0):
+            raise ValueError(
+                f"rope_dim_fraction must be in (0.0, 1.0], got {self.rope_dim_fraction}"
+            )
+        raw_rope_dim = int(self.head_dim * self.rope_dim_fraction)
+        # Round down to nearest even number (RoPE needs pairs).
+        self.rope_dim = max(2, raw_rope_dim - raw_rope_dim % 2)
+        if self.rope_dim > self.head_dim:
+            self.rope_dim = self.head_dim
         self.sliding_window = self.local_attention // 2
         self.mlp_activation = self.mlp_activation.lower()
         if self.mlp_activation not in {"swiglu", "glu", "srelu"}:
             raise ValueError(
-                f"Unsupported mlp_activation: {self.mlp_activation}. Supported: ['swiglu', 'glu', 'srelu']"
+                f"Unsupported mlp_activation: {self.mlp_activation}. "
+                "Supported: ['swiglu', 'glu', 'srelu']"
             )
         self.canon_layers_kernel_size = _resolve_canon_kernel_size(
             self.canon_layers_kernel_size,
