@@ -285,12 +285,12 @@ class ModernBertSReluMLP(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if USE_TRITON_SRELU:
+        if USE_TRITON_SRELU and isinstance(self.Wi, nn.Linear):
             from nanoplm.pretraining.models.modern_bert.triton_kernels import (
-                FusedLinearReLUSquare,
+                fused_linear_relu_square,
             )
 
-            out = FusedLinearReLUSquare.apply(x, self.Wi.weight, self.Wo_weight)
+            out = fused_linear_relu_square(x, self.Wi.weight, self.Wo_weight)
         else:
             h = F.relu(self.Wi(x))
             h = h * h
@@ -363,7 +363,8 @@ class ModernBertSwiGLUMLP(nn.Module):
                 attention_mask=attention_mask,
             )
         x_proj, gate = wi.chunk(2, dim=-1)
-        return self.Wo(self.drop(F.silu(gate) * x_proj))
+        hidden = F.silu(gate) * x_proj
+        return self.Wo(self.drop(hidden))
 
 
 class ModernBertAttention(nn.Module):
@@ -616,6 +617,15 @@ class ModernBertAttention(nn.Module):
         )
         if _FLASH_HAS_DROPOUT:
             kwargs["dropout_p"] = self.dropout if self.training else 0.0
+
+        # FlashAttention requires q/k/v share an fp16/bf16/fp8 dtype. Under
+        # eager autocast, QK-norm (F.rms_norm) returns fp32 regardless of the
+        # input/param dtype, so q/k can arrive as fp32 while v stays bf16. Align
+        # them to v's dtype before the kernel. No-op when dtypes already match.
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
 
         y = _flash_varlen_fn(q, k, v, **kwargs)
         if isinstance(y, tuple):
@@ -1443,12 +1453,26 @@ class ModernBertModel(nn.Module):
         )
 
     def update_prores_alphas(self, step: int) -> None:
-        """Recompute per-layer ProRes alphas. Call once per optimizer step."""
-        T = self._prores_T
-        vals = [
-            min(step / (T * (l + 1)), 1.0) for l in range(self.config.num_hidden_layers)
-        ]
-        self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
+        """Recompute per-layer ProRes alphas. Call once per optimizer step.
+
+        Computed entirely on the buffer's device: building a CPU tensor and
+        copy_()-ing it in is a pageable H2D memcpy, which synchronizes the
+        host with the full GPU stream every optimizer step (measured 50-80ms
+        stalls at grad_accum=1 — it drains all accumulated CPU run-ahead).
+        alpha_l = min(step / (T*(l+1)), 1) == clamp(step/T / (l+1), max=1).
+        """
+        denoms = getattr(self, "_prores_denoms", None)
+        if denoms is None or denoms.device != self._prores_alphas.device:
+            denoms = torch.arange(
+                1,
+                self.config.num_hidden_layers + 1,
+                device=self._prores_alphas.device,
+                dtype=self._prores_alphas.dtype,
+            )
+            self._prores_denoms = denoms
+        torch.clamp(
+            (step / self._prores_T) / denoms, max=1.0, out=self._prores_alphas
+        )
 
     def _recurrent_step_varlen(
         self,
@@ -1694,10 +1718,11 @@ class ModernBertModel(nn.Module):
                 if _max_seqlen is not None
                 else self.config.max_position_embeddings
             )
-            cos_f, sin_f = self.rotary_emb(rope_len, device, x.dtype, "full_attention")
-            cos_s, sin_s = self.rotary_emb(
-                rope_len, device, x.dtype, "sliding_attention"
-            )
+            # Specialized entry points (not forward(layer_type=...)): the
+            # string branch makes dynamo compile + guard-check one variant
+            # per value on every step.
+            cos_f, sin_f = self.rotary_emb.forward_full(rope_len, device, x.dtype)
+            cos_s, sin_s = self.rotary_emb.forward_sliding(rope_len, device, x.dtype)
             rope = {
                 "full_attention": (
                     self.rotary_emb.paired_from_positions(
@@ -2168,7 +2193,7 @@ class ModernBertForMaskedLM(nn.Module):
                 if hasattr(module, "bias") and module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        for layer in self.model.layers:
+        for layer_idx, layer in enumerate(self.model.layers):
             if isinstance(layer, MHCLiteBlock):
                 enc = layer.layer
                 mhc_blocks = [layer]

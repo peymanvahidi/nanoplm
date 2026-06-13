@@ -16,11 +16,14 @@ import torch
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 import wandb
-try:
-    from dion import Muon as DionMuon, NorMuon as DionNorMuon
-except ImportError:
-    class DionMuon: pass      # sentinel – isinstance() safely returns False
-    class DionNorMuon: pass
+from transformer_engine.common.recipe import (
+    DelayedScaling,
+    Float8BlockScaling,
+    Float8CurrentScaling,
+    Format,
+    MXFP8BlockScaling,
+    NVFP4BlockScaling,
+)
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -33,10 +36,10 @@ from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
     build_power_of_two_buckets,
+    mlm_masking_kwargs_from_config,
 )
 from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.models.modern_bert.modeling import MHCLiteBlock
-from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import prepare_run_and_steps, resolve_total_steps
@@ -46,10 +49,10 @@ from nanoplm.pretraining.pure_pipeline import (
     _create_optimizer,
     _create_scheduler,
     _ddp_sync_context,
+    _DION_OPTIMIZER_TYPES,
     _dist_barrier,
     _estimate_model_flops_per_token,
     _evaluate,
-    _first_nonfinite_grad,
     _first_nonfinite_param,
     _format_vram_for_log,
     _get_batch_warmup_params,
@@ -65,10 +68,52 @@ from nanoplm.pretraining.pure_pipeline import (
     _split_batch,
     _sync_train_loader_len,
 )
+from nanoplm.pretraining.optim import MuonAdamWGroup
 from nanoplm.utils.common import create_dirs, get_device
 from nanoplm.utils.logger import logger
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 from nanoplm.pretraining.utils import get_num_workers
+
+
+def _mlm_extra_excluded_token_ids(tokenizer, cfg):
+    if bool(getattr(cfg, "mlm_standard_amino_acids_only", True)):
+        return getattr(tokenizer, "NON_STANDARD_AA_TOKEN_IDS", None)
+    return None
+
+
+def _te_fp8_format_from_config(cfg: PretrainingConfig) -> Format:
+    fp8_format = str(getattr(cfg, "fp8_format", "hybrid")).strip().lower()
+    if fp8_format == "hybrid":
+        return Format.HYBRID
+    if fp8_format == "e4m3":
+        return Format.E4M3
+    raise ValueError(
+        "fp8_format must be one of: hybrid, e4m3 "
+        f"(got {getattr(cfg, 'fp8_format', None)!r})"
+    )
+
+
+def _te_fp8_recipe_from_config(cfg: PretrainingConfig):
+    recipe_name = str(getattr(cfg, "fp8_recipe", "delayed")).strip().lower()
+    fp8_format = _te_fp8_format_from_config(cfg)
+    if recipe_name == "delayed":
+        return DelayedScaling(
+            fp8_format=fp8_format,
+            amax_history_len=int(getattr(cfg, "fp8_amax_history_len", 64)),
+            reduce_amax=bool(getattr(cfg, "fp8_reduce_amax", True)),
+        )
+    if recipe_name == "current":
+        return Float8CurrentScaling(fp8_format=fp8_format)
+    if recipe_name == "block":
+        return Float8BlockScaling(fp8_format=fp8_format)
+    if recipe_name == "mxfp8":
+        return MXFP8BlockScaling(fp8_format=fp8_format)
+    if recipe_name == "nvfp4":
+        return NVFP4BlockScaling()
+    raise ValueError(
+        "fp8_recipe must be one of: delayed, current, block, mxfp8, nvfp4 "
+        f"(got {getattr(cfg, 'fp8_recipe', None)!r})"
+    )
 
 
 def _compile_te_mhc_blocks(
@@ -282,6 +327,32 @@ def run_te_pretraining(
 
     use_packing = bool(pretrain_config.use_packing)
     use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
+    mlm_standard_amino_acids_only = bool(
+        getattr(pretrain_config, "mlm_standard_amino_acids_only", True)
+    )
+    mlm_extra_excluded_token_ids = _mlm_extra_excluded_token_ids(
+        tokenizer, pretrain_config
+    )
+    logger.info(
+        "MLM token policy: %s",
+        "standard amino acids only"
+        if mlm_standard_amino_acids_only
+        else "legacy all non-special tokens",
+    )
+    mlm_token_policy = (
+        "standard amino acids only"
+        if mlm_standard_amino_acids_only
+        else "legacy all non-special tokens"
+    )
+    if getattr(pretrain_config, "mlm_masking_strategy", "token") == "span":
+        logger.info(
+            "MLM masking strategy: span (mean_length=%s, max_length=%s, token_policy=%s)",
+            pretrain_config.mlm_span_mean_length,
+            pretrain_config.mlm_span_max_length,
+            mlm_token_policy,
+        )
+    else:
+        logger.info("MLM masking strategy: token")
     pack_tokens_per_micro = None
     min_tokens_per_seq = None
     seq_count_buckets = None
@@ -463,7 +534,9 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
-            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
+            standard_amino_acids_only=mlm_standard_amino_acids_only,
+            extra_excluded_token_ids=mlm_extra_excluded_token_ids,
+            **mlm_masking_kwargs_from_config(pretrain_config),
         )
         if use_static_inp_size:
             assert tokens_per_micro == pack_tokens_per_micro
@@ -502,7 +575,9 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
-            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
+            standard_amino_acids_only=mlm_standard_amino_acids_only,
+            extra_excluded_token_ids=mlm_extra_excluded_token_ids,
+            **mlm_masking_kwargs_from_config(pretrain_config),
         )
     else:
         train_sampler = RandomSampler(train_ds)
@@ -512,7 +587,9 @@ def run_te_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
-            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
+            standard_amino_acids_only=mlm_standard_amino_acids_only,
+            extra_excluded_token_ids=mlm_extra_excluded_token_ids,
+            **mlm_masking_kwargs_from_config(pretrain_config),
         )
 
     # Keep orig_model reference for checkpointing/eval.
@@ -537,7 +614,9 @@ def run_te_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
-        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
+        standard_amino_acids_only=mlm_standard_amino_acids_only,
+        extra_excluded_token_ids=mlm_extra_excluded_token_ids,
+        **mlm_masking_kwargs_from_config(pretrain_config),
     )
     dl_kwargs = dict(
         num_workers=num_workers,
@@ -684,6 +763,7 @@ def run_te_pretraining(
             wandb.init(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
+                mode="offline",
                 config={
                     "pretrain": pretrain_config.__dict__,
                     "model": model.model_config.__dict__,
@@ -755,6 +835,9 @@ def run_te_pretraining(
     fp8_enabled = bool(pretrain_config.fp8 and device.type == "cuda")
     if pretrain_config.fp8 and device.type != "cuda":
         logger.warning("fp8=True but device is not CUDA. FP8 autocast will be disabled.")
+    fp8_recipe = _te_fp8_recipe_from_config(pretrain_config) if fp8_enabled else None
+    if fp8_recipe is not None:
+        logger.info(f"Transformer Engine FP8 recipe: {fp8_recipe}")
     # For multi-GPU: pass the process group so TE reduces FP8 amax tensors across all ranks,
     # keeping scaling factors in sync (avoids divergent quantization between data-parallel replicas).
     fp8_group = dist.group.WORLD if (fp8_enabled and distributed and dist.is_initialized()) else None
@@ -918,7 +1001,7 @@ def run_te_pretraining(
                         if amp_dtype is not None
                         else nullcontext()
                     )
-                    fp8_ctx = te.autocast(enabled=fp8_enabled, recipe=FP8_RECIPE, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
+                    fp8_ctx = te.autocast(enabled=fp8_enabled, recipe=fp8_recipe, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
                     with sync_ctx:
                         with amp_ctx, fp8_ctx:
                             fwd_kwargs = {
@@ -965,37 +1048,25 @@ def run_te_pretraining(
                         continue
 
                     if scaler is not None and scaler.is_enabled():
-                        scaler.unscale_(optimizer)
-                    try:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            orig_model.parameters(),
-                            max_norm=max_grad_norm,
-                            error_if_nonfinite=True,
-                        )
-                    except RuntimeError as exc:
-                        if "non-finite" not in str(exc).lower():
-                            raise
-                        bad_grad = _first_nonfinite_grad(orig_model)
-                        bad_name = bad_grad[0] if bad_grad is not None else "<unknown>"
-                        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-                        logger.error(
-                            "Skipping optimizer step %d due to non-finite gradient in %s on rank %d (epoch=%d data_step=%d sub_batch=%d).",
-                            global_step + 1,
-                            bad_name,
-                            rank,
-                            epoch,
-                            micro_step,
-                            sub_batch_idx,
-                        )
-                        optimizer.zero_grad(set_to_none=True)
-                        accum_loss.zero_()
-                        accum_micro_count = 0
-                        continue
+                        if isinstance(optimizer, MuonAdamWGroup):
+                            scaler.unscale_(optimizer.muon)
+                            scaler.unscale_(optimizer.adamw)
+                        else:
+                            scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        orig_model.parameters(),
+                        max_norm=max_grad_norm,
+                        error_if_nonfinite=False,
+                    )
 
                     optimizer_step_skipped = False
                     if scaler is not None and scaler.is_enabled():
                         old_scale = scaler.get_scale()
-                        scaler.step(optimizer)
+                        if isinstance(optimizer, MuonAdamWGroup):
+                            scaler.step(optimizer.muon)
+                            scaler.step(optimizer.adamw)
+                        else:
+                            scaler.step(optimizer)
                         scaler.update()
                         optimizer_step_skipped = scaler.get_scale() < old_scale
                     else:
@@ -1011,7 +1082,10 @@ def run_te_pretraining(
                             f"sub_batch={sub_batch_idx})."
                         )
 
-                    if isinstance(optimizer, (DionMuon, DionNorMuon)):
+                    if isinstance(optimizer, MuonAdamWGroup):
+                        muon_lr = optimizer.muon.param_groups[0]["lr"]
+                        learning_rate = optimizer.adamw.param_groups[0]["lr"]
+                    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
                         muon_lr = optimizer.param_groups[0]["lr"]
                         learning_rate = optimizer.param_groups[1]["lr"]
                     else:
@@ -1150,7 +1224,7 @@ def run_te_pretraining(
                         window_steps = 0
 
                     if global_step % eval_steps == 0:
-                        fp8_eval_ctx = te.autocast(enabled=fp8_enabled, recipe=FP8_RECIPE, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
+                        fp8_eval_ctx = te.autocast(enabled=fp8_enabled, recipe=fp8_recipe, amax_reduction_group=fp8_group) if fp8_enabled else nullcontext()
                         with fp8_eval_ctx:
                             eval_loss = _evaluate(
                                 model=orig_model,

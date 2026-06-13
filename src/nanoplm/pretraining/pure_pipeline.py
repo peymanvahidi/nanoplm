@@ -12,12 +12,22 @@ import yaml
 from copy import deepcopy
 from dataclasses import asdict
 try:
-    from dion import Muon, NorMuon, MuonH
+    from dion import Muon
 except ImportError:
     Muon = None  # type: ignore[assignment,misc]
+try:
+    from dion import NorMuon
+except ImportError:
     NorMuon = None  # type: ignore[assignment,misc]
+try:
+    from dion import MuonH
+except ImportError:
     MuonH = None  # type: ignore[assignment,misc]
-_DION_OPTIMIZER_TYPES = tuple(t for t in (Muon, NorMuon, MuonH) if t is not None)
+try:
+    from dion import Aurora
+except ImportError:
+    Aurora = None  # type: ignore[assignment,misc]
+_DION_OPTIMIZER_TYPES = tuple(t for t in (Muon, NorMuon, MuonH, Aurora) if t is not None)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -56,12 +66,13 @@ from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
     build_power_of_two_buckets,
+    mlm_masking_kwargs_from_config,
 )
 from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
 from nanoplm.pretraining.fp8 import (
-    Float8Linear,
-    Float8LinearConfig,
-    convert_to_float8_training,
+    convert_fp8_targets,
+    te_fp8_autocast_context,
+    te_fp8_recipe_from_config,
 )
 from nanoplm.pretraining.models.modern_bert.modeling import (
     MHCLiteBlock,
@@ -69,7 +80,12 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertEncoderLayer,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, MuonAdamWGroup
+from nanoplm.pretraining.optim import (
+    OptimizerGroup,
+    build_muon_optimizer,
+    is_muon_optimizer,
+    MuonAdamWGroup,
+)
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
@@ -95,6 +111,13 @@ H100_PEAK_TFLOPS = 989.4
 
 # https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
 N_PREFETCH_LAYERS_FSDP2 = 1
+
+# How many micro-steps before the synced epoch end the per-step batch
+# exhaustion allreduce kicks in.  synced_len is the all-rank MIN of exact
+# per-rank loader lengths, so ranks can only run dry inside this window;
+# running the (blocking) coordination allreduce every step would serialize
+# host and device once per micro-step.
+BATCH_COORD_TAIL_STEPS = 64
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +544,63 @@ def _has_nonfinite_params(model) -> bool:
     return _has_nonfinite_tensors([param for param in model.parameters()])
 
 
+def _nonfinite_check_tensor(tensors: list[torch.Tensor]) -> torch.Tensor | None:
+    """Device-side analog of _has_nonfinite_tensors: a scalar bool tensor
+    (True = some tensor is non-finite) with no host synchronization."""
+    local_tensors = []
+    for tensor in tensors:
+        local = _local_tensor(tensor.detach())
+        if local.numel() > 0:
+            local_tensors.append(local)
+    if not local_tensors:
+        return None
+    try:
+        norms = torch._foreach_norm(local_tensors, float("inf"))
+        return ~torch.isfinite(torch.stack(list(norms))).all()
+    except (RuntimeError, TypeError):
+        return ~torch.stack([torch.isfinite(t).all() for t in local_tensors]).all()
+
+
+class _DeferredFiniteCheck:
+    """Non-finite tripwire that avoids blocking the host on the full stream.
+
+    `.item()` on a fresh GPU scalar issues a stream-wide cudaStreamSynchronize,
+    draining every queued kernel and resetting CPU run-ahead (measured 31 ms
+    per step on GH200).  Instead, submit() enqueues a device->pinned-host copy
+    of the verdict and records a CUDA event; poll() waits only on that event,
+    which has long completed by the time the host loops back around.  On
+    non-CUDA devices it degrades to a synchronous check.
+    """
+
+    def __init__(self, device: torch.device):
+        self._is_cuda = device.type == "cuda"
+        self._verdict = False
+        self._pending = False
+        if self._is_cuda:
+            self._dev_buf = torch.zeros(1, dtype=torch.bool, device=device)
+            self._host_buf = torch.zeros(1, dtype=torch.bool, pin_memory=True)
+            self._event = torch.cuda.Event()
+
+    def submit(self, nonfinite: torch.Tensor) -> None:
+        if self._is_cuda:
+            self._dev_buf.copy_(nonfinite.reshape(1))
+            self._host_buf.copy_(self._dev_buf, non_blocking=True)
+            self._event.record()
+        else:
+            self._verdict = bool(nonfinite.item())
+        self._pending = True
+
+    def poll(self) -> bool:
+        """Verdict of the most recent submit(); False if nothing pending."""
+        if not self._pending:
+            return False
+        self._pending = False
+        if self._is_cuda:
+            self._event.synchronize()
+            return bool(self._host_buf.item())
+        return self._verdict
+
+
 def _use_weight_decay(name: str, param: torch.nn.Parameter) -> bool:
     if not param.requires_grad or param.ndim < 2:
         return False
@@ -548,6 +628,22 @@ def _get_distributed_mode(cfg: PretrainingConfig, *, distributed: bool) -> str:
 
 def _checkpoint_distributed_mode(*, distributed: bool, distributed_mode: str) -> str:
     return distributed_mode if distributed else "single"
+
+
+def _bootstrap_single_process_env() -> None:
+    """Default the torchrun rendezvous env vars for a self-contained 1-process
+    group, so a plain `nanoplm pretrain` invocation (no torchrun) can
+    initialize NCCL with the env:// method."""
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    if "MASTER_PORT" not in os.environ:
+        import socket
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            os.environ["MASTER_PORT"] = str(s.getsockname()[1])
 
 
 def _ddp_sync_context(model: torch.nn.Module, *, distributed_mode: str, sync: bool):
@@ -850,7 +946,7 @@ def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = Non
 
 def _create_optimizer(model, cfg, distributed_mesh=None):
     name = str(cfg.optimizer).lower()
-    if name in {"muon", "normuon", "muonh"}:
+    if name in {"muon", "normuon", "muonh", "aurora"}:
         return build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
     from nanoplm.pretraining.optim import _classify_noble_param
@@ -910,7 +1006,13 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
             logger.warning("StableAdamW unavailable; falling back to AdamW.")
             return torch.optim.AdamW(**kwargs)
         return cls(**kwargs)
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon, muonh]")
+    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon, muonh, aurora]")
+
+
+def _mlm_extra_excluded_token_ids(tokenizer, cfg):
+    if bool(getattr(cfg, "mlm_standard_amino_acids_only", True)):
+        return getattr(tokenizer, "NON_STANDARD_AA_TOKEN_IDS", None)
+    return None
 
 
 class _SchedulerGroup:
@@ -920,24 +1022,46 @@ class _SchedulerGroup:
     can call .step() and .state_dict() / .load_state_dict() transparently.
     """
 
-    def __init__(self, muon_scheduler: LambdaLR, adamw_scheduler: LambdaLR):
+    def __init__(self, muon_scheduler, adamw_scheduler):
         self.muon_sched = muon_scheduler
         self.adamw_sched = adamw_scheduler
 
+    @staticmethod
+    def _iter_scheds(sched):
+        return sched if isinstance(sched, list) else [sched]
+
+    @staticmethod
+    def _state_dict(sched):
+        if isinstance(sched, list):
+            return [s.state_dict() for s in sched]
+        return sched.state_dict()
+
+    @staticmethod
+    def _load_state_dict(sched, state_dict):
+        if isinstance(sched, list):
+            if not isinstance(state_dict, list) or len(state_dict) != len(sched):
+                raise ValueError("Scheduler state list does not match current scheduler layout.")
+            for s, sd in zip(sched, state_dict):
+                s.load_state_dict(sd)
+        else:
+            sched.load_state_dict(state_dict)
+
     def step(self):
-        self.muon_sched.step()
-        self.adamw_sched.step()
+        for sched in self._iter_scheds(self.muon_sched):
+            sched.step()
+        for sched in self._iter_scheds(self.adamw_sched):
+            sched.step()
 
     def state_dict(self):
         return {
-            "muon": self.muon_sched.state_dict(),
-            "adamw": self.adamw_sched.state_dict(),
+            "muon": self._state_dict(self.muon_sched),
+            "adamw": self._state_dict(self.adamw_sched),
         }
 
     def load_state_dict(self, state_dict):
         if "muon" in state_dict and "adamw" in state_dict:
-            self.muon_sched.load_state_dict(state_dict["muon"])
-            self.adamw_sched.load_state_dict(state_dict["adamw"])
+            self._load_state_dict(self.muon_sched, state_dict["muon"])
+            self._load_state_dict(self.adamw_sched, state_dict["adamw"])
         else:
             # Legacy single-scheduler checkpoint — skip gracefully.
             logger.warning(
@@ -1035,10 +1159,15 @@ def _create_scheduler(
                 pg.setdefault("initial_lr", pg["lr"])
         return LambdaLR(opt, lr_lambda, last_epoch=last_ep)
 
+    def _make_scheduler_any(opt, last_ep):
+        if isinstance(opt, OptimizerGroup):
+            return [_make_scheduler(inner, last_ep) for inner in opt.optimizers]
+        return _make_scheduler(opt, last_ep)
+
     if isinstance(optimizer, MuonAdamWGroup):
         return _SchedulerGroup(
-            _make_scheduler(optimizer.muon, last_epoch),
-            _make_scheduler(optimizer.adamw, last_epoch),
+            _make_scheduler_any(optimizer.muon, last_epoch),
+            _make_scheduler_any(optimizer.adamw, last_epoch),
         )
 
     if last_epoch >= 0:
@@ -1631,6 +1760,32 @@ def run_pure_pretraining(
 
     use_packing = bool(pretrain_config.use_packing)
     use_static_inp_size = bool(pretrain_config.use_static_inp_size and use_packing)
+    mlm_standard_amino_acids_only = bool(
+        getattr(pretrain_config, "mlm_standard_amino_acids_only", True)
+    )
+    mlm_extra_excluded_token_ids = _mlm_extra_excluded_token_ids(
+        tokenizer, pretrain_config
+    )
+    logger.info(
+        "MLM token policy: %s",
+        "standard amino acids only"
+        if mlm_standard_amino_acids_only
+        else "legacy all non-special tokens",
+    )
+    mlm_token_policy = (
+        "standard amino acids only"
+        if mlm_standard_amino_acids_only
+        else "legacy all non-special tokens"
+    )
+    if getattr(pretrain_config, "mlm_masking_strategy", "token") == "span":
+        logger.info(
+            "MLM masking strategy: span (mean_length=%s, max_length=%s, token_policy=%s)",
+            pretrain_config.mlm_span_mean_length,
+            pretrain_config.mlm_span_max_length,
+            mlm_token_policy,
+        )
+    else:
+        logger.info("MLM masking strategy: token")
 
     # MoE guard rails.
     if getattr(model.config, "use_moe", False):
@@ -1693,6 +1848,30 @@ def run_pure_pretraining(
     distributed_mode = _get_distributed_mode(pretrain_config, distributed=distributed)
     ddp_bucket_cap_mb = int(getattr(pretrain_config, "ddp_bucket_cap_mb", 25))
 
+    # Single-GPU bf16 runs are promoted to a 1-rank FSDP2 run so precision
+    # semantics match the multi-GPU path: FSDP's MixedPrecisionPolicy casts
+    # params to bf16 for forward (embeddings/norms/residual stream all bf16,
+    # no autocast) while the optimizer keeps fp32 masters. The legacy
+    # fp32-params + torch.autocast path leaves the residual stream in fp32,
+    # which diverges numerically from production and blocks bf16-gated
+    # kernels (e.g. the CuTeDSL canon backend). Set NANOPLM_SINGLE_GPU_AMP=1
+    # to keep the legacy autocast behavior.
+    if (
+        not distributed
+        and distributed_mode == "fsdp"
+        and pretrain_config.bf16
+        and torch.cuda.is_available()
+        and torch.cuda.is_bf16_supported()
+        and os.environ.get("NANOPLM_SINGLE_GPU_AMP", "0") != "1"
+    ):
+        _bootstrap_single_process_env()
+        distributed = True
+        logger.info(
+            "Single-GPU bf16: promoting to a 1-rank FSDP run so precision "
+            "matches the multi-GPU path (bf16 forward params, fp32 masters, "
+            "no autocast). Set NANOPLM_SINGLE_GPU_AMP=1 for the legacy "
+            "fp32+autocast behavior."
+        )
 
     if distributed:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
@@ -1727,7 +1906,9 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
-            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
+            standard_amino_acids_only=mlm_standard_amino_acids_only,
+            extra_excluded_token_ids=mlm_extra_excluded_token_ids,
+            **mlm_masking_kwargs_from_config(pretrain_config),
         )
         if use_static_inp_size:
             min_tokens_per_seq = max(
@@ -1769,22 +1950,42 @@ def run_pure_pretraining(
             mask_token_probability=pretrain_config.mask_replace_prob,
             random_token_probability=pretrain_config.random_token_prob,
             keep_probability=pretrain_config.keep_probability,
-            extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
+            standard_amino_acids_only=mlm_standard_amino_acids_only,
+            extra_excluded_token_ids=mlm_extra_excluded_token_ids,
+            **mlm_masking_kwargs_from_config(pretrain_config),
         )
         train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
+
+    # Move parameters to CUDA before optional TE MLP conversion so replacement
+    # modules are created on the target device/rank.
+    model.to(device)
 
     # ---- FP8 (optional) ----
     if pretrain_config.fp8:
         if device.type != "cuda":
             raise ValueError("fp8=True requires CUDA.")
-        fp8_filter = lambda mod, _: isinstance(mod, torch.nn.Linear) and mod.in_features % 16 == 0 and mod.out_features % 16 == 0
-        convert_to_float8_training(model, config=Float8LinearConfig.from_recipe_name("tensorwise"), module_filter_fn=fp8_filter)
-        n_fp8 = sum(1 for m in model.modules() if isinstance(m, Float8Linear))
-        n_lin = sum(1 for m in model.modules() if isinstance(m, torch.nn.Linear))
-        logger.info(f"FP8 enabled (tensorwise): converted={n_fp8} linear layers, skipped={max(0, n_lin - n_fp8)}")
+
+        fp8_recipe = te_fp8_recipe_from_config(pretrain_config)
+        fp8_target = getattr(pretrain_config, "fp8_target", "mlp")
+        fp8_skip_last = int(getattr(pretrain_config, "fp8_skip_last_n_layers", 0))
+        n_fp8 = convert_fp8_targets(
+            model,
+            target=fp8_target,
+            skip_last_n_layers=fp8_skip_last,
+        )
+        if n_fp8 == 0:
+            raise ValueError(
+                "fp8=True requires at least one eligible block for Transformer Engine "
+                f"FP8 conversion target={fp8_target!r}, "
+                f"skip_last_n_layers={fp8_skip_last}."
+            )
+        logger.info(
+            "FP8 enabled (Transformer Engine conversion): "
+            f"target={fp8_target}, recipe={fp8_recipe}, "
+            f"skip_last_n_layers={fp8_skip_last}, converted_blocks={n_fp8}"
+        )
 
     # ---- Model to device + compile + FSDP ----
-    model.to(device)
     base_model = model
 
     compile_dynamic = not bool(use_packing and use_static_inp_size)
@@ -1902,7 +2103,9 @@ def run_pure_pretraining(
         mask_token_probability=pretrain_config.mask_replace_prob,
         random_token_probability=pretrain_config.random_token_prob,
         keep_probability=pretrain_config.keep_probability,
-        extra_excluded_token_ids=tokenizer.NON_STANDARD_AA_TOKEN_IDS,
+        standard_amino_acids_only=mlm_standard_amino_acids_only,
+        extra_excluded_token_ids=mlm_extra_excluded_token_ids,
+        **mlm_masking_kwargs_from_config(pretrain_config),
     )
 
     dl_kwargs = dict(
@@ -2182,6 +2385,7 @@ def run_pure_pretraining(
             wandb.init(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
+                mode="offline",
                 config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
             )
             wandb_enabled = wandb.run is not None
@@ -2198,6 +2402,15 @@ def run_pure_pretraining(
     amp_dtype: Optional[torch.dtype] = None
     if use_bf16 and (not distributed or distributed_mode == "ddp"):
         amp_dtype = torch.bfloat16
+        if distributed_mode == "ddp":
+            logger.warning(
+                "DDP bf16 uses fp32 params + torch.autocast: the residual "
+                "stream and norms run in fp32, which differs numerically from "
+                "the FSDP path (bf16 forward params, no autocast) and "
+                "disables bf16-gated kernels such as the CuTeDSL canon "
+                "backend. Loss curves are not directly comparable with FSDP "
+                "runs."
+            )
     elif use_fp16:
         amp_dtype = torch.float16
 
@@ -2336,6 +2549,21 @@ def run_pure_pretraining(
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
+    loss_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
+    param_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
+
+    def _raise_on_nonfinite_params(context: str) -> None:
+        # Consumes the async verdict submitted after the previous optimizer
+        # step; detection therefore lags corruption by at most one step.
+        if param_finite_check is None or not param_finite_check.poll():
+            return
+        bad_param = _first_nonfinite_param(orig_model)
+        bad_name = bad_param[0] if bad_param is not None else "<unknown>"
+        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+        raise RuntimeError(
+            f"Non-finite parameter detected {context} in {bad_name} on rank {rank} "
+            f"(async check: corruption occurred during the preceding optimizer step)."
+        )
     debug_layerwise_enabled = bool(getattr(pretrain_config, "debug_layerwise_metrics", False))
     debug_tracker: LayerwiseDebugTracker | None = None
     if debug_layerwise_enabled:
@@ -2456,14 +2684,26 @@ def run_pure_pretraining(
 
                 # When packing + num_workers > 0, greedy bin-packing can produce
                 # different batch counts per rank.  Coordinate so all ranks break
-                # together to avoid FSDP / NCCL deadlock.
-                if distributed and dist.is_initialized():
+                # together to avoid FSDP / NCCL deadlock.  synced_len is the
+                # all-rank MIN of exact per-rank loader lengths, so exhaustion is
+                # only possible near the epoch tail — gate the (blocking)
+                # allreduce to that window instead of serializing every step.
+                near_epoch_tail = micro_step >= synced_len - BATCH_COORD_TAIL_STEPS
+                if distributed and dist.is_initialized() and near_epoch_tail:
                     has_batch_t = torch.tensor(1 if has_batch else 0, device=device, dtype=torch.int32)
                     dist.all_reduce(has_batch_t, op=dist.ReduceOp.MIN)
                     if int(has_batch_t.item()) == 0:
                         epoch_ended_early = True
                         break
                 elif not has_batch:
+                    if distributed and dist.is_initialized():
+                        # Outside the coordinated window other ranks keep going,
+                        # so a silent break would deadlock FSDP — fail loudly.
+                        raise RuntimeError(
+                            f"Rank {dist.get_rank()} exhausted its dataloader at micro-step "
+                            f"{micro_step}/{synced_len}, before the coordinated tail window "
+                            f"(last {BATCH_COORD_TAIL_STEPS} steps); train loader __len__ over-reported."
+                        )
                     epoch_ended_early = True
                     break
 
@@ -2564,8 +2804,13 @@ def run_pure_pretraining(
 
                     sync_ctx = _ddp_sync_context(model, distributed_mode=distributed_mode, sync=sync)
                     amp_ctx = torch.autocast(device_type=device.type, dtype=amp_dtype) if amp_dtype else nullcontext()
+                    fp8_ctx = te_fp8_autocast_context(
+                        enabled=bool(pretrain_config.fp8 and device.type == "cuda"),
+                        cfg=pretrain_config,
+                        distributed=distributed,
+                    )
                     with sync_ctx:
-                        with amp_ctx:
+                        with amp_ctx, fp8_ctx:
                             fwd_kwargs = dict(input_ids=batch["input_ids"], labels=batch["labels"])
                             if "attention_mask" in batch:
                                 fwd_kwargs["attention_mask"] = batch["attention_mask"]
@@ -2595,28 +2840,35 @@ def run_pure_pretraining(
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
-                        if debug_non_finite_params and not torch.isfinite(loss.detach()).all():
-                            rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-                            logger.error(
-                                "Skipping optimizer step %d due to non-finite loss on rank %d "
-                                "(epoch=%d micro_step=%d sub_batch=%d).",
-                                upcoming_step, rank, epoch, micro_step, sub_batch_idx,
-                            )
-                            optimizer.zero_grad(set_to_none=True)
-                            accum_loss.zero_()
-                            if _moe_layers:
-                                _moe_count_accum.zero_()
-                            if at_accum_boundary:
-                                accum_micro_count = 0
-                            else:
-                                discard_accumulation = True
-                            continue
+                        if loss_finite_check is not None:
+                            # Verdict is read back only after backward() below has
+                            # been queued, so this never drains the GPU stream.
+                            loss_finite_check.submit(~torch.isfinite(loss.detach()).all())
                         loss = loss / effective_grad_accum
 
                         if scaler is not None and scaler.is_enabled():
                             scaler.scale(loss).backward()
                         else:
                             loss.backward()
+
+                    if loss_finite_check is not None and loss_finite_check.poll():
+                        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                        logger.error(
+                            "Skipping optimizer step %d due to non-finite loss on rank %d "
+                            "(epoch=%d micro_step=%d sub_batch=%d).",
+                            upcoming_step, rank, epoch, micro_step, sub_batch_idx,
+                        )
+                        # backward() already ran on the non-finite loss; zero_grad
+                        # below discards those gradients along with any accumulation.
+                        optimizer.zero_grad(set_to_none=True)
+                        accum_loss.zero_()
+                        if _moe_layers:
+                            _moe_count_accum.zero_()
+                        if at_accum_boundary:
+                            accum_micro_count = 0
+                        else:
+                            discard_accumulation = True
+                        continue
 
                     accum_loss = accum_loss + loss.detach()
 
@@ -2631,7 +2883,10 @@ def run_pure_pretraining(
 
                     if scaler is not None and scaler.is_enabled():
                         if isinstance(optimizer, MuonAdamWGroup):
-                            scaler.unscale_(optimizer.muon)
+                            # optimizer.muon may be an OptimizerGroup (muonh_scope=mlp:
+                            # NorMuon + Hyperball); GradScaler needs each real optimizer.
+                            for _o in (optimizer.muon.optimizers if isinstance(optimizer.muon, OptimizerGroup) else [optimizer.muon]):
+                                scaler.unscale_(_o)
                             scaler.unscale_(optimizer.adamw)
                         else:
                             scaler.unscale_(optimizer)
@@ -2647,7 +2902,8 @@ def run_pure_pretraining(
                     if scaler is not None and scaler.is_enabled():
                         old_scale = scaler.get_scale()
                         if isinstance(optimizer, MuonAdamWGroup):
-                            scaler.step(optimizer.muon)
+                            for _o in (optimizer.muon.optimizers if isinstance(optimizer.muon, OptimizerGroup) else [optimizer.muon]):
+                                scaler.step(_o)
                             scaler.step(optimizer.adamw)
                         else:
                             scaler.step(optimizer)
@@ -2655,16 +2911,14 @@ def run_pure_pretraining(
                         step_skipped = scaler.get_scale() < old_scale
                     else:
                         optimizer.step()
-                    if debug_non_finite_params and _has_nonfinite_params(orig_model):
-                        bad_param = _first_nonfinite_param(orig_model)
-                        bad_name = bad_param[0] if bad_param is not None else "<unknown>"
-                        rank = dist.get_rank() if distributed and dist.is_initialized() else 0
-                        raise RuntimeError(
-                            f"Non-finite parameter detected after optimizer step {upcoming_step} "
-                            f"in {bad_name} on rank {rank} (epoch={epoch} data_step={micro_step} "
-                            f"sub_batch={sub_batch_idx})."
-                        )
-
+                    if param_finite_check is not None:
+                        # Raise on the previous step's async verdict (its event has
+                        # long completed), then enqueue this step's check — replaces
+                        # a per-step `.item()` that drained the whole GPU stream.
+                        _raise_on_nonfinite_params(f"at optimizer step {upcoming_step}")
+                        nonfinite_t = _nonfinite_check_tensor([param for param in orig_model.parameters()])
+                        if nonfinite_t is not None:
+                            param_finite_check.submit(nonfinite_t)
                     if isinstance(optimizer, MuonAdamWGroup):
                         muon_lr = optimizer.muon.param_groups[0]["lr"]
                         learning_rate = optimizer.adamw.param_groups[0]["lr"]
@@ -2837,7 +3091,7 @@ def run_pure_pretraining(
                                 if recycling_scheduler is not None and should_log:
                                     adapter = getattr(orig_model.model, "adapter", None) if hasattr(orig_model, "model") else None
                                     payload.update(logging_steps_payload(adapter, recycling_metrics_buffer))
-                                wandb.log(payload)
+                                wandb.log(payload, step=global_step)
                             except Exception as exc:
                                 wandb_enabled = False
                                 logger.warning(f"W&B log failed; disabling. Error: {exc}")
@@ -2846,7 +3100,7 @@ def run_pure_pretraining(
                         debug_payload = debug_tracker.flush(global_step)
                         if is_main and debug_payload is not None and wandb_enabled and wandb.run is not None:
                             try:
-                                wandb.log({**debug_payload, "train/global_step": global_step})
+                                wandb.log({**debug_payload, "train/global_step": global_step}, step=global_step)
                             except Exception as exc:
                                 logger.warning(f"W&B debug log failed: {exc}")
 
@@ -2884,6 +3138,7 @@ def run_pure_pretraining(
                     do_periodic = global_step % save_steps == 0
 
                     if global_step % eval_steps == 0 or at_wsd_stable_end:
+                        _raise_on_nonfinite_params(f"before eval at step {global_step}")
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
                             eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
                         elif recycling_scheduler is not None:
@@ -2932,6 +3187,7 @@ def run_pure_pretraining(
                     # terminal step -- the post-loop save writes the role-named
                     # terminal checkpoint there for every schedule.
                     if at_wsd_stable_end or (do_periodic and not at_terminal):
+                        _raise_on_nonfinite_params(f"before checkpoint at step {global_step}")
                         next_data_step = micro_step
                         next_sub_batch_step = sub_batch_idx + 1
                         next_batch_split_divisor = batch_split_divisor
@@ -3003,6 +3259,7 @@ def run_pure_pretraining(
             epoch += 1
 
     # ---- Finalize ----
+    _raise_on_nonfinite_params(f"before final checkpoint at step {global_step}")
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 

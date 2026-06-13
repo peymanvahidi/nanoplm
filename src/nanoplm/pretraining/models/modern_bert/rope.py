@@ -273,6 +273,25 @@ class ModernBertRotaryEmbedding(nn.Module):
         cos, sin = self.paired_from_positions(positions, device, dtype, layer_type)
         return cos[None], sin[None]
 
+    def forward_full(
+        self,
+        seq_len: int | torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Specialized entry point (no layer_type string arg): under
+        torch.compile a string-branch argument makes dynamo compile one
+        variant per value and re-check the guard at every entry."""
+        return self._cos_sin(self.inv_freq_full, seq_len, device, dtype)
+
+    def forward_sliding(
+        self,
+        seq_len: int | torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._cos_sin(self.inv_freq_sliding, seq_len, device, dtype)
+
     def forward(
         self,
         seq_len: int | torch.Tensor,
@@ -284,7 +303,15 @@ class ModernBertRotaryEmbedding(nn.Module):
             inv_freq = self.inv_freq_full
         else:
             inv_freq = self.inv_freq_sliding
+        return self._cos_sin(inv_freq, seq_len, device, dtype)
 
+    def _cos_sin(
+        self,
+        inv_freq: torch.Tensor,
+        seq_len: int | torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         inv_freq = inv_freq.to(device=device)
         if isinstance(seq_len, torch.Tensor):
             # Dynamic tensor lengths cannot be passed to torch.arange without

@@ -80,6 +80,8 @@ if not _HAS_FLASH_VARLEN:
 
 # -- Triton sReLU availability -------------------------------------------------
 
+import os as _os_srelu  # noqa: E402
+
 USE_TRITON_SRELU = False
 
 if torch.cuda.is_available() and (
@@ -87,6 +89,13 @@ if torch.cuda.is_available() and (
     or torch.cuda.get_device_capability() == (12, 0)
 ):
     USE_TRITON_SRELU = True
+
+# The fused kernel is a raw autograd.Function -> dynamo graph break mid-layer
+# (~1 ms GPU hole per bf16 layer at 35 W CPU). Setting
+# NANOPLM_DISABLE_TRITON_SRELU=1 routes ModernBertSReluMLP through plain ops so
+# inductor compiles the whole layer (max_autotune may fuse the epilogue itself).
+if _os_srelu.environ.get("NANOPLM_DISABLE_TRITON_SRELU", "0") == "1":
+    USE_TRITON_SRELU = False
 
 # -- Activation checkpointing toggles ------------------------------------------
 

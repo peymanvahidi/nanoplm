@@ -224,10 +224,24 @@ class TEModernBertModel(nn.Module):
         )
 
     def update_prores_alphas(self, step: int) -> None:
-        """Recompute per-layer ProRes alphas. Call once per optimizer step."""
-        T = self._prores_T
-        vals = [min(step / (T * (l + 1)), 1.0) for l in range(self.config.num_hidden_layers)]
-        self._prores_alphas.copy_(torch.tensor(vals, dtype=self._prores_alphas.dtype))
+        """Recompute per-layer ProRes alphas. Call once per optimizer step.
+
+        Computed on the buffer's device: a CPU torch.tensor + copy_() is a
+        pageable H2D memcpy that synchronizes the host with the full GPU
+        stream every optimizer step (50-80ms stalls at grad_accum=1).
+        """
+        denoms = getattr(self, "_prores_denoms", None)
+        if denoms is None or denoms.device != self._prores_alphas.device:
+            denoms = torch.arange(
+                1,
+                self.config.num_hidden_layers + 1,
+                device=self._prores_alphas.device,
+                dtype=self._prores_alphas.dtype,
+            )
+            self._prores_denoms = denoms
+        torch.clamp(
+            (step / self._prores_T) / denoms, max=1.0, out=self._prores_alphas
+        )
 
     def _get_rope_freqs(self, max_seqlen: int):
         """Return cached RoPE frequency tensors, computing on first call."""

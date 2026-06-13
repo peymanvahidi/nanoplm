@@ -206,6 +206,13 @@ class LayerwiseDebugTracker:
         buf_sq = self.residual_sq_sum
         buf_cnt = self.residual_count
 
+        # `torch.compiler.disable` keeps the hook body OUT of the compiled
+        # graph. The model is wrapped by torch.compile, so without this Dynamo
+        # would inline the hook's data-dependent control flow and in-place
+        # mutation of these external tracker tensors, churning guards and
+        # forcing repeated recompiles. Running it eager trades a graph break at
+        # each block boundary for compile stability.
+        @torch.compiler.disable
         def hook(_module, _inputs, output):
             if not _module.training:
                 return
@@ -222,6 +229,8 @@ class LayerwiseDebugTracker:
 
         return hook
 
+    # See `_make_residual_hook` for why these hooks are compile-disabled.
+    @torch.compiler.disable
     def _final_norm_hook(self, _module, _inputs, output):
         if not _module.training:
             return
@@ -240,6 +249,7 @@ class LayerwiseDebugTracker:
             )
             self.final_norm_elem_count.add_(float(xd.numel()))
 
+    @torch.compiler.disable
     def _logit_hook(self, _module, _inputs, output):
         if not _module.training:
             return
