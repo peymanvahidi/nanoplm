@@ -1100,6 +1100,7 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
     if kind == "pretrain":
         train_count = _count_pretrain_shard_sequences(train_dir)
         val_count = _count_pretrain_shard_sequences(val_dir)
+        train_tokens = _sum_pretrain_shard_tokens(train_dir)
     else:
         train_count = _count_distill_h5_sequences(train_dir)
         val_count = _count_distill_h5_sequences(val_dir)
@@ -1118,6 +1119,7 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
             num_register_tokens=register_tokens,
             sharded=True,
             samples_per_shard=samples_per_shard,
+            total_train_tokens=train_tokens,
         )
     else:
         # Pre-computed distillation mode requires train_h5_prefix and val_h5_prefix.
@@ -1160,6 +1162,22 @@ def _count_pretrain_shard_sequences(shard_dir: Path) -> int:
     for idx_path in sorted(shard_dir.glob("shard_*.idx.npy")):
         arr = np.load(idx_path)
         total += len(arr)
+    return total
+
+
+def _sum_pretrain_shard_tokens(shard_dir: Path) -> int:
+    """Sum all per-sequence encoded token lengths across a dir's .idx.npy shards.
+
+    The .idx.npy arrays (already loaded to count sequences) are int32 arrays of
+    per-sequence encoded lengths from the C writer's encoded_length() — i.e.
+    used residues plus BOS/EOS/register tokens. Summing them is therefore the
+    exact total encoded token count (the correct unit for a training token
+    budget) — no extra I/O or extra pass over the data.
+    """
+    import numpy as np
+    total = 0
+    for idx_path in sorted(shard_dir.glob("shard_*.idx.npy")):
+        total += int(np.load(idx_path).sum())
     return total
 
 

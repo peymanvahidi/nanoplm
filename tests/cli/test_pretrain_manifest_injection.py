@@ -58,9 +58,11 @@ def test_from_yaml_injects_register_tokens_from_manifest(tmp_path):
         "pretraining": {
             "dataset_dir": str(dataset_dir),
             "ckp_dir": str(tmp_path / "ckpt"),
-            "micro_batch_size": 2,
-            "global_batch_size": 2,
-            "num_epochs": 1,
+            "micro_batch_seqs": 2,
+            "global_batch_tokens": 2,
+            "lr_schedule": "wsd",
+            "stable_tokens": 9_000,
+            "decay_tokens": 1_000,
         },
         "resume": {"is_resume": False, "checkpoint_dir": ""},
     }

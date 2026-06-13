@@ -73,8 +73,12 @@ from nanoplm.pretraining.optim import build_muon_optimizer, is_muon_optimizer, M
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
     compute_batch_setup,
+    format_passes_hint,
     get_num_workers,
     prepare_run_and_steps,
+    resolve_total_steps,
+    tokens_to_steps,
+    StepHorizon,
 )
 from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
 from nanoplm.utils.logger import logger
@@ -237,7 +241,7 @@ def _split_packed_batch(
         if actual_tokens > effective_tokens_per_split:
             raise ValueError(
                 f"Packed split produced {actual_tokens} tokens but target split size is "
-                f"{effective_tokens_per_split}. Increase micro_batch_size or reduce warmup divisor."
+                f"{effective_tokens_per_split}. Increase micro_batch_seqs or reduce warmup divisor."
             )
         sub["input_ids"][:actual_tokens] = batch["input_ids"][s:e]
         sub["labels"][:actual_tokens] = batch["labels"][s:e]
@@ -290,118 +294,9 @@ def _split_batch(
     return _split_standard_batch(batch, n_splits=n_splits)
 
 
-def _estimate_steps_for_epoch(
-    *,
-    train_loader_len: int,
-    start_global_step: int,
-    full_grad_accum: int,
-    full_micro_batch: int,
-    batch_size_warmup_steps: int,
-) -> int:
-    """Simulate optimizer steps produced by one epoch of DataLoader batches."""
-    if train_loader_len <= 0:
-        return 1
-
-    global_step = int(start_global_step)
-    accum_micro_count = 0
-    effective_grad_accum, _, mbs_divisor = _get_batch_warmup_params(
-        global_step,
-        full_grad_accum,
-        full_micro_batch,
-        batch_size_warmup_steps,
-    )
-    for _ in range(train_loader_len):
-        batch_split_divisor = mbs_divisor
-        for _ in range(batch_split_divisor):
-            accum_micro_count += 1
-            if accum_micro_count < effective_grad_accum:
-                continue
-            global_step += 1
-            accum_micro_count = 0
-            effective_grad_accum, _, mbs_divisor = _get_batch_warmup_params(
-                global_step,
-                full_grad_accum,
-                full_micro_batch,
-                batch_size_warmup_steps,
-            )
-    return max(1, global_step - int(start_global_step))
-
-
-def _compute_epoch_start_steps(
-    *,
-    num_epochs: int,
-    train_loader_len: int,
-    full_grad_accum: int,
-    full_micro_batch: int,
-    batch_size_warmup_steps: int,
-) -> list[int]:
-    """Return global-step offsets at the start of each epoch plus the final end step."""
-    epoch_start_steps = [0]
-    global_step = 0
-    for _ in range(num_epochs):
-        global_step += _estimate_steps_for_epoch(
-            train_loader_len=train_loader_len,
-            start_global_step=global_step,
-            full_grad_accum=full_grad_accum,
-            full_micro_batch=full_micro_batch,
-            batch_size_warmup_steps=batch_size_warmup_steps,
-        )
-        epoch_start_steps.append(global_step)
-    return epoch_start_steps
-
-
-def _locate_resume_position_in_epoch(
-    *,
-    train_loader_len: int,
-    epoch_start_step: int,
-    resume_global_step: int,
-    full_grad_accum: int,
-    full_micro_batch: int,
-    batch_size_warmup_steps: int,
-) -> tuple[int, int, int]:
-    """Map an optimizer-step checkpoint to (data_step, sub_batch_step, split_divisor)."""
-    if train_loader_len <= 0 or resume_global_step <= epoch_start_step:
-        _, _, split_divisor = _get_batch_warmup_params(
-            epoch_start_step,
-            full_grad_accum,
-            full_micro_batch,
-            batch_size_warmup_steps,
-        )
-        return 0, 0, split_divisor
-
-    global_step = int(epoch_start_step)
-    accum_micro_count = 0
-    effective_grad_accum, _, mbs_divisor = _get_batch_warmup_params(
-        global_step,
-        full_grad_accum,
-        full_micro_batch,
-        batch_size_warmup_steps,
-    )
-    for data_step in range(train_loader_len):
-        batch_split_divisor = mbs_divisor
-        for sub_batch_step in range(batch_split_divisor):
-            accum_micro_count += 1
-            if accum_micro_count < effective_grad_accum:
-                continue
-            global_step += 1
-            accum_micro_count = 0
-            effective_grad_accum, _, mbs_divisor = _get_batch_warmup_params(
-                global_step,
-                full_grad_accum,
-                full_micro_batch,
-                batch_size_warmup_steps,
-            )
-            if global_step >= resume_global_step:
-                next_sub_batch_step = sub_batch_step + 1
-                if next_sub_batch_step >= batch_split_divisor:
-                    return data_step + 1, 0, mbs_divisor
-                return data_step, next_sub_batch_step, batch_split_divisor
-    return train_loader_len, 0, mbs_divisor
-
-
-def _maybe_expand_dynamo_cache_for_batch_warmup(batch_size_warmup_steps: int) -> None:
+def _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps: int) -> None:
     """Increase Dynamo cache room when warmup introduces a few extra static shapes."""
-    if int(batch_size_warmup_steps) <= 0:
+    if int(global_batch_warmup_steps) <= 0:
         return
     try:
         import torch._dynamo.config as dynamo_config
@@ -1059,27 +954,80 @@ def _create_scheduler(
     lr_decay_to_fraction: float,
     lr_schedule: str = "Linear",
     last_epoch: int = -1,
+    *,
+    stable_steps: Optional[int] = None,
+    decay_steps: Optional[int] = None,
+    decay_shape: str = "1-sqrt",
 ):
-    """Build a LambdaLR scheduler with warmup + cosine/linear decay.
+    """Warmup + (wsd | warmup_stable | cosine | linear | decay) scheduler.
+
+    wsd:           warmup -> constant over [warmup, stable_steps) -> decay over
+                   [stable_steps, stable_steps+decay_steps) to lr_decay_to_fraction.
+    warmup_stable: warmup -> constant for the rest (no decay).
+    decay:         no warmup; decay 1.0 -> lr_decay_to_fraction over total_steps
+                   (resume anneal from the checkpoint's current LR).
+    cosine/linear: unchanged single-phase warmup -> decay over total_steps.
 
     For MuonAdamWGroup, returns a _SchedulerGroup wrapping two LambdaLR
     schedulers (one per inner optimizer). For plain optimizers, returns
     a single LambdaLR.
 
     Args:
+        stable_steps: (wsd only) absolute step at which the constant phase ends
+            and decay begins. Required for ``wsd``.
+        decay_steps: (wsd only) number of steps over which the decay phase runs,
+            starting at ``stable_steps``. Required for ``wsd``.
+        decay_shape: Shape of the decay phase, one of {"1-sqrt", "linear"}
+            (case-insensitive). Used by ``wsd`` and ``decay``.
         last_epoch: If >= 0 the scheduler is positioned at that step
             (useful when reconstructing the schedule on resume).
             ``initial_lr`` is injected into param groups automatically.
+
+    Note:
+        For ``wsd`` the floor (``lr_decay_to_fraction``) is the value AT step
+        ``stable_steps + decay_steps`` (== total_steps), so the last executed
+        step (total_steps - 1) sits just above the floor. This is by design and
+        matches the schedule spec.
     """
+    sched = lr_schedule.lower()
+
+    if sched == "wsd" and (stable_steps is None or decay_steps is None):
+        raise ValueError(
+            "lr_schedule='wsd' requires stable_steps and decay_steps to be set"
+        )
+
+    shape = (decay_shape or "1-sqrt").lower()
+    if shape not in {"1-sqrt", "linear"}:
+        raise ValueError(
+            f"decay_shape must be '1-sqrt' or 'linear', got {decay_shape!r}"
+        )
+
+    def _decay_factor(progress: float) -> float:
+        progress = min(1.0, max(0.0, progress))
+        shaped = math.sqrt(progress) if shape == "1-sqrt" else progress
+        return lr_decay_to_fraction + (1.0 - lr_decay_to_fraction) * (1.0 - shaped)
+
     def lr_lambda(step: int) -> float:
+        if sched == "wsd":
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            if step < stable_steps:
+                return 1.0
+            return _decay_factor((step - stable_steps) / max(1, decay_steps))
+        if sched == "warmup_stable":
+            if step < warmup_steps:
+                return step / max(1, warmup_steps)
+            return 1.0
+        if sched == "decay":
+            return _decay_factor(step / max(1, total_steps))
+        # cosine / linear (unchanged single-phase behaviour)
         if step < warmup_steps:
             return step / max(1, warmup_steps)
-        decay_steps = max(1, total_steps - warmup_steps)
-        progress = min(1.0, (step - warmup_steps) / decay_steps)
-        if lr_schedule.lower() == "cosine":
+        decay_window = max(1, total_steps - warmup_steps)
+        progress = min(1.0, (step - warmup_steps) / decay_window)
+        if sched == "cosine":
             return lr_decay_to_fraction + 0.5 * (1.0 - lr_decay_to_fraction) * (1.0 + math.cos(math.pi * progress))
-        else:
-            return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
+        return max(lr_decay_to_fraction, 1.0 - (1.0 - lr_decay_to_fraction) * progress)
 
     def _make_scheduler(opt, last_ep):
         if last_ep >= 0:
@@ -1107,27 +1055,6 @@ def _resolve_world_size(cfg: PretrainingConfig) -> int:
         env = os.environ.get("WORLD_SIZE")
         return int(env) if env else max(torch.cuda.device_count(), 1)
     return int(cfg.world_size) if cfg.world_size else 1
-
-
-def _num_update_steps_per_epoch(
-    train_loader_len: int,
-    grad_accum: int,
-    *,
-    micro_batch_size: Optional[int] = None,
-    batch_size_warmup_steps: int = 0,
-    start_global_step: int = 0,
-) -> int:
-    if train_loader_len <= 0:
-        return 1
-    if int(batch_size_warmup_steps) > 0 and micro_batch_size is not None:
-        return _estimate_steps_for_epoch(
-            train_loader_len=train_loader_len,
-            start_global_step=start_global_step,
-            full_grad_accum=grad_accum,
-            full_micro_batch=micro_batch_size,
-            batch_size_warmup_steps=batch_size_warmup_steps,
-        )
-    return max(1, math.ceil(train_loader_len / max(1, grad_accum)))
 
 
 def _sync_train_loader_len(
@@ -1258,6 +1185,14 @@ def _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer):
         _shard_sub(opt_sd, optimizer)
 
 
+def _checkpoint_dir_name(global_step: int, phase: str = "periodic") -> str:
+    if phase == "stable-end":
+        return "checkpoint-stable-end"
+    if phase == "final":
+        return "checkpoint-final"
+    return f"checkpoint-{global_step}"
+
+
 def _save_checkpoint(
     model, optimizer, scheduler, global_step, epoch,
     output_dir, logging_steps, eval_steps, save_steps,
@@ -1268,8 +1203,13 @@ def _save_checkpoint(
     epoch_data_step: Optional[int] = None,
     epoch_sub_batch_step: Optional[int] = None,
     batch_split_divisor: Optional[int] = None,
+    phase: str = "periodic",
+    tokens_seen: Optional[int] = None,
+    achieved_global_batch_tokens: Optional[int] = None,
+    stable_steps: Optional[int] = None,
+    decay_steps: Optional[int] = None,
 ) -> None:
-    ckpt = Path(output_dir) / f"checkpoint-{global_step}"
+    ckpt = Path(output_dir) / _checkpoint_dir_name(global_step, phase)
 
     if distributed and distributed_mode == "fsdp":
         _fsdp_opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -1323,6 +1263,21 @@ def _save_checkpoint(
         training_state["epoch_sub_batch_step"] = int(epoch_sub_batch_step)
     if batch_split_divisor is not None:
         training_state["batch_split_divisor"] = int(batch_split_divisor)
+    # Schedule descriptor: lets resume reconstruct/validate the LR curve and
+    # lets eval/resume target a role (stable-end/final) instead of a step number.
+    training_state["phase"] = phase
+    if pretrain_config is not None:
+        training_state["lr_schedule"] = pretrain_config.lr_schedule
+        training_state["decay_shape"] = pretrain_config.decay_shape
+        training_state["lr_decay_to_fraction"] = pretrain_config.lr_decay_to_fraction
+    if tokens_seen is not None:
+        training_state["tokens_seen"] = int(tokens_seen)
+    if achieved_global_batch_tokens is not None:
+        training_state["achieved_global_batch_tokens"] = int(achieved_global_batch_tokens)
+    if stable_steps is not None:
+        training_state["stable_steps"] = int(stable_steps)
+    if decay_steps is not None:
+        training_state["decay_steps"] = int(decay_steps)
     (ckpt / "training_state.json").write_text(
         json.dumps(training_state, indent=2),
         encoding="utf-8",
@@ -1365,8 +1320,8 @@ def _load_checkpoint(
 
     Args:
         load_scheduler: When *False* the scheduler state dict is **not**
-            loaded.  This is used by the resume-override path which
-            rebuilds the scheduler from saved/overridden schedule params
+            loaded.  This is used by the continue/decay resume path which
+            rebuilds the scheduler from the saved schedule descriptor
             instead of relying on the pickled ``lr_lambda``.
     """
     ckp = Path(checkpoint_dir)
@@ -1484,164 +1439,129 @@ def _load_checkpoint(
     return 0, 0
 
 
+def _iter_param_groups(optimizer):
+    """Yield param groups across plain optimizers and MuonAdamWGroup."""
+    if isinstance(optimizer, MuonAdamWGroup):
+        yield from optimizer.muon.param_groups
+        yield from optimizer.adamw.param_groups
+    else:
+        yield from optimizer.param_groups
+
+
+def _read_training_state(checkpoint_dir: str) -> dict:
+    """Load ``training_state.json`` from a checkpoint directory.
+
+    Returns an empty dict if the file is missing (pre-upgrade checkpoint).
+    Raises ValueError (with the offending path) if the file exists but is not
+    valid JSON, e.g. a checkpoint truncated by a crash mid-write.
+    """
+    state_path = Path(checkpoint_dir) / "training_state.json"
+    if not state_path.exists():
+        return {}
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Could not parse training state at {state_path}: {exc}. "
+            "The checkpoint may be corrupt (e.g. truncated by a crash mid-write)."
+        ) from exc
+
+
 def _rebuild_scheduler_for_resume(
+    *,
     optimizer,
     resume_config: "ResumeConfig",
     pretrain_config: "PretrainingConfig",
     checkpoint_dir: str,
-    start_step: int,
-    total_steps: int,
+    decay_steps: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    start_step: Optional[int] = None,
+    stable_steps: Optional[int] = None,
+    decay_shape: Optional[str] = None,
     is_main: bool = True,
 ):
-    """Build a fresh LR scheduler for a resumed run.
+    """Build a fresh LR scheduler for a resumed run (spec §7).
 
-    Two modes (validated at YAML load time by ``_validate_resume_config_modes``):
+    Two intent-named modes (validated at YAML load by
+    ``_validate_resume_config_modes``):
 
-    EXTEND (``reset_scheduler=False``, default):
-        Per-group peak LR is read from the optimizer's loaded state
-        (``optimizer.pt``).  When ``resume.lr_decay_to_fraction`` is set,
-        each group decays to ``peak * fraction``.  When null, decay
-        targets the original final LR (``saved_base_lr * saved_decay``)
-        so crash-recovery preserves the original endpoint.
+    ``continue``
+        Finish an interrupted run to its original budget with the exact
+        original schedule. The original schedule descriptor is read back from
+        the checkpoint's ``training_state.json`` and the schedule is
+        fast-forwarded via ``last_epoch = global_step`` so the LR curve picks
+        up exactly where it left off.
 
-    RESET (``reset_scheduler=True``):
-        Per-group peak LR is overwritten with ``resume.learning_rate``
-        (and ``resume.muon_learning_rate`` for Muon-side groups).  Decay
-        shape and fraction come directly from ``resume_config``.
-
-    Warmup at resume is controlled solely by ``resume_config.warmup_steps``
-    (null/0 = none, positive int = fresh ramp over the first N resumed steps).
-
-    The new schedule is anchored at ``start_step``: warmup (if any) ramps
-    over the first ``resume.warmup_steps`` resumed steps, then decay runs
-    over the rest of the ``[start_step, eff_total]`` window.
+    ``decay``
+        Anneal a saved ``checkpoint-stable-end`` trunk. The peak LR is the
+        checkpoint's current (stable) LR already loaded into the optimizer; a
+        ``lr_schedule="decay"`` scheduler with no warmup runs ``decay_steps``
+        from that peak down to ``lr_decay_to_fraction``. With ``last_epoch=-1``
+        ``_create_scheduler`` captures each group's loaded ``lr`` as its
+        ``initial_lr``, so decay anneals from the checkpoint LR.
     """
-    ckp = Path(checkpoint_dir)
+    mode = (resume_config.mode or "continue").lower()
 
-    # ---- Inheritance defaults from checkpoint's pretrain_config.yaml -----
-    saved_base_lr = float(pretrain_config.adam_learning_rate)
-    saved_muon_lr = float(pretrain_config.muon_learning_rate)
-    saved_decay = float(pretrain_config.lr_decay_to_fraction)
-    saved_schedule = str(pretrain_config.lr_schedule)
-
-    saved_config_path = ckp / "pretrain_config.yaml"
-    if saved_config_path.exists():
-        with open(saved_config_path) as f:
-            saved_cfg = yaml.safe_load(f) or {}
-        saved_base_lr = float(saved_cfg.get("adam_learning_rate", saved_base_lr))
-        saved_muon_lr = float(saved_cfg.get("muon_learning_rate", saved_muon_lr))
-        saved_decay = float(saved_cfg.get("lr_decay_to_fraction", saved_decay))
-        saved_schedule = str(saved_cfg.get("lr_schedule", saved_schedule))
-    elif is_main:
-        logger.info(
-            "No pretrain_config.yaml in checkpoint (pre-upgrade checkpoint). "
-            "Using current YAML schedule params as inheritance base."
-        )
-
-    # ---- Resolve effective totals / warmup / shape -----------------------
-    eff_total = int(total_steps)
-    eff_warmup = int(resume_config.warmup_steps) if resume_config.warmup_steps else 0
-    if eff_total <= start_step:
-        raise ValueError(
-            f"Resume cannot proceed: eff_total ({eff_total}) <= start_step "
-            f"({start_step}). Increase resume_epochs to extend training."
-        )
-
-    eff_schedule = (resume_config.lr_schedule or saved_schedule or "cosine").lower()
-    if eff_schedule not in {"linear", "cosine"}:
-        raise ValueError(f"Invalid lr_schedule: {eff_schedule}")
-
-    # ---- Per-group peak + fraction resolution ----------------------------
-    def _peak_and_fraction(pg, side: str):
-        """Compute (peak_lr, fraction) for one param group.
-
-        side: "muon" or "adamw" -- selects which RESET peak to use and which
-        saved base LR drives the EXTEND auto-fraction default.
-        """
-        if resume_config.reset_scheduler:
-            peak = float(
-                resume_config.muon_learning_rate if side == "muon"
-                else resume_config.learning_rate
+    if mode == "decay":
+        floor = resume_config.lr_decay_to_fraction
+        if floor is None:
+            raise ValueError("resume decay requires lr_decay_to_fraction")
+        shape = (decay_shape or resume_config.decay_shape or "1-sqrt")
+        if decay_steps is None or decay_steps <= 0:
+            raise ValueError(
+                f"resume decay needs a positive decay_steps, got {decay_steps}"
             )
-            pg["lr"] = peak  # overwrite the loaded LR
-            fraction = float(resume_config.lr_decay_to_fraction)
-        else:
-            peak = float(pg["lr"])
-            if peak < 1e-10 and is_main:
-                logger.warning(
-                    f"Resume EXTEND: {side} group LR is near zero "
-                    f"({peak:.2e}); decay-from-current is effectively a no-op."
-                )
-            if resume_config.lr_decay_to_fraction is not None:
-                fraction = float(resume_config.lr_decay_to_fraction)
-            else:
-                # Q4(b): default end LR = original final LR.
-                base_for_side = saved_muon_lr if side == "muon" else saved_base_lr
-                target_end = base_for_side * saved_decay
-                if peak > 0:
-                    fraction = max(0.0, min(1.0, target_end / peak))
-                else:
-                    fraction = 1.0
-        pg["initial_lr"] = peak
-        return peak, fraction
-
-    # ---- Lambda factory anchored at start_step ---------------------------
-    decay_steps = max(1, (eff_total - start_step) - eff_warmup)
-    eff_warmup_local = eff_warmup  # capture for closure clarity
-
-    def _make_lambda(fraction: float):
-        # Capture fraction via default arg to avoid late-binding in loops.
-        def lr_lambda(step: int, fraction=fraction) -> float:
-            local = step - start_step
-            if local < eff_warmup_local:
-                return local / max(1, eff_warmup_local) if local >= 0 else 0.0
-            progress = min(1.0, (local - eff_warmup_local) / decay_steps)
-            if eff_schedule == "cosine":
-                return fraction + 0.5 * (1.0 - fraction) * (
-                    1.0 + math.cos(math.pi * progress)
-                )
-            return max(fraction, 1.0 - (1.0 - fraction) * progress)
-        return lr_lambda
-
-    last_epoch = max(-1, start_step - 1)
-
-    def _build_inner(inner_opt, sides):
-        """Build a LambdaLR for a flat optimizer with per-group sides."""
-        lambdas = []
-        peaks = []
-        for pg, side in zip(inner_opt.param_groups, sides):
-            peak, fraction = _peak_and_fraction(pg, side)
-            lambdas.append(_make_lambda(fraction))
-            peaks.append(peak)
-        return LambdaLR(inner_opt, lambdas, last_epoch=last_epoch), peaks
-
-    # ---- Wire the new scheduler ------------------------------------------
-    if isinstance(optimizer, MuonAdamWGroup):
-        muon_sched, muon_peaks = _build_inner(
-            optimizer.muon, ["muon"] * len(optimizer.muon.param_groups)
+        if is_main:
+            peaks = [f"{pg['lr']:.2e}" for pg in _iter_param_groups(optimizer)]
+            logger.info(
+                f"Resume schedule built [decay]: decay_steps={decay_steps}, "
+                f"floor={floor}, shape={shape}, peaks={peaks}"
+            )
+        # Peak = checkpoint's current (stable) LR, already loaded into the
+        # optimizer; last_epoch=-1 captures it as initial_lr.
+        return _create_scheduler(
+            optimizer,
+            warmup_steps=0,
+            total_steps=int(decay_steps),
+            learning_rate=0.0,
+            lr_decay_to_fraction=float(floor),
+            lr_schedule="decay",
+            last_epoch=-1,
+            decay_shape=shape,
         )
-        adamw_sched, adamw_peaks = _build_inner(
-            optimizer.adamw, ["adamw"] * len(optimizer.adamw.param_groups)
-        )
-        scheduler = _SchedulerGroup(muon_sched, adamw_sched)
-        peaks = muon_peaks + adamw_peaks
-    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
-        # DION layout: group[0] = muon-algorithm, group[1+] = adamw / scalar.
-        sides = ["muon"] + ["adamw"] * (len(optimizer.param_groups) - 1)
-        scheduler, peaks = _build_inner(optimizer, sides)
-    else:
-        sides = ["adamw"] * len(optimizer.param_groups)
-        scheduler, peaks = _build_inner(optimizer, sides)
 
+    # mode == "continue": reconstruct the ORIGINAL schedule and fast-forward.
+    sd = _read_training_state(checkpoint_dir)
+    sched_name = sd.get("lr_schedule", pretrain_config.lr_schedule)
+    eff_total = total_steps if total_steps is not None else sd.get("total_steps")
+    if eff_total is None:
+        raise ValueError(
+            "resume continue requires total_steps (none provided and the "
+            "checkpoint's training_state.json has no 'total_steps')"
+        )
+    eff_last_epoch = (
+        start_step if start_step is not None else int(sd.get("global_step", 0))
+    )
+    eff_stable = stable_steps if stable_steps is not None else sd.get("stable_steps")
+    eff_decay = decay_steps if decay_steps is not None else sd.get("decay_steps")
     if is_main:
-        mode = "RESET" if resume_config.reset_scheduler else "EXTEND"
+        peaks = [f"{pg['lr']:.2e}" for pg in _iter_param_groups(optimizer)]
         logger.info(
-            f"Resume schedule built [{mode}]: start_step={start_step}, "
-            f"eff_total={eff_total}, warmup={eff_warmup}, "
-            f"schedule={eff_schedule}, peaks={[f'{p:.2e}' for p in peaks]}"
+            f"Resume schedule built [continue]: start_step={eff_last_epoch}, "
+            f"total_steps={eff_total}, schedule={sched_name}, peaks={peaks}"
         )
-
-    return scheduler
+    return _create_scheduler(
+        optimizer,
+        warmup_steps=int(sd.get("warmup_steps", 0)),
+        total_steps=int(eff_total),
+        learning_rate=0.0,
+        lr_decay_to_fraction=float(sd.get("lr_decay_to_fraction", 0.1)),
+        lr_schedule=sched_name,
+        last_epoch=int(eff_last_epoch),
+        stable_steps=int(eff_stable) if eff_stable is not None else None,
+        decay_steps=int(eff_decay) if eff_decay is not None else None,
+        decay_shape=sd.get("decay_shape", "1-sqrt"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1724,22 +1644,22 @@ def run_pure_pretraining(
     effective_world_size = _resolve_world_size(pretrain_config)
 
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
-    global_batch_size_samples = pretrain_config.global_batch_size_samples
+    global_batch_seqs = pretrain_config.global_batch_seqs
     achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
-    batch_size_warmup_steps = max(
+    global_batch_warmup_steps = max(
         0,
-        int(getattr(pretrain_config, "batch_size_warmup_steps", 0)),
+        int(getattr(pretrain_config, "global_batch_warmup_steps", 0)),
     )
-    if any(v is None for v in (inferred_grad_accum_steps, global_batch_size_samples, achieved_global_batch_tokens)):
+    if any(v is None for v in (inferred_grad_accum_steps, global_batch_seqs, achieved_global_batch_tokens)):
         raise ValueError("Batch setup missing on PretrainingConfig. Run through nanoplm CLI.")
 
     world_tokens_per_micro_step = achieved_global_batch_tokens // max(1, inferred_grad_accum_steps)
-    tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
+    tokens_per_micro = pretrain_config.micro_batch_seqs * manifest.max_seq_len
     logger.info(
-        f"Batch setup: target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
+        f"Batch setup: target_global_batch_tokens={pretrain_config.global_batch_tokens:,} tokens, "
         f"micro_step_tokens={world_tokens_per_micro_step:,}, "
         f"grad_accum_steps={inferred_grad_accum_steps}, "
-        f"effective_global_batch_size={achieved_global_batch_tokens:,} tokens"
+        f"effective_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
 
     # ---- Run naming / output dir ----
@@ -1747,7 +1667,7 @@ def run_pure_pretraining(
         _run_name,
         wandb_run_name,
         output_dir,
-        num_epochs,
+        _,  # 4th slot is always None: horizon is token-budget driven
         logging_steps,
         eval_steps,
         save_steps,
@@ -1756,7 +1676,7 @@ def run_pure_pretraining(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=manifest.train_sequences,
-        global_batch_size_samples=global_batch_size_samples,
+        global_batch_seqs=global_batch_seqs,
     )
 
     num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
@@ -1927,7 +1847,7 @@ def run_pure_pretraining(
         if getattr(pretrain_config, "use_compile_max_autotune", False)
         else None
     )
-    _maybe_expand_dynamo_cache_for_batch_warmup(batch_size_warmup_steps)
+    _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps)
 
     # ---- TorchInductor knobs (must be set before torch.compile) ----
     if device.type == "cuda":
@@ -1994,23 +1914,57 @@ def run_pure_pretraining(
     if use_packing:
         train_loader = DataLoader(train_ds, batch_size=None, collate_fn=collator, **dl_kwargs)
     else:
-        train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=pretrain_config.micro_batch_size, collate_fn=collator, drop_last=False, **dl_kwargs)
-    eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_size, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
+        train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=collator, drop_last=False, **dl_kwargs)
+    eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
 
     # ---- Optimizer / Scheduler ----
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
-    epoch_start_steps = _compute_epoch_start_steps(
-        num_epochs=num_epochs,
-        train_loader_len=synced_len,
-        full_grad_accum=inferred_grad_accum_steps,
-        full_micro_batch=pretrain_config.micro_batch_size,
-        batch_size_warmup_steps=batch_size_warmup_steps,
-    )
-    steps_per_epoch = max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
-    total_steps = epoch_start_steps[-1]
+    if synced_len == 0:
+        raise RuntimeError(
+            "train_loader is empty (synced_len=0); cannot satisfy the token budget. "
+            "Check the dataset/manifest and per-rank sharding."
+        )
+
+    # ---- Training horizon (token budget -> optimizer steps) ----
+    # total_steps comes from the configured token/step budget, NOT from epochs.
+    # The DataLoader is repeated as many times as needed to meet the budget.
+    horizon = resolve_total_steps(pretrain_config, achieved_global_batch_tokens)
+    total_steps = horizon.total_steps
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+    if is_main and warmup_steps < pretrain_config.warmup_steps:
+        logger.warning(
+            "warmup_steps clamped from %d to %d (the token budget resolves to only "
+            "%d optimizer steps).",
+            pretrain_config.warmup_steps, warmup_steps, total_steps,
+        )
+
+    # ---- Epochs-equivalent startup hint (passes over the train set) ----
+    if is_main:
+        _approx = manifest.train_sequences * (manifest.min_seq_len + manifest.max_seq_len) // 2
+        if pretrain_config.lr_schedule.lower() == "wsd":
+            for label, steps in (("stable", horizon.stable_steps), ("decay", horizon.decay_steps),
+                                 ("total", horizon.total_steps)):
+                toks = steps * achieved_global_batch_tokens
+                logger.info(f"[{label}] " + format_passes_hint(toks, manifest.total_train_tokens, _approx))
+        else:
+            toks = horizon.total_steps * achieved_global_batch_tokens
+            logger.info(format_passes_hint(toks, manifest.total_train_tokens, _approx))
+
+    # Clamp the raw logging/eval/save intervals (from prepare_run_and_steps) to
+    # the token-budget total_steps now that the horizon is known.
+    logging_steps = max(1, min(total_steps, logging_steps))
+    eval_steps = max(1, min(total_steps, eval_steps))
+    save_steps = max(1, min(total_steps, save_steps))
+
+    if global_batch_warmup_steps > 0:
+        logger.warning(
+            "global_batch_warmup_steps=%d > 0: the token budget is approximate "
+            "under batch-size warmup (the ceil token->step conversion slightly "
+            "undercounts steps during the ramp).",
+            global_batch_warmup_steps,
+        )
 
     # ---- Recycling scheduler (no-op when recycling_loop_count == 1) ----
     from nanoplm.pretraining.recycling import RecyclingScheduler
@@ -2024,19 +1978,39 @@ def run_pure_pretraining(
     recycling_rng = None
     recycling_metrics_buffer = None
     if model.model_config.recycling_loop_count > 1:
+        # Resume semantics for the loop-count curriculum (spec §17):
+        #   - `continue` keeps the curriculum on the ORIGINAL horizon, read from
+        #     the checkpoint's training_state.json (not the locally recomputed
+        #     total_steps), so the loop-count ramp does not shift on resume.
+        #   - `decay` anneals a trunk that already finished the curriculum, so it
+        #     runs at the TARGET loop count from step 0 (curriculum_complete).
+        _is_resume = bool(resume_config and resume_config.is_resume)
+        _resume_mode = (resume_config.mode or "continue").lower() if _is_resume else None
+        _curriculum_complete = _is_resume and _resume_mode == "decay"
+        if _is_resume and _resume_mode == "continue":
+            _recycling_total_steps = int(
+                _read_training_state(resume_config.checkpoint_dir).get("total_steps", total_steps)
+            )
+        else:
+            _recycling_total_steps = total_steps
         recycling_scheduler = RecyclingScheduler(
             pretrain_config,
             target_loop_count=model.model_config.recycling_loop_count,
-            total_training_steps=total_steps,
+            total_training_steps=_recycling_total_steps,
+            curriculum_complete=_curriculum_complete,
         )
         # +999 offset keeps the r-sampling RNG stream distinct from the seed
         # used elsewhere (model init, data shuffling, dropout).
         recycling_rng = torch.Generator(device=device).manual_seed(int(pretrain_config.seed) + 999)
         recycling_metrics_buffer = RecyclingMetricsBuffer(window=100)
+    _is_wsd = pretrain_config.lr_schedule.lower() == "wsd"
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
         pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
         pretrain_config.lr_schedule,
+        stable_steps=horizon.stable_steps if _is_wsd else None,
+        decay_steps=horizon.decay_steps if _is_wsd else None,
+        decay_shape=pretrain_config.decay_shape,
     )
 
     # ---- Resume ----
@@ -2044,24 +2018,21 @@ def run_pure_pretraining(
     resume_data_step, resume_sub_batch_step = 0, 0
     resume_batch_split_divisor = 1
     resume_epoch = 0
+    # When a `decay` resume anneals a `warmup_stable` trunk, the loaded
+    # pretrain_config still says lr_schedule="warmup_stable", which would make
+    # the terminal save write "stable-end". Force "final" for decay resumes.
+    resume_force_final = False
     if resume_config and resume_config.is_resume:
-        logger.info(f"Resuming from checkpoint: {resume_config.checkpoint_dir}")
+        _resume_mode = (resume_config.mode or "continue").lower()
+        logger.info(
+            f"Resuming from checkpoint: {resume_config.checkpoint_dir} "
+            f"(mode={_resume_mode})"
+        )
         start_step, start_epoch = _load_checkpoint(
             orig_model, optimizer, scheduler, resume_config.checkpoint_dir,
             device, distributed, load_scheduler=False, distributed_mode=distributed_mode,
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
-
-        # Build the resumed LR scheduler (EXTEND or RESET per resume_config).
-        scheduler = _rebuild_scheduler_for_resume(
-            optimizer=optimizer,
-            resume_config=resume_config,
-            pretrain_config=pretrain_config,
-            checkpoint_dir=resume_config.checkpoint_dir,
-            start_step=start_step,
-            total_steps=total_steps,
-            is_main=is_main,
-        )
 
         # Detect dataset change: if the current dataset differs from the
         # checkpoint's dataset, start from batch 0 instead of fast-forwarding.
@@ -2084,103 +2055,131 @@ def run_pure_pretraining(
                     "Assuming same dataset for dataloader positioning."
                 )
 
-        resume_epoch = start_epoch
-        if not _dataset_changed:
-            if _ckp_state is not None and "epoch_data_step" in _ckp_state:
-                resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
-                resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
-                resume_batch_split_divisor = max(1, int(_ckp_state.get("batch_split_divisor", 1)))
-            else:
-                epoch_start_step = epoch_start_steps[min(start_epoch, len(epoch_start_steps) - 1)]
-                resume_data_step, resume_sub_batch_step, resume_batch_split_divisor = _locate_resume_position_in_epoch(
-                    train_loader_len=synced_len,
-                    epoch_start_step=epoch_start_step,
-                    resume_global_step=start_step,
-                    full_grad_accum=inferred_grad_accum_steps,
-                    full_micro_batch=pretrain_config.micro_batch_size,
-                    batch_size_warmup_steps=batch_size_warmup_steps,
+        if _resume_mode == "decay":
+            # Anneal a saved trunk: the decay phase is a fresh, short run from
+            # global_step 0 over `decay_steps`. Peak LR is the checkpoint's
+            # current (stable) LR already loaded into the optimizer.
+            if resume_config.decay_steps is not None:
+                resume_decay_steps = max(1, int(resume_config.decay_steps))
+            elif resume_config.decay_tokens is not None:
+                resume_decay_steps = tokens_to_steps(
+                    int(resume_config.decay_tokens), achieved_global_batch_tokens
                 )
-        if resume_data_step >= synced_len:
+            else:
+                raise ValueError(
+                    "resume mode='decay' requires decay_tokens or decay_steps"
+                )
+            # decay_steps (hence the LR curve) depends on the achieved per-step
+            # token throughput. If this resume reconfigured batch size / world
+            # size vs the trunk, the decay won't match a single-run wsd decay.
+            _trunk_gbt = (_ckp_state or {}).get("achieved_global_batch_tokens")
+            if (
+                is_main and _trunk_gbt is not None
+                and int(_trunk_gbt) != int(achieved_global_batch_tokens)
+            ):
+                logger.warning(
+                    "Decay resume: achieved_global_batch_tokens changed since the trunk "
+                    "(%d -> %d); decay_steps and the LR curve will differ from a "
+                    "single-run wsd decay.",
+                    int(_trunk_gbt), int(achieved_global_batch_tokens),
+                )
+            if is_main:
+                logger.info(
+                    "Resume decay anneals the trunk over %d steps. NOTE: the decay phase "
+                    "restarts the dataloader from the start of a pass, so weight "
+                    "equivalence with a single-run wsd decay holds only when the "
+                    "stable->decay boundary is data-pass aligned (spec sections 7/13).",
+                    resume_decay_steps,
+                )
+            scheduler = _rebuild_scheduler_for_resume(
+                optimizer=optimizer,
+                resume_config=resume_config,
+                pretrain_config=pretrain_config,
+                checkpoint_dir=resume_config.checkpoint_dir,
+                decay_steps=resume_decay_steps,
+                is_main=is_main,
+            )
+            # The decay phase runs from step 0 to `decay_steps`; override the
+            # loop horizon so `while global_step < total_steps` runs exactly the
+            # decay, and reset the start so global_step/tokens_seen anchor at 0.
+            total_steps = resume_decay_steps
+            warmup_steps = 0
+            start_step = 0
+            start_epoch = 0
+            horizon = StepHorizon(total_steps=resume_decay_steps)
+            resume_force_final = True
+            # Re-clamp logging/eval/save to the (shorter) decay horizon.
+            logging_steps = max(1, min(total_steps, logging_steps))
+            eval_steps = max(1, min(total_steps, eval_steps))
+            save_steps = max(1, min(total_steps, save_steps))
+            # Fresh phase: no dataloader fast-forward.
+            resume_epoch = 0
             resume_data_step = 0
             resume_sub_batch_step = 0
             resume_batch_split_divisor = 1
-            _pre_adjust_start_epoch = start_epoch
-            start_epoch = min(start_epoch + 1, num_epochs)
-            resume_epoch = start_epoch
-            # If the +1 advanced past a fully-consumed epoch boundary AND the
-            # user asked for a bounded resume (resume_epochs > 0), num_epochs
-            # was set to checkpoint_epoch + resume_epochs; the +1 would now
-            # leave range(start_epoch, num_epochs) empty.  Bump num_epochs by
-            # the same amount and rebuild the scheduler so we run exactly
-            # resume_epochs full epochs from the new start_epoch.
-            if (
-                start_epoch > _pre_adjust_start_epoch
-                and resume_config.resume_epochs is not None
-                and int(resume_config.resume_epochs) > 0
-            ):
-                num_epochs = start_epoch + int(resume_config.resume_epochs)
-                epoch_start_steps = _compute_epoch_start_steps(
-                    num_epochs=num_epochs,
-                    train_loader_len=synced_len,
-                    full_grad_accum=inferred_grad_accum_steps,
-                    full_micro_batch=pretrain_config.micro_batch_size,
-                    batch_size_warmup_steps=batch_size_warmup_steps,
-                )
-                steps_per_epoch = (
-                    max(1, epoch_start_steps[1] - epoch_start_steps[0])
-                    if num_epochs > 0 else 1
-                )
-                total_steps = epoch_start_steps[-1]
-                warmup_steps = min(pretrain_config.warmup_steps, total_steps)
-                scheduler = _rebuild_scheduler_for_resume(
-                    optimizer=optimizer,
-                    resume_config=resume_config,
-                    pretrain_config=pretrain_config,
-                    checkpoint_dir=resume_config.checkpoint_dir,
-                    start_step=start_step,
-                    total_steps=total_steps,
-                    is_main=is_main,
-                )
+            if is_main:
                 logger.info(
-                    f"Mid-epoch resume detected; bumped num_epochs to {num_epochs} "
-                    f"and rebuilt scheduler with total_steps={total_steps}."
+                    "Resume decay: total_steps=%d (decay), peak LR from checkpoint, "
+                    "warmup=0, terminal checkpoint -> checkpoint-final",
+                    total_steps,
                 )
-        elif resume_data_step > 0 and resume_sub_batch_step == 0:
-            if use_packing and hasattr(train_ds, "fast_forward"):
-                logger.info(
-                    f"Fast-forwarding dataloader by {resume_data_step} packed batches "
-                    f"(index-only, no data I/O)..."
-                )
-                skipped_samples = train_ds.fast_forward(
-                    resume_data_step,
-                    epoch=resume_epoch,
-                )
-                logger.info(
-                    f"Fast-forward complete: will skip {skipped_samples} underlying samples "
-                    f"to resume at data_step {resume_data_step}"
-                )
-                # Reset resume_data_step so the training loop doesn't also
-                # try to iterate-and-skip through the DataLoader.
-                resume_data_step = 0
-            else:
-                logger.info(
-                    f"Skipping {resume_data_step} DataLoader batch(es) in resumed epoch {resume_epoch}"
-                )
-        elif resume_data_step > 0 or resume_sub_batch_step > 0:
-            logger.info(
-                "Resuming inside epoch %d at data_step=%d sub_batch=%d/%d",
-                resume_epoch,
-                resume_data_step,
-                resume_sub_batch_step,
-                resume_batch_split_divisor,
+        else:
+            # continue: finish to the ORIGINAL budget with the ORIGINAL schedule,
+            # fast-forwarding the dataloader from the saved within-epoch position.
+            scheduler = _rebuild_scheduler_for_resume(
+                optimizer=optimizer,
+                resume_config=resume_config,
+                pretrain_config=pretrain_config,
+                checkpoint_dir=resume_config.checkpoint_dir,
+                start_step=start_step,
+                total_steps=total_steps,
+                stable_steps=horizon.stable_steps,
+                decay_steps=horizon.decay_steps,
+                is_main=is_main,
             )
+            resume_epoch = start_epoch
+            if (
+                not _dataset_changed
+                and _ckp_state is not None
+                and "epoch_data_step" in _ckp_state
+            ):
+                # Restore the exact within-pass position saved at checkpoint time.
+                # (Boundary/periodic saves persist epoch_data_step/sub_batch/
+                # divisor; the dataloader fast-forwards to this point.)
+                resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
+                resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
+                resume_batch_split_divisor = max(
+                    1, int(_ckp_state.get("batch_split_divisor", 1))
+                )
+            else:
+                # Dataset changed, pre-upgrade checkpoint, or a terminal/role
+                # checkpoint without a saved within-pass position: replay the
+                # DataLoader from the top of the current pass (spec §11 honest
+                # fallback). The LR schedule still fast-forwards via global_step.
+                resume_data_step = 0
+                resume_sub_batch_step = 0
+                resume_batch_split_divisor = 1
+            if resume_data_step >= synced_len:
+                # Saved position lands at/after the end of a pass; start the next
+                # pass cleanly from the top.
+                resume_data_step = 0
+                resume_sub_batch_step = 0
+                resume_batch_split_divisor = 1
+                resume_epoch = start_epoch + 1
+                start_epoch = resume_epoch
+            if is_main:
+                logger.info(
+                    "Resume continue: total_steps=%d, start_step=%d, "
+                    "fast-forward to epoch=%d data_step=%d sub_batch=%d divisor=%d",
+                    total_steps, start_step, resume_epoch, resume_data_step,
+                    resume_sub_batch_step, resume_batch_split_divisor,
+                )
 
     # ---- W&B ----
     wandb_enabled = False
     if is_main:
         try:
             wandb.init(
-                mode="offline",
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
@@ -2229,10 +2228,10 @@ def run_pure_pretraining(
 
     _run_t0 = time.perf_counter()
     logger.info(
-        f"Starting pure-torch training: epochs={num_epochs}, total_steps={total_steps}, "
-        f"warmup_steps={warmup_steps}, batch_size_warmup_steps={batch_size_warmup_steps}, "
+        f"Starting pure-torch training: total_steps={total_steps} (token-budget driven), "
+        f"warmup_steps={warmup_steps}, global_batch_warmup_steps={global_batch_warmup_steps}, "
         f"grad_accum={inferred_grad_accum_steps}, "
-        f"achieved_global_batch_size={achieved_global_batch_tokens:,} tokens"
+        f"achieved_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
@@ -2292,12 +2291,18 @@ def run_pure_pretraining(
     optimizer.zero_grad(set_to_none=True)
 
     global_step = start_step
+    # Running token counter for the schedule descriptor in training_state.json.
+    # Anchored at start_step so resume stays consistent. When
+    # global_batch_warmup_steps > 0 the per-step token count ramps; we use the
+    # steady-state achieved_global_batch_tokens here, so tokens_seen is an
+    # approximation in that regime (noted in the warmup log above).
+    tokens_seen = int(start_step) * int(achieved_global_batch_tokens)
     accum_micro_count = 0
     effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
         global_step,
         inferred_grad_accum_steps,
-        pretrain_config.micro_batch_size,
-        batch_size_warmup_steps,
+        pretrain_config.micro_batch_seqs,
+        global_batch_warmup_steps,
     )
     pending_compile_rebuild = False
     pending_compile_target_divisor = mbs_divisor
@@ -2353,20 +2358,45 @@ def run_pure_pretraining(
     # [0]=loss, [1]=grad_norm (local)
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
     profiler_ctx, profiler_step_cb = _make_pure_profiler(pretrain_config, output_dir, is_main)
-    if batch_size_warmup_steps > 0 and is_main:
+    if global_batch_warmup_steps > 0 and is_main:
         logger.info(
             "Batch-size warmup active: steps=%d, initial_grad_accum=%d, initial_micro_batch=%d, split_divisor=%d",
-            batch_size_warmup_steps,
+            global_batch_warmup_steps,
             effective_grad_accum,
             effective_micro_batch,
             mbs_divisor,
         )
 
+    # Step-driven outer loop: repeat the DataLoader (one pass == one "epoch")
+    # until the token-budget total_steps is reached. The horizon is driven by
+    # global_step, not a fixed epoch count.
+    epoch = start_epoch
+
+    # Single entry point for every checkpoint write. The common kwargs are
+    # captured by reference (resolved at call time); per-call-site differences
+    # (phase, and the resume data-position fields) are passed via **over.
+    def _save(phase, **over):
+        _save_checkpoint(
+            orig_model, optimizer, scheduler, global_step, epoch, output_dir,
+            logging_steps, eval_steps, save_steps,
+            distributed=distributed, is_main=is_main, distributed_mode=distributed_mode,
+            model_config=_model_config, manifest=_manifest, pretrain_config=pretrain_config,
+            total_steps=total_steps, warmup_steps=warmup_steps,
+            dataset_fingerprint=_dataset_fingerprint,
+            tokens_seen=tokens_seen,
+            achieved_global_batch_tokens=achieved_global_batch_tokens,
+            stable_steps=horizon.stable_steps, decay_steps=horizon.decay_steps,
+            phase=phase,
+            **over,
+        )
+
     with profiler_ctx:
-        for epoch in range(start_epoch, num_epochs):
+        while global_step < total_steps:
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
                 epoch_setter.set_epoch(epoch)
-            epoch_start_step = epoch_start_steps[min(epoch, len(epoch_start_steps) - 1)]
+            # global_step at the start of this pass — used only for the
+            # per-pass "optimizer steps" log line below.
+            epoch_start_step = global_step
 
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
@@ -2484,8 +2514,8 @@ def run_pure_pretraining(
                             effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
                                 global_step,
                                 inferred_grad_accum_steps,
-                                pretrain_config.micro_batch_size,
-                                batch_size_warmup_steps,
+                                pretrain_config.micro_batch_seqs,
+                                global_batch_warmup_steps,
                             )
                         continue
 
@@ -2675,6 +2705,7 @@ def run_pure_pretraining(
                         _moe_count_accum.zero_()
 
                     global_step += 1
+                    tokens_seen += int(achieved_global_batch_tokens)
                     profiler_step_cb(global_step)
 
                     if _prores_model is not None:
@@ -2694,14 +2725,14 @@ def run_pure_pretraining(
                     effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
                         global_step,
                         inferred_grad_accum_steps,
-                        pretrain_config.micro_batch_size,
-                        batch_size_warmup_steps,
+                        pretrain_config.micro_batch_seqs,
+                        global_batch_warmup_steps,
                     )
                     if prev_warmup_state[2] != mbs_divisor:
                         pending_compile_rebuild = True
                         pending_compile_target_divisor = mbs_divisor
                     if (
-                        batch_size_warmup_steps > 0
+                        global_batch_warmup_steps > 0
                         and is_main
                         and prev_warmup_state != (effective_grad_accum, effective_micro_batch, mbs_divisor)
                     ):
@@ -2829,7 +2860,30 @@ def run_pure_pretraining(
                         window_loss.zero_()
                         window_steps = 0
 
-                    if global_step % eval_steps == 0:
+                    # ---- Phase-boundary detection (role-named checkpoints) ----
+                    # Terminal role per schedule (spec §6):
+                    #   wsd            -> stable-end at stable_steps (intermediate,
+                    #                     pre-decay) + final at total_steps.
+                    #   warmup_stable  -> stable-end at total_steps (the reusable
+                    #                     trunk; no separate final).
+                    #   cosine/linear  -> final at total_steps.
+                    # The terminal checkpoint (at total_steps) is written exactly
+                    # once by the post-loop save below; the in-loop branch only
+                    # handles the intermediate wsd stable-end.
+                    _sched = pretrain_config.lr_schedule.lower()
+                    # The wsd intermediate stable-end fires in-loop at stable_steps
+                    # (always < total_steps, pre-decay). Every schedule's TERMINAL
+                    # checkpoint (at total_steps) is the post-loop save's
+                    # responsibility, so the in-loop booleans are wsd-intermediate
+                    # only.
+                    at_wsd_stable_end = (
+                        _sched == "wsd" and horizon.stable_steps is not None
+                        and global_step == horizon.stable_steps
+                    )
+                    at_terminal = (global_step == total_steps)
+                    do_periodic = global_step % save_steps == 0
+
+                    if global_step % eval_steps == 0 or at_wsd_stable_end:
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
                             eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
                         elif recycling_scheduler is not None:
@@ -2873,7 +2927,11 @@ def run_pure_pretraining(
                                         logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
-                    if global_step % save_steps == 0:
+                    # In-loop saves: the forced wsd stable-end boundary and the
+                    # periodic save_steps cadence. Skip the periodic save at the
+                    # terminal step -- the post-loop save writes the role-named
+                    # terminal checkpoint there for every schedule.
+                    if at_wsd_stable_end or (do_periodic and not at_terminal):
                         next_data_step = micro_step
                         next_sub_batch_step = sub_batch_idx + 1
                         next_batch_split_divisor = batch_split_divisor
@@ -2881,23 +2939,27 @@ def run_pure_pretraining(
                             next_data_step = micro_step + 1
                             next_sub_batch_step = 0
                             next_batch_split_divisor = mbs_divisor
-                        _save_checkpoint(
-                            orig_model, optimizer, scheduler, global_step, epoch,
-                            output_dir, logging_steps, eval_steps, save_steps,
-                            distributed, is_main, distributed_mode=distributed_mode,
-                            model_config=_model_config, manifest=_manifest,
-                            pretrain_config=pretrain_config,
-                            total_steps=total_steps, warmup_steps=warmup_steps,
-                            dataset_fingerprint=_dataset_fingerprint,
+                        _pos = dict(
                             epoch_data_step=next_data_step,
                             epoch_sub_batch_step=next_sub_batch_step,
                             batch_split_divisor=next_batch_split_divisor,
                         )
+                        _save("stable-end" if at_wsd_stable_end else "periodic", **_pos)
+                        # When the wsd stable-end coincides with the periodic
+                        # cadence, also write the periodic checkpoint so the
+                        # save_steps trail is unbroken.
+                        if at_wsd_stable_end and do_periodic:
+                            _save("periodic", **_pos)
 
                 if epoch == resume_epoch and micro_step == resume_data_step:
                     resume_data_step = 0
                     resume_sub_batch_step = 0
                     resume_batch_split_divisor = 1
+
+                # Token-budget horizon reached: stop after the current
+                # optimizer step's logging/eval/save have fired.
+                if global_step >= total_steps:
+                    break
 
             # ---- Epoch boundary cleanup ----
             # When the inner loop ends (either by exhausting synced_len or
@@ -2913,8 +2975,8 @@ def run_pure_pretraining(
             partial_discarded = accum_micro_count
             if is_main:
                 logger.info(
-                    "Epoch %d/%d complete: %d effective micro-steps, %d optimizer steps%s",
-                    epoch + 1, num_epochs, epoch_fwd_count,
+                    "Data pass %d complete (global_step %d/%d): %d effective micro-steps, %d optimizer steps%s",
+                    epoch + 1, global_step, total_steps, epoch_fwd_count,
                     global_step - epoch_start_step,
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
                     if partial_discarded else "",
@@ -2934,19 +2996,30 @@ def run_pure_pretraining(
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
 
+            # Stop once the token-budget horizon is met; otherwise replay the
+            # DataLoader for another pass.
+            if global_step >= total_steps:
+                break
+            epoch += 1
+
     # ---- Finalize ----
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
-    _save_checkpoint(
-        orig_model, optimizer, scheduler, global_step, num_epochs,
-        output_dir, logging_steps, eval_steps, save_steps,
-        distributed, is_main, distributed_mode=distributed_mode,
-        model_config=_model_config, manifest=_manifest,
-        pretrain_config=pretrain_config,
-        total_steps=total_steps, warmup_steps=warmup_steps,
-        dataset_fingerprint=_dataset_fingerprint,
+    # Terminal role checkpoint, written exactly once at total_steps:
+    #   resume decay  -> final (anneal output; overrides the trunk's schedule)
+    #   warmup_stable -> stable-end (the reusable trunk a later run anneals)
+    #   wsd / cosine / linear -> final
+    _terminal_phase = (
+        "final"
+        if resume_force_final
+        else (
+            "stable-end"
+            if pretrain_config.lr_schedule.lower() == "warmup_stable"
+            else "final"
+        )
     )
+    _save(_terminal_phase)
 
     if debug_tracker is not None:
         debug_tracker.close()

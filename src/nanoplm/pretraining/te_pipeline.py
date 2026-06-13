@@ -39,11 +39,10 @@ from nanoplm.pretraining.models.modern_bert.modeling import MHCLiteBlock
 from nanoplm.pretraining.models.modern_bert.modelling_te import FP8_RECIPE
 from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
-from nanoplm.pretraining.utils import prepare_run_and_steps
+from nanoplm.pretraining.utils import prepare_run_and_steps, resolve_total_steps
 from nanoplm.pretraining.pure_pipeline import (
     H100_PEAK_TFLOPS,
     N_PREFETCH_LAYERS_FSDP2,
-    _compute_epoch_start_steps,
     _create_optimizer,
     _create_scheduler,
     _ddp_sync_context,
@@ -57,10 +56,8 @@ from nanoplm.pretraining.pure_pipeline import (
     _get_distributed_mode,
     _has_nonfinite_params,
     _load_checkpoint,
-    _locate_resume_position_in_epoch,
     _maybe_expand_dynamo_cache_for_batch_warmup,
     _move_batch_to_device,
-    _num_update_steps_per_epoch,
     _rebuild_scheduler_for_resume,
     _resolve_world_size,
     _save_checkpoint,
@@ -290,7 +287,7 @@ def run_te_pretraining(
     seq_count_buckets = None
     max_seqlen_buckets = None
     if use_static_inp_size:
-        pack_tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
+        pack_tokens_per_micro = pretrain_config.micro_batch_seqs * manifest.max_seq_len
         min_tokens_per_seq = max(
             1,
             int(manifest.min_seq_len) + int(tokenizer.num_special_tokens_to_add(pair=False)),
@@ -304,16 +301,16 @@ def run_te_pretraining(
     effective_world_size = _resolve_world_size(pretrain_config)
 
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
-    global_batch_size_samples = pretrain_config.global_batch_size_samples
+    global_batch_seqs = pretrain_config.global_batch_seqs
     achieved_global_batch_tokens = pretrain_config.achieved_global_batch_tokens
-    batch_size_warmup_steps = max(
+    global_batch_warmup_steps = max(
         0,
-        int(getattr(pretrain_config, "batch_size_warmup_steps", 0)),
+        int(getattr(pretrain_config, "global_batch_warmup_steps", 0)),
     )
 
     if (
         inferred_grad_accum_steps is None
-        or global_batch_size_samples is None
+        or global_batch_seqs is None
         or achieved_global_batch_tokens is None
     ):
         raise ValueError(
@@ -324,20 +321,20 @@ def run_te_pretraining(
     world_tokens_per_micro_step = achieved_global_batch_tokens // max(
         1, inferred_grad_accum_steps
     )
-    tokens_per_micro = pretrain_config.micro_batch_size * manifest.max_seq_len
+    tokens_per_micro = pretrain_config.micro_batch_seqs * manifest.max_seq_len
     logger.info(
         "Batch setup: "
-        f"target_global_batch_size={pretrain_config.global_batch_size:,} tokens, "
+        f"target_global_batch_tokens={pretrain_config.global_batch_tokens:,} tokens, "
         f"micro_step_tokens={world_tokens_per_micro_step:,}, "
         f"grad_accum_steps={inferred_grad_accum_steps}, "
-        f"effective_global_batch_size={achieved_global_batch_tokens:,} tokens"
+        f"effective_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
 
     (
         _run_name,
         wandb_run_name,
         output_dir,
-        num_epochs,
+        _unused_epochs_slot,
         logging_steps,
         eval_steps,
         save_steps,
@@ -346,7 +343,7 @@ def run_te_pretraining(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
-        global_batch_size_samples=global_batch_size_samples,
+        global_batch_seqs=global_batch_seqs,
     )
 
     num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
@@ -380,7 +377,7 @@ def run_te_pretraining(
         if getattr(pretrain_config, "use_compile_max_autotune", False)
         else None
     )
-    _maybe_expand_dynamo_cache_for_batch_warmup(batch_size_warmup_steps)
+    _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps)
     if model.model.config.use_mhc_lite:
         _compile_te_mhc_blocks(
             model,
@@ -564,7 +561,7 @@ def run_te_pretraining(
         train_loader = DataLoader(
             train_ds,
             sampler=train_sampler,
-            batch_size=pretrain_config.micro_batch_size,
+            batch_size=pretrain_config.micro_batch_seqs,
             collate_fn=collator,
             drop_last=False,
             **dl_kwargs,
@@ -572,7 +569,7 @@ def run_te_pretraining(
     eval_loader = DataLoader(
         val_ds,
         sampler=eval_sampler,
-        batch_size=pretrain_config.micro_batch_size,
+        batch_size=pretrain_config.micro_batch_seqs,
         collate_fn=eval_collator,
         drop_last=False,
         **dl_kwargs,
@@ -585,16 +582,30 @@ def run_te_pretraining(
         distributed=distributed,
         device=device,
     )
-    epoch_start_steps = _compute_epoch_start_steps(
-        num_epochs=num_epochs,
-        train_loader_len=synced_train_loader_len,
-        full_grad_accum=inferred_grad_accum_steps,
-        full_micro_batch=pretrain_config.micro_batch_size,
-        batch_size_warmup_steps=batch_size_warmup_steps,
-    )
-    steps_per_epoch = max(1, epoch_start_steps[1] - epoch_start_steps[0]) if num_epochs > 0 else 1
-    total_steps = epoch_start_steps[-1]
+    if synced_train_loader_len == 0:
+        raise RuntimeError(
+            "train_loader is empty (synced_len=0); cannot satisfy the token budget. "
+            "Check the dataset/manifest and per-rank sharding."
+        )
+    # ---- Training horizon (token budget -> optimizer steps) ----
+    # total_steps comes from the configured token/step budget, NOT from epochs.
+    # TE only ever sees warmup_stable/cosine/linear, so stable_steps/decay_steps
+    # are None and the DataLoader is repeated as many passes as needed.
+    horizon = resolve_total_steps(pretrain_config, achieved_global_batch_tokens)
+    total_steps = horizon.total_steps
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+    if is_main and warmup_steps < pretrain_config.warmup_steps:
+        logger.warning(
+            "warmup_steps clamped from %d to %d (the token budget resolves to only "
+            "%d optimizer steps).",
+            pretrain_config.warmup_steps, warmup_steps, total_steps,
+        )
+    # Clamp the raw logging/eval/save intervals to the token-budget horizon so a
+    # tiny budget (total_steps < save_steps/eval_steps) still gets at least one
+    # periodic eval/checkpoint instead of none (mirrors pure_pipeline).
+    logging_steps = max(1, min(total_steps, logging_steps))
+    eval_steps = max(1, min(total_steps, eval_steps))
+    save_steps = max(1, min(total_steps, save_steps))
     scheduler = _create_scheduler(
         optimizer, warmup_steps, total_steps,
         pretrain_config.adam_learning_rate, pretrain_config.lr_decay_to_fraction,
@@ -621,7 +632,10 @@ def run_te_pretraining(
         )
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
-        # Build the resumed LR scheduler (EXTEND or RESET per resume_config).
+        # continue: finish to the ORIGINAL budget with the ORIGINAL schedule,
+        # fast-forwarding the dataloader from the saved within-pass position.
+        # TE only ever sees continue resume (wsd/decay are gated to pure_torch),
+        # so stable_steps/decay_steps stay None.
         scheduler = _rebuild_scheduler_for_resume(
             optimizer=optimizer,
             resume_config=resume_config,
@@ -629,7 +643,6 @@ def run_te_pretraining(
             checkpoint_dir=resume_config.checkpoint_dir,
             start_step=start_step,
             total_steps=total_steps,
-            is_main=is_main,
         )
         resume_epoch = start_epoch
         _ckp_state_path = Path(resume_config.checkpoint_dir) / "training_state.json"
@@ -637,25 +650,25 @@ def run_te_pretraining(
         if _ckp_state_path.exists():
             _ckp_state = json.loads(_ckp_state_path.read_text(encoding="utf-8"))
         if _ckp_state is not None and "epoch_data_step" in _ckp_state:
+            # Restore the exact within-pass position saved at checkpoint time.
             resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
             resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
             resume_batch_split_divisor = max(1, int(_ckp_state.get("batch_split_divisor", 1)))
         else:
-            epoch_start_step = epoch_start_steps[min(start_epoch, len(epoch_start_steps) - 1)]
-            resume_data_step, resume_sub_batch_step, resume_batch_split_divisor = _locate_resume_position_in_epoch(
-                train_loader_len=synced_train_loader_len,
-                epoch_start_step=epoch_start_step,
-                resume_global_step=start_step,
-                full_grad_accum=inferred_grad_accum_steps,
-                full_micro_batch=pretrain_config.micro_batch_size,
-                batch_size_warmup_steps=batch_size_warmup_steps,
-            )
-        if resume_data_step >= synced_train_loader_len:
+            # Pre-upgrade checkpoint with no saved within-pass position: replay
+            # the DataLoader from the top of the current pass (spec §11 honest
+            # fallback). The LR schedule still fast-forwards via global_step.
             resume_data_step = 0
             resume_sub_batch_step = 0
             resume_batch_split_divisor = 1
-            start_epoch = min(start_epoch + 1, num_epochs)
-            resume_epoch = start_epoch
+        if resume_data_step >= synced_train_loader_len:
+            # Saved position lands at/after the end of a pass; start the next
+            # pass cleanly from the top.
+            resume_data_step = 0
+            resume_sub_batch_step = 0
+            resume_batch_split_divisor = 1
+            resume_epoch = start_epoch + 1
+            start_epoch = resume_epoch
         elif resume_data_step > 0 or resume_sub_batch_step > 0:
             logger.info(
                 "Resuming inside epoch %d at data_step=%d sub_batch=%d/%d",
@@ -718,10 +731,10 @@ def run_te_pretraining(
 
     logger.info(
         "Starting Transformer Engine training: "
-        f"epochs={num_epochs}, total_steps={total_steps}, warmup_steps={warmup_steps}, "
-        f"batch_size_warmup_steps={batch_size_warmup_steps}, "
+        f"total_steps={total_steps}, warmup_steps={warmup_steps}, "
+        f"global_batch_warmup_steps={global_batch_warmup_steps}, "
         f"grad_accum={inferred_grad_accum_steps}, "
-        f"achieved_global_batch_size={achieved_global_batch_tokens:,} tokens"
+        f"achieved_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
@@ -766,8 +779,8 @@ def run_te_pretraining(
     effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
         global_step,
         inferred_grad_accum_steps,
-        pretrain_config.micro_batch_size,
-        batch_size_warmup_steps,
+        pretrain_config.micro_batch_seqs,
+        global_batch_warmup_steps,
     )
     accum_loss = torch.zeros((), device=device)
     window_loss = torch.zeros((), device=device)
@@ -785,20 +798,26 @@ def run_te_pretraining(
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
 
     profiler_ctx, profiler_step_cb = _make_te_profiler(pretrain_config, output_dir, is_main)
-    if batch_size_warmup_steps > 0 and is_main:
+    if global_batch_warmup_steps > 0 and is_main:
         logger.info(
             "Batch-size warmup active: steps=%d, initial_grad_accum=%d, initial_micro_batch=%d, split_divisor=%d",
-            batch_size_warmup_steps,
+            global_batch_warmup_steps,
             effective_grad_accum,
             effective_micro_batch,
             mbs_divisor,
         )
 
+    # Step-driven outer loop: repeat the DataLoader (one pass == one "epoch")
+    # until the token-budget total_steps is reached. The horizon is driven by
+    # global_step, not a fixed epoch count.
+    epoch = start_epoch
     with profiler_ctx:
-        for epoch in range(start_epoch, num_epochs):
+        while global_step < total_steps:
             if _epoch_setter is not None and hasattr(_epoch_setter, "set_epoch"):
                 _epoch_setter.set_epoch(epoch)
-            epoch_start_step = epoch_start_steps[min(epoch, len(epoch_start_steps) - 1)]
+            # global_step at the start of this pass — used only for the
+            # per-pass "optimizer steps" log line below.
+            epoch_start_step = global_step
 
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
@@ -873,8 +892,8 @@ def run_te_pretraining(
                             effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
                                 global_step,
                                 inferred_grad_accum_steps,
-                                pretrain_config.micro_batch_size,
-                                batch_size_warmup_steps,
+                                pretrain_config.micro_batch_seqs,
+                                global_batch_warmup_steps,
                             )
                         continue
 
@@ -1018,11 +1037,11 @@ def run_te_pretraining(
                     effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
                         global_step,
                         inferred_grad_accum_steps,
-                        pretrain_config.micro_batch_size,
-                        batch_size_warmup_steps,
+                        pretrain_config.micro_batch_seqs,
+                        global_batch_warmup_steps,
                     )
                     if (
-                        batch_size_warmup_steps > 0
+                        global_batch_warmup_steps > 0
                         and is_main
                         and prev_warmup_state != (effective_grad_accum, effective_micro_batch, mbs_divisor)
                     ):
@@ -1191,6 +1210,11 @@ def run_te_pretraining(
                     resume_sub_batch_step = 0
                     resume_batch_split_divisor = 1
 
+                # Token-budget horizon reached: stop after the current
+                # optimizer step's logging/eval/save have fired.
+                if global_step >= total_steps:
+                    break
+
             # ---- Epoch boundary cleanup ----
             # Flush partial gradient-accumulation state left over from
             # micro-steps that ran forward+backward but never reached an
@@ -1202,8 +1226,8 @@ def run_te_pretraining(
             partial_discarded = accum_micro_count
             if is_main:
                 logger.info(
-                    "Epoch %d/%d complete: %d effective micro-steps, %d optimizer steps%s",
-                    epoch + 1, num_epochs, epoch_fwd_count,
+                    "Data pass %d complete (global_step %d/%d): %d effective micro-steps, %d optimizer steps%s",
+                    epoch + 1, global_step, total_steps, epoch_fwd_count,
                     global_step - epoch_start_step,
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
                     if partial_discarded else "",
@@ -1222,6 +1246,12 @@ def run_te_pretraining(
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
 
+            # Stop once the token-budget horizon is met; otherwise replay the
+            # DataLoader for another pass.
+            if global_step >= total_steps:
+                break
+            epoch += 1
+
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
@@ -1230,7 +1260,7 @@ def run_te_pretraining(
         optimizer=optimizer,
         scheduler=scheduler,
         global_step=global_step,
-        epoch=num_epochs,
+        epoch=epoch,
         output_dir=output_dir,
         logging_steps=logging_steps,
         eval_steps=eval_steps,

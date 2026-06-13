@@ -134,49 +134,12 @@ class WandbSourceSnapshotCallback(TrainerCallback):
         return control
 
 
-def _warn_unsupported_resume_fields_on_hf(
-    resume_config: Optional[ResumeConfig],
-) -> None:
-    """Warn the user when EXTEND/RESET schedule fields are set on the HF path.
-
-    HF Trainer manages its own scheduler/optimizer state and bit-exactly
-    resumes from ``resume_from_checkpoint``.  ``ResumeConfig.lr_schedule``,
-    ``lr_decay_to_fraction``, ``learning_rate``, ``muon_learning_rate``,
-    ``warmup_steps``, and ``reset_scheduler`` are silently ignored on this
-    path -- which is a footgun.  The pure-torch and pure-te pipelines honor
-    them via ``_rebuild_scheduler_for_resume``; HF does not.
-    """
-    if resume_config is None or not resume_config.is_resume:
-        return
-
-    set_fields = []
-    if resume_config.reset_scheduler:
-        set_fields.append("reset_scheduler")
-    for name in (
-        "warmup_steps", "learning_rate", "muon_learning_rate",
-        "lr_schedule", "lr_decay_to_fraction",
-    ):
-        if getattr(resume_config, name) is not None:
-            set_fields.append(name)
-
-    if set_fields:
-        logger.warning(
-            "HF Trainer pipeline ignores resume schedule fields: "
-            f"{', '.join(set_fields)}. The HF path bit-exactly resumes the "
-            "scheduler from the checkpoint. To use the EXTEND/RESET resume "
-            "semantics, switch to --pure-torch (or --pure-te), where these "
-            "fields are honored."
-        )
-
-
 def run_pretraining(
     model: ProtModernBertMLM,
     pretrain_config: PretrainingConfig,
     manifest: DataManifest,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
-
-    _warn_unsupported_resume_fields_on_hf(resume_config)
 
     device = get_device()
 
@@ -224,7 +187,7 @@ def run_pretraining(
     batch = compute_batch_setup(pretrain_config, manifest.max_seq_len, effective_world_size)
 
     inferred_grad_accum_steps = batch.grad_accum_steps
-    global_batch_size_samples = batch.global_batch_size_samples
+    global_batch_seqs = batch.global_batch_seqs
 
     # Prepare run info and step intervals in a single place
     (
@@ -240,10 +203,10 @@ def run_pretraining(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
         train_samples=train_sequences,
-        global_batch_size_samples=global_batch_size_samples,
+        global_batch_seqs=global_batch_seqs,
     )
 
-    steps_per_epoch = (train_sequences + global_batch_size_samples - 1) // global_batch_size_samples
+    steps_per_epoch = (train_sequences + global_batch_seqs - 1) // global_batch_seqs
     total_steps = num_epochs * steps_per_epoch
     warmup_steps = min(pretrain_config.warmup_steps, total_steps)
 
@@ -255,8 +218,8 @@ def run_pretraining(
 
     training_dict = {
         "output_dir": output_dir,
-        "per_device_train_batch_size": pretrain_config.micro_batch_size,
-        "per_device_eval_batch_size": pretrain_config.micro_batch_size,
+        "per_device_train_batch_size": pretrain_config.micro_batch_seqs,
+        "per_device_eval_batch_size": pretrain_config.micro_batch_seqs,
         "gradient_accumulation_steps": inferred_grad_accum_steps,
         "num_train_epochs": num_epochs,
         "learning_rate": pretrain_config.adam_learning_rate,

@@ -14,14 +14,23 @@ class PretrainingConfig:
     ckp_dir: str = "output/pretraining"
 
     # Training hyperparameters
-    micro_batch_size: int = 64
-    num_epochs: int = 10
-    warmup_steps: int = 302
+    micro_batch_seqs: int = 64
+    warmup_steps: int = 1000
     # RePO activation warmup (optimizer-step based) for pure-torch path.
     # If None, defaults to warmup_steps (backward-compatible behavior).
     repo_rope_warmup_steps: Optional[int] = None
     lr_decay_to_fraction: float = 0.1
-    lr_schedule: str = "cosine"
+    lr_schedule: str = "wsd"            # wsd | warmup_stable | cosine | linear
+    decay_shape: str = "1-sqrt"         # 1-sqrt | linear (wsd/decay only)
+    # Duration as a TOKEN budget (primary). Exactly one unit per phase.
+    # (Mutual-exclusivity/precedence is ENFORCED later by duration-precedence validation at config load, not by this dataclass.)
+    stable_tokens: Optional[int] = None   # wsd: tokens up to the pre-decay checkpoint (warmup incl.)
+    decay_tokens: Optional[int] = None    # wsd: additional anneal tokens
+    train_tokens: Optional[int] = None    # warmup_stable | cosine | linear: single budget
+    # Advanced step overrides (mutually exclusive with their *_tokens counterpart):
+    stable_steps: Optional[int] = None
+    decay_steps: Optional[int] = None
+    max_steps: Optional[int] = None    # ↔ train_tokens (single-phase step override)
     optimizer: str = "normuon"
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
@@ -45,11 +54,11 @@ class PretrainingConfig:
     muonh_normalization: str = "neuron"
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
-    global_batch_size: int = 256000
+    global_batch_tokens: int = 256000
     inferred_grad_accum_steps: Optional[int] = None
-    global_batch_size_samples: Optional[int] = None
+    global_batch_seqs: Optional[int] = None
     achieved_global_batch_tokens: Optional[int] = None
-    batch_size_warmup_steps: int = 0
+    global_batch_warmup_steps: int = 0
 
     # Mixed precision
     bf16: bool = True
@@ -139,13 +148,9 @@ class PretrainingConfig:
 class ResumeConfig:
     is_resume: bool
     checkpoint_dir: str
-    # resume_epochs: number of additional epochs to train from the checkpoint.
-    # 0 (or None) means "continue to the original num_epochs from pretrain config".
-    # N > 0 means "train for exactly N more epochs from the checkpoint"
-    resume_epochs: Optional[int] = None
-    warmup_steps: Optional[int] = None
-    learning_rate: Optional[float] = None
-    muon_learning_rate: Optional[float] = None
-    lr_schedule: Optional[str] = None
+    mode: str = "continue"                 # continue | decay
+    # decay-only fields (mode == "decay"):
+    decay_tokens: Optional[int] = None
+    decay_steps: Optional[int] = None
+    decay_shape: Optional[str] = None      # 1-sqrt | linear
     lr_decay_to_fraction: Optional[float] = None
-    reset_scheduler: bool = False

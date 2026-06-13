@@ -6,7 +6,7 @@ This directory contains comprehensive tests for the nanoPLM project, focusing on
 
 - `test_data_collator.py` - Tests for data collation and padding functionality
 - `test_fasta_dataset.py` - Tests for FASTA dataset creation and iteration
-- `test_integration.py` - Integration tests for the full pipeline
+- `test_wsd_equivalence.py` - End-to-end test: single-run WSD decay ≡ resume-decay from the trunk
 - `test_smoke.py` - Basic smoke tests that can run without additional dependencies
 - `conftest.py` - Pytest configuration and shared fixtures
 - `test_runner.py` - Simple test runner for environments without pytest

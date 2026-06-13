@@ -23,7 +23,6 @@ os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
 import torch
 
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
-from nanoplm.pretraining.pipeline import run_pretraining
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 
 _TE_IMPORT_ERROR = None
@@ -88,31 +87,31 @@ def _populate_batch_setup(cfg: PretrainingConfig) -> None:
     manifest = validation_result["manifest"]
 
     effective_world_size = _resolve_effective_world_size(cfg)
-    if cfg.global_batch_size <= 0:
-        raise ValueError(f"global_batch_size must be > 0, got {cfg.global_batch_size}")
+    if cfg.global_batch_tokens <= 0:
+        raise ValueError(f"global_batch_tokens must be > 0, got {cfg.global_batch_tokens}")
 
     world_tokens_per_micro_step = (
-        cfg.micro_batch_size * manifest.max_seq_len * effective_world_size
+        cfg.micro_batch_seqs * manifest.max_seq_len * effective_world_size
     )
     if world_tokens_per_micro_step <= 0:
         raise ValueError(
             f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check micro_batch_size, max_seq_len, and world_size."
+            "Check micro_batch_seqs, max_seq_len, and world_size."
         )
 
     inferred_grad_accum_steps = max(
         1,
-        math.ceil(cfg.global_batch_size / world_tokens_per_micro_step),
+        math.ceil(cfg.global_batch_tokens / world_tokens_per_micro_step),
     )
     achieved_global_batch_tokens = (
         inferred_grad_accum_steps * world_tokens_per_micro_step
     )
-    global_batch_size_samples = (
-        inferred_grad_accum_steps * cfg.micro_batch_size * effective_world_size
+    global_batch_seqs = (
+        inferred_grad_accum_steps * cfg.micro_batch_seqs * effective_world_size
     )
 
     cfg.inferred_grad_accum_steps = inferred_grad_accum_steps
-    cfg.global_batch_size_samples = global_batch_size_samples
+    cfg.global_batch_seqs = global_batch_seqs
     cfg.achieved_global_batch_tokens = achieved_global_batch_tokens
 
 
@@ -176,6 +175,23 @@ def _validate_debug_layerwise_metrics_compat(
         )
 
 
+def _check_pipeline_supported(pure_torch: bool, pure_te: bool,
+                              lr_schedule: str, resume_mode) -> None:
+    """Pretraining requires pure_torch or pure_te; wsd/decay require pure_torch (spec section 14)."""
+    if not (pure_torch or pure_te):
+        raise ValueError(
+            "Pretraining requires pure_torch: true or pure_te: true. "
+            "The HF Trainer pretraining path is no longer supported."
+        )
+    sched = (lr_schedule or "").lower()
+    mode = (resume_mode or "").lower() if resume_mode else None
+    if not pure_torch and (sched == "wsd" or mode == "decay"):
+        raise ValueError(
+            "lr_schedule: wsd and resume mode: decay require pure_torch: true "
+            "(TE supports warmup_stable/cosine/linear + continue only)."
+        )
+
+
 @click.group(name="pretrain")
 @click.help_option("--help", "-h")
 def pretrain():
@@ -200,12 +216,11 @@ def pretrain():
 )
 # Training hyperparameters
 @click.option(
-    "--micro-batch-size",
+    "--micro-batch-seqs",
     type=int,
     default=64,
-    help="Per-device micro-batch size (samples per GPU per forward pass)",
+    help="Sequences per GPU per micro-step (forward pass)",
 )
-@click.option("--num-epochs", type=int, default=10, help="Number of epochs")
 @click.option(
     "--adam-learning-rate",
     type=float,
@@ -237,11 +252,11 @@ def pretrain():
     "If unset, defaults to --warmup-steps.",
 )
 @click.option(
-    "--batch-size-warmup-steps",
+    "--global-batch-warmup-steps",
     type=int,
     default=0,
-    help="Optimizer steps to ramp effective batch size from 1/8 to full by reducing "
-    "grad accumulation first, then splitting DataLoader batches when needed.",
+    help="Optimizer steps to ramp the global batch from 1/8 to full (1/8 -> 1/4 -> 1/2 -> full). "
+    "Default 0: no batch-size warmup.",
 )
 @click.option(
     "--lr-decay-to-fraction",
@@ -251,12 +266,64 @@ def pretrain():
 )
 @click.option(
     "--lr-schedule",
-    type=click.Choice(["linear", "cosine"], case_sensitive=False),
-    default="cosine",
-    help="Learning rate schedule to use after warmup",
+    type=click.Choice(
+        ["wsd", "warmup_stable", "cosine", "linear"], case_sensitive=False
+    ),
+    default="wsd",
+    help="LR schedule after warmup. wsd: warmup->stable->decay (use --stable-tokens/"
+    "--decay-tokens); warmup_stable/cosine/linear: single phase (use --train-tokens).",
 )
 @click.option(
-    "--global-batch-size",
+    "--train-tokens",
+    type=int,
+    default=None,
+    help="Single-phase token budget (warmup_stable/cosine/linear). "
+    "Set exactly one of --train-tokens or --max-steps for the training budget.",
+)
+@click.option(
+    "--stable-tokens",
+    type=int,
+    default=None,
+    help="wsd only: tokens up to the pre-decay checkpoint (warmup included). "
+    "Set exactly one of --stable-tokens or --stable-steps for the stable budget.",
+)
+@click.option(
+    "--decay-tokens",
+    type=int,
+    default=None,
+    help="wsd only: additional anneal token budget. "
+    "Set exactly one of --decay-tokens or --decay-steps for the decay budget.",
+)
+@click.option(
+    "--max-steps",
+    type=int,
+    default=None,
+    help="Single-phase step override for --train-tokens (warmup_stable/cosine/linear). "
+    "Set exactly one of --train-tokens or --max-steps for the training budget.",
+)
+@click.option(
+    "--stable-steps",
+    type=int,
+    default=None,
+    help="wsd only: step override for --stable-tokens. "
+    "Set exactly one of --stable-tokens or --stable-steps for the stable budget.",
+)
+@click.option(
+    "--decay-steps",
+    type=int,
+    default=None,
+    help="wsd only: step override for --decay-tokens. "
+    "Set exactly one of --decay-tokens or --decay-steps for the decay budget.",
+)
+@click.option(
+    "--decay-shape",
+    type=click.Choice(["1-sqrt", "linear"], case_sensitive=False),
+    default="1-sqrt",
+    show_default=True,
+    help="wsd/decay anneal shape: 1-sqrt | linear.",
+)
+@click.option(
+    "--global-batch-tokens",
     type=int,
     default=256000,
     help="Target tokens per optimizer step (grad_accum inferred automatically)",
@@ -469,52 +536,37 @@ def pretrain():
     help="Checkpoint directory to resume from",
 )
 @click.option(
-    "--resume-epochs",
-    type=int,
-    default=None,
+    "--resume-mode",
+    type=click.Choice(["continue", "decay"], case_sensitive=False),
+    default="continue",
     help=(
-        "Number of additional epochs to train from the checkpoint. "
-        "0 (or unset) continues to the original num_epochs from the pretrain "
-        "config; N>0 trains for exactly N more epochs from the checkpoint."
+        "continue: finish the original token/step budget from the checkpoint. "
+        "decay: anneal a trunk checkpoint over an additional decay budget."
     ),
 )
 @click.option(
-    "--resume-warmup-steps",
+    "--resume-decay-tokens",
     type=int,
     default=None,
-    help="Override warmup steps for resumed training",
+    help="(mode=decay) Additional anneal token budget from the checkpoint.",
 )
 @click.option(
-    "--resume-learning-rate",
-    type=float,
+    "--resume-decay-steps",
+    type=int,
     default=None,
-    help="Override AdamW learning rate when resuming",
+    help="(mode=decay) Additional anneal step budget (mutually exclusive with --resume-decay-tokens).",
 )
 @click.option(
-    "--resume-muon-learning-rate",
-    type=float,
+    "--resume-decay-shape",
+    type=click.Choice(["1-sqrt", "linear"], case_sensitive=False),
     default=None,
-    help="Override Muon learning rate when resuming",
-)
-@click.option(
-    "--resume-lr-schedule",
-    type=click.Choice(["linear", "cosine"], case_sensitive=False),
-    default=None,
-    help="Override LR schedule when resuming",
+    help="(mode=decay) Anneal shape: 1-sqrt | linear.",
 )
 @click.option(
     "--resume-lr-decay-to-fraction",
     type=float,
     default=None,
-    help="Override LR decay floor fraction when resuming",
-)
-@click.option(
-    "--resume-reset-scheduler/--no-resume-reset-scheduler",
-    default=False,
-    help=(
-        "Reset (true) builds a fresh LR curve from a new peak; default (false) "
-        "extends smoothly from the checkpoint's current LR."
-    ),
+    help="(mode=decay) LR decay floor fraction for the anneal.",
 )
 # Model hyperparameters (ModernBERT)
 @click.option("--hidden-size", type=int, default=768, help="Model hidden size")
@@ -655,6 +707,12 @@ def pretrain():
     "subtraction for noise cancellation in attention (pure-torch only).",
 )
 @click.option(
+    "--use-paired-head-attention/--no-use-paired-head-attention",
+    default=False,
+    help="Enable paired-head attention (pure-torch only). "
+    "Mutually exclusive with --use-diff-attn-v2.",
+)
+@click.option(
     "--attn-layer-pattern",
     type=str,
     default=None,
@@ -737,17 +795,23 @@ def run(
     dataset_dir: str,
     ckp_dir: str,
     # training hp
-    micro_batch_size: int,
-    num_epochs: int,
+    micro_batch_seqs: int,
     adam_learning_rate: float,
     adam_weight_decay: float,
     gradient_clipping: bool,
     warmup_steps: int,
     repo_rope_warmup_steps: Optional[int],
-    batch_size_warmup_steps: int,
+    global_batch_warmup_steps: int,
     lr_decay_to_fraction: float,
     lr_schedule: str,
-    global_batch_size: int,
+    train_tokens: Optional[int],
+    stable_tokens: Optional[int],
+    decay_tokens: Optional[int],
+    max_steps: Optional[int],
+    stable_steps: Optional[int],
+    decay_steps: Optional[int],
+    decay_shape: str,
+    global_batch_tokens: int,
     optimizer: str,
     adam_beta1: float,
     adam_beta2: float,
@@ -792,13 +856,11 @@ def run(
     run_name: str,
     resume: bool,
     resume_checkpoint_dir: str,
-    resume_epochs: Optional[int],
-    resume_warmup_steps: Optional[int],
-    resume_learning_rate: Optional[float],
-    resume_muon_learning_rate: Optional[float],
-    resume_lr_schedule: Optional[str],
+    resume_mode: str,
+    resume_decay_tokens: Optional[int],
+    resume_decay_steps: Optional[int],
+    resume_decay_shape: Optional[str],
     resume_lr_decay_to_fraction: Optional[float],
-    resume_reset_scheduler: bool,
     # model hp
     hidden_size: int,
     intermediate_size: int,
@@ -847,17 +909,23 @@ def run(
     cfg = PretrainingConfig(
         dataset_dir=dataset_dir,
         ckp_dir=ckp_dir,
-        micro_batch_size=micro_batch_size,
-        num_epochs=num_epochs,
+        micro_batch_seqs=micro_batch_seqs,
         adam_learning_rate=adam_learning_rate,
         adam_weight_decay=adam_weight_decay,
         max_grad_norm=1.0 if gradient_clipping else float("inf"),
         warmup_steps=warmup_steps,
         repo_rope_warmup_steps=repo_rope_warmup_steps,
-        batch_size_warmup_steps=batch_size_warmup_steps,
+        global_batch_warmup_steps=global_batch_warmup_steps,
         lr_decay_to_fraction=lr_decay_to_fraction,
         lr_schedule=lr_schedule,
-        global_batch_size=global_batch_size,
+        train_tokens=train_tokens,
+        stable_tokens=stable_tokens,
+        decay_tokens=decay_tokens,
+        max_steps=max_steps,
+        stable_steps=stable_steps,
+        decay_steps=decay_steps,
+        decay_shape=decay_shape,
+        global_batch_tokens=global_batch_tokens,
         optimizer=optimizer,
         adam_beta1=adam_beta1,
         adam_beta2=adam_beta2,
@@ -1001,6 +1069,22 @@ def run(
         raise click.ClickException(
             "use_paired_head_attention and use_diff_attn_v2 are mutually exclusive."
         )
+    # Fail fast before any heavy manifest/model instantiation: only
+    # pure_torch/pure_te pipelines are supported, and wsd/decay require
+    # pure_torch. The HF Trainer pretraining path is no longer supported.
+    try:
+        _check_pipeline_supported(
+            pure_torch, pure_te, cfg.lr_schedule,
+            resume_mode if resume else None,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        _validate_duration_config(cfg)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
     manifest = _load_manifest_and_inject(cfg, model_cfg)
     if pure_te:
         logger.info("Using Transformer Engine model and training loop")
@@ -1024,23 +1108,18 @@ def run(
         logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    if resume_epochs is not None and resume_epochs < 0:
-        raise click.ClickException("--resume-epochs must be >= 0")
-
     resume_cfg = ResumeConfig(
         is_resume=resume,
         checkpoint_dir=resume_checkpoint_dir,
-        resume_epochs=resume_epochs,
-        warmup_steps=resume_warmup_steps,
-        learning_rate=resume_learning_rate,
-        muon_learning_rate=resume_muon_learning_rate,
-        lr_schedule=resume_lr_schedule,
+        mode=resume_mode,
+        decay_tokens=resume_decay_tokens,
+        decay_steps=resume_decay_steps,
+        decay_shape=resume_decay_shape,
         lr_decay_to_fraction=resume_lr_decay_to_fraction,
-        reset_scheduler=resume_reset_scheduler,
     )
     if resume_cfg.is_resume and not resume_cfg.checkpoint_dir:
         raise click.ClickException("--resume requires --resume-checkpoint-dir")
-    _validate_resume_config_modes(resume_cfg, optimizer)
+    _validate_resume_config_modes(resume_cfg)
 
     if pure_te:
         run_te_pretraining(
@@ -1051,13 +1130,6 @@ def run(
         )
     elif pure_torch:
         run_pure_pretraining(
-            model=model,
-            pretrain_config=cfg,
-            manifest=manifest,
-            resume_config=resume_cfg if resume_cfg.is_resume else None,
-        )
-    else:
-        run_pretraining(
             model=model,
             pretrain_config=cfg,
             manifest=manifest,
@@ -1125,7 +1197,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
 
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
-    _validate_resume_config_modes(resume_config, pretrain_config.optimizer)
+    _validate_resume_config_modes(resume_config)
     _validate_muonh_wo_init_compat(pretrain_config, model_config)
     if getattr(model_config, "use_noble", False) and not pure_torch:
         raise click.ClickException(
@@ -1202,6 +1274,13 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     )
     _populate_batch_setup(pretrain_config)
 
+    # Fail fast before any heavy model instantiation: only pure_torch/pure_te
+    # pipelines are supported, and wsd/decay require pure_torch.
+    _check_pipeline_supported(
+        pure_torch, pure_te, pretrain_config.lr_schedule,
+        resume_config.mode if resume_config.is_resume else None,
+    )
+
     manifest = _load_manifest_and_inject(pretrain_config, model_config)
     _set_seed_for_init(pretrain_config.seed)
     if pure_te:
@@ -1210,8 +1289,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     elif pure_torch:
         logger.info("Using pure-torch model and training loop")
         model = PureProtModernBertMLM(config=model_config)
-    else:
-        model = ProtModernBertMLM(config=model_config)
 
     model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
@@ -1235,13 +1312,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         )
     elif pure_torch:
         run_pure_pretraining(
-            model=model,
-            pretrain_config=pretrain_config,
-            manifest=manifest,
-            resume_config=resume_config if resume_config.is_resume else None,
-        )
-    else:
-        run_pretraining(
             model=model,
             pretrain_config=pretrain_config,
             manifest=manifest,
@@ -1355,9 +1425,22 @@ def get_yaml(output: Optional[str], force: bool):
         "pretraining:\n"
         '  dataset_dir: "output/data/pretrain_data"\n'
         '  ckp_dir: "output/pretraining_checkpoints"\n'
-        "  micro_batch_size: 64\n"
-        "  global_batch_size: 256000\n"
-        "  num_epochs: 10\n"
+        "  # Batch sizing (token-budget surface)\n"
+        "  micro_batch_seqs: 64\n"
+        "  global_batch_tokens: 256000\n"
+        "  global_batch_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
+        "  # Duration + LR schedule (token-budget surface)\n"
+        '  lr_schedule: "wsd"  # wsd | warmup_stable | cosine | linear\n'
+        "  warmup_steps: 1000\n"
+        "  stable_tokens: 9000000   # wsd: tokens up to the pre-decay checkpoint (warmup included)\n"
+        "  decay_tokens: 1000000    # wsd: additional anneal tokens\n"
+        '  decay_shape: "1-sqrt"  # 1-sqrt | linear\n'
+        "  lr_decay_to_fraction: 0.1\n"
+        "  # train_tokens: 10000000  # single-phase budget for warmup_stable | cosine | linear (NOT used with wsd)\n"
+        "  # Advanced step overrides (each replaces its *_tokens counterpart; never set both):\n"
+        "  # stable_steps:  # ↔ stable_tokens (wsd)\n"
+        "  # decay_steps:   # ↔ decay_tokens (wsd / resume-decay)\n"
+        "  # max_steps:     # ↔ train_tokens (warmup_stable | cosine | linear)\n"
         '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh\n'
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"
         "  adam_beta1: 0.9\n"
@@ -1365,11 +1448,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  adam_epsilon: 1e-8\n"
         "  adam_learning_rate: 1e-4\n"
         "  max_grad_norm: .inf\n"
-        "  warmup_steps: 302\n"
-        "  repo_rope_warmup_steps: 302\n"
-        "  batch_size_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
-        "  lr_decay_to_fraction: 0.1\n"
-        '  lr_schedule: "cosine"\n'
+        "  repo_rope_warmup_steps: 1000\n"
         "  adam_weight_decay: 0.0\n"
         "  muon_learning_rate: 1e-3\n"
         "  muon_weight_decay: 0.01\n"
@@ -1437,24 +1516,22 @@ def get_yaml(output: Optional[str], force: bool):
         "resume:\n"
         "  is_resume: false\n"
         '  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"\n'
-        "  # resume_epochs: 0 (or unset) continues to the original 'pretraining.num_epochs'.\n"
-        "  # N>0 trains for exactly N more epochs from the checkpoint\n"
-        "  resume_epochs: 0\n"
-        "  # warmup_steps: null/0 = no warmup at resume; positive int = fresh ramp from 0 to peak\n"
-        "  warmup_steps: null\n"
-        "  # Two LR modes:\n"
-        "  # EXTEND (reset_scheduler: false) - continue smoothly from checkpoint's current LR.\n"
-        "  #   learning_rate / muon_learning_rate MUST be null.\n"
-        "  #   lr_schedule / lr_decay_to_fraction may be null (inherit -> end at original final LR)\n"
-        "  #   or set to override.\n"
-        "  # RESET (reset_scheduler: true) - fresh curve from a new peak.\n"
-        "  #   lr_schedule, lr_decay_to_fraction, learning_rate are REQUIRED.\n"
-        "  #   muon_learning_rate is REQUIRED when optimizer is muon/normuon/muonh.\n"
-        "  reset_scheduler: false\n"
-        "  learning_rate: null\n"
-        "  muon_learning_rate: null\n"
-        "  lr_schedule: null\n"
-        "  lr_decay_to_fraction: null\n"
+        "  # Two resume modes:\n"
+        "  # continue - finish the original token/step budget from the checkpoint\n"
+        "  #   with the original schedule. Takes NO decay_* fields.\n"
+        "  # decay - anneal a stable-end trunk checkpoint over an additional budget.\n"
+        "  #   Set exactly one of decay_tokens / decay_steps. decay_shape and\n"
+        "  #   lr_decay_to_fraction are OPTIONAL overrides; leave null to fall\n"
+        "  #   back to the schedule defaults.\n"
+        "  #   NOTE: decay restarts the dataloader from the start of a pass, so a\n"
+        "  #   resume-decay matches a single-run wsd decay bit-for-bit only when the\n"
+        "  #   trunk's stable->decay boundary is data-pass aligned; keep\n"
+        "  #   global_batch_tokens / world_size identical to the trunk's run.\n"
+        '  mode: "decay"  # continue | decay\n'
+        "  # decay-mode fields (leave null / omit for mode: continue):\n"
+        "  decay_tokens: 1000000  # additional anneal tokens (or use decay_steps)\n"
+        '  decay_shape: "1-sqrt"  # 1-sqrt | linear\n'
+        "  lr_decay_to_fraction: 0.1\n"
         "\n"
         "# pure_torch: false\n"
         "# pure_te: false\n"
@@ -1469,6 +1546,40 @@ def get_yaml(output: Optional[str], force: bool):
     # Write the template to the file
     output_path.write_text(template, encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
+
+
+def _validate_duration_config(cfg: PretrainingConfig) -> None:
+    """Validate schedule <-> duration-budget consistency (spec section 12)."""
+    sched = (cfg.lr_schedule or "").lower()
+    valid = {"wsd", "warmup_stable", "cosine", "linear"}
+    if sched not in valid:
+        raise ValueError(f"lr_schedule must be one of {sorted(valid)}, got {cfg.lr_schedule!r}")
+
+    def _one(token_field, step_field, label):
+        tok = getattr(cfg, token_field)
+        stp = getattr(cfg, step_field)
+        for field, value in ((token_field, tok), (step_field, stp)):
+            if value is not None and value <= 0:
+                raise ValueError(f"{field} must be a positive integer, got {value}")
+        if tok is not None and stp is not None:
+            raise ValueError(
+                f"Set exactly one of {token_field} or {step_field} for the {label} budget, not both."
+            )
+        if tok is None and stp is None:
+            raise ValueError(
+                f"{sched} requires a {label} budget: set {token_field} (tokens) or {step_field} (steps)."
+            )
+
+    if sched == "wsd":
+        _one("stable_tokens", "stable_steps", "stable")
+        _one("decay_tokens", "decay_steps", "decay")
+        if (cfg.train_tokens is not None) or (cfg.max_steps is not None):
+            raise ValueError("wsd uses stable_*/decay_* budgets; remove train_tokens/max_steps.")
+    else:
+        _one("train_tokens", "max_steps", "training")
+        if any(getattr(cfg, f) is not None for f in
+               ("stable_tokens", "decay_tokens", "stable_steps", "decay_steps")):
+            raise ValueError(f"{sched} uses train_tokens/max_steps; remove stable_*/decay_* budgets.")
 
 
 def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
@@ -1486,7 +1597,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     if "gradient_accumulation_steps" in present_keys:
         raise ValueError(
             "gradient_accumulation_steps is inferred automatically from "
-            "global_batch_size, micro_batch_size, max_seq_len, and world_size. "
+            "global_batch_tokens, micro_batch_seqs, max_seq_len, and world_size. "
             "Remove gradient_accumulation_steps from your pretraining config."
         )
 
@@ -1566,7 +1677,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
     for warmup_key in (
         "warmup_steps",
         "repo_rope_warmup_steps",
-        "batch_size_warmup_steps",
+        "global_batch_warmup_steps",
     ):
         if warmup_key in kwargs and kwargs[warmup_key] is not None:
             try:
@@ -1601,7 +1712,9 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             elif isinstance(value, str):
                 kwargs[bool_key] = value.lower() == "true"
 
-    return PretrainingConfig(**kwargs)
+    cfg = PretrainingConfig(**kwargs)
+    _validate_duration_config(cfg)
+    return cfg
 
 
 def _load_manifest_and_inject(
@@ -1679,18 +1792,27 @@ def _load_model_config(config: Dict[str, Any]) -> ProtModernBertMLMConfig:
         raise ValueError(f"Invalid model configuration: {exc}") from exc
 
 
+_RESUME_ALLOWED_KEYS = {
+    "is_resume",
+    "checkpoint_dir",
+    "mode",
+    "decay_tokens",
+    "decay_steps",
+    "decay_shape",
+    "lr_decay_to_fraction",
+}
+
+
 def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
     if config is None:
         return ResumeConfig(is_resume=False, checkpoint_dir="")
 
-    expected_keys = set(ResumeConfig.__annotations__.keys())
     present_keys = set(config.keys())
-
-    extra = []
-    kwargs: Dict[str, Any] = {
-        "is_resume": False,
-        "checkpoint_dir": "",
-    }
+    extra = sorted(present_keys - _RESUME_ALLOWED_KEYS)
+    if extra:
+        raise ValueError(
+            f"Unexpected resume configuration keys: {', '.join(extra)}"
+        )
 
     def _parse_float_like(raw_value: Any, field_name: str) -> float:
         if not isinstance(raw_value, str):
@@ -1722,10 +1844,11 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
                 f"Invalid {field_name} value: {raw_value}. Must be a number."
             ) from exc
 
+    kwargs: Dict[str, Any] = {
+        "is_resume": False,
+        "checkpoint_dir": "",
+    }
     for key in present_keys:
-        if key not in expected_keys:
-            extra.append(key)
-            continue
         value = config.get(key)
         # Keep None values for Optional fields — they mean "use default /
         # inherit from checkpoint".  Only skip None for required fields
@@ -1734,7 +1857,7 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
             continue
         kwargs[key] = value
 
-    for int_key in ("resume_epochs", "warmup_steps"):
+    for int_key in ("decay_tokens", "decay_steps"):
         if int_key in kwargs and kwargs[int_key] is not None:
             try:
                 kwargs[int_key] = int(kwargs[int_key])
@@ -1743,30 +1866,26 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
                     f"Invalid {int_key} value: {kwargs[int_key]}. Must be an integer."
                 ) from exc
 
-    if kwargs.get("resume_epochs") is not None and kwargs["resume_epochs"] < 0:
-        raise ValueError(
-            f"Invalid resume_epochs value: {kwargs['resume_epochs']}. Must be >= 0."
+    if "lr_decay_to_fraction" in kwargs and kwargs["lr_decay_to_fraction"] is not None:
+        kwargs["lr_decay_to_fraction"] = _parse_float_like(
+            kwargs["lr_decay_to_fraction"], "lr_decay_to_fraction"
         )
 
-    for float_key in ("learning_rate", "muon_learning_rate", "lr_decay_to_fraction"):
-        if float_key in kwargs and kwargs[float_key] is not None:
-            kwargs[float_key] = _parse_float_like(kwargs[float_key], float_key)
-
-    if "lr_schedule" in kwargs and kwargs["lr_schedule"] is not None:
-        lr_schedule = str(kwargs["lr_schedule"]).strip().lower()
-        if lr_schedule not in {"linear", "cosine"}:
+    if "decay_shape" in kwargs and kwargs["decay_shape"] is not None:
+        decay_shape = str(kwargs["decay_shape"]).strip().lower()
+        if decay_shape not in {"1-sqrt", "linear"}:
             raise ValueError(
-                f"Invalid lr_schedule value: {kwargs['lr_schedule']}. Must be one of: linear, cosine."
+                f"Invalid decay_shape value: {kwargs['decay_shape']}. Must be one of: 1-sqrt, linear."
             )
-        kwargs["lr_schedule"] = lr_schedule
+        kwargs["decay_shape"] = decay_shape
 
-    for bool_key in ("is_resume", "reset_scheduler"):
-        if bool_key in kwargs:
-            value = kwargs[bool_key]
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, str):
-                kwargs[bool_key] = value.lower() == "true"
+    if "mode" in kwargs and kwargs["mode"] is not None:
+        kwargs["mode"] = str(kwargs["mode"]).strip().lower()
+
+    if "is_resume" in kwargs:
+        value = kwargs["is_resume"]
+        if isinstance(value, str):
+            kwargs["is_resume"] = value.lower() == "true"
 
     checkpoint_dir = kwargs.get("checkpoint_dir")
     is_resume = kwargs.get("is_resume", False)
@@ -1783,80 +1902,35 @@ def _load_resume_config(config: Dict[str, Any]) -> ResumeConfig:
                 f"Checkpoint directory does not exist: {checkpoint_dir}"
             )
 
-    if extra:
-        raise ValueError(
-            f"Unexpected resume configuration keys: {', '.join(sorted(extra))}"
-        )
-
     return ResumeConfig(**kwargs)
 
 
-_MUON_OPTIMIZER_NAMES = {"muon", "normuon", "muonh"}
-
-
-def _validate_resume_config_modes(
-    resume_config: ResumeConfig,
-    optimizer: str,
-) -> None:
-    """Enforce the EXTEND vs RESET contract on a loaded ResumeConfig.
-
-    Raises ``ValueError`` if the user's resume block mixes the two modes
-    incoherently — peak LR overrides without ``reset_scheduler``, or a
-    reset that's missing required fields.
-    """
+def _validate_resume_config_modes(resume_config: ResumeConfig) -> None:
+    """Validate the continue/decay resume contract (spec section 7)."""
     if not resume_config.is_resume:
         return
-
-    is_muon = str(optimizer).strip().lower() in _MUON_OPTIMIZER_NAMES
-    has_lr = resume_config.learning_rate is not None
-    has_muon_lr = resume_config.muon_learning_rate is not None
-
-    if not resume_config.reset_scheduler:
-        # EXTEND mode: peak LR overrides are forbidden.
-        offending = []
-        if has_lr:
-            offending.append("learning_rate")
-        if has_muon_lr:
-            offending.append("muon_learning_rate")
-        if offending:
+    mode = (resume_config.mode or "").lower()
+    if mode not in {"continue", "decay"}:
+        raise ValueError(f"resume.mode must be 'continue' or 'decay', got {resume_config.mode!r}")
+    has_tok = resume_config.decay_tokens is not None
+    has_stp = resume_config.decay_steps is not None
+    if mode == "continue":
+        set_fields = [
+            name
+            for name in ("decay_tokens", "decay_steps", "decay_shape", "lr_decay_to_fraction")
+            if getattr(resume_config, name) is not None
+        ]
+        if set_fields:
             raise ValueError(
-                "resume.{} can only be set when resume.reset_scheduler=true. "
-                "Leave them null on the EXTEND path; the peak LR comes from "
-                "the checkpoint's optimizer state.".format(
-                    " and resume.".join(offending)
-                )
+                f"resume.mode=continue takes no decay_* fields, but got: "
+                f"{', '.join(set_fields)} (they belong to mode=decay)."
             )
         return
-
-    # RESET mode: lr_schedule, lr_decay_to_fraction, learning_rate(s) required.
-    missing = []
-    if resume_config.lr_schedule is None:
-        missing.append("lr_schedule")
-    if resume_config.lr_decay_to_fraction is None:
-        missing.append("lr_decay_to_fraction")
-    if not has_lr:
-        missing.append("learning_rate")
-    if is_muon and not has_muon_lr:
-        missing.append("muon_learning_rate")
-    if missing:
-        raise ValueError(
-            "resume.reset_scheduler=true requires explicit values for: "
-            f"{', '.join(missing)}."
-        )
-
-    # Both LR fields must be coherent with the optimizer:
-    if is_muon:
-        if has_lr != has_muon_lr:
-            raise ValueError(
-                "Optimizer is a Muon variant: resume.learning_rate and "
-                "resume.muon_learning_rate must both be set."
-            )
-    else:
-        if has_muon_lr:
-            raise ValueError(
-                "resume.muon_learning_rate is only valid when optimizer is "
-                f"muon/normuon/muonh (current optimizer: {optimizer})."
-            )
+    # mode == "decay"
+    if has_tok and has_stp:
+        raise ValueError("resume decay: set exactly one of decay_tokens or decay_steps, not both.")
+    if not has_tok and not has_stp:
+        raise ValueError("resume.mode=decay requires a budget: set decay_tokens or decay_steps.")
 
 
 def _set_seed_for_init(seed: int) -> None:

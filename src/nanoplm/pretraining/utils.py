@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 class BatchSetup:
     """Derived batch parameters inferred from PretrainingConfig at runtime."""
     grad_accum_steps: int
-    global_batch_size_samples: int
+    global_batch_seqs: int
     achieved_global_batch_tokens: int
 
 
@@ -32,26 +32,26 @@ def compute_batch_setup(
     max_seq_len: int,
     effective_world_size: int,
 ) -> BatchSetup:
-    """Infer grad_accum and effective batch sizes from global_batch_size."""
-    if cfg.global_batch_size <= 0:
-        raise ValueError(f"global_batch_size must be > 0, got {cfg.global_batch_size}")
+    """Infer grad_accum and effective batch sizes from global_batch_tokens."""
+    if cfg.global_batch_tokens <= 0:
+        raise ValueError(f"global_batch_tokens must be > 0, got {cfg.global_batch_tokens}")
 
     world_tokens_per_micro_step = (
-        cfg.micro_batch_size * max_seq_len * effective_world_size
+        cfg.micro_batch_seqs * max_seq_len * effective_world_size
     )
     if world_tokens_per_micro_step <= 0:
         raise ValueError(
             f"Invalid token throughput per micro-step: {world_tokens_per_micro_step}. "
-            "Check micro_batch_size, max_seq_len, and world_size."
+            "Check micro_batch_seqs, max_seq_len, and world_size."
         )
 
-    grad_accum = max(1, math.ceil(cfg.global_batch_size / world_tokens_per_micro_step))
+    grad_accum = max(1, math.ceil(cfg.global_batch_tokens / world_tokens_per_micro_step))
     achieved_tokens = grad_accum * world_tokens_per_micro_step
-    batch_samples = grad_accum * cfg.micro_batch_size * effective_world_size
+    batch_samples = grad_accum * cfg.micro_batch_seqs * effective_world_size
 
     logger.info(
         f"Batch setup: "
-        f"target={cfg.global_batch_size:,} tok, "
+        f"target={cfg.global_batch_tokens:,} tok, "
         f"micro_step={world_tokens_per_micro_step:,} tok, "
         f"grad_accum={grad_accum}, "
         f"achieved={achieved_tokens:,} tok"
@@ -59,9 +59,62 @@ def compute_batch_setup(
 
     return BatchSetup(
         grad_accum_steps=grad_accum,
-        global_batch_size_samples=batch_samples,
+        global_batch_seqs=batch_samples,
         achieved_global_batch_tokens=achieved_tokens,
     )
+
+
+def tokens_to_steps(target_tokens: int, achieved_global_batch_tokens: int) -> int:
+    """Optimizer steps needed to process `target_tokens`.
+
+    Ceil so the budget is met (overshoot < one optimizer step of tokens). The
+    same value drives both the loop stop condition and the LR-schedule horizon.
+    """
+    if target_tokens <= 0:
+        raise ValueError(f"target token budget must be > 0, got {target_tokens}")
+    if achieved_global_batch_tokens <= 0:
+        raise ValueError(
+            f"achieved_global_batch_tokens must be > 0, got {achieved_global_batch_tokens}"
+        )
+    return max(1, math.ceil(target_tokens / achieved_global_batch_tokens))
+
+
+@dataclass
+class StepHorizon:
+    """Resolved optimizer-step horizon: total_steps, plus stable_steps/decay_steps for wsd."""
+    total_steps: int
+    stable_steps: Optional[int] = None   # wsd only
+    decay_steps: Optional[int] = None    # wsd only
+
+
+def resolve_total_steps(cfg, achieved_global_batch_tokens: int) -> StepHorizon:
+    """Map the configured token/step budget to optimizer steps (spec sections 4-5)."""
+    sched = (cfg.lr_schedule or "").lower()
+
+    def _steps(token_field, step_field):
+        stp = getattr(cfg, step_field)
+        if stp is not None:
+            return max(1, int(stp))
+        return tokens_to_steps(getattr(cfg, token_field), achieved_global_batch_tokens)
+
+    if sched == "wsd":
+        S = _steps("stable_tokens", "stable_steps")
+        Dd = _steps("decay_tokens", "decay_steps")
+        return StepHorizon(total_steps=S + Dd, stable_steps=S, decay_steps=Dd)
+    total = _steps("train_tokens", "max_steps")
+    return StepHorizon(total_steps=total)
+
+
+def format_passes_hint(budget_tokens: int, total_train_tokens: int,
+                       approx_total: Optional[int] = None) -> str:
+    """One-line 'passes over the train set' hint for a token budget."""
+    denom = total_train_tokens if total_train_tokens and total_train_tokens > 0 else approx_total
+    if not denom:
+        return f"Budget: {budget_tokens:,} tokens (dataset token count unknown)"
+    passes = budget_tokens / denom
+    tag = "" if (total_train_tokens and total_train_tokens > 0) else " (approx)"
+    return (f"Budget: {budget_tokens:,} tokens → ≈{passes:.1f} passes over the "
+            f"train set (each sample seen ~{passes:.1f}×){tag}")
 
 
 def get_num_workers(user_value: Union[int, str], world_size: int) -> int:
@@ -100,6 +153,33 @@ def get_num_workers(user_value: Union[int, str], world_size: int) -> int:
         )
 
 
+def checkpoint_step(checkpoint_dir: Union[str, Path]) -> int:
+    """Resolve the optimizer step for a ``checkpoint-*`` directory.
+
+    Numbered dirs (``checkpoint-<N>``) parse the step from the name. Role-named
+    dirs (``checkpoint-final``, ``checkpoint-stable-end``) have no numeric
+    suffix, so the step is read from ``training_state.json["global_step"]``
+    (``checkpoint-final`` carries ``total_steps``, ``checkpoint-stable-end``
+    carries ``stable_steps``). Returns ``-1`` for non-checkpoint names or when
+    the role dir's step cannot be determined.
+    """
+    path = Path(checkpoint_dir)
+    name = path.name
+    if not name.startswith("checkpoint-"):
+        return -1
+    try:
+        return int(name.split("-", 1)[1])
+    except ValueError:
+        pass
+
+    state_path = path / "training_state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        return int(state["global_step"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return -1
+
+
 def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
     """Archive checkpoints with steps greater than resume_step.
 
@@ -114,12 +194,12 @@ def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
     checkpoints_to_archive = []
 
     for ckpt_dir in run_dir.glob("checkpoint-*"):
-        try:
-            step = int(ckpt_dir.name.split("-")[1])
-            if step > resume_step:
-                checkpoints_to_archive.append((step, ckpt_dir))
-        except (IndexError, ValueError):
+        if not ckpt_dir.is_dir():
             continue
+        step = checkpoint_step(ckpt_dir)
+        # step == -1 (unresolvable) must NOT be treated as future work.
+        if step > resume_step:
+            checkpoints_to_archive.append((step, ckpt_dir))
 
     if checkpoints_to_archive:
         checkpoints_to_archive.sort()
@@ -176,18 +256,28 @@ def prepare_run_and_steps(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig],
     train_samples: int,
-    global_batch_size_samples: int,
-) -> Tuple[str, str, str, int, int, int, int, Optional[int]]:
-    """Prepare run naming/dirs and compute epochs & step intervals.
+    global_batch_seqs: int,
+) -> Tuple[str, str, str, None, int, int, int, Optional[int]]:
+    """Prepare run naming/dirs and resolve the raw logging/eval/save intervals.
+
+    The training horizon (total_steps) is no longer derived from epochs here:
+    it comes from the token budget and is computed by the caller via
+    ``resolve_total_steps``. This helper therefore returns the *raw* configured
+    intervals (un-clamped); the caller clamps them to the token-budget
+    total_steps once the horizon is known.
 
     Args:
         pretrain_config: Pretraining configuration
         resume_config: Resume configuration (if resuming)
-        train_samples: Number of training samples (from manifest)
-        global_batch_size_samples: Effective samples per optimizer step
+        train_samples: Number of training samples (from manifest) [unused for
+            horizon now; kept for signature stability]
+        global_batch_seqs: Effective samples per optimizer step [unused for
+            horizon now; kept for signature stability]
 
-    Returns a tuple: (run_name, wandb_run_name, output_dir, num_epochs,
-                      logging_steps, eval_steps, save_steps, resume_step)
+    Returns a tuple: (run_name, wandb_run_name, output_dir, None,
+                      logging_steps, eval_steps, save_steps, resume_step).
+    The 4th return slot is always ``None`` (now unused): the horizon is
+    token-budget driven and resolved by the caller.
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
@@ -218,16 +308,20 @@ def prepare_run_and_steps(
         wandb_run_name = f"{run_name}-re{resume_counter}"
         logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
 
-        # Archive any future checkpoints to prevent conflicts (rank 0 only)
+        # Archive any future checkpoints to prevent conflicts (rank 0 only).
+        # Use checkpoint_step so resuming from a role-named dir (e.g.
+        # checkpoint-stable-end) resolves its true step from training_state.json
+        # instead of failing to parse the name.
         resume_step = None
         if is_local_main:
-            try:
-                resume_step = int(checkpoint_path.name.split("-")[1])
-                _archive_future_checkpoints(run_root, resume_step)
-            except (IndexError, ValueError) as e:
+            step = checkpoint_step(checkpoint_path)
+            if step >= 0:
+                resume_step = step
+                _archive_future_checkpoints(run_root, step)
+            else:
                 logger.warning(
-                    f"Could not extract step number from checkpoint path: {checkpoint_path.name}. "
-                    f"Skipping future checkpoint archival. Error: {e}"
+                    f"Could not determine step for checkpoint path: {checkpoint_path.name}. "
+                    f"Skipping future checkpoint archival."
                 )
     else:
         slurm_job_id = os.environ.get("SLURM_JOB_ID")
@@ -255,23 +349,18 @@ def prepare_run_and_steps(
         except Exception:
             pass
 
-    # Compute epochs and step intervals
+    # Resolve raw logging/eval/save intervals. The token-budget total_steps is
+    # computed by the caller (run_pure_pretraining via resolve_total_steps);
+    # the caller clamps these intervals to it once the horizon is known.
+    logging_steps = max(1, pretrain_config.logging_steps)
+    eval_steps = max(1, pretrain_config.eval_steps)
+    save_steps = max(1, pretrain_config.save_steps)
+
+    # On resume, preserve the original logging/eval/save intervals recorded in
+    # the checkpoint's training_args.bin when available, so cadence is stable
+    # across resume sessions.
     if resume_config and resume_config.is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
-
-        if resume_config.resume_epochs and int(resume_config.resume_epochs) > 0:
-            checkpoint_epoch = _read_checkpoint_epoch(resume_config.checkpoint_dir)
-            num_epochs = checkpoint_epoch + int(resume_config.resume_epochs)
-            if num_epochs <= checkpoint_epoch:
-                raise ValueError(
-                    f"resume_epochs would result in zero or negative training: "
-                    f"checkpoint is at epoch {checkpoint_epoch}, requested target "
-                    f"is {num_epochs}."
-                )
-        else:
-            num_epochs = pretrain_config.num_epochs
-
-        # Preserve original logging/eval/save intervals when available
         if training_args_path.exists():
             try:
                 original_args = torch.load(training_args_path, weights_only=False)
@@ -282,29 +371,8 @@ def prepare_run_and_steps(
                     f"Resuming with preserved intervals: save_steps={save_steps}, eval_steps={eval_steps}"
                 )
             except Exception:
-                # Use ceiling division to ensure at least 1 step per epoch
-                steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
-                total_steps = num_epochs * steps_per_epoch
-                # Use direct step counts from config (clamped to valid range)
-                logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-                eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-                save_steps = max(1, min(total_steps, pretrain_config.save_steps))
-        else:
-            # Use ceiling division to ensure at least 1 step per epoch
-            steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
-            total_steps = num_epochs * steps_per_epoch
-            # Use direct step counts from config (clamped to valid range)
-            logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-            eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-            save_steps = max(1, min(total_steps, pretrain_config.save_steps))
-    else:
-        num_epochs = pretrain_config.num_epochs
-        # Use ceiling division to ensure at least 1 step per epoch
-        steps_per_epoch = (train_samples + global_batch_size_samples - 1) // global_batch_size_samples
-        total_steps = num_epochs * steps_per_epoch
-        # Use direct step counts from config (clamped to valid range)
-        logging_steps = max(1, min(total_steps, pretrain_config.logging_steps))
-        eval_steps = max(1, min(total_steps, pretrain_config.eval_steps))
-        save_steps = max(1, min(total_steps, pretrain_config.save_steps))
+                # Fall back to the raw configured intervals computed above.
+                pass
 
-    return run_name, wandb_run_name, output_dir, num_epochs, logging_steps, eval_steps, save_steps, resume_step
+    # 4th return slot (now unused) is None: horizon is token-budget driven.
+    return run_name, wandb_run_name, output_dir, None, logging_steps, eval_steps, save_steps, resume_step

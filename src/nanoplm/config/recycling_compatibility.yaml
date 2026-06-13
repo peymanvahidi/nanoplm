@@ -64,5 +64,5 @@ pipeline_flags:
     - tf32
     - multi_gpu
     - lr_schedule
-    - batch_size_warmup_steps
+    - global_batch_warmup_steps
     - activation_checkpointing
