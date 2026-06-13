@@ -1553,7 +1553,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  # stable_steps:  # ↔ stable_tokens (wsd)\n"
         "  # decay_steps:   # ↔ decay_tokens (wsd / resume-decay)\n"
         "  # max_steps:     # ↔ train_tokens (warmup_stable | cosine | linear)\n"
-        '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh\n'
+        '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh | aurora\n'
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"
         "  adam_beta1: 0.9\n"
         "  adam_beta2: 0.999\n"
@@ -1570,6 +1570,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  muon_nesterov: true\n"
         "  muon_eps: 1e-7\n"
         '  muonh_normalization: "neuron"  # used only when optimizer=muonh: neuron | short_axis | none\n'
+        '  muonh_scope: "all"  # used when optimizer=muonh|aurora: all = all matrices; mlp = MLP matrices only (rest on NorMuon)\n'
         "  # NOBLE optimizer LR scaling (only used when model.use_noble=true)\n"
         "  noble_base_lr: 3e-4  # independent base LR for NOBLE branch params\n"
         "  noble_lr_gamma: 0.3  # W_up LR power (actual exponent = 2γ = 0.6)\n"
