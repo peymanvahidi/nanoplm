@@ -10,8 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch import attention as te_attention
-from transformer_engine.pytorch.attention.dot_product_attention import backends as te_dpa_backends
-from transformer_engine.common.recipe import DelayedScaling, Format,NVFP4BlockScaling,Float8CurrentScaling,Float8BlockScaling,MXFP8BlockScaling
 
 from nanoplm.pretraining.models.modern_bert.modeling import (
     MHCLiteBlock,
@@ -20,27 +18,11 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     _unpad_input,
 )
 
-try:
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
-        # Match modeling.py's FA3 kernel loading pattern and wire it into TE internals.
-        from kernels import get_kernel
-
-        _te_fa3 = get_kernel("varunneal/flash-attention-3")
-        _te_fa3 = getattr(_te_fa3, "flash_attn_interface", _te_fa3)
-        te_dpa_backends.flash_attn_func_v3 = _te_fa3.flash_attn_func
-        te_dpa_backends.flash_attn_varlen_func_v3 = _te_fa3.flash_attn_varlen_func
-        te_dpa_backends.fa_utils.fa3_version = te_dpa_backends.PkgVersion("3.0.0")
-        te_dpa_backends.fa_utils.set_flash_attention_3_params()
-except Exception as exc:
-    print(f"FA3 monkey patch failed; using default TE attention backend: {exc}")
+# FA3 monkey patch intentionally disabled for TE profiling/sweep runs.
+# TE will use its default attention backend selection.
 
 USE_FP_ATTN=False
 USE_FP8 = True
-FULL_ATTN_EVERY_N_LAYER = 3
-
-# FP8 recipe: delayed scaling with HYBRID format (E4M3 forward, E5M2 backward).
-# amax_history_len=16 is a reasonable default for stability; increase for smoother scaling.
-FP8_RECIPE = DelayedScaling()
 
 # TE requires window_size=(-1, -1) for full attention, not None.
 _FULL_ATTN_WINDOW: tuple[int, int] = (-1, -1)
@@ -75,10 +57,13 @@ class TEModernBertEncoderLayer(nn.Module):
         super().__init__()
         self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
 
-        if FULL_ATTN_EVERY_N_LAYER == 0:
-            self.is_full_attention = True
-        else:
-            self.is_full_attention = layer_idx % FULL_ATTN_EVERY_N_LAYER == 0
+        self._attention_type = config.layer_types[layer_idx]
+        if self._attention_type not in {"full_attention", "sliding_attention"}:
+            raise ValueError(
+                f"Unsupported attention type for TE layer {layer_idx}: "
+                f"{self._attention_type!r}"
+            )
+        self.is_full_attention = self._attention_type == "full_attention"
 
         # TE requires (-1, -1) for full attention (not None).
         self.window_size: tuple[int, int] = (
@@ -121,25 +106,25 @@ class TEModernBertEncoderLayer(nn.Module):
             input_layernorm=layer_idx != 0,  # layer 0: embedding already normed
             attn_mask_type="padding",         # required for qkv_format=thd
             window_size=self.window_size,
-            fuse_qkv_params=True,
+            fuse_qkv_params=bool(config.fused_qkv),
             qkv_format="thd",
             return_layernorm_output=False,
             return_bias=False,
             init_method=_init,
             output_layer_init_method=_output_init,
             qk_norm_type="RMSNorm" if config.use_qk_norm else None,
+            qk_norm_before_rope=bool(config.reorder_RoPE_QKNorm),
         )
 
         # Fused LayerNorm + FC1 + activation + FC2.
         if self.has_mlp:
-            te_mlp_activation = "srelu" if config.mlp_activation == "srelu" else "swiglu"
             self.mlp = te.LayerNormMLP(
                 hidden_size=config.hidden_size,
                 ffn_hidden_size=config.intermediate_size,
                 eps=config.norm_eps,
                 bias=config.mlp_bias,
                 normalization="RMSNorm",
-                activation=te_mlp_activation,
+                activation=config.mlp_activation,
                 init_method=_init,
                 output_layer_init_method=_output_init,
             )
@@ -148,7 +133,7 @@ class TEModernBertEncoderLayer(nn.Module):
 
     @property
     def attention_type(self) -> str:
-        return "full_attention" if self.is_full_attention else "sliding_attention"
+        return self._attention_type
 
     def forward(
         self,

@@ -171,11 +171,6 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
                 "Paired head attention is currently implemented only in the pure-torch "
                 "path. Disable use_paired_head_attention or use --pure-torch."
             )
-        if not config.fused_qkv:
-            raise ValueError(
-                "fused_qkv=False is implemented only in the pure-torch path. "
-                "Use --pure-torch with fused_qkv=false."
-            )
         if not config.fused_up_gate:
             raise ValueError(
                 "fused_up_gate=False is implemented only in the pure-torch path. "

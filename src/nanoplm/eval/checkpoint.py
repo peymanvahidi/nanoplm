@@ -10,6 +10,7 @@ from typing import Any, Optional, Union
 import torch
 import yaml
 
+from nanoplm.pretraining.fp8 import convert_fp8_targets
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.utils import checkpoint_step as _checkpoint_step
@@ -84,6 +85,47 @@ def resolve_checkpoint_dir(checkpoint_dir: Union[str, Path]) -> Path:
     )
 
 
+def _pretrain_config_from_checkpoint(checkpoint_dir: Path) -> dict[str, Any]:
+    pretrain_cfg_path = checkpoint_dir / "pretrain_config.yaml"
+    if not pretrain_cfg_path.exists():
+        return {}
+    loaded = _safe_load_checkpoint_yaml(pretrain_cfg_path)
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _apply_training_mlp_layout(
+    model: PureProtModernBertMLM,
+    pretrain_cfg: dict[str, Any],
+    device: torch.device,
+) -> None:
+    """Match FP8 TE MLP module layout saved during training."""
+    use_fp8 = bool(pretrain_cfg.get("fp8", False))
+    if not use_fp8:
+        return
+    if device.type != "cuda":
+        raise ValueError(
+            "FP8 checkpoints require CUDA for eval "
+            "(TE MLP layout is built on GPU)."
+        )
+
+    model.to(device)
+    fp8_target = pretrain_cfg.get("fp8_target", "mlp")
+    fp8_skip_last = int(pretrain_cfg.get("fp8_skip_last_n_layers", 0))
+    n_converted = convert_fp8_targets(
+        model,
+        target=fp8_target,
+        skip_last_n_layers=fp8_skip_last,
+    )
+    if n_converted == 0:
+        raise ValueError(
+            "Checkpoint has fp8=True but no FP8 module blocks were converted for eval."
+        )
+    logger.info(
+        f"FP8 eval: converted {n_converted} block(s) to TE layout "
+        f"(target={fp8_target!r}, skip_last_n_layers={fp8_skip_last})"
+    )
+
+
 def load_checkpoint(
     checkpoint_dir: Union[str, Path],
     config: ProtModernBertMLMConfig,
@@ -100,8 +142,11 @@ def load_checkpoint(
     state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
 
     model = PureProtModernBertMLM(config)
+    pretrain_cfg = _pretrain_config_from_checkpoint(checkpoint_dir)
+    _apply_training_mlp_layout(model, pretrain_cfg, device)
     model.load_state_dict(state_dict, strict=True)
-    model.to(device)
+    if device.type == "cuda" and next(model.parameters()).device.type != "cuda":
+        model.to(device)
     model.eval()
 
     training_state_path = checkpoint_dir / "training_state.json"
