@@ -1619,7 +1619,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  bf16: true\n"
         "  tf32: true\n"
         "  fp8: false\n"
-        '  fp8_target: "mlp"  # pure_torch FP8 target(s): mlp | attn_wqkv | mlp_wi; combine as "attn_wqkv,mlp" or YAML list\n'
+        '  fp8_target: "mlp"  # pure_torch FP8 target(s): mlp | attn_wqkv | attn_wo; combine as "attn_wqkv,mlp" or YAML list\n'
         "  fp8_skip_last_n_layers: 0  # pure_torch FP8 only: keep final N transformer layers in bf16 for stability\n"
         '  fp8_recipe: "delayed"  # TE only: delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 are Blackwell+ only)\n'
         '  fp8_format: "hybrid"  # TE only: hybrid | e4m3; ignored by nvfp4\n'
