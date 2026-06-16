@@ -71,15 +71,19 @@ HPAD = 4             # staged halo rows each side (>= R)
 # 1 CTA/SM (and the register file caps ~128 regs/thread at NTHR=512),
 # leaving all three kernels under 60% with no config to fix it; it falls
 # back to Triton.
+# FWD_MINB: min_blocks_per_mp launch bound for the fwd kernel. Only C=1024
+# benefits: at 172 regs it lands at 2.97 CTAs/SM -> 2 (12% occ); FWD_MINB=3
+# trims to 168 regs -> exactly 3 CTAs/SM (18% occ), no spill, 148->136us, DRAM
+# 42->45% SOL, bit-identical. Other C already hit ~18% occ or spill if forced.
 #   C: (FWD_BT, BWD_BT, BWD_NITER, DWDB_BT, DWDB_NITER, FWD_ROWG,
-#       BWD_XS, BWD_MINB)
+#       BWD_XS, BWD_MINB, FWD_MINB)
 _CFG = {
-    512:  (16, 8, 16, 8, 16, 1, 0, 0),
-    768:  (8, 4, 16, 8, 16, 1, 1, 4),
-    1024: (16, 8, 16, 8, 32, 1, 0, 0),
-    1536: (8, 8, 16, 16, 8, 1, 1, 2),
-    2048: (16, 8, 16, 8, 32, 1, 0, 0),
-    3072: (16, 8, 32, 8, 32, 1, 1, 1),
+    512:  (16, 8, 16, 8, 16, 1, 0, 0, 0),
+    768:  (8, 4, 16, 8, 16, 1, 1, 4, 0),
+    1024: (16, 8, 16, 8, 32, 1, 0, 0, 3),
+    1536: (8, 8, 16, 16, 8, 1, 1, 2, 0),
+    2048: (16, 8, 16, 8, 32, 1, 0, 0, 0),
+    3072: (16, 8, 32, 8, 32, 1, 1, 1, 0),
 }
 
 
@@ -132,8 +136,8 @@ def _fwd_kernel(
     s_x = alloc.allocate_tensor(
         cute.BFloat16,
         cute.make_layout((HB, LANES, VEC), stride=(LANES * VEC, VEC, 1)), 128)
-    s_inv = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(HB), 16)
     s_seq = alloc.allocate_tensor(cutlass.Int32, cute.make_layout(HB), 16)
+    s_inv = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(HB), 16)
     s_scl = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(BT * K), 16)
 
     atom = cute.make_copy_atom(cpasync.CopyG2SOp(), cute.BFloat16,
@@ -250,6 +254,96 @@ def _fwd_kernel(
 
 
 @cute.kernel
+def _pconv_fwd_persist_kernel(
+    mX: cute.Tensor,    # (T, LANES, VEC) bf16
+    mO: cute.Tensor,    # (T, LANES, VEC) bf16
+    mSeq: cute.Tensor,  # (T,) int32
+    mWf: cute.Tensor,   # (K, LANES, VEC) bf16
+    mB: cute.Tensor,    # (LANES, VEC) bf16
+    T: cutlass.Int32,
+    BT: cutlass.Constexpr,
+    LANES: cutlass.Constexpr,
+    NITER: cutlass.Constexpr,
+):
+    HB = BT + 2 * HPAD
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    lane = tidx
+
+    alloc = cutlass.utils.SmemAllocator()
+    s_x = alloc.allocate_tensor(
+        cute.BFloat16,
+        cute.make_layout((HB, LANES, VEC), stride=(LANES * VEC, VEC, 1)), 128)
+    s_seq = alloc.allocate_tensor(cutlass.Int32, cute.make_layout(HB), 16)
+    s_scl = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(BT * K), 16)
+
+    atom = cute.make_copy_atom(cpasync.CopyG2SOp(), cute.BFloat16,
+                               num_bits_per_copy=128)
+
+    wf = []
+    for j in cutlass.range_constexpr(K):
+        f = cute.make_fragment(cute.make_layout(VEC), cute.BFloat16)
+        cute.autovec_copy(mWf[j, lane, None], f)
+        wf.append(f.load())
+    bias_f16 = cute.make_fragment(cute.make_layout(VEC), cute.BFloat16)
+    cute.autovec_copy(mB[lane, None], bias_f16)
+    bias = bias_f16.load().to(cutlass.Float32)
+
+    xfr = cute.make_fragment(cute.make_layout(VEC), cute.BFloat16)
+    out_frag = cute.make_fragment(cute.make_layout(VEC), cute.BFloat16)
+
+    for tile in cutlass.range_constexpr(NITER):
+        t0 = (bidx * NITER + tile) * BT
+
+        for c in cutlass.range_constexpr(HB):
+            gt = t0 - HPAD + c
+            if gt < 0:
+                gt = 0
+            if gt > T - 1:
+                gt = T - 1
+            cute.copy(atom, mX[gt, lane, None], s_x[c, lane, None])
+        cute.arch.cp_async_commit_group()
+
+        if tidx < HB:
+            gt = t0 - HPAD + tidx
+            sq = cutlass.Int32(-1)
+            if gt >= 0 and gt < T:
+                sq = mSeq[gt]
+            s_seq[tidx] = sq
+
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+        n2 = (BT * K + LANES - 1) // LANES
+        for it in cutlass.range_constexpr(n2):
+            idx = tidx + it * LANES
+            if idx < BT * K:
+                row = idx // K
+                tap = idx % K
+                hc = row + HPAD
+                hn = hc + tap - R
+                sc = cutlass.Float32(0.0)
+                if s_seq[hn] == s_seq[hc]:
+                    sc = cutlass.Float32(1.0)
+                s_scl[idx] = sc
+        cute.arch.barrier()
+
+        for row in cutlass.range_constexpr(BT):
+            hc = row + HPAD
+            srow = row * K
+            cute.autovec_copy(s_x[hc, lane, None], xfr)
+            acc = bias + xfr.load().to(cutlass.Float32)
+            for s in cutlass.range_constexpr(K):
+                cute.autovec_copy(s_x[hc - R + s, lane, None], xfr)
+                acc = acc + xfr.load().to(cutlass.Float32) * (
+                    wf[s].to(cutlass.Float32) * s_scl[srow + s])
+            out_frag.store(acc.to(cute.BFloat16))
+            cute.autovec_copy(out_frag, mO[t0 + row, lane, None])
+
+        cute.arch.barrier()
+
+
+@cute.kernel
 def _bwd_dx_kernel(
     mGo: cute.Tensor,    # (T, LANES, VEC) bf16
     mX: cute.Tensor,     # (T, LANES, VEC) bf16
@@ -279,19 +373,21 @@ def _bwd_dx_kernel(
     s_go = alloc.allocate_tensor(
         cute.BFloat16,
         cute.make_layout((HB, LANES, VEC), stride=(LANES * VEC, VEC, 1)), 128)
-    s_gro = alloc.allocate_tensor(
-        cute.BFloat16,
-        cute.make_layout((BT, LANES, VEC), stride=(LANES * VEC, VEC, 1)), 128)
+    if cutlass.const_expr(HAS_NORM):
+        s_gro = alloc.allocate_tensor(
+            cute.BFloat16,
+            cute.make_layout((BT, LANES, VEC), stride=(LANES * VEC, VEC, 1)), 128)
     if cutlass.const_expr(XSMEM):
         s_x = alloc.allocate_tensor(
             cute.BFloat16,
             cute.make_layout((BT, LANES, VEC), stride=(LANES * VEC, VEC, 1)),
             128)
     s_seq = alloc.allocate_tensor(cutlass.Int32, cute.make_layout(HB), 16)
-    s_inv = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(BT), 16)
-    s_msk = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(BT * K), 16)
-    s_red = alloc.allocate_tensor(
-        cutlass.Float32, cute.make_layout(BT * NL32), 16)
+    if cutlass.const_expr(HAS_NORM):
+        s_inv = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(BT), 16)
+        s_msk = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(BT * K), 16)
+        s_red = alloc.allocate_tensor(
+            cutlass.Float32, cute.make_layout(BT * NL32), 16)
 
     atom = cute.make_copy_atom(cpasync.CopyG2SOp(), cute.BFloat16,
                                num_bits_per_copy=128)
@@ -313,9 +409,10 @@ def _bwd_dx_kernel(
         cute.autovec_copy(mG[lane, None], gam_f16)
         gam = gam_f16.load().to(cutlass.Float32)
 
-    dg_acc_f = cute.make_fragment(cute.make_layout(VEC), cutlass.Float32)
-    dg_acc_f.fill(0.0)
-    dg = dg_acc_f.load()
+    if cutlass.const_expr(HAS_NORM):
+        dg_acc_f = cute.make_fragment(cute.make_layout(VEC), cutlass.Float32)
+        dg_acc_f.fill(0.0)
+        dg = dg_acc_f.load()
 
     fr = cute.make_fragment(cute.make_layout(VEC), cute.BFloat16)
     fr2 = cute.make_fragment(cute.make_layout(VEC), cute.BFloat16)
@@ -368,30 +465,36 @@ def _bwd_dx_kernel(
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
 
-        n2 = (BT * K + NTHR - 1) // NTHR
-        for c in cutlass.range_constexpr(n2):
-            idx = tidx + c * NTHR
-            if idx < BT * K:
-                row = idx // K
-                tap = idx % K
-                hc = row + HPAD
-                m = cutlass.Float32(0.0)
-                if s_seq[hc + tap - R] == s_seq[hc]:
-                    m = cutlass.Float32(1.0)
-                s_msk[idx] = m
-        cute.arch.barrier()
+        if cutlass.const_expr(HAS_NORM):
+            n2 = (BT * K + NTHR - 1) // NTHR
+            for c in cutlass.range_constexpr(n2):
+                idx = tidx + c * NTHR
+                if idx < BT * K:
+                    row = idx // K
+                    tap = idx % K
+                    hc = row + HPAD
+                    m = cutlass.Float32(0.0)
+                    if s_seq[hc + tap - R] == s_seq[hc]:
+                        m = cutlass.Float32(1.0)
+                    s_msk[idx] = m
+            cute.arch.barrier()
 
         # B1: conv-T (+ gro stash + dgamma + per-warp partial <x, wdy>)
         for j in cutlass.range_constexpr(RT):
             row = rg * RT + j
             hc = row + HPAD
-            srow = row * K
             cute.autovec_copy(s_go[hc, lane, None], fr)
             acc = fr.load().to(cutlass.Float32)
             for s in cutlass.range_constexpr(K):
-                cute.autovec_copy(s_go[hc - R + s, lane, None], fr)
-                acc = acc + fr.load().to(cutlass.Float32) * (
-                    wfl[s].to(cutlass.Float32) * s_msk[srow + s])
+                hn = hc - R + s
+                cute.autovec_copy(s_go[hn, lane, None], fr)
+                gv = fr.load().to(cutlass.Float32)
+                if cutlass.const_expr(HAS_NORM):
+                    srow = row * K
+                    acc = acc + gv * (wfl[s].to(cutlass.Float32) * s_msk[srow + s])
+                else:
+                    if s_seq[hn] == s_seq[hc]:
+                        acc = acc + gv * wfl[s].to(cutlass.Float32)
             if cutlass.const_expr(HAS_NORM):
                 inv_c = s_inv[row]
                 fr2.store(acc.to(cute.BFloat16))
@@ -432,7 +535,7 @@ def _bwd_dx_kernel(
                 dx = (gro * gam - xv * c1) * inv_c
                 out_frag.store(dx.to(cute.BFloat16))
                 cute.autovec_copy(out_frag, mDx[t0 + row, lane, None])
-        cute.arch.barrier()  # protect smem before next tile's staging
+            cute.arch.barrier()  # protect smem before next tile's staging
 
     if cutlass.const_expr(HAS_NORM):
         dg_acc_f.store(dg)
@@ -468,8 +571,9 @@ def _dwdb_kernel(
         cute.BFloat16,
         cute.make_layout((BT, LANES, VEC), stride=(LANES * VEC, VEC, 1)), 128)
     s_seq = alloc.allocate_tensor(cutlass.Int32, cute.make_layout(HB), 16)
-    s_inv = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(HB), 16)
-    s_scl = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(BT * K), 16)
+    if cutlass.const_expr(HAS_NORM):
+        s_inv = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(HB), 16)
+        s_scl = alloc.allocate_tensor(cutlass.Float32, cute.make_layout(BT * K), 16)
 
     atom = cute.make_copy_atom(cpasync.CopyG2SOp(), cute.BFloat16,
                                num_bits_per_copy=128)
@@ -510,32 +614,32 @@ def _dwdb_kernel(
         if tidx < HB:
             gt = t0 - HPAD + tidx
             sq = cutlass.Int32(-1)
-            iv = cutlass.Float32(0.0)
             if gt >= 0 and gt < T:
                 sq = mSeq[gt]
-                if cutlass.const_expr(HAS_NORM):
-                    iv = mInv[gt]
-                else:
-                    iv = cutlass.Float32(1.0)
             s_seq[tidx] = sq
-            s_inv[tidx] = iv
+            if cutlass.const_expr(HAS_NORM):
+                iv = cutlass.Float32(0.0)
+                if gt >= 0 and gt < T:
+                    iv = mInv[gt]
+                s_inv[tidx] = iv
 
         cute.arch.cp_async_wait_group(0)
         cute.arch.barrier()
 
-        n2 = (BT * K + NTHR - 1) // NTHR
-        for c in cutlass.range_constexpr(n2):
-            idx = tidx + c * NTHR
-            if idx < BT * K:
-                row = idx // K
-                tap = idx % K
-                hc = row + HPAD
-                hn = hc + tap - R
-                sc = cutlass.Float32(0.0)
-                if s_seq[hn] == s_seq[hc]:
-                    sc = s_inv[hn]
-                s_scl[idx] = sc
-        cute.arch.barrier()
+        if cutlass.const_expr(HAS_NORM):
+            n2 = (BT * K + NTHR - 1) // NTHR
+            for c in cutlass.range_constexpr(n2):
+                idx = tidx + c * NTHR
+                if idx < BT * K:
+                    row = idx // K
+                    tap = idx % K
+                    hc = row + HPAD
+                    hn = hc + tap - R
+                    sc = cutlass.Float32(0.0)
+                    if s_seq[hn] == s_seq[hc]:
+                        sc = s_inv[hn]
+                    s_scl[idx] = sc
+            cute.arch.barrier()
 
         for j in cutlass.range_constexpr(RT):
             row = rg * RT + j
@@ -545,9 +649,16 @@ def _dwdb_kernel(
             gov = fr.load().to(cutlass.Float32)
             db = db + gov
             for s in cutlass.range_constexpr(K):
-                cute.autovec_copy(s_x[hc - R + s, lane, None], fr2)
-                xv = fr2.load().to(cutlass.Float32)
-                dw[s] = dw[s] + gov * (xv * s_scl[srow + s])
+                hn = hc - R + s
+                if cutlass.const_expr(HAS_NORM):
+                    cute.autovec_copy(s_x[hn, lane, None], fr2)
+                    xv = fr2.load().to(cutlass.Float32)
+                    dw[s] = dw[s] + gov * (xv * s_scl[srow + s])
+                else:
+                    cute.autovec_copy(s_x[hn, lane, None], fr2)
+                    xv = fr2.load().to(cutlass.Float32)
+                    if s_seq[hn] == s_seq[hc]:
+                        dw[s] = dw[s] + gov * xv
         cute.arch.barrier()
 
     for s in cutlass.range_constexpr(K):
@@ -569,7 +680,7 @@ def _fwd_launch(
     eps: cutlass.Float32, T: cutlass.Int32, nblk: cutlass.Int32,
     stream: _cuda_drv.CUstream,
     BT: cutlass.Constexpr, NTHR: cutlass.Constexpr, LANES: cutlass.Constexpr,
-    HAS_NORM: cutlass.Constexpr,
+    HAS_NORM: cutlass.Constexpr, MINB: cutlass.Constexpr,
 ):
     l3 = cute.make_layout((T, LANES, VEC), stride=(LANES * VEC, VEC, 1))
     mX = cute.make_tensor(pX, l3)
@@ -582,7 +693,27 @@ def _fwd_launch(
     mB = cute.make_tensor(pB, cute.make_layout((LANES, VEC), stride=(VEC, 1)))
     _fwd_kernel(mX, mO, mSeq, mInv, mWf, mG, mB, eps, T, BT, NTHR,
                 LANES, HAS_NORM).launch(
-        grid=(nblk, 1, 1), block=(NTHR, 1, 1), stream=stream
+        grid=(nblk, 1, 1), block=(NTHR, 1, 1), stream=stream,
+        min_blocks_per_mp=MINB,
+    )
+
+
+@cute.jit
+def _pconv_fwd_persist_launch(
+    pX: cute.Pointer, pO: cute.Pointer, pSeq: cute.Pointer,
+    pWf: cute.Pointer, pB: cute.Pointer,
+    T: cutlass.Int32, nblk: cutlass.Int32, stream: _cuda_drv.CUstream,
+    BT: cutlass.Constexpr, LANES: cutlass.Constexpr, NITER: cutlass.Constexpr,
+):
+    l3 = cute.make_layout((T, LANES, VEC), stride=(LANES * VEC, VEC, 1))
+    mX = cute.make_tensor(pX, l3)
+    mO = cute.make_tensor(pO, l3)
+    mSeq = cute.make_tensor(pSeq, cute.make_layout(T))
+    mWf = cute.make_tensor(
+        pWf, cute.make_layout((K, LANES, VEC), stride=(LANES * VEC, VEC, 1)))
+    mB = cute.make_tensor(pB, cute.make_layout((LANES, VEC), stride=(VEC, 1)))
+    _pconv_fwd_persist_kernel(mX, mO, mSeq, mWf, mB, T, BT, LANES, NITER).launch(
+        grid=(nblk, 1, 1), block=(LANES, 1, 1), stream=stream
     )
 
 
@@ -784,6 +915,7 @@ def _fwd_cuda(x, seq_id, rms_weight, rms_eps, conv_weight, conv_bias):
     wf = (conv_weight.detach() * g16.unsqueeze(1)).t().contiguous()
     seq = _seq_i32(seq_id)
     lanes = _lanes(C)
+
     fwd_bt, fwd_nthr = _CFG[C][0], _CFG[C][5] * lanes
     args = (
         _pbf16(x), _pbf16(out), _pi32(seq), _pf32(inv),
@@ -791,7 +923,8 @@ def _fwd_cuda(x, seq_id, rms_weight, rms_eps, conv_weight, conv_bias):
         cutlass.Float32(rms_eps), cutlass.Int32(T),
         cutlass.Int32(T // fwd_bt), _stream(),
     )
-    fn = _compiled("fwd", _fwd_launch, args, (fwd_bt, fwd_nthr, lanes, True))
+    fn = _compiled("fwd", _fwd_launch, args,
+                   (fwd_bt, fwd_nthr, lanes, True, _CFG[C][8]))
     fn(*args)
     _maybe_sync("rms_conv_fwd")
     return out, inv
@@ -900,6 +1033,20 @@ def _pconv_fwd_cuda(x, seq_id, conv_weight, conv_bias):
     seq = _seq_i32(seq_id)
     lanes = _lanes(C)
     fwd_bt, fwd_nthr = _CFG[C][0], _CFG[C][5] * lanes
+    if C == 3072 and fwd_nthr == lanes and T % (fwd_bt * 2) == 0:
+        niter = 2
+        args = (
+            _pbf16(x), _pbf16(out), _pi32(seq),
+            _pbf16(wf), _pbf16(b16),
+            cutlass.Int32(T), cutlass.Int32(T // (fwd_bt * niter)),
+            _stream(),
+        )
+        fn = _compiled("pconv_fwd_persist", _pconv_fwd_persist_launch, args,
+                       (fwd_bt, lanes, niter))
+        fn(*args)
+        _maybe_sync("conv_fwd_persist")
+        return out
+
     args = (
         _pbf16(x), _pbf16(out), _pi32(seq), _pf32(dummy),
         _pbf16(wf), _pbf16(dummy), _pbf16(b16),
@@ -907,7 +1054,7 @@ def _pconv_fwd_cuda(x, seq_id, conv_weight, conv_bias):
         cutlass.Int32(T // fwd_bt), _stream(),
     )
     fn = _compiled("pconv_fwd", _fwd_launch, args,
-                   (fwd_bt, fwd_nthr, lanes, False))
+                   (fwd_bt, fwd_nthr, lanes, False, _CFG[C][8]))
     fn(*args)
     _maybe_sync("conv_fwd")
     return out
@@ -923,6 +1070,11 @@ def _pconv_bwd_dx_cuda(go, seq_id, conv_weight):
     dummy = _dummy(go.device, C)
     lanes = _lanes(C)
     bwd_bt, bwd_niter_pref = _CFG[C][1], _CFG[C][2]
+    # Plain Canon-B has no RMS reduction/dgamma work, so a longer persistent
+    # span amortizes launch/grid overhead better at QKV width. RMS mode keeps
+    # the shared _CFG value.
+    if C == 3072:
+        bwd_niter_pref = 64
     niter = _pick_niter(T, bwd_bt, bwd_niter_pref)
     nG = T // (bwd_bt * niter)
     seq = _seq_i32(seq_id)
@@ -948,6 +1100,11 @@ def _pconv_bwd_dwdb_cuda(go, x, seq_id):
     x = x.detach().contiguous()
     lanes = _lanes(C)
     dwdb_bt, dwdb_niter_pref = _CFG[C][3], _CFG[C][4]
+    # Plain Canon-B skips the RMS scale-table phase below. At C=3072 that
+    # shifts the best persistence point: fewer partial CTAs wins without
+    # hurting resident CTA count. Keep the shared _CFG value for RMS mode.
+    if C == 3072:
+        dwdb_niter_pref = 64
     niter = _pick_niter(T, dwdb_bt, dwdb_niter_pref)
     nG = T // (dwdb_bt * niter)
     dwp = torch.empty(nG, K + 1, C, dtype=torch.float32, device=x.device)
