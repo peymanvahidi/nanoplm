@@ -617,17 +617,64 @@ def _dist_barrier(local_rank: int) -> None:
         dist.barrier()
 
 
+# Sharded modes that go through the FSDP2 fully_shard() code path. "hsdp" is
+# plain FSDP2 with a 2D (replicate x shard) device mesh, so it shares every
+# sharded branch (checkpoint gather/reshard, gradient-sync toggling, etc.).
+_FSDP_MODES = ("fsdp", "hsdp")
+
+
+def _is_fsdp(distributed_mode: str) -> bool:
+    """True for any FSDP2-backed mode (plain FSDP or HSDP)."""
+    return distributed_mode in _FSDP_MODES
+
+
 def _get_distributed_mode(cfg: PretrainingConfig, *, distributed: bool) -> str:
     mode = str(getattr(cfg, "distributed_mode", "fsdp")).strip().lower()
-    if mode not in {"fsdp", "ddp"}:
-        raise ValueError(f"Unsupported distributed_mode={mode!r}. Expected 'fsdp' or 'ddp'.")
-    if not distributed and mode == "ddp":
-        raise ValueError("distributed_mode='ddp' requires multi_gpu=True.")
+    if mode not in {"fsdp", "hsdp", "ddp"}:
+        raise ValueError(
+            f"Unsupported distributed_mode={mode!r}. Expected 'fsdp', 'hsdp', or 'ddp'."
+        )
+    if not distributed and mode in {"ddp", "hsdp"}:
+        raise ValueError(f"distributed_mode={mode!r} requires multi_gpu=True.")
     return mode
 
 
+def _resolve_hsdp_shard_size(cfg: PretrainingConfig, world_size: int) -> int:
+    """Resolve the intra-replica shard group size for HSDP.
+
+    "auto" reads LOCAL_WORLD_SIZE (GPUs per node) so each node holds one full
+    replica sharded across its GPUs. Validates that it evenly divides
+    world_size and leaves a replicate dim > 1 (otherwise HSDP is pointless and
+    plain "fsdp" should be used instead).
+    """
+    raw = getattr(cfg, "hsdp_shard_size", "auto")
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        env = os.environ.get("LOCAL_WORLD_SIZE")
+        shard = int(env) if env else max(torch.cuda.device_count(), 1)
+    else:
+        shard = int(raw)
+    if shard < 1 or shard > world_size:
+        raise ValueError(
+            f"hsdp_shard_size={shard} out of range for world_size={world_size}."
+        )
+    if world_size % shard != 0:
+        raise ValueError(
+            f"hsdp_shard_size={shard} must evenly divide world_size={world_size}."
+        )
+    if shard == world_size:
+        raise ValueError(
+            f"hsdp_shard_size={shard} equals world_size={world_size}; the replicate "
+            "dim would be 1. Use distributed_mode='fsdp' instead of 'hsdp'."
+        )
+    return shard
+
+
 def _checkpoint_distributed_mode(*, distributed: bool, distributed_mode: str) -> str:
-    return distributed_mode if distributed else "single"
+    if not distributed:
+        return "single"
+    # HSDP and FSDP both save/restore full (gathered) state dicts, so their
+    # checkpoints are interchangeable — tag both as "fsdp" for resume compat.
+    return "fsdp" if _is_fsdp(distributed_mode) else distributed_mode
 
 
 def _bootstrap_single_process_env() -> None:
@@ -1340,7 +1387,7 @@ def _save_checkpoint(
 ) -> None:
     ckpt = Path(output_dir) / _checkpoint_dir_name(global_step, phase)
 
-    if distributed and distributed_mode == "fsdp":
+    if distributed and _is_fsdp(distributed_mode):
         _fsdp_opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         model_sd = get_model_state_dict(model, options=_fsdp_opts)
         if isinstance(optimizer, MuonAdamWGroup):
@@ -1469,7 +1516,7 @@ def _load_checkpoint(
     mode_mismatch = checkpoint_mode is not None and checkpoint_mode != current_mode
 
     model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
-    if distributed and distributed_mode == "fsdp":
+    if distributed and _is_fsdp(distributed_mode):
         set_model_state_dict(model, model_sd, options=StateDictOptions(full_state_dict=True))
     else:
         model.load_state_dict(model_sd)
@@ -1489,7 +1536,7 @@ def _load_checkpoint(
     # Use FSDP2-aware optimizer state restore so that both DTensor and plain-
     # tensor optimizer buffers are correctly gathered/sharded.  Falls back to
     # legacy manual sharding for checkpoints saved before this change.
-    if distributed and distributed_mode == "fsdp" and dist.is_initialized():
+    if distributed and _is_fsdp(distributed_mode) and dist.is_initialized():
         _fsdp_opts = StateDictOptions(full_state_dict=True)
         try:
             if isinstance(optimizer, MuonAdamWGroup) and "muon" in opt_sd:
@@ -1998,11 +2045,34 @@ def run_pure_pretraining(
 
     fsdp_mesh = None
     optimizer_dist = None
-    if distributed and distributed_mode == "fsdp":
+    if distributed and _is_fsdp(distributed_mode):
         fsdp_kwargs: dict = {}
         if use_bf16:
             fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
-        fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
+        if distributed_mode == "hsdp":
+            # 2D mesh: FSDP2 auto-enables HSDP — all-gather/reduce-scatter within
+            # the "shard" dim (intra-node), all-reduce grads across "replicate"
+            # (inter-node). fully_shard() takes the full 2D mesh; the Dion-family
+            # optimizer takes only the 1D "shard" sub-mesh (its distributed
+            # Newton-Schulz runs within the shard group, and FSDP2 already syncs
+            # gradients across the replicate dim before optimizer.step()).
+            shard_size = _resolve_hsdp_shard_size(pretrain_config, effective_world_size)
+            replicate_size = effective_world_size // shard_size
+            fsdp_mesh = init_device_mesh(
+                "cuda",
+                (replicate_size, shard_size),
+                mesh_dim_names=("replicate", "shard"),
+            )
+            optimizer_dist = fsdp_mesh["shard"]
+            logger.info(
+                "HSDP enabled: mesh=(replicate=%d, shard=%d), world_size=%d",
+                replicate_size,
+                shard_size,
+                effective_world_size,
+            )
+        else:
+            fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
+            optimizer_dist = fsdp_mesh
         fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
         fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
                 
@@ -2030,7 +2100,7 @@ def run_pure_pretraining(
             reshard_after_forward=fsdp_reshard_after_forward,
         )
         fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
-        optimizer_dist = fsdp_mesh
+        # optimizer_dist was set above (full mesh for fsdp, "shard" sub-mesh for hsdp)
 
         # Explicit prefetching for FSDP2
         if N_PREFETCH_LAYERS_FSDP2 > 1:
@@ -2762,7 +2832,7 @@ def run_pure_pretraining(
                     batch = _move_batch_to_device(batch, device)
                     upcoming_step = global_step + 1
                     sync = at_accum_boundary
-                    if distributed and distributed_mode == "fsdp":
+                    if distributed and _is_fsdp(distributed_mode):
                         model.set_requires_gradient_sync(sync)
 
                     if "num_valid_tokens" in batch:

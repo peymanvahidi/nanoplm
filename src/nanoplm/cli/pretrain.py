@@ -123,9 +123,9 @@ def _populate_batch_setup(cfg: PretrainingConfig) -> None:
 
 def _normalize_distributed_mode(value: str) -> str:
     mode = str(value).strip().lower()
-    if mode not in {"fsdp", "ddp"}:
+    if mode not in {"fsdp", "hsdp", "ddp"}:
         raise click.ClickException(
-            f"Unsupported distributed_mode={value!r}. Expected one of: fsdp, ddp."
+            f"Unsupported distributed_mode={value!r}. Expected one of: fsdp, hsdp, ddp."
         )
     return mode
 
@@ -142,11 +142,13 @@ def _validate_distributed_mode(
         raise click.ClickException("ddp_bucket_cap_mb must be > 0.")
     if not (pure_torch or pure_te):
         return
-    if cfg.distributed_mode == "ddp" and not cfg.multi_gpu:
-        raise click.ClickException("distributed_mode=ddp requires multi_gpu=true.")
-    if cfg.distributed_mode != "fsdp" and cfg.fsdp_reshard_after_forward:
+    if cfg.distributed_mode in {"ddp", "hsdp"} and not cfg.multi_gpu:
         raise click.ClickException(
-            "fsdp_reshard_after_forward applies only when distributed_mode=fsdp."
+            f"distributed_mode={cfg.distributed_mode} requires multi_gpu=true."
+        )
+    if cfg.distributed_mode not in {"fsdp", "hsdp"} and cfg.fsdp_reshard_after_forward:
+        raise click.ClickException(
+            "fsdp_reshard_after_forward applies only when distributed_mode=fsdp or hsdp."
         )
     if cfg.distributed_mode != "ddp" and cfg.ddp_bucket_cap_mb != 25:
         raise click.ClickException(
@@ -1624,7 +1626,8 @@ def get_yaml(output: Optional[str], force: bool):
         "  fp8_amax_history_len: 64  # TE DelayedScaling only; amax history window length\n"
         "  fp8_reduce_amax: true  # TE DelayedScaling only; true synchronizes amax across the FP8 reduction group\n"
         "  multi_gpu: true\n"
-        '  distributed_mode: "fsdp"  # fsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n'
+        '  distributed_mode: "fsdp"  # fsdp | hsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n'
+        "  hsdp_shard_size: 'auto'  # hsdp only: GPUs per replica (shard intra-node, replicate inter-node); 'auto'=LOCAL_WORLD_SIZE; must divide world_size\n"
         '  fsdp_shard_granularity: "layer"  # layer (fewer boundaries, NVLink/SXM) | sublayer (finer overlap, PCIe)\n'
         "  fsdp_reshard_after_forward: false  # universal FSDP2 reshard_after_forward setting for pure_torch/pure_te\n"
         "  world_size: 'auto'\n"

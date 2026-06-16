@@ -183,7 +183,16 @@ class PretrainingConfig:
     # Distributed training
     multi_gpu: bool = True
     world_size: Union[int, str] = "auto"
-    distributed_mode: str = "fsdp"
+    distributed_mode: str = "fsdp"  # fsdp | hsdp | ddp
+    # HSDP (Hybrid Sharded Data Parallel): shard params within a node (intra-node
+    # FSDP over fast NVLink) and replicate + all-reduce gradients across nodes
+    # (inter-node DDP). Only used when distributed_mode="hsdp". The shard group
+    # size = GPUs per replica; "auto" reads LOCAL_WORLD_SIZE (GPUs per node), so
+    # each node holds one full replica sharded across its GPUs. world_size must be
+    # an integer multiple of the shard size. Makes sense for multi-node runs where
+    # the inter-node fabric is the bottleneck and the model fits sharded within one
+    # node; on a single node it degenerates to plain FSDP.
+    hsdp_shard_size: Union[int, str] = "auto"
     # FSDP2 wrapping granularity: "layer" wraps whole transformer blocks (fewer
     # boundaries, less CPU dispatch overhead — better for fast interconnects like
     # NVLink/SXM); "sublayer" wraps attn & mlp separately (more boundaries, but
