@@ -11,11 +11,11 @@
 [![PyPI Version](https://img.shields.io/pypi/v/nanoplm?style=plastic&color=4b8bbe&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/nanoplm/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=plastic)](https://github.com/psf/black)
 
-<p>🚀 Ship a protein language model without writing a training loop. nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a simple YAML files to control everything.</p>
+<p> nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a simple YAML files to control everything. THE FOCUS IS ON HAVING A SIMPLIFIED ENCODER ONLY TRAINING PIPELINE SIMILAR TO NANOCHAT, by no means is this project is producing SOTA models, this is mostly an educational playground to experiment on various aspects of encoder model training e2e pipeline</p>
 
 </div>
 
-## 🧬 What makes nanoPLM different?
+## What makes nanoPLM different?
 
 - **Control everything with simple YAML files**: Prepare your data and Pretrain your model, with YAML files.
 - **Data you can trust**: Using Data Version Control (DVC) under the hood.
@@ -259,6 +259,9 @@ pretraining:
   muon_nesterov: true
   muon_eps: 1e-7
   mlm_probability: 0.3
+  mlm_masking_strategy: "token" # token or span
+  mlm_span_mean_length: 3.0 # used only when mlm_masking_strategy: "span"
+  mlm_span_max_length: 10 # used only when mlm_masking_strategy: "span"
   mask_replace_prob: 0.8
   random_token_prob: 0.1
   keep_probability: 0.1

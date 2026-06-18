@@ -69,6 +69,10 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             use_resid_lambdas=config.use_resid_lambdas,
             use_x0_lambdas=config.use_x0_lambdas,
             use_qk_norm=config.use_qk_norm,
+            reorder_RoPE_QKNorm=config.reorder_RoPE_QKNorm,
+            global_rope_theta=config.global_rope_theta,
+            local_rope_theta=config.local_rope_theta,
+            rope_dim_fraction=config.rope_dim_fraction,
             use_canon_layers=config.use_canon_layers,
             canon_layers_mode=config.canon_layers_mode,
             canon_layers_kernel_size=config.canon_layers_kernel_size,
@@ -167,11 +171,6 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
                 "Paired head attention is currently implemented only in the pure-torch "
                 "path. Disable use_paired_head_attention or use --pure-torch."
             )
-        if not config.fused_qkv:
-            raise ValueError(
-                "fused_qkv=False is implemented only in the pure-torch path. "
-                "Use --pure-torch with fused_qkv=false."
-            )
         if not config.fused_up_gate:
             raise ValueError(
                 "fused_up_gate=False is implemented only in the pure-torch path. "
@@ -209,6 +208,10 @@ class TEProtModernBertMLM(TEModernBertForMaskedLM):
             use_resid_lambdas=config.use_resid_lambdas,
             use_x0_lambdas=config.use_x0_lambdas,
             use_qk_norm=config.use_qk_norm,
+            reorder_RoPE_QKNorm=config.reorder_RoPE_QKNorm,
+            global_rope_theta=config.global_rope_theta,
+            local_rope_theta=config.local_rope_theta,
+            rope_dim_fraction=config.rope_dim_fraction,
             use_canon_layers=config.use_canon_layers,
             canon_layers_mode=config.canon_layers_mode,
             canon_layers_kernel_size=config.canon_layers_kernel_size,

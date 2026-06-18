@@ -130,6 +130,12 @@ def linear_relu_square(a, b, aux=None):
 
 
 class FusedLinearReLUSquare(torch.autograd.Function):
+    """Legacy eager-only wrapper. A raw autograd.Function is a dynamo graph
+    break (the model shattered into two compiled fragments per layer with a
+    ~1 ms GPU hole at the seam); prefer fused_linear_relu_square below, which
+    routes through registered custom ops that torch.compile keeps in-graph.
+    """
+
     @staticmethod
     def forward(ctx, x, W1, W2):
         flat = x.view(-1, x.shape[-1])
@@ -148,3 +154,69 @@ class FusedLinearReLUSquare(torch.autograd.Function):
         dW1 = dpre.T @ flat_x
         dx = dpre @ W1
         return dx.view(x.shape), dW1, dW2
+
+
+# -- torch.compile-friendly custom ops ----------------------------------------
+#
+# Same kernels and op order as FusedLinearReLUSquare (bit-identical results),
+# but registered through torch.library so dynamo records a single graph node
+# instead of breaking the layer graph in half.  pre/post are returned from the
+# forward op so register_autograd can save them for the fused backward.
+
+
+@torch.library.custom_op("nanoplm_srelu::mlp_fwd", mutates_args=(), device_types="cuda")
+def _srelu_mlp_fwd(
+    x2d: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    pre, post = linear_relu_square(x2d.contiguous(), w1)
+    out = post @ w2
+    return out, pre, post
+
+
+@_srelu_mlp_fwd.register_fake
+def _srelu_mlp_fwd_fake(x2d, w1, w2):
+    M = x2d.shape[0]
+    N = w1.shape[0]
+    H = w2.shape[1]
+    return (
+        x2d.new_empty((M, H)),
+        x2d.new_empty((M, N)),
+        x2d.new_empty((M, N)),
+    )
+
+
+@torch.library.custom_op("nanoplm_srelu::lrs_bwd", mutates_args=(), device_types="cuda")
+def _srelu_lrs_bwd(g2d: torch.Tensor, w2: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    # (g2d @ w2.T) * 2*relu(pre): gemm with the activation derivative fused in.
+    return linear_relu_square(g2d.contiguous(), w2, aux=pre)
+
+
+@_srelu_lrs_bwd.register_fake
+def _srelu_lrs_bwd_fake(g2d, w2, pre):
+    return g2d.new_empty((g2d.shape[0], w2.shape[0]))
+
+
+def _srelu_mlp_setup_context(ctx, inputs, output):
+    x2d, w1, w2 = inputs
+    _, pre, post = output
+    ctx.save_for_backward(x2d, w1, w2, pre, post)
+
+
+def _srelu_mlp_backward(ctx, grad_out, grad_pre, grad_post):
+    x2d, w1, w2, pre, post = ctx.saved_tensors
+    g = grad_out.contiguous()
+    dw2 = post.T @ g
+    dpre = torch.ops.nanoplm_srelu.lrs_bwd(g, w2, pre)
+    dw1 = dpre.T @ x2d
+    dx = dpre @ w1
+    return dx, dw1, dw2
+
+
+_srelu_mlp_fwd.register_autograd(_srelu_mlp_backward, setup_context=_srelu_mlp_setup_context)
+
+
+def fused_linear_relu_square(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
+    """relu(x @ w1.T)^2 @ w2 via the fused kernels; traceable by torch.compile."""
+    flat = x.view(-1, x.shape[-1])
+    out, _, _ = torch.ops.nanoplm_srelu.mlp_fwd(flat, w1, w2)
+    return out.view(x.shape)
