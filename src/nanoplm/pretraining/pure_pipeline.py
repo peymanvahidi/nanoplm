@@ -69,8 +69,10 @@ from nanoplm.pretraining.collator import (
     mlm_masking_kwargs_from_config,
 )
 from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
+from nanoplm.pretraining import cpu_offload
 from nanoplm.pretraining.fp8 import (
     convert_fp8_targets,
+    iter_te_cpu_offload_target_wrappers,
     te_fp8_autocast_context,
     te_fp8_recipe_from_config,
 )
@@ -1740,6 +1742,48 @@ def _rebuild_scheduler_for_resume(
     )
 
 
+def _configure_fp8_cpu_activation_offload(
+    *,
+    model: PureProtModernBertMLM,
+    pretrain_config: PretrainingConfig,
+    device: torch.device,
+) -> None:
+    if not bool(getattr(pretrain_config, "fp8_cpu_activation_offload", False)):
+        cpu_offload.disable(model)
+        return
+
+    if not bool(getattr(pretrain_config, "fp8", False)):
+        raise ValueError("fp8_cpu_activation_offload=true requires fp8=true.")
+    if device.type != "cuda":
+        raise ValueError("fp8_cpu_activation_offload=true requires CUDA.")
+
+    model_config = getattr(model, "model_config", None)
+    if bool(getattr(model_config, "activation_checkpointing", False)):
+        raise ValueError(
+            "fp8_cpu_activation_offload is not supported with activation_checkpointing=true."
+        )
+    if int(getattr(model_config, "recycling_loop_count", 1)) != 1:
+        raise ValueError(
+            "fp8_cpu_activation_offload is not supported with recycling_loop_count > 1."
+        )
+
+    targets = list(iter_te_cpu_offload_target_wrappers(model))
+    if not targets:
+        raise ValueError(
+            "fp8_cpu_activation_offload=true found no eligible TE wrappers; "
+            "set fp8_target to include 'attn_wqkv' and/or 'mlp'."
+        )
+
+    retain = bool(getattr(pretrain_config, "fp8_cpu_activation_offload_retain_buffers", False))
+    n = cpu_offload.install(model, targets, retain_pinned_buffers=retain)
+    logger.info(
+        "FP8 CPU activation offload enabled: targets=%d (inputmat+ln_out, 1-step reload "
+        "prefetch), retain_pinned_cpu_buffers=%s (torch.compile remains enabled)",
+        n,
+        retain,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -2031,6 +2075,12 @@ def run_pure_pretraining(
             f"target={fp8_target}, recipe={fp8_recipe}, "
             f"skip_last_n_layers={fp8_skip_last}, converted_blocks={n_fp8}"
         )
+
+    _configure_fp8_cpu_activation_offload(
+        model=model,
+        pretrain_config=pretrain_config,
+        device=device,
+    )
 
     # ---- Model to device + compile + FSDP ----
     base_model = model

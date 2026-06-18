@@ -1625,6 +1625,10 @@ def get_yaml(output: Optional[str], force: bool):
         '  fp8_format: "hybrid"  # TE only: hybrid | e4m3; ignored by nvfp4\n'
         "  fp8_amax_history_len: 64  # TE DelayedScaling only; amax history window length\n"
         "  fp8_reduce_amax: true  # TE DelayedScaling only; true synchronizes amax across the FP8 reduction group\n"
+        "  fp8_cpu_activation_offload: false  # pure_torch FP8 only: TE CPU activation offload via saved-tensor hooks\n"
+        "  #   NOTE: hand-tuned for the 4xGH200 SKU; performance on other systems is not guaranteed\n"
+        '  fp8_cpu_activation_offload_layers: "auto"  # reserved; current mode offloads eligible TE LayerNormLinear + LayerNormMLP wrappers\n'
+        "  fp8_cpu_activation_offload_retain_buffers: false  # reuse pinned CPU buffers across iterations for stable shapes\n"
         "  multi_gpu: true\n"
         '  distributed_mode: "fsdp"  # fsdp | hsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)\n'
         "  hsdp_shard_size: 'auto'  # hsdp only: GPUs per replica (shard intra-node, replicate inter-node); 'auto'=LOCAL_WORLD_SIZE; must divide world_size\n"
@@ -1828,6 +1832,8 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "tf32",
         "fp8",
         "fp8_reduce_amax",
+        "fp8_cpu_activation_offload",
+        "fp8_cpu_activation_offload_retain_buffers",
         "muon_nesterov",
         "muon_cautious_weight_decay",
         "muon_use_polar_express",
