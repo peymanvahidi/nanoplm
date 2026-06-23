@@ -129,12 +129,13 @@ class MoELayer(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        from .modeling import ModernBertSwiGLUMLP
+        from .modeling import ModernBertSReluMLP, ModernBertSwiGLUMLP
 
         self.num_experts: int = config.moe_num_experts
         self.top_k: int = config.moe_top_k
         self.hidden_size: int = config.hidden_size
         self.intermediate_size: int = config.intermediate_size
+        self.srelu: bool = config.mlp_activation == "srelu"
 
         # Router
         self.router = Router(
@@ -149,8 +150,10 @@ class MoELayer(nn.Module):
         # Routed expert weights — stacked for grouped_gemm.
         # Layout: (num_experts, in_features, out_features).
         # This is transposed relative to nn.Linear's (out, in).
+        # SwiGLU's Wi emits gate+up (2*inter); sReLU is non-gated (just inter).
+        inter_out = config.intermediate_size if self.srelu else 2 * config.intermediate_size
         self.Wi = nn.Parameter(
-            torch.empty(self.num_experts, config.hidden_size, 2 * config.intermediate_size),
+            torch.empty(self.num_experts, config.hidden_size, inter_out),
         )
         self.Wo = nn.Parameter(
             torch.empty(self.num_experts, config.intermediate_size, config.hidden_size),
@@ -158,7 +161,9 @@ class MoELayer(nn.Module):
         self.drop = nn.Dropout(config.mlp_dropout)
 
         # Shared expert — a normal MLP that processes all tokens.
-        self.shared_expert = ModernBertSwiGLUMLP(config)
+        self.shared_expert = (
+            ModernBertSReluMLP if self.srelu else ModernBertSwiGLUMLP
+        )(config)
 
         self.aux_loss_coef: float = float(config.moe_aux_loss_coef)
         self.z_loss_coef: float = float(config.moe_z_loss_coef)
@@ -273,10 +278,14 @@ class MoELayer(nn.Module):
         # Store for external bias-update logic.
         self.last_expert_counts = counts.detach().clone()
 
-        # --- expert SwiGLU via grouped_gemm ---
-        wi = moe_grouped_gemm(x_sorted, self.Wi, counts)  # (T*top_k, 2*inter)
-        x_proj, gate = wi.chunk(2, dim=-1)
-        activated = F.silu(gate) * x_proj  # (T*top_k, inter)
+        # --- expert MLP via grouped_gemm ---
+        wi = moe_grouped_gemm(x_sorted, self.Wi, counts)  # (T*top_k, inter or 2*inter)
+        if self.srelu:
+            h = F.relu(wi)
+            activated = h * h  # (T*top_k, inter)
+        else:
+            x_proj, gate = wi.chunk(2, dim=-1)
+            activated = F.silu(gate) * x_proj  # (T*top_k, inter)
         expert_out_sorted = moe_grouped_gemm(
             self.drop(activated),
             self.Wo,

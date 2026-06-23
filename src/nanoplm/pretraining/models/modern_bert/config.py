@@ -378,9 +378,9 @@ class ModernBertConfig:
             )
         # MoE layer flags.
         if self.use_moe:
-            if self.mlp_activation != "swiglu":
+            if self.mlp_activation not in {"swiglu", "srelu"}:
                 raise ValueError(
-                    "use_moe=True currently requires mlp_activation='swiglu'."
+                    "use_moe=True requires mlp_activation in {'swiglu', 'srelu'}."
                 )
             if self.moe_num_experts < 1:
                 raise ValueError(
