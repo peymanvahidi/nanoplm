@@ -49,7 +49,7 @@ else:
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
-_OFFLINE_MODE = False
+_OFFLINE_MODE = True
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:

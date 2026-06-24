@@ -168,6 +168,13 @@ class MoELayer(nn.Module):
         self.aux_loss_coef: float = float(config.moe_aux_loss_coef)
         self.z_loss_coef: float = float(config.moe_z_loss_coef)
         self.routed_scaling_factor: float = float(config.moe_routed_scaling_factor)
+        # Routed-expert compute backend: 'cutlass' (device-side grouped GEMM,
+        # default) or 'sonicmoe' (SonicMoE/quack fused expert path). The sonicmoe
+        # path fuses dispatch+up+act+down+combine and cannot insert dropout
+        # between the projections.
+        self.moe_kernel_backend: str = str(getattr(config, "moe_kernel_backend", "cutlass"))
+        if self.moe_kernel_backend == "sonicmoe" and float(config.mlp_dropout) != 0.0:
+            raise ValueError("moe_kernel_backend='sonicmoe' does not support mlp_dropout > 0.")
         ckpt_enabled = bool(getattr(config, "activation_checkpointing", False))
         ckpt_mode = str(
             getattr(config, "activation_checkpointing_mode", "layer")
@@ -255,9 +262,17 @@ class MoELayer(nn.Module):
         # --- routing ---
         weights, indices, z_loss, router_scores = self.router(x)  # (T, top_k), (T, top_k), scalar, (T, E)
 
-        # --- dispatch: sort by expert, compute per-expert counts, fused gather ---
+        # --- dispatch metadata ---
         expert_flat = indices.reshape(-1)  # (T*top_k,)
-        if self._reuse_dispatch_workspaces:
+        if self.moe_kernel_backend == "sonicmoe":
+            count_ones = torch.ones_like(expert_flat, dtype=torch.int64)
+            counts = torch.zeros(
+                self.num_experts,
+                device=expert_flat.device,
+                dtype=torch.int64,
+            )
+            counts.scatter_add_(0, expert_flat, count_ones)
+        elif self._reuse_dispatch_workspaces:
             num_assignments = expert_flat.numel()
             sort_vals, sorted_idx, count_ones, counts = self._ensure_dispatch_buffers(
                 num_assignments,
@@ -271,32 +286,42 @@ class MoELayer(nn.Module):
             sorted_idx = expert_flat.argsort(stable=True)
             counts = expert_flat.bincount(minlength=self.num_experts).to(torch.int64)
 
-        token_idx = (sorted_idx // self.top_k).to(torch.int32)
-        slot_idx = (sorted_idx % self.top_k).to(torch.int32)
-        x_sorted = moe_scatter_dispatch(x, token_idx)  # (T*top_k, H)
-
         # Store for external bias-update logic.
         self.last_expert_counts = counts.detach().clone()
 
-        # --- expert MLP via grouped_gemm ---
-        wi = moe_grouped_gemm(x_sorted, self.Wi, counts)  # (T*top_k, inter or 2*inter)
-        if self.srelu:
-            h = F.relu(wi)
-            activated = h * h  # (T*top_k, inter)
+        if self.moe_kernel_backend == "sonicmoe":
+            # SonicMoE/quack fused expert path: dispatch gather is fused into the
+            # up-projection GEMM, and the down-projection scatters/combines with
+            # the router weights — all driven by nanoplm's routing decisions.
+            from .moe_sonicmoe import sonicmoe_routed_experts
+            expert_out = sonicmoe_routed_experts(
+                x, indices, weights,
+                self.Wi, self.Wo, self.num_experts, self.top_k,
+                self.srelu, self.routed_scaling_factor,
+            )  # (T, H)
         else:
-            x_proj, gate = wi.chunk(2, dim=-1)
-            activated = F.silu(gate) * x_proj  # (T*top_k, inter)
-        expert_out_sorted = moe_grouped_gemm(
-            self.drop(activated),
-            self.Wo,
-            counts,
-        )  # (T*top_k, H)
+            # --- expert MLP via cutlass grouped_gemm ---
+            token_idx = (sorted_idx // self.top_k).to(torch.int32)
+            slot_idx = (sorted_idx % self.top_k).to(torch.int32)
+            x_sorted = moe_scatter_dispatch(x, token_idx)  # (T*top_k, H)
+            wi = moe_grouped_gemm(x_sorted, self.Wi, counts)  # (T*top_k, inter or 2*inter)
+            if self.srelu:
+                h = F.relu(wi)
+                activated = h * h  # (T*top_k, inter)
+            else:
+                x_proj, gate = wi.chunk(2, dim=-1)
+                activated = F.silu(gate) * x_proj  # (T*top_k, inter)
+            expert_out_sorted = moe_grouped_gemm(
+                self.drop(activated),
+                self.Wo,
+                counts,
+            )  # (T*top_k, H)
 
-        # --- combine: fused unsort + weighted sum ---
-        inv_map = build_inverse_map(token_idx, slot_idx, T, self.top_k)
-        expert_out = moe_gather_combine(
-            expert_out_sorted, inv_map, weights, self.routed_scaling_factor,
-        )  # (T, H)
+            # --- combine: fused unsort + weighted sum ---
+            inv_map = build_inverse_map(token_idx, slot_idx, T, self.top_k)
+            expert_out = moe_gather_combine(
+                expert_out_sorted, inv_map, weights, self.routed_scaling_factor,
+            )  # (T, H)
 
         # --- auxiliary losses ---
         aux = torch.zeros(1, device=x.device, dtype=torch.float32)

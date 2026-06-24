@@ -2192,13 +2192,28 @@ def run_pure_pretraining(
             )
             inductor_config.triton.persistent_reductions = persistent_reductions
             inductor_config.triton.mix_order_reduction = mix_order_reduction
+            sonicmoe_backend = (
+                str(getattr(_model_config, "moe_kernel_backend", "cutlass")).lower() == "sonicmoe"
+            )
+            if sonicmoe_backend:
+                # SonicMoE/quack owns the routed-expert GEMMs. Keep torch.compile
+                # for the surrounding graph, but avoid Inductor's Triton GEMM
+                # max-autotune templates here: on H100 they can pick/precompile
+                # candidates over the shared-memory limit and fail before the
+                # SonicMoE kernels even run.
+                os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS"] = "ATEN"
+                os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_PRUNE_CHOICES_BASED_ON_SHARED_MEM"] = "1"
+                inductor_config.max_autotune_gemm_backends = "ATEN"
+                inductor_config.max_autotune_prune_choices_based_on_shared_mem = True
             logger.info(
                 "TorchInductor: triton.persistent_reductions=%s (env TORCHINDUCTOR_PERSISTENT_REDUCTIONS=%s); "
-                "triton.mix_order_reduction=%s (env TORCHINDUCTOR_MIX_ORDER_REDUCTION=%s)",
+                "triton.mix_order_reduction=%s (env TORCHINDUCTOR_MIX_ORDER_REDUCTION=%s); "
+                "max_autotune_gemm_backends=%s",
                 persistent_reductions,
                 os.environ.get("TORCHINDUCTOR_PERSISTENT_REDUCTIONS"),
                 mix_order_reduction,
                 os.environ.get("TORCHINDUCTOR_MIX_ORDER_REDUCTION"),
+                getattr(inductor_config, "max_autotune_gemm_backends", None),
             )
         except Exception:
             logger.exception("Failed to apply TorchInductor config overrides; continuing.")
