@@ -79,6 +79,21 @@ running your first MoE job. If CUTLASS is not checked out under
 `third_party/cutlass`, set `NANOPLM_CUTLASS_ROOT` or `CUTLASS_ROOT` to a CUTLASS
 checkout.
 
+### TransformerEngine on JURECA (JSC)
+
+The prebuilt `transformer_engine` wheels (2.14–2.16) fail to import on JURECA
+(`undefined symbol: cublasLtGroupedMatrixLayoutInit_internal`) because they link
+a newer cublasLt than `module load CUDA/13` provides. Build it from source once,
+from a **login node** (needs internet; no GPU required):
+
+```bash
+bash scripts/install_te_jureca.sh
+```
+
+This clones TE 2.16, builds it for sm90 against the cluster's CUDA, installs it
+into `.venv`, and verifies the import. Only needed for the FP8 / `--pure-te`
+pipelines; the default bf16 / `--pure-torch` path does not require TE.
+
 ### Optional: SonicMoE expert backend
 
 Set `moe_kernel_backend: sonicmoe` in the pretraining YAML to run the routed
