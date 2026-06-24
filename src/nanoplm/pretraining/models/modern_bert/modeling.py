@@ -61,6 +61,8 @@ from .canon_layer import (
     _varlen_canon_inner,
 )
 
+from nanoplm.pretraining.cpu_offload import run_flush
+
 
 def _pair_sdpa_attention_mask(
     attn_mask: Optional[torch.Tensor],
@@ -285,7 +287,13 @@ class ModernBertSReluMLP(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if USE_TRITON_SRELU and isinstance(self.Wi, nn.Linear):
+        # Width-gate the custom Triton srelu kernel. Benchmarked on GH200
+        # (M=16384 tokens, i=4h): the fused kernel beats cuBLAS only at narrow
+        # hidden dims (short K) and loses ~10-15% from h>=2048, crossover ~1700.
+        # Above the gate, fall through to the compiled cuBLAS path below.
+        # Crossover measured in practice, not theoretical. x.shape[-1] == h is
+        # static under dynamic=False, so this branch resolves at compile time.
+        if USE_TRITON_SRELU and isinstance(self.Wi, nn.Linear) and x.shape[-1] < 1700:
             from nanoplm.pretraining.models.modern_bert.triton_kernels import (
                 fused_linear_relu_square,
             )
@@ -1435,6 +1443,8 @@ class ModernBertModel(nn.Module):
         self.final_norm = _create_norm(
             config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
         )
+        # Set by cpu_offload.install() to flush the final activation offload.
+        self._cpu_offload_flush = None
         self.rotary_emb = ModernBertRotaryEmbedding(config)
         # RePO: disabled at init; enabled by the training loop after
         # repo_rope_warmup_steps (or warmup_steps fallback).
@@ -1905,7 +1915,7 @@ class ModernBertModel(nn.Module):
 
             if self.config.use_mhc_lite:
                 x = x[..., 0, :]  # compress: take stream 0
-            return self.final_norm(x)
+            return run_flush(self._cpu_offload_flush, self.final_norm(x))
 
         # ---- SDPA (fallback) path -----------------------------------------
         _, seq_len = input_ids.shape
@@ -2102,7 +2112,7 @@ class ModernBertModel(nn.Module):
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]  # compress: take stream 0
-        return self.final_norm(x)
+        return run_flush(self._cpu_offload_flush, self.final_norm(x))
 
 
 @dataclass
@@ -2242,7 +2252,11 @@ class ModernBertForMaskedLM(nn.Module):
                         nn.init.uniform_(shared.W_up.weight, -bu, bu)
                         bg = _noble_bound(shared.W_gate)
                         nn.init.uniform_(shared.W_gate.weight, -bg, bg)
-                    _init_wo(shared.Wo.weight, mlp_out_bound)
+                    # SwiGLU shared expert has a Wo Linear; sReLU has a Wo_weight param.
+                    if hasattr(shared, "Wo"):
+                        _init_wo(shared.Wo.weight, mlp_out_bound)
+                    else:
+                        _init_wo(shared.Wo_weight, mlp_out_bound)
                 elif enc.mlp.Wi is not None:
                     bi = _noble_bound(enc.mlp.Wi)
                     nn.init.uniform_(enc.mlp.Wi.weight, -bi, bi)
@@ -2290,8 +2304,9 @@ class ModernBertForMaskedLM(nn.Module):
                             nn.init.zeros_(shared.W_up.bias)
                         if shared.W_gate.bias is not None:
                             nn.init.zeros_(shared.W_gate.bias)
-                    if shared.Wo.bias is not None:
-                        nn.init.zeros_(shared.Wo.bias)
+                    wo_bias = shared.Wo.bias if hasattr(shared, "Wo") else shared.Wo_bias
+                    if wo_bias is not None:
+                        nn.init.zeros_(wo_bias)
                 elif enc.mlp.Wi is not None:
                     if enc.mlp.Wi.bias is not None:
                         nn.init.zeros_(enc.mlp.Wi.bias)

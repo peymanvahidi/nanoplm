@@ -156,6 +156,11 @@ class ModernBertConfig:
     moe_topk_group: int = 1
     moe_bias_update_rate: float = 1e-3
     moe_leading_dense_layers: int = 0  # first N layers are always dense (DeepSeek uses 1)
+    # Routed-expert compute backend (pure_torch MoE only). 'cutlass' = the custom
+    # device-side grouped-GEMM kernel (default, sync-free). 'sonicmoe' = the
+    # SonicMoE/quack fused expert path (sync-free fwd+bwd, fused dispatch gather);
+    # requires mlp_activation in {srelu, swiglu}.
+    moe_kernel_backend: Literal["cutlass", "sonicmoe"] = "cutlass"
 
     # Huginn-style recycling: split the L-layer stack into prelude/recurrent/coda
     # regions. The recurrent block (R = L - P - C layers) is weight-tied and
@@ -378,9 +383,9 @@ class ModernBertConfig:
             )
         # MoE layer flags.
         if self.use_moe:
-            if self.mlp_activation != "swiglu":
+            if self.mlp_activation not in {"swiglu", "srelu"}:
                 raise ValueError(
-                    "use_moe=True currently requires mlp_activation='swiglu'."
+                    "use_moe=True requires mlp_activation in {'swiglu', 'srelu'}."
                 )
             if self.moe_num_experts < 1:
                 raise ValueError(
@@ -408,6 +413,11 @@ class ModernBertConfig:
                     )
             else:
                 self.moe_topk_group = 1
+            if self.moe_kernel_backend not in {"cutlass", "sonicmoe"}:
+                raise ValueError(
+                    "moe_kernel_backend must be 'cutlass' or 'sonicmoe', got "
+                    f"{self.moe_kernel_backend!r}"
+                )
             self.moe_layer_flags = [True] * self.num_hidden_layers
             # Force first N layers to dense.
             for i in range(min(self.moe_leading_dense_layers, self.num_hidden_layers)):

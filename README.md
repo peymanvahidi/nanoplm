@@ -78,6 +78,24 @@ If you need different architectures, override `TORCH_CUDA_ARCH_LIST` before
 running your first MoE job. If CUTLASS is not checked out under
 `third_party/cutlass`, set `NANOPLM_CUTLASS_ROOT` or `CUTLASS_ROOT` to a CUTLASS
 checkout.
+
+### Optional: SonicMoE expert backend
+
+Set `moe_kernel_backend: sonicmoe` in the pretraining YAML to run the routed
+experts on the [SonicMoE](https://github.com/Dao-AILab/sonic-moe) /
+[QuACK](https://github.com/Dao-AILab/quack) fused kernels (sync-free forward and
+backward, dispatch fused into the GEMM). It requires our SonicMoE fork, which
+adds squared-ReLU (`srelu`) support on top of upstream (PR
+[Dao-AILab/sonic-moe#64](https://github.com/Dao-AILab/sonic-moe/pull/64)):
+
+```bash
+pip install quack-kernels            # use quack-kernels[cu13] on CUDA 13
+pip install git+https://github.com/alint77/sonic-moe.git@feat/srelu-relu_sq-support
+```
+
+Requires a Hopper (SM90) or newer GPU. The default `moe_kernel_backend: cutlass`
+needs none of this.
+
 ---
 
 ## 🤖 Zero‑to‑model in 4 commands

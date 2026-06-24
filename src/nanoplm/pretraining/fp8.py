@@ -8,6 +8,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from nanoplm.pretraining.cpu_offload import run_target
+
 _TE_IMPORT_ERROR: Exception | None = None
 try:  # pragma: no cover - import availability depends on the runtime image
     import transformer_engine.pytorch as te
@@ -45,6 +47,8 @@ class _TELayerNormMLPWrapper(nn.Module):
     def __init__(self, layernorm_mlp: nn.Module):
         super().__init__()
         self.layernorm_mlp = layernorm_mlp
+        # Set by cpu_offload.install() when activation offload is enabled.
+        self._cpu_offload = None
 
     def forward(
         self,
@@ -54,7 +58,7 @@ class _TELayerNormMLPWrapper(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del position_ids, cu_seqlens, attention_mask
-        return self.layernorm_mlp(x)
+        return run_target(self._cpu_offload, self.layernorm_mlp, x)
 
 
 class _TELayerNormLinearWrapper(nn.Module):
@@ -63,9 +67,23 @@ class _TELayerNormLinearWrapper(nn.Module):
     def __init__(self, layernorm_linear: nn.Module):
         super().__init__()
         self.layernorm_linear = layernorm_linear
+        # Set by cpu_offload.install() when activation offload is enabled.
+        self._cpu_offload = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layernorm_linear(x)
+        return run_target(self._cpu_offload, self.layernorm_linear, x)
+
+
+def iter_te_cpu_offload_target_wrappers(module: nn.Module):
+    """Yield TE wrapper modules eligible for CPU activation offload.
+
+    Yielded in module-registration order, which for ModernBERT matches
+    forward-execution order (attention QKV before MLP, layers in sequence) --
+    the order ``cpu_offload.install`` relies on for its 1-step-ahead schedule.
+    """
+    for child in module.modules():
+        if isinstance(child, (_TELayerNormLinearWrapper, _TELayerNormMLPWrapper)):
+            yield child
 
 
 def _normalization_name(norm: nn.Module) -> str:
@@ -488,6 +506,7 @@ __all__ = [
     "convert_attention_wo_to_te_linear",
     "convert_fp8_targets",
     "convert_mlp_blocks_to_te_layernorm_mlp",
+    "iter_te_cpu_offload_target_wrappers",
     "te_fp8_autocast_context",
     "te_fp8_format_from_config",
     "te_fp8_recipe_from_config",

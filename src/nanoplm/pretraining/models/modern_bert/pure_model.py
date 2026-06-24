@@ -118,6 +118,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             moe_topk_group=config.moe_topk_group,
             moe_bias_update_rate=config.moe_bias_update_rate,
             moe_leading_dense_layers=config.moe_leading_dense_layers,
+            moe_kernel_backend=config.moe_kernel_backend,
             recycling_num_prelude_layers=config.recycling_num_prelude_layers,
             recycling_num_coda_layers=config.recycling_num_coda_layers,
             recycling_loop_count=config.recycling_loop_count,

@@ -104,6 +104,7 @@ class ProtModernBertMLMConfig:
     moe_topk_group: int = 1  # group-limited routing: number of groups kept per token
     moe_bias_update_rate: float = 1e-3  # Ling-style expert-bias update rate
     moe_leading_dense_layers: int = 0
+    moe_kernel_backend: str = "cutlass"  # cutlass | sonicmoe (routed-expert compute)
     # Huginn-style recycling (pure-torch path only). See ModernBertConfig for field semantics.
     recycling_num_prelude_layers: int = 0
     recycling_num_coda_layers: int = 0

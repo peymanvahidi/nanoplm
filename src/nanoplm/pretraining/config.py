@@ -125,6 +125,15 @@ class PretrainingConfig:
     fp8_amax_history_len: int = 64
     # DelayedScaling only: synchronize amax across the FP8 reduction group.
     fp8_reduce_amax: bool = True
+    # Pure-torch FP8 only: use Transformer Engine saved-tensor hooks to
+    # offload layer activations to pinned CPU memory between forward/backward.
+    fp8_cpu_activation_offload: bool = False
+    # Reserved for future placement policies. Current pure-torch FP8 offload
+    # targets all eligible TE LayerNormLinear and LayerNormMLP wrappers.
+    fp8_cpu_activation_offload_layers: Union[int, str] = "auto"
+    # Retain pinned CPU buffers across iterations. This can reduce allocator
+    # churn for fixed shapes, but increases steady CPU memory footprint.
+    fp8_cpu_activation_offload_retain_buffers: bool = False
     # MLM settings
     mlm_probability: float = 0.3
     mask_replace_prob: float = 0.8
@@ -306,6 +315,33 @@ class PretrainingConfig:
             raise ValueError(
                 "fp8_amax_history_len must be >= 1, "
                 f"got {self.fp8_amax_history_len}"
+            )
+
+        self.fp8_cpu_activation_offload = bool(self.fp8_cpu_activation_offload)
+        self.fp8_cpu_activation_offload_retain_buffers = bool(
+            self.fp8_cpu_activation_offload_retain_buffers
+        )
+        if isinstance(self.fp8_cpu_activation_offload_layers, str):
+            offload_layers = self.fp8_cpu_activation_offload_layers.strip().lower()
+            if offload_layers != "auto":
+                try:
+                    offload_layers = int(offload_layers)
+                except ValueError as exc:
+                    raise ValueError(
+                        "fp8_cpu_activation_offload_layers must be 'auto' or a "
+                        f"positive integer, got {self.fp8_cpu_activation_offload_layers!r}"
+                    ) from exc
+            self.fp8_cpu_activation_offload_layers = offload_layers
+        if isinstance(self.fp8_cpu_activation_offload_layers, int):
+            if self.fp8_cpu_activation_offload_layers < 1:
+                raise ValueError(
+                    "fp8_cpu_activation_offload_layers must be >= 1 when set to "
+                    f"an integer, got {self.fp8_cpu_activation_offload_layers}"
+                )
+        elif self.fp8_cpu_activation_offload_layers != "auto":
+            raise ValueError(
+                "fp8_cpu_activation_offload_layers must be 'auto' or a positive "
+                f"integer, got {self.fp8_cpu_activation_offload_layers!r}"
             )
 
         try:

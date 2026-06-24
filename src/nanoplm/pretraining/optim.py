@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
 
@@ -199,6 +201,23 @@ def _is_mlp_matrix_param(name: str) -> bool:
     return ".mlp." in lname or ".mhc_mlp." in lname or ".shared_expert." in lname
 
 
+def _env_flag_enabled(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(
+        f"Ignoring invalid {name}={raw!r}; expected one of "
+        "1/0, true/false, yes/no, on/off. "
+        f"Using default={default}."
+    )
+    return default
+
+
 def _collect_qkv_split_sizes(raw_model: torch.nn.Module) -> dict[int, tuple[int, ...]]:
     """Map id(param) -> row-block sizes for fused QKV weights.
 
@@ -320,11 +339,27 @@ def build_muon_optimizer(
         )
 
     # Route fused QKV weights on the Muon/NorMuon side into per-split_sizes
-    # groups so q/k/v are orthogonalized independently. Hyperball params are
-    # left untouched: MuonH/Aurora do not support split_sizes and would
-    # silently ignore the group option.
+    # groups so q/k/v are orthogonalized independently. Set
+    # NANOPLM_MUON_SPLIT_FUSED_QKV=0 to leave fused Wqkv in the plain Muon group,
+    # causing the whole fused matrix to be orthogonalized together. Hyperball
+    # params are left untouched: MuonH/Aurora do not support split_sizes and
+    # would silently ignore the group option.
     muon_split_groups: dict[tuple[int, ...], list[torch.nn.Parameter]] = {}
-    qkv_split_map = _collect_qkv_split_sizes(raw_model)
+    use_qkv_split_sizes = _env_flag_enabled(
+        "NANOPLM_MUON_SPLIT_FUSED_QKV",
+        default=True,
+    )
+    qkv_split_map = (
+        _collect_qkv_split_sizes(raw_model)
+        if use_qkv_split_sizes
+        else {}
+    )
+    if not use_qkv_split_sizes:
+        logger.info(
+            "Fused-QKV Muon split_sizes disabled by "
+            "NANOPLM_MUON_SPLIT_FUSED_QKV; fused Wqkv weights will be "
+            "orthogonalized as whole matrices."
+        )
     if qkv_split_map and muon_params:
         remaining: list[torch.nn.Parameter] = []
         for param in muon_params:
@@ -559,6 +594,7 @@ def build_optimizer(
         use_triton=True,
         newton_schulz_func=ns_func,
         adjust_lr="rms_norm",
+        # use_gram_newton_schulz=True,
     )
     if variant in {"muonh", "aurora"}:
         if variant == "muonh":
