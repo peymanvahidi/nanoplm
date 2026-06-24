@@ -39,8 +39,13 @@ git clone --recursive --depth 1 --branch "$TE_TAG" \
 source "$ROOT/.venv/bin/activate"
 echo ">> nvcc: $(nvcc --version | grep release) | CUDA_HOME=$CUDA_HOME | archs=$NVTE_CUDA_ARCHS | MAX_JOBS=$MAX_JOBS"
 
-# Build + install from source into .venv (no build isolation so it links the
-# venv's torch). Takes ~7-10 min on a login node.
+# TE builds with --no-build-isolation (so it links the venv's torch), which means
+# the build tools must already be in the venv. torch is the only hard prereq;
+# install the rest here so a fresh venv works.
+echo ">> installing build deps (cmake, ninja, pybind11) ..."
+VIRTUAL_ENV="$ROOT/.venv" uv pip install cmake ninja pybind11 setuptools wheel
+
+# Build + install from source into .venv. Takes ~7-10 min on a login node.
 VIRTUAL_ENV="$ROOT/.venv" uv pip install -v --no-build-isolation "$BUILD_DIR/TransformerEngine"
 
 # Verify it imports against the module's CUDA (the cublasLt symbol check).
