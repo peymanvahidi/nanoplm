@@ -72,6 +72,38 @@ satisfied() {  # satisfied <dist> <needle> — honors --force
   [ "$FORCE" -eq 0 ] && dist_ok "$1" "$2"
 }
 
+# torch_runtime_ok: 0 iff "$PY" can import torch and torch.__version__ equals
+# $TORCH_PIN exactly. torch's dist metadata is flavor-blind — 2.12.x wheels
+# all report the plain "2.12.1" in their version/direct_url.json regardless of
+# whether they're the +cu130 build or a CPU/other-CUDA build, and index
+# installs write no direct_url.json at all — so dist_ok can never distinguish
+# flavors here. Only the runtime __version__ does; this mirrors the check
+# verify.py uses as the authority for "is the right torch installed".
+torch_runtime_ok() {
+  "$PY" - "$TORCH_PIN" <<'PY' 2>/dev/null
+import sys
+try:
+    import torch
+except Exception:
+    sys.exit(1)
+sys.exit(0 if torch.__version__ == sys.argv[1] else 1)
+PY
+}
+
+satisfied_torch() { [ "$FORCE" -eq 0 ] && torch_runtime_ok; }
+
+# quack_ok: dion dep-pulls plain `quack-kernels==0.4.1` on its own, so seeing
+# quack-kernels 0.4.1 in the dist DB does not mean our pinned
+# `quack-kernels[cu13]==0.4.1` ran — the [cu13] extra's actual payload,
+# nvidia-cutlass-dsl-libs-cu13, might still be missing. Presence of that
+# payload dist (any version — it floats with nvidia-cutlass-dsl[cu13]) is the
+# real satisfaction signal, so require both.
+quack_ok() {
+  dist_ok quack-kernels "0.4.1" && dist_ok nvidia-cutlass-dsl-libs-cu13 ""
+}
+
+satisfied_quack() { [ "$FORCE" -eq 0 ] && quack_ok; }
+
 # ---- preflight: fail loudly, no auto-detect ----------------------------------
 resolve_cuda_home() {
   if [ -z "${CUDA_HOME:-}" ]; then
@@ -133,7 +165,7 @@ preflight() {
 
 # ---- steps (each: skip when satisfied, unless --force) ------------------------
 step_torch() {
-  if satisfied torch "$TORCH_PIN"; then log "torch $TORCH_PIN present; skipping."; return 0; fi
+  if satisfied_torch; then log "torch $TORCH_PIN present; skipping."; return 0; fi
   log "installing torch $TORCH_PIN from $TORCH_INDEX"
   run_cmd "$PY" -m pip install "torch==2.12.1" --index-url "$TORCH_INDEX"
 }
@@ -223,7 +255,7 @@ step_fa3() {
 }
 
 step_moe() {
-  if satisfied quack-kernels "0.4.1"; then log "quack-kernels 0.4.1 present; skipping."; else
+  if satisfied_quack; then log "quack-kernels 0.4.1 present; skipping."; else
     log "installing $QUACK_SPEC"
     run_cmd "$PY" -m pip install "$QUACK_SPEC" --extra-index-url "$TORCH_INDEX"
   fi

@@ -4,10 +4,13 @@ Real installs never run here: preflight failures are provoked with fake tools
 on PATH, and the happy path runs under NANOPLM_DEPS_DRY_RUN=1, which prints
 `DRY> <command>` lines instead of executing them.
 
-Assumption (see plan Global Constraints): the test venv was created with
-`pip install -e .` from PyPI, so torch is the plain `2.12.1` build (NOT
-`+cu130`) and none of dion/TE/FA3/quack/sonic-moe are installed — every step
-is 'unsatisfied' and must appear in the dry-run output.
+The test venv's torch runtime-reports the full pinned build (`2.12.1+cu130`)
+and can also have some/all of dion/TE/FA3/quack/sonic-moe already installed,
+so the dry-run sequence test (`test_dry_run_prints_full_pinned_sequence`)
+passes `--force` to make every step print deterministically regardless of
+what's already satisfied in this venv. Skip behavior itself is exercised
+separately via the steps' runtime/presence checks (torch's runtime
+`__version__` compare, quack's `[cu13]` payload-presence guard, etc.).
 """
 import os
 import stat
@@ -91,6 +94,7 @@ def test_all_pins_present():
     assert "v2.16" in text                                             # TE tag
     assert "cu130torch2120cxx11abitrue.8a8b2f" in text                 # FA3 wheel
     assert "deps-assets" in text                                       # FA3 release tag
+    assert "nvidia-cutlass-dsl-libs-cu13" in text                      # quack [cu13] payload guard
 
 
 def test_no_venv_refused(tmp_path):
@@ -158,11 +162,13 @@ def test_unknown_flag_exits_2(tmp_path):
 
 
 def test_dry_run_prints_full_pinned_sequence(tmp_path):
+    # --force makes every step print unconditionally, regardless of what's
+    # already satisfied in this venv, so the sequence is deterministic.
     bindir = _fake_bin(tmp_path)
-    r = _run([], path=f"{bindir}:{SYS_PATH}", extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+    r = _run(["--force"], path=f"{bindir}:{SYS_PATH}", extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
     assert r.returncode == 0, r.stderr
     out = r.stdout
-    # 1. torch repair (test venv has PyPI torch, not +cu130)
+    # 1. torch (forced, regardless of what's already satisfied)
     assert "pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu130" in out
     # 2. dion @ SHA
     assert "git+https://github.com/microsoft/dion.git@0333cc1136cd456b3fe3a56407d4ff104cfef604" in out
@@ -198,8 +204,11 @@ def test_fa3_sha256_is_pinned():
 def test_fa3_sha_unset_refused_in_real_mode(tmp_path):
     # Real mode (no DRY_RUN) must refuse to reach the download with an unpinned
     # sha256. Call the step function directly via sourcing — no install runs.
+    # FORCE=1 bypasses the satisfied short-circuit ("present; skipping") so the
+    # refusal branch is reached deterministically even in a venv where FA3 is
+    # really installed — the guard must trigger regardless of venv state.
     cmd = (
-        f'source "{SCRIPT}"; FA3_SHA256=UNSET; DRY_RUN=""; step_fa3'
+        f'source "{SCRIPT}"; FA3_SHA256=UNSET; DRY_RUN=""; FORCE=1; step_fa3'
     )
     r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
                        env={**os.environ, "VIRTUAL_ENV": sys.prefix})
