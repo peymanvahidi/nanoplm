@@ -78,8 +78,10 @@ nanoplm deps install
 node to confirm the device checks. Re-running `nanoplm deps install` is cheap —
 every component that is already correct is skipped (`--force` reinstalls).
 
-While the repo is private, the flash-attn-3 wheel download needs
-`export GITHUB_TOKEN=<token with repo read>`.
+While the repo is private you need GitHub auth twice: the `pip install` git
+clone (use `pip install "nanoplm @ git+https://<token>@github.com/peymanvahidi/nanoplm"`,
+or a git credential helper), and the flash-attn-3 wheel download
+(`export GITHUB_TOKEN=<token with repo read>`).
 
 ### Benchmarking extra (optional)
 
