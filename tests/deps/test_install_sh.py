@@ -90,7 +90,8 @@ def test_all_pins_present():
     assert "0333cc1136cd456b3fe3a56407d4ff104cfef604" in text          # dion
     assert "4923037d858aebfe5738ebb17d02f88d7871c333" in text          # sonic-moe
     assert "Dao-AILab/sonic-moe" in text
-    assert "quack-kernels[cu13]==0.4.1" in text
+    assert "quack-kernels[cu13]==0.5.0" in text                        # 0.5.0 = compile-under-flock fix
+    assert "nvidia-cutlass-dsl[cu13]==4.5.3" in text                   # pinned: 0.5.0 only floors it
     assert "v2.16" in text                                             # TE tag
     assert "cu130torch2120cxx11abitrue.8a8b2f" in text                 # FA3 wheel
     assert "deps-assets" in text                                       # FA3 release tag
@@ -183,8 +184,9 @@ def test_dry_run_prints_full_pinned_sequence(tmp_path):
     assert "--no-build-isolation --no-deps" in out
     # 4. FA3 from the release mirror
     assert "releases/download/deps-assets" in out
-    # 5. quack + sonic-moe
-    assert "quack-kernels[cu13]==0.4.1" in out
+    # 5. quack + DSL co-resolved in one pip call, then sonic-moe
+    assert "quack-kernels[cu13]==0.5.0" in out
+    assert "nvidia-cutlass-dsl[cu13]==4.5.3" in out
     assert "git+https://github.com/Dao-AILab/sonic-moe.git@4923037d858aebfe5738ebb17d02f88d7871c333" in out
     # steps run in pin order
     assert out.index("torch==2.12.1") < out.index("dion") < out.index("v2.16") \

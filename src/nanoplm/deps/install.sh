@@ -5,7 +5,8 @@
 # Installs, idempotently and always all of them:
 #   1. torch 2.12.1+cu130                    2. dion (pinned commit)
 #   3. TransformerEngine v2.16 (from source) 4. flash-attn-3 (pinned wheel, sha256)
-#   5. quack-kernels[cu13]==0.4.1 + sonic-moe (pinned commit)
+#   5. quack-kernels[cu13]==0.5.0 + nvidia-cutlass-dsl[cu13]==4.5.3
+#      + sonic-moe (pinned commit)
 #
 # Not user-facing: run `nanoplm deps install`.
 #
@@ -20,7 +21,16 @@ DION_SHA="0333cc1136cd456b3fe3a56407d4ff104cfef604"           # microsoft/dion P
 TE_TAG="${TE_TAG:-v2.16}"
 SONICMOE_SHA="4923037d858aebfe5738ebb17d02f88d7871c333"       # Dao-AILab/sonic-moe PR #64 head
 SONICMOE_URL="git+https://github.com/Dao-AILab/sonic-moe.git@${SONICMOE_SHA}"
-QUACK_SPEC="quack-kernels[cu13]==0.4.1"
+# quack 0.5.0 is the earliest release that runs cute.compile() UNDER the per-key
+# exclusive flock (quack/cache/jit.py:224-234). 0.4.1 compiled in the unlocked
+# window between the shared-lock read and the exclusive-lock write, so on a cold
+# cache every rank -- and every autotuner _compile_worker subprocess -- compiled
+# the same kernel concurrently and one died with a bare exit(1). 0.5.1-0.5.3 pin
+# the PRERELEASE nvidia-cutlass-dsl==4.6.0.dev0; 0.6.x forces ==4.6.0. 0.5.0 only
+# FLOORS the DSL (>=4.5.2), which pip would float to 4.6.0 -- a version published
+# after 0.5.0 and untested with it -- so pin the release-era DSL explicitly.
+QUACK_SPEC="quack-kernels[cu13]==0.5.0"
+DSL_SPEC="nvidia-cutlass-dsl[cu13]==4.5.3"
 FA3_WHEEL="flash_attn_3-3.0.0+20260519.cu130torch2120cxx11abitrue.8a8b2f-cp39-abi3-linux_x86_64.whl"
 FA3_REPO="peymanvahidi/nanoplm"
 FA3_RELEASE_TAG="deps-assets"
@@ -96,14 +106,13 @@ PY
 
 satisfied_torch() { [ "$FORCE" -eq 0 ] && torch_runtime_ok; }
 
-# quack_ok: dion dep-pulls plain `quack-kernels==0.4.1` on its own, so seeing
-# quack-kernels 0.4.1 in the dist DB does not mean our pinned
-# `quack-kernels[cu13]==0.4.1` ran — the [cu13] extra's actual payload,
-# nvidia-cutlass-dsl-libs-cu13, might still be missing. Presence of that
-# payload dist (any version — it floats with nvidia-cutlass-dsl[cu13]) is the
-# real satisfaction signal, so require both.
+# quack_ok: dion dep-pulls plain `quack-kernels==0.4.1` on its own (metadata
+# only — dion never imports quack at runtime), so step_moe has to UPGRADE over
+# whatever dion left behind. Pin-check BOTH dists: seeing quack-kernels alone
+# does not mean our `[cu13]` extra ran, and a stale 4.4.2 payload left by dion's
+# pull must not falsely satisfy us.
 quack_ok() {
-  dist_ok quack-kernels "0.4.1" && dist_ok nvidia-cutlass-dsl-libs-cu13 ""
+  dist_ok quack-kernels "0.5.0" && dist_ok nvidia-cutlass-dsl-libs-cu13 "4.5.3"
 }
 
 satisfied_quack() { [ "$FORCE" -eq 0 ] && quack_ok; }
@@ -272,9 +281,14 @@ step_fa3() {
 }
 
 step_moe() {
-  if satisfied_quack; then log "quack-kernels 0.4.1 present; skipping."; else
-    log "installing $QUACK_SPEC"
-    run_cmd "$PY" -m pip install "$QUACK_SPEC" --extra-index-url "$TORCH_INDEX"
+  if satisfied_quack; then log "quack-kernels 0.5.0 present; skipping."; else
+    log "installing $QUACK_SPEC + $DSL_SPEC"
+    # Installed in one command so pip co-resolves them (0.5.0 floors the DSL at
+    # >=4.5.2; we pin ==4.5.3). This upgrades dion's transitive quack 0.4.1 /
+    # DSL 4.4.2, so pip prints a benign "dion 0.1.0 requires quack-kernels==0.4.1"
+    # warning: dion never imports quack, and verify.py checks imports rather than
+    # `pip check`, so the install still verifies clean.
+    run_cmd "$PY" -m pip install "$QUACK_SPEC" "$DSL_SPEC" --extra-index-url "$TORCH_INDEX"
   fi
   if satisfied sonic-moe "$SONICMOE_SHA"; then log "sonic-moe @ ${SONICMOE_SHA:0:12} present; skipping."; else
     log "installing sonic-moe @ ${SONICMOE_SHA:0:12}"
