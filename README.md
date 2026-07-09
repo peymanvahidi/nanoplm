@@ -74,6 +74,10 @@ module load CUDA/13 NCCL cuDNN Ninja    # do NOT module purge
 nanoplm deps install
 ```
 
+Login/build nodes with non-Hopper display GPUs (e.g. JURECA login nodes) only
+warn, they don't refuse — `export CUDA_VISIBLE_DEVICES=` beforehand to hide
+the local GPU and skip that warning cleanly.
+
 `nanoplm deps verify` re-checks the environment anytime; run it once on a GPU
 node to confirm the device checks. Re-running `nanoplm deps install` is cheap —
 every component that is already correct is skipped (`--force` reinstalls).

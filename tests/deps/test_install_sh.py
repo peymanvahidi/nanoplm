@@ -135,11 +135,13 @@ def test_cuda_home_prefers_ebrootcuda(tmp_path):
     assert "CUDA_HOME=/opt/ebcuda" in r.stdout
 
 
-def test_non_hopper_gpu_refused(tmp_path):
+def test_non_hopper_gpu_warns_and_continues(tmp_path):
     bindir = _fake_bin(tmp_path, compute_cap="8.9")
     r = _run([], path=f"{bindir}:{SYS_PATH}", extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
-    assert r.returncode == 1
+    assert r.returncode == 0, r.stderr
+    assert "WARNING" in r.stderr
     assert "Hopper" in r.stderr
+    assert "preflight OK" in r.stdout
 
 
 def test_hopper_gpu_passes_gate(tmp_path):

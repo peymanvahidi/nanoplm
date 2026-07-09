@@ -39,6 +39,7 @@ JURECA_HINT="module load CUDA/13 NCCL cuDNN Ninja"
 
 log() { echo ">> $*"; }
 err() { echo "ERROR: $*" >&2; }
+warn() { echo "WARNING: $*" >&2; }
 # All mutating commands go through run_cmd so NANOPLM_DEPS_DRY_RUN=1 prints the
 # exact command instead of executing (this is how the unit tests cover the steps).
 run_cmd() { if [ -n "$DRY_RUN" ]; then echo "DRY> $*"; else "$@"; fi; }
@@ -121,15 +122,17 @@ resolve_cuda_home() {
   fi
 }
 
+# Install-time declares the build target (NVTE_CUDA_ARCHS); run-time verifies
+# the actual GPU (`nanoplm deps verify`) — so a local non-Hopper GPU here is
+# only ever a warning, never a refusal.
 hopper_gate() {
   command -v nvidia-smi >/dev/null 2>&1 || return 0      # no GPU tool: build box / container build
   local caps
   caps="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' ' | sort -u)" || return 0
   [ -z "$caps" ] && return 0                             # nvidia-smi present but no devices (login node)
   if [ "$NVTE_CUDA_ARCHS" = "90" ] && ! echo "$caps" | grep -qx "9.0"; then
-    err "nanoPLM's full stack requires Hopper (sm90); detected compute capability: $caps"
-    err "Non-Hopper GPUs are unsupported (--arch <cc> exists as an untested escape hatch)."
-    exit 1
+    warn "installing for Hopper (sm90); this machine's GPU (compute capability: $caps) is not a supported run target — nanoPLM will not run on THIS GPU."
+    warn "Fine on login/build nodes. Tip: export CUDA_VISIBLE_DEVICES= to hide local GPUs (also skips the GPU row in the final verification)."
   fi
 }
 
