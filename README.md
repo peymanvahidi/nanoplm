@@ -25,92 +25,82 @@
 
 ## 🛠️ Install
 
-Install the package from PyPI:
+> **Supported platform:** Linux x86_64 · NVIDIA **Hopper** GPU (H100/H200, sm90) ·
+> CUDA ≥ 13.0 driver. Every install carries the full feature set — torch 2.12.1+cu130,
+> TransformerEngine 2.16 (FP8), FlashAttention-3, SonicMoE/QuACK kernels, and Dion.
+> Other GPUs or OSes may partially work but are unsupported.
+
+Two ways to the **exact same environment** — pick one:
+
+### Option A — prebuilt container
 
 ```bash
-pip install nanoplm
+# Docker (workstation / cloud H100)
+docker run --gpus all -it --rm ghcr.io/peymanvahidi/nanoplm:latest
+
+# Apptainer (most HPC clusters, e.g. JURECA)
+apptainer pull nanoplm.sif docker://ghcr.io/peymanvahidi/nanoplm:latest
+srun --gres=gpu:4 apptainer exec --nv --bind $PROJECT:/work nanoplm.sif \
+  nanoplm pretrain from-yaml --config /work/config.yaml
+
+# enroot (LRZ-style clusters)
+enroot import docker://ghcr.io#peymanvahidi/nanoplm:latest
 ```
 
-For a local editable install:
+> While this repository is private the image is private too:
+> `docker login ghcr.io` / `apptainer registry login --username <user> docker://ghcr.io`
+> with a GitHub token first.
+
+### Option B — pip + `nanoplm deps install`
 
 ```bash
-uv pip install -e .
-```
-For benchmarking you also need Biotrainer.
-```bash
-pip install git+https://github.com/sacdallago/biotrainer@main
-```
-
-For CUDA training, install Dion manually from the Microsoft repository:
-
-```bash
-pip install git+https://github.com/microsoft/dion.git
+python3 -m venv .venv && source .venv/bin/activate    # any venv tool works
+pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \
+    --extra-index-url https://download.pytorch.org/whl/cu130
+nanoplm deps install       # installs + verifies the entire pinned GPU stack
 ```
 
-MoE training now uses an in-tree CUTLASS grouped GEMM extension instead of the
-external `grouped_gemm` package. The extension is JIT-built on first use, so
-you only need a CUDA toolkit that matches `torch.version.cuda`.
+Contributors: clone and use `pip install -e .` (add `--extra-index-url
+https://download.pytorch.org/whl/cu130` to skip a duplicate torch download),
+then `nanoplm deps install`. Once nanoPLM is public on PyPI this becomes
+`pip install nanoplm`.
 
-1. Check your active PyTorch CUDA version:
+**On clusters (JURECA/EasyBuild):** load the toolchain first, then install from
+a **login node** (needs internet; no GPU; the TransformerEngine source build
+takes ~10 min):
 
 ```bash
-uv run python -c "import torch; print(torch.__version__, torch.version.cuda)"
+module load CUDA/13 NCCL cuDNN Ninja    # do NOT module purge
+nanoplm deps install
 ```
 
-2. Point `CUDA_HOME` at the matching toolkit and set the architectures you want
-to build for:
+`nanoplm deps verify` re-checks the environment anytime; run it once on a GPU
+node to confirm the device checks. Re-running `nanoplm deps install` is cheap —
+every component that is already correct is skipped (`--force` reinstalls).
+
+While the repo is private, the flash-attn-3 wheel download needs
+`export GITHUB_TOKEN=<token with repo read>`.
+
+### Benchmarking extra (optional)
 
 ```bash
-export CUDA_HOME=/path/to/cuda-matching-torch
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export TORCH_CUDA_ARCH_LIST="9.0"  # H100; adjust for your GPU
+pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"   # or: pip install -e ".[eval]"
 ```
 
-3. Run nanoPLM normally. The first CUDA MoE call will compile the vendored
-CUTLASS backend and cache it under `.cache/torch_extensions`:
+### MoE kernel backends (runtime notes)
 
-```bash
-nanoplm pretrain from-yaml --pure-torch
-```
-
-If you need different architectures, override `TORCH_CUDA_ARCH_LIST` before
-running your first MoE job. If CUTLASS is not checked out under
-`third_party/cutlass`, set `NANOPLM_CUTLASS_ROOT` or `CUTLASS_ROOT` to a CUTLASS
-checkout.
-
-### TransformerEngine on JURECA (JSC)
-
-The prebuilt `transformer_engine` wheels (2.14–2.16) fail to import on JURECA
-(`undefined symbol: cublasLtGroupedMatrixLayoutInit_internal`) because they link
-a newer cublasLt than `module load CUDA/13` provides. Build it from source once,
-from a **login node** (needs internet; no GPU required):
-
-```bash
-bash install_te_jureca.sh
-```
-
-This clones TE 2.16, builds it for sm90 + sm120 against the cluster's CUDA,
-installs it into `.venv`, and verifies the import. Override `NVTE_CUDA_ARCHS`
-(e.g. `NVTE_CUDA_ARCHS=90`) to retarget. Only needed for the FP8 / `--pure-te`
-pipelines; the default bf16 / `--pure-torch` path does not require TE.
-
-### Optional: SonicMoE expert backend
-
-Set `moe_kernel_backend: sonicmoe` in the pretraining YAML to run the routed
-experts on the [SonicMoE](https://github.com/Dao-AILab/sonic-moe) /
-[QuACK](https://github.com/Dao-AILab/quack) fused kernels (sync-free forward and
-backward, dispatch fused into the GEMM). It requires our SonicMoE fork, which
-adds squared-ReLU (`srelu`) support on top of upstream (PR
-[Dao-AILab/sonic-moe#64](https://github.com/Dao-AILab/sonic-moe/pull/64)):
-
-```bash
-pip install quack-kernels            # use quack-kernels[cu13] on CUDA 13
-pip install git+https://github.com/alint77/sonic-moe.git@feat/srelu-relu_sq-support
-```
-
-Requires a Hopper (SM90) or newer GPU. The default `moe_kernel_backend: cutlass`
-needs none of this.
+- **`moe_kernel_backend: cutlass` (default)** — JIT-compiles an in-tree CUTLASS
+  grouped-GEMM extension on first use against the same CUDA 13 toolkit the
+  install used (cached under `.cache/torch_extensions`). Override
+  `TORCH_CUDA_ARCH_LIST` (default target `9.0`) before the first MoE job if
+  needed; if CUTLASS isn't under `third_party/cutlass`, set
+  `NANOPLM_CUTLASS_ROOT` or `CUTLASS_ROOT`.
+- **`moe_kernel_backend: sonicmoe`** — runs the routed experts on the
+  [SonicMoE](https://github.com/Dao-AILab/sonic-moe) /
+  [QuACK](https://github.com/Dao-AILab/quack) fused kernels (sync-free forward
+  and backward). Already installed by `nanoplm deps install` (pinned to the
+  squared-ReLU support from
+  [Dao-AILab/sonic-moe#64](https://github.com/Dao-AILab/sonic-moe/pull/64)).
 
 ---
 
