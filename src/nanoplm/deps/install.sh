@@ -25,7 +25,11 @@ QUACK_SPEC="quack-kernels[cu13]==0.4.1"
 FA3_WHEEL="flash_attn_3-3.0.0+20260519.cu130torch2120cxx11abitrue.8a8b2f-cp39-abi3-linux_x86_64.whl"
 FA3_REPO="peymanvahidi/nanoplm"
 FA3_RELEASE_TAG="deps-assets"
-FA3_URL="https://github.com/${FA3_REPO}/releases/download/${FA3_RELEASE_TAG}/${FA3_WHEEL}"
+FA3_WHEEL_URLENC="${FA3_WHEEL//+/%2B}"   # GitHub's release-download endpoint 504s on a literal '+' in the path
+FA3_URL="https://github.com/${FA3_REPO}/releases/download/${FA3_RELEASE_TAG}/${FA3_WHEEL_URLENC}"
+# Public third-party upstream fallback (no auth needed) — used only when the
+# private mirror above is unreachable; bytes are still sha256-gated below.
+FA3_FALLBACK_URL="https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.05.20-072445f/${FA3_WHEEL_URLENC}"
 # Pinned by the release-mirror task; real installs refuse to run while UNSET.
 FA3_SHA256="${FA3_SHA256:-177359694998fee12e293d15d3398482fc0193f5f40d4aca3ceb257105d5bbf2}"
 
@@ -209,11 +213,12 @@ fa3_download() {  # fa3_download <dest-file>
        -o "$dest" "$FA3_URL" 2>/dev/null; then
     return 0
   fi
-  # … then the authenticated API (private repo needs a token: asset downloads
-  # go release → asset id → octet-stream, which plain curl can't do in one hop).
+  # … then the authenticated API, if a token is available (private repo needs
+  # a token: asset downloads go release → asset id → octet-stream, which plain
+  # curl can't do in one hop) …
   if [ -n "${GITHUB_TOKEN:-}" ]; then
     log "anonymous download failed; retrying via the GitHub API with GITHUB_TOKEN"
-    "$PY" - "$dest" "$FA3_REPO" "$FA3_RELEASE_TAG" "$FA3_WHEEL" <<'PY'
+    if "$PY" - "$dest" "$FA3_REPO" "$FA3_RELEASE_TAG" "$FA3_WHEEL" <<'PY'
 import json, os, sys, urllib.request
 dest, repo, tag, wheel = sys.argv[1:5]
 hdr = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
@@ -227,10 +232,20 @@ with urllib.request.urlopen(req) as r, open(dest, "wb") as f:
     f.write(r.read())
 print(f">> downloaded {wheel} via API")
 PY
+    then
+      return 0
+    fi
+    warn "GitHub API download failed; will try the public upstream fallback next"
+  fi
+  # … finally the public third-party mirror — no auth needed, so this is the
+  # path most collaborators on the private repo actually take.
+  log "mirror unavailable; falling back to the public upstream wheel (windreamer)"
+  if curl -fSL --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused \
+       -o "$dest" "$FA3_FALLBACK_URL" 2>/dev/null; then
     return 0
   fi
-  err "could not download the flash-attn-3 wheel from $FA3_URL"
-  err "While the repo is private you need auth: export GITHUB_TOKEN=<PAT with repo read>,"
+  err "could not download the flash-attn-3 wheel from $FA3_URL or the public fallback $FA3_FALLBACK_URL"
+  err "While the repo is private you can also: export GITHUB_TOKEN=<PAT with repo read>,"
   err "or download the wheel manually from the '$FA3_RELEASE_TAG' GitHub Release and"
   err "point NANOPLM_FA3_WHEEL at the file, then re-run."
   return 1

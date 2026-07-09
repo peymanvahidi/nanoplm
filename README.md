@@ -82,10 +82,12 @@ the local GPU and skip that warning cleanly.
 node to confirm the device checks. Re-running `nanoplm deps install` is cheap —
 every component that is already correct is skipped (`--force` reinstalls).
 
-While the repo is private you need GitHub auth twice: the `pip install` git
-clone (use `pip install "nanoplm @ git+https://<token>@github.com/peymanvahidi/nanoplm"`,
-or a git credential helper), and the flash-attn-3 wheel download
-(`export GITHUB_TOKEN=<token with repo read>`).
+While the repo is private you need GitHub auth for the `pip install` git clone
+(use `pip install "nanoplm @ git+https://<token>@github.com/peymanvahidi/nanoplm"`,
+or a git credential helper). The flash-attn-3 wheel itself is fetched from a
+public upstream mirror automatically, so `GITHUB_TOKEN` is optional there —
+only set it (`export GITHUB_TOKEN=<token with repo read>`) if that public
+fallback is ever unavailable.
 
 ### Benchmarking extra (optional)
 

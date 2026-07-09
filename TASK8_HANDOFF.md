@@ -45,6 +45,7 @@ Expected build behavior:
 - The `nanoplm deps install --arch 90` layer: preflight passes with no GPU (no `nvidia-smi` in the build → the Hopper gate deliberately no-ops; `CUDA_HOME=/usr/local/cuda` from ENV); the torch step should log "present; skipping." (runtime check); TE compiles from source — **this layer dominates, ~30–60 min at MAX_JOBS=8** (raise MAX_JOBS if the machine has cores/RAM to spare; TE needs ~2 GB RAM per job); FA3 downloads via the mounted secret (anonymous download 404s while the repo is private — that's expected, the script falls through to the authenticated API path).
 - The `python -m nanoplm.deps.verify` gate layer: rows may show "installed (import needs a GPU driver — re-run verify on a GPU node)" — that degraded note is EXPECTED without a driver; the build must still end `verify: OK`. If a row fails with a message that is NOT driver-related, that's a real finding — stop and report rather than patching around it.
 - `--mount=type=secret,...,env=GITHUB_TOKEN` needs the dockerfile frontend the file already pins (`# syntax=docker/dockerfile:1.10`); the token never lands in a layer.
+- If no build secret is provided, the FA3 step falls back to the public upstream wheel (still sha256-gated), so the build can succeed without the secret; passing the secret keeps the private mirror as primary.
 
 Push:
 ```bash

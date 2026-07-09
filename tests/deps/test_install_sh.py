@@ -95,6 +95,9 @@ def test_all_pins_present():
     assert "cu130torch2120cxx11abitrue.8a8b2f" in text                 # FA3 wheel
     assert "deps-assets" in text                                       # FA3 release tag
     assert "nvidia-cutlass-dsl-libs-cu13" in text                      # quack [cu13] payload guard
+    assert "windreamer/flash-attention3-wheels" in text                # FA3 public upstream fallback
+    assert "2026.05.20-072445f" in text                                # FA3 fallback release tag
+    assert 'FA3_WHEEL_URLENC="${FA3_WHEEL//+/%2B}"' in text            # GitHub 504s on literal '+' in the path
 
 
 def test_no_venv_refused(tmp_path):
@@ -201,6 +204,43 @@ def test_fa3_sha256_is_pinned():
     text = SCRIPT.read_text()
     m = re.search(r'FA3_SHA256="\$\{FA3_SHA256:-([0-9a-f]{64})\}"', text)
     assert m, "FA3_SHA256 must default to a pinned 64-hex digest (not UNSET)"
+
+
+def test_fa3_download_falls_back_to_public_wheel(tmp_path):
+    # Stub curl ahead of PATH: 404s (exit 22) the private mirror URL, succeeds
+    # (writes a marker byte to the -o destination) for the public windreamer
+    # fallback URL. GITHUB_TOKEN is unset, so the authenticated API path is
+    # skipped entirely and fa3_download must fall through mirror -> fallback.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    curl = bindir / "curl"
+    curl.write_text(
+        "#!/bin/bash\n"
+        'dest=""\n'
+        'prev=""\n'
+        'url="${@: -1}"\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$prev" = "-o" ]; then dest="$arg"; fi\n'
+        '  prev="$arg"\n'
+        "done\n"
+        'case "$url" in\n'
+        "  *peymanvahidi/nanoplm*) exit 22 ;;\n"
+        '  *windreamer*) printf \'X\' > "$dest"; exit 0 ;;\n'
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    curl.chmod(0o755)
+    out = tmp_path / "out.whl"
+    env = dict(os.environ)
+    env.pop("GITHUB_TOKEN", None)
+    env["VIRTUAL_ENV"] = sys.prefix
+    env["PATH"] = f"{bindir}:{SYS_PATH}"
+    cmd = f'source "{SCRIPT}"; fa3_download "{out}"'
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert out.is_file()
+    combined = r.stdout + r.stderr
+    assert "falling back to the public upstream wheel" in combined
 
 
 def test_fa3_sha_unset_refused_in_real_mode(tmp_path):
