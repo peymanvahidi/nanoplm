@@ -188,6 +188,13 @@ def test_arch_flag_exported(tmp_path):
     assert "archs=120" in r.stdout
 
 
+def test_fa3_sha256_is_pinned():
+    import re
+    text = SCRIPT.read_text()
+    m = re.search(r'FA3_SHA256="\$\{FA3_SHA256:-([0-9a-f]{64})\}"', text)
+    assert m, "FA3_SHA256 must default to a pinned 64-hex digest (not UNSET)"
+
+
 def test_fa3_sha_unset_refused_in_real_mode(tmp_path):
     # Real mode (no DRY_RUN) must refuse to reach the download with an unpinned
     # sha256. Call the step function directly via sourcing — no install runs.

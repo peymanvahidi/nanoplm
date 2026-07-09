@@ -27,7 +27,7 @@ FA3_REPO="peymanvahidi/nanoplm"
 FA3_RELEASE_TAG="deps-assets"
 FA3_URL="https://github.com/${FA3_REPO}/releases/download/${FA3_RELEASE_TAG}/${FA3_WHEEL}"
 # Pinned by the release-mirror task; real installs refuse to run while UNSET.
-FA3_SHA256="${FA3_SHA256:-UNSET}"
+FA3_SHA256="${FA3_SHA256:-177359694998fee12e293d15d3398482fc0193f5f40d4aca3ceb257105d5bbf2}"
 
 # ---- knobs -------------------------------------------------------------------
 export NVTE_FRAMEWORK="${NVTE_FRAMEWORK:-pytorch}"
