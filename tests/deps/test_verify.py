@@ -36,7 +36,7 @@ def test_check_import_missing_module():
 
 def test_check_import_degrades_on_missing_driver(tmp_path, monkeypatch):
     # A module that IS installed but whose import needs the GPU driver
-    # (docker build has no libcuda): verify must degrade to presence-check.
+    # (a login/build node has no libcuda): verify must degrade to presence-check.
     mod = tmp_path / "fake_driver_dep.py"
     mod.write_text("raise OSError('libcuda.so.1: cannot open shared object file')\n")
     monkeypatch.syspath_prepend(str(tmp_path))

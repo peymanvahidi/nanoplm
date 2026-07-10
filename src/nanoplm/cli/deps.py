@@ -3,8 +3,7 @@
 One supported environment: Linux + Hopper (sm90) + CUDA >= 13.0, full feature
 set always. `install` runs the packaged src/nanoplm/deps/install.sh (all pins
 live there) and then verifies in a fresh interpreter; `verify` re-runs just the
-verification. The Dockerfile calls this same CLI, so container and venv installs
-cannot drift.
+verification.
 """
 import atexit
 import os

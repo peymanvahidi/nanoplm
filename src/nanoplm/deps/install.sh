@@ -7,8 +7,7 @@
 #   3. TransformerEngine v2.16 (from source) 4. flash-attn-3 (pinned wheel, sha256)
 #   5. quack-kernels[cu13]==0.4.1 + sonic-moe (pinned commit)
 #
-# Not user-facing: run `nanoplm deps install`. The Dockerfile runs the same CLI,
-# so the container is this exact procedure executed in the CUDA 13.0 base image.
+# Not user-facing: run `nanoplm deps install`.
 #
 # Everything installs with `$VIRTUAL_ENV/bin/python -m pip` — never uv — because
 # quack-kernels forbids uv on CUDA 13.x and one tool means one behavior.
@@ -116,11 +115,11 @@ resolve_cuda_home() {
       export CUDA_HOME="$EBROOTCUDA"                     # EasyBuild clusters (JURECA)
     elif command -v nvcc >/dev/null 2>&1; then
       CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
-      export CUDA_HOME                                   # containers / desktops
+      export CUDA_HOME                                   # desktops / plain toolkit installs
     fi
   fi
   # TE's build reads CUDNN_HOME/CUDNN_PATH; on non-EasyBuild systems cuDNN sits
-  # on the default include/lib paths (e.g. the -cudnn-devel docker base).
+  # on the default include/lib paths.
   if [ -n "${EBROOTCUDNN:-}" ]; then
     export CUDNN_HOME="$EBROOTCUDNN" CUDNN_PATH="$EBROOTCUDNN"
   fi
@@ -130,7 +129,7 @@ resolve_cuda_home() {
 # the actual GPU (`nanoplm deps verify`) — so a local non-Hopper GPU here is
 # only ever a warning, never a refusal.
 hopper_gate() {
-  command -v nvidia-smi >/dev/null 2>&1 || return 0      # no GPU tool: build box / container build
+  command -v nvidia-smi >/dev/null 2>&1 || return 0      # no GPU tool: build box / login node
   local caps
   caps="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' ' | sort -u)" || return 0
   [ -z "$caps" ] && return 0                             # nvidia-smi present but no devices (login node)

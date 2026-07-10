@@ -6,7 +6,7 @@ process itself imported the old torch at startup and must not self-check).
 
 Import rules: this module imports only the stdlib at module level; torch and
 the hard deps are imported inside the checks. On machines without a GPU driver
-(docker build) an installed dep whose import needs libcuda degrades to a
+(login/build nodes) an installed dep whose import needs libcuda degrades to a
 presence check with an explicit note instead of failing.
 """
 import importlib

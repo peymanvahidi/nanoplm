@@ -30,29 +30,6 @@
 > TransformerEngine 2.16 (FP8), FlashAttention-3, SonicMoE/QuACK kernels, and Dion.
 > Other GPUs or OSes may partially work but are unsupported.
 
-Two ways to the **exact same environment** — pick one:
-
-### Option A — prebuilt container
-
-```bash
-# Docker (workstation / cloud H100)
-docker run --gpus all -it --rm ghcr.io/peymanvahidi/nanoplm:latest
-
-# Apptainer (most HPC clusters, e.g. JURECA)
-apptainer pull nanoplm.sif docker://ghcr.io/peymanvahidi/nanoplm:latest
-srun --gres=gpu:4 apptainer exec --nv --bind $PROJECT:/work nanoplm.sif \
-  nanoplm pretrain from-yaml --config /work/config.yaml
-
-# enroot (LRZ-style clusters)
-enroot import docker://ghcr.io#peymanvahidi/nanoplm:latest
-```
-
-> While this repository is private the image is private too:
-> `docker login ghcr.io` / `apptainer registry login --username <user> docker://ghcr.io`
-> with a GitHub token first.
-
-### Option B — pip + `nanoplm deps install`
-
 ```bash
 python3 -m venv .venv && source .venv/bin/activate    # any venv tool works
 pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \
