@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="nanoPLM">
+  <title>nanoPLM</title>
+  <rect width="64" height="64" rx="14" fill="#0d9488"/>
+  <!-- Three linked nodes: data -> pretrain -> eval, the whole product in one mark. -->
+  <path d="M16 44 L32 20 L48 44" fill="none" stroke="#ffffff" stroke-width="5"
+        stroke-linecap="round" stroke-linejoin="round" opacity="0.35"/>
+  <circle cx="16" cy="44" r="6" fill="#ffffff"/>
+  <circle cx="32" cy="20" r="6" fill="#ffffff"/>
+  <circle cx="48" cy="44" r="6" fill="#ffffff"/>
+</svg>

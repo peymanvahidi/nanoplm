@@ -58,6 +58,7 @@ nanoplm-eval = "nanoplm.cli.eval:eval"
 
 [project.optional-dependencies]
 eval = ["biotrainer==1.4.0"]
+docs = ["pyyaml>=6"]
 
 [project.urls]
 "Homepage" = "https://github.com/peymanvahidi/nanoplm"

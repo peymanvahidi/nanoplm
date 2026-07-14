@@ -1,0 +1,49 @@
+---
+import { loadCompat, type CompatFlag } from '../lib/compat';
+
+const compat = loadCompat();
+const LABEL = { reject: 'Rejected', warn: 'Warning', caveat: 'Caveat', allow: 'Compatible' } as const;
+const groups = [
+  { title: 'Model flags', flags: compat.model },
+  { title: 'Pipeline flags', flags: compat.pipeline },
+];
+
+function note(f: CompatFlag): string {
+  return f.reason ?? f.message ?? '';
+}
+---
+
+<p class="compat-trigger">These rules apply when <code>{compat.trigger}</code> (feature <code>{compat.feature}</code>).</p>
+
+{groups.map((g) => (
+  <section class="compat-group">
+    <h3>{g.title}</h3>
+    <table class="compat-table">
+      <thead>
+        <tr><th>Flag</th><th>Status</th><th>Condition</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        {g.flags.map((f) => (
+          <tr>
+            <td><code>{f.flag}</code></td>
+            <td><span class={`compat-badge compat-badge-${f.status}`}>{LABEL[f.status]}</span></td>
+            <td>{f.condition ? <code>{f.condition}</code> : <span class="compat-muted">—</span>}</td>
+            <td>{note(f) ? note(f) : <span class="compat-muted">—</span>}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </section>
+))}
+
+<style>
+  .compat-trigger { font-size: 0.9rem; color: var(--sl-color-gray-3); }
+  .compat-group { margin-bottom: 1.5rem; }
+  .compat-table { width: 100%; font-size: 0.875rem; }
+  .compat-table th, .compat-table td { text-align: left; vertical-align: top; }
+  .compat-muted { color: var(--sl-color-gray-4); }
+  .compat-badge { font-size: 0.7rem; font-weight: 700; padding: 0.1em 0.55em; border-radius: 999px; white-space: nowrap; }
+  .compat-badge-reject { background: #7f1d1d; color: #fecaca; }
+  .compat-badge-warn, .compat-badge-caveat { background: #78350f; color: #fde68a; }
+  .compat-badge-allow { background: #064e3b; color: #a7f3d0; }
+</style>

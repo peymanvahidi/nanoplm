@@ -1,0 +1,145 @@
+---
+title: Install
+description: Install nanoPLM with pip or uv, add the optional CUDA stacks you need, and verify the CLI works.
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Install nanoPLM
+
+<Tabs>
+<TabItem label="pip">
+
+```bash
+pip install nanoplm
+```
+
+</TabItem>
+<TabItem label="uv">
+
+```bash
+uv pip install nanoplm
+```
+
+</TabItem>
+</Tabs>
+
+nanoPLM declares `requires-python = ">=3.10"`, but the project pins `3.12` in `.python-version` and
+the README asks for 3.12. **Use Python 3.12** — it is what the code is developed and tested against.
+
+That single command gives you the full `data` → `pretrain` → `eval` pipeline on CPU or a single GPU.
+Everything below is optional, and every one of the optional stacks is CUDA-only.
+
+### Editable install
+
+To hack on nanoPLM itself, clone the repo and install it in editable mode:
+
+```bash
+git clone https://github.com/peymanvahidi/nanoplm.git
+cd nanoplm
+uv pip install -e .
+```
+
+## Optional stacks
+
+None of these are installed by `pip install nanoplm`. Add the ones your run actually needs.
+
+### Benchmarking — `nanoplm eval`
+
+`nanoplm eval` runs [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline, which
+ships as an extra:
+
+```bash
+pip install "nanoplm[eval]"
+```
+
+Without it, `nanoplm eval from-yaml` cannot import biotrainer and fails at startup.
+
+### Muon-family optimizers — `dion`
+
+`optimizer: muon | normuon | muonh | aurora` needs Microsoft's `dion` package, which is not on PyPI:
+
+```bash
+pip install git+https://github.com/microsoft/dion.git
+```
+
+:::caution[The error message points at an extra that does not exist]
+Request a Muon-family optimizer without `dion` installed and nanoPLM tells you to run
+`pip install nanoplm[cuda]`. **There is no `cuda` extra** — the only extras defined are `eval` and
+`docs`, so that command fails. Install `dion` from GitHub as shown above.
+:::
+
+### Token packing — `flash-attn`
+
+`use_packing` defaults to `true`, and packing is implemented with flash-attention's variable-length
+kernel. Without flash-attn installed, a packed run raises
+`Sequence packing requires flash attention (flash_attn or flash_attn_interface)`.
+
+```bash
+pip install flash-attn --no-build-isolation
+```
+
+Set [`use_packing: false`](/nanoplm/reference/pretrain/#pretrain-pretraining-use_packing) in
+`pretrain.yaml` if you cannot install it — you will pay for the padding, but the run will work.
+
+### FP8 and the TE backend — `transformer-engine`
+
+[`fp8: true`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8) and the `--pure-te` backend both
+route through NVIDIA's Transformer Engine. This holds even on the pure-torch path, which swaps
+eligible blocks for TE modules when FP8 is on.
+
+```bash
+pip install transformer-engine[pytorch]
+```
+
+## Verify your install
+
+<Steps>
+
+1. Check that the CLI is on your `PATH` and reports a version.
+
+   ```bash
+   nanoplm --version
+   # nanoplm, version 0.2.0
+   ```
+
+2. Check that the command groups are registered.
+
+   ```bash
+   nanoplm --help
+   # Usage: nanoplm [OPTIONS] COMMAND [ARGS]...
+   #
+   #   Make your own protein language model
+   #
+   # Commands:
+   #   data      Manage protein datasets ...
+   #   eval      Group of commands for downstream evaluation.
+   #   pretrain  Group of commands for model pretraining.
+   #   ...
+   ```
+
+3. Scaffold a config to confirm the templates ship correctly.
+
+   ```bash
+   nanoplm pretrain get-yaml
+   # Template written to: /work/pretrain.yaml
+   ```
+
+</Steps>
+
+If all three work, go train something: [Your first PLM](/nanoplm/start/first-plm/).
+
+## Hardware
+
+A GPU is strongly recommended. nanoPLM runs on CPU, but pretraining a language model on one is
+impractical for anything past a smoke test.
+
+| Feature | Requirement |
+| --- | --- |
+| Pretraining (`--pure-torch`) | Any CUDA GPU. Ampere or newer picks up bf16 + TF32 automatically. |
+| Token packing (`use_packing: true`, the default) | CUDA + `flash-attn`. |
+| `fp8: true` | FP8 tensor cores — **Hopper (H100) or newer** — plus `transformer-engine`. |
+| `fp8_recipe: mxfp8` or `nvfp4` | **Blackwell or newer.** The `delayed`, `current`, and `block` recipes run on Hopper. |
+| `--pure-te` | CUDA + `transformer-engine`. |
+
+Multi-GPU runs are launched with `torchrun` — see [Scale up](/nanoplm/guides/scale-up/).

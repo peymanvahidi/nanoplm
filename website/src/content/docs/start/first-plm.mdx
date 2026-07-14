@@ -1,0 +1,259 @@
+---
+title: Your first PLM
+description: Train and evaluate a small protein language model on SwissProt, end to end, in about half an hour on one GPU.
+---
+
+import { Steps, FileTree } from '@astrojs/starlight/components';
+
+You are going to pretrain a real protein language model — a 2.3M-parameter ModernBERT-style
+encoder — on 20,000 SwissProt sequences, then score it on a downstream benchmark. Every command is
+run from the same working directory, and each stage hands its artifacts to the next.
+
+**What you need**
+
+- One CUDA GPU. The token budget below is tiny; any modern card will do.
+- nanoPLM installed, with the `eval` extra and `flash-attn`. See [Install](/nanoplm/start/install/).
+- About 30 minutes: roughly 10 for the SwissProt download and tokenization, a few for training, and
+  the rest for benchmarking.
+
+:::note
+`use_packing` defaults to `true`, which requires `flash-attn`. If you skipped it during install, add
+`use_packing: false` under `pretraining:` in Stage 2 and everything else here still holds.
+:::
+
+## Stage 1 — Build the dataset
+
+<Steps>
+
+1. **Scaffold the config.** This writes two files: `data.yaml`, which you edit, and `dvc.yaml`, which
+   is the generated stage graph and which you never edit.
+
+   ```bash
+   nanoplm data get-yaml
+   # Wrote data.yaml and dvc.yaml in /work.
+   # Edit data.yaml and run `nanoplm data from-yaml` to execute.
+   ```
+
+2. **Check three keys.** The template already points at SwissProt, so there is little to change —
+   but these are the three values that decide how big and how long your dataset is, and they are
+   worth setting on purpose.
+
+   ```yaml title="data.yaml" {2,7,9}
+   data_dirs:
+     url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+     # ...
+     output_dir:         "output/data/pretrain_data"   # pretrain.yaml reads from here
+
+   data_params:
+     seqs_num: 20000        # SwissProt has ~570k; 20k trains fast and still learns
+     min_seq_len: 20
+     max_seq_len: 512       # pad/truncate length — pretraining reads this back from the manifest
+     # ...
+   ```
+
+   `max_seq_len` is the one to notice. You set it here, once. Pretraining reads it out of the
+   manifest and uses it to convert your token budget into optimizer steps — which is why it does
+   **not** appear in `pretrain.yaml`.
+
+3. **Run the pipeline.** nanoPLM drives the download → extract → check → shuffle → filter → split →
+   tokenize graph through DVC.
+
+   ```bash
+   nanoplm data from-yaml
+   # Running dvc repro (full pipeline)...
+   # ...
+   # Pretraining data pipeline complete.
+   #
+   #   Source:          https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz
+   #   Total sequences: 20000
+   #     Train:         18000
+   #     Val:           2000
+   #   Manifest:        /work/output/data/pretrain_data/.data_manifest
+   ```
+
+</Steps>
+
+You now have binary token shards and the manifest that describes them:
+
+<FileTree>
+
+- output/data/pretrain_data/
+  - train/
+    - shard_0000.bin
+    - shard_0000.idx.npy
+    - ...
+  - val/
+    - shard_0000.bin
+    - shard_0000.idx.npy
+  - .data_manifest **the contract: pretraining reads `max_seq_len` and `num_register_tokens` from here**
+
+</FileTree>
+
+## Stage 2 — Pretrain
+
+<Steps>
+
+1. **Scaffold the config.**
+
+   ```bash
+   nanoplm pretrain get-yaml
+   # Template written to: /work/pretrain.yaml
+   ```
+
+   The file is long — around 200 lines — because it exposes every knob nanoPLM has. You need to touch
+   six of them. Leave the rest alone; the defaults are good. The
+   [pretrain.yaml reference](/nanoplm/reference/pretrain/) documents the others when you want them.
+
+2. **Shrink the model.** The template ships a 768-wide, 12-layer model. Replace the top of the
+   `model:` block with something that trains in minutes:
+
+   ```yaml title="pretrain.yaml"
+   model:
+     hidden_size: 256
+     intermediate_size: 512
+     num_hidden_layers: 4
+     num_attention_heads: 4
+     vocab_size: 32          # the protein tokenizer's vocabulary — leave it
+     # ... leave the rest of the model block as generated
+   ```
+
+3. **Set the batch and the budget.** These four keys under `pretraining:` are the ones that decide
+   what a run costs.
+
+   ```yaml title="pretrain.yaml"
+   # ...
+   pretraining:
+     dataset_dir: "output/data/pretrain_data"  # where Stage 1 wrote its shards
+
+     micro_batch_seqs: 16          # sequences per GPU per forward pass — your VRAM knob
+     global_batch_tokens: 65536    # tokens per optimizer step: 16 seqs x 512 tokens x 8 accum
+
+     warmup_steps: 20              # optimizer steps, not a ratio
+     stable_tokens: 8000000        # tokens up to the pre-decay checkpoint (warmup is inside this)
+     decay_tokens: 2000000         # additional anneal tokens on top
+   # ...
+   ```
+
+   There are **no epochs** in nanoPLM. Duration is a token budget, and the dataset is replayed as
+   many times as the budget needs. The default `lr_schedule` is `wsd`, so your run is
+   `stable_tokens` + `decay_tokens` = 10M tokens total: warm up, hold the peak learning rate, then
+   anneal. Gradient accumulation is *inferred* from these numbers — never set it.
+
+4. **Train.**
+
+   ```bash
+   nanoplm pretrain from-yaml --pure-torch
+   # Using pure-torch model and training loop
+   # Total Trainable Parameters: 2306848
+   # Flash attention available: True
+   # ...
+   # [total] Budget: 10,092,544 tokens → ≈1.6 passes over the train set (each sample seen ~1.6×)
+   # [step 1/154] loss=3.4412 lr=5.00e-06 grad_norm=1.8834 tok/s=412,190 real_tok/step=65,536 dt=159.00ms
+   # ...
+   # [step 123/154] loss=2.5107 lr=1.00e-04 grad_norm=0.4630 tok/s=438,024 real_tok/step=65,536 dt=149.60ms
+   # ...
+   # [step 154/154] loss=2.3915 lr=1.09e-05 grad_norm=0.3901 tok/s=437,551 real_tok/step=65,536 dt=149.80ms
+   ```
+
+   Your 10M-token budget resolved to 154 optimizer steps: 123 stable, then 31 of decay. Watch `lr`
+   hold flat and then fall away after step 123 — that is the WSD schedule doing its job.
+
+</Steps>
+
+:::caution[`--pure-torch` is required]
+There is no default backend. Run `nanoplm pretrain from-yaml` with neither `--pure-torch` nor
+`--pure-te` and it fails immediately with *"Pretraining requires pure_torch: true or pure_te: true."*
+Use `--pure-torch`: it is the fully-featured path and the only one `nanoplm eval` can load. See
+[Choose a backend](/nanoplm/guides/backends/).
+:::
+
+The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:
+
+<FileTree>
+
+- output/pretraining_checkpoints/
+  - run-14071932/
+    - run_name.txt
+    - checkpoint-stable-end/ saved automatically at the stable→decay boundary
+    - checkpoint-final/ **your trained model**
+      - pytorch_model.bin
+      - model_config.yaml **the architecture, so eval needs nothing but a path**
+      - pretrain_config.yaml
+      - training_state.json
+      - ...
+
+</FileTree>
+
+## Stage 3 — Evaluate
+
+<Steps>
+
+1. **Scaffold the config.**
+
+   ```bash
+   nanoplm eval get-yaml
+   # Template written to: /work/eval.yaml
+   ```
+
+2. **Point it at your checkpoint.** This is the only value eval cannot infer — everything else about
+   the model comes out of `model_config.yaml` inside the checkpoint.
+
+   ```yaml title="eval.yaml"
+   eval:
+     checkpoint_dir: "output/pretraining_checkpoints/run-14071932/checkpoint-final"
+     framework: [pbc]    # protein benchmark collection; downstream probing tasks
+     output_dir: "autoeval_output"
+     batch_size: 16
+     # ...
+   ```
+
+3. **Run the benchmark.** nanoPLM embeds the benchmark sequences with your model, then trains a probe
+   on top of those embeddings for each task.
+
+   ```bash
+   nanoplm eval from-yaml
+   # Starting autoeval pipeline (sequential): framework=pbc
+   # ============================================================
+   # [0/5] PBC: secondary_structure
+   # ...
+   # ============================================================
+   # AUTOEVAL COMPLETE — Final Report Summary
+   # ============================================================
+   ```
+
+</Steps>
+
+The report lands under your embedder's directory, which defaults to the checkpoint's directory name:
+
+<FileTree>
+
+- autoeval_output/
+  - checkpoint-final/
+    - PBC/ per-task results
+    - ...
+
+</FileTree>
+
+## Verify
+
+You are done when all three are true:
+
+- `output/data/pretrain_data/.data_manifest` exists and reports 18,000 train and 2,000 val sequences.
+- Training reached `[step 154/154]` and your loss fell — from around 3.4 to under 2.5. A tiny model on
+  10M tokens will not be state of the art; a falling loss is what proves the pipeline works.
+- `output/pretraining_checkpoints/<your-run>/checkpoint-final/pytorch_model.bin` exists. **That file
+  is your protein language model**, and `model_config.yaml` beside it describes its architecture.
+- `autoeval_output/checkpoint-final/` holds a benchmark report.
+
+## Next steps
+
+The tutorial gave you a working run. Now make it a good one.
+
+- [How the pipeline fits together](/nanoplm/pipeline/) — the artifact contract behind the run you
+  completed, in full.
+- [Scale up](/nanoplm/guides/scale-up/) — a bigger model, a bigger budget, and `torchrun` across
+  several GPUs.
+- [Choose an optimizer](/nanoplm/guides/optimizers/) — the Muon family usually beats AdamW here.
+- [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/) — pick a run back up, or anneal one
+  trunk into several models.
+- [pretrain.yaml reference](/nanoplm/reference/pretrain/) — every key you left at its default.

@@ -64,7 +64,9 @@ scripts/
 # Planning directory (local only)
 .planning/
 
-docs/
+# Root-level scratch docs dir only. NOT anchored = would also match
+# website/src/content/docs/, which is the actual documentation source.
+/docs/
 
 # Local extension build cache
 .cache/
@@ -91,3 +93,7 @@ wandb_sync_daemon.lock
 wandb_sync_daemon.state.json
 Screenshot*.png
 canon_cutedsl.md
+
+# Docs site (Astro/Starlight)
+node_modules/
+website/.astro/

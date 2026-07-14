@@ -1,0 +1,179 @@
+---
+// website/src/components/PipelineDiagram.astro
+// The one diagram on the site: three YAMLs, three commands, and the artifacts
+// that flow between them. Used on the home page and the pipeline overview.
+// Zero JS; styled entirely with Starlight's own theme variables so it tracks
+// light/dark automatically.
+
+const STAGES = [
+  {
+    n: '1',
+    name: 'Prepare data',
+    file: 'data.yaml',
+    cmd: 'nanoplm data from-yaml',
+    blurb: 'FASTA in, tokenized shards out.',
+    href: '/nanoplm/pipeline/data/',
+  },
+  {
+    n: '2',
+    name: 'Pretrain',
+    file: 'pretrain.yaml',
+    cmd: 'nanoplm pretrain from-yaml',
+    blurb: 'Shards in, a trained model out.',
+    href: '/nanoplm/pipeline/pretrain/',
+  },
+  {
+    n: '3',
+    name: 'Evaluate',
+    file: 'eval.yaml',
+    cmd: 'nanoplm eval from-yaml',
+    blurb: 'A checkpoint in, benchmark scores out.',
+    href: '/nanoplm/pipeline/eval/',
+  },
+];
+
+// What each stage hands to the next. These are the real filenames on disk —
+// they are the whole point of the diagram.
+const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.yaml'];
+---
+
+<div class="pipe">
+  {
+    STAGES.map((s, i) => (
+      <>
+        <a class="pipe-stage" href={s.href}>
+          <span class="pipe-n">{s.n}</span>
+          <span class="pipe-name">{s.name}</span>
+          <code class="pipe-file">{s.file}</code>
+          <span class="pipe-blurb">{s.blurb}</span>
+          <code class="pipe-cmd">{s.cmd}</code>
+        </a>
+        {i < ARTIFACTS.length && (
+          <div class="pipe-arrow" aria-hidden="true">
+            <span class="pipe-artifact">{ARTIFACTS[i]}</span>
+            <span class="pipe-line" />
+          </div>
+        )}
+      </>
+    ))
+  }
+</div>
+
+<style>
+  .pipe {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr auto 1fr;
+    align-items: stretch;
+    gap: 0.5rem;
+    margin: 1.5rem 0 2rem;
+  }
+
+  .pipe-stage {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 1rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+    background: var(--sl-color-black);
+    text-decoration: none;
+    color: var(--sl-color-white);
+    transition: border-color 0.15s ease;
+  }
+  .pipe-stage:hover {
+    border-color: var(--sl-color-accent);
+  }
+
+  .pipe-n {
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--sl-color-accent-high);
+  }
+  .pipe-name {
+    font-weight: 600;
+    line-height: 1.2;
+  }
+  .pipe-file {
+    font-size: 0.8rem;
+    color: var(--sl-color-accent-high);
+    background: none;
+    padding: 0;
+  }
+  .pipe-blurb {
+    font-size: 0.8rem;
+    color: var(--sl-color-gray-3);
+    line-height: 1.4;
+    margin-top: 0.15rem;
+  }
+  .pipe-cmd {
+    font-size: 0.72rem;
+    margin-top: auto;
+    padding-top: 0.5rem;
+    color: var(--sl-color-gray-2);
+    background: none;
+    word-break: break-all;
+  }
+
+  /* The arrow column carries the artifact name — the handoff IS the content. */
+  .pipe-arrow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.3rem;
+    min-width: 8.5rem;
+  }
+  .pipe-artifact {
+    font-family: var(--sl-font-mono);
+    font-size: 0.68rem;
+    line-height: 1.35;
+    text-align: center;
+    white-space: pre;
+    color: var(--sl-color-gray-3);
+  }
+  .pipe-line {
+    display: block;
+    width: 100%;
+    height: 1px;
+    background: var(--sl-color-gray-5);
+    position: relative;
+  }
+  .pipe-line::after {
+    content: '';
+    position: absolute;
+    right: 0;
+    top: -3px;
+    border-left: 6px solid var(--sl-color-gray-5);
+    border-top: 3.5px solid transparent;
+    border-bottom: 3.5px solid transparent;
+  }
+
+  /* Stack on narrow screens; the arrows become vertical dividers. */
+  @media (max-width: 50rem) {
+    .pipe {
+      grid-template-columns: 1fr;
+    }
+    .pipe-arrow {
+      flex-direction: row;
+      gap: 0.6rem;
+      min-height: 2.5rem;
+    }
+    .pipe-artifact {
+      white-space: normal;
+    }
+    .pipe-line {
+      width: 1px;
+      height: 1.75rem;
+    }
+    .pipe-line::after {
+      right: -3px;
+      top: auto;
+      bottom: 0;
+      border-left: 3.5px solid transparent;
+      border-right: 3.5px solid transparent;
+      border-top: 6px solid var(--sl-color-gray-5);
+      border-bottom: none;
+    }
+  }
+</style>

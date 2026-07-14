@@ -1,0 +1,19 @@
+{
+  "name": "nanoplm-docs",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.30.0",
+    "astro": "^5.0.0",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "vitest": "^2.1.0"
+  }
+}

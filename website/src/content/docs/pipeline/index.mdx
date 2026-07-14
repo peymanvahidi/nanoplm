@@ -1,0 +1,130 @@
+---
+title: How the pipeline fits together
+description: Three YAML files, one verb pair, and the artifacts that carry information between the stages.
+---
+
+import PipelineDiagram from '../../../components/PipelineDiagram.astro';
+import { FileTree } from '@astrojs/starlight/components';
+
+nanoPLM has one loop. Learn it once and every stage of the tool works the same way:
+
+```sh
+nanoplm <stage> get-yaml     # scaffold a config
+$EDITOR <stage>.yaml         # edit it
+nanoplm <stage> from-yaml    # run it
+```
+
+`<stage>` is `data`, `pretrain`, or `eval`. Nothing else is required to train a protein language model end to end. Scaffolding the first config looks like this:
+
+```sh
+nanoplm data get-yaml
+```
+
+```text title="Output"
+Wrote data.yaml and dvc.yaml in /work/my-plm.
+Edit data.yaml and run `nanoplm data from-yaml` to execute.
+```
+
+Every config is a plain file you own, keep in git, and diff against your last run.
+
+<PipelineDiagram />
+
+## What each file owns
+
+Each YAML answers exactly one question. Where a stage needs a fact that another stage already decided, it reads it from an artifact rather than asking you to type it twice.
+
+| File | Owns | Deliberately does not own |
+| --- | --- | --- |
+| `data.yaml` | **What data.** Which FASTA, how it is filtered, how long a sequence may be, how it is sharded. | Anything about the model. |
+| `pretrain.yaml` | **What model, and how long.** Architecture, optimizer, LR schedule, token budget. | Sequence length and register tokens — the data stage already fixed those. |
+| `eval.yaml` | **Which checkpoint, which benchmarks.** | The model architecture — the checkpoint carries it. |
+
+## The artifact contract
+
+The three stages are decoupled through two artifacts on disk. This is the whole design, and it is why the configs stay small.
+
+### `data` writes shards plus a manifest
+
+`nanoplm data from-yaml` tokenizes your FASTA into binary shards and writes a `.data_manifest` next to them:
+
+<FileTree>
+
+- output/data/pretrain_data/
+  - train/
+    - shard_0000.bin
+    - shard_0000.idx.npy
+    - …
+  - val/
+    - …
+  - **.data_manifest** the contract
+
+</FileTree>
+
+The manifest records what the data stage decided:
+
+```yaml title=".data_manifest"
+pipeline_mode: pretrain
+seqs_num: 20000
+min_seq_len: 20
+max_seq_len: 512          # <- the number pretraining does its token math with
+val_ratio: 0.1
+train_dir: train
+val_dir: val
+train_sequences: 18000
+val_sequences: 2000
+num_register_tokens: 0    # <- injected into the model config at pretrain time
+# ...
+```
+
+### `pretrain` reads the manifest back
+
+This is the fact that explains the whole tool: **`max_seq_len` and `num_register_tokens` are not keys in `pretrain.yaml`.** Pretraining loads them out of `.data_manifest` at startup.
+
+`max_seq_len` is what turns your token budget into optimizer steps. Gradient accumulation is derived from it:
+
+```
+grad_accum = ceil( global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size) )
+                                                              ^^^^^^^^^^^
+                                                        from .data_manifest
+```
+
+`num_register_tokens` is copied straight into the model config, so the model's tokenizer matches the tokenizer that wrote the shards. If you could set either of these in `pretrain.yaml`, you could set them *wrong*, and a mismatch between the shards and the model is silent corruption. So the keys do not exist. Set the length once, in [`data.yaml`](/nanoplm/pipeline/data/), and every downstream stage agrees with you.
+
+### `pretrain` writes a self-describing checkpoint
+
+Every checkpoint carries the three configs that produced it:
+
+<FileTree>
+
+- output/pretraining_checkpoints/
+  - run-14071932/
+    - checkpoint-500/
+      - pytorch_model.bin
+      - **model_config.yaml** the architecture
+      - **pretrain_config.yaml** the training config
+      - **data_manifest.yaml** a copy of the data manifest
+      - …
+
+</FileTree>
+
+That is why `eval.yaml` needs nothing but a path. Point `checkpoint_dir` at the directory and the evaluator rebuilds the exact model — no architecture keys to re-type, no chance of loading 12 layers of weights into an 8-layer model.
+
+### A mismatch is caught, not tolerated
+
+The contract is checked, not assumed. Point pretraining at a dataset prepared for a different pipeline and it stops before allocating a single tensor:
+
+```text title="Output"
+ValueError: Dataset was prepared for 'distillation' pipeline, but 'pretrain' was expected.
+```
+
+The same holds for the config surface itself: every loader rejects keys it does not recognise, so a typo or a stale key from an older release fails loudly at load time instead of quietly training the wrong thing.
+
+## Read next
+
+Work through the stages in order. Each page shows the config, the command, the output, and the artifacts it leaves behind.
+
+1. [Prepare data](/nanoplm/pipeline/data/) — FASTA in, tokenized shards and a manifest out.
+2. [Pretrain](/nanoplm/pipeline/pretrain/) — shards in, checkpoints out.
+3. [Evaluate](/nanoplm/pipeline/eval/) — a checkpoint in, benchmark scores out.
+
+For the exhaustive key-by-key tables, see the [data.yaml](/nanoplm/reference/data/), [pretrain.yaml](/nanoplm/reference/pretrain/), and [eval.yaml](/nanoplm/reference/eval/) references. They are generated from the code, so they cannot drift.
