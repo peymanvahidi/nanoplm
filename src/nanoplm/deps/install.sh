@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# nanoPLM hard-dependency installer — ONE supported environment:
-#   Linux x86_64 · NVIDIA Hopper (sm90) · CUDA >= 13.0 · torch 2.12.1+cu130
+# nanoPLM hard-dependency installer — supported environments:
+#   Linux x86_64 or aarch64 · NVIDIA Hopper (sm90: H100 / GH200) · CUDA >= 13.0 · torch 2.12.1+cu130
 #
 # Installs, idempotently and always all of them:
 #   1. torch 2.12.1+cu130                    2. dion (pinned commit)
@@ -31,16 +31,35 @@ SONICMOE_URL="git+https://github.com/Dao-AILab/sonic-moe.git@${SONICMOE_SHA}"
 # after 0.5.0 and untested with it -- so pin the release-era DSL explicitly.
 QUACK_SPEC="quack-kernels[cu13]==0.5.0"
 DSL_SPEC="nvidia-cutlass-dsl[cu13]==4.5.3"
-FA3_WHEEL="flash_attn_3-3.0.0+20260519.cu130torch2120cxx11abitrue.8a8b2f-cp39-abi3-linux_x86_64.whl"
-FA3_REPO="peymanvahidi/nanoplm"
-FA3_RELEASE_TAG="deps-assets"
+# flash-attn-3 is the one hard-dep shipped as a PREBUILT wheel (no source build),
+# so the exact artifact differs per CPU arch: x86_64 (H100-class boxes) vs aarch64
+# (GH200 superchips / JUPITER). Each arch pins its own wheel filename, installed-
+# version needle, and sha256; all are fetched from the shared windreamer mirror
+# (FA3_URL) below. NOTE: the two builds are NOT the same commit/date (x86_64 =
+# 20260519/8a8b2f, aarch64 = 20260520/417891) — they are upstream's independent
+# per-arch builds, pinned as-is. FA3_SHA256 stays env-overridable; a real install
+# refuses to run while it is UNSET (see step_fa3).
+FA3_ARCH="$(uname -m)"
+case "$FA3_ARCH" in
+  x86_64)
+    FA3_WHEEL="flash_attn_3-3.0.0+20260519.cu130torch2120cxx11abitrue.8a8b2f-cp39-abi3-linux_x86_64.whl"
+    FA3_VERSION_NEEDLE="3.0.0+20260519"
+    FA3_SHA256="${FA3_SHA256:-177359694998fee12e293d15d3398482fc0193f5f40d4aca3ceb257105d5bbf2}"
+    ;;
+  aarch64|arm64)
+    FA3_WHEEL="flash_attn_3-3.0.0+20260520.cu130torch2120cxx11abitrue.417891-cp39-abi3-linux_aarch64.whl"
+    FA3_VERSION_NEEDLE="3.0.0+20260520"
+    FA3_SHA256="${FA3_SHA256:-8a520336c5126cf638db1b39eee74b74da57fd5eaa9aac275c5ae949b291bb80}"
+    ;;
+  *)
+    echo "ERROR: unsupported CPU architecture for flash-attn-3: $FA3_ARCH (supported: x86_64, aarch64)" >&2
+    exit 1
+    ;;
+esac
 FA3_WHEEL_URLENC="${FA3_WHEEL//+/%2B}"   # GitHub's release-download endpoint 504s on a literal '+' in the path
-FA3_URL="https://github.com/${FA3_REPO}/releases/download/${FA3_RELEASE_TAG}/${FA3_WHEEL_URLENC}"
-# Public third-party upstream fallback (no auth needed) — used only when the
-# private mirror above is unreachable; bytes are still sha256-gated below.
-FA3_FALLBACK_URL="https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.05.20-072445f/${FA3_WHEEL_URLENC}"
-# Pinned by the release-mirror task; real installs refuse to run while UNSET.
-FA3_SHA256="${FA3_SHA256:-177359694998fee12e293d15d3398482fc0193f5f40d4aca3ceb257105d5bbf2}"
+# Single source: the public windreamer wheel mirror (no auth), pinned to a fixed
+# release tag. Downloaded bytes are sha256-gated in step_fa3 regardless.
+FA3_URL="https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.05.20-072445f/${FA3_WHEEL_URLENC}"
 
 # ---- knobs -------------------------------------------------------------------
 export NVTE_FRAMEWORK="${NVTE_FRAMEWORK:-pytorch}"
@@ -216,51 +235,19 @@ fa3_download() {  # fa3_download <dest-file>
     log "using pre-downloaded FA3 wheel: $NANOPLM_FA3_WHEEL"
     cp "$NANOPLM_FA3_WHEEL" "$dest"; return 0
   fi
-  # Anonymous first (works the moment the repo/release is public) …
+  log "downloading flash-attn-3 wheel from the public windreamer mirror"
   if curl -fSL --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused \
        -o "$dest" "$FA3_URL" 2>/dev/null; then
     return 0
   fi
-  # … then the authenticated API, if a token is available (private repo needs
-  # a token: asset downloads go release → asset id → octet-stream, which plain
-  # curl can't do in one hop) …
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    log "anonymous download failed; retrying via the GitHub API with GITHUB_TOKEN"
-    if "$PY" - "$dest" "$FA3_REPO" "$FA3_RELEASE_TAG" "$FA3_WHEEL" <<'PY'
-import json, os, sys, urllib.request
-dest, repo, tag, wheel = sys.argv[1:5]
-hdr = {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}"}
-rel = json.load(urllib.request.urlopen(urllib.request.Request(
-    f"https://api.github.com/repos/{repo}/releases/tags/{tag}", headers=hdr)))
-aid = next(a["id"] for a in rel["assets"] if a["name"] == wheel)
-req = urllib.request.Request(
-    f"https://api.github.com/repos/{repo}/releases/assets/{aid}",
-    headers={**hdr, "Accept": "application/octet-stream"})
-with urllib.request.urlopen(req) as r, open(dest, "wb") as f:
-    f.write(r.read())
-print(f">> downloaded {wheel} via API")
-PY
-    then
-      return 0
-    fi
-    warn "GitHub API download failed; will try the public upstream fallback next"
-  fi
-  # … finally the public third-party mirror — no auth needed, so this is the
-  # path most collaborators on the private repo actually take.
-  log "mirror unavailable; falling back to the public upstream wheel (windreamer)"
-  if curl -fSL --proto '=https' --tlsv1.2 --retry 3 --retry-connrefused \
-       -o "$dest" "$FA3_FALLBACK_URL" 2>/dev/null; then
-    return 0
-  fi
-  err "could not download the flash-attn-3 wheel from $FA3_URL or the public fallback $FA3_FALLBACK_URL"
-  err "While the repo is private you can also: export GITHUB_TOKEN=<PAT with repo read>,"
-  err "or download the wheel manually from the '$FA3_RELEASE_TAG' GitHub Release and"
+  err "could not download the flash-attn-3 wheel from $FA3_URL"
+  err "If this host has no outbound internet, download the wheel elsewhere and"
   err "point NANOPLM_FA3_WHEEL at the file, then re-run."
   return 1
 }
 
 step_fa3() {
-  if satisfied flash_attn_3 "3.0.0+20260519"; then log "flash-attn-3 present; skipping."; return 0; fi
+  if satisfied flash_attn_3 "$FA3_VERSION_NEEDLE"; then log "flash-attn-3 present; skipping."; return 0; fi
   if [ -n "$DRY_RUN" ]; then
     echo "DRY> download $FA3_URL (sha256-verified)"
     echo "DRY> $PY -m pip install <downloaded>/$FA3_WHEEL"

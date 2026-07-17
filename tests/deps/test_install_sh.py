@@ -94,10 +94,9 @@ def test_all_pins_present():
     assert "nvidia-cutlass-dsl[cu13]==4.5.3" in text                   # pinned: 0.5.0 only floors it
     assert "v2.16" in text                                             # TE tag
     assert "cu130torch2120cxx11abitrue.8a8b2f" in text                 # FA3 wheel
-    assert "deps-assets" in text                                       # FA3 release tag
     assert "nvidia-cutlass-dsl-libs-cu13" in text                      # quack [cu13] payload guard
-    assert "windreamer/flash-attention3-wheels" in text                # FA3 public upstream fallback
-    assert "2026.05.20-072445f" in text                                # FA3 fallback release tag
+    assert "windreamer/flash-attention3-wheels" in text                # FA3 single source (windreamer mirror)
+    assert "2026.05.20-072445f" in text                                # FA3 pinned release tag
     assert 'FA3_WHEEL_URLENC="${FA3_WHEEL//+/%2B}"' in text            # GitHub 504s on literal '+' in the path
 
 
@@ -182,15 +181,15 @@ def test_dry_run_prints_full_pinned_sequence(tmp_path):
     assert "nvdlfw-inspect" in out
     assert "--branch v2.16" in out
     assert "--no-build-isolation --no-deps" in out
-    # 4. FA3 from the release mirror
-    assert "releases/download/deps-assets" in out
+    # 4. FA3 from the windreamer mirror
+    assert "windreamer/flash-attention3-wheels/releases/download/2026.05.20-072445f" in out
     # 5. quack + DSL co-resolved in one pip call, then sonic-moe
     assert "quack-kernels[cu13]==0.5.0" in out
     assert "nvidia-cutlass-dsl[cu13]==4.5.3" in out
     assert "git+https://github.com/Dao-AILab/sonic-moe.git@4923037d858aebfe5738ebb17d02f88d7871c333" in out
     # steps run in pin order
     assert out.index("torch==2.12.1") < out.index("dion") < out.index("v2.16") \
-        < out.index("deps-assets") < out.index("quack-kernels")
+        < out.index("flash-attention3-wheels") < out.index("quack-kernels")
 
 
 def test_arch_flag_exported(tmp_path):
@@ -208,11 +207,11 @@ def test_fa3_sha256_is_pinned():
     assert m, "FA3_SHA256 must default to a pinned 64-hex digest (not UNSET)"
 
 
-def test_fa3_download_falls_back_to_public_wheel(tmp_path):
-    # Stub curl ahead of PATH: 404s (exit 22) the private mirror URL, succeeds
-    # (writes a marker byte to the -o destination) for the public windreamer
-    # fallback URL. GITHUB_TOKEN is unset, so the authenticated API path is
-    # skipped entirely and fa3_download must fall through mirror -> fallback.
+def test_fa3_download_uses_windreamer(tmp_path):
+    # Single source now: fa3_download curls the public windreamer wheel URL and
+    # writes it to the -o destination. Stub curl ahead of PATH to succeed (write
+    # a marker byte) ONLY for a windreamer URL and fail anything else, so a stray
+    # fetch to some other host would be caught as a failure.
     bindir = tmp_path / "bin"
     bindir.mkdir()
     curl = bindir / "curl"
@@ -226,7 +225,6 @@ def test_fa3_download_falls_back_to_public_wheel(tmp_path):
         '  prev="$arg"\n'
         "done\n"
         'case "$url" in\n'
-        "  *peymanvahidi/nanoplm*) exit 22 ;;\n"
         '  *windreamer*) printf \'X\' > "$dest"; exit 0 ;;\n'
         "  *) exit 1 ;;\n"
         "esac\n"
@@ -234,15 +232,13 @@ def test_fa3_download_falls_back_to_public_wheel(tmp_path):
     curl.chmod(0o755)
     out = tmp_path / "out.whl"
     env = dict(os.environ)
-    env.pop("GITHUB_TOKEN", None)
     env["VIRTUAL_ENV"] = sys.prefix
     env["PATH"] = f"{bindir}:{SYS_PATH}"
     cmd = f'source "{SCRIPT}"; fa3_download "{out}"'
     r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
     assert r.returncode == 0, r.stderr
     assert out.is_file()
-    combined = r.stdout + r.stderr
-    assert "falling back to the public upstream wheel" in combined
+    assert "windreamer" in (r.stdout + r.stderr)
 
 
 def test_fa3_sha_unset_refused_in_real_mode(tmp_path):
