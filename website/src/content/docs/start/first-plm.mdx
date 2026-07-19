@@ -31,7 +31,7 @@ puts in the env.
 
    ```bash
    nanoplm data get-yaml
-   # Wrote data.yaml and dvc.yaml in /work.
+   # Wrote data.yaml and dvc.yaml in <cwd>.
    # Edit data.yaml and run `nanoplm data from-yaml` to execute.
    ```
 
@@ -69,7 +69,7 @@ puts in the env.
    #   Total sequences: 20000
    #     Train:         18000
    #     Val:           2000
-   #   Manifest:        /work/output/data/pretrain_data/.data_manifest
+   #   Manifest:        output/data/pretrain_data/.data_manifest
    ```
 
 </Steps>
@@ -86,7 +86,7 @@ You now have binary token shards and the manifest that describes them:
   - val/
     - shard_0000.bin
     - shard_0000.idx.npy
-  - .data_manifest **the contract: pretraining reads `max_seq_len` and `num_register_tokens` from here**
+  - .data_manifest **the contract: pretraining reads some information from here**
 
 </FileTree>
 
@@ -98,7 +98,7 @@ You now have binary token shards and the manifest that describes them:
 
    ```bash
    nanoplm pretrain get-yaml
-   # Template written to: /work/pretrain.yaml
+   # Template written to: <cwd>/pretrain.yaml
    ```
 
    The file is long (around 200 lines) because it exposes every knob nanoPLM has. You need to touch
@@ -193,7 +193,7 @@ The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:
 
    ```bash
    nanoplm eval get-yaml
-   # Template written to: /work/eval.yaml
+   # Template written to: <cwd>/eval.yaml
    ```
 
 2. **Point it at your checkpoint.** This is the only value eval cannot infer: everything else about
