@@ -4,15 +4,12 @@ description: Three YAML files, one verb pair, and the artifacts that carry infor
 ---
 
 import PipelineDiagram from '../../../components/PipelineDiagram.astro';
+import LoopDiagram from '../../../components/LoopDiagram.astro';
 import { FileTree } from '@astrojs/starlight/components';
 
 nanoPLM has one loop. Learn it once and every stage of the tool works the same way:
 
-```sh
-nanoplm <stage> get-yaml     # scaffold a config
-$EDITOR <stage>.yaml         # edit it
-nanoplm <stage> from-yaml    # run it
-```
+<LoopDiagram />
 
 `<stage>` is `data`, `pretrain`, or `eval`. Nothing else is required to train a protein language model end to end. Scaffolding the first config looks like this:
 
