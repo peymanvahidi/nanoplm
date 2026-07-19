@@ -1,0 +1,200 @@
+---
+// website/src/components/LoopDiagram.astro
+// The one loop, taught once: get-yaml → edit → from-yaml. Sits directly above
+// PipelineDiagram on the pipeline overview, so it is deliberately lighter than
+// a stage card — it reads as the key to the diagram below, not a rival to it.
+// Zero JS; Starlight theme variables only, so light/dark tracks automatically.
+
+// Split so `<stage>` can be highlighted in all three commands: the whole point
+// is that it is the same word you substitute each time.
+const STEPS = [
+  {
+    n: '1',
+    label: 'Scaffold',
+    note: 'nanoPLM writes it',
+    pre: 'nanoplm ',
+    post: ' get-yaml',
+    who: 'tool',
+  },
+  {
+    n: '2',
+    label: 'Edit',
+    note: 'you decide',
+    pre: '$EDITOR ',
+    post: '.yaml',
+    who: 'you',
+  },
+  {
+    n: '3',
+    label: 'Run',
+    note: 'nanoPLM executes it',
+    pre: 'nanoplm ',
+    post: ' from-yaml',
+    who: 'tool',
+  },
+];
+---
+
+<div class="loop-wrap">
+  {/* `not-content` opts the list out of Starlight's markdown styling — without
+      it, its `li + li` top margin drops cards 2 and 3 inside their grid cells.
+      Astro scopes with :where() (zero specificity), so a local reset can't win. */}
+  <ol class="loop not-content">
+    {
+      STEPS.map((s) => (
+        <li class:list={['loop-step', `is-${s.who}`]}>
+          <span class="loop-head">
+            <span class="loop-n">{s.n}</span>
+            <span class="loop-label">{s.label}</span>
+          </span>
+          {/* Kept on one line: newlines here would leak stray spaces into the command. */}
+          <code class="loop-cmd">{s.pre}<span class="loop-slot">&lt;stage&gt;</span>{s.post}</code>
+          <span class="loop-note">{s.note}</span>
+        </li>
+      ))
+    }
+  </ol>
+</div>
+
+<style>
+  /* Container-query root: 3-across only once the commands fit on one line,
+     otherwise stacked. Never wider than the prose column. */
+  .loop-wrap {
+    container-type: inline-size;
+    margin: 1.5rem 0 1.75rem;
+  }
+
+  .loop {
+    /* Beat Starlight's list styling — this is a diagram, not prose. */
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.4rem;
+  }
+
+  .loop-step {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    /* Starlight gives `li + li` a top margin; unset it or cards 2 and 3 sit
+       4px lower than card 1 in their grid cells. */
+    margin: 0;
+    gap: 0.3rem;
+    padding: 0.7rem 0.85rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+    background: var(--sl-color-gray-6);
+  }
+  :global([data-theme='light']) .loop-step {
+    background: var(--sl-color-black);
+  }
+
+  /* Step 2 is the human one: dashed, unfilled — visibly the step nanoPLM
+     does not do for you. */
+  .loop-step.is-you {
+    border-style: dashed;
+    background: none;
+  }
+  :global([data-theme='light']) .loop-step.is-you {
+    background: none;
+  }
+
+  .loop-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .loop-n {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 1.25rem;
+    height: 1.25rem;
+    border-radius: 999px;
+    background: var(--sl-color-accent-low);
+    font-family: var(--sl-font-mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: var(--sl-color-accent-high);
+  }
+  .loop-label {
+    font-weight: 600;
+    font-size: 0.9rem;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+    color: var(--sl-color-white);
+  }
+
+  /* Qualified so it beats the site-wide inline-code chip style in custom.css —
+     plain mono, no border or padding. */
+  .loop-step .loop-cmd {
+    font-family: var(--sl-font-mono);
+    font-size: 0.74rem;
+    line-height: 1.45;
+    color: var(--sl-color-gray-2);
+    background: none;
+    border: none;
+    padding: 0;
+    white-space: nowrap;
+  }
+  .loop-slot {
+    color: var(--sl-color-accent-high);
+  }
+  .loop-note {
+    font-size: 0.72rem;
+    line-height: 1.4;
+    color: var(--sl-color-gray-3);
+  }
+
+  /* Stacked: a short dashed drop between steps. */
+  .loop-step:not(:last-child)::after {
+    content: '';
+    position: absolute;
+    left: 1.47rem;
+    top: 100%;
+    width: 0;
+    height: 0.4rem;
+    border-left: 1px dashed var(--sl-color-gray-4);
+  }
+
+  @container (min-width: 34rem) {
+    .loop {
+      /* The gap is the arrow track — connectors are drawn across it. */
+      grid-template-columns: repeat(3, 1fr);
+      align-items: stretch;
+      gap: 2.5rem;
+    }
+    .loop-step {
+      padding: 0.75rem 0.8rem;
+    }
+    /* Horizontal connector spanning the gap, with an arrowhead at the far end. */
+    .loop-step:not(:last-child)::after {
+      left: 100%;
+      top: 50%;
+      width: 2.5rem;
+      height: 0;
+      border-left: none;
+      border-top: 1px dashed var(--sl-color-gray-4);
+    }
+    .loop-step:not(:last-child)::before {
+      content: '';
+      position: absolute;
+      left: calc(100% + 2.5rem);
+      top: 50%;
+      margin-top: -3.5px;
+      margin-left: -6px;
+      border-left: 6px solid var(--sl-color-gray-4);
+      border-top: 3.5px solid transparent;
+      border-bottom: 3.5px solid transparent;
+    }
+    .loop-step .loop-cmd {
+      font-size: 0.7rem;
+    }
+    .loop-note {
+      font-size: 0.68rem;
+    }
+  }
+</style>
