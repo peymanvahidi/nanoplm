@@ -5,7 +5,7 @@ description: "Every field in the pretraining config, extracted from the nanoplm 
 
 import ReferenceFields from '../../../components/ReferenceFields.astro';
 
-`nanoplm pretrain get-yaml` writes a 207-line `pretrain.yaml` with three blocks: `model:` (architecture), `pretraining:` (the training loop), and `resume:` (restarting from a checkpoint). The fields below are extracted from that template and the config dataclasses behind it, so they cannot drift from the tool. Launch with `nanoplm pretrain from-yaml --pure-torch`.
+`nanoplm pretrain get-yaml` writes a ~360-line `pretrain.yaml` with three blocks: `model:` (architecture), `pretraining:` (the training loop), and `resume:` (restarting from a checkpoint), plus top-level backend flags. The fields below are extracted from that template and the config dataclasses behind it, so they cannot drift from the tool. Launch with `nanoplm pretrain from-yaml --pure-torch`.
 
 ## Where to start
 

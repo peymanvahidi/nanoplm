@@ -30,4 +30,6 @@ def test_artifacts_are_strict_json(tmp_path):
         json.loads(text, parse_constant=_reject_constant)
     pre = json.loads((tmp_path / "nanoplm.pretrain.schema.json").read_text())
     mgn = pre["properties"]["pretraining"]["properties"]["max_grad_norm"]
-    assert mgn["default"] == ".inf"   # non-finite default serialized as a JSON-safe sentinel
+    # Template ships a finite default; still confirm the field is a number and
+    # the strict-JSON load above did not hit bare Infinity/NaN constants.
+    assert mgn["type"] == "integer" and mgn["default"] == 1

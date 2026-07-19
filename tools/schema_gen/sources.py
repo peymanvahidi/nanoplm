@@ -26,7 +26,7 @@ class DataclassSource:
 # Surfaces whose docs live in a comment-rich get-yaml template string.
 TEMPLATE_SOURCES = {
     "data":     TemplateSource(str(REPO_SRC / "cli/_templates.py"), "PRETRAIN_DATA_YAML"),
-    "pretrain": TemplateSource(str(REPO_SRC / "cli/pretrain.py"),   "get_yaml"),
+    "pretrain": TemplateSource(str(REPO_SRC / "cli/_templates.py"), "PRETRAIN_YAML"),
     "distill":  TemplateSource(str(REPO_SRC / "cli/distill.py"),    "get_yaml"),
 }
 

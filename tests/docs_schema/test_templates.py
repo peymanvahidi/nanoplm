@@ -4,7 +4,7 @@ from tools.schema_gen import templates
 def test_extract_pretrain_template_text():
     text = templates.load_template_text("pretrain")
     assert "model:" in text and "pretraining:" in text and "resume:" in text
-    assert "micro_batch_seqs: 64" in text
+    assert "micro_batch_seqs: 128" in text
 
 def test_parse_fields_captures_section_key_default_and_comments():
     text = templates.load_template_text("pretrain")
@@ -13,12 +13,12 @@ def test_parse_fields_captures_section_key_default_and_comments():
 
     # bare int default, no end-of-line comment
     mb = by_key[("pretraining", "micro_batch_seqs")]
-    assert mb.raw_default == "64"
+    assert mb.raw_default == "128"
     assert mb.eol_comment == ""
 
     # int default WITH an end-of-line comment
     gbt = by_key[("pretraining", "global_batch_tokens")]
-    assert gbt.raw_default == "256000"
+    assert gbt.raw_default == "1024000"
 
     st = by_key[("pretraining", "stable_tokens")]
     assert st.raw_default == "9000000"
@@ -26,7 +26,7 @@ def test_parse_fields_captures_section_key_default_and_comments():
 
     # quoted string default + its enum-listing end-of-line comment
     opt = by_key[("pretraining", "optimizer")]
-    assert opt.raw_default == '"adamw"'
+    assert opt.raw_default == '"normuon"'
     assert "adamw | stable_adamw | muon | normuon | muonh | aurora" in opt.description
 
     # preceding full-line comment block becomes part of the description
@@ -57,8 +57,9 @@ def test_commented_out_step_override_is_not_attached_as_description():
     # The heading that introduces that commented-out block ("Advanced step
     # overrides ...") documents the block, not `optimizer`, so it goes too.
     assert "Advanced step overrides" not in opt.description
-    # ...while optimizer's own end-of-line comment survives.
-    assert opt.description == "adamw | stable_adamw | muon | normuon | muonh | aurora"
+    # ...while optimizer's own end-of-line enum comment survives (plus optional
+    # intentional preceding note about adam_* / Muon side params).
+    assert "adamw | stable_adamw | muon | normuon | muonh | aurora" in opt.description
 
 def test_same_key_comment_prose_is_kept():
     by_key = {(f.section, f.key): f for f in templates.parse_fields(templates.load_template_text("pretrain"))}

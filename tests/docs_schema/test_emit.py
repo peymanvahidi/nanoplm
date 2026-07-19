@@ -8,7 +8,7 @@ def test_pretrain_schema_shape():
     props = s["properties"]
     assert {"model", "pretraining", "resume"} <= set(props)
     mb = props["pretraining"]["properties"]["micro_batch_seqs"]
-    assert mb["type"] == "integer" and mb["default"] == 64
+    assert mb["type"] == "integer" and mb["default"] == 128
     opt = props["pretraining"]["properties"]["optimizer"]
     assert opt["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "muonh", "aurora"]
     sched = props["pretraining"]["properties"]["lr_schedule"]

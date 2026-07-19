@@ -1,6 +1,8 @@
 """
-YAML template strings emitted by `nanoplm data get-yaml`. Two templates
-each for data.yaml and dvc.yaml — pretrain and distillation variants.
+YAML template strings emitted by `nanoplm * get-yaml` commands.
+
+- Data: PRETRAIN_DATA_YAML / DISTILL_DATA_YAML (data.yaml for pretrain and distill)
+- Pretrain: PRETRAIN_YAML (pretrain.yaml)
 """
 
 PRETRAIN_DATA_YAML = """\
@@ -68,4 +70,366 @@ data_params:
   teacher_model: "prott5"
   samples_per_shard: 2000
   embed_calc_batch_size: 4
+"""
+
+PRETRAIN_YAML = """\
+# =============================================================================
+# Pretraining configuration for nanoPLM
+# =============================================================================
+#
+# Generate:  nanoplm pretrain get-yaml
+# Launch:    nanoplm pretrain from-yaml --pure-torch PATH
+#
+# First edit (most runs only need these):
+#   pretraining.dataset_dir / ckp_dir / project_name / run_name
+#   model size: hidden_size, intermediate_size, num_hidden_layers, heads
+#   batch:      micro_batch_seqs (VRAM) + global_batch_tokens (optimizer step)
+#   schedule:   lr_schedule + token budget (stable_tokens+decay_tokens or train_tokens)
+#   optimizer:  optimizer + adam_learning_rate or muon_learning_rate
+#
+# Data prep (required before pretraining):
+#   1. Set pipeline_mode: 'pretrain' in params.yaml
+#   2. Run: nanoplm data from-yaml
+#      → binary shards + .data_manifest  (sequence length comes from the manifest)
+#
+# Full field docs: website reference/pretrain
+# Backend: prefer CLI --pure-torch / --pure-te over the booleans at the bottom.
+# =============================================================================
+
+
+# =============================================================================
+# model — architecture
+# =============================================================================
+model:
+
+  # ── Architecture (edit these first) ───────────────────────────────────────
+
+  hidden_size: 1024
+  intermediate_size: 2048
+  num_hidden_layers: 16
+  num_attention_heads: 16
+  num_kv_heads: 8                       # GQA; equal to num_attention_heads = MHA
+  vocab_size: 32
+
+  # ── Norms & MLP ───────────────────────────────────────────────────────────
+
+  norm_type: "rmsnorm"                  # layernorm | rmsnorm  (rmsnorm: slightly faster, no bias)
+  mlp_activation: "swiglu"              # swiglu | glu | srelu
+  mlp_dropout: 0.0
+  mlp_bias: false
+  no_mlp_on_first_layer: false
+
+  # ── Attention basics ──────────────────────────────────────────────────────
+
+  attention_bias: false
+  attention_dropout: 0.0
+  classifier_activation: "gelu"         # relu | gelu | srelu  (srelu: pure_torch / pure_te)
+  tie_word_embeddings: false            # share input embedding ↔ output decoder weights
+
+  # ── QK-norm & residual scales ─────────────────────────────────────────────
+
+  # Available on pure_torch and pure_te unless a feature banner says otherwise.
+  use_qk_norm: false                    # RMS-norm Q and K in attention
+  reorder_RoPE_QKNorm: false            # true = norm BEFORE RoPE (LLaMA-style, better fusion); needs use_qk_norm
+  use_resid_lambdas: false              # per-layer residual scale; incompatible with use_mhc_lite
+  use_x0_lambdas: false                 # blend initial embedding x0 into each layer
+
+  # ── RoPE, layer pattern, fusion, init ─────────────────────────────────────
+
+  global_rope_theta: 40000.0            # RoPE base for full-attention layers; lower (10k–40k) suits short max_seq_len
+  local_rope_theta: 10000.0             # RoPE base for sliding-window layers
+  rope_dim_fraction: 1.0                # fraction of head_dim that is rotary (e.g. 0.25 = 25% RoPE + 75% NoPE)
+  attn_layer_pattern: 'F'               # F=full, S=sliding; tiles over num_layers (e.g. 'FSS')
+  fused_qkv: true                       # false = separate Wq / Wk / Wv
+  fused_up_gate: true                   # false = separate W_up / W_gate (SwiGLU/GLU)
+  wo_init: "kaiming"                    # residual out-proj init: kaiming | zero (muonh forbids zero)
+
+  # ── Canon (pure_torch only) ───────────────────────────────────────────────
+
+  use_canon_layers: false               # Canon-ABCD local mixing layers
+  canon_layers_mode: "ac"               # subset of sites A/B/C/D  (e.g. "ac" = lighter)
+  canon_layers_kernel_size: 5           # 3 | 5 | 7
+
+  # ── RePO (pure_torch only) ────────────────────────────────────────────────
+
+  use_repo: false                       # learned per-head positions instead of fixed RoPE
+  repo_after_n_layers: 3                # first N layers keep standard RoPE; rest use RePO
+  # training-time companion: pretraining.repo_rope_warmup_steps
+
+  # ── ProRes ────────────────────────────────────────────────────────────────
+
+  use_prores: false                     # progressive residual warmup (deeper layers slower)
+  prores_T: 1000                        # warmup length for layer 0; layer l ends at step T*l
+
+  # ── mHC-lite (pure_torch only) ────────────────────────────────────────────
+
+  # Multi-stream residual with doubly stochastic mixing.
+  # Incompatible with use_resid_lambdas.
+  use_mhc_lite: false
+  mhc_n_streams: 4                      # residual streams (n! permutation matrices)
+  mhc_lite_wrapping_level: "layer"      # layer | sublayers
+  mhc_triton_fused: true                # fused Triton stream ops; first run slow (autotune)
+
+  # ── Differential attention & paired heads (pure_torch only) ───────────────
+
+  use_diff_attn_v2: false               # DiffAttn V2: doubles Q heads + differential subtract
+  use_paired_head_attention: false      # pair adjacent heads → shared softmax; MHA only; incompatible with diff_attn_v2, RePO, Canon-B
+
+  # ── NOBLE (pure_torch only) ───────────────────────────────────────────────
+
+  # Nonlinear low-rank branches on linear layers.
+  # Training LR scaling lives under pretraining.noble_* (active when use_noble).
+  use_noble: false
+  noble_rank: 64                        # bottleneck rank (typical 64–256)
+  noble_alpha: 0.01                     # W_up initialization scale
+  noble_half_kaiming: true              # halve main weight init scale (paper §3.3)
+  noble_targets: all                    # all | attn | ffn | qkv | out
+
+  # ── Activation checkpointing ──────────────────────────────────────────────
+
+  activation_checkpointing: false       # recompute activations in backward → less VRAM
+  activation_checkpointing_mode: "attn" # layer | attn | attn+mlp   (attn = highest ROI)
+
+  # ── MoE — Mixture-of-Experts (pure_torch only) ────────────────────────────
+
+  # Requires: pretraining.use_packing: true  and  use_static_inp_size: true
+  # Always-on: one shared expert; routing is always sigmoid.
+  use_moe: false
+  moe_num_experts: 8                    # routed experts
+  moe_top_k: 2                          # experts activated per token
+  moe_use_bias_correction: true         # expert-bias load balancing (selection-only)
+  moe_aux_loss_coef: 0.01               # differentiable balance regularizer (router mass)
+  moe_z_loss_coef: 5e-5                 # router z-loss (small-model MoE stability)
+  moe_routed_scaling_factor: 1.0        # routed branch output scale; start conservative
+  moe_n_group: 1                        # group-limited routing: 1 = off; >1 = partitions
+  moe_topk_group: 1                     # when moe_n_group > 1: keep top-K groups / token
+  moe_bias_update_rate: 1e-3            # expert-bias correction step size
+  moe_leading_dense_layers: 1           # first N layers stay dense (DeepSeek uses 1)
+  moe_kernel_backend: 'sonicmoe'        # cutlass | sonicmoe  (SonicMoE/quack fused path)
+
+  # ── Recycling / Huginn architecture (pure_torch only) ─────────────────────
+
+  # recycling_loop_count: 1  →  recycling OFF (default).
+  # Splits the L-layer stack into:
+  #   prelude  P  — first P layers, run once
+  #   recurrent   — layers P .. L-C-1, weight-tied and looped
+  #   coda     C  — last C layers, run once
+  # A learned 2h→h adapter consumes [s, e] at each recycling iteration.
+  # Training-time knobs live under pretraining.recycling_* (when recycling_loop_count > 1).
+  recycling_num_prelude_layers: 0       # P
+  recycling_num_coda_layers: 0          # C
+  recycling_loop_count: 1               # target mean loop count (1 = off)
+  recycling_adapter_bias: false         # bias on 2h→h adapter (Huginn: no bias)
+  recycling_s0_noise_sigma: 0.6324555320336759  # sqrt(2/5) — Huginn s₀ noise scale
+  recycling_use_takase_init: true       # Takase spike init on recurrent block + adapter
+
+
+# =============================================================================
+# pretraining — training loop
+# =============================================================================
+pretraining:
+
+  # ── Paths & run identity ──────────────────────────────────────────────────
+
+  dataset_dir: "output/data/pretrain_data"
+  ckp_dir: "output/pretraining_checkpoints"
+  project_name: "nanoplm-pretraining"
+  run_name: "run"                       # on-disk name: DDMMHHMM-<run_name>
+
+  # ── Batch (token-budget surface) ──────────────────────────────────────────
+
+  # micro_batch_seqs     = sequences per GPU per forward  (the VRAM knob)
+  # global_batch_tokens  = tokens per optimizer step
+  # Gradient accumulation is inferred from those two + manifest seq_len +
+  # world_size. You never set grad_accum yourself.
+  micro_batch_seqs: 128
+  global_batch_tokens: 1024000
+  # Ramp global batch: 1/8 → 1/4 → 1/2 → full, reaching full at this step.
+  # 0 = disabled (no batch-size warmup).
+  global_batch_warmup_steps: 0
+
+  # ── Duration + LR schedule ────────────────────────────────────────────────
+
+  # Token budget, not epochs.
+  #   lr_schedule: wsd
+  #     set stable_tokens + decay_tokens
+  #     stable_tokens INCLUDES warmup — it is the point where decay begins,
+  #     not a length added after warmup. decay_tokens IS a length after that.
+  #   lr_schedule: warmup_stable | cosine | linear
+  #     comment out stable_tokens / decay_tokens; uncomment train_tokens
+  # warmup_steps is used by ALL schedules.
+  # Prefer tokens over steps. Step overrides (below) replace their *_tokens twin — never set both of a pair.
+  lr_schedule: "wsd"                    # wsd | warmup_stable | cosine | linear
+  warmup_steps: 1000
+  stable_tokens: 9000000                # wsd only: tokens up to the pre-decay checkpoint (warmup included)
+  decay_tokens: 1000000                 # wsd only: additional anneal tokens
+  decay_shape: "1-sqrt"                 # 1-sqrt | linear
+  lr_decay_to_fraction: 0.1
+  # train_tokens: 10000000              # non-wsd single-phase budget (NOT used with wsd)
+  #
+  # Advanced step overrides (uncomment one side of a pair only):
+  # stable_steps:                       # ↔ stable_tokens  (wsd)
+  # decay_steps:                        # ↔ decay_tokens   (wsd / resume-decay)
+  # max_steps:                          # ↔ train_tokens   (warmup_stable | cosine | linear)
+
+  # ── Optimizer — shared & Adam side ────────────────────────────────────────
+
+  # adam_* also drives the AdamW side (1D params + embeddings/unembed) when
+  # optimizer is muon | normuon | muonh | aurora.
+  optimizer: "normuon"                  # adamw | stable_adamw | muon | normuon | muonh | aurora
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1e-8
+  adam_learning_rate: 1e-4
+  adam_weight_decay: 0.0
+  max_grad_norm: 1
+
+  # ── Optimizer — Muon family ───────────────────────────────────────────────
+
+  muon_learning_rate: 1e-3
+  muon_weight_decay: 0.01
+  muon_cautious_weight_decay: true
+  muon_use_polar_express: true
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_eps: 1e-7
+  muonh_normalization: "neuron"         # muonh only: neuron | short_axis | none
+  muonh_scope: "all"                    # muonh|aurora: all = all matrices; mlp = MLP only (rest on NorMuon)
+
+  # ── RePO training (when model.use_repo: true) ─────────────────────────────
+
+  repo_rope_warmup_steps: 1000
+
+  # ── NOBLE LR scaling (only when model.use_noble: true) ────────────────────
+
+  noble_base_lr: 3e-4                   # independent base LR for NOBLE branch params
+  noble_lr_gamma: 0.3                   # W_up LR power  (actual exponent = 2γ = 0.6)
+  noble_lr_gamma_M: 0.45                # M mixing-matrix LR power
+  noble_freq_lr_mult: 3.0               # ω frequency LR multiplier
+  noble_phase_lr_mult: 5.0              # φ phase LR multiplier
+
+  # ── Recycling training (only when model.recycling_loop_count > 1) ──────────
+
+  recycling_bptt: 8                     # truncated BPTT depth K (last K iters get grads)
+  recycling_loop_count_sampling: "lognormal_poisson"  # fixed | lognormal_poisson
+  recycling_loop_count_sigma: 0.5       # log-normal std (Huginn value)
+  recycling_loop_count_curriculum: "1_sqrt"           # none | linear | 1_sqrt
+  recycling_loop_count_curriculum_steps: -1           # -1 = auto (25% of total steps)
+  recycling_pretraining_eval_loop_counts: null        # null = single r at target mean; e.g. [1, 4] for eval sweep
+
+  # ── MLM objective ─────────────────────────────────────────────────────────
+
+  mlm_probability: 0.3
+  mlm_masking_strategy: "token"         # token = independent per-token; span = BERT-style contiguous spans
+  mlm_span_mean_length: 3.0             # only when mlm_masking_strategy: span
+  mlm_span_max_length: 10               # only when mlm_masking_strategy: span
+  mask_replace_prob: 0.8
+  random_token_prob: 0.1
+  keep_probability: 0.1
+  mlm_standard_amino_acids_only: true   # true = 20 standard AAs for targets/random; false = all non-special tokens
+
+  # ── Logging, eval, checkpoints ────────────────────────────────────────────
+
+  logging_steps: 1
+  eval_steps: 1000
+  save_steps: 2500
+  seed: 42
+
+  # ── Debug ─────────────────────────────────────────────────────────────────
+
+  debug_non_finite_params: false        # NaN/Inf check on params after every step
+  debug_layerwise_metrics: false        # per-layer grad/weight norms, residual RMS, logits; overhead; breaks compile; not pure_te
+  debug_layerwise_log_every: 100        # log layerwise metrics every N optimizer steps
+
+  # ── Data loading ──────────────────────────────────────────────────────────
+
+  num_workers: "auto"
+  prefetch_factor: 2
+  use_packing: true
+  use_static_inp_size: true             # required for MoE; also helps compile shapes
+
+  # ── torch.compile knobs (pure_torch only) ─────────────────────────────────
+
+  use_compile_max_autotune: false       # may raise throughput; long compile/autotune at start
+  compile_triton_persistent_reductions: false  # set true if it works on your shapes/GPU
+  compile_triton_mix_order_reduction: false    # may be faster; can hit shared-memory limits
+
+  # ── Precision ─────────────────────────────────────────────────────────────
+
+  # Recommended: keep bf16 enabled (~1.5–3× speedup).
+  # When bf16: true, hardware picks the best path:
+  #   CUDA Ampere+ (A100, RTX 3090+)  →  bf16 + TF32
+  #   CUDA Volta/Turing (V100, 2080)  →  fp16 fallback
+  #   Apple Silicon (M1/M2/M3/…)      →  fp16 (hardware accelerated)
+  #   CPU                             →  fp32 (no mixed precision)
+  bf16: true
+  tf32: true
+
+  # FP8 — pure_torch targets vs TE recipe knobs (see field comments)
+  fp8: false
+  fp8_target: "mlp"                     # pure_torch: mlp | attn_wqkv | attn_wo; combine as "attn_wqkv,mlp" or YAML list
+  fp8_skip_last_n_layers: 0             # pure_torch FP8: keep final N layers in bf16
+  fp8_recipe: "delayed"                 # TE only: delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)
+  fp8_format: "hybrid"                  # TE only: hybrid | e4m3; ignored by nvfp4
+  fp8_amax_history_len: 64              # TE DelayedScaling only: amax history window
+  fp8_reduce_amax: true                 # TE DelayedScaling: sync amax across FP8 group
+  fp8_cpu_activation_offload: false     # pure_torch FP8: TE CPU activation offload hooks
+  # Offload knobs below were hand-tuned for 4×GH200; other systems not guaranteed.
+  fp8_cpu_activation_offload_layers: "auto"  # reserved; offloads eligible TE LayerNormLinear + LayerNormMLP wrappers
+  fp8_cpu_activation_offload_retain_buffers: false  # reuse pinned CPU buffers across iters (stable shapes)
+
+  # ── Distributed ───────────────────────────────────────────────────────────
+
+  multi_gpu: true
+  distributed_mode: "fsdp"              # fsdp | hsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)
+  hsdp_shard_size: 'auto'               # hsdp only: GPUs per replica; 'auto'=LOCAL_WORLD_SIZE; must divide world_size
+  fsdp_shard_granularity: "layer"       # layer (NVLink/SXM) | sublayer (PCIe overlap)
+  fsdp_reshard_after_forward: false     # FSDP2 reshard_after_forward (pure_torch / pure_te)
+  world_size: 'auto'
+  ddp_bucket_cap_mb: 25                 # only when distributed_mode: ddp
+
+  # ── Profiler ──────────────────────────────────────────────────────────────
+
+  profiler_enabled: false
+  profiler_start_step: 18
+  profiler_end_step: 22
+
+
+# =============================================================================
+# resume — restart from a checkpoint
+# =============================================================================
+resume:
+
+  # ── Entry points ──────────────────────────────────────────────────────────
+
+  is_resume: false
+  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
+  # FOOTGUN: the stock default mode is "decay". Flipping only is_resume: true
+  # starts a decay run, not a continuation. Always set mode explicitly.
+  # Two resume modes:
+  # continue - finish the original token/step budget from the checkpoint
+  #   with the original schedule. Takes NO decay_* fields.
+  # decay - anneal a stable-end trunk checkpoint over an additional budget.
+  #   Set exactly one of decay_tokens / decay_steps. decay_shape is OPTIONAL
+  #   (falls back to schedule default). lr_decay_to_fraction is REQUIRED for
+  #   mode: decay.
+  #   NOTE: decay restarts the dataloader from the start of a pass, so a
+  #   resume-decay matches a single-run wsd decay bit-for-bit only when the
+  #   trunk's stable->decay boundary is data-pass aligned; keep
+  #   global_batch_tokens / world_size identical to the trunk's run.
+  mode: "decay"                         # continue | decay
+
+  # ── Decay-mode fields (omit / null for mode: continue) ────────────────────
+
+  # decay-mode fields (leave null / omit for mode: continue):
+  decay_tokens: 1000000                 # additional anneal tokens (or use decay_steps)
+  decay_shape: "1-sqrt"                 # 1-sqrt | linear
+  lr_decay_to_fraction: 0.1             # REQUIRED for mode: decay
+
+
+# =============================================================================
+# Backend selection (CLI flags override these)
+# =============================================================================
+pure_torch: true
+# pure_te: false
 """
