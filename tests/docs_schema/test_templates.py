@@ -72,15 +72,49 @@ def test_same_key_comment_prose_is_kept():
     assert "decay restarts the dataloader" in mode.description
     assert "continue | decay" in mode.description
     # A `# decay-mode fields (leave null / omit for mode: continue):` heading is
-    # prose too, not a commented-out field.
-    assert "decay-mode fields" in by_key[("resume", "decay_tokens")].description
+    # prose too, not a commented-out field. It opens its banner's block, so it is
+    # kept as that block's note rather than as the first field's description.
+    _, notes = templates.parse_template(templates.load_template_text("pretrain"))
+    assert "decay-mode fields" in notes[
+        ("resume", "Decay-mode fields (omit / null for mode: continue)")
+    ]
+    assert "decay-mode fields" not in by_key[("resume", "decay_tokens")].description
 
 def test_distill_descriptions_not_over_dropped():
     by_key = {(f.section, f.key): f for f in templates.parse_fields(templates.load_template_text("distill"))}
     # `# Optimizer: adamw | muon | normuon` is a human heading documenting the
-    # optimizer field (case-insensitive key match) — must be retained.
+    # optimizer field (case-insensitive key match). Must be retained.
     assert "adamw | muon | normuon" in by_key[("distillation", "optimizer")].description
     # `# Note: paths are RELATIVE ...` is prose, not a commented-out field.
     assert "RELATIVE" in by_key[("distillation", "dataset_dir")].description
     # cross-referenced `# resume_epochs: 0 (or unset) ...` prose above is_resume is kept.
     assert "continues to the original" in by_key[("resume", "is_resume")].description
+
+
+def test_group_banners_become_groups_and_notes():
+    text = templates.load_template_text("pretrain")
+    fields, notes = templates.parse_template(text)
+    by_key = {(f.section, f.key): f for f in fields}
+
+    # Every field sits under the `# -- Title ---` banner above it.
+    assert by_key[("model", "hidden_size")].group == "Architecture (edit these first)"
+    assert by_key[("pretraining", "profiler_enabled")].group == "Profiler"
+    # A banner never leaks into the field's own description.
+    assert "Profiler" not in by_key[("pretraining", "profiler_enabled")].description
+    # A new section resets the grouping.
+    assert by_key[("resume", "is_resume")].group == "Entry points"
+
+    # Prose between a banner and the block's first field documents the block, so
+    # it becomes the group note instead of that one field's description.
+    assert "Gradient accumulation is inferred" in notes[
+        ("pretraining", "Batch (token-budget surface)")
+    ]
+    assert by_key[("pretraining", "micro_batch_seqs")].description == ""
+    # Prose that follows a field still documents the next field.
+    assert "Two resume modes" in by_key[("resume", "mode")].description
+
+
+def test_templates_without_banners_are_ungrouped():
+    fields, notes = templates.parse_template(templates.load_template_text("data"))
+    assert {f.group for f in fields} == {""}
+    assert notes == {}

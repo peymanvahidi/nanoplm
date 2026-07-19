@@ -1,0 +1,12 @@
+---
+// website/src/components/MobileTableOfContents.astro
+// The narrow-viewport twin of TableOfContents.astro. Same patch, so the mobile
+// dropdown lists the same entries as the desktop panel.
+import Default from '@astrojs/starlight/components/MobileTableOfContents.astro';
+import { withFieldGroups } from '../lib/toc';
+
+const { toc, slug } = Astro.props;
+const patched = toc ? { ...toc, items: withFieldGroups(toc.items, slug) } : toc;
+---
+
+<Default {...Astro.props} toc={patched} />

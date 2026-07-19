@@ -3,8 +3,8 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 // Published to GitHub Pages at https://peymanvahidi.github.io/nanoplm/.
-// `base` is why every in-content link is written as /nanoplm/... — Astro does not
-// rewrite root-relative links inside Markdown, so the prefix is spelled out. CI
+// `base` is why every in-content link is written as /nanoplm/..., since Astro does
+// not rewrite root-relative links inside Markdown. The prefix is spelled out. CI
 // stages the build under _linkcheck/nanoplm/ so lychee can verify those links.
 export default defineConfig({
   site: 'https://peymanvahidi.github.io',
@@ -20,6 +20,16 @@ export default defineConfig({
         'Pretrain a protein language model from a FASTA file. Three YAML files, three commands.',
       social: { github: 'https://github.com/peymanvahidi/nanoplm' },
       customCss: ['./src/styles/custom.css'],
+      // The config reference nests three levels: the file, its `model:` /
+      // `pretraining:` / `resume:` blocks, and the field groups inside each.
+      // Starlight stops at 3 by default, which would cut the groups off.
+      tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 4 },
+      // Both ToC components are patched to include the field groups, which are
+      // rendered from the generated schema and so are invisible to remark.
+      components: {
+        TableOfContents: './src/components/TableOfContents.astro',
+        MobileTableOfContents: './src/components/MobileTableOfContents.astro',
+      },
       expressiveCode: { themes: ['github-dark', 'github-light'] },
       editLink: {
         baseUrl: 'https://github.com/peymanvahidi/nanoplm/edit/master/website/',

@@ -17,7 +17,7 @@ _DRAFT = "https://json-schema.org/draft/2020-12/schema"
 
 
 # Annotation keys an overlay entry (or an x-extra-fields declaration) may carry.
-_ANNOTATION_KEYS = ("enum", "minimum", "maximum", "backend", "advanced")
+_ANNOTATION_KEYS = ("enum", "minimum", "maximum", "backend", "advanced", "group")
 
 
 def _apply(frag: dict, key: str, description: str, ov: dict, vis: dict) -> dict:
@@ -33,6 +33,11 @@ def _apply(frag: dict, key: str, description: str, ov: dict, vis: dict) -> dict:
         frag["x-nanoplm-backend"] = ov["backend"]
     if ov.get("advanced"):
         frag["x-nanoplm-advanced"] = True
+    # An overlay/x-extra-fields `group` wins over the banner the parser found,
+    # which is how a commented-out field is filed under the block that documents
+    # it (the parser cannot see it, so it has no banner of its own).
+    if ov.get("group"):
+        frag["x-nanoplm-group"] = ov["group"]
     if key in vis:
         frag["x-nanoplm-visible-when"] = vis[key]
     return frag
@@ -44,9 +49,12 @@ def _fold(frag: dict, section: str, key: str, description: str, o: dict, vis: di
 
 
 def _field_schema(section: str, key: str, raw_default: str, description: str,
-                  o: dict, vis: dict) -> dict:
+                  o: dict, vis: dict, group: str = "") -> dict:
     # Template (YAML-literal) surfaces: infer type + default from the literal text.
-    return _fold(_types.infer(raw_default), section, key, description, o, vis)
+    frag = _types.infer(raw_default)
+    if group:
+        frag["x-nanoplm-group"] = group
+    return _fold(frag, section, key, description, o, vis)
 
 
 def _extra_field_schema(section: str, key: str, spec: dict, o: dict, vis: dict) -> dict:
@@ -139,6 +147,26 @@ def _dataclass_field_schema(field, o: dict, vis: dict):
     return frag, required
 
 
+def _regroup(properties: dict) -> dict:
+    """Reorder one section's fields so each group's fields stay contiguous.
+
+    The template parser emits fields in template order, which is already grouped,
+    but `x-extra-fields` are folded in afterwards and land at the end of the
+    section, away from the block that documents them. Bucketing by group (groups
+    in first-appearance order, fields in template order within a group) puts them
+    back. A section with no banners has one bucket and comes out unchanged.
+    """
+    order: list[str] = []
+    for frag in properties.values():
+        g = frag.get("x-nanoplm-group", "")
+        if g not in order:
+            order.append(g)
+    buckets: dict[str, list[tuple[str, dict]]] = {g: [] for g in order}
+    for key, frag in properties.items():
+        buckets[frag.get("x-nanoplm-group", "")].append((key, frag))
+    return {key: frag for g in order for key, frag in buckets[g]}
+
+
 def build_surface(surface: str) -> dict:
     o = _overlay.load()
     vis = _gates.visibility_gates()
@@ -148,17 +176,25 @@ def build_surface(surface: str) -> dict:
     if surface in TEMPLATE_SOURCES:
         text = _tpl.load_template_text(surface)
         sections: dict[str, dict] = {}
-        for f in _tpl.parse_fields(text):
+        parsed, group_notes = _tpl.parse_template(text)
+        for f in parsed:
             sec = sections.setdefault(f.section, {"type": "object", "properties": {}})
             sec["properties"][f.key] = _field_schema(
-                f.section, f.key, f.raw_default, f.description, o, vis
+                f.section, f.key, f.raw_default, f.description, o, vis, f.group
             )
         # Fold in the fields the template ships commented out (see overlay.yaml's
-        # `x-extra-fields`) — they are user-settable and must be documented.
+        # `x-extra-fields`). They are user-settable and must be documented.
         for sec_name, extras in _overlay.extra_fields(o, surface).items():
             sec = sections.setdefault(sec_name, {"type": "object", "properties": {}})
             for key, spec in (extras or {}).items():
                 sec["properties"][key] = _extra_field_schema(sec_name, key, spec or {}, o, vis)
+        for sec_name, sec in sections.items():
+            sec["properties"] = _regroup(sec["properties"])
+            # The banner-intro prose for each block that has any, so the docs can
+            # render it under the heading instead of on the block's first field.
+            notes = {g: note for (s, g), note in group_notes.items() if s == sec_name}
+            if notes:
+                sec["x-nanoplm-group-notes"] = notes
         props = sections
     elif surface in DATACLASS_SOURCES:
         spec = DATACLASS_SOURCES[surface]

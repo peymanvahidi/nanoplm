@@ -2,7 +2,7 @@
 // website/src/components/LoopDiagram.astro
 // The one loop, taught once: get-yaml → edit → from-yaml. Sits directly above
 // PipelineDiagram on the pipeline overview, so it is deliberately lighter than
-// a stage card — it reads as the key to the diagram below, not a rival to it.
+// a stage card, so it reads as the key to the diagram below, not a rival to it.
 // Zero JS; Starlight theme variables only, so light/dark tracks automatically.
 
 // Split so `<stage>` can be highlighted in all three commands: the whole point
@@ -36,7 +36,7 @@ const STEPS = [
 ---
 
 <div class="loop-wrap">
-  {/* `not-content` opts the list out of Starlight's markdown styling — without
+  {/* `not-content` opts the list out of Starlight's markdown styling. Without
       it, its `li + li` top margin drops cards 2 and 3 inside their grid cells.
       Astro scopes with :where() (zero specificity), so a local reset can't win. */}
   <ol class="loop not-content">
@@ -65,7 +65,7 @@ const STEPS = [
   }
 
   .loop {
-    /* Beat Starlight's list styling — this is a diagram, not prose. */
+    /* Beat Starlight's list styling: this is a diagram, not prose. */
     list-style: none;
     margin: 0;
     padding: 0;
@@ -91,7 +91,7 @@ const STEPS = [
     background: var(--sl-color-black);
   }
 
-  /* Step 2 is the human one: dashed, unfilled — visibly the step nanoPLM
+  /* Step 2 is the human one: dashed and unfilled, visibly the step nanoPLM
      does not do for you. */
   .loop-step.is-you {
     border-style: dashed;
@@ -128,7 +128,7 @@ const STEPS = [
     color: var(--sl-color-white);
   }
 
-  /* Qualified so it beats the site-wide inline-code chip style in custom.css —
+  /* Qualified so it beats the site-wide inline-code chip style in custom.css.
      plain mono, no border or padding. */
   .loop-step .loop-cmd {
     font-family: var(--sl-font-mono);
@@ -162,7 +162,7 @@ const STEPS = [
 
   @container (min-width: 34rem) {
     .loop {
-      /* The gap is the arrow track — connectors are drawn across it. */
+      /* The gap is the arrow track: connectors are drawn across it. */
       grid-template-columns: repeat(3, 1fr);
       align-items: stretch;
       gap: 2.5rem;

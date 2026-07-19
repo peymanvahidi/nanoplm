@@ -7,7 +7,7 @@ import { FileTree, Steps } from '@astrojs/starlight/components';
 
 The pretraining stage reads the shards and `.data_manifest` the [data stage](/nanoplm/pipeline/data/) produced, trains a masked-language model on them, and writes self-describing checkpoints.
 
-`nanoplm pretrain get-yaml` writes a scaffold of about 207 lines. That number is not a warning: it is the whole surface of the codebase, exposed so that nothing is hidden from you. **A real run touches roughly a dozen of those keys.** Everything else has a working default, and this page is a tour of the handful you will actually edit.
+`nanoplm pretrain get-yaml` writes a scaffold of about 360 lines, split into labelled blocks. That number is not a warning: it is the whole surface of the codebase, exposed so that nothing is hidden from you. **A real run touches roughly a dozen of those keys.** Everything else has a working default, and this page is a tour of the handful you will actually edit.
 
 ## Run it
 

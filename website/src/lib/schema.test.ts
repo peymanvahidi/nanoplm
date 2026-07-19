@@ -1,6 +1,14 @@
 // website/src/lib/schema.test.ts
 import { describe, it, expect } from 'vitest';
-import { toRows, stripEnumRestatement, type Surface, type SectionSchema } from './schema';
+import {
+  toRows,
+  toGroups,
+  groupSlug,
+  stripEnumRestatement,
+  type Surface,
+  type SectionSchema,
+} from './schema';
+import { withFieldGroups, type TocItem } from './toc';
 import pretrain from '../generated/nanoplm.pretrain.schema.json';
 import evalSchema from '../generated/nanoplm.eval.schema.json';
 
@@ -16,7 +24,9 @@ describe('toRows', () => {
     const source = (pretrain as Surface).properties.pretraining as SectionSchema;
     expect(mb.default).toBe(source.properties.micro_batch_seqs.default);
     expect(mb.default).toEqual(expect.any(Number));
-    expect(mb.description).toBeTruthy();
+    // No per-field description on purpose: the template documents this one in
+    // its block's intro prose, which now lives on the group (see toGroups).
+    expect(rows.find((r) => r.key === 'run_name')?.description).toBeTruthy();
   });
 
   it('surfaces enum and backend tags', () => {
@@ -52,12 +62,10 @@ describe('toRows', () => {
 
   it('drops descriptions that only restate the enum', () => {
     const rows = toRows(pretrain as Surface, 'pretraining');
-    // "adamw | stable_adamw | muon | ..." — the choice list already says this.
+    // "adamw | stable_adamw | muon | ...": the choice list already says this.
     expect(rows.find((r) => r.key === 'optimizer')?.description).toBeUndefined();
-    // "Duration + LR schedule (token-budget surface) wsd | warmup_stable | ..."
-    expect(rows.find((r) => r.key === 'lr_schedule')?.description).toBe(
-      'Duration + LR schedule (token-budget surface)',
-    );
+    // Likewise "wsd | warmup_stable | cosine | linear".
+    expect(rows.find((r) => r.key === 'lr_schedule')?.description).toBeUndefined();
   });
 
   it('keeps descriptions that explain the values rather than list them', () => {
@@ -66,12 +74,9 @@ describe('toRows', () => {
     expect(rows.find((r) => r.key === 'mlm_masking_strategy')?.description).toContain(
       'BERT-style',
     );
-    expect(rows.find((r) => r.key === 'muonh_scope')?.description).toContain('MLP matrices');
-    const model = toRows(pretrain as Surface, 'model');
-    // The run sits mid-sentence; removing it would leave "(allowed: , default: 5)".
-    expect(model.find((r) => r.key === 'canon_layers_kernel_size')?.description).toBe(
-      'symmetric Canon kernel size (allowed: 3/5/7, default: 5)',
-    );
+    expect(rows.find((r) => r.key === 'muonh_scope')?.description).toContain('rest on NorMuon');
+    // The mid-sentence case ("size (allowed: a/b, default: b)") no longer occurs
+    // in the real template, so it is exercised by the unit tests below instead.
   });
 
   describe('stripEnumRestatement', () => {
@@ -87,7 +92,7 @@ describe('toRows', () => {
     });
 
     it('leaves a run alone unless it lists every value at an edge', () => {
-      // Partial list — the rest of the sentence may depend on it.
+      // Partial list, so the rest of the sentence may depend on it.
       expect(stripEnumRestatement('a | b then something', ['a', 'b', 'c'])).toBe(
         'a | b then something',
       );
@@ -105,6 +110,90 @@ describe('toRows', () => {
       expect(stripEnumRestatement(desc, ['continue', 'decay'])).toBe(
         'one of decay_tokens / decay_steps.',
       );
+    });
+  });
+
+  describe('toGroups', () => {
+    it('folds a section into the template blocks, in template order', () => {
+      const pre = pretrain as Surface;
+      const groups = toGroups(toRows(pre, 'model'), pre, 'model');
+      expect(groups[0].title).toBe('Architecture (edit these first)');
+      expect(groups.at(-1)!.title).toContain('Recycling');
+      // Every field lands in exactly one block, and none is left ungrouped.
+      expect(groups.flatMap((g) => g.rows)).toHaveLength(toRows(pre, 'model').length);
+      expect(groups.every((g) => g.title)).toBe(true);
+    });
+
+    it('carries the block intro prose as the group note, not the first field', () => {
+      const pre = pretrain as Surface;
+      const groups = toGroups(toRows(pre, 'pretraining'), pre, 'pretraining');
+      const batch = groups.find((g) => g.title === 'Batch (token-budget surface)')!;
+      // This sentence describes the whole block. Before it had a home it was
+      // glued to micro_batch_seqs, which read as a note about that one key.
+      expect(batch.note).toContain('Gradient accumulation is inferred');
+      expect(batch.rows.find((r) => r.key === 'micro_batch_seqs')?.description).toBeUndefined();
+    });
+
+    it('files the commented-out step overrides under the schedule block', () => {
+      // They reach the schema via x-extra-fields, which appends them to the end
+      // of the section; the generator regroups so they sit with their twins.
+      const pre = pretrain as Surface;
+      const groups = toGroups(toRows(pre, 'pretraining'), pre, 'pretraining');
+      const duration = groups.find((g) => g.title === 'Duration + LR schedule')!;
+      const keys = duration.rows.map((r) => r.key);
+      for (const key of ['stable_tokens', 'stable_steps', 'decay_steps', 'max_steps']) {
+        expect(keys).toContain(key);
+      }
+    });
+
+    it('marks a block advanced only when every field in it is', () => {
+      const pre = pretrain as Surface;
+      const groups = toGroups(toRows(pre, 'pretraining'), pre, 'pretraining');
+      expect(groups.find((g) => g.title === 'Paths & run identity')!.advanced).toBe(false);
+      expect(groups.find((g) => g.title!.startsWith('torch.compile'))!.advanced).toBe(true);
+    });
+
+    it('yields one untitled block for a template with no banners', () => {
+      const groups = toGroups(toRows(evalSchema as Surface), evalSchema as Surface);
+      expect(groups).toHaveLength(1);
+      expect(groups[0].title).toBe('');
+      expect(groups[0].slug).toBe('');
+    });
+  });
+
+  describe('groupSlug', () => {
+    it('keeps underscores so a backend name survives', () => {
+      expect(
+        groupSlug('pretrain-model', 'Recycling / Huginn architecture (pure_torch only)'),
+      ).toBe('pretrain-model-group-recycling-huginn-architecture-pure_torch-only');
+      expect(groupSlug('pretrain-model', 'Norms & MLP')).toBe('pretrain-model-group-norms-mlp');
+    });
+  });
+
+  describe('withFieldGroups', () => {
+    const toc = (): TocItem[] => [
+      { depth: 2, slug: 'the-fields', text: 'The fields', children: [
+        { depth: 3, slug: 'model', text: 'model', children: [] },
+      ] },
+    ];
+
+    it('nests every block under its section, with ids the renderer emits', () => {
+      const out = withFieldGroups(toc(), 'reference/pretrain');
+      const model = out[0].children[0];
+      expect(model.children.length).toBeGreaterThan(10);
+      expect(model.children[0]).toEqual({
+        depth: 4,
+        slug: groupSlug('pretrain-model', 'Architecture (edit these first)'),
+        text: 'Architecture (edit these first)',
+        children: [],
+      });
+    });
+
+    it('leaves other pages and the caller’s array alone', () => {
+      const input = toc();
+      expect(withFieldGroups(input, 'guides/optimizers')).toBe(input);
+      withFieldGroups(input, 'reference/pretrain');
+      expect(input[0].children[0].children).toEqual([]);
     });
   });
 

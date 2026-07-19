@@ -48,7 +48,7 @@ PARITY_SOURCES = {
 COMPAT_MATRIX = str(REPO_SRC / "config/recycling_compatibility.yaml")
 
 # Fields that exist on the dataclass but are intentionally NOT user-facing
-# (auto-computed/internal) — excluded from the parity check.
+# (auto-computed/internal). Excluded from the parity check.
 PARITY_INTERNAL_ALLOWLIST = {
     # Derived at runtime by cli/pretrain.py::_populate_batch_setup from
     # global_batch_tokens / micro_batch_seqs / manifest.max_seq_len / world_size.
@@ -59,7 +59,7 @@ PARITY_INTERNAL_ALLOWLIST = {
                     "achieved_global_batch_tokens"},
     "resume": set(),
     "distillation": {
-        # Auto-populated from the .data_manifest / data-prep params.yaml — not
+        # Auto-populated from the .data_manifest / data-prep params.yaml, not
         # set by the user in distill.yaml's `distillation:` section.
         "train_fasta", "val_fasta", "train_h5_prefix", "val_h5_prefix",
         "train_sequences", "val_sequences", "max_seq_len", "max_seqs_num",

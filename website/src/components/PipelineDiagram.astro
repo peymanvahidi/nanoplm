@@ -33,7 +33,7 @@ const STAGES = [
   },
 ];
 
-// What each stage hands to the next. These are the real filenames on disk —
+// What each stage hands to the next. These are the real filenames on disk,
 // they are the whole point of the diagram.
 const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.yaml'];
 ---
@@ -72,7 +72,7 @@ const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.y
 <style>
   /* The wrapper is a container-query root: the grid goes 3-across only when
      the diagram is wide enough for one-line commands; otherwise it stacks.
-     It stays exactly as wide as the prose column — no breakout. */
+     It stays exactly as wide as the prose column, no breakout. */
   .pipe-wrap {
     container-type: inline-size;
     margin: 1.75rem 0 2.25rem;
@@ -85,7 +85,7 @@ const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.y
     gap: 0.4rem;
   }
 
-  /* Cards sit a step above the page background — a faint top-lit gradient in
+  /* Cards sit a step above the page background: a faint top-lit gradient in
      dark mode (overridden to flat white in light mode below). */
   .pipe-stage {
     position: relative;
@@ -125,7 +125,7 @@ const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.y
     outline-offset: 2px;
   }
 
-  /* Cards are links — a quiet affordance in the corner that answers on hover. */
+  /* Cards are links, with a quiet affordance in the corner that answers on hover. */
   .pipe-stage::after {
     content: '→';
     position: absolute;
@@ -194,7 +194,7 @@ const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.y
     line-height: 1.45;
   }
   /* Qualified selectors so these beat the site-wide inline-code chip style
-     (border + padding) from custom.css — plain mono, no chrome. */
+     (border + padding) from custom.css: plain mono, no chrome. */
   .pipe-stage .pipe-cmd {
     font-family: var(--sl-font-mono);
     font-size: inherit;
@@ -224,7 +224,7 @@ const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.y
     padding: 0;
   }
 
-  /* The arrow carries the artifact name — the handoff IS the content.
+  /* The arrow carries the artifact name: the handoff IS the content.
      Stacked: a file chip beside a short dashed drop line. */
   .pipe-arrow {
     display: flex;
@@ -266,8 +266,8 @@ const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.y
   }
 
   /* Three-across, but only once the cards genuinely fit their commands on
-     one line — tuned so the full prose column (~50rem) qualifies. Below
-     that the stacked layout stays — better stacked than wrapped
+     one line, tuned so the full prose column (~50rem) qualifies. Below
+     that the stacked layout stays, since stacked beats wrapped
      mid-command. The prompt glyphs and chip chrome are dropped here: at
      these sizes every character of width goes to the commands themselves. */
   @container (min-width: 49rem) {

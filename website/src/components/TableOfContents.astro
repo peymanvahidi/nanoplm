@@ -1,0 +1,13 @@
+---
+// website/src/components/TableOfContents.astro
+// Starlight override. Adds the config reference's field blocks to the ToC (see
+// lib/toc.ts for why they are missing) and otherwise renders Starlight's own
+// component untouched, so it keeps every future upstream fix.
+import Default from '@astrojs/starlight/components/TableOfContents.astro';
+import { withFieldGroups } from '../lib/toc';
+
+const { toc, slug } = Astro.props;
+const patched = toc ? { ...toc, items: withFieldGroups(toc.items, slug) } : toc;
+---
+
+<Default {...Astro.props} toc={patched} />

@@ -17,6 +17,7 @@ class ExtractedField:
     key: str              # field name
     raw_default: str      # exact text of the value, e.g. '64', '"adamw"', '.inf', 'null'
     eol_comment: str      # end-of-line comment text (no leading '#')
+    group: str = ""       # nearest `# ── Title ───` banner above the key ("" if none)
     preceding: list[str] = field(default_factory=list)  # full-line comments above the key
 
     @property
@@ -80,6 +81,14 @@ def load_template_text(surface: str) -> str:
 _TOP = re.compile(r"^(?P<key>[A-Za-z_][\w]*):")  # column-0 lines in these templates are bare section headers
 _FIELD = re.compile(r"^\s+(?P<key>[A-Za-z_][\w]*):\s?(?P<val_and_comment>.*)$")
 
+# A group banner: `# ── Norms & MLP ──────────────`. The pretrain template uses
+# these to break its long sections into labelled blocks; the docs reference
+# renders the same blocks, so the grouping cannot drift from the template.
+# Box-drawing U+2500 only, so an ordinary `# --- note ---` comment stays prose.
+_GROUP = re.compile(r"^─+\s*(?P<title>\S.*?)\s*─+$")
+# A titleless rule (`# =========`, `# ─────────`). Never a description.
+_RULE = re.compile(r"^[─=_-]{3,}$")
+
 # A buffered full-line comment shaped like `<identifier>: ...`.
 _COMMENTED_FIELD = re.compile(r"^(?P<key>[A-Za-z_]\w*):")
 
@@ -88,10 +97,10 @@ def _describes(comment: str, field_key: str) -> bool:
     """Whether a buffered full-line comment documents ``field_key``.
 
     Most comments document the field directly below them and are kept. The one
-    exception is a *commented-out other field* — e.g. an optional
-    ``# num_kv_heads: 8`` line, or a value-less placeholder like
+    exception is a *commented-out other field*: an optional ``# num_kv_heads: 8``
+    line, say, or a value-less placeholder like
     ``# max_steps:   # ↔ train_tokens``, sitting directly above an unrelated
-    field — which must NOT become that field's description. Such a line is
+    field. Such a line must NOT become that field's description. It is
     recognised as ``<identifier>:`` for a *different* key with either a single
     scalar value (``8``, ``"x"``, ``false``, ``null``) or no value at all.
     Human-written headings and prose that merely start with ``Word:`` (e.g.
@@ -106,7 +115,7 @@ def _describes(comment: str, field_key: str) -> bool:
     value, _ = _split_value_comment(comment[m.end():])
     # Keep only genuine prose: a multi-word value. A commented-out config field
     # carries a single scalar value (`# num_kv_heads: 8`) or none at all
-    # (`# max_steps:   # ↔ train_tokens`) — both must be dropped.
+    # (`# max_steps:   # ↔ train_tokens`). Both must be dropped.
     return len(value.split()) > 1
 
 
@@ -114,7 +123,7 @@ def _preceding_for(pending: list[str], field_key: str) -> list[str]:
     """Select, from the buffered full-line comments, those that document ``field_key``.
 
     A commented-out *other* field in the buffer documents itself, not the field
-    below it — and so does the prose directly above it, which is typically the
+    below it, and so does the prose directly above it, which is typically the
     heading that introduces the commented-out block::
 
         # Advanced step overrides (each replaces its *_tokens counterpart):
@@ -151,34 +160,97 @@ def _split_value_comment(s: str) -> tuple[str, str]:
     return s.strip(), ""
 
 
-def parse_fields(text: str) -> list[ExtractedField]:
+def parse_template(text: str) -> tuple[list[ExtractedField], dict[tuple[str, str], str]]:
+    """Parse a template into its fields plus its per-group intro notes.
+
+    A group note is the prose between a `# ── Title ───` banner and the first
+    field under it. That prose describes the *block*: "Gradient accumulation is
+    inferred from those two...", "Splits the L-layer stack into: prelude ...",
+    "adam_* also drives the AdamW side...". The field parser has nowhere to put it
+    except the first field's description, which misattributes a block-wide note to
+    one arbitrary key. Captured here instead, keyed by (section, group).
+
+    Prose that follows a field is unaffected: it still documents the next field,
+    which is what the resume block's FOOTGUN note above `mode:` relies on.
+    """
     fields: list[ExtractedField] = []
+    notes: dict[tuple[str, str], str] = {}
     section = ""
+    group = ""
+    at_group_start = False  # no field seen yet under the current banner
     pending: list[str] = []  # buffered full-line comments awaiting the next field
+    # The same comments with their indentation intact, for group notes only.
+    pending_raw: list[str] = []
+
+    def flush() -> None:
+        pending.clear()
+        pending_raw.clear()
+
     for raw in text.splitlines():
         if not raw.strip():
-            pending.clear()
+            flush()
             continue
         if raw.lstrip().startswith("#"):
-            pending.append(raw.lstrip()[1:].strip())
+            body = raw.lstrip()[1:]
+            comment = body.strip()
+            # Banners and rules label a block; they never describe the field
+            # below them, so they are consumed rather than buffered. (The
+            # templates also leave a blank line after each, which would clear
+            # the buffer anyway, but this makes it independent of that.)
+            m_group = _GROUP.match(comment)
+            if m_group:
+                group = m_group.group("title")
+                at_group_start = True
+                flush()
+            elif _RULE.match(comment):
+                flush()
+            else:
+                pending.append(comment)
+                # Drop only the conventional single space after `#`, so the
+                # comment's own indentation survives into the note.
+                pending_raw.append(body[1:] if body.startswith(" ") else body)
             continue
         m_top = _TOP.match(raw)
         if m_top and not raw.startswith((" ", "\t")):
             section = m_top.group("key")
-            pending.clear()
+            group = ""
+            at_group_start = False
+            flush()
             continue
         m_field = _FIELD.match(raw)
         if m_field:
             key = m_field.group("key")
             val, comment = _split_value_comment(m_field.group("val_and_comment"))
+            # Prose sitting between the banner and this, the block's first field,
+            # belongs to the block, so take it whole rather than through
+            # _preceding_for, which exists to strip commented-out *fields* from a
+            # single field's description.
+            preceding = _preceding_for(pending, key)
+            if at_group_start and group:
+                # Newlines kept, unlike a field description. Several of these
+                # notes are laid out as ASCII in the template (an aligned
+                # hardware table under Precision, an indented schedule tree under
+                # Duration, the prelude/recurrent/coda split under Recycling) and
+                # collapsing them to one line destroys the structure that makes
+                # them readable. The docs render them preformatted.
+                note = "\n".join(pending_raw).strip("\n")
+                if note:
+                    notes[(section, group)] = note
+                    preceding = []
+                at_group_start = False
             fields.append(
                 ExtractedField(
                     section=section,
                     key=key,
                     raw_default=val,
                     eol_comment=comment,
-                    preceding=_preceding_for(pending, key),
+                    group=group,
+                    preceding=preceding,
                 )
             )
-            pending.clear()
-    return fields
+            flush()
+    return fields, notes
+
+
+def parse_fields(text: str) -> list[ExtractedField]:
+    return parse_template(text)[0]

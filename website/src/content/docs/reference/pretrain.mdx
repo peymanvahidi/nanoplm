@@ -19,7 +19,7 @@ A normal run touches roughly a dozen keys. The rest have defaults that work.
 
 Two semantics catch people out. **`stable_tokens` includes warmup**: it is the point at which decay begins, not a length added after warmup. `decay_tokens` *is* a length, added on top of it. See [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
 
-Every token budget has a step-based twin ([`stable_steps`](#pretrain-pretraining-stable_steps), [`decay_steps`](#pretrain-pretraining-decay_steps), [`max_steps`](#pretrain-pretraining-max_steps)) that replaces it. Set exactly one of each pair, never both. The template ships these (and `train_tokens`) commented out, because a template that set both forms at once would fail to load; they are documented below, behind the advanced toggle.
+Every token budget has a step-based twin ([`stable_steps`](#pretrain-pretraining-stable_steps), [`decay_steps`](#pretrain-pretraining-decay_steps), [`max_steps`](#pretrain-pretraining-max_steps)) that replaces it. Set exactly one of each pair, never both. The template ships these (and `train_tokens`) commented out, because a template that set both forms at once would fail to load; they are documented below all the same.
 
 :::caution[Two traps that bite on the first run]
 The stock `resume:` block ships `mode: "decay"` with the decay fields filled in, so flipping only [`is_resume`](#pretrain-resume-is_resume) to `true` gives you a **decay** run rather than a continuation: set [`mode`](#pretrain-resume-mode) explicitly. Separately, the default [`optimizer`](#pretrain-pretraining-optimizer) is `normuon`, which needs Microsoft's `dion` package: a stock template will not start without a full `nanoplm deps install`.
@@ -27,21 +27,25 @@ The stock `resume:` block ships `mode: "decay"` with the decay fields filled in,
 
 ## Reading the reference
 
-Each section hides its **advanced** fields behind a *Show advanced fields* checkbox above it. Tick it to reveal them, or follow a link straight to one and it reveals itself. Advanced covers four kinds of field:
+The reference is laid out like the file it documents. Each of the three blocks is broken into the same labelled groups the template uses, carrying the template's own heading and its intro note, so a group you find here is the group you will scroll to in your editor. The panel on the right lists all of them.
+
+Every field is listed, including the ones a normal run never touches. Those are mostly:
 
 - The experimental architecture features and their tuning knobs: Canon layers, RePO, mHC-lite, differential attention, paired-head attention, NOBLE, MoE, recycling.
 - The FP8, `torch.compile`, and layerwise-debug knobs.
 - The step-based duration overrides (`train_tokens`, `stable_steps`, `decay_steps`, `max_steps`).
 
-Most of them are pure-torch only, but not all: a few FP8 fields are Transformer Engine recipe knobs. The backend marker next to a field name is the authoritative per-field answer, so read it rather than the toggle label; a field with no marker works on both backends. Pure-TE supports a strictly smaller surface than pure-torch; see [Choose a backend](/nanoplm/guides/backends/) and the [compatibility matrix](/nanoplm/reference/compatibility/).
+Most of them are pure-torch only, but not all: a few FP8 fields are Transformer Engine recipe knobs. The backend marker next to a field name is the authoritative per-field answer; a field with no marker works on both backends. Pure-TE supports a strictly smaller surface than pure-torch; see [Choose a backend](/nanoplm/guides/backends/) and the [compatibility matrix](/nanoplm/reference/compatibility/).
 
-## model
+## The fields
+
+### model
 <ReferenceFields surface="pretrain" section="model" />
 
-## pretraining
+### pretraining
 <ReferenceFields surface="pretrain" section="pretraining" />
 
-## resume
+### resume
 <ReferenceFields surface="pretrain" section="resume" />
 
 The `resume:` block's template comment calls `lr_decay_to_fraction` an optional override for `mode: decay`. That comment is wrong: decay mode **requires** it, and the run raises `resume decay requires lr_decay_to_fraction` without it. `decay_shape` genuinely is optional and falls back to `1-sqrt`.
