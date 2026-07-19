@@ -3,7 +3,7 @@ title: eval.yaml
 description: Every field in the evaluation config, extracted from the EvalConfig dataclass.
 ---
 
-import ReferenceTable from '../../../components/ReferenceTable.astro';
+import ReferenceFields from '../../../components/ReferenceFields.astro';
 
 `eval.yaml` scores a trained checkpoint on downstream benchmarks. Scaffold it with `nanoplm eval get-yaml`, edit it, then run `nanoplm eval from-yaml`. See [Evaluate](/nanoplm/pipeline/eval/) for the walkthrough.
 
@@ -15,4 +15,4 @@ loads **pure-torch checkpoints only**. [`tasks`](#eval-tasks) is honored only wh
 [`parallel_tasks`](#eval-parallel_tasks) is greater than `0` (default `0`); in sequential mode it is
 ignored with a warning.
 
-<ReferenceTable surface="eval" />
+<ReferenceFields surface="eval" />

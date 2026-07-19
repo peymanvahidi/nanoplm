@@ -87,6 +87,15 @@
   font-weight: 600;
   letter-spacing: 0.01em;
 }
+/* Starlight's reset gives every <code> `overflow-wrap: anywhere`, which drops its
+   min-content width to a single character. Inside a table that lets the auto
+   layout squeeze code columns to nothing, splitting `data.yaml` into "data.yam"
+   + "l". `break-word` keeps min-content at the full token, so the column sizes
+   itself to fit, while still breaking a token too long for the column at all
+   (e.g. the UniProt URLs) instead of overflowing. */
+.sl-markdown-content :is(td, th) code:not(:where(.expressive-code *)) {
+  overflow-wrap: break-word;
+}
 
 /* Accent the site title to reinforce the protein-teal identity */
 .site-title {

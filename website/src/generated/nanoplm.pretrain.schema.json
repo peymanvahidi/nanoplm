@@ -8,19 +8,24 @@
       "properties": {
         "hidden_size": {
           "type": "integer",
-          "default": 768
+          "default": 1024
         },
         "intermediate_size": {
           "type": "integer",
-          "default": 1536
+          "default": 2048
         },
         "num_hidden_layers": {
           "type": "integer",
-          "default": 12
+          "default": 16
         },
         "num_attention_heads": {
           "type": "integer",
-          "default": 8
+          "default": 16
+        },
+        "num_kv_heads": {
+          "type": "integer",
+          "default": 8,
+          "description": "GQA: number of KV heads (default: same as num_attention_heads = MHA)"
         },
         "vocab_size": {
           "type": "integer",
@@ -28,7 +33,7 @@
         },
         "norm_type": {
           "type": "string",
-          "default": "layernorm",
+          "default": "rmsnorm",
           "enum": [
             "layernorm",
             "rmsnorm"
@@ -55,7 +60,7 @@
         },
         "no_mlp_on_first_layer": {
           "type": "boolean",
-          "default": true
+          "default": false
         },
         "attention_bias": {
           "type": "boolean",
@@ -77,7 +82,7 @@
         },
         "tie_word_embeddings": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "tie input embedding and output decoder weights"
         },
         "use_resid_lambdas": {
@@ -102,7 +107,7 @@
         },
         "global_rope_theta": {
           "type": "number",
-          "default": 160000.0,
+          "default": 40000.0,
           "description": "RoPE base for full-attention layers; lower (e.g. 10000-40000) suits short max_seq_len"
         },
         "local_rope_theta": {
@@ -318,8 +323,8 @@
           }
         },
         "attn_layer_pattern": {
-          "type": "null",
-          "default": null,
+          "type": "string",
+          "default": "F",
           "description": "Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers."
         },
         "fused_qkv": {
@@ -334,7 +339,7 @@
         },
         "wo_init": {
           "type": "string",
-          "default": "zero",
+          "default": "kaiming",
           "enum": [
             "kaiming",
             "zero"
@@ -465,6 +470,11 @@
             "value": true
           }
         },
+        "moe_kernel_backend": {
+          "type": "string",
+          "default": "sonicmoe",
+          "description": "cutlass | sonicmoe (SonicMoE/quack fused expert path)"
+        },
         "recycling_num_prelude_layers": {
           "type": "integer",
           "default": 0,
@@ -539,12 +549,12 @@
         },
         "micro_batch_seqs": {
           "type": "integer",
-          "default": 64,
+          "default": 128,
           "description": "Batch sizing (token-budget surface)"
         },
         "global_batch_tokens": {
           "type": "integer",
-          "default": 256000
+          "default": 1024000
         },
         "global_batch_warmup_steps": {
           "type": "integer",
@@ -564,17 +574,18 @@
         },
         "warmup_steps": {
           "type": "integer",
-          "default": 1000
+          "default": 1000,
+          "description": "If using anything else rather than wsd, comment out the stable_tokens and decay_tokens lines below, and uncomment train_tokens. The warmup_steps line is used for all schedules."
         },
         "stable_tokens": {
           "type": "integer",
           "default": 9000000,
-          "description": "wsd: tokens up to the pre-decay checkpoint (warmup included)"
+          "description": "wsd only: tokens up to the pre-decay checkpoint (warmup included)"
         },
         "decay_tokens": {
           "type": "integer",
           "default": 1000000,
-          "description": "wsd: additional anneal tokens"
+          "description": "wsd only: additional anneal tokens"
         },
         "decay_shape": {
           "type": "string",
@@ -591,7 +602,7 @@
         },
         "optimizer": {
           "type": "string",
-          "default": "adamw",
+          "default": "normuon",
           "enum": [
             "adamw",
             "stable_adamw",
@@ -609,7 +620,7 @@
         },
         "adam_beta2": {
           "type": "number",
-          "default": 0.999
+          "default": 0.95
         },
         "adam_epsilon": {
           "type": "number",
@@ -620,8 +631,8 @@
           "default": 0.0001
         },
         "max_grad_norm": {
-          "type": "number",
-          "default": ".inf"
+          "type": "integer",
+          "default": 1
         },
         "repo_rope_warmup_steps": {
           "type": "integer",
@@ -891,11 +902,11 @@
         },
         "eval_steps": {
           "type": "integer",
-          "default": 250
+          "default": 1000
         },
         "save_steps": {
           "type": "integer",
-          "default": 5000
+          "default": 2500
         },
         "seed": {
           "type": "integer",
@@ -903,7 +914,7 @@
         },
         "debug_non_finite_params": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "checks params for NaN/Inf after every optimizer step"
         },
         "debug_layerwise_metrics": {
@@ -917,7 +928,7 @@
         },
         "debug_layerwise_log_every": {
           "type": "integer",
-          "default": 20,
+          "default": 100,
           "description": "log layerwise metrics every N optimizer steps",
           "x-nanoplm-backend": [
             "pure_torch"
@@ -1125,11 +1136,11 @@
         },
         "profiler_start_step": {
           "type": "integer",
-          "default": 10
+          "default": 18
         },
         "profiler_end_step": {
           "type": "integer",
-          "default": 15
+          "default": 22
         },
         "train_tokens": {
           "type": "integer",

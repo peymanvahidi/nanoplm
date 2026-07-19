@@ -3,9 +3,9 @@ title: pretrain.yaml
 description: "Every field in the pretraining config, extracted from the nanoplm pretrain get-yaml template: model, pretraining, and resume."
 ---
 
-import ReferenceTable from '../../../components/ReferenceTable.astro';
+import ReferenceFields from '../../../components/ReferenceFields.astro';
 
-`nanoplm pretrain get-yaml` writes a 207-line `pretrain.yaml` with three blocks: `model:` (architecture), `pretraining:` (the training loop), and `resume:` (restarting from a checkpoint). The tables below are extracted from that template and the config dataclasses behind it, so they cannot drift from the tool. Launch with `nanoplm pretrain from-yaml --pure-torch`.
+`nanoplm pretrain get-yaml` writes a 207-line `pretrain.yaml` with three blocks: `model:` (architecture), `pretraining:` (the training loop), and `resume:` (restarting from a checkpoint). The fields below are extracted from that template and the config dataclasses behind it, so they cannot drift from the tool. Launch with `nanoplm pretrain from-yaml --pure-torch`.
 
 ## Where to start
 
@@ -19,30 +19,30 @@ A normal run touches roughly a dozen keys. The rest have defaults that work.
 
 Two semantics catch people out. **`stable_tokens` includes warmup**: it is the point at which decay begins, not a length added after warmup. `decay_tokens` *is* a length, added on top of it. See [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
 
-Every token budget has a step-based twin ([`stable_steps`](#pretrain-pretraining-stable_steps), [`decay_steps`](#pretrain-pretraining-decay_steps), [`max_steps`](#pretrain-pretraining-max_steps)) that replaces it. Set exactly one of each pair, never both. The template ships these (and `train_tokens`) commented out, because a template that set both forms at once would fail to load; they are documented in the tables below, behind the advanced toggle.
+Every token budget has a step-based twin ([`stable_steps`](#pretrain-pretraining-stable_steps), [`decay_steps`](#pretrain-pretraining-decay_steps), [`max_steps`](#pretrain-pretraining-max_steps)) that replaces it. Set exactly one of each pair, never both. The template ships these (and `train_tokens`) commented out, because a template that set both forms at once would fail to load; they are documented below, behind the advanced toggle.
 
 :::caution[Two traps that bite on the first run]
-The stock `resume:` block ships `mode: "decay"` with the decay fields filled in, so flipping only [`is_resume`](#pretrain-resume-is_resume) to `true` gives you a **decay** run rather than a continuation: set [`mode`](#pretrain-resume-mode) explicitly. Separately, `optimizer: muonh` fails at startup out of the box, because [`wo_init`](#pretrain-model-wo_init) defaults to `zero` and MuonH forbids that; set `wo_init: kaiming`.
+The stock `resume:` block ships `mode: "decay"` with the decay fields filled in, so flipping only [`is_resume`](#pretrain-resume-is_resume) to `true` gives you a **decay** run rather than a continuation: set [`mode`](#pretrain-resume-mode) explicitly. Separately, the default [`optimizer`](#pretrain-pretraining-optimizer) is `normuon`, which needs Microsoft's `dion` package: a stock template will not start without a full `nanoplm deps install`.
 :::
 
-## Reading the tables
+## Reading the reference
 
-Each table hides its **advanced** rows behind a *Show advanced fields* checkbox above it. Tick it to reveal them. Advanced covers four kinds of field:
+Each section hides its **advanced** fields behind a *Show advanced fields* checkbox above it. Tick it to reveal them, or follow a link straight to one and it reveals itself. Advanced covers four kinds of field:
 
 - The experimental architecture features and their tuning knobs: Canon layers, RePO, mHC-lite, differential attention, paired-head attention, NOBLE, MoE, recycling.
 - The FP8, `torch.compile`, and layerwise-debug knobs.
 - The step-based duration overrides (`train_tokens`, `stable_steps`, `decay_steps`, `max_steps`).
 
-Most of them are pure-torch only, but not all: a few FP8 rows are Transformer Engine recipe knobs. The **Backend** column is the authoritative per-field answer, so read it rather than the toggle label. Pure-TE supports a strictly smaller surface than pure-torch; see [Choose a backend](/nanoplm/guides/backends/) and the [compatibility matrix](/nanoplm/reference/compatibility/).
+Most of them are pure-torch only, but not all: a few FP8 fields are Transformer Engine recipe knobs. The backend marker next to a field name is the authoritative per-field answer, so read it rather than the toggle label; a field with no marker works on both backends. Pure-TE supports a strictly smaller surface than pure-torch; see [Choose a backend](/nanoplm/guides/backends/) and the [compatibility matrix](/nanoplm/reference/compatibility/).
 
 ## model
-<ReferenceTable surface="pretrain" section="model" />
+<ReferenceFields surface="pretrain" section="model" />
 
 ## pretraining
-<ReferenceTable surface="pretrain" section="pretraining" />
+<ReferenceFields surface="pretrain" section="pretraining" />
 
 ## resume
-<ReferenceTable surface="pretrain" section="resume" />
+<ReferenceFields surface="pretrain" section="resume" />
 
 The `resume:` block's template comment calls `lr_decay_to_fraction` an optional override for `mode: decay`. That comment is wrong: decay mode **requires** it, and the run raises `resume decay requires lr_decay_to_fraction` without it. `decay_shape` genuinely is optional and falls back to `1-sqrt`.
 

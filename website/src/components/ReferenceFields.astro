@@ -1,0 +1,229 @@
+---
+// website/src/components/ReferenceFields.astro
+// Renders one config surface (optionally one section of it) as a list of field
+// blocks, sourced from the generated JSON Schema via toRows(). Deliberately not a
+// table: a config reference is read by field, not compared down a column, and
+// enum/backend are present on well under a quarter of fields — as columns they
+// were ~85% em-dashes while the description got starved. Inline and conditional
+// instead, so the description gets the full content width at any viewport.
+// The distill surface is still generated (the parity gate keeps it honest), but it
+// is deliberately not rendered: distillation is unmaintained and gets one prose
+// page, not a config reference.
+import { toRows, type Surface } from '../lib/schema';
+import data from '../generated/nanoplm.data.schema.json';
+import pretrain from '../generated/nanoplm.pretrain.schema.json';
+import evalSchema from '../generated/nanoplm.eval.schema.json';
+
+interface Props {
+  surface: 'data' | 'pretrain' | 'eval';
+  section?: string;
+}
+
+const { surface, section } = Astro.props;
+
+const SCHEMAS: Record<Props['surface'], Surface> = {
+  data: data as Surface,
+  pretrain: pretrain as Surface,
+  eval: evalSchema as Surface,
+};
+
+const rows = toRows(SCHEMAS[surface], section);
+const prefix = section ? `${surface}-${section}` : surface;
+const hasAdvanced = rows.some((r) => r.advanced);
+
+function fmtDefault(value: unknown): string {
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+---
+
+{/* `not-content` is Starlight's opt-out: every rule in its markdown.css excludes
+    `:where(.not-content *)`. Without it, `.sl-markdown-content X + Y { margin-top:
+    1rem }` hits every adjacent sibling pair in here — including 158 field blocks
+    and the <p>s inside them. Astro scopes styles with `:where(.astro-xxx)`, which
+    adds no specificity, so a plain `.ref-field` rule (0,1,0) silently loses to
+    that (0,1,2) selector. Opting out is the fix; it also means every margin and
+    the inline-code chip styling below are ours to set explicitly. */}
+<div class="ref-fields not-content">
+  {hasAdvanced && (
+    <label class="ref-adv-toggle">
+      <input type="checkbox" /> Show advanced fields
+    </label>
+  )}
+  {rows.map((r) => (
+    <div
+      id={`${prefix}-${r.key}`}
+      class={r.advanced ? 'ref-field ref-advanced' : 'ref-field'}
+      hidden={r.advanced ? 'until-found' : undefined}
+    >
+      {/* All visible styling lives on this inner wrapper. The outer element carries
+          `hidden`, which the script below upgrades to hidden="until-found" — that
+          hides an element's *contents* but still renders its own box, so a border
+          or padding out here would show up as a blank row. */}
+      <div class="ref-body">
+        <p class="ref-head">
+          <span class="ref-id">
+            <code class="ref-name">{r.key}</code>
+            {r.required && <span class="ref-req" title="required (no default)">*</span>}
+            {r.backend && <span class="ref-backend">{r.backend.join(', ')}</span>}
+          </span>
+          {/* Right-aligned so type and default line up down the page and can be
+              scanned as a column, without costing a real table column. */}
+          <span class="ref-meta">
+            <span class="ref-type">{r.type}</span>
+            {r.default !== undefined && (
+              <><span class="ref-sep">·</span><span class="ref-default">default <code>{fmtDefault(r.default)}</code></span></>
+            )}
+            {r.required && !('default' in r) && (
+              <><span class="ref-sep">·</span><span class="ref-req-word">required</span></>
+            )}
+          </span>
+        </p>
+        {r.enum && (
+          <p class="ref-enum">
+            <span class="ref-enum-label">one of</span>
+            {r.enum.map((v) => (
+              <code
+                class={String(v) === fmtDefault(r.default) ? 'ref-choice is-default' : 'ref-choice'}
+                title={String(v) === fmtDefault(r.default) ? 'default' : undefined}
+              >{String(v)}</code>
+            ))}
+          </p>
+        )}
+        {r.description && <p class="ref-desc">{r.description}</p>}
+      </div>
+    </div>
+  ))}
+</div>
+
+<style>
+  .ref-fields { margin: 0.5rem 0 1.5rem; }
+
+  /* Bare on purpose: a hidden .ref-field must collapse to zero height, so it gets
+     no border, padding or margin of its own. `content-visibility: hidden` also
+     applies layout containment, which stops margins collapsing — so a margin here
+     would be paid in full by every hidden field and stack into a large gap. */
+  .ref-field {
+    margin: 0;
+    /* Starlight's header is sticky; without this every deep link lands with the
+       field name tucked underneath it. */
+    scroll-margin-top: 5rem;
+  }
+  .ref-body {
+    border-top: 1px solid var(--sl-color-hairline-shade);
+    padding: 0.7rem 0 0.75rem;
+  }
+
+  /* Restated because `not-content` opts out of Starlight's inline-code styling;
+     keeps the chips looking like inline code everywhere else on the site. */
+  .ref-fields code {
+    background-color: var(--sl-color-bg-inline-code);
+    border: 1px solid var(--sl-color-hairline-shade);
+    border-radius: 0.25rem;
+    padding: 0.1em 0.35em;
+    font-family: var(--sl-font-mono);
+    font-size: var(--sl-text-code);
+  }
+
+  /* Head line: name on the left, type/default pinned right. Both halves wrap
+     internally, and on a narrow viewport the meta drops to its own line rather
+     than forcing a horizontal scroll. */
+  .ref-head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.15rem 1rem;
+    margin: 0;
+  }
+  .ref-id {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.4rem;
+    min-width: 0;
+  }
+  .ref-name { font-weight: 600; }
+  .ref-meta {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    color: var(--sl-color-gray-3);
+    /* Keeps type/default flush right even when the name is short. */
+    margin-inline-start: auto;
+  }
+  .ref-sep { color: var(--sl-color-gray-4); }
+  .ref-type { font-family: var(--sl-font-mono); }
+  .ref-req { color: var(--sl-color-accent); font-weight: 700; margin-inline-start: -0.25rem; }
+  .ref-req-word { color: var(--sl-color-accent); }
+  .ref-backend {
+    font-size: 0.7rem;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--sl-color-gray-3);
+    border: 1px solid var(--sl-color-hairline-shade);
+    border-radius: 999rem;
+    padding: 0.05rem 0.45rem;
+  }
+
+  /* Choices as discrete chips: one token per value reads as a set, where
+     `a | b | c` in a single chip reads as one opaque string. */
+  .ref-enum {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.3rem;
+  }
+  .ref-enum-label { color: var(--sl-color-gray-3); }
+  .ref-fields code.ref-choice {
+    background: transparent;
+    border-color: var(--sl-color-gray-5);
+  }
+  .ref-fields code.ref-choice.is-default {
+    color: var(--sl-color-accent);
+    border-color: var(--sl-color-accent);
+    background: var(--sl-color-accent-low);
+  }
+
+  .ref-enum,
+  .ref-desc { margin: 0.3rem 0 0; font-size: 0.9rem; line-height: 1.5; }
+  .ref-enum { color: var(--sl-color-gray-3); }
+
+  .ref-adv-toggle {
+    display: inline-flex; gap: 0.4rem; align-items: center;
+    font-size: 0.8rem; color: var(--sl-color-gray-3); margin-bottom: 0.5rem; cursor: pointer;
+  }
+
+  /* Advanced fields are hidden by attribute, upgraded to hidden="until-found" by
+     the script below so Ctrl-F still reaches them. Ticking the box overrides
+     both the attribute and content-visibility. */
+  .ref-fields:has(.ref-adv-toggle input:checked) .ref-advanced {
+    content-visibility: visible;
+    display: block;
+  }
+
+  /* A deep link into an advanced field must work regardless of the toggle:
+     22 links across the guides point at fields that are hidden by default. */
+  .ref-field:target {
+    content-visibility: visible;
+    display: block;
+  }
+  .ref-field:target .ref-body {
+    background: var(--sl-color-accent-low);
+    box-shadow: inset 3px 0 0 var(--sl-color-accent);
+    padding-inline: 0.75rem;
+    margin-inline: -0.75rem;
+    border-radius: 0.15rem;
+  }
+</style>
+
+{/* Astro serializes hidden="until-found" down to a bare `hidden`, which loses the
+    find-in-page behaviour. Re-apply it at runtime; without JS the advanced fields
+    stay plainly hidden, exactly as they are today. */}
+<script is:inline>
+  for (const el of document.querySelectorAll('.ref-field.ref-advanced[hidden]')) {
+    el.setAttribute('hidden', 'until-found');
+  }
+</script>

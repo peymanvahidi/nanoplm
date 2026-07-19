@@ -84,7 +84,7 @@ pretraining:
   micro_batch_seqs: 32          # SEQUENCES per GPU per forward: turn this down when you hit OOM
   global_batch_tokens: 131072   # TOKENS per optimizer step: grad accum is inferred from it
 
-  optimizer: "adamw"            # adamw is the scaffold default; Muon family needs dion (from deps install)
+  optimizer: "adamw"            # set explicitly: the template ships normuon, which needs dion
   adam_learning_rate: 1e-4
 
   lr_schedule: "wsd"            # warmup -> stable -> decay, all inside one run
@@ -95,9 +95,9 @@ pretraining:
 pure_torch: true                # or pass --pure-torch on the command line
 ```
 
-Those four `model:` keys are the only ones with no default; the rest of the block is optional. In `pretraining:`, only `dataset_dir` is strictly required: but a `wsd` schedule needs a budget, so `stable_tokens` and `decay_tokens` come with it.
+Those four `model:` keys are the only ones you must supply; the rest of the block is optional. The [reference](/nanoplm/reference/pretrain/) lists a value for them, but that is the number the template pre-fills, not a fallback: leave them out of a hand-written config and the run stops. In `pretraining:`, only `dataset_dir` is strictly required: but a `wsd` schedule needs a budget, so `stable_tokens` and `decay_tokens` come with it.
 
-One key deserves the explicit setting it gets above: `optimizer`. The scaffold ships `adamw`, but the underlying default is `normuon`, which needs Microsoft's `dion` package. A full [install](/nanoplm/start/install/) (`nanoplm deps install`) already includes dion; spell the optimizer out so you are not surprised. See [Choose an optimizer](/nanoplm/guides/optimizers/).
+One key deserves the explicit setting it gets above: `optimizer`. The default is `normuon`, a Muon-family optimizer that needs Microsoft's `dion` package and a second learning rate to tune. A full [install](/nanoplm/start/install/) (`nanoplm deps install`) already includes dion, so `normuon` is a fine choice: this config spells out `adamw` only to keep the first run dependency-free and single-LR. See [Choose an optimizer](/nanoplm/guides/optimizers/).
 
 ## Duration is a token budget
 
@@ -179,14 +179,14 @@ At the stable→decay boundary the run saves a `checkpoint-stable-end` automatic
 
 ## The `model:` block
 
-Four keys decide the size of your model, and they are the four with no defaults:
+Four keys decide the size of your model, and they are the four you must always supply. The table shows what the config above uses next to what `get-yaml` pre-fills, so you can see the range:
 
-| Key | Scaffold value | Notes |
-| --- | --- | --- |
-| [`hidden_size`](/nanoplm/reference/pretrain/#pretrain-model-hidden_size) | `768` | Residual stream width. The dominant parameter-count knob. |
-| [`intermediate_size`](/nanoplm/reference/pretrain/#pretrain-model-intermediate_size) | `1536` | MLP width. |
-| [`num_hidden_layers`](/nanoplm/reference/pretrain/#pretrain-model-num_hidden_layers) | `12` | Depth. |
-| [`num_attention_heads`](/nanoplm/reference/pretrain/#pretrain-model-num_attention_heads) | `8` | `hidden_size` must divide evenly by this. |
+| Key | This config | `get-yaml` | Notes |
+| --- | --- | --- | --- |
+| [`hidden_size`](/nanoplm/reference/pretrain/#pretrain-model-hidden_size) | `768` | `1024` | Residual stream width. The dominant parameter-count knob. |
+| [`intermediate_size`](/nanoplm/reference/pretrain/#pretrain-model-intermediate_size) | `1536` | `2048` | MLP width. |
+| [`num_hidden_layers`](/nanoplm/reference/pretrain/#pretrain-model-num_hidden_layers) | `12` | `16` | Depth. |
+| [`num_attention_heads`](/nanoplm/reference/pretrain/#pretrain-model-num_attention_heads) | `8` | `16` | `hidden_size` must divide evenly by this. |
 
 The rest of the block is a long tail of `use_*` flags: alternative attention schemes, mixture-of-experts, low-rank branches, weight-tied recurrence. **They all default to off**, and none of them is needed for a good model. Each is documented in the [pretrain.yaml reference](/nanoplm/reference/pretrain/), and which ones can be combined with which backend is in the [compatibility matrix](/nanoplm/reference/compatibility/). Get a baseline trained first; then turn one on and measure.
 

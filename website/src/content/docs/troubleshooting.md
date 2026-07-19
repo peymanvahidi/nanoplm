@@ -109,7 +109,7 @@ Budgets must be greater than zero.
 
 **`optimizer=muonh is incompatible with model.wo_init='zero'. MuonH initializes each matrix hyperball radius from ||W_init||_F, so zero-initialized Wo matrices are locked at zero. Set model.wo_init='kaiming' (or --wo-init kaiming).`**
 
-This fires **out of the box**: [`wo_init`](/nanoplm/reference/pretrain/#pretrain-model-wo_init) defaults to `zero`, so `optimizer: muonh` never starts on a stock template. The fix is one line:
+The `get-yaml` template ships [`wo_init`](/nanoplm/reference/pretrain/#pretrain-model-wo_init) as `kaiming`, so a stock template does not hit this. It fires on a **hand-written `model:` block that omits the key**, because the underlying default is `zero`, not the template's value. The fix is one line:
 
 ```yaml title="pretrain.yaml" ins={3}
 model:
