@@ -97,11 +97,22 @@ If the build host has no outbound internet for the FlashAttention-3 wheel, downl
 
 `nanoplm eval` runs [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline. That dependency is **not** part of `nanoplm deps install`; pull it with the `eval` extra:
 
+<Tabs>
+<TabItem label="From GitHub (recommended)">
+
 ```bash
 uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
-# contributors:
+```
+
+</TabItem>
+<TabItem label="Editable (contributors)">
+
+```bash
 uv pip install -e ".[eval]"
 ```
+
+</TabItem>
+</Tabs>
 
 Without it, `nanoplm eval from-yaml` fails at import time.
 
