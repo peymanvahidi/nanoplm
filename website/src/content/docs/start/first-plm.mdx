@@ -143,7 +143,7 @@ You now have binary token shards and the manifest that describes them:
 4. **Train.**
 
    ```bash
-   nanoplm pretrain from-yaml --pure-torch
+   nanoplm pretrain from-yaml
    # Using pure-torch model and training loop
    # Total Trainable Parameters: 2306848
    # Flash attention available: True
@@ -161,10 +161,10 @@ You now have binary token shards and the manifest that describes them:
 
 </Steps>
 
-:::caution[`--pure-torch` is required]
-There is no default backend. Run `nanoplm pretrain from-yaml` with neither `--pure-torch` nor
-`--pure-te` and it fails immediately with *"Pretraining requires pure_torch: true or pure_te: true."*
-Use `--pure-torch`: it is the fully-featured path and the only one `nanoplm eval` can load. See
+:::note
+The scaffolded `pretrain.yaml` already sets `pure_torch: true`, so no `--pure-torch` flag is needed.
+That is the fully-featured path and the only one `nanoplm eval` can load. To use Transformer Engine
+instead, edit the YAML (`pure_te: true` and `pure_torch: false`); see
 [Choose a backend](/nanoplm/guides/backends/).
 :::
 

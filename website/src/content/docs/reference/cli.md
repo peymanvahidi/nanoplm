@@ -257,24 +257,20 @@ Template written to: <cwd>/pretrain.yaml
 ### pretrain from-yaml
 
 ```
-nanoplm pretrain from-yaml [CONFIG] --pure-torch | --pure-te
+nanoplm pretrain from-yaml [CONFIG] [--pure-torch | --pure-te]
 ```
 
 Runs pretraining from a config with `model:`, `pretraining:`, and `resume:` blocks. `CONFIG` defaults to `pretrain.yaml`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--pure-torch` | Use the pure-torch model and training loop | off |
+| `--pure-torch` | Force the pure-torch model and training loop | off (YAML `pure_torch: true` is the template default) |
 | `--pure-te` | Use the Transformer Engine model and training loop | off |
 
-:::caution[A backend flag is required]
-Pretraining fails immediately with `Pretraining requires pure_torch: true or pure_te: true.` if you pass neither. There is no third backend. Use `--pure-torch` unless you specifically need Transformer Engine: see [Choose a backend](/nanoplm/guides/backends/).
-:::
-
-You may instead set the top-level `pure_torch: true` (or `pure_te: true`) key in the YAML; the CLI flag wins when both are present. The two are mutually exclusive.
+The stock template sets top-level `pure_torch: true`, so a normal `from-yaml` run needs no backend flag. A CLI flag can force a backend on but does not clear the other YAML key: with `pure_torch: true` still set, `--pure-te` alone fails. For Transformer Engine, set `pure_te: true` and `pure_torch: false`. See [Choose a backend](/nanoplm/guides/backends/).
 
 ```bash
-nanoplm pretrain from-yaml --pure-torch
+nanoplm pretrain from-yaml
 ```
 
 ```
@@ -288,7 +284,7 @@ step 2 | loss 3.0388 | lr 2.00e-07
 Multi-GPU runs go through `torchrun`, handing it the console-script path:
 
 ```bash
-torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml --pure-torch
+torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml
 ```
 
 ### pretrain run
@@ -297,7 +293,7 @@ torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml --pure-torch
 nanoplm pretrain run --dataset-dir DIR [OPTIONS] --pure-torch | --pure-te
 ```
 
-Flag-driven pretraining without a YAML file. `--dataset-dir` is the only required option; a backend flag is still mandatory. Every flag maps to a `pretrain.yaml` key of the same name, so the [pretrain.yaml reference](/nanoplm/reference/pretrain/) is the authoritative source for meanings and defaults.
+Flag-driven pretraining without a YAML file. `--dataset-dir` is the only required option; a backend flag **is** mandatory here because there is no YAML default to fall back on. Every flag maps to a `pretrain.yaml` key of the same name, so the [pretrain.yaml reference](/nanoplm/reference/pretrain/) is the authoritative source for meanings and defaults.
 
 - **Dataset and output**: `--dataset-dir`, `--ckp-dir`.
 - **Batch and duration**: `--micro-batch-seqs`, `--global-batch-tokens`, `--global-batch-warmup-steps`, `--train-tokens`, `--max-steps`, `--stable-tokens`, `--stable-steps`, `--decay-tokens`, `--decay-steps`.

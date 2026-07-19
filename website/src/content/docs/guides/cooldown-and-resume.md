@@ -66,7 +66,7 @@ resume:
 Set `mode: "continue"` and **delete the three decay keys**. Then relaunch exactly as before:
 
 ```bash
-nanoplm pretrain from-yaml --pure-torch
+nanoplm pretrain from-yaml
 ```
 
 ```
@@ -111,7 +111,7 @@ pretraining:
 ```
 
 ```bash
-torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml --pure-torch
+torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml
 ```
 
 ```

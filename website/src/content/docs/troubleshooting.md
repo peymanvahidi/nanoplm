@@ -43,22 +43,26 @@ pure_torch:
   use_compile: true
 ```
 
-On current nanoPLM, `pure_torch` is a **top-level boolean**, and the loader evaluates it with `bool(...)`. A non-empty mapping is truthy, so `{enabled: false}` turns pure-torch **on**. There is no error and no warning: you get a backend you did not ask for. Delete the block and use the `--pure-torch` flag, or a bare `pure_torch: true`.
+On current nanoPLM, `pure_torch` is a **top-level boolean**, and the loader evaluates it with `bool(...)`. A non-empty mapping is truthy, so `{enabled: false}` turns pure-torch **on**. There is no error and no warning: you get a backend you did not ask for. Delete the block and use a bare `pure_torch: true` (the template default).
 :::
 
 ## Pretraining won't start
 
 **`Pretraining requires pure_torch: true or pure_te: true. The HF Trainer pretraining path is no longer supported.`**
 
-A backend is mandatory. There is no default and no HF-Trainer path.
+Some backend must be selected: either in the YAML or on the CLI. The stock template already sets `pure_torch: true`, so this usually means a hand-written config is missing the key, both backends are false, or you used `pretrain run` without a flag. There is no HF-Trainer path.
 
 ```bash
-nanoplm pretrain from-yaml --pure-torch
+# YAML path (template default is pure_torch: true)
+nanoplm pretrain from-yaml
+
+# Flag-driven path still needs an explicit backend
+nanoplm pretrain run --dataset-dir output/data/pretrain_data --pure-torch
 ```
 
 **`lr_schedule: wsd and resume mode: decay require pure_torch: true (TE supports warmup_stable/cosine/linear + continue only).`**
 
-You asked for WSD or a decay resume on the Transformer Engine backend. Either switch to `--pure-torch`, or pick an `lr_schedule` TE supports.
+You asked for WSD or a decay resume on the Transformer Engine backend. Either switch back to pure-torch (`pure_torch: true` or `--pure-torch`), or pick an `lr_schedule` TE supports.
 
 **`--pure-torch and --pure-te are mutually exclusive.`** (or `pure_torch and pure_te cannot both be true.`)
 
@@ -248,7 +252,7 @@ The same message shape appears for `use_noble`, `use_diff_attn_v2`, and `use_pai
 - **`MoE is currently implemented only in the pure-torch path. Disable use_moe or use --pure-torch.`**
 - **`Huginn-style recycling (recycling_loop_count > 1) is implemented only in the pure-torch path. Use --pure-torch with recycling_loop_count>1.`**
 
-Run these on `--pure-torch`.
+Keep pure-torch (the template default). Do not switch to `--pure-te` while these features are on.
 
 ### Incompatible pairs
 

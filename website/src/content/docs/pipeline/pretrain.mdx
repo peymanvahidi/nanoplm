@@ -7,7 +7,7 @@ import { FileTree, Steps } from '@astrojs/starlight/components';
 
 The pretraining stage reads the shards and `.data_manifest` the [data stage](/nanoplm/pipeline/data/) produced, trains a masked-language model on them, and writes self-describing checkpoints.
 
-`nanoplm pretrain get-yaml` writes a scaffold of about 360 lines, split into labelled blocks. That number is not a warning: it is the whole surface of the codebase, exposed so that nothing is hidden from you. **A real run touches roughly a dozen of those keys.** Everything else has a working default, and this page is a tour of the handful you will actually edit.
+`nanoplm pretrain get-yaml` writes a scaffold of about 360 lines, split into labelled blocks. That number is not a warning: it is the whole surface of the codebase, exposed so that nothing is hidden from you. **A real run touches multiple of those keys.** Everything else has a working default, and this page is a tour of the handful you may edit.
 
 ## Run it
 
@@ -25,10 +25,10 @@ The pretraining stage reads the shards and `.data_manifest` the [data stage](/na
 
 2. Edit `pretrain.yaml`. Point `dataset_dir` at the data stage's `output_dir`, set the model size, set the budget.
 
-3. Train with a backend flag.
+3. Start training your model.
 
    ```sh
-   nanoplm pretrain from-yaml --pure-torch
+   nanoplm pretrain from-yaml
    ```
 
    ```text title="Output (trimmed)"
@@ -54,17 +54,9 @@ Read those startup lines. They are the config after nanoPLM has resolved it: the
 
 ## Pick a backend
 
-:::caution[A backend is mandatory]
-`nanoplm pretrain from-yaml` with no backend flag fails immediately:
+The stock template ships `pure_torch: true` at the bottom of `pretrain.yaml`, so `nanoplm pretrain from-yaml` already runs the pure-torch backend. You do **not** need `--pure-torch` for a normal YAML run.
 
-```text title="Output"
-Error: Pretraining requires pure_torch: true or pure_te: true. The HF Trainer pretraining path is no longer supported.
-```
-
-Pass `--pure-torch`, or set `pure_torch: true` as a top-level key in the YAML. The CLI flag wins if both are present.
-:::
-
-**Use `--pure-torch`.** It is the hand-written training loop, it is the only backend that supports the default `wsd` schedule, and it is the only one whose checkpoints the [eval stage](/nanoplm/pipeline/eval/) can load. `--pure-te` is the Transformer Engine path, for FP8 on Hopper-class hardware and later. The two flags are mutually exclusive. See [Choose a backend](/nanoplm/guides/backends/) for the full comparison.
+Pure-torch is the hand-written training loop, the only backend that supports the default `wsd` schedule, and the only one whose checkpoints the [eval stage](/nanoplm/pipeline/eval/) can load. Switch to Transformer Engine only when you need it: set `pure_te: true` **and** `pure_torch: false` (or pass `--pure-te` after clearing the YAML pure-torch key). The two backends are mutually exclusive. See [Choose a backend](/nanoplm/guides/backends/) for the full comparison.
 
 ## A config that really runs
 
@@ -92,7 +84,7 @@ pretraining:
   stable_tokens: 60000000       # tokens up to the decay boundary: warmup is INSIDE this
   decay_tokens: 6000000         # extra tokens spent annealing the LR down
 
-pure_torch: true                # or pass --pure-torch on the command line
+pure_torch: true                # template default; omit only if you switch backends
 ```
 
 Those four `model:` keys are the only ones you must supply; the rest of the block is optional. The [reference](/nanoplm/reference/pretrain/) lists a value for them, but that is the number the template pre-fills, not a fallback: leave them out of a hand-written config and the run stops. In `pretraining:`, only `dataset_dir` is strictly required: but a `wsd` schedule needs a budget, so `stable_tokens` and `decay_tokens` come with it.
@@ -239,7 +231,7 @@ Each checkpoint carries the three configs that produced it, so it can be evaluat
 Launch with `torchrun`. Nothing in the config changes: `world_size: 'auto'` picks the process count up from the environment, and `grad_accum` is re-inferred so that `global_batch_tokens` stays the batch you asked for:
 
 ```sh
-torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml --pure-torch
+torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml
 ```
 
 ```text title="Output (trimmed)"

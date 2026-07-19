@@ -5,7 +5,7 @@ description: "Every field in the pretraining config, extracted from the nanoplm 
 
 import ReferenceFields from '../../../components/ReferenceFields.astro';
 
-`nanoplm pretrain get-yaml` writes a ~360-line `pretrain.yaml` with three blocks: `model:` (architecture), `pretraining:` (the training loop), and `resume:` (restarting from a checkpoint), plus top-level backend flags. The fields below are extracted from that template and the config dataclasses behind it, so they cannot drift from the tool. Launch with `nanoplm pretrain from-yaml --pure-torch`.
+`nanoplm pretrain get-yaml` writes a ~360-line `pretrain.yaml` with three blocks: `model:` (architecture), `pretraining:` (the training loop), and `resume:` (restarting from a checkpoint), plus a top-level `pure_torch: true` default. The fields below are extracted from that template and the config dataclasses behind it, so they cannot drift from the tool. Launch with `nanoplm pretrain from-yaml`.
 
 ## Where to start
 
@@ -50,4 +50,4 @@ Most of them are pure-torch only, but not all: a few FP8 fields are Transformer 
 
 The `resume:` block's template comment calls `lr_decay_to_fraction` an optional override for `mode: decay`. That comment is wrong: decay mode **requires** it, and the run raises `resume decay requires lr_decay_to_fraction` without it. `decay_shape` genuinely is optional and falls back to `1-sqrt`.
 
-Backend selection lives outside all three blocks, as the top-level `pure_torch:` / `pure_te:` booleans shown commented out at the bottom of the template. Prefer the `--pure-torch` / `--pure-te` CLI flags, which override them. When a config fails to load, [Troubleshooting](/nanoplm/troubleshooting/) lists every validation error with its fix.
+Backend selection lives outside all three blocks, as the top-level `pure_torch:` / `pure_te:` booleans at the bottom of the template. The scaffold ships `pure_torch: true`; leave it alone for a normal run. A CLI flag can force a backend on but does not clear the other YAML key, so switch by editing those booleans (only one may be true). When a config fails to load, [Troubleshooting](/nanoplm/troubleshooting/) lists every validation error with its fix.

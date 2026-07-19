@@ -22,10 +22,10 @@ model:
                                      # recurrent block = L - P - C = 8 weight-tied layers
 ```
 
-It is **pure-torch only**:
+It is **pure-torch only** (the stock template already selects pure-torch):
 
 ```bash
-nanoplm pretrain from-yaml --pure-torch
+nanoplm pretrain from-yaml
 ```
 
 ```
@@ -138,7 +138,7 @@ pure_torch: true
 ```
 
 ```bash
-nanoplm pretrain from-yaml --pure-torch
+nanoplm pretrain from-yaml
 ```
 
 ```

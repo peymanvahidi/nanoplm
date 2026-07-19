@@ -163,7 +163,7 @@ After a successful `nanoplm deps install`, Muon-family optimizers, token packing
 
 | Feature | Still needs in config / hardware |
 | --- | --- |
-| Pretraining (`--pure-torch`) | Hopper GPU for the supported path |
+| Pretraining (pure-torch, the default) | Hopper GPU for the supported path |
 | Token packing (`use_packing: true`, the default) | FA3 is installed; set `use_packing: false` only if you want padding instead |
 | `fp8: true` / `--pure-te` | TE is installed; FP8 tensor cores need Hopper+; `mxfp8` / `nvfp4` need Blackwell+ |
 | `optimizer: muon \| normuon \| muonh \| aurora` | Dion is installed; see [Choose an optimizer](/nanoplm/guides/optimizers/) |

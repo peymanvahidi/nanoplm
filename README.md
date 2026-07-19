@@ -121,10 +121,10 @@ nanoplm distill get-yaml
 ### 4. Start your pretraining or distillation
 
 ```bash
-nanoplm pretrain from-yaml --pure-torch
+nanoplm pretrain from-yaml
 ```
 
-A backend flag is required — see [Choose a backend](https://peymanvahidi.github.io/nanoplm/guides/backends/).
+The stock `pretrain.yaml` sets `pure_torch: true`, so no backend flag is needed. For Transformer Engine, set `pure_te: true` and turn off pure-torch — see [Choose a backend](https://peymanvahidi.github.io/nanoplm/guides/backends/).
 
 ---
 
@@ -135,7 +135,7 @@ Everything is controlled by three YAML files. Scaffold one, edit it, run it:
 | Stage | Scaffold | Run | Reference |
 |---|---|---|---|
 | Data | `nanoplm data get-yaml` | `nanoplm data from-yaml` | [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) |
-| Pretraining | `nanoplm pretrain get-yaml` | `nanoplm pretrain from-yaml --pure-torch` | [pretrain.yaml](https://peymanvahidi.github.io/nanoplm/reference/pretrain/) |
+| Pretraining | `nanoplm pretrain get-yaml` | `nanoplm pretrain from-yaml` | [pretrain.yaml](https://peymanvahidi.github.io/nanoplm/reference/pretrain/) |
 | Evaluation | `nanoplm eval get-yaml` | `nanoplm eval from-yaml` | [eval.yaml](https://peymanvahidi.github.io/nanoplm/reference/eval/) |
 
 The reference tables are generated directly from the `get-yaml` templates and the config

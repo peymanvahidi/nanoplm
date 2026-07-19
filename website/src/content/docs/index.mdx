@@ -45,7 +45,7 @@ identical.
 3. **Run** it.
 
    ```bash frame="terminal"
-   nanoplm pretrain from-yaml --pure-torch
+   nanoplm pretrain from-yaml
    # Using pure-torch model and training loop
    # Total Trainable Parameters: 2306848
    # Flash attention available: True
@@ -64,7 +64,7 @@ uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \
 nanoplm deps install
 
 nanoplm data get-yaml && nanoplm data from-yaml
-nanoplm pretrain get-yaml && nanoplm pretrain from-yaml --pure-torch
+nanoplm pretrain get-yaml && nanoplm pretrain from-yaml
 # optional: uv pip install -e ".[eval]"   (or the GitHub form)
 nanoplm eval get-yaml && nanoplm eval from-yaml
 ```
@@ -76,8 +76,9 @@ is exactly where `pretrain.yaml` looks for them. The one value the defaults cann
 `eval.checkpoint_dir`: open `eval.yaml` and point it at the run you trained above.
 
 :::note
-`--pure-torch` is not optional. Pretraining requires you to pick a backend (`--pure-torch` or
-`--pure-te`), and pure-torch is the one to use. See [Choose a backend](/nanoplm/guides/backends/).
+The stock `pretrain.yaml` sets `pure_torch: true`, so `from-yaml` needs no backend flag. To use
+Transformer Engine instead, set `pure_te: true` and turn off pure-torch in the YAML. See
+[Choose a backend](/nanoplm/guides/backends/).
 :::
 
 For the real thing (a tiny model trained and evaluated end to end, with the edits spelled out),

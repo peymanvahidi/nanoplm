@@ -1,12 +1,12 @@
 ---
 title: Choose a backend
-description: "nanoPLM pretrains on pure-torch or pure-TE. Use pure-torch unless you specifically need Transformer Engine kernels, and know what pure-TE cannot do."
+description: "nanoPLM pretrains on pure-torch or pure-TE. Pure-torch is the default; use pure-TE only when you need Transformer Engine kernels, and know what it cannot do."
 ---
 
-Use `--pure-torch`. It is the backend every feature in nanoPLM supports, and it is the one the project's own launcher uses.
+Use pure-torch. It is the backend every feature in nanoPLM supports, the one the stock `pretrain.yaml` selects, and the one the project's own launcher uses.
 
 ```bash
-nanoplm pretrain from-yaml --pure-torch
+nanoplm pretrain from-yaml
 ```
 
 ```
@@ -18,7 +18,7 @@ Starting pure-torch training: total_steps=39 (token-budget driven), warmup_steps
 # ...
 ```
 
-Read on only if you are considering the alternative.
+No backend CLI flag is required for a normal YAML run: `get-yaml` writes `pure_torch: true` at the bottom of the file. Read on only if you are considering the alternative.
 
 ## Pick a backend from two
 
@@ -26,8 +26,8 @@ There are exactly two pretraining backends.
 
 | Backend | Select with | What it is |
 | --- | --- | --- |
-| **pure-torch** | `--pure-torch` or `pure_torch: true` | nanoPLM's own model and training loop. Every feature lands here first; most land here only. |
-| **pure-TE** | `--pure-te` or `pure_te: true` | Transformer Engine model and training loop: TE kernels and the full TE FP8 recipe surface. |
+| **pure-torch** | `pure_torch: true` (template default) or `--pure-torch` | nanoPLM's own model and training loop. Every feature lands here first; most land here only. |
+| **pure-TE** | `pure_te: true` or `--pure-te` | Transformer Engine model and training loop: TE kernels and the full TE FP8 recipe surface. |
 
 The flags live on both `pretrain from-yaml` and `pretrain run`. `pure_torch` and `pure_te` are **top-level** keys in `pretrain.yaml` (siblings of `model:`, not children of it):
 
@@ -40,14 +40,16 @@ pretraining:
 pure_torch: true   # top level; the CLI flag overrides this if both are set
 ```
 
-A CLI flag beats the YAML key. The two are mutually exclusive: setting both raises `pure_torch and pure_te cannot both be true.`
+A CLI flag can force a backend on, but it does not clear the other key in the YAML. With the stock `pure_torch: true`, passing only `--pure-te` raises `pure_torch and pure_te cannot both be true.` — set `pure_torch: false` (or remove it) when you switch. The two backends are always mutually exclusive.
 
-## Run without a backend flag and the run stops
+## When a run still fails without a backend
 
-There is no third, default backend. Earlier versions of nanoPLM ran a Hugging Face `Trainer` when you passed no flag; **that path was removed.** If you have seen older docs or an older README, this is the change that invalidates them.
+You still need **some** backend selected — either in the YAML or on the CLI. Earlier versions of nanoPLM ran a Hugging Face `Trainer` when neither was set; **that path was removed.**
+
+With a stock template this does not come up. It fires when you hand-write a config without `pure_torch` / `pure_te`, delete the key, set both to false, or use `pretrain run` (flag-driven, no YAML defaults) without a backend flag:
 
 ```bash
-nanoplm pretrain from-yaml
+nanoplm pretrain run --dataset-dir output/data/pretrain_data
 ```
 
 ```
@@ -56,7 +58,7 @@ ValueError: Pretraining requires pure_torch: true or pure_te: true.
 The HF Trainer pretraining path is no longer supported.
 ```
 
-The fix is to add `--pure-torch` (or set `pure_torch: true`).
+The fix is `pure_torch: true` in the YAML (the template default), or `--pure-torch` / `--pure-te` on the command line.
 
 ## Know what pure-TE costs you
 

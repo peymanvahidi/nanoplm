@@ -12,7 +12,7 @@ Every key here lives in `pretrain.yaml` and is documented in the [pretrain.yaml 
 Launch with `torchrun`. nanoPLM's own launcher is a single line:
 
 ```bash
-torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml --pure-torch
+torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml
 ```
 
 ```
@@ -184,6 +184,6 @@ The `tok/s` and `h100_mfu` fields in the step log are how you tell whether any o
 
 ## Where to go next
 
-- [Choose a backend](/nanoplm/guides/backends/): why `--pure-torch`.
+- [Choose a backend](/nanoplm/guides/backends/): why pure-torch is the default.
 - [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/): WSD, and picking a long run back up.
 - [pretrain.yaml reference](/nanoplm/reference/pretrain/): every key, with defaults.
