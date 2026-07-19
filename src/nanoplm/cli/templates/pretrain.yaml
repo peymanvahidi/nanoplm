@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # Generate:  nanoplm pretrain get-yaml
-# Launch:    nanoplm pretrain from-yaml --pure-torch PATH
+# Launch:    nanoplm pretrain from-yaml
 #
 # First edit (most runs only need these):
 #   pretraining.dataset_dir / ckp_dir / project_name / run_name
@@ -18,7 +18,6 @@
 #      → binary shards + .data_manifest  (sequence length comes from the manifest)
 #
 # Full field docs: website reference/pretrain
-# Backend: prefer CLI --pure-torch / --pure-te over the booleans at the bottom.
 # =============================================================================
 
 
