@@ -1,12 +1,12 @@
 ---
 title: Your first PLM
-description: Train and evaluate a small protein language model on SwissProt, end to end, in about half an hour on one GPU.
+description: Train and evaluate a small protein language model on UniProt50, end to end, in about half an hour on one GPU.
 ---
 
 import { Steps, FileTree } from '@astrojs/starlight/components';
 
 You are going to pretrain a real protein language model (a 2.3M-parameter ModernBERT-style
-encoder) on 20,000 SwissProt sequences, then score it on a downstream benchmark. Every command is
+encoder) on 20,000 UniProt50 sequences, then score it on a downstream benchmark. Every command is
 run from the same working directory, and each stage hands its artifacts to the next.
 
 **What you need**
@@ -14,13 +14,12 @@ run from the same working directory, and each stage hands its artifacts to the n
 - A supported install: Linux + Hopper GPU + CUDA 13, via `nanoplm deps install`. See
   [Install](/nanoplm/start/install/).
 - The `eval` extra for Stage 3 (`uv pip install -e ".[eval]"` or the GitHub equivalent).
-- About 30 minutes: roughly 10 for the SwissProt download and tokenization, a few for training, and
+- About 30 minutes: roughly 10 for the UniProt50 download and tokenization, a few for training, and
   the rest for benchmarking.
 
 :::note
 `use_packing` defaults to `true` and uses FlashAttention-3, which `nanoplm deps install` already
-puts in the env. If verify failed on `flash_attn_interface`, either re-run deps install or set
-`use_packing: false` under `pretraining:` in Stage 2 so the run uses padding instead.
+puts in the env.
 :::
 
 ## Stage 1: Build the dataset
@@ -36,20 +35,20 @@ puts in the env. If verify failed on `flash_attn_interface`, either re-run deps 
    # Edit data.yaml and run `nanoplm data from-yaml` to execute.
    ```
 
-2. **Check three keys.** The template already points at SwissProt, so there is little to change,
+2. **Check three keys.** The template already points at UniProt50, so there is little to change,
    but these are the three values that decide how big and how long your dataset is, and they are
    worth setting on purpose.
 
    ```yaml title="data.yaml" {2,7,9}
    data_dirs:
-     url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+     url: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
      # ...
-     output_dir:         "output/data/pretrain_data"   # pretrain.yaml reads from here
+     output_dir: "output/data/pretrain_data"   # pretrain.yaml reads from here
 
    data_params:
-     seqs_num: 20000        # SwissProt has ~570k; 20k trains fast and still learns
+     seqs_num: 20000        # UniProt50 has ~570k; 20k trains fast and still learns
      min_seq_len: 20
-     max_seq_len: 512       # pad/truncate length: pretraining reads this back from the manifest
+     max_seq_len: 512       # only sequences below this length will be selected
      # ...
    ```
 
