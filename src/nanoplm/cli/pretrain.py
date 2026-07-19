@@ -226,7 +226,7 @@ def pretrain():
 @click.option(
     "--micro-batch-seqs",
     type=int,
-    default=64,
+    default=128,
     help="Sequences per GPU per micro-step (forward pass)",
 )
 @click.option(
@@ -243,13 +243,13 @@ def pretrain():
 )
 @click.option(
     "--gradient-clipping/--no-gradient-clipping",
-    default=False,
+    default=True,
     help="Enable gradient clipping with max norm 1.0",
 )
 @click.option(
     "--warmup-steps",
     type=int,
-    default=302,
+    default=1000,
     help="Number of optimizer steps for LR warmup",
 )
 @click.option(
@@ -333,7 +333,7 @@ def pretrain():
 @click.option(
     "--global-batch-tokens",
     type=int,
-    default=256000,
+    default=1024000,
     help="Target tokens per optimizer step (grad_accum inferred automatically)",
 )
 @click.option(
@@ -345,7 +345,7 @@ def pretrain():
     help="Optimizer to use",
 )
 @click.option("--adam-beta1", type=float, default=0.9, help="Adam beta1")
-@click.option("--adam-beta2", type=float, default=0.999, help="Adam beta2")
+@click.option("--adam-beta2", type=float, default=0.95, help="Adam beta2")
 @click.option("--adam-epsilon", type=float, default=1e-8, help="Adam epsilon")
 @click.option(
     "--muon-learning-rate",
@@ -429,18 +429,18 @@ def pretrain():
     "--logging-steps", type=int, default=1, help="Number of steps between log events"
 )
 @click.option(
-    "--eval-steps", type=int, default=250, help="Number of steps between evaluations"
+    "--eval-steps", type=int, default=1000, help="Number of steps between evaluations"
 )
 @click.option(
     "--save-steps",
     type=int,
-    default=5000,
+    default=2500,
     help="Number of steps between checkpoint saves",
 )
 @click.option("--seed", type=int, default=42, help="Random seed")
 @click.option(
     "--debug-non-finite-params/--no-debug-non-finite-params",
-    default=True,
+    default=False,
     help="Check parameters for non-finite values after every optimizer step.",
 )
 @click.option(
@@ -453,7 +453,7 @@ def pretrain():
 @click.option(
     "--debug-layerwise-log-every",
     type=int,
-    default=20,
+    default=100,
     help="Log layerwise debug metrics every N optimizer steps.",
 )
 @click.option(
@@ -606,6 +606,26 @@ def pretrain():
     default="run",
     help=f"Weights & Biases run name under the project name as DDMMHHMM-<run_name>",
 )
+@click.option(
+    "--profiler-enabled/--no-profiler-enabled",
+    default=False,
+    show_default=True,
+    help="Profile a step window and export a Chrome trace to --ckp-dir.",
+)
+@click.option(
+    "--profiler-start-step",
+    type=int,
+    default=18,
+    show_default=True,
+    help="First optimizer step captured by the profiler (only when --profiler-enabled).",
+)
+@click.option(
+    "--profiler-end-step",
+    type=int,
+    default=22,
+    show_default=True,
+    help="Last optimizer step captured by the profiler (only when --profiler-enabled).",
+)
 # Resume options
 @click.option(
     "--resume/--no-resume",
@@ -652,29 +672,29 @@ def pretrain():
     help="(mode=decay) LR decay floor fraction for the anneal.",
 )
 # Model hyperparameters (ModernBERT)
-@click.option("--hidden-size", type=int, default=768, help="Model hidden size")
+@click.option("--hidden-size", type=int, default=1024, help="Model hidden size")
 @click.option(
     "--intermediate-size",
     type=int,
-    default=1536,
+    default=2048,
     help="Intermediate (FFN) size",
 )
 @click.option(
     "--num-hidden-layers",
     type=int,
-    default=12,
+    default=16,
     help="Number of transformer layers",
 )
 @click.option(
     "--num-attention-heads",
     type=int,
-    default=8,
+    default=16,
     help="Number of attention heads",
 )
 @click.option(
     "--num-kv-heads",
     type=int,
-    default=None,
+    default=8,
     help="Number of KV heads for GQA (default: same as num_attention_heads = MHA)",
 )
 @click.option(
@@ -686,7 +706,7 @@ def pretrain():
 @click.option(
     "--norm-type",
     type=click.Choice(["layernorm", "rmsnorm"], case_sensitive=False),
-    default="layernorm",
+    default="rmsnorm",
     help="Normalization type: layernorm (default) or rmsnorm (slightly faster, no bias)",
 )
 @click.option(
@@ -699,7 +719,7 @@ def pretrain():
 @click.option("--mlp-bias", is_flag=True, default=False, help="Use MLP bias")
 @click.option(
     "--no-mlp-on-first-layer/--mlp-on-first-layer",
-    default=True,
+    default=False,
     help="Disable the MLP branch in encoder layer 0",
 )
 @click.option("--attention-bias", is_flag=True, default=False, help="Use attn bias")
@@ -712,18 +732,25 @@ def pretrain():
 )
 @click.option(
     "--use-resid-lambdas/--no-use-resid-lambdas",
-    default=True,
+    default=False,
     help="Enable per-layer residual scaling (resid_lambdas). Not compatible with --use-mhc-lite.",
 )
 @click.option(
     "--use-x0-lambdas/--no-use-x0-lambdas",
-    default=True,
+    default=False,
     help="Enable per-layer x0 shortcut scaling (x0_lambdas)",
 )
 @click.option(
     "--use-qk-norm/--no-use-qk-norm",
     default=False,
     help="Enable NanoChat-style RMS QK normalization in attention",
+)
+@click.option(
+    "--global-rope-theta",
+    type=float,
+    default=40000.0,
+    show_default=True,
+    help="RoPE base for full-attention layers; lower (e.g. 10000-40000) suits short max_seq_len",
 )
 @click.option(
     "--reorder-rope-qknorm/--no-reorder-rope-qknorm",
@@ -733,7 +760,7 @@ def pretrain():
 )
 @click.option(
     "--use-canon-layers/--no-use-canon-layers",
-    default=True,
+    default=False,
     help="Enable bidirectional Canon-ABCD local mixing layers (pure-torch path only)",
 )
 @click.option(
@@ -745,8 +772,9 @@ def pretrain():
 @click.option(
     "--canon-layers-kernel-size",
     type=int,
-    default=None,
-    help="Canon kernel size. If omitted, defaults to 5. Allowed values: {3,5,7}.",
+    default=5,
+    show_default=True,
+    help="Canon kernel size. Allowed values: {3,5,7}.",
 )
 @click.option(
     "--use-repo/--no-use-repo",
@@ -778,7 +806,7 @@ def pretrain():
 @click.option(
     "--activation-checkpointing-mode",
     type=click.Choice(["layer", "attn", "attn+mlp"], case_sensitive=False),
-    default="layer",
+    default="attn",
     show_default=True,
     help="Checkpoint scope. 'layer' checkpoints the whole transformer layer; "
     "'attn' checkpoints only the attention residual branch (usually the best tradeoff); "
@@ -786,8 +814,8 @@ def pretrain():
 )
 @click.option(
     "--tie-word-embeddings/--no-tie-word-embeddings",
-    default=True,
-    help="Tie input embedding and output decoder weights (default: enabled).",
+    default=False,
+    help="Tie input embedding and output decoder weights (default: disabled).",
 )
 @click.option(
     "--use-diff-attn-v2/--no-use-diff-attn-v2",
@@ -804,7 +832,7 @@ def pretrain():
 @click.option(
     "--attn-layer-pattern",
     type=str,
-    default=None,
+    default="F",
     help="Attention layer pattern string using F (full) and S (sliding), e.g. 'FSS'. "
     "Tiles to cover all layers. Overrides --global-attn-every-n-layers when set.",
 )
@@ -822,9 +850,16 @@ def pretrain():
 @click.option(
     "--wo-init",
     type=click.Choice(["kaiming", "zero"], case_sensitive=False),
-    default="zero",
+    default="kaiming",
     show_default=True,
     help="Initialization for residual out-projections (attn.Wo and mlp.Wo).",
+)
+@click.option(
+    "--moe-kernel-backend",
+    type=click.Choice(["cutlass", "sonicmoe"], case_sensitive=False),
+    default="sonicmoe",
+    show_default=True,
+    help="Routed-expert compute backend for MoE layers (sonicmoe = SonicMoE/quack fused path).",
 )
 @click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
@@ -952,6 +987,9 @@ def run(
     ddp_bucket_cap_mb: int,
     project_name: str,
     run_name: str,
+    profiler_enabled: bool,
+    profiler_start_step: int,
+    profiler_end_step: int,
     resume: bool,
     resume_checkpoint_dir: str,
     resume_mode: str,
@@ -977,6 +1015,7 @@ def run(
     use_resid_lambdas: bool,
     use_x0_lambdas: bool,
     use_qk_norm: bool,
+    global_rope_theta: float,
     reorder_rope_qknorm: bool,
     use_canon_layers: bool,
     canon_layers_mode: str,
@@ -994,6 +1033,7 @@ def run(
     fused_qkv: bool,
     fused_up_gate: bool,
     wo_init: str,
+    moe_kernel_backend: str,
     use_mhc_lite: bool,
     mhc_n_streams: int,
     mhc_lite_wrapping_level: str,
@@ -1075,7 +1115,10 @@ def run(
         world_size=world_size,
         ddp_bucket_cap_mb=ddp_bucket_cap_mb,
         project_name=project_name,
-        run_name=run_name
+        run_name=run_name,
+        profiler_enabled=profiler_enabled,
+        profiler_start_step=profiler_start_step,
+        profiler_end_step=profiler_end_step,
     )
 
     if pure_torch and pure_te:
@@ -1140,6 +1183,7 @@ def run(
         use_resid_lambdas=use_resid_lambdas,
         use_x0_lambdas=use_x0_lambdas,
         use_qk_norm=use_qk_norm,
+        global_rope_theta=global_rope_theta,
         reorder_RoPE_QKNorm=reorder_rope_qknorm,
         use_canon_layers=use_canon_layers,
         canon_layers_mode=canon_layers_mode,
@@ -1160,6 +1204,7 @@ def run(
         fused_qkv=fused_qkv,
         fused_up_gate=fused_up_gate,
         wo_init=wo_init,
+        moe_kernel_backend=moe_kernel_backend.lower(),
     )
 
     _validate_muonh_wo_init_compat(cfg, model_cfg)
@@ -1466,27 +1511,27 @@ def get_yaml(output: Optional[str], force: bool):
         "# This will generate binary shards and a .data_manifest file.\n"
         "\n"
         "model:\n"
-        "  hidden_size: 768\n"
-        "  intermediate_size: 1536\n"
-        "  num_hidden_layers: 12\n"
-        "  num_attention_heads: 8\n"
-        "  # num_kv_heads: 8  # GQA: number of KV heads (default: same as num_attention_heads = MHA)\n"
+        "  hidden_size: 1024\n"
+        "  intermediate_size: 2048\n"
+        "  num_hidden_layers: 16\n"
+        "  num_attention_heads: 16\n"
+        "  num_kv_heads: 8  # GQA: number of KV heads (default: same as num_attention_heads = MHA)\n"
         "  vocab_size: 32\n"
-        '  norm_type: "layernorm"  # layernorm | rmsnorm (rmsnorm is slightly faster, no bias)\n'
+        '  norm_type: "rmsnorm"  # layernorm | rmsnorm (rmsnorm is slightly faster, no bias)\n'
         '  mlp_activation: "swiglu"  # swiglu | glu | srelu\n'
         "  mlp_dropout: 0.0\n"
         "  mlp_bias: false\n"
-        "  no_mlp_on_first_layer: true\n"
+        "  no_mlp_on_first_layer: false\n"
         "  attention_bias: false\n"
         "  attention_dropout: 0.0\n"
         '  classifier_activation: "gelu"  # relu | gelu | srelu (srelu requires pure_torch or pure_te)\n'
-        "  tie_word_embeddings: true  # tie input embedding and output decoder weights\n"
+        "  tie_word_embeddings: false  # tie input embedding and output decoder weights\n"
         "  # The options below only work on pure-torch and TE pipelines unless noted\n"
         "  use_resid_lambdas: false  # scales residual stream per layer (not compatible with use_mhc_lite)\n"
         "  use_x0_lambdas: false  # blends initial embedding x0 per layer\n"
         "  use_qk_norm: false  # applies RMS norm to Q/K in attention\n"
         "  reorder_RoPE_QKNorm: false  # true = QK norm BEFORE RoPE (LLaMA-style, better fusion); needs use_qk_norm\n"
-        "  global_rope_theta: 160000.0  # RoPE base for full-attention layers; lower (e.g. 10000-40000) suits short max_seq_len\n"
+        "  global_rope_theta: 40000.0  # RoPE base for full-attention layers; lower (e.g. 10000-40000) suits short max_seq_len\n"
         "  local_rope_theta: 10000.0  # RoPE base for sliding-window layers\n"
         "  rope_dim_fraction: 1.0  # fraction of head_dim to apply RoPE (e.g. 0.25 = 25% rotary + 75% NoPE content dims)\n"
         "  use_canon_layers: false # enables Canon-ABCD local mixing layers (pure_torch only)\n"
@@ -1507,10 +1552,10 @@ def get_yaml(output: Optional[str], force: bool):
         "  noble_alpha: 0.01  # NOBLE W_up initialization scale\n"
         "  noble_half_kaiming: true  # halve main weight init scale for NOBLE layers (paper §3.3)\n"
         "  noble_targets: all  # which projections get NOBLE: all|attn|ffn|qkv|out\n"
-        "  attn_layer_pattern: null  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
+        "  attn_layer_pattern: 'F'  # Attention pattern string e.g. 'FSS' (F=full, S=sliding). Tiles to num_layers. Overrides global_attn_every_n_layers.\n"
         "  fused_qkv: true  # false = separate Wq/Wk/Wv instead of a single Wqkv\n"
         "  fused_up_gate: true  # false = separate W_up/W_gate instead of a single Wi for SwiGLU/GLU\n"
-        '  wo_init: "zero"  # residual out-projection init for attn.Wo/mlp.Wo: kaiming | zero\n'
+        '  wo_init: "kaiming"  # residual out-projection init for attn.Wo/mlp.Wo: kaiming | zero\n'
         "  activation_checkpointing: false  # Enable to reduce VRAM by recomputing activations during backward\n"
         '  activation_checkpointing_mode: "attn"  # (layer | attn | attn+mlp), attn mode has highest ROI \n'
         "  # MoE (Mixture-of-Experts) — pure_torch only, requires use_packing + use_static_inp_size\n"
@@ -1526,6 +1571,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  moe_topk_group: 1               # with moe_n_group > 1, keep top K groups per token\n"
         "  moe_bias_update_rate: 1e-3      # expert-bias correction step size\n"
         "  moe_leading_dense_layers: 1     # first N layers are always dense (DeepSeek uses 1)\n"
+        "  moe_kernel_backend: 'sonicmoe'  # cutlass | sonicmoe (SonicMoE/quack fused expert path)\n"
         "  # Huginn-style recycling — pure_torch only. recycling_loop_count: 1 disables recycling.\n"
         "  # Splits the L-layer stack into prelude (P, runs once) / recurrent (L-P-C, weight-tied,\n"
         "  # looped) / coda (C, runs once); a learned 2h->h adapter consumes [s, e] at each iter.\n"
@@ -1540,14 +1586,15 @@ def get_yaml(output: Optional[str], force: bool):
         '  dataset_dir: "output/data/pretrain_data"\n'
         '  ckp_dir: "output/pretraining_checkpoints"\n'
         "  # Batch sizing (token-budget surface)\n"
-        "  micro_batch_seqs: 64\n"
-        "  global_batch_tokens: 256000\n"
+        "  micro_batch_seqs: 128\n"
+        "  global_batch_tokens: 1024000\n"
         "  global_batch_warmup_steps: 0  # number of steps to warm up to the target global batch size, starts at 1/8 -> 1/4 -> 1/2 -> full (at the provided step). default: 0, no batch size warmup. \n"
         "  # Duration + LR schedule (token-budget surface)\n"
         '  lr_schedule: "wsd"  # wsd | warmup_stable | cosine | linear\n'
+        "  # If using anything else rather than wsd, comment out the stable_tokens and decay_tokens lines below, and uncomment train_tokens. The warmup_steps line is used for all schedules.\n"
         "  warmup_steps: 1000\n"
-        "  stable_tokens: 9000000   # wsd: tokens up to the pre-decay checkpoint (warmup included)\n"
-        "  decay_tokens: 1000000    # wsd: additional anneal tokens\n"
+        "  stable_tokens: 9000000   # wsd only: tokens up to the pre-decay checkpoint (warmup included)\n"
+        "  decay_tokens: 1000000    # wsd only: additional anneal tokens\n"
         '  decay_shape: "1-sqrt"  # 1-sqrt | linear\n'
         "  lr_decay_to_fraction: 0.1\n"
         "  # train_tokens: 10000000  # single-phase budget for warmup_stable | cosine | linear (NOT used with wsd)\n"
@@ -1555,13 +1602,13 @@ def get_yaml(output: Optional[str], force: bool):
         "  # stable_steps:  # ↔ stable_tokens (wsd)\n"
         "  # decay_steps:   # ↔ decay_tokens (wsd / resume-decay)\n"
         "  # max_steps:     # ↔ train_tokens (warmup_stable | cosine | linear)\n"
-        '  optimizer: "adamw"  # adamw | stable_adamw | muon | normuon | muonh | aurora\n'
+        '  optimizer: "normuon"  # adamw | stable_adamw | muon | normuon | muonh | aurora\n'
         "  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon, normuon, or muonh)\n"
         "  adam_beta1: 0.9\n"
-        "  adam_beta2: 0.999\n"
+        "  adam_beta2: 0.95\n"
         "  adam_epsilon: 1e-8\n"
         "  adam_learning_rate: 1e-4\n"
-        "  max_grad_norm: .inf\n"
+        "  max_grad_norm: 1\n"
         "  repo_rope_warmup_steps: 1000\n"
         "  adam_weight_decay: 0.0\n"
         "  muon_learning_rate: 1e-3\n"
@@ -1596,12 +1643,12 @@ def get_yaml(output: Optional[str], force: bool):
         "  keep_probability: 0.1\n"
         "  mlm_standard_amino_acids_only: true  # true=current: MLM targets/random replacements use only 20 standard AAs; false=legacy all non-special tokens\n"
         "  logging_steps: 1\n"
-        "  eval_steps: 250\n"
-        "  save_steps: 5000\n"
+        "  eval_steps: 1000\n"
+        "  save_steps: 2500\n"
         "  seed: 42\n"
-        "  debug_non_finite_params: true  # checks params for NaN/Inf after every optimizer step\n"
+        "  debug_non_finite_params: false  # checks params for NaN/Inf after every optimizer step\n"
         "  debug_layerwise_metrics: false  # per-layer grad/weight norms, residual RMS, logit stats (overhead; breaks torch.compile graphs; not supported with pure_te)\n"
-        "  debug_layerwise_log_every: 20  # log layerwise metrics every N optimizer steps\n"
+        "  debug_layerwise_log_every: 100  # log layerwise metrics every N optimizer steps\n"
         '  num_workers: "auto"\n'
         "  prefetch_factor: 2\n"
         "  use_packing: true\n"
@@ -1639,8 +1686,8 @@ def get_yaml(output: Optional[str], force: bool):
         '  project_name: "nanoplm-pretraining"\n'
         '  run_name: "run" # will be DDMMHHMM-<run_name>\n'
         "  profiler_enabled: false\n"
-        "  profiler_start_step: 10\n"
-        "  profiler_end_step: 15\n"
+        "  profiler_start_step: 18\n"
+        "  profiler_end_step: 22\n"
         "\n"
         "\n"
         "resume:\n"
@@ -1663,7 +1710,7 @@ def get_yaml(output: Optional[str], force: bool):
         '  decay_shape: "1-sqrt"  # 1-sqrt | linear\n'
         "  lr_decay_to_fraction: 0.1\n"
         "\n"
-        "# pure_torch: false\n"
+        "pure_torch: true\n"
         "# pure_te: false\n"
     )
 
