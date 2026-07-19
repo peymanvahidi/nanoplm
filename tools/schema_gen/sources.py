@@ -13,10 +13,11 @@ REPO_SRC = REPO_ROOT / "src" / "nanoplm"
 
 @dataclass(frozen=True)
 class TemplateSource:
-    # A get-yaml template embedded as a Python string literal.
+    # Path to a packaged ``.yaml`` template, or a ``.py`` file that embeds one.
     file: str
-    # The Python variable OR function whose string body holds the template.
-    symbol: str
+    # For ``.py`` sources: the module-level constant or function that holds the
+    # template string. For ``.yaml`` sources: unused (pass ``""``).
+    symbol: str = ""
 
 @dataclass(frozen=True)
 class DataclassSource:
@@ -25,9 +26,10 @@ class DataclassSource:
 
 # Surfaces whose docs live in a comment-rich get-yaml template string.
 TEMPLATE_SOURCES = {
-    "data":     TemplateSource(str(REPO_SRC / "cli/_templates.py"), "PRETRAIN_DATA_YAML"),
-    "pretrain": TemplateSource(str(REPO_SRC / "cli/_templates.py"), "PRETRAIN_YAML"),
-    "distill":  TemplateSource(str(REPO_SRC / "cli/distill.py"),    "get_yaml"),
+    "data":     TemplateSource(str(REPO_SRC / "cli/templates/data_pretrain.yaml")),
+    "pretrain": TemplateSource(str(REPO_SRC / "cli/templates/pretrain.yaml")),
+    # Distill still ships as an embedded string in distill.get_yaml (for now).
+    "distill":  TemplateSource(str(REPO_SRC / "cli/distill.py"), "get_yaml"),
 }
 
 # Surfaces whose docs live in a dataclass with per-field leading comments.

@@ -1,0 +1,34 @@
+# Evaluation configuration for nanoPLM
+#
+# Runs biotrainer's autoeval pipeline on a pure-torch nanoPLM checkpoint.
+# Requires:  pip install nanoplm[eval]
+#
+# The model config is loaded from <checkpoint_dir>/model_config.yaml.
+# Checkpoints without that file are not supported.
+
+eval:
+  # Checkpoint path. Accepts a checkpoint-* directory or a run-*
+  # directory (the latest checkpoint inside the run-* is used).
+  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
+
+  # One or more of: pbc, flip, pgym. 'pgym' is zero-shot ProteinGym.
+  framework: [pbc]
+
+  output_dir: "autoeval_output"
+
+  batch_size: 16
+  min_seq_length: 0
+  max_seq_length: 2000
+
+  # device: cuda                     # auto-detected when omitted
+  # embedder_name: my-run            # defaults to checkpoint dir stem
+  parallel_tasks: 0                  # 0 = sequential, >0 = parallel workers
+
+  # Zero-shot scoring method when framework includes 'pgym'.
+  zero_shot_method: masked_marginals  # masked_marginals | wt_marginals | pseudoperplexity
+
+  # Optional whitelist of task names. Parallel mode only.
+  # tasks: [PBC-secondary_structure]
+
+  # Re-download framework datasets (use when new tasks land upstream).
+  force_download: false

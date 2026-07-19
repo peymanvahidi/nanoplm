@@ -41,8 +41,19 @@ def _concat_str_parts(node: ast.AST) -> str | None:
 
 
 def load_template_text(surface: str) -> str:
+    """Return the raw YAML template text for a docs surface.
+
+    Sources may be:
+    - a packaged ``.yaml`` file (read as UTF-8 text), or
+    - a ``.py`` file with a module-level string constant / ``get_yaml`` body
+      (static AST extract; no import of nanoplm).
+    """
     spec = TEMPLATE_SOURCES[surface]
-    tree = ast.parse(Path(spec.file).read_text(encoding="utf-8"))
+    path = Path(spec.file)
+    if path.suffix in {".yaml", ".yml"}:
+        return path.read_text(encoding="utf-8")
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
 
     # Case 1: module-level assignment `SYMBOL = "..."`
     for n in tree.body:

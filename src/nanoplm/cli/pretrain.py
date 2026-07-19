@@ -48,7 +48,7 @@ from nanoplm.pretraining.models.modern_bert.pure_model import (
 from nanoplm.data.infra.validation import validate_pretrain_dataset
 from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline, DataManifest
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
-from nanoplm.cli._templates import PRETRAIN_YAML
+from nanoplm.cli.templates import load_template
 from nanoplm.utils.logger import logger
 
 
@@ -1501,7 +1501,7 @@ def get_yaml(output: Optional[str], force: bool):
     # Ensure target directory exists
     create_dirs(output_path)
 
-    output_path.write_text(PRETRAIN_YAML, encoding="utf-8")
+    output_path.write_text(load_template("pretrain"), encoding="utf-8")
     click.echo(f"Template written to: {output_path}")
 
 

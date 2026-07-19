@@ -68,6 +68,7 @@ docs = ["pyyaml>=6"]
 "nanoplm.pretraining" = ["csrc/*.c"]
 "nanoplm.data" = ["csrc/*.c"]
 "nanoplm.pretraining.models.modern_bert" = ["csrc/*.cpp", "csrc/*.cu"]
+"nanoplm.cli.templates" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

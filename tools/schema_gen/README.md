@@ -19,7 +19,7 @@ keeping CI light and runnable without the training stack.
 | module | responsibility |
 |--------|----------------|
 | `sources.py` | registry of where each surface's docs live (template files / dataclasses), the compat matrix, and the parity allowlist |
-| `templates.py` | statically extract a `get-yaml` template string and parse its fields + inline comments |
+| `templates.py` | load a `get-yaml` template (packaged `.yaml` or embedded Python string) and parse its fields + inline comments |
 | `dataclass_ast.py` | extract `@dataclass` fields + leading/trailing comments (for the `eval` surface + parity) |
 | `types.py` | infer a JSON-Schema type/default from a raw YAML scalar literal |
 | `overlay.py` / `overlay.yaml` | hand-authored enum / range / backend / advanced annotations literals can't express |
@@ -28,10 +28,12 @@ keeping CI light and runnable without the training stack.
 | `generate.py` | serialize the schemas to `website/src/generated/` (JSON-safe) |
 
 The four surfaces are `data`, `pretrain`, `distill` (from comment-rich `get-yaml` templates) and
-`eval` (from the `EvalConfig` dataclass). `nanoplm eval get-yaml` does exist, but its template
-curates a subset — it comments out optional, auto-defaulted fields (`device`, `embedder_name`,
-`tasks`) — so the dataclass is used as eval's source instead, because it documents *every* settable
-field with its per-field comments.
+`eval` (from the `EvalConfig` dataclass). `data` / `pretrain` templates live as packaged YAML under
+`src/nanoplm/cli/templates/`; `distill` is still an embedded string in `distill.get_yaml`.
+`nanoplm eval get-yaml` also ships a packaged `eval.yaml`, but its template curates a subset — it
+comments out optional, auto-defaulted fields (`device`, `embedder_name`, `tasks`) — so the dataclass
+is used as eval's *docs* source, because it documents *every* settable field with its per-field
+comments.
 
 ## The parity gate (the keystone)
 
