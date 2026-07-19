@@ -41,7 +41,7 @@ export default defineConfig({
         {
           label: 'Get started',
           items: [
-            { label: 'What is nanoPLM?', link: '/' },
+            { label: 'What is nanoPLM?', link: '/start/what-is-nanoplm/' },
             { label: 'Install', link: '/start/install/' },
             { label: 'Your first PLM', link: '/start/first-plm/' },
           ],

@@ -1,0 +1,1935 @@
+---
+// website/src/pages/index.astro
+// The marketing front door. This is a plain Astro page rather than a Starlight
+// docs page, because the landing layout (full-bleed hero, no sidebar, no ToC)
+// fights every part of the docs chrome. Astro gives `src/pages` priority over
+// Starlight's injected catch-all route, so this file owns "/" and the old docs
+// index moved to /start/what-is-nanoplm/.
+//
+// It still imports the docs stylesheet, so every colour, font and light/dark
+// override comes from the one place that already defines them. Nothing about
+// the palette is restated here; if custom.css changes, this page follows.
+import fs from 'node:fs';
+import { Image } from 'astro:assets';
+import logo from '../assets/nanoplm-logo.png';
+import PipelineDiagram from '../components/PipelineDiagram.astro';
+import '../styles/custom.css';
+
+// BASE_URL is "/nanoplm/" in production and "/" in a bare dev server. Strip the
+// trailing slash once so every link below can be written as `${base}/path/`.
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const GITHUB = 'https://github.com/peymanvahidi/nanoplm';
+const PYPI = 'https://pypi.org/project/nanoplm/';
+
+// Read the version from the package metadata instead of hardcoding it. The docs
+// already generate their reference tables from the source of truth so they
+// cannot go stale; the one number on the landing page should not be the
+// exception that quietly rots.
+let version = '';
+try {
+  const pyproject = fs.readFileSync(new URL('../../../pyproject.toml', import.meta.url), 'utf8');
+  version = pyproject.match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? '';
+} catch {
+  // A missing pyproject only costs us the version chip, so render without it.
+}
+
+const title = 'nanoPLM: from FASTA to a protein language model';
+const description =
+  'nanoPLM pretrains a protein language model from a FASTA file. Three YAML files, six commands, and reproducible artifacts that flow between them.';
+const ogImage = new URL(logo.src, Astro.site).href;
+
+// The quickstart, split so each block gets its own copy button. These are the
+// same commands as the install docs; the section links there for the full story
+// (clusters, verification, the eval extra) rather than duplicating it.
+const STEPS = [
+  {
+    n: '01',
+    title: 'Install',
+    body: 'One pinned GPU stack: torch, Transformer Engine, FlashAttention-3, SonicMoE and Dion.',
+    code: `uv venv && source .venv/bin/activate
+uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \\
+    --extra-index-url https://download.pytorch.org/whl/cu130
+nanoplm deps install`,
+  },
+  {
+    n: '02',
+    title: 'Prepare data',
+    body: 'FASTA in, tokenized shards out, tracked by DVC and described by a manifest.',
+    code: `nanoplm data get-yaml
+nanoplm data from-yaml`,
+  },
+  {
+    n: '03',
+    title: 'Pretrain',
+    body: 'Shards in, a checkpoint out. The manifest tells pretraining what the data stage decided.',
+    code: `nanoplm pretrain get-yaml
+nanoplm pretrain from-yaml`,
+  },
+  {
+    n: '04',
+    title: 'Evaluate',
+    body: 'A checkpoint in, benchmark scores out, via biotrainer’s autoeval pipeline.',
+    code: `nanoplm eval get-yaml
+nanoplm eval from-yaml`,
+  },
+];
+
+// `hue` walks the logo left to right, so the six cards together replay the
+// wordmark's own sweep rather than repeating one accent six times.
+const FEATURES = [
+  {
+    hue: 'indigo',
+    icon: 'sliders',
+    title: 'Configured, not coded',
+    body: 'Three commented YAML files control the whole pipeline. Scaffold one with get-yaml, edit it, run it with from-yaml. No training script to fork and maintain.',
+  },
+  {
+    hue: 'azure',
+    icon: 'file-check',
+    title: 'Artifacts that describe themselves',
+    body: 'The data stage writes a .data_manifest recording what it decided. Checkpoints carry their own model_config.yaml. You never retype a setting to hand it to the next stage.',
+  },
+  {
+    hue: 'cyan',
+    icon: 'git-branch',
+    title: 'Data you can trust',
+    body: 'DVC runs under the hood, so every dataset you build is versioned and reproducible. Rerun a month-old experiment and get the same shards.',
+  },
+  {
+    hue: 'sage',
+    icon: 'cpu',
+    title: 'Serious kernels, quietly',
+    body: 'FP8 through Transformer Engine, FlashAttention-3, token packing, SonicMoE and the Dion optimizer family are installed and wired up. Turn them on with a config key.',
+  },
+  {
+    hue: 'violet',
+    icon: 'zap',
+    title: 'Native fast paths',
+    body: 'Tokenizing and shard writing drop to an OpenMP-enabled C backend, as do FASTA shuffle, filter and split. Both fall back to Python when unavailable.',
+  },
+  {
+    hue: 'azure',
+    icon: 'shield-check',
+    title: 'Reference that cannot drift',
+    body: 'Every key of every config is generated from the get-yaml templates and the config dataclasses, and CI fails when they disagree with the docs.',
+  },
+];
+
+const REQUIREMENTS = [
+  { label: 'OS / CPU', value: 'Linux x86_64 or aarch64' },
+  { label: 'GPU', value: 'NVIDIA Hopper (H100, H200, GH200, sm90)' },
+  { label: 'CUDA', value: '13.0 or newer' },
+  { label: 'Python', value: '3.11 to 3.13, tested on 3.12' },
+];
+
+// Decorative only, and hidden from assistive tech. Twenty proteinogenic amino
+// acid letters in the alphabet nanoPLM actually tokenizes, repeated to fill a
+// marquee. It is a texture, not a real sequence, so it makes no claim.
+const ALPHABET = 'MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKR';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="icon" href={`${base}/favicon.svg`} type="image/svg+xml" />
+    <link rel="canonical" href={new URL(base + '/', Astro.site).href} />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:image" content={ogImage} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+
+    {/* Inlined and first so the theme lands before paint, exactly like
+        Starlight's own ThemeProvider. It reads the same localStorage key, which
+        is what makes the preference survive the trip between here and the docs. */}
+    <script is:inline>
+      (() => {
+        const stored =
+          typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
+        const theme =
+          stored || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+        document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+      })();
+    </script>
+  </head>
+
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="nav">
+      <div class="shell nav-inner">
+        <a class="brand" href={`${base}/`} aria-label="nanoPLM home">
+          <Image src={logo} alt="nanoPLM" height={27} densities={[1, 2]} loading="eager" />
+        </a>
+
+        <nav class="nav-links" aria-label="Page sections">
+          <a href="#why">Why</a>
+          <a href="#pipeline">How it works</a>
+          <a href="#features">Features</a>
+          <a href="#install">Install</a>
+        </nav>
+
+        <div class="nav-actions">
+          <a class="btn btn-ghost" href={`${base}/start/install/`}>Docs</a>
+          <a class="icon-btn" href={GITHUB} aria-label="nanoPLM on GitHub">
+            <svg viewBox="0 0 24 24" aria-hidden="true"
+              ><path
+                d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"
+              ></path><path d="M9 18c-4.51 2-5-2-7-2"></path></svg
+            >
+          </a>
+          <button class="icon-btn" id="theme-toggle" type="button" aria-label="Toggle colour theme">
+            <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true"
+              ><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path><path d="M12 20v2"
+              ></path><path d="m4.93 4.93 1.41 1.41"></path><path d="m17.66 17.66 1.41 1.41"
+              ></path><path d="M2 12h2"></path><path d="M20 12h2"></path><path
+                d="m6.34 17.66-1.41 1.41"></path><path d="m19.07 4.93-1.41 1.41"></path></svg
+            >
+            <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true"
+              ><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"></path></svg
+            >
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main id="main">
+      <!-- ================= HERO ================= -->
+      <section class="hero">
+        <div class="hero-glow" aria-hidden="true"></div>
+        <div class="shell hero-grid">
+          <div class="hero-copy">
+            <p class="eyebrow">
+              <span class="dot" aria-hidden="true"></span>
+              Encoder-only protein language models
+              {version && <span class="ver">v{version}</span>}
+            </p>
+
+            {/* Broken by hand into three lines. Left to wrap on its own the
+                article "a" ends up orphaned on a line of its own, and the
+                headline is short enough that these breaks hold down to 320px. */}
+            <h1>
+              From FASTA to a<br />
+              <span class="grad">Foundation&nbsp;Model</span>.<br />
+              Fast.
+            </h1>
+
+            <p class="lede">
+              Pretraining a protein language model no longer needs hundreds of GPUs. It needs
+              tooling. nanoPLM is a batteries-included pipeline: three YAML files, six commands,
+              and reproducible artifacts that flow between them.
+            </p>
+
+            <div class="cta-row">
+              <a class="btn btn-primary" href={`${base}/start/first-plm/`}>
+                Train your first PLM
+                <svg viewBox="0 0 24 24" aria-hidden="true"
+                  ><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg
+                >
+              </a>
+              <a class="btn btn-outline" href={GITHUB}>
+                <svg viewBox="0 0 24 24" aria-hidden="true"
+                  ><path
+                    d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.4 5.4 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"
+                  ></path><path d="M9 18c-4.51 2-5-2-7-2"></path></svg
+                >
+                Star on GitHub
+              </a>
+            </div>
+
+            <div class="install-line">
+              <code>uv pip install nanoplm &amp;&amp; nanoplm deps install</code>
+              <button
+                class="copy"
+                type="button"
+                data-copy="uv pip install nanoplm && nanoplm deps install"
+                aria-label="Copy install command"
+              >
+                <svg class="i-copy" viewBox="0 0 24 24" aria-hidden="true"
+                  ><rect width="14" height="14" x="8" y="8" rx="2"></rect><path
+                    d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></svg
+                >
+                <svg class="i-check" viewBox="0 0 24 24" aria-hidden="true"
+                  ><path d="M20 6 9 17l-5-5"></path></svg
+                >
+              </button>
+            </div>
+            <p class="fineprint">
+              Hopper GPU and CUDA 13 required. <a href={`${base}/start/install/`}>Full install</a>.
+            </p>
+          </div>
+
+          <!-- A real session, not a mockup of one: these are the commands from
+               the quickstart and the log lines the pretrain loop actually
+               prints. The lines fade in one by one on load, and appear at once
+               when reduced motion is requested. -->
+          <div class="term" data-reveal-seq>
+            <div class="term-bar" aria-hidden="true">
+              <span class="tl tl-r"></span><span class="tl tl-y"></span><span class="tl tl-g"></span>
+              <span class="term-title">nanoplm</span>
+            </div>
+            <pre class="term-body"><code>{[
+              { t: 'cmd', v: 'nanoplm data get-yaml' },
+              { t: 'out', v: 'wrote data.yaml, dvc.yaml' },
+              { t: 'cmd', v: 'nanoplm data from-yaml' },
+              { t: 'out', v: 'train.fasta  val.fasta' },
+              { t: 'out', v: 'shard_*.bin  .data_manifest' },
+              { t: 'cmd', v: 'nanoplm pretrain from-yaml' },
+              { t: 'out', v: 'Using pure-torch model and training loop' },
+              { t: 'ok', v: 'Total Trainable Parameters: 2306848' },
+              { t: 'ok', v: 'Flash attention available: True' },
+              { t: 'log', v: '[step 1/154] loss=3.4412 lr=5.00e-06 tok/s=412,190' },
+              { t: 'log', v: '[step 2/154] loss=3.3901 lr=1.00e-05 tok/s=418,004' },
+              { t: 'log', v: '[step 3/154] loss=3.2118 lr=1.50e-05 tok/s=420,771' },
+            ].map((l, i) => (
+              <span class={`ln ln-${l.t}`} style={`--i:${i}`}>{l.v}</span>
+            ))}<span class="ln caret" aria-hidden="true"></span></code></pre>
+          </div>
+        </div>
+
+        <!-- Amino acid texture: the alphabet the tokenizer sees, masked to
+             nothing at both edges so it reads as material rather than content. -->
+        <div class="strip" aria-hidden="true">
+          <div class="strip-track">
+            <span>{ALPHABET}</span><span>{ALPHABET}</span><span>{ALPHABET}</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= FACTS ================= -->
+      <section class="facts">
+        <div class="shell facts-grid">
+          {
+            [
+              { hue: 'indigo', n: '3', label: 'YAML files control everything' },
+              { hue: 'cyan', n: '6', label: 'commands, FASTA to benchmark' },
+              { hue: 'sage', n: 'FP8', label: 'Transformer Engine and FA-3' },
+              { hue: 'violet', n: 'MIT', label: 'open source, built in the open' },
+            ].map((f) => (
+              <div style={`--h: var(--c-${f.hue})`}>
+                <b>{f.n}</b>
+                <span>{f.label}</span>
+              </div>
+            ))
+          }
+        </div>
+      </section>
+
+      <!-- ================= WHY =================
+           Placed directly after the hero on purpose: this is the problem the
+           project exists to solve, so it frames every how-to section below it
+           rather than arriving as an afterthought at the bottom of the page. -->
+      <section class="band" id="why">
+        <div class="shell">
+          <header class="sec-head" data-reveal>
+            <p class="kicker">Why we built it</p>
+            <h2>The bottleneck is no longer compute</h2>
+          </header>
+
+          <div class="why" data-reveal>
+            <p>
+              Protein language modelling borrowed its playbook from natural language processing,
+              then fell behind it. New architectures, optimizers and training methods land in NLP
+              almost weekly, while protein models see a new state of the art every year or two.
+            </p>
+            <p>
+              That gap is not a shortage of scientific interest. Training a pLM from scratch means
+              multi-GPU setups, input pipelines fast enough to keep the GPUs fed, batch
+              construction, sequence packing, and a long tail of choices that sit well outside most
+              computational biologists' day job. So the realistic options are months of
+              infrastructure work before the actual research question, or fine-tuning a model
+              someone else trained. Plenty of questions cannot be answered that way.
+            </p>
+            <p class="why-punch">
+              A strong pLM now trains on a handful of GPUs, a scale many academic labs already
+              have. <strong>What is missing is the tooling.</strong>
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= THE LOOP ================= -->
+      <section class="band alt" id="loop">
+        <div class="shell">
+          <header class="sec-head" data-reveal>
+            <p class="kicker">The loop</p>
+            <h2>Every stage has the same two verbs</h2>
+            <p class="sub">
+              Learn the loop once and you know the whole tool. <code>get-yaml</code> scaffolds a
+              fully commented config, you edit it, <code>from-yaml</code> runs it. Shown for
+              pretraining; swap in <code>data</code> or <code>eval</code> and the shape is identical.
+            </p>
+          </header>
+
+          <ol class="loop" data-reveal>
+            <li style="--h: var(--c-indigo)">
+              <span class="loop-n">1</span>
+              <h3>Scaffold</h3>
+              <p>A config with every key explained in place, written to your working directory.</p>
+              <code class="loop-code"><i>$</i> nanoplm pretrain get-yaml</code>
+            </li>
+            <li style="--h: var(--c-cyan)">
+              <span class="loop-n">2</span>
+              <h3>Edit</h3>
+              <p>Change what your experiment needs. Every field is commented in place, so you rarely leave the file.</p>
+              <code class="loop-code"><i>#</i> $EDITOR pretrain.yaml</code>
+            </li>
+            <li style="--h: var(--c-violet)">
+              <span class="loop-n">3</span>
+              <h3>Run</h3>
+              <p>The config is the run. Rerunning the same file reproduces the same result.</p>
+              <code class="loop-code"><i>$</i> nanoplm pretrain from-yaml</code>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <!-- ================= PIPELINE ================= -->
+      <section class="band" id="pipeline">
+        <div class="shell">
+          <header class="sec-head" data-reveal>
+            <p class="kicker">The pipeline</p>
+            <h2>Three stages, and the files they hand each other</h2>
+            <p class="sub">
+              Because each stage describes itself on disk, you never repeat yourself. Data writes a
+              manifest that pretraining reads back. Pretraining writes checkpoints that carry their
+              own config, so evaluation needs nothing but a path.
+            </p>
+          </header>
+
+          <div class="pipe-host" data-reveal>
+            <PipelineDiagram />
+          </div>
+
+          <p class="sec-foot" data-reveal>
+            <a class="textlink" href={`${base}/pipeline/`}>
+              How the pipeline fits together
+              <svg viewBox="0 0 24 24" aria-hidden="true"
+                ><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg
+              >
+            </a>
+          </p>
+        </div>
+      </section>
+
+      <!-- ================= QUICKSTART ================= -->
+      <section class="band alt" id="quickstart">
+        <div class="shell">
+          <header class="sec-head" data-reveal>
+            <p class="kicker">Quickstart</p>
+            <h2>Zero to a trained model</h2>
+            <p class="sub">
+              The defaults are wired to chain: <code>data.yaml</code> writes shards exactly where
+              <code>pretrain.yaml</code> looks for them. The one value the defaults cannot guess is
+              <code>eval.checkpoint_dir</code>, so point that at the run you just trained.
+            </p>
+          </header>
+
+          <ol class="steps">
+            {
+              STEPS.map((s) => (
+                <li data-reveal>
+                  <div class="step-head">
+                    <span class="step-n">{s.n}</span>
+                    <div>
+                      <h3>{s.title}</h3>
+                      <p>{s.body}</p>
+                    </div>
+                  </div>
+                  <div class="code-card">
+                    <button class="copy" type="button" data-copy={s.code} aria-label={`Copy the ${s.title.toLowerCase()} commands`}>
+                      <svg class="i-copy" viewBox="0 0 24 24" aria-hidden="true">
+                        <rect width="14" height="14" x="8" y="8" rx="2" />
+                        <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+                      </svg>
+                      <svg class="i-check" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                    </button>
+                    <pre><code>{s.code}</code></pre>
+                  </div>
+                </li>
+              ))
+            }
+          </ol>
+        </div>
+      </section>
+
+      <!-- ================= FEATURES ================= -->
+      <section class="band" id="features">
+        <div class="shell">
+          <header class="sec-head" data-reveal>
+            <p class="kicker">What you get</p>
+            <h2>Opinionated where it saves you time</h2>
+          </header>
+
+          <div class="cards">
+            {
+              FEATURES.map((f) => (
+                <article class="card" data-reveal style={`--h: var(--c-${f.hue})`}>
+                  <span class="card-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24">
+                      {f.icon === 'sliders' && (
+                        <>
+                          <path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3" />
+                          <path d="M14 2v4M8 10v4M16 18v4" />
+                        </>
+                      )}
+                      {f.icon === 'file-check' && (
+                        <>
+                          <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+                          <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+                          <path d="m9 15 2 2 4-4" />
+                        </>
+                      )}
+                      {f.icon === 'git-branch' && (
+                        <>
+                          <path d="M6 3v12" />
+                          <circle cx="18" cy="6" r="3" />
+                          <circle cx="6" cy="18" r="3" />
+                          <path d="M18 9a9 9 0 0 1-9 9" />
+                        </>
+                      )}
+                      {f.icon === 'cpu' && (
+                        <>
+                          <rect width="16" height="16" x="4" y="4" rx="2" />
+                          <rect width="6" height="6" x="9" y="9" rx="1" />
+                          <path d="M15 2v2M15 20v2M2 15h2M2 9h2M20 15h2M20 9h2M9 2v2M9 20v2" />
+                        </>
+                      )}
+                      {f.icon === 'zap' && (
+                        <path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z" />
+                      )}
+                      {f.icon === 'shield-check' && (
+                        <>
+                          <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+                          <path d="m9 12 2 2 4-4" />
+                        </>
+                      )}
+                    </svg>
+                  </span>
+                  <h3>{f.title}</h3>
+                  <p>{f.body}</p>
+                </article>
+              ))
+            }
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= INSTALL ================= -->
+      <section class="band alt" id="install">
+        <div class="shell install-grid">
+          <header class="sec-head left" data-reveal>
+            <p class="kicker">Requirements</p>
+            <h2>One supported stack, pinned</h2>
+            <p class="sub">
+              Every full install carries the same pinned versions, so a run that works on your
+              node works on someone else's. Other GPUs and operating systems may partially work
+              but are unsupported.
+            </p>
+            <p class="sec-foot">
+              <a class="textlink" href={`${base}/start/install/`}>
+                Install guide, including clusters
+                <svg viewBox="0 0 24 24" aria-hidden="true"
+                  ><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg
+                >
+              </a>
+            </p>
+          </header>
+
+          <dl class="reqs" data-reveal>
+            {
+              REQUIREMENTS.map((r) => (
+                <div>
+                  <dt>{r.label}</dt>
+                  <dd>{r.value}</dd>
+                </div>
+              ))
+            }
+          </dl>
+        </div>
+      </section>
+
+      <!-- ================= CLOSING CTA ================= -->
+      <section class="closer">
+        <div class="shell" data-reveal>
+          <h2>Start with a tiny model, end to end</h2>
+          <p>
+            Train and evaluate a small PLM top to bottom, with every edit spelled out. It is the
+            fastest way to see the whole pipeline move.
+          </p>
+          <div class="cta-row center">
+            <a class="btn btn-primary" href={`${base}/start/first-plm/`}>
+              Your first PLM
+              <svg viewBox="0 0 24 24" aria-hidden="true"
+                ><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg
+              >
+            </a>
+            <a class="btn btn-outline" href={`${base}/reference/cli/`}>Browse the CLI reference</a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <div class="shell foot-inner">
+        <div class="foot-brand">
+          <Image src={logo} alt="nanoPLM" height={20} densities={[1, 2]} loading="lazy" />
+          <p>From FASTA to a foundation model. Fast.</p>
+        </div>
+
+        <nav class="foot-cols" aria-label="Footer">
+          <div>
+            <h3>Get started</h3>
+            <a href={`${base}/start/what-is-nanoplm/`}>What is nanoPLM?</a>
+            <a href={`${base}/start/install/`}>Install</a>
+            <a href={`${base}/start/first-plm/`}>Your first PLM</a>
+          </div>
+          <div>
+            <h3>Pipeline</h3>
+            <a href={`${base}/pipeline/data/`}>Prepare data</a>
+            <a href={`${base}/pipeline/pretrain/`}>Pretrain</a>
+            <a href={`${base}/pipeline/eval/`}>Evaluate</a>
+          </div>
+          <div>
+            <h3>Reference</h3>
+            <a href={`${base}/reference/cli/`}>CLI</a>
+            <a href={`${base}/reference/pretrain/`}>pretrain.yaml</a>
+            <a href={`${base}/troubleshooting/`}>Troubleshooting</a>
+          </div>
+          <div>
+            <h3>Project</h3>
+            <a href={GITHUB}>GitHub</a>
+            <a href={PYPI}>PyPI</a>
+            <a href={`${GITHUB}/blob/master/LICENSE`}>MIT License</a>
+          </div>
+        </nav>
+      </div>
+      <div class="shell foot-legal">
+        <p>MIT licensed. Copyright &copy; 2025 Peyman Vahidi.</p>
+        <a href="#top" class="to-top">Back to top</a>
+      </div>
+    </footer>
+
+    <script>
+      // Copy buttons. The button swaps to a check for a moment, which is the
+      // only feedback a copy action can honestly give.
+      document.querySelectorAll<HTMLButtonElement>('button[data-copy]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(btn.dataset.copy ?? '');
+            btn.classList.add('copied');
+            setTimeout(() => btn.classList.remove('copied'), 1600);
+          } catch {
+            // Clipboard access can be denied; the text is selectable anyway.
+          }
+        });
+      });
+
+      // Theme toggle, writing the key Starlight reads so the choice carries
+      // over to the docs and back.
+      const toggle = document.getElementById('theme-toggle');
+      toggle?.addEventListener('click', () => {
+        const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+        document.documentElement.dataset.theme = next;
+        try {
+          localStorage.setItem('starlight-theme', next);
+        } catch {
+          // Private mode can block storage; the toggle still works for this page.
+        }
+      });
+
+      // Scroll reveals and the terminal line cascade. Both are opacity and
+      // transform only, both are skipped entirely when the visitor asks for
+      // reduced motion, and in that case the markup is already in its final
+      // state because "shown" is the default and JS only removes the pre-state.
+      const wantsMotion = window.matchMedia('(prefers-reduced-motion: no-preference)').matches;
+      if (wantsMotion && 'IntersectionObserver' in window) {
+        const targets = Array.from(
+          document.querySelectorAll('[data-reveal], [data-reveal-seq]')
+        );
+        // Only pre-hide what is still below the fold. Whatever is already on
+        // screen when this runs (including after a jump straight to an #anchor)
+        // is left alone, so the first paint is never a blank section.
+        const hidden = targets.filter(
+          (el) => el.getBoundingClientRect().top > window.innerHeight * 0.9
+        );
+        hidden.forEach((el) => el.classList.add('pre'));
+
+        const io = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              if (!entry.isIntersecting) return;
+              entry.target.classList.remove('pre');
+              io.unobserve(entry.target);
+            });
+          },
+          { rootMargin: '0px 0px -8% 0px', threshold: 0.05 }
+        );
+        hidden.forEach((el) => io.observe(el));
+
+        // Failsafe. An animation is a nice-to-have; content that never appears
+        // is a broken page, so anything still hidden well after load is shown
+        // regardless of what the observer did.
+        setTimeout(() => hidden.forEach((el) => el.classList.remove('pre')), 6000);
+      }
+    </script>
+
+    <style is:global>
+      /* This page owns its own reset. Starlight ships one for docs routes, but
+         a plain Astro page gets nothing, so the basics are set here rather than
+         inherited. Everything visual below resolves to a --sl-* token from
+         custom.css, which is what keeps the landing page and the docs in step. */
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+      html {
+        -webkit-text-size-adjust: 100%;
+        scroll-behavior: smooth;
+        scroll-padding-top: 5rem;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+      }
+      body {
+        margin: 0;
+        background: var(--sl-color-bg);
+        color: var(--sl-color-white);
+        font-family: var(--sl-font);
+        font-size: 16px;
+        line-height: 1.6;
+        -webkit-font-smoothing: antialiased;
+        overflow-x: hidden;
+      }
+      h1,
+      h2,
+      h3,
+      p,
+      ol,
+      ul,
+      dl,
+      dd,
+      figure,
+      blockquote {
+        margin: 0;
+      }
+      ol,
+      ul {
+        padding: 0;
+        list-style: none;
+      }
+      img {
+        max-width: 100%;
+        height: auto;
+      }
+      a {
+        color: inherit;
+      }
+      code,
+      pre {
+        font-family: var(--sl-font-mono);
+      }
+      /* One focus treatment for every interactive element on the page. */
+      :where(a, button):focus-visible {
+        outline: 2px solid var(--sl-color-accent);
+        outline-offset: 3px;
+        border-radius: 0.35rem;
+      }
+      /* Icons are all 24-box strokes, so set the stroke once. */
+      svg {
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.6;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+    </style>
+
+    <style>
+      /* --- Logo palette -----------------------------------------------------
+         Sampled from src/assets/nanoplm-logo.png: the wordmark sweeps indigo
+         into azure, through the cyan of the accretion disk, into the sage of
+         "PL" and the violet of "M". The raw samples cannot be used as-is,
+         because the logo's colours are dark ones (#202060 indigo, #503070
+         violet) that sit at 1.2:1 to 2.2:1 on a near-black page. So the hue and
+         saturation are kept and only the lightness is retuned per mode: bright
+         on the dark page, deep on the light one. Every value below clears 4.5:1
+         against both the page and the raised card behind it.
+
+         These are set on body, not :root, so they win over the imported docs
+         stylesheet no matter which order the bundler emits the two in. The
+         --sl-* overrides are what carry the palette into PipelineDiagram, which
+         is shared with the docs and reads those tokens. */
+      body {
+        --c-indigo: #8a8ae6;
+        --c-azure: #6e9fdc;
+        --c-cyan: #4fc3d9;
+        --c-violet: #ae8ae0;
+        --c-sage: #a2c46e;
+
+        --sl-color-accent-low: #0b2c34;
+        --sl-color-accent: #35b4cc;
+        --sl-color-accent-high: #7fd8e8;
+
+        --btn-bg: #35b4cc;
+        --btn-fg: #06161a;
+        --surface: color-mix(in srgb, var(--sl-color-gray-6) 60%, var(--sl-color-bg));
+        --surface-2: var(--sl-color-gray-6);
+      }
+      :global([data-theme='light']) body {
+        --c-indigo: #3b3b9e;
+        --c-azure: #2f63a8;
+        --c-cyan: #1c6f80;
+        --c-violet: #6e42a0;
+        --c-sage: #4f6d2c;
+
+        --sl-color-accent-low: #cfeaf1;
+        --sl-color-accent: #1c6f80;
+        --sl-color-accent-high: #13525e;
+
+        --btn-bg: #1c6f80;
+        --btn-fg: #ffffff;
+        --surface: #ffffff;
+        --surface-2: #ffffff;
+      }
+
+      .shell {
+        width: 100%;
+        max-width: 72rem;
+        margin-inline: auto;
+        padding-inline: 1.25rem;
+      }
+      @media (min-width: 48rem) {
+        .shell {
+          padding-inline: 2rem;
+        }
+      }
+
+      /* Grid and flex children default to min-width:auto, so a child holding an
+         unbreakable line (a nowrap command, the long install URL) refuses to
+         shrink and drags the whole page wider than the viewport. Every track
+         that can contain code is allowed to shrink instead, which lets the code
+         scroll inside its own box the way it should. */
+      .hero-grid > *,
+      .loop li,
+      .steps li,
+      .card,
+      .install-grid > *,
+      .reqs > div,
+      .foot-inner > *,
+      .foot-cols > div,
+      .facts-grid > div {
+        min-width: 0;
+      }
+
+      .skip {
+        position: absolute;
+        left: -9999px;
+        top: 0;
+        z-index: 100;
+        padding: 0.75rem 1rem;
+        background: var(--btn-bg);
+        color: var(--btn-fg);
+        font-weight: 600;
+        text-decoration: none;
+      }
+      .skip:focus {
+        left: 0.5rem;
+        top: 0.5rem;
+      }
+
+      /* --- Nav -------------------------------------------------------------- */
+      .nav {
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        background: color-mix(in srgb, var(--sl-color-bg) 82%, transparent);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--sl-color-hairline-shade);
+      }
+      .nav-inner {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        height: 4rem;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        flex-shrink: 0;
+      }
+      .nav-links {
+        display: none;
+        gap: 1.75rem;
+        margin-inline: auto;
+        font-size: 0.9rem;
+        color: var(--sl-color-gray-2);
+      }
+      @media (min-width: 62rem) {
+        .nav-links {
+          display: flex;
+        }
+      }
+      .nav-links a {
+        text-decoration: none;
+        transition: color 0.18s ease;
+      }
+      .nav-links a:hover {
+        color: var(--sl-color-accent-high);
+      }
+      .nav-actions {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        margin-left: auto;
+      }
+      @media (min-width: 62rem) {
+        .nav-actions {
+          margin-left: 0;
+        }
+      }
+
+      /* Below about 26rem the nav runs out of room for a full-size wordmark
+         beside three controls. The icon buttons keep their 44px because touch
+         targets are not negotiable, so the wordmark, the Docs button and the
+         page gutter give up the space instead. */
+      @media (max-width: 26rem) {
+        .shell {
+          padding-inline: 1rem;
+        }
+        .nav-inner {
+          gap: 0.5rem;
+        }
+        .brand :global(img) {
+          height: 20px;
+          width: auto;
+        }
+        .nav-actions {
+          gap: 0.25rem;
+        }
+        .btn-ghost {
+          padding: 0 0.6rem;
+        }
+      }
+
+      /* --- Buttons ---------------------------------------------------------- */
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        min-height: 2.75rem;
+        padding: 0 1.1rem;
+        border-radius: 0.55rem;
+        border: 1px solid transparent;
+        font-size: 0.925rem;
+        font-weight: 600;
+        letter-spacing: -0.005em;
+        text-decoration: none;
+        cursor: pointer;
+        white-space: nowrap;
+        transition:
+          background-color 0.18s ease,
+          border-color 0.18s ease,
+          color 0.18s ease,
+          transform 0.18s ease;
+      }
+      .btn svg {
+        width: 1rem;
+        height: 1rem;
+        flex-shrink: 0;
+      }
+      .btn-primary {
+        background: var(--btn-bg);
+        color: var(--btn-fg);
+      }
+      .btn-primary:hover {
+        background: color-mix(in srgb, var(--btn-bg) 86%, var(--sl-color-white));
+      }
+      .btn-outline {
+        border-color: var(--sl-color-gray-5);
+        color: var(--sl-color-white);
+        background: var(--surface);
+      }
+      .btn-outline:hover {
+        border-color: var(--sl-color-accent);
+        color: var(--sl-color-accent-high);
+      }
+      .btn-ghost {
+        color: var(--sl-color-gray-1);
+        padding: 0 0.85rem;
+      }
+      .btn-ghost:hover {
+        color: var(--sl-color-accent-high);
+        background: var(--surface-2);
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .btn-primary:hover,
+        .btn-outline:hover {
+          transform: translateY(-1px);
+        }
+      }
+
+      /* 44px minimum on both axes, which is also why the nav is 64px tall. */
+      .icon-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.75rem;
+        height: 2.75rem;
+        border: 1px solid transparent;
+        border-radius: 0.55rem;
+        background: none;
+        color: var(--sl-color-gray-2);
+        cursor: pointer;
+        transition:
+          color 0.18s ease,
+          background-color 0.18s ease;
+      }
+      .icon-btn:hover {
+        color: var(--sl-color-accent-high);
+        background: var(--surface-2);
+      }
+      .icon-btn svg {
+        width: 1.15rem;
+        height: 1.15rem;
+      }
+      /* Show the icon for the theme you would switch to, not the current one. */
+      .i-moon {
+        display: none;
+      }
+      :global([data-theme='light']) .i-sun {
+        display: none;
+      }
+      :global([data-theme='light']) .i-moon {
+        display: block;
+      }
+
+      /* --- Hero ------------------------------------------------------------- */
+      .hero {
+        position: relative;
+        padding-top: 4rem;
+        overflow: hidden;
+      }
+      /* A single soft accent bloom behind the headline. Kept very low opacity:
+         the docs describe this theme as a lab instrument, not a product launch. */
+      .hero-glow {
+        position: absolute;
+        top: -18rem;
+        left: 50%;
+        width: min(78rem, 150vw);
+        height: 40rem;
+        transform: translateX(-50%);
+        /* Three overlapping blooms rather than one, so the bloom reads as the
+           logo's accretion disk: indigo trailing left, cyan at the core, violet
+           trailing right. */
+        background:
+          radial-gradient(
+            38% 58% at 28% 42%,
+            color-mix(in srgb, var(--c-indigo) 20%, transparent) 0%,
+            transparent 72%
+          ),
+          radial-gradient(
+            34% 54% at 72% 46%,
+            color-mix(in srgb, var(--c-violet) 18%, transparent) 0%,
+            transparent 72%
+          ),
+          radial-gradient(
+            42% 48% at 50% 50%,
+            color-mix(in srgb, var(--c-cyan) 16%, transparent) 0%,
+            transparent 70%
+          );
+        pointer-events: none;
+      }
+      :global([data-theme='light']) .hero-glow {
+        opacity: 0.62;
+      }
+      .hero-grid {
+        position: relative;
+        display: grid;
+        gap: 3rem;
+        align-items: center;
+        padding-bottom: 4rem;
+      }
+      @media (min-width: 62rem) {
+        .hero {
+          padding-top: 5.5rem;
+        }
+        .hero-grid {
+          grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+          gap: 3.5rem;
+          padding-bottom: 5.5rem;
+        }
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 1.5rem;
+        padding: 0.3rem 0.75rem 0.3rem 0.6rem;
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 999px;
+        background: var(--surface);
+        font-size: 0.775rem;
+        font-weight: 500;
+        color: var(--sl-color-gray-2);
+      }
+      .dot {
+        width: 0.4rem;
+        height: 0.4rem;
+        border-radius: 999px;
+        background: var(--sl-color-accent);
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .dot {
+          animation: pulse 2.6s ease-in-out infinite;
+        }
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.35;
+        }
+      }
+      .ver {
+        padding-left: 0.55rem;
+        border-left: 1px solid var(--sl-color-hairline-shade);
+        font-family: var(--sl-font-mono);
+        font-size: 0.72rem;
+        color: var(--sl-color-accent-high);
+      }
+
+      h1 {
+        /* The lower bound is set by "Foundation Model", the longest of the three
+           hand-broken lines: at 2.25rem it fills a 320px screen to the pixel, so
+           any font-metric difference would wrap it and strand a word. */
+        font-size: clamp(2.05rem, 6.2vw, 3.65rem);
+        line-height: 1.06;
+        letter-spacing: -0.033em;
+        font-weight: 700;
+      }
+      /* The wordmark's full sweep, in its own order: indigo at the n, cyan
+         through the black hole, the sage of PL, violet out at the M.
+         Interpolated in oklab because sage to violet crosses straight through
+         grey in sRGB, which drains the middle of the word. The plain sRGB
+         gradient is declared first as a fallback: this text is transparent, so
+         a background the browser cannot parse would leave it invisible. */
+      .grad {
+        background: linear-gradient(
+          100deg,
+          var(--c-indigo) 0%,
+          var(--c-cyan) 32%,
+          var(--c-sage) 62%,
+          var(--c-violet) 100%
+        );
+        background: linear-gradient(
+          100deg in oklab,
+          var(--c-indigo) 0%,
+          var(--c-cyan) 32%,
+          var(--c-sage) 62%,
+          var(--c-violet) 100%
+        );
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .lede {
+        max-width: 34rem;
+        margin-top: 1.35rem;
+        font-size: 1.075rem;
+        line-height: 1.65;
+        color: var(--sl-color-gray-2);
+      }
+
+      .cta-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.7rem;
+        margin-top: 2rem;
+      }
+      .cta-row.center {
+        justify-content: center;
+      }
+
+      .install-line {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        max-width: 34rem;
+        margin-top: 1.75rem;
+        padding: 0.55rem 0.55rem 0.55rem 0.85rem;
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 0.6rem;
+        background: var(--surface);
+        overflow: hidden;
+      }
+      .install-line code {
+        flex: 1;
+        min-width: 0;
+        overflow-x: auto;
+        white-space: nowrap;
+        font-size: 0.82rem;
+        color: var(--sl-color-gray-1);
+        scrollbar-width: none;
+      }
+      .install-line code::-webkit-scrollbar {
+        display: none;
+      }
+      .fineprint {
+        margin-top: 0.85rem;
+        font-size: 0.8rem;
+        color: var(--sl-color-gray-3);
+      }
+      .fineprint a {
+        color: var(--sl-color-accent-high);
+        text-underline-offset: 3px;
+      }
+
+      /* Copy button: 44px hit area, icon crossfade on success. */
+      .copy {
+        position: relative;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        width: 2.2rem;
+        height: 2.2rem;
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 0.45rem;
+        background: var(--surface-2);
+        color: var(--sl-color-gray-3);
+        cursor: pointer;
+        transition:
+          color 0.18s ease,
+          border-color 0.18s ease;
+      }
+      .copy::after {
+        /* Pads the pointer target out to 44px without moving the visual box. */
+        content: '';
+        position: absolute;
+        inset: -0.6rem;
+      }
+      .copy:hover {
+        color: var(--sl-color-accent-high);
+        border-color: var(--sl-color-accent);
+      }
+      .copy svg {
+        width: 0.95rem;
+        height: 0.95rem;
+      }
+      .copy .i-check {
+        display: none;
+      }
+      .copy.copied {
+        color: var(--sl-color-accent);
+        border-color: var(--sl-color-accent);
+      }
+      .copy.copied .i-copy {
+        display: none;
+      }
+      .copy.copied .i-check {
+        display: block;
+      }
+
+      /* --- Terminal --------------------------------------------------------- */
+      .term {
+        border: 1px solid var(--sl-color-gray-5);
+        border-radius: 0.75rem;
+        background: var(--surface-2);
+        overflow: hidden;
+        box-shadow: 0 24px 60px -28px rgba(0, 0, 0, 0.65);
+      }
+      :global([data-theme='light']) .term {
+        background: #10161a;
+        border-color: #26313a;
+      }
+      .term-bar {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.7rem 0.85rem;
+        border-bottom: 1px solid var(--sl-color-hairline-shade);
+        background: color-mix(in srgb, var(--sl-color-bg) 55%, var(--surface-2));
+      }
+      :global([data-theme='light']) .term-bar {
+        background: #0c1114;
+        border-bottom-color: #26313a;
+      }
+      .tl {
+        width: 0.6rem;
+        height: 0.6rem;
+        border-radius: 999px;
+      }
+      .tl-r {
+        background: #f0685f;
+      }
+      .tl-y {
+        background: #f4bf4f;
+      }
+      .tl-g {
+        background: #5ec269;
+      }
+      .term-title {
+        margin-left: 0.5rem;
+        font-family: var(--sl-font-mono);
+        font-size: 0.7rem;
+        /* Literal, like the rest of the terminal: its chrome stays dark in both
+           themes, so a theme-following grey would invert against it. */
+        color: #8a9596;
+      }
+      .term-body {
+        margin: 0;
+        padding: 1.1rem 1.15rem 1.35rem;
+        overflow-x: auto;
+        /* Sized so the longest log line clears a 390px phone without scrolling. */
+        font-size: 0.7rem;
+        line-height: 1.85;
+      }
+      @media (min-width: 30rem) {
+        .term-body {
+          font-size: 0.775rem;
+        }
+      }
+      .term-body code {
+        display: block;
+        min-width: max-content;
+      }
+      .ln {
+        display: block;
+        white-space: pre;
+      }
+      /* The terminal keeps its dark chrome in light mode, so its text colours
+         are literal rather than tokenised. All clear 4.5:1 on #10161a. */
+      .ln-cmd {
+        color: #e7edee;
+        margin-top: 0.55rem;
+      }
+      .ln-cmd:first-child {
+        margin-top: 0;
+      }
+      .ln-cmd::before {
+        content: '$ ';
+        color: #4fc3d9;
+      }
+      .ln-out {
+        color: #93a1a1;
+      }
+      /* The two capability lines are the good news in the run, so they take the
+         logo's sage rather than reading as ordinary output. */
+      .ln-ok {
+        color: #a2c46e;
+      }
+      .ln-log {
+        color: #7fd8e8;
+      }
+      :global([data-theme='light']) .ln-out {
+        color: #9aa8a8;
+      }
+      .caret {
+        width: 0.5rem;
+        height: 1rem;
+        margin-top: 0.35rem;
+        background: #4fc3d9;
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .caret {
+          animation: blink 1.15s steps(1) infinite;
+        }
+      }
+      @keyframes blink {
+        50% {
+          opacity: 0;
+        }
+      }
+
+      /* --- Amino acid strip -------------------------------------------------- */
+      .strip {
+        position: relative;
+        border-block: 1px solid var(--sl-color-hairline-shade);
+        padding-block: 0.7rem;
+        overflow: hidden;
+        -webkit-mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
+        mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
+      }
+      .strip-track {
+        display: flex;
+        width: max-content;
+        gap: 2rem;
+        font-family: var(--sl-font-mono);
+        font-size: 0.9rem;
+        letter-spacing: 0.3em;
+        /* The alphabet the tokenizer sees, running through the logo's own
+           sweep. Decorative and aria-hidden, so it is held well below body
+           contrast on purpose. */
+        background: linear-gradient(
+          90deg,
+          var(--c-indigo),
+          var(--c-azure),
+          var(--c-cyan),
+          var(--c-sage),
+          var(--c-violet),
+          var(--c-indigo)
+        );
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        opacity: 0.55;
+        user-select: none;
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .strip-track {
+          animation: drift 64s linear infinite;
+        }
+      }
+      @keyframes drift {
+        to {
+          transform: translateX(calc(-100% / 3 - 0.667rem));
+        }
+      }
+
+      /* --- Facts ------------------------------------------------------------ */
+      .facts {
+        border-bottom: 1px solid var(--sl-color-hairline-shade);
+      }
+      .facts-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 1.75rem 1rem;
+        padding-block: 2.5rem;
+        text-align: center;
+      }
+      @media (min-width: 48rem) {
+        .facts-grid {
+          grid-template-columns: repeat(4, 1fr);
+        }
+      }
+      .facts-grid b {
+        display: block;
+        font-size: 1.65rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: var(--h);
+      }
+      .facts-grid span {
+        display: block;
+        margin-top: 0.2rem;
+        font-size: 0.83rem;
+        line-height: 1.45;
+        color: var(--sl-color-gray-3);
+      }
+
+      /* --- Section scaffolding ---------------------------------------------- */
+      .band {
+        padding-block: 5rem;
+        scroll-margin-top: 4rem;
+      }
+      .band.alt {
+        background: color-mix(in srgb, var(--sl-color-gray-6) 40%, var(--sl-color-bg));
+        border-block: 1px solid var(--sl-color-hairline-shade);
+      }
+      :global([data-theme='light']) .band.alt {
+        background: var(--sl-color-gray-6);
+      }
+      @media (min-width: 62rem) {
+        .band {
+          padding-block: 6.5rem;
+        }
+      }
+      .sec-head {
+        max-width: 44rem;
+        margin: 0 auto 3rem;
+        text-align: center;
+      }
+      .sec-head.left {
+        margin-inline: 0;
+        text-align: left;
+      }
+      .kicker {
+        margin-bottom: 0.7rem;
+        font-family: var(--sl-font-mono);
+        font-size: 0.72rem;
+        font-weight: 500;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--sl-color-accent-high);
+      }
+      .sec-head h2 {
+        font-size: clamp(1.6rem, 3.6vw, 2.3rem);
+        line-height: 1.18;
+        letter-spacing: -0.024em;
+        font-weight: 700;
+      }
+      .sub {
+        margin-top: 1rem;
+        font-size: 1rem;
+        line-height: 1.65;
+        color: var(--sl-color-gray-2);
+      }
+      .sub code {
+        padding: 0.1em 0.35em;
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 0.25rem;
+        background: var(--surface);
+        font-size: 0.86em;
+        color: var(--sl-color-accent-high);
+      }
+      .sec-foot {
+        margin-top: 2rem;
+        text-align: center;
+      }
+      .sec-head.left .sec-foot {
+        text-align: left;
+      }
+      .textlink {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        min-height: 2.75rem;
+        font-size: 0.925rem;
+        font-weight: 600;
+        color: var(--sl-color-accent-high);
+        text-decoration: none;
+      }
+      .textlink svg {
+        width: 1rem;
+        height: 1rem;
+        transition: transform 0.18s ease;
+      }
+      .textlink:hover {
+        text-decoration: underline;
+        text-underline-offset: 4px;
+      }
+      .textlink:hover svg {
+        transform: translateX(3px);
+      }
+
+      /* --- The loop --------------------------------------------------------- */
+      .loop {
+        display: grid;
+        gap: 1rem;
+        counter-reset: loop;
+      }
+      /* Three across only once a card is wide enough for a whole command on one
+         line. Below that the stacked layout wins, because a command clipped
+         mid-word reads as broken in a way a taller card does not. */
+      @media (min-width: 54rem) {
+        .loop {
+          grid-template-columns: repeat(3, 1fr);
+        }
+        .loop-code {
+          font-size: 0.72rem;
+        }
+      }
+      .loop li {
+        position: relative;
+        padding: 1.6rem 1.5rem;
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 0.75rem;
+        background: var(--surface);
+      }
+      /* A connector between the three steps, so they read as one loop rather
+         than three unrelated cards. Wide screens only, where they sit in a row. */
+      @media (min-width: 54rem) {
+        .loop li:not(:last-child)::after {
+          content: '';
+          position: absolute;
+          top: 2.55rem;
+          right: -1rem;
+          width: 1rem;
+          border-top: 1px dashed var(--sl-color-gray-4);
+        }
+      }
+      .loop-n {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 1.7rem;
+        height: 1.7rem;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--h) 16%, transparent);
+        font-family: var(--sl-font-mono);
+        font-size: 0.78rem;
+        font-weight: 600;
+        color: var(--h);
+      }
+      .loop h3 {
+        margin-top: 0.85rem;
+        font-size: 1.1rem;
+        font-weight: 650;
+        letter-spacing: -0.015em;
+      }
+      .loop p {
+        margin-top: 0.4rem;
+        font-size: 0.9rem;
+        line-height: 1.6;
+        color: var(--sl-color-gray-3);
+      }
+      .loop-code {
+        display: block;
+        margin-top: 1.1rem;
+        padding-top: 0.9rem;
+        border-top: 1px solid var(--sl-color-hairline-shade);
+        font-size: 0.76rem;
+        color: var(--sl-color-gray-2);
+        overflow-x: auto;
+        white-space: nowrap;
+      }
+      .loop-code i {
+        font-style: normal;
+        color: var(--h);
+      }
+
+      /* --- Pipeline host ----------------------------------------------------- */
+      /* PipelineDiagram is a container-query component sized for the 50rem prose
+         column, so it is given exactly that much room and centred here. */
+      .pipe-host {
+        max-width: 54rem;
+        margin-inline: auto;
+      }
+
+      /* --- Quickstart steps -------------------------------------------------- */
+      .steps {
+        display: grid;
+        gap: 1rem;
+      }
+      @media (min-width: 56rem) {
+        .steps {
+          grid-template-columns: repeat(2, 1fr);
+          gap: 1.25rem;
+        }
+      }
+      .steps li {
+        display: flex;
+        flex-direction: column;
+        padding: 1.6rem 1.5rem;
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 0.75rem;
+        background: var(--surface);
+      }
+      .step-head {
+        display: flex;
+        gap: 0.9rem;
+      }
+      .step-n {
+        flex-shrink: 0;
+        font-family: var(--sl-font-mono);
+        font-size: 0.78rem;
+        font-weight: 600;
+        line-height: 1.7;
+        color: var(--sl-color-accent);
+      }
+      .steps h3 {
+        font-size: 1.1rem;
+        font-weight: 650;
+        letter-spacing: -0.015em;
+      }
+      .steps .step-head p {
+        margin-top: 0.35rem;
+        font-size: 0.9rem;
+        line-height: 1.6;
+        color: var(--sl-color-gray-3);
+      }
+      .code-card {
+        position: relative;
+        margin-top: 1.2rem;
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 0.55rem;
+        background: color-mix(in srgb, var(--sl-color-bg) 70%, var(--surface-2));
+      }
+      :global([data-theme='light']) .code-card {
+        background: #f2f6f6;
+      }
+      .code-card .copy {
+        position: absolute;
+        top: 0.5rem;
+        right: 0.5rem;
+        z-index: 1;
+      }
+      .code-card pre {
+        margin: 0;
+        padding: 0.9rem 3rem 0.9rem 1rem;
+        overflow-x: auto;
+        font-size: 0.775rem;
+        line-height: 1.75;
+        color: var(--sl-color-gray-1);
+      }
+
+      /* --- Feature cards ----------------------------------------------------- */
+      .cards {
+        display: grid;
+        gap: 1rem;
+      }
+      @media (min-width: 44rem) {
+        .cards {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+      @media (min-width: 68rem) {
+        .cards {
+          grid-template-columns: repeat(3, 1fr);
+        }
+      }
+      .card {
+        padding: 1.6rem 1.5rem;
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 0.75rem;
+        background: var(--surface);
+        transition:
+          border-color 0.18s ease,
+          transform 0.18s ease;
+      }
+      :global([data-theme='light']) .card {
+        box-shadow: 0 1px 2px rgba(20, 24, 28, 0.04);
+      }
+      .card:hover {
+        border-color: color-mix(in srgb, var(--h) 55%, transparent);
+      }
+      @media (prefers-reduced-motion: no-preference) {
+        .card:hover {
+          transform: translateY(-2px);
+        }
+      }
+      .card-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2.35rem;
+        height: 2.35rem;
+        margin-bottom: 1rem;
+        border: 1px solid color-mix(in srgb, var(--h) 32%, transparent);
+        border-radius: 0.55rem;
+        background: color-mix(in srgb, var(--h) 14%, transparent);
+        color: var(--h);
+      }
+      .card-icon svg {
+        width: 1.15rem;
+        height: 1.15rem;
+      }
+      .card h3 {
+        font-size: 1.05rem;
+        font-weight: 650;
+        letter-spacing: -0.015em;
+      }
+      .card p {
+        margin-top: 0.5rem;
+        font-size: 0.9rem;
+        line-height: 1.62;
+        color: var(--sl-color-gray-3);
+      }
+
+      /* --- Why ---------------------------------------------------------------- */
+      .why {
+        max-width: 44rem;
+        margin-inline: auto;
+      }
+      .why p {
+        margin-top: 1.15rem;
+        font-size: 1.02rem;
+        line-height: 1.72;
+        color: var(--sl-color-gray-2);
+      }
+      .why p:first-child {
+        margin-top: 0;
+      }
+      /* The thesis, set above a rule so it reads as the conclusion rather than
+         a third paragraph. Qualified with p so it outranks `.why p` above. */
+      .why p.why-punch {
+        margin-top: 1.7rem;
+        padding-top: 1.5rem;
+        border-top: 1px solid var(--sl-color-hairline-shade);
+        font-size: 1.1rem;
+        color: var(--sl-color-white);
+      }
+      .why-punch strong {
+        color: var(--c-cyan);
+        font-weight: 650;
+      }
+
+      /* --- Requirements ------------------------------------------------------- */
+      .install-grid {
+        display: grid;
+        gap: 2.5rem;
+        align-items: start;
+      }
+      @media (min-width: 62rem) {
+        .install-grid {
+          grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+          gap: 4rem;
+        }
+      }
+      .install-grid .sec-head {
+        margin-bottom: 0;
+      }
+      .reqs {
+        border: 1px solid var(--sl-color-hairline-shade);
+        border-radius: 0.75rem;
+        background: var(--surface);
+        overflow: hidden;
+      }
+      .reqs > div {
+        display: grid;
+        grid-template-columns: 7rem minmax(0, 1fr);
+        gap: 1rem;
+        padding: 1rem 1.35rem;
+        border-bottom: 1px solid var(--sl-color-hairline-shade);
+      }
+      .reqs > div:last-child {
+        border-bottom: none;
+      }
+      .reqs dt {
+        font-family: var(--sl-font-mono);
+        font-size: 0.76rem;
+        letter-spacing: 0.02em;
+        color: var(--sl-color-gray-3);
+        align-self: center;
+      }
+      .reqs dd {
+        margin: 0;
+        font-size: 0.9rem;
+        font-weight: 500;
+        color: var(--sl-color-white);
+      }
+
+      /* --- Closer ------------------------------------------------------------- */
+      .closer {
+        padding-block: 5.5rem;
+        text-align: center;
+      }
+      .closer h2 {
+        font-size: clamp(1.6rem, 3.6vw, 2.3rem);
+        line-height: 1.18;
+        letter-spacing: -0.024em;
+        font-weight: 700;
+      }
+      .closer p {
+        max-width: 34rem;
+        margin: 1rem auto 0;
+        font-size: 1rem;
+        line-height: 1.65;
+        color: var(--sl-color-gray-2);
+      }
+
+      /* --- Footer ------------------------------------------------------------- */
+      .foot {
+        border-top: 1px solid var(--sl-color-hairline-shade);
+        background: color-mix(in srgb, var(--sl-color-gray-6) 40%, var(--sl-color-bg));
+        padding-top: 3.5rem;
+      }
+      :global([data-theme='light']) .foot {
+        background: var(--sl-color-gray-6);
+      }
+      .foot-inner {
+        display: grid;
+        gap: 2.5rem;
+        padding-bottom: 3rem;
+      }
+      @media (min-width: 56rem) {
+        .foot-inner {
+          grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+          gap: 3rem;
+        }
+      }
+      .foot-brand p {
+        margin-top: 0.9rem;
+        max-width: 18rem;
+        font-size: 0.85rem;
+        line-height: 1.55;
+        color: var(--sl-color-gray-3);
+      }
+      .foot-cols {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 2rem 1rem;
+      }
+      @media (min-width: 40rem) {
+        .foot-cols {
+          grid-template-columns: repeat(4, 1fr);
+        }
+      }
+      .foot-cols h3 {
+        margin-bottom: 0.8rem;
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--sl-color-gray-3);
+      }
+      .foot-cols a {
+        display: block;
+        padding-block: 0.4rem;
+        font-size: 0.875rem;
+        color: var(--sl-color-gray-2);
+        text-decoration: none;
+        transition: color 0.18s ease;
+      }
+      .foot-cols a:hover {
+        color: var(--sl-color-accent-high);
+      }
+      .foot-legal {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: center;
+        gap: 0.75rem;
+        padding-block: 1.35rem;
+        border-top: 1px solid var(--sl-color-hairline-shade);
+        font-size: 0.8rem;
+        /* gray-4 lands at 3.3:1 here, under AA for body text, so this line uses
+           the same grey as the other small print. */
+        color: var(--sl-color-gray-3);
+      }
+      .to-top {
+        display: inline-flex;
+        align-items: center;
+        min-height: 2.75rem;
+        color: var(--sl-color-gray-3);
+        text-decoration: none;
+      }
+      .to-top:hover {
+        color: var(--sl-color-accent-high);
+      }
+
+      /* --- Reveals ------------------------------------------------------------
+         "Shown" is the default state, so no-JS and reduced-motion visitors get
+         the finished page. The script adds .pre only when motion is welcome,
+         then removes it as each element scrolls in. */
+      .pre {
+        opacity: 0;
+        transform: translateY(14px);
+      }
+      [data-reveal],
+      [data-reveal-seq] {
+        transition:
+          opacity 0.55s ease-out,
+          transform 0.55s ease-out;
+      }
+      /* The terminal cascades its own lines once the card itself is revealed.
+         Each line carries its index as --i, so the delay is a single rule
+         rather than a dozen nth-child selectors. */
+      [data-reveal-seq] .ln {
+        opacity: 1;
+        transition: opacity 0.32s ease-out;
+        transition-delay: calc(55ms * var(--i, 0));
+      }
+      [data-reveal-seq].pre .ln {
+        opacity: 0;
+        transition-delay: 0s;
+      }
+    </style>
+  </body>
+</html>
