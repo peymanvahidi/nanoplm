@@ -1,6 +1,6 @@
 ---
 title: Choose a backend
-description: nanoPLM pretrains on pure-torch or pure-TE. Use pure-torch unless you specifically need Transformer Engine kernels — and know what pure-TE cannot do.
+description: "nanoPLM pretrains on pure-torch or pure-TE. Use pure-torch unless you specifically need Transformer Engine kernels, and know what pure-TE cannot do."
 ---
 
 Use `--pure-torch`. It is the backend every feature in nanoPLM supports, and it is the one the project's own launcher uses.
@@ -29,7 +29,7 @@ There are exactly two pretraining backends.
 | **pure-torch** | `--pure-torch` or `pure_torch: true` | nanoPLM's own model and training loop. Every feature lands here first; most land here only. |
 | **pure-TE** | `--pure-te` or `pure_te: true` | Transformer Engine model and training loop: TE kernels and the full TE FP8 recipe surface. |
 
-The flags live on both `pretrain from-yaml` and `pretrain run`. `pure_torch` and `pure_te` are **top-level** keys in `pretrain.yaml` — siblings of `model:`, not children of it:
+The flags live on both `pretrain from-yaml` and `pretrain run`. `pure_torch` and `pure_te` are **top-level** keys in `pretrain.yaml` (siblings of `model:`, not children of it):
 
 ```yaml title="pretrain.yaml"
 model:
@@ -40,7 +40,7 @@ pretraining:
 pure_torch: true   # top level; the CLI flag overrides this if both are set
 ```
 
-A CLI flag beats the YAML key. The two are mutually exclusive — setting both raises `pure_torch and pure_te cannot both be true.`
+A CLI flag beats the YAML key. The two are mutually exclusive: setting both raises `pure_torch and pure_te cannot both be true.`
 
 ## Run without a backend flag and the run stops
 
@@ -60,12 +60,12 @@ The fix is to add `--pure-torch` (or set `pure_torch: true`).
 
 ## Know what pure-TE costs you
 
-Pure-TE gives you Transformer Engine's fused kernels and the complete TE FP8 recipe surface (`fp8_recipe`, `fp8_format`, `fp8_amax_history_len`, `fp8_reduce_amax` — see [Scale up](/nanoplm/guides/scale-up/)). FP8 itself is **not** a reason to switch: `fp8: true` works on pure-torch too, and it goes through Transformer Engine either way.
+Pure-TE gives you Transformer Engine's fused kernels and the complete TE FP8 recipe surface (`fp8_recipe`, `fp8_format`, `fp8_amax_history_len`, `fp8_reduce_amax`: see [Scale up](/nanoplm/guides/scale-up/)). FP8 itself is **not** a reason to switch: `fp8: true` works on pure-torch too, and it goes through Transformer Engine either way.
 
 What pure-TE cannot do is the deciding factor. It supports only:
 
-- `lr_schedule: warmup_stable | cosine | linear` — **not `wsd`**, which is the default schedule
-- `resume.mode: continue` — **not `decay`**
+- `lr_schedule: warmup_stable | cosine | linear`: **not `wsd`**, which is the default schedule
+- `resume.mode: continue`: **not `decay`**
 
 and it rejects these model and training features outright:
 
@@ -105,6 +105,6 @@ The full per-key rules are in the [compatibility matrix](/nanoplm/reference/comp
 
 ## Where to go next
 
-- [Scale up](/nanoplm/guides/scale-up/) — multi-GPU, FSDP/HSDP, packing, FP8.
-- [pretrain.yaml reference](/nanoplm/reference/pretrain/) — every key, with defaults.
-- [Compatibility matrix](/nanoplm/reference/compatibility/) — which feature needs which backend.
+- [Scale up](/nanoplm/guides/scale-up/): multi-GPU, FSDP/HSDP, packing, FP8.
+- [pretrain.yaml reference](/nanoplm/reference/pretrain/): every key, with defaults.
+- [Compatibility matrix](/nanoplm/reference/compatibility/): which feature needs which backend.

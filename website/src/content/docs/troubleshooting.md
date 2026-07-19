@@ -17,11 +17,11 @@ A key in that block is not a field. The batch and duration surface was redesigne
 
 | Dead key | What replaced it |
 | --- | --- |
-| `micro_batch_size` | [`micro_batch_seqs`](/nanoplm/reference/pretrain/#pretrain-pretraining-micro_batch_seqs) — **sequences** per GPU per forward |
-| `global_batch_size` | [`global_batch_tokens`](/nanoplm/reference/pretrain/#pretrain-pretraining-global_batch_tokens) — **tokens** per optimizer step |
+| `micro_batch_size` | [`micro_batch_seqs`](/nanoplm/reference/pretrain/#pretrain-pretraining-micro_batch_seqs): **sequences** per GPU per forward |
+| `global_batch_size` | [`global_batch_tokens`](/nanoplm/reference/pretrain/#pretrain-pretraining-global_batch_tokens): **tokens** per optimizer step |
 | `num_epochs` | Nothing. Duration is a token budget: `stable_tokens` + `decay_tokens`, or `train_tokens`. |
-| `warmup_ratio` | [`warmup_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-warmup_steps) — absolute optimizer steps |
-| `reset_scheduler`, `resume_epochs`, `extra_epochs` | [`resume.mode`](/nanoplm/reference/pretrain/#pretrain-resume-mode) — `continue` or `decay` |
+| `warmup_ratio` | [`warmup_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-warmup_steps): absolute optimizer steps |
+| `reset_scheduler`, `resume_epochs`, `extra_epochs` | [`resume.mode`](/nanoplm/reference/pretrain/#pretrain-resume-mode): `continue` or `decay` |
 | `min_lr` | Nothing. It was never a valid key. Use [`lr_decay_to_fraction`](/nanoplm/reference/pretrain/#pretrain-pretraining-lr_decay_to_fraction), a fraction of peak LR. |
 
 **`gradient_accumulation_steps is inferred automatically from global_batch_tokens, micro_batch_seqs, max_seq_len, and world_size. Remove gradient_accumulation_steps from your pretraining config.`**
@@ -30,7 +30,7 @@ Accumulation is derived, never configured. Delete the key. To change the effecti
 
 **`dataset_dir is required in pretraining configuration`**
 
-Set [`dataset_dir`](/nanoplm/reference/pretrain/#pretrain-pretraining-dataset_dir) to the `output_dir` your data pipeline produced — the directory holding `train/`, `val/`, and `.data_manifest`.
+Set [`dataset_dir`](/nanoplm/reference/pretrain/#pretrain-pretraining-dataset_dir) to the `output_dir` your data pipeline produced: the directory holding `train/`, `val/`, and `.data_manifest`.
 
 Never set `inferred_grad_accum_steps`, `global_batch_seqs`, or `achieved_global_batch_tokens`. They are runtime outputs that happen to live on the same dataclass.
 
@@ -43,7 +43,7 @@ pure_torch:
   use_compile: true
 ```
 
-On current nanoPLM, `pure_torch` is a **top-level boolean**, and the loader evaluates it with `bool(...)`. A non-empty mapping is truthy, so `{enabled: false}` turns pure-torch **on**. There is no error and no warning — you get a backend you did not ask for. Delete the block and use the `--pure-torch` flag, or a bare `pure_torch: true`.
+On current nanoPLM, `pure_torch` is a **top-level boolean**, and the loader evaluates it with `bool(...)`. A non-empty mapping is truthy, so `{enabled: false}` turns pure-torch **on**. There is no error and no warning: you get a backend you did not ask for. Delete the block and use the `--pure-torch` flag, or a bare `pure_torch: true`.
 :::
 
 ## Pretraining won't start
@@ -62,7 +62,7 @@ You asked for WSD or a decay resume on the Transformer Engine backend. Either sw
 
 **`--pure-torch and --pure-te are mutually exclusive.`** (or `pure_torch and pure_te cannot both be true.`)
 
-Pass one flag, not both. Also check the YAML — a `pure_te: true` key plus a `--pure-torch` flag is fine (the flag wins), but two `true` keys are not.
+Pass one flag, not both. Also check the YAML: a `pure_te: true` key plus a `--pure-torch` flag is fine (the flag wins), but two `true` keys are not.
 
 ### Duration and schedule disagree
 
@@ -95,7 +95,7 @@ Each budget has a token form and a step form. Pick one. The same message appears
 
 **`wsd requires a stable budget: set stable_tokens (tokens) or stable_steps (steps).`**
 
-You removed both forms. Supply one — [`stable_tokens`](/nanoplm/reference/pretrain/#pretrain-pretraining-stable_tokens) or [`stable_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-stable_steps).
+You removed both forms. Supply one: [`stable_tokens`](/nanoplm/reference/pretrain/#pretrain-pretraining-stable_tokens) or [`stable_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-stable_steps).
 
 **`lr_schedule must be one of ['cosine', 'linear', 'warmup_stable', 'wsd'], got 'onecycle'`**
 
@@ -151,7 +151,7 @@ resume:
 
 **`resume decay requires lr_decay_to_fraction`**
 
-Decay mode needs a floor. The template's own comment calls this field an *optional override* — that comment is wrong. Set it:
+Decay mode needs a floor. The template's own comment calls this field an *optional override*; that comment is wrong. Set it:
 
 ```yaml title="pretrain.yaml"
 resume:
@@ -198,7 +198,7 @@ HSDP shards inside a node and replicates across nodes, so its shard size has to 
 
 **`hsdp_shard_size=8 equals world_size=8; the replicate dim would be 1. Use distributed_mode='fsdp' instead of 'hsdp'.`**
 
-If one replica would span the whole world there is nothing to replicate — that is plain FSDP.
+If one replica would span the whole world there is nothing to replicate: that is plain FSDP.
 
 :::note[HSDP is YAML-only]
 `pretrain run --distributed-mode` accepts only `fsdp` and `ddp`, and there is no `--hsdp-shard-size` flag. To use HSDP, set [`distributed_mode`](/nanoplm/reference/pretrain/#pretrain-pretraining-distributed_mode) and [`hsdp_shard_size`](/nanoplm/reference/pretrain/#pretrain-pretraining-hsdp_shard_size) in `pretrain.yaml` and launch with `from-yaml`. See [Scale up](/nanoplm/guides/scale-up/).
@@ -208,7 +208,7 @@ If one replica would span the whole world there is nothing to replicate — that
 
 ## FP8 errors
 
-FP8 goes through Transformer Engine on **both** backends — including pure-torch, which swaps eligible blocks for TE modules. "TE only" in the template comments means "these are TE recipe knobs", not "pure-TE backend only".
+FP8 goes through Transformer Engine on **both** backends: including pure-torch, which swaps eligible blocks for TE modules. "TE only" in the template comments means "these are TE recipe knobs", not "pure-TE backend only".
 
 **`fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`**
 
@@ -224,7 +224,7 @@ CPU activation offload is the fussiest FP8 feature. All four of these are hard e
 
 - **`fp8_cpu_activation_offload=true requires fp8=true.`**
 - **`fp8_cpu_activation_offload=true requires CUDA.`**
-- **`fp8_cpu_activation_offload is not supported with activation_checkpointing=true.`** — pick one; both trade compute for memory.
+- **`fp8_cpu_activation_offload is not supported with activation_checkpointing=true.`**: pick one; both trade compute for memory.
 - **`fp8_cpu_activation_offload is not supported with recycling_loop_count > 1.`**
 - **`fp8_cpu_activation_offload=true found no eligible TE wrappers; set fp8_target to include 'attn_wqkv' and/or 'mlp'.`**
 
@@ -262,7 +262,7 @@ Run these on `--pure-torch`.
 MoE has three prerequisites beyond pure-torch:
 
 - **`use_moe=True requires mlp_activation in {'swiglu', 'srelu'}.`**
-- **`MoE requires use_packing=True`** and **`MoE requires use_static_inp_size=True`** — both default to `true`, so this fires only if you turned them off.
+- **`MoE requires use_packing=True`** and **`MoE requires use_static_inp_size=True`**: both default to `true`, so this fires only if you turned them off.
 - **`MoE is not compatible with activation_checkpointing_mode='attn+mlp'. Use 'attn' or 'layer' mode instead.`**
 
 Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts`, `moe_num_experts` must be divisible by `moe_n_group`, and `moe_topk_group` must be `<= moe_n_group`.
@@ -271,7 +271,7 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 
 **`rope_dim_fraction must be in (0.0, 1.0], got 1.5`**
 
-**`Unsupported mlp_activation: gelu. Supported: ['swiglu', 'glu', 'srelu']`** — note `glu` is pure-torch only; Transformer Engine does not implement it.
+**`Unsupported mlp_activation: gelu. Supported: ['swiglu', 'glu', 'srelu']`**: note `glu` is pure-torch only; Transformer Engine does not implement it.
 
 **`norm_bias=True is not compatible with norm_type='rmsnorm'. RMSNorm does not support bias. Set norm_bias=False.`**
 
@@ -279,7 +279,7 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 
 **`Invalid character 'X' in attn_layer_pattern. Use 'F' for full attention and 'S' for sliding attention.`**
 
-**`debug_layerwise_metrics is not supported with --pure-te / pure_te: true.`** — use pure-torch, or set `debug_layerwise_metrics: false` (the default).
+**`debug_layerwise_metrics is not supported with --pure-te / pure_te: true.`**: use pure-torch, or set `debug_layerwise_metrics: false` (the default).
 
 ## Data pipeline
 
@@ -318,4 +318,4 @@ Don't. It is generated, it carries a `# DO NOT EDIT THIS FILE MANUALLY.` header,
 
 ## Still stuck?
 
-Check that the key you are setting actually exists — the [pretrain.yaml](/nanoplm/reference/pretrain/), [data.yaml](/nanoplm/reference/data/), and [eval.yaml](/nanoplm/reference/eval/) reference tables are generated from the source, so a key that is not in them is not a key. If a run fails and the message is not on this page, open an issue on [GitHub](https://github.com/peymanvahidi/nanoplm) with the config and the full traceback.
+Check that the key you are setting actually exists: the [pretrain.yaml](/nanoplm/reference/pretrain/), [data.yaml](/nanoplm/reference/data/), and [eval.yaml](/nanoplm/reference/eval/) reference tables are generated from the source, so a key that is not in them is not a key. If a run fails and the message is not on this page, open an issue on [GitHub](https://github.com/peymanvahidi/nanoplm) with the config and the full traceback.

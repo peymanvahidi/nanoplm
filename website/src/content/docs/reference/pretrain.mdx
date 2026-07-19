@@ -1,6 +1,6 @@
 ---
 title: pretrain.yaml
-description: Every field in the pretraining config, extracted from the nanoplm pretrain get-yaml template — model, pretraining, and resume.
+description: "Every field in the pretraining config, extracted from the nanoplm pretrain get-yaml template: model, pretraining, and resume."
 ---
 
 import ReferenceTable from '../../../components/ReferenceTable.astro';
@@ -11,29 +11,29 @@ import ReferenceTable from '../../../components/ReferenceTable.astro';
 
 A normal run touches roughly a dozen keys. The rest have defaults that work.
 
-- **Point at the data**: [`dataset_dir`](#pretrain-pretraining-dataset_dir) and [`ckp_dir`](#pretrain-pretraining-ckp_dir). Sequence length is **not** here — it comes from the dataset's `.data_manifest`.
+- **Point at the data**: [`dataset_dir`](#pretrain-pretraining-dataset_dir) and [`ckp_dir`](#pretrain-pretraining-ckp_dir). Sequence length is **not** here: it comes from the dataset's `.data_manifest`.
 - **Size the model**: [`hidden_size`](#pretrain-model-hidden_size), [`intermediate_size`](#pretrain-model-intermediate_size), [`num_hidden_layers`](#pretrain-model-num_hidden_layers), [`num_attention_heads`](#pretrain-model-num_attention_heads).
-- **Size the batch**: [`micro_batch_seqs`](#pretrain-pretraining-micro_batch_seqs) is **sequences** per GPU per forward pass (the VRAM knob); [`global_batch_tokens`](#pretrain-pretraining-global_batch_tokens) is **tokens** per optimizer step. Gradient accumulation is inferred from those two plus the manifest's sequence length and your world size — you never set it.
+- **Size the batch**: [`micro_batch_seqs`](#pretrain-pretraining-micro_batch_seqs) is **sequences** per GPU per forward pass (the VRAM knob); [`global_batch_tokens`](#pretrain-pretraining-global_batch_tokens) is **tokens** per optimizer step. Gradient accumulation is inferred from those two plus the manifest's sequence length and your world size: you never set it.
 - **Set the duration**: a **token budget**, not epochs. With the default [`lr_schedule`](#pretrain-pretraining-lr_schedule) of `wsd`, the budget is [`stable_tokens`](#pretrain-pretraining-stable_tokens) plus [`decay_tokens`](#pretrain-pretraining-decay_tokens). With `warmup_stable`, `cosine`, or `linear` it is a single [`train_tokens`](#pretrain-pretraining-train_tokens) budget instead.
-- **Pick an optimizer**: [`optimizer`](#pretrain-pretraining-optimizer) and its learning rate — [`adam_learning_rate`](#pretrain-pretraining-adam_learning_rate), or [`muon_learning_rate`](#pretrain-pretraining-muon_learning_rate) for the Muon family. See [Choose an optimizer](/nanoplm/guides/optimizers/).
+- **Pick an optimizer**: [`optimizer`](#pretrain-pretraining-optimizer) and its learning rate: [`adam_learning_rate`](#pretrain-pretraining-adam_learning_rate), or [`muon_learning_rate`](#pretrain-pretraining-muon_learning_rate) for the Muon family. See [Choose an optimizer](/nanoplm/guides/optimizers/).
 
-Two semantics catch people out. **`stable_tokens` includes warmup** — it is the point at which decay begins, not a length added after warmup. `decay_tokens` *is* a length, added on top of it. See [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
+Two semantics catch people out. **`stable_tokens` includes warmup**: it is the point at which decay begins, not a length added after warmup. `decay_tokens` *is* a length, added on top of it. See [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
 
-Every token budget has a step-based twin — [`stable_steps`](#pretrain-pretraining-stable_steps), [`decay_steps`](#pretrain-pretraining-decay_steps), [`max_steps`](#pretrain-pretraining-max_steps) — that replaces it. Set exactly one of each pair, never both. The template ships these (and `train_tokens`) commented out, because a template that set both forms at once would fail to load; they are documented in the tables below, behind the advanced toggle.
+Every token budget has a step-based twin ([`stable_steps`](#pretrain-pretraining-stable_steps), [`decay_steps`](#pretrain-pretraining-decay_steps), [`max_steps`](#pretrain-pretraining-max_steps)) that replaces it. Set exactly one of each pair, never both. The template ships these (and `train_tokens`) commented out, because a template that set both forms at once would fail to load; they are documented in the tables below, behind the advanced toggle.
 
 :::caution[Two traps that bite on the first run]
-The stock `resume:` block ships `mode: "decay"` with the decay fields filled in, so flipping only [`is_resume`](#pretrain-resume-is_resume) to `true` gives you a **decay** run rather than a continuation — set [`mode`](#pretrain-resume-mode) explicitly. Separately, `optimizer: muonh` fails at startup out of the box, because [`wo_init`](#pretrain-model-wo_init) defaults to `zero` and MuonH forbids that; set `wo_init: kaiming`.
+The stock `resume:` block ships `mode: "decay"` with the decay fields filled in, so flipping only [`is_resume`](#pretrain-resume-is_resume) to `true` gives you a **decay** run rather than a continuation: set [`mode`](#pretrain-resume-mode) explicitly. Separately, `optimizer: muonh` fails at startup out of the box, because [`wo_init`](#pretrain-model-wo_init) defaults to `zero` and MuonH forbids that; set `wo_init: kaiming`.
 :::
 
 ## Reading the tables
 
 Each table hides its **advanced** rows behind a *Show advanced fields* checkbox above it. Tick it to reveal them. Advanced covers four kinds of field:
 
-- The experimental architecture features and their tuning knobs — Canon layers, RePO, mHC-lite, differential attention, paired-head attention, NOBLE, MoE, recycling.
+- The experimental architecture features and their tuning knobs: Canon layers, RePO, mHC-lite, differential attention, paired-head attention, NOBLE, MoE, recycling.
 - The FP8, `torch.compile`, and layerwise-debug knobs.
 - The step-based duration overrides (`train_tokens`, `stable_steps`, `decay_steps`, `max_steps`).
 
-Most of them are pure-torch only, but not all — a few FP8 rows are Transformer Engine recipe knobs. The **Backend** column is the authoritative per-field answer, so read it rather than the toggle label. Pure-TE supports a strictly smaller surface than pure-torch; see [Choose a backend](/nanoplm/guides/backends/) and the [compatibility matrix](/nanoplm/reference/compatibility/).
+Most of them are pure-torch only, but not all: a few FP8 rows are Transformer Engine recipe knobs. The **Backend** column is the authoritative per-field answer, so read it rather than the toggle label. Pure-TE supports a strictly smaller surface than pure-torch; see [Choose a backend](/nanoplm/guides/backends/) and the [compatibility matrix](/nanoplm/reference/compatibility/).
 
 ## model
 <ReferenceTable surface="pretrain" section="model" />

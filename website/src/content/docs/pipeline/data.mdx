@@ -5,7 +5,7 @@ description: Turn a FASTA file into tokenized binary shards and a manifest, with
 
 import { FileTree, Steps } from '@astrojs/starlight/components';
 
-The data stage takes a FASTA file — a URL or a local path — and produces the two things pretraining consumes: **tokenized binary shards** and a **`.data_manifest`**.
+The data stage takes a FASTA file (a URL or a local path) and produces the two things pretraining consumes: **tokenized binary shards** and a **`.data_manifest`**.
 
 In between, it runs a fixed sequence of steps:
 
@@ -28,7 +28,7 @@ download → extract → validate → shuffle → filter → split → tokenize 
    Edit data.yaml and run `nanoplm data from-yaml` to execute.
    ```
 
-2. Edit `data.yaml` (the whole file is shown below — it is short).
+2. Edit `data.yaml` (the whole file is shown below; it is short).
 
 3. Run the pipeline.
 
@@ -81,7 +81,7 @@ data_params:
   max_seq_len: 512           # truncation length AND the length pretraining does its token math with
   val_ratio: 0.1
   shuffle: true
-  shuffle_seed: 24           # same seed, same split — so two runs stay comparable
+  shuffle_seed: 24           # same seed, same split: so two runs stay comparable
   drop_invalid_sequences: false   # false = an invalid sequence FAILS the run instead of vanishing
 
   samples_per_shard: 2000    # more, smaller shards give the dataloader more to parallelise over
@@ -125,7 +125,7 @@ Start with SwissProt (about 570k sequences). It downloads in minutes and is enou
 | [`drop_invalid_sequences`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences) | `false` | Whether a sequence with an unrecognised residue kills the run or gets excluded. See below. |
 
 :::caution[max_seq_len is set here and nowhere else]
-`max_seq_len` is written into `.data_manifest`, and pretraining reads it back to compute gradient accumulation: `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`. There is no `max_seq_len` key in `pretrain.yaml`. If you want longer sequences, change it here and re-run the data stage — the shards themselves have to change.
+`max_seq_len` is written into `.data_manifest`, and pretraining reads it back to compute gradient accumulation: `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`. There is no `max_seq_len` key in `pretrain.yaml`. If you want longer sequences, change it here and re-run the data stage: the shards themselves have to change.
 :::
 
 Longer sequences cost quadratically in attention and linearly in memory, so `512` is a deliberate starting point rather than a limitation. Raise it when your proteins genuinely need the context.
@@ -149,7 +149,7 @@ To exclude these sequences and continue the pipeline:
     nanoplm data from-yaml --fix
 ```
 
-Look at `invalid.fasta` first — a large invalid count usually means the file is not what you thought it was. When the sequences are genuinely unusable, take the offer:
+Look at `invalid.fasta` first: a large invalid count usually means the file is not what you thought it was. When the sequences are genuinely unusable, take the offer:
 
 ```sh
 nanoplm data from-yaml --fix

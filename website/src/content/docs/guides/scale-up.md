@@ -1,6 +1,6 @@
 ---
 title: Scale up
-description: Add GPUs, shard with FSDP2 or HSDP, pack tokens, trade VRAM for throughput, and turn on FP8 — the knobs that make a nanoPLM run bigger or faster.
+description: "Add GPUs, shard with FSDP2 or HSDP, pack tokens, trade VRAM for throughput, and turn on FP8: the knobs that make a nanoPLM run bigger or faster."
 ---
 
 You have trained one model on one GPU. This page is the order in which you reach for more: more GPUs first, then the sharding strategy, then the knobs that squeeze the GPUs you already have.
@@ -32,7 +32,7 @@ pretraining:
   world_size: 'auto'   # reads $WORLD_SIZE from torchrun, else torch.cuda.device_count()
 ```
 
-Leave [`world_size`](/nanoplm/reference/pretrain/#pretrain-pretraining-world_size) at `'auto'` — `torchrun --nproc-per-node` already told it the answer.
+Leave [`world_size`](/nanoplm/reference/pretrain/#pretrain-pretraining-world_size) at `'auto'`: `torchrun --nproc-per-node` already told it the answer.
 
 Adding GPUs does **not** change your token budget or your global batch. It changes how many micro-steps it takes to reach one optimizer step: `grad_accum` is inferred from `global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size)` and shrinks as `world_size` grows. Four GPUs means the same batch, four times faster.
 
@@ -58,13 +58,13 @@ pretraining:
 HSDP enabled: mesh=(replicate=2, shard=8), world_size=16
 ```
 
-[`hsdp_shard_size`](/nanoplm/reference/pretrain/#pretrain-pretraining-hsdp_shard_size) is the number of GPUs per replica. `'auto'` resolves to `LOCAL_WORLD_SIZE`, which puts exactly one sharded replica on each node — the setting HSDP exists for. If you set it by hand, two rules are enforced:
+[`hsdp_shard_size`](/nanoplm/reference/pretrain/#pretrain-pretraining-hsdp_shard_size) is the number of GPUs per replica. `'auto'` resolves to `LOCAL_WORLD_SIZE`, which puts exactly one sharded replica on each node: the setting HSDP exists for. If you set it by hand, two rules are enforced:
 
 - it must evenly divide `world_size`, otherwise `hsdp_shard_size=6 must evenly divide world_size=16.`
-- it must not *equal* `world_size` — that would leave a replicate dimension of 1, and the run tells you to use `distributed_mode: 'fsdp'` instead.
+- it must not *equal* `world_size`: that would leave a replicate dimension of 1, and the run tells you to use `distributed_mode: 'fsdp'` instead.
 
 :::caution
-HSDP is **YAML-only**. `nanoplm pretrain run` has no `--distributed-mode hsdp` and no `--hsdp-shard-size` flag; its choices are `fsdp` and `ddp`. Use `pretrain from-yaml` — it is the only path that exposes the full surface.
+HSDP is **YAML-only**. `nanoplm pretrain run` has no `--distributed-mode hsdp` and no `--hsdp-shard-size` flag; its choices are `fsdp` and `ddp`. Use `pretrain from-yaml`: it is the only path that exposes the full surface.
 :::
 
 ## Tune FSDP for your interconnect
@@ -109,12 +109,12 @@ model:
 
 [`activation_checkpointing_mode: attn`](/nanoplm/reference/pretrain/#pretrain-model-activation_checkpointing_mode) has the best return: attention activations are the largest and the cheapest to recompute. `layer` and `attn+mlp` save more memory for more recompute. (MoE rejects `attn+mlp`.)
 
-**`micro_batch_seqs`** is the VRAM dial. It is the number of sequences one GPU holds in one forward pass — halve it and peak memory roughly halves.
+**`micro_batch_seqs`** is the VRAM dial. It is the number of sequences one GPU holds in one forward pass: halve it and peak memory roughly halves.
 
 ```yaml title="pretrain.yaml"
 pretraining:
   micro_batch_seqs: 32       # was 64; halves activation memory per GPU
-  global_batch_tokens: 256000  # unchanged — this is the number that defines the run
+  global_batch_tokens: 256000  # unchanged: this is the number that defines the run
 ```
 
 Halving [`micro_batch_seqs`](/nanoplm/reference/pretrain/#pretrain-pretraining-micro_batch_seqs) does not change your training recipe. Gradient accumulation is inferred, so it doubles to absorb the change and the token budget per optimizer step stays where you put it. You are trading wall-clock for memory, not changing the math.
@@ -143,7 +143,7 @@ The run warns that `the token budget is approximate under batch-size warmup`. St
 
 `fp8: true` halves the bytes moved through the eligible linear layers. Two requirements before you enable it:
 
-- **Transformer Engine must be installed** — even on pure-torch. nanoPLM swaps eligible blocks for TE modules and runs them under a TE autocast. Without TE: `fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`
+- **Transformer Engine must be installed**: even on pure-torch. nanoPLM swaps eligible blocks for TE modules and runs them under a TE autocast. Without TE: `fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`
 - **Hopper (H100) or newer.** FP8 tensor cores do not exist on Ampere.
 
 ```yaml title="pretrain.yaml"
@@ -184,6 +184,6 @@ The `tok/s` and `h100_mfu` fields in the step log are how you tell whether any o
 
 ## Where to go next
 
-- [Choose a backend](/nanoplm/guides/backends/) — why `--pure-torch`.
-- [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/) — WSD, and picking a long run back up.
-- [pretrain.yaml reference](/nanoplm/reference/pretrain/) — every key, with defaults.
+- [Choose a backend](/nanoplm/guides/backends/): why `--pure-torch`.
+- [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/): WSD, and picking a long run back up.
+- [pretrain.yaml reference](/nanoplm/reference/pretrain/): every key, with defaults.

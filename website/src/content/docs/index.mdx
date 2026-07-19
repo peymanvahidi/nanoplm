@@ -1,49 +1,59 @@
 ---
 title: What is nanoPLM?
-description: nanoPLM pretrains a protein language model from a FASTA file. Three YAML files, three commands, and the artifacts that flow between them.
+description: nanoPLM pretrains a protein language model from a FASTA file. Three YAML files, six commands, and the artifacts that flow between them.
 ---
 
+import { Steps } from '@astrojs/starlight/components';
 import PipelineDiagram from '../../components/PipelineDiagram.astro';
 
-**nanoPLM turns a FASTA file into a trained, benchmarked protein language model.** The whole
-pipeline is three YAML files and three commands — no training script to write, no research
-codebase to fork.
+**nanoPLM turns a FASTA file into a trained, benchmarked protein language model easier than ever.** The whole
+pipeline is three YAML files and six commands, this helps you to focus on your research question instead of spending a long time for engnieering.
 
 ## The mental model
 
 Pretraining a PLM is three stages: turn sequences into tokens, train a masked-language model on
 those tokens, then score the result on downstream benchmarks. nanoPLM gives each stage one config
-file and one command, and defines the artifacts that pass between them. Those artifacts are the
-whole design: the data stage writes a `.data_manifest` that the pretraining stage reads its
-sequence length back out of, and the pretraining stage writes checkpoints that carry their own
-`model_config.yaml`, so evaluation needs nothing but a path.
+file and two commands, and defines the artifacts to make your life easier. Because each stage
+describes itself on disk, you never repeat yourself. The data stage writes a
+[`.data_manifest`](/nanoplm/pipeline/#data-writes-shards-plus-a-manifest) recording what it decided so pretraining
+reads those back instead of asking you to retype them. The pretraining stage then writes checkpoints carrying their own
+[`model_config.yaml`](/nanoplm/pipeline/#pretrain-writes-a-self-describing-checkpoint), so evaluation needs nothing but a path.
 
 <PipelineDiagram />
-
-Because each stage is self-describing, you never repeat yourself. `max_seq_len` is set once, in
-`data.yaml`. The model architecture is written into the checkpoint, so `eval.yaml` never restates
-it.
 
 ## The loop
 
 Every stage has the same two verbs. `get-yaml` scaffolds a fully-commented config, you edit it, and
-`from-yaml` runs it.
+`from-yaml` runs it. Shown for pretraining; swap `pretrain` for `data` or `eval` and the shape is
+identical.
 
-```bash
-nanoplm pretrain get-yaml
-# Template written to: /work/pretrain.yaml
+<Steps>
 
-$EDITOR pretrain.yaml
+1. **Scaffold** a fully-commented config.
 
-nanoplm pretrain from-yaml --pure-torch
-# Using pure-torch model and training loop
-# Total Trainable Parameters: 2306848
-# Flash attention available: True
-# [step 1/154] loss=3.4412 lr=5.00e-06 grad_norm=1.8834 tok/s=412,190 ...
-# ...
-```
+   ```bash frame="terminal"
+   nanoplm pretrain get-yaml
+   # writes pretrain.yaml
+   ```
 
-Swap `pretrain` for `data` or `eval` and the shape is identical.
+2. **Edit** it.
+
+   ```bash frame="terminal"
+   $EDITOR pretrain.yaml
+   ```
+
+3. **Run** it.
+
+   ```bash frame="terminal"
+   nanoplm pretrain from-yaml --pure-torch
+   # Using pure-torch model and training loop
+   # Total Trainable Parameters: 2306848
+   # Flash attention available: True
+   # [step 1/154] loss=3.4412 lr=5.00e-06 grad_norm=1.8834 tok/s=412,190 ...
+   # ...
+   ```
+
+</Steps>
 
 ## Quickstart
 
@@ -57,7 +67,7 @@ nanoplm eval get-yaml && nanoplm eval from-yaml
 
 The defaults are wired to chain: `data.yaml` writes shards to `output/data/pretrain_data/`, which
 is exactly where `pretrain.yaml` looks for them. The one value the defaults cannot guess is
-`eval.checkpoint_dir` — open `eval.yaml` and point it at the run you trained above.
+`eval.checkpoint_dir`: open `eval.yaml` and point it at the run you trained above.
 
 Success looks like this:
 
@@ -75,25 +85,25 @@ nanoplm data from-yaml
 ```
 
 :::note
-`--pure-torch` is not optional. Pretraining requires you to pick a backend — `--pure-torch` or
-`--pure-te` — and pure-torch is the one to use. See [Choose a backend](/nanoplm/guides/backends/).
+`--pure-torch` is not optional. Pretraining requires you to pick a backend (`--pure-torch` or
+`--pure-te`), and pure-torch is the one to use. See [Choose a backend](/nanoplm/guides/backends/).
 :::
 
-For the real thing — a tiny model trained and evaluated end to end, with the edits spelled out —
+For the real thing (a tiny model trained and evaluated end to end, with the edits spelled out),
 follow [Your first PLM](/nanoplm/start/first-plm/).
 
 ## How these docs are organized
 
-- **Get started** — [Install](/nanoplm/start/install/) nanoPLM, then train your
+- **Get started**: [Install](/nanoplm/start/install/) nanoPLM, then train your
   [first PLM](/nanoplm/start/first-plm/) top to bottom.
-- **The three YAMLs** — [how the pipeline fits together](/nanoplm/pipeline/), then one page each for
+- **The three YAMLs**: [how the pipeline fits together](/nanoplm/pipeline/), then one page each for
   [data](/nanoplm/pipeline/data/), [pretraining](/nanoplm/pipeline/pretrain/), and
   [evaluation](/nanoplm/pipeline/eval/).
-- **Going further** — goal-shaped guides: [choose a backend](/nanoplm/guides/backends/),
+- **Going further**: goal-shaped guides: [choose a backend](/nanoplm/guides/backends/),
   [scale up](/nanoplm/guides/scale-up/), [choose an optimizer](/nanoplm/guides/optimizers/),
   [cooldown and resuming](/nanoplm/guides/cooldown-and-resume/), and
   [recycling](/nanoplm/guides/recycling/).
-- **Reference and Troubleshooting** — every key of every config, generated from the code
+- **Reference and Troubleshooting**: every key of every config, generated from the code
   ([data.yaml](/nanoplm/reference/data/), [pretrain.yaml](/nanoplm/reference/pretrain/),
   [eval.yaml](/nanoplm/reference/eval/), [CLI](/nanoplm/reference/cli/)), plus
   [what to do when a run fails](/nanoplm/troubleshooting/).

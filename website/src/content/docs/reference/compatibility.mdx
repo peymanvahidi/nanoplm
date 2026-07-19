@@ -11,14 +11,14 @@ Huginn-style recycling activates when `model.recycling_loop_count` is greater th
 
 Each flag below carries one of four verdicts:
 
-- **Rejected** — the combination is refused at **config load**, before training starts. You get an error and a non-zero exit, not a degraded run.
-- **Warning** — the run proceeds, but the combination is untested. Read the note and decide.
-- **Caveat** — the run proceeds and the flag works, with a correctness or performance qualifier attached.
-- **Compatible** — known to work with recycling.
+- **Rejected**: the combination is refused at **config load**, before training starts. You get an error and a non-zero exit, not a degraded run.
+- **Warning**: the run proceeds, but the combination is untested. Read the note and decide.
+- **Caveat**: the run proceeds and the flag works, with a correctness or performance qualifier attached.
+- **Compatible**: known to work with recycling.
 
 The **Condition** column matters: some entries fire only in a particular state. `pure_torch` is listed as rejected *when it is false*, which is the matrix's way of saying recycling requires the pure-torch backend.
 
-The matrix is generated from `recycling_compatibility.yaml` — the same rules file the trainer reads when it validates your config — so what you see here is exactly what the tool enforces.
+The matrix is generated from `recycling_compatibility.yaml` (the same rules file the trainer reads when it validates your config), so what you see here is exactly what the tool enforces.
 
 ## Recycling is pure-torch only
 

@@ -12,6 +12,10 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'nanoPLM',
+      logo: {
+        src: './src/assets/nanoplm-logo.png',
+        replacesTitle: true,
+      },
       description:
         'Pretrain a protein language model from a FASTA file. Three YAML files, three commands.',
       social: { github: 'https://github.com/peymanvahidi/nanoplm' },

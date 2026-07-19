@@ -44,8 +44,8 @@ Three `model:` keys define the shape.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | [`recycling_loop_count`](/nanoplm/reference/pretrain/#pretrain-model-recycling_loop_count) | `1` | Target **mean** number of times the recurrent block runs. `1` disables recycling entirely. |
-| [`recycling_num_prelude_layers`](/nanoplm/reference/pretrain/#pretrain-model-recycling_num_prelude_layers) | `0` | P — the first P layers run once, before the loop. |
-| [`recycling_num_coda_layers`](/nanoplm/reference/pretrain/#pretrain-model-recycling_num_coda_layers) | `0` | C — the last C layers run once, after the loop. |
+| [`recycling_num_prelude_layers`](/nanoplm/reference/pretrain/#pretrain-model-recycling_num_prelude_layers) | `0` | P: the first P layers run once, before the loop. |
+| [`recycling_num_coda_layers`](/nanoplm/reference/pretrain/#pretrain-model-recycling_num_coda_layers) | `0` | C: the last C layers run once, after the loop. |
 
 The recurrent block is whatever is left: `num_hidden_layers - P - C` layers, weight-tied and looped. With `P = C = 0` the entire stack becomes the recurrent block.
 
@@ -72,7 +72,7 @@ pretraining:
 | [`recycling_loop_count_sigma`](/nanoplm/reference/pretrain/#pretrain-pretraining-recycling_loop_count_sigma) | `0.5` | Width of that distribution. Ignored when sampling is `fixed`. |
 | [`recycling_loop_count_curriculum`](/nanoplm/reference/pretrain/#pretrain-pretraining-recycling_loop_count_curriculum) | `1_sqrt` | Ramps the mean loop count up over training instead of starting deep. `none` disables the ramp. |
 | [`recycling_loop_count_curriculum_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-recycling_loop_count_curriculum_steps) | `-1` | Length of that ramp in optimizer steps. `-1` means 25% of the run. |
-| [`recycling_pretraining_eval_loop_counts`](/nanoplm/reference/pretrain/#pretrain-pretraining-recycling_pretraining_eval_loop_counts) | `null` | A list, e.g. `[1, 4]`, evaluates at several depths each eval step — the cheapest way to see whether extra loops are actually buying accuracy. |
+| [`recycling_pretraining_eval_loop_counts`](/nanoplm/reference/pretrain/#pretrain-pretraining-recycling_pretraining_eval_loop_counts) | `null` | A list, e.g. `[1, 4]`, evaluates at several depths each eval step: the cheapest way to see whether extra loops are actually buying accuracy. |
 
 ## Check compatibility before you run
 
@@ -89,11 +89,11 @@ The error names the flag: `recycling: incompatible model flag 'use_moe=True'. ..
 
 And the pure-TE backend is rejected, as above.
 
-Three more are **allowed with a warning** — they run, but nobody has validated them:
+Three more are **allowed with a warning**: they run, but nobody has validated them:
 
-- `use_repo` — RePO re-predicts head positions on every iteration. Set `repo_after_n_layers` so RePO lands in the coda.
-- `fp8` — FP8 combined with truncated BPTT is not validated for gradient correctness.
-- `use_compile_max_autotune` — compiles the recurrent *step* rather than the unrolled loop, and triggers an extra smoke test at startup.
+- `use_repo`: RePO re-predicts head positions on every iteration. Set `repo_after_n_layers` so RePO lands in the coda.
+- `fp8`: FP8 combined with truncated BPTT is not validated for gradient correctness.
+- `use_compile_max_autotune`: compiles the recurrent *step* rather than the unrolled loop, and triggers an extra smoke test at startup.
 
 :::caution
 `fp8_cpu_activation_offload` is not "warn", it is a hard stop: `fp8_cpu_activation_offload is not supported with recycling_loop_count > 1.`
@@ -147,10 +147,10 @@ Starting pure-torch training: total_steps=39 (token-budget driven), warmup_steps
 [step 10] in-loop eval r=1: 3.1204, r=4: 2.8871
 ```
 
-If the two eval losses stay close, the extra loops are not earning their compute — lower `recycling_loop_count`.
+If the two eval losses stay close, the extra loops are not earning their compute: lower `recycling_loop_count`.
 
 ## Where to go next
 
-- [Choose a backend](/nanoplm/guides/backends/) — recycling is pure-torch only.
-- [Compatibility matrix](/nanoplm/reference/compatibility/) — every flag recycling rejects or warns on.
-- [pretrain.yaml reference](/nanoplm/reference/pretrain/) — every `recycling_*` key, with defaults.
+- [Choose a backend](/nanoplm/guides/backends/): recycling is pure-torch only.
+- [Compatibility matrix](/nanoplm/reference/compatibility/): every flag recycling rejects or warns on.
+- [pretrain.yaml reference](/nanoplm/reference/pretrain/): every `recycling_*` key, with defaults.

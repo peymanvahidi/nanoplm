@@ -5,8 +5,8 @@ description: Train and evaluate a small protein language model on SwissProt, end
 
 import { Steps, FileTree } from '@astrojs/starlight/components';
 
-You are going to pretrain a real protein language model — a 2.3M-parameter ModernBERT-style
-encoder — on 20,000 SwissProt sequences, then score it on a downstream benchmark. Every command is
+You are going to pretrain a real protein language model (a 2.3M-parameter ModernBERT-style
+encoder) on 20,000 SwissProt sequences, then score it on a downstream benchmark. Every command is
 run from the same working directory, and each stage hands its artifacts to the next.
 
 **What you need**
@@ -21,7 +21,7 @@ run from the same working directory, and each stage hands its artifacts to the n
 `use_packing: false` under `pretraining:` in Stage 2 and everything else here still holds.
 :::
 
-## Stage 1 — Build the dataset
+## Stage 1: Build the dataset
 
 <Steps>
 
@@ -34,7 +34,7 @@ run from the same working directory, and each stage hands its artifacts to the n
    # Edit data.yaml and run `nanoplm data from-yaml` to execute.
    ```
 
-2. **Check three keys.** The template already points at SwissProt, so there is little to change —
+2. **Check three keys.** The template already points at SwissProt, so there is little to change,
    but these are the three values that decide how big and how long your dataset is, and they are
    worth setting on purpose.
 
@@ -47,12 +47,12 @@ run from the same working directory, and each stage hands its artifacts to the n
    data_params:
      seqs_num: 20000        # SwissProt has ~570k; 20k trains fast and still learns
      min_seq_len: 20
-     max_seq_len: 512       # pad/truncate length — pretraining reads this back from the manifest
+     max_seq_len: 512       # pad/truncate length: pretraining reads this back from the manifest
      # ...
    ```
 
    `max_seq_len` is the one to notice. You set it here, once. Pretraining reads it out of the
-   manifest and uses it to convert your token budget into optimizer steps — which is why it does
+   manifest and uses it to convert your token budget into optimizer steps: which is why it does
    **not** appear in `pretrain.yaml`.
 
 3. **Run the pipeline.** nanoPLM drives the download → extract → check → shuffle → filter → split →
@@ -89,7 +89,7 @@ You now have binary token shards and the manifest that describes them:
 
 </FileTree>
 
-## Stage 2 — Pretrain
+## Stage 2: Pretrain
 
 <Steps>
 
@@ -100,7 +100,7 @@ You now have binary token shards and the manifest that describes them:
    # Template written to: /work/pretrain.yaml
    ```
 
-   The file is long — around 200 lines — because it exposes every knob nanoPLM has. You need to touch
+   The file is long (around 200 lines) because it exposes every knob nanoPLM has. You need to touch
    six of them. Leave the rest alone; the defaults are good. The
    [pretrain.yaml reference](/nanoplm/reference/pretrain/) documents the others when you want them.
 
@@ -113,7 +113,7 @@ You now have binary token shards and the manifest that describes them:
      intermediate_size: 512
      num_hidden_layers: 4
      num_attention_heads: 4
-     vocab_size: 32          # the protein tokenizer's vocabulary — leave it
+     vocab_size: 32          # the protein tokenizer's vocabulary: leave it
      # ... leave the rest of the model block as generated
    ```
 
@@ -125,7 +125,7 @@ You now have binary token shards and the manifest that describes them:
    pretraining:
      dataset_dir: "output/data/pretrain_data"  # where Stage 1 wrote its shards
 
-     micro_batch_seqs: 16          # sequences per GPU per forward pass — your VRAM knob
+     micro_batch_seqs: 16          # sequences per GPU per forward pass: your VRAM knob
      global_batch_tokens: 65536    # tokens per optimizer step: 16 seqs x 512 tokens x 8 accum
 
      warmup_steps: 20              # optimizer steps, not a ratio
@@ -137,7 +137,7 @@ You now have binary token shards and the manifest that describes them:
    There are **no epochs** in nanoPLM. Duration is a token budget, and the dataset is replayed as
    many times as the budget needs. The default `lr_schedule` is `wsd`, so your run is
    `stable_tokens` + `decay_tokens` = 10M tokens total: warm up, hold the peak learning rate, then
-   anneal. Gradient accumulation is *inferred* from these numbers — never set it.
+   anneal. Gradient accumulation is *inferred* from these numbers: never set it.
 
 4. **Train.**
 
@@ -156,7 +156,7 @@ You now have binary token shards and the manifest that describes them:
    ```
 
    Your 10M-token budget resolved to 154 optimizer steps: 123 stable, then 31 of decay. Watch `lr`
-   hold flat and then fall away after step 123 — that is the WSD schedule doing its job.
+   hold flat and then fall away after step 123: that is the WSD schedule doing its job.
 
 </Steps>
 
@@ -184,7 +184,7 @@ The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:
 
 </FileTree>
 
-## Stage 3 — Evaluate
+## Stage 3: Evaluate
 
 <Steps>
 
@@ -195,7 +195,7 @@ The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:
    # Template written to: /work/eval.yaml
    ```
 
-2. **Point it at your checkpoint.** This is the only value eval cannot infer — everything else about
+2. **Point it at your checkpoint.** This is the only value eval cannot infer: everything else about
    the model comes out of `model_config.yaml` inside the checkpoint.
 
    ```yaml title="eval.yaml"
@@ -217,7 +217,7 @@ The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:
    # [0/5] PBC: secondary_structure
    # ...
    # ============================================================
-   # AUTOEVAL COMPLETE — Final Report Summary
+   # AUTOEVAL COMPLETE: Final Report Summary
    # ============================================================
    ```
 
@@ -239,7 +239,7 @@ The report lands under your embedder's directory, which defaults to the checkpoi
 You are done when all three are true:
 
 - `output/data/pretrain_data/.data_manifest` exists and reports 18,000 train and 2,000 val sequences.
-- Training reached `[step 154/154]` and your loss fell — from around 3.4 to under 2.5. A tiny model on
+- Training reached `[step 154/154]` and your loss fell from around 3.4 to under 2.5. A tiny model on
   10M tokens will not be state of the art; a falling loss is what proves the pipeline works.
 - `output/pretraining_checkpoints/<your-run>/checkpoint-final/pytorch_model.bin` exists. **That file
   is your protein language model**, and `model_config.yaml` beside it describes its architecture.
@@ -249,11 +249,11 @@ You are done when all three are true:
 
 The tutorial gave you a working run. Now make it a good one.
 
-- [How the pipeline fits together](/nanoplm/pipeline/) — the artifact contract behind the run you
+- [How the pipeline fits together](/nanoplm/pipeline/): the artifact contract behind the run you
   completed, in full.
-- [Scale up](/nanoplm/guides/scale-up/) — a bigger model, a bigger budget, and `torchrun` across
+- [Scale up](/nanoplm/guides/scale-up/): a bigger model, a bigger budget, and `torchrun` across
   several GPUs.
-- [Choose an optimizer](/nanoplm/guides/optimizers/) — the Muon family usually beats AdamW here.
-- [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/) — pick a run back up, or anneal one
+- [Choose an optimizer](/nanoplm/guides/optimizers/): the Muon family usually beats AdamW here.
+- [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/): pick a run back up, or anneal one
   trunk into several models.
-- [pretrain.yaml reference](/nanoplm/reference/pretrain/) — every key you left at its default.
+- [pretrain.yaml reference](/nanoplm/reference/pretrain/): every key you left at its default.

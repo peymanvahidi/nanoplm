@@ -22,7 +22,7 @@ The pretraining path, by contrast, is what the project is for and what everythin
 
 Two halves, both reachable from the CLI:
 
-**Teacher embeddings.** `nanoplm data get-yaml --distillation` writes a `distillation_data.yaml` whose pipeline terminates in a `kd-embed` stage. That stage — also available standalone as `nanoplm data kd-embed`, with `nanoplm data kd-reshard` to split its output — runs ProtT5 over your FASTA and stores per-residue teacher embeddings as HDF5 shards.
+**Teacher embeddings.** `nanoplm data get-yaml --distillation` writes a `distillation_data.yaml` whose pipeline terminates in a `kd-embed` stage. That stage (also available standalone as `nanoplm data kd-embed`, with `nanoplm data kd-reshard` to split its output) runs ProtT5 over your FASTA and stores per-residue teacher embeddings as HDF5 shards.
 
 **Student training.** `nanoplm distill get-yaml` writes a `distill.yaml`; `nanoplm distill from-yaml` trains a smaller student model against those stored ProtT5 embeddings. ProtT5 is the only teacher.
 
@@ -30,4 +30,4 @@ That is the whole feature. There is no reference table for `distill.yaml` on thi
 
 ## If you were going to use it anyway
 
-Prefer [pretraining](/nanoplm/pipeline/pretrain/) — it is maintained, it supports the full model and optimizer surface, and its checkpoints work with [`nanoplm eval`](/nanoplm/pipeline/eval/). The [CLI reference](/nanoplm/reference/cli/) lists the distillation commands and their flags at the very bottom, marked as unmaintained.
+Prefer [pretraining](/nanoplm/pipeline/pretrain/): it is maintained, it supports the full model and optimizer surface, and its checkpoints work with [`nanoplm eval`](/nanoplm/pipeline/eval/). The [CLI reference](/nanoplm/reference/cli/) lists the distillation commands and their flags at the very bottom, marked as unmaintained.

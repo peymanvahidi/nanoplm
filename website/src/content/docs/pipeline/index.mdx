@@ -36,8 +36,8 @@ Each YAML answers exactly one question. Where a stage needs a fact that another 
 | File | Owns | Deliberately does not own |
 | --- | --- | --- |
 | `data.yaml` | **What data.** Which FASTA, how it is filtered, how long a sequence may be, how it is sharded. | Anything about the model. |
-| `pretrain.yaml` | **What model, and how long.** Architecture, optimizer, LR schedule, token budget. | Sequence length and register tokens — the data stage already fixed those. |
-| `eval.yaml` | **Which checkpoint, which benchmarks.** | The model architecture — the checkpoint carries it. |
+| `pretrain.yaml` | **What model, and how long.** Architecture, optimizer, LR schedule, token budget. | Sequence length and register tokens: the data stage already fixed those. |
+| `eval.yaml` | **Which checkpoint, which benchmarks.** | The model architecture: the checkpoint carries it. |
 
 ## The artifact contract
 
@@ -60,21 +60,40 @@ The three stages are decoupled through two artifacts on disk. This is the whole 
 
 </FileTree>
 
-The manifest records what the data stage decided:
+The manifest is a small YAML file recording every decision the data stage made that a later stage needs to know about. It is written for you and marked `DO NOT EDIT`: regenerate it by re-running `nanoplm data from-yaml`, never by hand, because editing it makes it disagree with the shards sitting next to it.
 
 ```yaml title=".data_manifest"
-pipeline_mode: pretrain
+pipeline_mode: pretrain     # which pipeline these shards were built for
 seqs_num: 20000
 min_seq_len: 20
-max_seq_len: 512          # <- the number pretraining does its token math with
+max_seq_len: 512            # <- the number pretraining does its token math with
 val_ratio: 0.1
-train_dir: train
+train_dir: train            # where the shards live, relative to this file
 val_dir: val
 train_sequences: 18000
 val_sequences: 2000
-num_register_tokens: 0    # <- injected into the model config at pretrain time
-# ...
+num_register_tokens: 0      # <- injected into the model config at pretrain time
+sharded: true
+samples_per_shard: 5000
+total_train_tokens: 4823117 # <- exact token count, used for the epoch estimate
+created_at: '2026-07-19T14:07:19'
 ```
+
+Every field is there because some later stage would otherwise have to ask you for it, or guess:
+
+- **`pipeline_mode`** is the safety check. Pretraining refuses shards built for distillation, and vice versa.
+- **`max_seq_len` and `num_register_tokens`** are the tokenization decisions the model must match exactly. They are covered in detail [below](#pretrain-reads-the-manifest-back).
+- **`train_dir`, `val_dir`, `sharded`, `samples_per_shard`** are how the loader finds and reads the shards, so no path or layout detail has to be restated in `pretrain.yaml`.
+- **`train_sequences` and `val_sequences`** size the dataloader and the evaluation split.
+- **`total_train_tokens`** is the exact number of tokens across the training shards, counting BOS, EOS, and register tokens. The data stage is the only place that can know this cheaply (it has just written every shard), so it counts once and records the answer.
+
+That last one is worth spelling out, because it is what turns an abstract token budget into a number you can reason about. In `pretrain.yaml` you set a budget like `train_tokens: 10_000_000`. On its own that says nothing about whether your model will see the dataset twice or two hundred times. Dividing the budget by `total_train_tokens` answers exactly that, and pretraining prints it at startup before it trains anything:
+
+```text title="Output"
+Budget: 10,000,000 tokens → ≈2.1 passes over the train set (each sample seen ~2.1×)
+```
+
+So a budget of 10M tokens against this 4.8M-token dataset means roughly two epochs. If you expected twenty, you found out in the first second of the run instead of at the end of it. (For a `wsd` schedule the hint is printed once per phase: stable, decay, and total.) Older manifests written before `total_train_tokens` existed still load; pretraining falls back to estimating from the sequence count and length bounds, and tags the line `(approx)` so you know the difference.
 
 ### `pretrain` reads the manifest back
 
@@ -107,7 +126,28 @@ Every checkpoint carries the three configs that produced it:
 
 </FileTree>
 
-That is why `eval.yaml` needs nothing but a path. Point `checkpoint_dir` at the directory and the evaluator rebuilds the exact model — no architecture keys to re-type, no chance of loading 12 layers of weights into an 8-layer model.
+`model_config.yaml` is the full architecture dump: every key the model needs to reconstruct itself. A mid-size MoE run might look like this (most keys omitted):
+
+```yaml title="model_config.yaml"
+hidden_size: 1024
+intermediate_size: 768
+num_hidden_layers: 20
+num_attention_heads: 16
+num_kv_heads: 8
+vocab_size: 32
+num_register_tokens: 0      # <- copied from .data_manifest at pretrain time
+norm_type: rmsnorm
+mlp_activation: srelu
+use_qk_norm: true
+use_canon_layers: true
+# ...
+use_moe: true
+moe_num_experts: 47
+moe_top_k: 3
+# ...
+```
+
+That is why `eval.yaml` needs nothing but a path. Point `checkpoint_dir` at the directory and the evaluator rebuilds the exact model: no architecture keys to re-type, no chance of loading 12 layers of weights into an 8-layer model.
 
 ### A mismatch is caught, not tolerated
 
@@ -123,8 +163,8 @@ The same holds for the config surface itself: every loader rejects keys it does 
 
 Work through the stages in order. Each page shows the config, the command, the output, and the artifacts it leaves behind.
 
-1. [Prepare data](/nanoplm/pipeline/data/) — FASTA in, tokenized shards and a manifest out.
-2. [Pretrain](/nanoplm/pipeline/pretrain/) — shards in, checkpoints out.
-3. [Evaluate](/nanoplm/pipeline/eval/) — a checkpoint in, benchmark scores out.
+1. [Prepare data](/nanoplm/pipeline/data/): FASTA in, tokenized shards and a manifest out.
+2. [Pretrain](/nanoplm/pipeline/pretrain/): shards in, checkpoints out.
+3. [Evaluate](/nanoplm/pipeline/eval/): a checkpoint in, benchmark scores out.
 
 For the exhaustive key-by-key tables, see the [data.yaml](/nanoplm/reference/data/), [pretrain.yaml](/nanoplm/reference/pretrain/), and [eval.yaml](/nanoplm/reference/eval/) references. They are generated from the code, so they cannot drift.

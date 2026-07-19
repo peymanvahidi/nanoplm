@@ -57,9 +57,9 @@ function fmtDefault(value: unknown): string {
             <code>{r.key}</code>{r.required && <span class="ref-req" title="required (no default)">&nbsp;*</span>}
           </td>
           <td><code>{r.type}</code></td>
-          <td>{r.default === undefined ? <span class="ref-muted">—</span> : <code>{fmtDefault(r.default)}</code>}</td>
-          <td>{r.enum ? <code>{r.enum.map(String).join(' | ')}</code> : <span class="ref-muted">—</span>}</td>
-          <td>{r.backend ? r.backend.join(', ') : <span class="ref-muted">—</span>}</td>
+          <td>{r.default === undefined ? <span class="ref-muted"-</span> : <code>{fmtDefault(r.default)}</code>}</td>
+          <td>{r.enum ? <code>{r.enum.map(String).join(' | ')}</code> : <span class="ref-muted"-</span>}</td>
+          <td>{r.backend ? r.backend.join(', ') : <span class="ref-muted"-</span>}</td>
           <td>{r.description ?? ''}</td>
         </tr>
       ))}

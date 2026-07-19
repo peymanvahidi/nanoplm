@@ -34,7 +34,7 @@ Successfully installed dion-0.1.0
 ```
 
 :::caution
-When dion is missing, nanoPLM raises `Optimizer 'muon' requires the 'dion' package which is not installed. Install it with: pip install nanoplm[cuda]`. **That instruction is wrong** — there is no `cuda` extra. Install from the GitHub URL above.
+When dion is missing, nanoPLM raises `Optimizer 'muon' requires the 'dion' package which is not installed. Install it with: pip install nanoplm[cuda]`. **That instruction is wrong**: there is no `cuda` extra. Install from the GitHub URL above.
 :::
 
 ## Think in two learning rates
@@ -48,7 +48,7 @@ Muon is defined on 2-D weight matrices. It has nothing sensible to say about a b
 | 2-D hidden-layer weight matrices (attention and MLP projections) | Muon / NorMuon / MuonH / Aurora | [`muon_learning_rate`](/nanoplm/reference/pretrain/#pretrain-pretraining-muon_learning_rate) (default `1e-3`) |
 | Everything else: 1-D params, embeddings, unembeddings, MoE routers | Fused AdamW | [`adam_learning_rate`](/nanoplm/reference/pretrain/#pretrain-pretraining-adam_learning_rate) (default `1e-4`) |
 
-So a Muon run has **two** peak learning rates, and both are on the same LR schedule — warmup, stable, and decay scale both curves by the same multiplier. Tuning one and leaving the other at its default is the most common way to get a disappointing Muon result.
+So a Muon run has **two** peak learning rates, and both are on the same LR schedule: warmup, stable, and decay scale both curves by the same multiplier. Tuning one and leaving the other at its default is the most common way to get a disappointing Muon result.
 
 ```yaml title="pretrain.yaml"
 pretraining:
@@ -78,7 +78,7 @@ each matrix hyperball radius from ||W_init||_F, so zero-initialized Wo matrices
 are locked at zero. Set model.wo_init='kaiming' (or --wo-init kaiming).
 ```
 
-MuonH constrains each matrix to a ball whose radius is seeded from the Frobenius norm of its *initial* weights. `model.wo_init` defaults to `"zero"`, which makes that radius zero for the residual out-projections — they can never move. The fix is one key:
+MuonH constrains each matrix to a ball whose radius is seeded from the Frobenius norm of its *initial* weights. `model.wo_init` defaults to `"zero"`, which makes that radius zero for the residual out-projections: they can never move. The fix is one key:
 
 ```yaml title="pretrain.yaml"
 model:
@@ -111,7 +111,7 @@ These apply to `adamw` and `stable_adamw`, and to the AdamW side of every Muon-f
 | [`adam_epsilon`](/nanoplm/reference/pretrain/#pretrain-pretraining-adam_epsilon) | `1e-8` | Rarely. |
 | [`max_grad_norm`](/nanoplm/reference/pretrain/#pretrain-pretraining-max_grad_norm) | `.inf` | `.inf` means gradient clipping is **off**. Set a finite value (e.g. `1.0`) if `grad_norm` in the step log spikes. The run tells you which it is: `Gradient clipping: disabled (max_grad_norm=inf)`. |
 
-The peak LR does not act alone — it is scaled by the schedule. See [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/) for `lr_schedule`, `warmup_steps`, and `lr_decay_to_fraction`.
+The peak LR does not act alone: it is scaled by the schedule. See [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/) for `lr_schedule`, `warmup_steps`, and `lr_decay_to_fraction`.
 
 ## Leave the Muon internals alone
 
@@ -119,6 +119,6 @@ The peak LR does not act alone — it is scaled by the schedule. See [Cooldown a
 
 ## Where to go next
 
-- [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/) — the LR schedule that both learning rates ride on.
-- [Scale up](/nanoplm/guides/scale-up/) — batch size, sharding, FP8.
-- [pretrain.yaml reference](/nanoplm/reference/pretrain/) — every optimizer key, with defaults.
+- [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/): the LR schedule that both learning rates ride on.
+- [Scale up](/nanoplm/guides/scale-up/): batch size, sharding, FP8.
+- [pretrain.yaml reference](/nanoplm/reference/pretrain/): every optimizer key, with defaults.

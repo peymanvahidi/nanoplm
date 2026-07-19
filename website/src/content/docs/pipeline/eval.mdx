@@ -7,7 +7,7 @@ import { FileTree, Steps } from '@astrojs/starlight/components';
 
 Evaluation answers the only question that matters: did the model learn anything useful?
 
-This is where the checkpoint format pays off. `eval.yaml` needs **a path and a list of benchmarks** — nothing else. The architecture, the tokenizer, the register-token count, and the training step are all read out of the checkpoint's own `model_config.yaml`, `pretrain_config.yaml`, and `data_manifest.yaml`. There is no architecture to re-declare, so there is no architecture to get wrong.
+This is where the checkpoint format pays off. `eval.yaml` needs **a path and a list of benchmarks**, nothing else. The architecture, the tokenizer, the register-token count, and the training step are all read out of the checkpoint's own `model_config.yaml`, `pretrain_config.yaml`, and `data_manifest.yaml`. There is no architecture to re-declare, so there is no architecture to get wrong.
 
 ## Before you start
 
@@ -51,7 +51,7 @@ Evaluation loads **pure-torch checkpoints only**. That is one more reason to tra
    [1/8] PBC: PBC-secondary_structure
    # ...
    ============================================================
-   AUTOEVAL COMPLETE — Final Report Summary
+   AUTOEVAL COMPLETE: Final Report Summary
    ============================================================
    ```
 
@@ -70,7 +70,7 @@ eval:
 
   output_dir: "autoeval_output"
 
-  batch_size: 16                      # embedding batch size — the only VRAM knob here
+  batch_size: 16                      # embedding batch size: the only VRAM knob here
   min_seq_length: 0                   # filters applied to the BENCHMARK data, not yours
   max_seq_length: 2000
 
@@ -80,7 +80,7 @@ eval:
 
   zero_shot_method: masked_marginals  # masked_marginals | wt_marginals | pseudoperplexity
 
-  # tasks: [PBC-secondary_structure]  # optional whitelist — parallel mode only
+  # tasks: [PBC-secondary_structure]  # optional whitelist: parallel mode only
 
   force_download: false               # re-download benchmark datasets
 ```
@@ -89,8 +89,8 @@ eval:
 
 [`checkpoint_dir`](/nanoplm/reference/eval/#eval-checkpoint_dir) accepts either shape:
 
-- A **`checkpoint-*` directory** — that exact checkpoint is evaluated.
-- A **`run-*` directory** — the checkpoint with the highest step inside it is evaluated.
+- A **`checkpoint-*` directory**: that exact checkpoint is evaluated.
+- A **`run-*` directory**: the checkpoint with the highest step inside it is evaluated.
 
 So during a long run you can leave `checkpoint_dir` pointed at the run directory and re-run evaluation whenever you want the latest score, without editing the config. The resolved path is echoed on the first line of the output, so you always know which checkpoint produced a number.
 
@@ -100,26 +100,26 @@ So during a long run you can leave `checkpoint_dir` pointed at the run directory
 
 | Value | What it measures |
 | --- | --- |
-| `pbc` | Protein Benchmark Collection — supervised probes on frozen embeddings (secondary structure, localisation, and similar). |
-| `flip` | FLIP — supervised probes on fitness-landscape splits. |
+| `pbc` | Protein Benchmark Collection: supervised probes on frozen embeddings (secondary structure, localisation, and similar). |
+| `flip` | FLIP: supervised probes on fitness-landscape splits. |
 | `pgym` | ProteinGym, **zero-shot**: the model scores mutants directly, with no probe trained on top. |
 
 `pbc` and `flip` train a small supervised head on your model's frozen embeddings, so they measure representation quality. `pgym` uses the MLM head itself, so it measures how well the model models proteins. They can disagree, and the disagreement is informative.
 
 Zero-shot scoring has three methods, set by [`zero_shot_method`](/nanoplm/reference/eval/#eval-zero_shot_method) and used only when `pgym` is in `framework`:
 
-- `masked_marginals` (default) — mask each mutated position and read the log-probabilities. Slowest and usually the strongest.
-- `wt_marginals` — a single forward pass over the wild-type sequence.
-- `pseudoperplexity` — the full pseudo-log-likelihood of the mutant.
+- `masked_marginals` (default): mask each mutated position and read the log-probabilities. Slowest and usually the strongest.
+- `wt_marginals`: a single forward pass over the wild-type sequence.
+- `pseudoperplexity`: the full pseudo-log-likelihood of the mutant.
 
 ## Sequential or parallel
 
-[`parallel_tasks`](/nanoplm/reference/eval/#eval-parallel_tasks) defaults to `0`, which runs each benchmark task one after another through biotrainer's own pipeline. Set it above `0` and nanoPLM instead computes every embedding on the GPU first, then trains the supervised probes on CPU across that many workers. On a machine with spare cores this is substantially faster, and it is the only mode in which the [`tasks`](/nanoplm/reference/eval/#eval-tasks) whitelist works — in sequential mode a `tasks:` list is ignored with a warning.
+[`parallel_tasks`](/nanoplm/reference/eval/#eval-parallel_tasks) defaults to `0`, which runs each benchmark task one after another through biotrainer's own pipeline. Set it above `0` and nanoPLM instead computes every embedding on the GPU first, then trains the supervised probes on CPU across that many workers. On a machine with spare cores this is substantially faster, and it is the only mode in which the [`tasks`](/nanoplm/reference/eval/#eval-tasks) whitelist works. In sequential mode a `tasks:` list is ignored with a warning.
 
 The two modes write to **differently named output directories**. Switching `parallel_tasks` between runs therefore hides your earlier results from the resume cache: already-completed tasks are recomputed, and the scores land in a new tree. Pick a mode per project and keep it.
 
 :::caution[`force_download` clears every framework's cache]
-[`force_download: true`](/nanoplm/reference/eval/#eval-force_download) does not re-download only the framework you are running — it wipes **all** benchmark caches under the autoeval root. Every other framework you evaluate afterwards re-downloads its data too. Use it when new tasks land upstream, then set it back to `false`.
+[`force_download: true`](/nanoplm/reference/eval/#eval-force_download) does not re-download only the framework you are running: it wipes **all** benchmark caches under the autoeval root. Every other framework you evaluate afterwards re-downloads its data too. Use it when new tasks land upstream, then set it back to `false`.
 :::
 
 ## What you get
@@ -127,7 +127,7 @@ The two modes write to **differently named output directories**. Switching `para
 <FileTree>
 
 - autoeval_output/
-  - checkpoint-final/ the embedder name — defaults to the checkpoint directory's name
+  - checkpoint-final/ the embedder name: defaults to the checkpoint directory's name
     - pbc_0_2000/ parallel mode: framework, min\_seq\_length, max\_seq\_length
       - PBC-secondary_structure/
         - …

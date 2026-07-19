@@ -57,6 +57,19 @@
   --sl-content-width: 50rem;
 }
 
+/* Cap the right "On this page" rail. By default Starlight hands it half of all
+   leftover space on wide screens, so it balloons past 30rem. Match it to the
+   left sidebar width and keep the article centered between the two rails. */
+@media (min-width: 72rem) {
+  .right-sidebar-container {
+    width: var(--sl-sidebar-width);
+  }
+  [data-has-sidebar][data-has-toc] .main-pane {
+    width: calc(100% - var(--sl-sidebar-width));
+    --sl-content-margin-inline: auto;
+  }
+}
+
 .sl-markdown-content code:not(:where(.expressive-code *)) {
   font-family: var(--sl-font-mono);
   font-size: var(--sl-text-code);
