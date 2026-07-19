@@ -24,7 +24,7 @@ download → extract → validate → shuffle → filter → split → tokenize 
    ```
 
    ```text title="Output"
-   Wrote data.yaml and dvc.yaml in /work/my-plm.
+   Wrote data.yaml and dvc.yaml in <cwd>.
    Edit data.yaml and run `nanoplm data from-yaml` to execute.
    ```
 
@@ -37,7 +37,7 @@ download → extract → validate → shuffle → filter → split → tokenize 
    ```
 
    ```text title="Output (trimmed)"
-   Regenerated dvc.yaml in /work/my-plm
+   Regenerated dvc.yaml in <cwd>
    Running dvc repro (full pipeline)...
    # ...
    Successfully created 9 shard files:
@@ -157,7 +157,7 @@ nanoplm data from-yaml --fix
 
 ```text title="Output (trimmed)"
 Set data.yaml: data_params.drop_invalid_sequences=true
-Regenerated dvc.yaml in /work/my-plm
+Regenerated dvc.yaml in <cwd>
 Running dvc repro (full pipeline)...
 # ...
 ```

@@ -80,7 +80,7 @@ nanoplm data get-yaml
 ```
 
 ```
-Wrote data.yaml and dvc.yaml in /work/my-plm.
+Wrote data.yaml and dvc.yaml in <cwd>.
 Edit data.yaml and run `nanoplm data from-yaml` to execute.
 ```
 
@@ -251,7 +251,7 @@ nanoplm pretrain get-yaml
 ```
 
 ```
-Template written to: /work/my-plm/pretrain.yaml
+Template written to: <cwd>/pretrain.yaml
 ```
 
 ### pretrain from-yaml

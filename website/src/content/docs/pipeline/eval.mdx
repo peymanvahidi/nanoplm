@@ -33,7 +33,7 @@ Evaluation loads **pure-torch checkpoints only**. That is one more reason to tra
    ```
 
    ```text title="Output"
-   Template written to: /work/my-plm/eval.yaml
+   Template written to: <cwd>/eval.yaml
    ```
 
 2. Point `checkpoint_dir` at a checkpoint (or at the run directory that contains it) and pick your frameworks.
@@ -45,7 +45,7 @@ Evaluation loads **pure-torch checkpoints only**. That is one more reason to tra
    ```
 
    ```text title="Output (trimmed)"
-   Resolved checkpoint: /work/my-plm/output/pretraining_checkpoints/run-14071932/checkpoint-final
+   Resolved checkpoint: output/pretraining_checkpoints/run-14071932/checkpoint-final
    Using device: cuda
    Loaded model config from checkpoint: .../checkpoint-final/model_config.yaml
    Embedder name: checkpoint-final
