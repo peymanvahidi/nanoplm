@@ -1,9 +1,9 @@
 ---
 title: CLI
-description: "Every nanoplm command, argument, and option, grouped by the four command families: data, pretrain, eval, and the unmaintained distill."
+description: "Every nanoplm command, argument, and option, grouped by data, pretrain, eval, deps, and the unmaintained distill."
 ---
 
-`nanoplm` has four command groups: `data`, `pretrain`, `eval`, and `distill`. Every group has the same shape:
+`nanoplm` has five command groups: `data`, `pretrain`, `eval`, `deps`, and `distill`. The pipeline groups share the same shape:
 
 ```
 nanoplm <group> get-yaml | from-yaml | run
@@ -15,7 +15,41 @@ nanoplm <group> get-yaml | from-yaml | run
 
 For `pretrain` and `eval`, **`from-yaml` is the path to use.** `pretrain run` works, but it exposes a strictly smaller surface than the YAML: it has no flags for HSDP, MoE, NOBLE, recycling, the profiler, RoPE thetas, or FP8 CPU offload, and it silently defaults every one of them. Reach for it only for a quick one-off.
 
+`deps` is different: it installs and verifies the pinned GPU stack. See [Install](/nanoplm/start/install/).
+
 The root group takes `--version`. Every command takes `-h` / `--help`.
+
+---
+
+## deps
+
+`nanoplm deps` installs and verifies the hard GPU dependency stack (Hopper + CUDA 13). It is required after installing the package itself; the package alone does not pull Dion, TransformerEngine, FlashAttention-3, or SonicMoE/QuACK.
+
+### deps install
+
+```
+nanoplm deps install [OPTIONS]
+```
+
+Runs the packaged installer into the **active virtualenv**, then verifies in a fresh interpreter. Must be run with a venv activated. On clusters, load the CUDA 13 toolchain first and run from a login node (internet, no GPU required; TE source build ~10 min).
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--arch TEXT` | CUDA arch for source builds (`NVTE_CUDA_ARCHS`). `90` = Hopper / H100 | `90` |
+| `--force` | Reinstall every component even if already satisfied | off |
+
+```bash
+module load CUDA/13 NCCL cuDNN Ninja    # clusters only
+nanoplm deps install
+```
+
+### deps verify
+
+```
+nanoplm deps verify
+```
+
+Checks torch build (`2.12.1+cu130`), hard-dep imports (`dion`, `transformer_engine.pytorch`, `flash_attn_interface`, `quack`, `sonicmoe`), and GPU compute capability when a device is visible. Re-run on a GPU node after installing on a login node.
 
 ---
 
@@ -281,7 +315,7 @@ Flag-driven pretraining without a YAML file. `--dataset-dir` is the only require
 
 ## eval
 
-`nanoplm eval` scores a checkpoint on downstream benchmarks through biotrainer's autoeval. It needs `pip install nanoplm[eval]`, and it loads **pure-torch checkpoints only**. Fields are documented in the [eval.yaml reference](/nanoplm/reference/eval/).
+`nanoplm eval` scores a checkpoint on downstream benchmarks through biotrainer's autoeval. It needs the `eval` extra (`uv pip install -e ".[eval]"` or the GitHub equivalent; see [Install](/nanoplm/start/install/)), and it loads **pure-torch checkpoints only**. Fields are documented in the [eval.yaml reference](/nanoplm/reference/eval/).
 
 ### eval get-yaml
 

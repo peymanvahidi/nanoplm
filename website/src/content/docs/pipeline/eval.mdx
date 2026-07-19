@@ -11,10 +11,13 @@ This is where the checkpoint format pays off. `eval.yaml` needs **a path and a l
 
 ## Before you start
 
-Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer), which is an optional dependency:
+Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer), which is an optional
+dependency (not part of `nanoplm deps install`; see [Install](/nanoplm/start/install/)):
 
 ```sh
-pip install nanoplm[eval]
+uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
+# or, for an editable checkout:
+uv pip install -e ".[eval]"
 ```
 
 Evaluation loads **pure-torch checkpoints only**. That is one more reason to train with `--pure-torch`, as [2. Pretrain](/nanoplm/pipeline/pretrain/) recommends.

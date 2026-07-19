@@ -28,92 +28,46 @@
 
 ## 🛠️ Install
 
-Install the package from PyPI:
+> **Supported platform:** Linux x86_64 or aarch64 · NVIDIA **Hopper** GPU
+> (H100/H200/GH200, sm90) · CUDA ≥ 13.0. Every full install carries the same
+> stack: torch 2.12.1+cu130, TransformerEngine 2.16 (FP8), FlashAttention-3,
+> SonicMoE/QuACK, and Dion. Other GPUs or OSes may partially work but are
+> unsupported. Step-by-step docs:
+> [Install](https://peymanvahidi.github.io/nanoplm/start/install/).
 
 ```bash
-pip install nanoplm
+uv venv && source .venv/bin/activate
+uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \
+    --extra-index-url https://download.pytorch.org/whl/cu130
+nanoplm deps install
 ```
 
-For a local editable install:
+Contributors: clone and use `uv pip install -e .` (add
+`--extra-index-url https://download.pytorch.org/whl/cu130` so torch resolves to
+the cu130 wheel), then `nanoplm deps install`. Once nanoPLM is public on PyPI
+this becomes `uv pip install nanoplm`.
+
+**On clusters (e.g. JURECA):** load the toolchain first, then install from a
+**login node** (needs internet; no GPU; the TransformerEngine source build takes
+~10 min):
 
 ```bash
-uv pip install -e .
-```
-For benchmarking you also need Biotrainer.
-```bash
-pip install git+https://github.com/sacdallago/biotrainer@main
+module load CUDA/13 NCCL cuDNN Ninja    # do NOT module purge
+nanoplm deps install
 ```
 
-For CUDA training, install Dion manually from the Microsoft repository:
+Verify on a GPU node with `nanoplm deps verify`.
 
-```bash
-pip install git+https://github.com/microsoft/dion.git
-```
+### Benchmarking extra
 
-MoE training now uses an in-tree CUTLASS grouped GEMM extension instead of the
-external `grouped_gemm` package. The extension is JIT-built on first use, so
-you only need a CUDA toolkit that matches `torch.version.cuda`.
-
-1. Check your active PyTorch CUDA version:
+`nanoplm eval` runs on [biotrainer](https://github.com/sacdallago/biotrainer)'s
+autoeval pipeline, so the `eval` extra pulls in **biotrainer 1.4.0**:
 
 ```bash
-uv run python -c "import torch; print(torch.__version__, torch.version.cuda)"
+uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
+# or, for an editable checkout:
+uv pip install -e ".[eval]"
 ```
-
-2. Point `CUDA_HOME` at the matching toolkit and set the architectures you want
-to build for:
-
-```bash
-export CUDA_HOME=/path/to/cuda-matching-torch
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export TORCH_CUDA_ARCH_LIST="9.0"  # H100; adjust for your GPU
-```
-
-3. Run nanoPLM normally. The first CUDA MoE call will compile the vendored
-CUTLASS backend and cache it under `.cache/torch_extensions`:
-
-```bash
-nanoplm pretrain from-yaml --pure-torch
-```
-
-If you need different architectures, override `TORCH_CUDA_ARCH_LIST` before
-running your first MoE job. If CUTLASS is not checked out under
-`third_party/cutlass`, set `NANOPLM_CUTLASS_ROOT` or `CUTLASS_ROOT` to a CUTLASS
-checkout.
-
-### TransformerEngine on JURECA (JSC)
-
-The prebuilt `transformer_engine` wheels (2.14–2.16) fail to import on JURECA
-(`undefined symbol: cublasLtGroupedMatrixLayoutInit_internal`) because they link
-a newer cublasLt than `module load CUDA/13` provides. Build it from source once,
-from a **login node** (needs internet; no GPU required):
-
-```bash
-bash install_te_jureca.sh
-```
-
-This clones TE 2.16, builds it for sm90 + sm120 against the cluster's CUDA,
-installs it into `.venv`, and verifies the import. Override `NVTE_CUDA_ARCHS`
-(e.g. `NVTE_CUDA_ARCHS=90`) to retarget. Only needed for the FP8 / `--pure-te`
-pipelines; the default bf16 / `--pure-torch` path does not require TE.
-
-### Optional: SonicMoE expert backend
-
-Set `moe_kernel_backend: sonicmoe` in the pretraining YAML to run the routed
-experts on the [SonicMoE](https://github.com/Dao-AILab/sonic-moe) /
-[QuACK](https://github.com/Dao-AILab/quack) fused kernels (sync-free forward and
-backward, dispatch fused into the GEMM). It requires our SonicMoE fork, which
-adds squared-ReLU (`srelu`) support on top of upstream (PR
-[Dao-AILab/sonic-moe#64](https://github.com/Dao-AILab/sonic-moe/pull/64)):
-
-```bash
-pip install quack-kernels            # use quack-kernels[cu13] on CUDA 13
-pip install git+https://github.com/alint77/sonic-moe.git@feat/srelu-relu_sq-support
-```
-
-Requires a Hopper (SM90) or newer GPU. The default `moe_kernel_backend: cutlass`
-needs none of this.
 
 ---
 

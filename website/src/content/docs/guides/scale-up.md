@@ -143,7 +143,7 @@ The run warns that `the token budget is approximate under batch-size warmup`. St
 
 `fp8: true` halves the bytes moved through the eligible linear layers. Two requirements before you enable it:
 
-- **Transformer Engine must be installed**: even on pure-torch. nanoPLM swaps eligible blocks for TE modules and runs them under a TE autocast. Without TE: `fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`
+- **Transformer Engine must be installed**: even on pure-torch. nanoPLM swaps eligible blocks for TE modules and runs them under a TE autocast. A normal install gets TE from `nanoplm deps install` (see [Install](/nanoplm/start/install/)). Without TE: `fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`
 - **Hopper (H100) or newer.** FP8 tensor cores do not exist on Ampere.
 
 ```yaml title="pretrain.yaml"

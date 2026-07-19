@@ -11,14 +11,16 @@ run from the same working directory, and each stage hands its artifacts to the n
 
 **What you need**
 
-- One CUDA GPU. The token budget below is tiny; any modern card will do.
-- nanoPLM installed, with the `eval` extra and `flash-attn`. See [Install](/nanoplm/start/install/).
+- A supported install: Linux + Hopper GPU + CUDA 13, via `nanoplm deps install`. See
+  [Install](/nanoplm/start/install/).
+- The `eval` extra for Stage 3 (`uv pip install -e ".[eval]"` or the GitHub equivalent).
 - About 30 minutes: roughly 10 for the SwissProt download and tokenization, a few for training, and
   the rest for benchmarking.
 
 :::note
-`use_packing` defaults to `true`, which requires `flash-attn`. If you skipped it during install, add
-`use_packing: false` under `pretraining:` in Stage 2 and everything else here still holds.
+`use_packing` defaults to `true` and uses FlashAttention-3, which `nanoplm deps install` already
+puts in the env. If verify failed on `flash_attn_interface`, either re-run deps install or set
+`use_packing: false` under `pretraining:` in Stage 2 so the run uses padding instead.
 :::
 
 ## Stage 1: Build the dataset

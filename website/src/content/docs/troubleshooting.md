@@ -119,10 +119,14 @@ model:
 
 **`Optimizer 'normuon' requires the 'dion' package which is not installed.`**
 
-`muon`, `normuon`, `muonh`, and `aurora` all come from Microsoft's `dion`, which is not a base dependency. The message suggests `pip install nanoplm[cuda]`; install from source instead:
+`muon`, `normuon`, `muonh`, and `aurora` all come from Microsoft's `dion`. A full install puts it in
+place via `nanoplm deps install` (see [Install](/nanoplm/start/install/)). The message may still
+suggest `pip install nanoplm[cuda]`; **there is no `cuda` extra**. Re-run the deps installer and
+verify:
 
 ```bash
-pip install git+https://github.com/microsoft/dion.git
+nanoplm deps install
+nanoplm deps verify
 ```
 
 **`muonh_scope must be one of: all, mlp (got 'ffn')`**
@@ -212,7 +216,10 @@ FP8 goes through Transformer Engine on **both** backends: including pure-torch, 
 
 **`fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`**
 
-Install Transformer Engine, or set `fp8: false`. FP8 tensor cores need Hopper (H100) or newer; `fp8_recipe: mxfp8` and `nvfp4` need Blackwell.
+Transformer Engine is part of the hard stack from `nanoplm deps install` (built from source as
+v2.16). If it is missing, re-run that command rather than `pip install transformer-engine` (prebuilt
+wheels often break against cluster CUDA toolkits). Or set `fp8: false`. FP8 tensor cores need Hopper
+(H100) or newer; `fp8_recipe: mxfp8` and `nvfp4` need Blackwell.
 
 **`fp8=True requires at least one eligible block for Transformer Engine FP8 conversion target='mlp', skip_last_n_layers=12.`**
 

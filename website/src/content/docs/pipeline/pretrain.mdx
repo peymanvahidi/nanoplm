@@ -84,7 +84,7 @@ pretraining:
   micro_batch_seqs: 32          # SEQUENCES per GPU per forward: turn this down when you hit OOM
   global_batch_tokens: 131072   # TOKENS per optimizer step: grad accum is inferred from it
 
-  optimizer: "adamw"            # adamw runs everywhere; the Muon family needs the dion package
+  optimizer: "adamw"            # adamw is the scaffold default; Muon family needs dion (from deps install)
   adam_learning_rate: 1e-4
 
   lr_schedule: "wsd"            # warmup -> stable -> decay, all inside one run
@@ -97,7 +97,7 @@ pure_torch: true                # or pass --pure-torch on the command line
 
 Those four `model:` keys are the only ones with no default; the rest of the block is optional. In `pretraining:`, only `dataset_dir` is strictly required: but a `wsd` schedule needs a budget, so `stable_tokens` and `decay_tokens` come with it.
 
-One key deserves the explicit setting it gets above: `optimizer`. The scaffold ships `adamw`, but the underlying default is `normuon`, which needs the third-party `dion` package. Spell it out and you will not be surprised. See [Choose an optimizer](/nanoplm/guides/optimizers/).
+One key deserves the explicit setting it gets above: `optimizer`. The scaffold ships `adamw`, but the underlying default is `normuon`, which needs Microsoft's `dion` package. A full [install](/nanoplm/start/install/) (`nanoplm deps install`) already includes dion; spell the optimizer out so you are not surprised. See [Choose an optimizer](/nanoplm/guides/optimizers/).
 
 ## Duration is a token budget
 

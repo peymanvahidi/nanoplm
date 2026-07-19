@@ -1,9 +1,9 @@
 ---
 title: Choose an optimizer
-description: nanoPLM ships AdamW and four Muon-family optimizers. Switching to Muon means installing dion, thinking about two learning rates, and avoiding one out-of-the-box failure.
+description: nanoPLM ships AdamW and four Muon-family optimizers. Switching to Muon means thinking about two learning rates, and avoiding one out-of-the-box failure.
 ---
 
-`pretrain.yaml` ships `optimizer: adamw`, and AdamW is a defensible choice for every run you will ever do. The reason to read this page is that the Muon family is not a drop-in swap: it needs a package that is not installed, it introduces a *second* learning rate, and one of its four variants fails on the first step unless you change a model key.
+`pretrain.yaml` ships `optimizer: adamw`, and AdamW is a defensible choice for every run you will ever do. The reason to read this page is that the Muon family is not a drop-in swap: it introduces a *second* learning rate, and one of its four variants fails on the first step unless you change a model key.
 
 ```yaml title="pretrain.yaml"
 pretraining:
@@ -19,22 +19,22 @@ pretraining:
 | `muonh` | Muon with a per-matrix hyperball constraint. **See the caution below.** |
 | `aurora` | Hyperball variant with the `muonh_scope` control. |
 
-`adamw` and `stable_adamw` need nothing extra. The four Muon-family values do.
+`adamw` and `stable_adamw` need nothing beyond the base package. The four Muon-family values need
+Microsoft's **dion** package, which `nanoplm deps install` already pins into the environment (see
+[Install](/nanoplm/start/install/)).
 
-## Install dion for the Muon family
-
-`muon`, `normuon`, `muonh`, and `aurora` are provided by Microsoft's **dion** package, which nanoPLM does **not** declare as a dependency.
+If you skipped the deps installer, or your env is incomplete, the run fails with
+`Optimizer 'muon' requires the 'dion' package which is not installed.` Re-run:
 
 ```bash
-pip install git+https://github.com/microsoft/dion.git
-```
-
-```
-Successfully installed dion-0.1.0
+nanoplm deps install
+nanoplm deps verify
 ```
 
 :::caution
-When dion is missing, nanoPLM raises `Optimizer 'muon' requires the 'dion' package which is not installed. Install it with: pip install nanoplm[cuda]`. **That instruction is wrong**: there is no `cuda` extra. Install from the GitHub URL above.
+Older error text still suggests `pip install nanoplm[cuda]`. **There is no `cuda` extra.** The
+supported fix is `nanoplm deps install`, which installs the pinned dion commit along with the rest
+of the hard GPU stack.
 :::
 
 ## Think in two learning rates

@@ -58,31 +58,22 @@ identical.
 ## Quickstart
 
 ```bash
-pip install nanoplm
+uv venv && source .venv/bin/activate
+uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \
+    --extra-index-url https://download.pytorch.org/whl/cu130
+nanoplm deps install
 
 nanoplm data get-yaml && nanoplm data from-yaml
 nanoplm pretrain get-yaml && nanoplm pretrain from-yaml --pure-torch
+# optional: uv pip install -e ".[eval]"   (or the GitHub form)
 nanoplm eval get-yaml && nanoplm eval from-yaml
 ```
+
+Full install details (clusters, verify, the `eval` extra): [Install](/nanoplm/start/install/).
 
 The defaults are wired to chain: `data.yaml` writes shards to `output/data/pretrain_data/`, which
 is exactly where `pretrain.yaml` looks for them. The one value the defaults cannot guess is
 `eval.checkpoint_dir`: open `eval.yaml` and point it at the run you trained above.
-
-Success looks like this:
-
-```bash
-nanoplm data from-yaml
-# Running dvc repro (full pipeline)...
-# ...
-# Pretraining data pipeline complete.
-#
-#   Source:          https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz
-#   Total sequences: 20000
-#     Train:         18000
-#     Val:           2000
-#   Manifest:        /work/output/data/pretrain_data/.data_manifest
-```
 
 :::note
 `--pure-torch` is not optional. Pretraining requires you to pick a backend (`--pure-torch` or
