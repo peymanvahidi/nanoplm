@@ -1,0 +1,140 @@
+# .github/workflows/docs.yml
+#
+# Builds the documentation site in website/ and publishes it to GitHub Pages at
+# https://peymanvahidi.github.io/nanoplm/.
+#
+# One-time maintainer setup (manual, not automatable): in the GitHub repo,
+# Settings -> Pages -> Source, select "GitHub Actions". Required once before the
+# first deploy ever succeeds.
+#
+# No `paths:` filter, deliberately. The reference tables are generated from the
+# config dataclasses, so the set of files that can change the published site is
+# roughly "src/nanoplm plus tools/schema_gen plus website". A hand-maintained
+# mirror of the generator's input set is a liability rather than a saving: add an
+# input to the generator, forget to add it here, and the drift gate below quietly
+# stops running for that file. The schema job is stdlib + PyYAML and takes
+# seconds, and it is the only place in CI that runs pytest at all, so it runs on
+# everything.
+name: docs
+
+on:
+  push:
+    branches: [master, feat/docs]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default; only `deploy` widens it. This matters because the
+# build job runs `npm ci` over the site's full transitive dependency tree, and
+# should not hold a token that can publish to the live site.
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The doc-drift firewall. The reference tables on the site are generated from the
+  # `get-yaml` templates and config dataclasses, so this job proves the committed
+  # schema still matches the code. If it fails, the fix is always the same: run
+  # `python -m tools.schema_gen.generate` and commit the result.
+  schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml pytest
+
+      - name: Schema parity gate
+        # --noconftest: the repo-root tests/conftest.py imports torch + nanoplm at
+        # module level, but the docs_schema suite is pure stdlib + PyYAML and uses no
+        # conftest fixtures. Skipping it keeps this job torch-free, which is the whole
+        # point of the static, no-import generator. pythonpath still applies (it comes
+        # from pyproject.toml's [tool.pytest.ini_options], not from conftest).
+        run: python -m pytest tests/docs_schema -q --noconftest
+
+      - name: Regenerate schema and fail on drift
+        # `git status --porcelain`, not `git diff --exit-code`: diff only reports
+        # files git already tracks, so a schema file the generator emits for the
+        # first time (a new surface, say) lands as untracked and slips through.
+        # status reports modified and untracked alike. The diff is still printed,
+        # since it is what actually tells you what drifted.
+        run: |
+          python -m tools.schema_gen.generate
+          if [ -n "$(git status --porcelain website/src/generated)" ]; then
+            git status --porcelain website/src/generated
+            git diff -- website/src/generated
+            echo "::error::Generated schema is stale. Run 'python -m tools.schema_gen.generate' and commit website/src/generated."
+            exit 1
+          fi
+
+  build:
+    needs: schema
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      # `npm ci` (not `install`) so the build is reproducible and a package.json
+      # edited without regenerating the lockfile fails loudly instead of drifting.
+      - run: npm ci
+      - run: npm run test
+      - run: npm run build
+
+      # Internal (offline) broken-link check.
+      #
+      # Base-path staging: the site is served under /nanoplm, so the built HTML
+      # contains absolute hrefs like /nanoplm/reference/data/. Astro does NOT nest
+      # dist under the base path — that page is on disk at
+      # website/dist/reference/data/index.html. Copying dist into _linkcheck/nanoplm/
+      # and pointing --root-dir at _linkcheck makes /nanoplm/... resolve to a real file.
+      #
+      # --offline skips external URLs; only local links are checked. working-directory
+      # is overridden here because the paths below are repo-root-relative.
+      - name: Stage site for base-path link check
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p _linkcheck/nanoplm
+          cp -r website/dist/. _linkcheck/nanoplm/
+
+      - name: Internal link check
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >-
+            --offline
+            --root-dir "$GITHUB_WORKSPACE/_linkcheck"
+            "_linkcheck/nanoplm/**/*.html"
+          fail: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/dist
+
+  # Publish only from master. PRs and feature-branch pushes build and link-check but
+  # never touch the live site.
+  deploy:
+    if: github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow-level block outright rather than
+    # merging with it, so `contents` is restated here. deploy-pages is the only
+    # step in the workflow that needs pages/id-token; upload-pages-artifact in the
+    # build job is a plain artifact upload and needs neither.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

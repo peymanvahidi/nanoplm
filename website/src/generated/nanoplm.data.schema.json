@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-nanoplm-surface": "data",
+  "type": "object",
+  "properties": {
+    "data_dirs": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "type": "string",
+          "default": "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+        },
+        "local_fasta": {
+          "type": "null",
+          "default": null,
+          "description": "optional local .fasta or .fasta.gz file (skips network download)"
+        },
+        "compressed_fasta": {
+          "type": "string",
+          "default": "output/data/raw/uniref50.fasta.gz",
+          "description": "unused if source is a plain .fasta (URL or local_fasta)"
+        },
+        "extracted_fasta": {
+          "type": "string",
+          "default": "output/data/raw/uniref50.fasta"
+        },
+        "validation_dir": {
+          "type": "string",
+          "default": "output/data/validation"
+        },
+        "shuffled_fasta": {
+          "type": "string",
+          "default": "output/data/raw/uniref50_shuffled.fasta"
+        },
+        "filtered_fasta": {
+          "type": "string",
+          "default": "output/data/filter/uniref50_filtered.fasta"
+        },
+        "splitted_fasta_dir": {
+          "type": "string",
+          "default": "output/data/split"
+        },
+        "output_dir": {
+          "type": "string",
+          "default": "output/data/pretrain_data"
+        }
+      }
+    },
+    "data_params": {
+      "type": "object",
+      "properties": {
+        "seqs_num": {
+          "type": "integer",
+          "default": 20000,
+          "description": "FASTA pipeline"
+        },
+        "min_seq_len": {
+          "type": "integer",
+          "default": 20
+        },
+        "max_seq_len": {
+          "type": "integer",
+          "default": 512
+        },
+        "val_ratio": {
+          "type": "number",
+          "default": 0.1
+        },
+        "shuffle": {
+          "type": "boolean",
+          "default": true
+        },
+        "shuffle_seed": {
+          "type": "integer",
+          "default": 24
+        },
+        "drop_invalid_sequences": {
+          "type": "boolean",
+          "default": false
+        },
+        "samples_per_shard": {
+          "type": "integer",
+          "default": 2000,
+          "description": "Shard generation"
+        },
+        "max_workers": {
+          "type": "integer",
+          "default": 2
+        },
+        "register_tokens": {
+          "type": "integer",
+          "default": 0
+        }
+      }
+    }
+  }
+}

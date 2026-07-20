@@ -10,6 +10,9 @@
 [![License](https://img.shields.io/github/license/peymanvahidi/nanoplm?style=plastic&color=orange&logo=github&label=License)](./LICENSE)
 [![PyPI Version](https://img.shields.io/pypi/v/nanoplm?style=plastic&color=4b8bbe&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/nanoplm/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=plastic)](https://github.com/psf/black)
+[![Docs](https://img.shields.io/badge/docs-nanoPLM-14b8a6?style=plastic&logo=readthedocs&logoColor=white)](https://peymanvahidi.github.io/nanoplm/)
+
+### 📖 [Read the documentation →](https://peymanvahidi.github.io/nanoplm/)
 
 <p>🚀 Ship a protein language model easier and faster. nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a simple YAML files to control everything.</p>
 
@@ -70,7 +73,7 @@ uv pip install biotrainer
 nanoplm data get-yaml
 ```
 
->You'll get a `data.yaml` and a `dvc.yaml`. Just edit the `data.yaml` if you want.
+>You'll get [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) and a dvc.yaml files. Just edit the params.yaml if you want.
 
 > We're using DVC under the hood, so you can track your data version.
 
@@ -94,7 +97,14 @@ Like: `nanoplm data from-yaml <path/to/data.yaml>`
 nanoplm pretrain get-yaml
 ```
 
-> This writes a `pretrain.yaml` to your current directory.
+> This writes [pretrain.yaml](https://peymanvahidi.github.io/nanoplm/reference/pretrain/) to your current directory.
+
+```bash
+nanoplm distill get-yaml
+```
+
+> This writes `distill.yaml` to your current directory. The distillation pipeline is
+> [unmaintained](https://peymanvahidi.github.io/nanoplm/distillation/) — use pretraining instead.
 
 ### 4. Start your pretraining
 
@@ -102,22 +112,29 @@ nanoplm pretrain get-yaml
 nanoplm pretrain from-yaml
 ```
 
+The stock `pretrain.yaml` sets `pure_torch: true`, so no backend flag is needed. For Transformer Engine, set `pure_te: true` and turn off pure-torch — see [Choose a backend](https://peymanvahidi.github.io/nanoplm/guides/backends/).
+
 ---
 
 ## Configuration
 
-Every stage is driven by a YAML file: generate it with `get-yaml`, edit it, then hand it back with `from-yaml`. Each generated file carries an inline comment on every field, so the file you get *is* the reference.
+Everything is controlled by three YAML files. Scaffold one, edit it, run it:
 
-| File | Generate with | Configures |
-| --- | --- | --- |
-| `data.yaml` | `nanoplm data get-yaml` | source FASTA, filtering, shuffling, train/val split, pretraining shard generation |
-| `pretrain.yaml` | `nanoplm pretrain get-yaml` | model architecture, MLM objective, optimizer and LR schedule, precision, packing, multi-GPU, resume |
-| `eval.yaml` | `nanoplm eval get-yaml` | downstream benchmarks for a trained checkpoint (needs the [benchmarking extra](#benchmarking-extra)) |
+| Stage | Scaffold | Run | Reference |
+|---|---|---|---|
+| Data | `nanoplm data get-yaml` | `nanoplm data from-yaml` | [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) |
+| Pretraining | `nanoplm pretrain get-yaml` | `nanoplm pretrain from-yaml` | [pretrain.yaml](https://peymanvahidi.github.io/nanoplm/reference/pretrain/) |
+| Evaluation | `nanoplm eval get-yaml` | `nanoplm eval from-yaml` | [eval.yaml](https://peymanvahidi.github.io/nanoplm/reference/eval/) |
 
-`nanoplm data get-yaml` also writes a `dvc.yaml` alongside the config, so the data
-stages stay version-tracked.
+The reference tables are generated directly from the `get-yaml` templates and the config
+dataclasses, and CI fails if they drift — so they cannot go stale the way a hand-written
+README section can.
 
-Tip: Paths are resolved relative to where you run the command (not where the YAML lives).
+**Start here:** [How the pipeline fits together](https://peymanvahidi.github.io/nanoplm/pipeline/)
+· [Your first PLM](https://peymanvahidi.github.io/nanoplm/start/first-plm/)
+· [Troubleshooting](https://peymanvahidi.github.io/nanoplm/troubleshooting/)
+
+Paths inside a config are resolved relative to the config file's directory.
 
 ---
 

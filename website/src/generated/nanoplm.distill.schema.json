@@ -1,0 +1,507 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-nanoplm-surface": "distill",
+  "type": "object",
+  "properties": {
+    "model": {
+      "type": "object",
+      "properties": {
+        "hidden_size": {
+          "type": "integer",
+          "default": 512,
+          "description": "Core architecture"
+        },
+        "intermediate_size": {
+          "type": "integer",
+          "default": 1024
+        },
+        "num_hidden_layers": {
+          "type": "integer",
+          "default": 6
+        },
+        "num_attention_heads": {
+          "type": "integer",
+          "default": 8
+        },
+        "num_kv_heads": {
+          "type": "null",
+          "default": null,
+          "description": "GQA: set < num_attention_heads to enable; null = MHA"
+        },
+        "mlp_activation": {
+          "type": "string",
+          "default": "swiglu",
+          "enum": [
+            "swiglu",
+            "glu",
+            "srelu"
+          ]
+        },
+        "mlp_dropout": {
+          "type": "number",
+          "default": 0.0
+        },
+        "mlp_bias": {
+          "type": "boolean",
+          "default": false
+        },
+        "no_mlp_on_first_layer": {
+          "type": "boolean",
+          "default": true
+        },
+        "attention_bias": {
+          "type": "boolean",
+          "default": false
+        },
+        "attention_dropout": {
+          "type": "number",
+          "default": 0.0
+        },
+        "classifier_activation": {
+          "type": "string",
+          "default": "gelu",
+          "enum": [
+            "relu",
+            "gelu",
+            "srelu"
+          ]
+        },
+        "projection_layer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Set to false if student hidden_size matches teacher (1024)"
+        },
+        "use_canon_layers": {
+          "type": "boolean",
+          "default": false,
+          "description": "Advanced architecture features (pure-torch Triton-fused kernels) Canon depthwise-conv token-mixing layers",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true
+        },
+        "canon_layers_mode": {
+          "type": "string",
+          "default": "abcd",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-visible-when": {
+            "field": "use_canon_layers",
+            "op": "==",
+            "value": true
+          }
+        },
+        "use_mhc_lite": {
+          "type": "boolean",
+          "default": false,
+          "description": "mHC-lite multi-stream residual mixing",
+          "x-nanoplm-backend": [
+            "pure_torch",
+            "pure_te"
+          ],
+          "x-nanoplm-advanced": true
+        },
+        "mhc_n_streams": {
+          "type": "integer",
+          "default": 4,
+          "x-nanoplm-visible-when": {
+            "field": "use_mhc_lite",
+            "op": "==",
+            "value": true
+          }
+        },
+        "mhc_triton_fused": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-visible-when": {
+            "field": "use_mhc_lite",
+            "op": "==",
+            "value": true
+          }
+        },
+        "mhc_lite_wrapping_level": {
+          "type": "string",
+          "default": "layer",
+          "enum": [
+            "layer",
+            "sublayers"
+          ],
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-visible-when": {
+            "field": "use_mhc_lite",
+            "op": "==",
+            "value": true
+          }
+        },
+        "use_diff_attn_v2": {
+          "type": "boolean",
+          "default": false,
+          "description": "Differential Attention V2",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true
+        },
+        "use_repo": {
+          "type": "boolean",
+          "default": false,
+          "description": "Residual Proportional Output",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true
+        },
+        "use_resid_lambdas": {
+          "type": "boolean",
+          "default": false
+        },
+        "use_x0_lambdas": {
+          "type": "boolean",
+          "default": false
+        },
+        "use_qk_norm": {
+          "type": "boolean",
+          "default": false
+        },
+        "activation_checkpointing": {
+          "type": "boolean",
+          "default": false
+        },
+        "activation_checkpointing_mode": {
+          "type": "string",
+          "default": "layer",
+          "enum": [
+            "layer",
+            "attn",
+            "attn+mlp"
+          ]
+        }
+      }
+    },
+    "distillation": {
+      "type": "object",
+      "properties": {
+        "dataset_dir": {
+          "type": "string",
+          "default": "output/data/distillation_data",
+          "description": "Dataset directory (contains .data_manifest from nanoplm data from-yaml) Note: paths are RELATIVE to where you RUN the command, NOT the YAML file."
+        },
+        "ckp_dir": {
+          "type": "string",
+          "default": "output/distillation_checkpoints",
+          "description": "Output checkpoint path"
+        },
+        "num_epochs": {
+          "type": "integer",
+          "default": 10,
+          "description": "Training hyperparameters"
+        },
+        "batch_size": {
+          "type": "integer",
+          "default": 64
+        },
+        "learning_rate": {
+          "type": "number",
+          "default": 0.001,
+          "description": "used only when optimizer: adamw"
+        },
+        "gradient_accumulation_steps": {
+          "type": "integer",
+          "default": 1
+        },
+        "warmup_ratio": {
+          "type": "number",
+          "default": 0.05
+        },
+        "max_grad_norm": {
+          "type": "number",
+          "default": ".inf",
+          "description": "gradient clipping L2 norm (.inf = disabled)"
+        },
+        "optimizer": {
+          "type": "string",
+          "default": "adamw",
+          "enum": [
+            "adamw",
+            "muon",
+            "normuon"
+          ],
+          "description": "Optimizer: adamw | muon | normuon muon/normuon routes 2-D matrices through Dion Muon/NorMuon and biases/embeddings through fused AdamW (same as pretraining)."
+        },
+        "muon_learning_rate": {
+          "type": "number",
+          "default": 0.001
+        },
+        "muon_weight_decay": {
+          "type": "number",
+          "default": 0.01
+        },
+        "muon_cautious_weight_decay": {
+          "type": "boolean",
+          "default": true
+        },
+        "muon_use_polar_express": {
+          "type": "boolean",
+          "default": true
+        },
+        "muon_momentum": {
+          "type": "number",
+          "default": 0.95
+        },
+        "muon_nesterov": {
+          "type": "boolean",
+          "default": true
+        },
+        "muon_eps": {
+          "type": "number",
+          "default": 1e-07
+        },
+        "adam_learning_rate": {
+          "type": "number",
+          "default": 0.0001
+        },
+        "adam_weight_decay": {
+          "type": "number",
+          "default": 0.0
+        },
+        "lr_scheduler": {
+          "type": "string",
+          "default": "cosine",
+          "enum": [
+            "cosine",
+            "linear",
+            "polynomial",
+            "constant"
+          ],
+          "description": "LR scheduler cosine, linear, polynomial, constant"
+        },
+        "lr_scheduler_kwargs": {
+          "type": "object",
+          "default": {}
+        },
+        "max_open_files": {
+          "type": "integer",
+          "default": 5,
+          "description": "Data loader optimization"
+        },
+        "chunk_size": {
+          "type": "integer",
+          "default": 32
+        },
+        "prefetch_batches": {
+          "type": "integer",
+          "default": 2
+        },
+        "use_threading": {
+          "type": "boolean",
+          "default": true
+        },
+        "num_workers": {
+          "type": "integer",
+          "default": 4
+        },
+        "project_name": {
+          "type": "string",
+          "default": "nanoplm-distillation",
+          "description": "Checkpointing"
+        },
+        "logging_steps": {
+          "type": "integer",
+          "default": 10
+        },
+        "eval_steps": {
+          "type": "integer",
+          "default": 50
+        },
+        "save_steps": {
+          "type": "integer",
+          "default": 100
+        },
+        "bf16": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mixed precision training (recommended: keep enabled for 1.5-3x speedup) When bf16 is true, automatically selects the best precision for your hardware: - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32 - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated) - CPU: fp32 (no mixed precision)"
+        },
+        "tf32": {
+          "type": "boolean",
+          "default": true,
+          "description": "TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)"
+        },
+        "use_compile": {
+          "type": "boolean",
+          "default": false,
+          "description": "torch.compile (requires CUDA)"
+        },
+        "use_compile_max_autotune": {
+          "type": "boolean",
+          "default": false,
+          "description": "slower warmup, faster steady-state"
+        },
+        "compile_triton_persistent_reductions": {
+          "type": "boolean",
+          "default": false
+        },
+        "compile_triton_mix_order_reduction": {
+          "type": "boolean",
+          "default": false
+        },
+        "multi_gpu": {
+          "type": "boolean",
+          "default": false,
+          "description": "Distributed training"
+        },
+        "world_size": {
+          "type": "integer",
+          "default": 1
+        },
+        "distributed_mode": {
+          "type": "string",
+          "default": "ddp",
+          "description": "ddp | fsdp (FSDP2 with bf16/fp32 mixed)"
+        },
+        "fsdp_shard_granularity": {
+          "type": "string",
+          "default": "layer",
+          "description": "layer | sublayer"
+        },
+        "seed": {
+          "type": "integer",
+          "default": 42
+        },
+        "profiler_enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Profiling (rank-0 only; writes Chrome trace or Nsight profile)"
+        },
+        "profiler_start_step": {
+          "type": "integer",
+          "default": 10
+        },
+        "profiler_end_step": {
+          "type": "integer",
+          "default": 15
+        },
+        "adam_beta1": {
+          "type": "number",
+          "default": 0.9,
+          "description": "AdamW beta1 (first-moment decay). Used by the AdamW optimizer, and by the AdamW sub-optimizer that handles 1-D / embedding params when optimizer is muon or normuon.",
+          "x-nanoplm-advanced": true
+        },
+        "adam_beta2": {
+          "type": "number",
+          "default": 0.999,
+          "description": "AdamW beta2 (second-moment decay). Used by the AdamW optimizer, and by the AdamW sub-optimizer that handles 1-D / embedding params when optimizer is muon or normuon.",
+          "x-nanoplm-advanced": true
+        },
+        "adam_epsilon": {
+          "type": "number",
+          "default": 1e-08,
+          "description": "AdamW epsilon (denominator stability term). Used by the AdamW optimizer, and by the AdamW sub-optimizer that handles 1-D / embedding params when optimizer is muon or normuon.",
+          "x-nanoplm-advanced": true
+        }
+      }
+    },
+    "resume": {
+      "type": "object",
+      "properties": {
+        "is_resume": {
+          "type": "boolean",
+          "default": false,
+          "description": "Set is_resume: true to resume training from a checkpoint When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir resume_epochs: 0 (or unset) continues to the original 'distillation.num_epochs'. N>0 trains for exactly N more epochs from the checkpoint (i.e., final num_epochs = checkpoint_epoch + N)."
+        },
+        "checkpoint_dir": {
+          "type": "string",
+          "default": "output/distillation/run-1/checkpoint-1"
+        },
+        "resume_epochs": {
+          "type": "integer",
+          "default": 0
+        }
+      }
+    }
+  },
+  "x-nanoplm-compat": {
+    "trigger": "recycling_loop_count > 1",
+    "feature": "huggin_style_recycling",
+    "model_reject": [
+      {
+        "flag": "use_moe",
+        "reason": "MoE per-layer state (last_expert_counts, last_aux_loss) is overwritten on every recurrent iteration; only the last iteration's routing decisions would reach the pipeline's expert-bias correction. Disable use_moe or recycling_loop_count > 1.",
+        "condition": ""
+      },
+      {
+        "flag": "use_x0_lambdas",
+        "reason": "x0 captured once before the loop; per-physical-layer rescaling re-applied every recurrent iteration has unvalidated semantics.",
+        "condition": ""
+      },
+      {
+        "flag": "use_resid_lambdas",
+        "reason": "Per-physical-layer residual scaling re-applied every iteration has unvalidated semantics; likely interacts with adapter + noise s_0.",
+        "condition": ""
+      },
+      {
+        "flag": "use_mhc_lite",
+        "reason": "mHC-lite multi-stream residual mixing has its own stability guarantees (doubly-stochastic mixing); interaction with the recycled residual stream is untested.",
+        "condition": ""
+      }
+    ],
+    "model_warn": [
+      {
+        "flag": "use_repo",
+        "message": "RePO will re-predict per-head positions every recurrent iteration. This hasn't been ablated; consider setting repo_after_n_layers >= recycling_num_prelude_layers + (num_hidden_layers - recycling_num_prelude_layers - recycling_num_coda_layers) so RePO stays in the coda.",
+        "condition": "repo_after_n_layers falls inside the recurrent block region"
+      }
+    ],
+    "model_allow": [
+      "use_qk_norm",
+      "use_canon_layers",
+      "use_noble",
+      "use_diff_attn_v2",
+      "use_paired_head_attention",
+      "use_prores",
+      "fused_qkv",
+      "fused_up_gate",
+      "wo_init",
+      "activation_checkpointing",
+      "attn_layer_pattern"
+    ],
+    "pipeline_reject": [
+      {
+        "flag": "pure_te",
+        "reason": "te_pipeline.py is out of scope for the v1 recycling implementation. Use pure_torch.",
+        "condition": "pure_te is True"
+      },
+      {
+        "flag": "pure_torch",
+        "reason": "Recycling lands only in pure_pipeline.py for v1; the HF path is out of scope.",
+        "condition": "pure_torch is False"
+      }
+    ],
+    "pipeline_caveat": [
+      {
+        "flag": "fp8",
+        "message": "fp8 + truncated BPTT gradient correctness is not validated. Disable unless you have a specific reason.",
+        "condition": "fp8 is True"
+      },
+      {
+        "flag": "use_compile_max_autotune",
+        "message": "Recycled forward must compile the recurrent STEP, not unroll the loop. Enabling compile triggers an additional smoke test.",
+        "condition": "use_compile_max_autotune is True"
+      }
+    ],
+    "pipeline_allow": [
+      "distributed_mode",
+      "bf16",
+      "tf32",
+      "multi_gpu",
+      "lr_schedule",
+      "global_batch_warmup_steps",
+      "activation_checkpointing"
+    ]
+  }
+}

@@ -6,9 +6,9 @@ from nanoplm.cli.data import data
 
 def test_fix_flag_flips_drop_invalid_in_config(tmp_path, monkeypatch):
     """from-yaml --fix should set drop_invalid_sequences=true in data.yaml."""
-    from nanoplm.cli._templates import PRETRAIN_DATA_YAML
+    from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
-    cfg.write_text(PRETRAIN_DATA_YAML)
+    cfg.write_text(load_template("data_pretrain"))
     # Stub dvc — return object must expose .returncode AND .stdout (used by is_git_subdir)
     monkeypatch.setattr("subprocess.run",
                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())

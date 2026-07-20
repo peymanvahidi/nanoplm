@@ -22,9 +22,10 @@ class TestGetYamlTemplate:
         assert p["decay_tokens"] == 1_000_000
         assert p["decay_shape"] == "1-sqrt"
         assert p["lr_decay_to_fraction"] == 0.1
-        assert p["micro_batch_seqs"] == 64
-        assert p["global_batch_tokens"] == 256000
+        assert p["micro_batch_seqs"] == 128
+        assert p["global_batch_tokens"] == 1_024_000
         assert p["global_batch_warmup_steps"] == 0
+        assert p["optimizer"] == "normuon"
         # advanced/alternative fields must stay COMMENTED (absent as active keys)
         for k in ("train_tokens", "stable_steps", "decay_steps", "max_steps"):
             assert k not in p, f"{k} should remain a commented alternative, not active"

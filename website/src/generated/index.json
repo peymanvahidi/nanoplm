@@ -1,0 +1,20 @@
+{
+  "surfaces": [
+    {
+      "surface": "data",
+      "file": "nanoplm.data.schema.json"
+    },
+    {
+      "surface": "pretrain",
+      "file": "nanoplm.pretrain.schema.json"
+    },
+    {
+      "surface": "distill",
+      "file": "nanoplm.distill.schema.json"
+    },
+    {
+      "surface": "eval",
+      "file": "nanoplm.eval.schema.json"
+    }
+  ]
+}

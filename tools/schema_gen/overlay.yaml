@@ -1,0 +1,259 @@
+# tools/schema_gen/overlay.yaml
+# Hand-authored annotations the default literals cannot express.
+#
+# Two namespaces live in this file:
+#
+#  1. Flat field annotations, keyed "<section>.<field>". Any of:
+#     enum, minimum, maximum, backend, advanced, auto_computed, type.
+#     Every enum below is transcribed from the authoritative validator: the
+#     `click.Choice(...)` in src/nanoplm/cli/*.py and/or the dataclass
+#     `__post_init__` check. Never from prose.
+#
+#  2. The reserved top-level key `x-extra-fields` (bottom of this file): real
+#     user-settable config fields the get-yaml templates ship COMMENTED OUT, so
+#     the template parser cannot see them. It is NOT a "<section>.<field>"
+#     annotation; see the block comment above it.
+
+# ---------------------------------------------------------------- pretraining
+# click.Choice --optimizer
+pretraining.optimizer:
+  enum: [adamw, stable_adamw, muon, normuon, muonh, aurora]
+# click.Choice --lr-schedule + _validate_duration_config's `valid` set
+pretraining.lr_schedule:
+  enum: [wsd, warmup_stable, cosine, linear]
+# _normalize_distributed_mode -> {fsdp, hsdp, ddp}
+pretraining.distributed_mode:
+  enum: [fsdp, hsdp, ddp]
+pretraining.fsdp_shard_granularity:
+  enum: [layer, sublayer]
+# click.Choice --decay-shape
+pretraining.decay_shape:
+  enum: ["1-sqrt", linear]
+# click.Choice --muonh-normalization
+pretraining.muonh_normalization:
+  enum: [neuron, short_axis, "none"]
+# PretrainingConfig.__post_init__ -> {all, mlp}
+pretraining.muonh_scope:
+  enum: [all, mlp]
+# click.Choice --mlm-masking-strategy + __post_init__ -> {token, span}
+pretraining.mlm_masking_strategy:
+  enum: [token, span]
+
+# FP8, Transformer-Engine-only knobs (recipe/format/amax are TE constructs).
+pretraining.fp8_recipe:
+  enum: [delayed, current, block, mxfp8, nvfp4]
+  backend: [pure_te]
+pretraining.fp8_format:
+  enum: [hybrid, e4m3]
+  backend: [pure_te]
+pretraining.fp8_amax_history_len: { backend: [pure_te], advanced: true }
+pretraining.fp8_reduce_amax: { backend: [pure_te], advanced: true }
+# FP8, pure-torch-only knobs. fp8_target gets NO enum on purpose: any
+# COMBINATION of mlp / attn_wqkv / attn_wo is legal (_normalize_fp8_targets),
+# so a closed value list would be a lie.
+pretraining.fp8_target: { backend: [pure_torch] }
+pretraining.fp8_skip_last_n_layers: { backend: [pure_torch] }
+pretraining.fp8_cpu_activation_offload: { backend: [pure_torch], advanced: true }
+pretraining.fp8_cpu_activation_offload_layers: { backend: [pure_torch], advanced: true }
+pretraining.fp8_cpu_activation_offload_retain_buffers: { backend: [pure_torch], advanced: true }
+
+# torch.compile / TorchInductor knobs: pure-torch pipeline only.
+pretraining.use_compile_max_autotune: { backend: [pure_torch], advanced: true }
+pretraining.compile_triton_persistent_reductions: { backend: [pure_torch], advanced: true }
+pretraining.compile_triton_mix_order_reduction: { backend: [pure_torch], advanced: true }
+
+# Layerwise debug hooks are explicitly rejected under pure_te
+# (_validate_debug_layerwise_metrics_compat).
+pretraining.debug_layerwise_metrics: { backend: [pure_torch], advanced: true }
+pretraining.debug_layerwise_log_every: { backend: [pure_torch], advanced: true }
+
+# RePO exists only on the pure-torch path.
+pretraining.repo_rope_warmup_steps: { backend: [pure_torch], advanced: true }
+
+# Huginn-style recycling: pure-torch only (both ProtModernBertMLM and
+# TEProtModernBertMLM reject recycling_loop_count > 1). Enums come from
+# pretraining/recycling/scheduler.py's validators.
+pretraining.recycling_bptt: { backend: [pure_torch], advanced: true }
+pretraining.recycling_loop_count_sampling:
+  enum: [fixed, lognormal_poisson]
+  backend: [pure_torch]
+  advanced: true
+pretraining.recycling_loop_count_sigma: { backend: [pure_torch], advanced: true }
+pretraining.recycling_loop_count_curriculum:
+  enum: ["none", linear, "1_sqrt"]
+  backend: [pure_torch]
+  advanced: true
+pretraining.recycling_loop_count_curriculum_steps: { backend: [pure_torch], advanced: true }
+pretraining.recycling_pretraining_eval_loop_counts: { backend: [pure_torch], advanced: true }
+
+# NOBLE LR scaling: only meaningful with model.use_noble, which is pure-torch only.
+pretraining.noble_base_lr: { backend: [pure_torch], advanced: true }
+pretraining.noble_lr_gamma: { backend: [pure_torch], advanced: true }
+pretraining.noble_lr_gamma_M: { backend: [pure_torch], advanced: true }
+pretraining.noble_freq_lr_mult: { backend: [pure_torch], advanced: true }
+pretraining.noble_phase_lr_mult: { backend: [pure_torch], advanced: true }
+
+# auto-computed / not user-facing (documented as such, excluded from form):
+pretraining.world_size: { auto_computed: false }   # 'auto' allowed, keep visible
+
+# --------------------------------------------------------------------- resume
+# click.Choice --resume-mode + _validate_resume_config_modes
+resume.mode:
+  enum: [continue, decay]
+# _load_resume_config's decay_shape check
+resume.decay_shape:
+  enum: ["1-sqrt", linear]
+
+# ---------------------------------------------------------------------- model
+model.norm_type:
+  enum: [layernorm, rmsnorm]
+model.classifier_activation:
+  enum: [relu, gelu, srelu]
+model.mlp_activation:
+  enum: [swiglu, glu, srelu]
+# ModernBertConfig.__post_init__ / click.Choice --wo-init
+model.wo_init:
+  enum: [kaiming, zero]
+# click.Choice --activation-checkpointing-mode
+model.activation_checkpointing_mode:
+  enum: [layer, attn, attn+mlp]
+# _resolve_canon_kernel_size -> {3, 5, 7}
+model.canon_layers_kernel_size:
+  enum: [3, 5, 7]
+  backend: [pure_torch]
+  advanced: true
+model.canon_layers_mode: { backend: [pure_torch], advanced: true }
+model.use_canon_layers: { backend: [pure_torch], advanced: true }
+model.use_repo: { backend: [pure_torch], advanced: true }
+# mHC-lite itself runs on pure_torch AND pure_te; only pure_torch honors a
+# wrapping level other than "layer" (TEProtModernBertMLM rejects 'sublayers').
+model.use_mhc_lite: { backend: [pure_torch, pure_te], advanced: true }
+model.mhc_lite_wrapping_level:
+  enum: [layer, sublayers]
+  backend: [pure_torch]
+  advanced: true
+model.use_diff_attn_v2: { backend: [pure_torch], advanced: true }
+model.use_paired_head_attention: { backend: [pure_torch], advanced: true }
+model.use_noble: { backend: [pure_torch], advanced: true }
+# _NOBLE_TARGET_ROLES in models/modern_bert/config.py
+model.noble_targets:
+  enum: [all, attn, ffn, qkv, out]
+  backend: [pure_torch]
+  advanced: true
+model.use_moe: { backend: [pure_torch], advanced: true }
+model.recycling_loop_count: { backend: [pure_torch], advanced: true }
+
+# --------------------------------------------------------------- distillation
+distillation.optimizer:
+  enum: [adamw, muon, normuon]
+distillation.lr_scheduler:
+  enum: [cosine, linear, polynomial, constant]
+
+# ----------------------------------------------------------------------- eval
+eval.zero_shot_method:
+  enum: [masked_marginals, wt_marginals, pseudoperplexity]
+
+# =============================================================================
+# x-extra-fields: RESERVED KEY (not a "<section>.<field>" annotation).
+#
+# Real, user-settable config fields that the `get-yaml` templates deliberately
+# ship COMMENTED OUT, so templates.parse_fields() cannot see them. They cannot
+# just be uncommented upstream: each is mutually exclusive with its *_tokens
+# counterpart (setting both is a hard error in _validate_duration_config /
+# _validate_resume_config_modes), so an uncommented template would fail on
+# every generated config.
+#
+# They must still appear in the published reference: `train_tokens` is the ONLY
+# duration knob the warmup_stable / cosine / linear schedules accept, and the
+# *_steps fields are the only step-based alternative to the token budgets.
+# emit.build_surface() folds these into the named section's `properties` after
+# the template has been parsed.
+#
+# Shape:
+#   surface -> section -> field -> {type, default, description,
+#                                   advanced, backend, enum, minimum, maximum}
+#
+# `default: null` mirrors the dataclass (`Optional[int] = None`) and matches how
+# the eval dataclass surface already emits Optional fields: real type from the
+# annotation, JSON-null default.
+# =============================================================================
+x-extra-fields:
+  pretrain:
+    pretraining:
+      train_tokens:
+        type: integer
+        default: null
+        advanced: true
+        group: Duration + LR schedule
+        description: >-
+          Total token budget for the single-phase schedules (lr_schedule:
+          warmup_stable | cosine | linear), the only token budget those
+          schedules accept. Mutually exclusive with max_steps: set exactly one
+          of them, never both. Must NOT be combined with lr_schedule: wsd, which
+          takes stable_tokens/decay_tokens instead. Shipped commented out by
+          `nanoplm pretrain get-yaml` because that template defaults to wsd.
+      max_steps:
+        type: integer
+        default: null
+        advanced: true
+        group: Duration + LR schedule
+        description: >-
+          Step-based override for train_tokens (lr_schedule: warmup_stable |
+          cosine | linear): train for this many optimizer steps instead of for a
+          token budget. Set exactly one of train_tokens or max_steps, never
+          both; neither is valid with lr_schedule: wsd.
+      stable_steps:
+        type: integer
+        default: null
+        advanced: true
+        group: Duration + LR schedule
+        description: >-
+          Step-based override for stable_tokens (lr_schedule: wsd only): number
+          of optimizer steps up to the pre-decay checkpoint, warmup included.
+          Set exactly one of stable_tokens or stable_steps, never both.
+      decay_steps:
+        type: integer
+        default: null
+        advanced: true
+        group: Duration + LR schedule
+        description: >-
+          Step-based override for decay_tokens (lr_schedule: wsd only): number
+          of additional anneal optimizer steps after the stable phase. Set
+          exactly one of decay_tokens or decay_steps, never both.
+    resume:
+      decay_steps:
+        type: integer
+        default: null
+        advanced: true
+        group: "Decay-mode fields (omit / null for mode: continue)"
+        description: >-
+          (mode: decay) Step-based override for resume.decay_tokens: number of
+          additional anneal optimizer steps to run from the checkpoint. Set
+          exactly one of decay_tokens or decay_steps, never both. mode: continue
+          accepts no decay_* field at all.
+  distill:
+    distillation:
+      adam_beta1:
+        type: number
+        default: 0.9
+        advanced: true
+        description: >-
+          AdamW beta1 (first-moment decay). Used by the AdamW optimizer, and by
+          the AdamW sub-optimizer that handles 1-D / embedding params when
+          optimizer is muon or normuon.
+      adam_beta2:
+        type: number
+        default: 0.999
+        advanced: true
+        description: >-
+          AdamW beta2 (second-moment decay). Used by the AdamW optimizer, and by
+          the AdamW sub-optimizer that handles 1-D / embedding params when
+          optimizer is muon or normuon.
+      adam_epsilon:
+        type: number
+        default: 1.0e-8
+        advanced: true
+        description: >-
+          AdamW epsilon (denominator stability term). Used by the AdamW
+          optimizer, and by the AdamW sub-optimizer that handles 1-D / embedding
+          params when optimizer is muon or normuon.

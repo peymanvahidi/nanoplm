@@ -1,0 +1,241 @@
+---
+// website/src/components/ReferenceFields.astro
+// Renders one config surface (optionally one section of it) as a list of field
+// blocks, sourced from the generated JSON Schema via toRows(). Deliberately not a
+// table: a config reference is read by field, not compared down a column, and
+// enum/backend are present on well under a quarter of fields. As columns they
+// were ~85% em-dashes while the description got starved. Inline and conditional
+// instead, so the description gets the full content width at any viewport.
+// The distill surface is still generated (the parity gate keeps it honest), but it
+// is deliberately not rendered: distillation is unmaintained and gets one prose
+// page, not a config reference.
+import { toRows, toGroups, type Surface } from '../lib/schema';
+import data from '../generated/nanoplm.data.schema.json';
+import pretrain from '../generated/nanoplm.pretrain.schema.json';
+import evalSchema from '../generated/nanoplm.eval.schema.json';
+
+interface Props {
+  surface: 'data' | 'pretrain' | 'eval';
+  section?: string;
+}
+
+const { surface, section } = Astro.props;
+
+const SCHEMAS: Record<Props['surface'], Surface> = {
+  data: data as Surface,
+  pretrain: pretrain as Surface,
+  eval: evalSchema as Surface,
+};
+
+const rows = toRows(SCHEMAS[surface], section);
+// The template's `# ── Title ───` banners, carried through the generated schema.
+// A section runs to ~90 fields; the banners are how the tool itself breaks that
+// up, so the page reads in the same blocks as the file the reader is editing.
+const groups = toGroups(rows, SCHEMAS[surface], section);
+const prefix = section ? `${surface}-${section}` : surface;
+
+function fmtDefault(value: unknown): string {
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+---
+
+{/* `not-content` is Starlight's opt-out: every rule in its markdown.css excludes
+    `:where(.not-content *)`. Without it, `.sl-markdown-content X + Y { margin-top:
+    1rem }` hits every adjacent sibling pair in here, including 158 field blocks
+    and the <p>s inside them. Astro scopes styles with `:where(.astro-xxx)`, which
+    adds no specificity, so a plain `.ref-field` rule (0,1,0) silently loses to
+    that (0,1,2) selector. Opting out is the fix; it also means every margin and
+    the inline-code chip styling below are ours to set explicitly. */}
+<div class="ref-fields not-content">
+  {groups.map((g) => (<>
+  {g.title && (
+    <div class="ref-group">
+      {/* h4 under the page's `### model` etc. Remark cannot see these, so
+          lib/toc.ts adds them to the table of contents by hand; the id must stay
+          in sync with groupSlug(), which is why both call the same helper. */}
+      <h4 class="ref-group-title" id={g.slug}>{g.title}</h4>
+      {g.note && <p class="ref-group-note">{g.note}</p>}
+    </div>
+  )}
+  {g.rows.map((r) => (
+    <div id={`${prefix}-${r.key}`} class="ref-field">
+      <p class="ref-head">
+        <span class="ref-id">
+          <code class="ref-name">{r.key}</code>
+          {r.required && <span class="ref-req" title="required (no default)">*</span>}
+          {r.backend && <span class="ref-backend">{r.backend.join(', ')}</span>}
+        </span>
+        {/* Right-aligned so type and default line up down the page and can be
+            scanned as a column, without costing a real table column. */}
+        <span class="ref-meta">
+          <span class="ref-type">{r.type}</span>
+          {r.default !== undefined && (
+            <><span class="ref-sep">·</span><span class="ref-default">default <code>{fmtDefault(r.default)}</code></span></>
+          )}
+          {r.required && !('default' in r) && (
+            <><span class="ref-sep">·</span><span class="ref-req-word">required</span></>
+          )}
+        </span>
+      </p>
+      {r.enum && (
+        <p class="ref-enum">
+          <span class="ref-enum-label">one of</span>
+          {r.enum.map((v) => (
+            <code
+              class={String(v) === fmtDefault(r.default) ? 'ref-choice is-default' : 'ref-choice'}
+              title={String(v) === fmtDefault(r.default) ? 'default' : undefined}
+            >{String(v)}</code>
+          ))}
+        </p>
+      )}
+      {r.description && <p class="ref-desc">{r.description}</p>}
+    </div>
+  ))}
+  </>))}
+</div>
+
+<style>
+  .ref-fields { margin: 0.5rem 0 1.5rem; }
+
+  /* One hairline per field, drawn on top rather than as a bottom border, so the
+     rule under a group heading is the first field's and no stray line closes the
+     list. Margin stays at 0: the padding is the whole gap. */
+  .ref-field {
+    margin: 0;
+    border-top: 1px solid var(--sl-color-hairline-shade);
+    padding: 0.7rem 0 0.75rem;
+    /* Starlight's header is sticky; without this every deep link lands with the
+       field name tucked underneath it. */
+    scroll-margin-top: 5rem;
+  }
+
+  .ref-group { margin: 0; }
+
+  /* Deliberately NOT uppercased. These titles are the template's own words and
+     several carry meaning in their casing: `pure_torch`, `mHC-lite`, `MoE`,
+     `RePO`, `NOBLE`. text-transform would flatten all of that to noise.
+     No border either: the next field's .ref-body border-top lands directly
+     underneath and reads as the heading's rule. */
+  .ref-group-title {
+    margin: 2rem 0 0;
+    padding: 0 0 0.1rem;
+    font-size: 0.95rem;
+    font-weight: 600;
+    line-height: 1.4;
+    letter-spacing: 0.01em;
+    /* Starlight flips --sl-color-white per theme, so this is the
+       highest-contrast text colour in both light and dark. */
+    color: var(--sl-color-white);
+    /* Deep-linked from the table of contents, past the sticky header. */
+    scroll-margin-top: 5rem;
+  }
+  /* No leading gap when a block opens the list. */
+  .ref-group:first-child .ref-group-title { margin-top: 0.25rem; }
+
+  /* The template's own intro prose for the block. Sits between the heading and
+     the block's first field, exactly where it sits in the YAML file.
+
+     Rendered as the comment block it is: `pre-wrap` keeps the line breaks and
+     the monospace font keeps the alignment, because several of these notes are
+     ASCII layouts (the Precision hardware table, the Duration schedule tree)
+     that read as run-on sentences once the structure is lost. `pre-wrap` wraps
+     rather than overflows, so a long line never forces a horizontal scroll. */
+  .ref-group-note {
+    margin: 0.35rem 0 0.7rem;
+    white-space: pre-wrap;
+    font-family: var(--sl-font-mono);
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: var(--sl-color-gray-3);
+    border-inline-start: 2px solid var(--sl-color-hairline-shade);
+    padding-inline-start: 0.7rem;
+  }
+
+  /* Restated because `not-content` opts out of Starlight's inline-code styling;
+     keeps the chips looking like inline code everywhere else on the site. */
+  .ref-fields code {
+    background-color: var(--sl-color-bg-inline-code);
+    border: 1px solid var(--sl-color-hairline-shade);
+    border-radius: 0.25rem;
+    padding: 0.1em 0.35em;
+    font-family: var(--sl-font-mono);
+    font-size: var(--sl-text-code);
+  }
+
+  /* Head line: name on the left, type/default pinned right. Both halves wrap
+     internally, and on a narrow viewport the meta drops to its own line rather
+     than forcing a horizontal scroll. */
+  .ref-head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.15rem 1rem;
+    margin: 0;
+  }
+  .ref-id {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.4rem;
+    min-width: 0;
+  }
+  .ref-name { font-weight: 600; }
+  .ref-meta {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    color: var(--sl-color-gray-3);
+    /* Keeps type/default flush right even when the name is short. */
+    margin-inline-start: auto;
+  }
+  .ref-sep { color: var(--sl-color-gray-4); }
+  .ref-type { font-family: var(--sl-font-mono); }
+  .ref-req { color: var(--sl-color-accent); font-weight: 700; margin-inline-start: -0.25rem; }
+  .ref-req-word { color: var(--sl-color-accent); }
+  .ref-backend {
+    font-size: 0.7rem;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--sl-color-gray-3);
+    border: 1px solid var(--sl-color-hairline-shade);
+    border-radius: 999rem;
+    padding: 0.05rem 0.45rem;
+  }
+
+  /* Choices as discrete chips: one token per value reads as a set, where
+     `a | b | c` in a single chip reads as one opaque string. */
+  .ref-enum {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.3rem;
+  }
+  .ref-enum-label { color: var(--sl-color-gray-3); }
+  .ref-fields code.ref-choice {
+    background: transparent;
+    border-color: var(--sl-color-gray-5);
+  }
+  .ref-fields code.ref-choice.is-default {
+    color: var(--sl-color-accent);
+    border-color: var(--sl-color-accent);
+    background: var(--sl-color-accent-low);
+  }
+
+  .ref-enum,
+  .ref-desc { margin: 0.3rem 0 0; font-size: 0.9rem; line-height: 1.5; }
+  .ref-enum { color: var(--sl-color-gray-3); }
+
+  /* Deep links land mid-list, with 150+ near-identical blocks around them, so the
+     arrival needs marking. 22 links across the guides point in here. */
+  .ref-field:target {
+    background: var(--sl-color-accent-low);
+    box-shadow: inset 3px 0 0 var(--sl-color-accent);
+    padding-inline: 0.75rem;
+    margin-inline: -0.75rem;
+    border-radius: 0.15rem;
+  }
+</style>
