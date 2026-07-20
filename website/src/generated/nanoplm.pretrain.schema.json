@@ -691,7 +691,7 @@
         "train_tokens": {
           "type": "integer",
           "default": null,
-          "description": "Total token budget for the single-phase schedules (lr_schedule: warmup_stable | cosine | linear) \u2014 the only token budget those schedules accept. Mutually exclusive with max_steps: set exactly one of them, never both. Must NOT be combined with lr_schedule: wsd, which takes stable_tokens/decay_tokens instead. Shipped commented out by `nanoplm pretrain get-yaml` because that template defaults to wsd.",
+          "description": "Total token budget for the single-phase schedules (lr_schedule: warmup_stable | cosine | linear), the only token budget those schedules accept. Mutually exclusive with max_steps: set exactly one of them, never both. Must NOT be combined with lr_schedule: wsd, which takes stable_tokens/decay_tokens instead. Shipped commented out by `nanoplm pretrain get-yaml` because that template defaults to wsd.",
           "x-nanoplm-advanced": true,
           "x-nanoplm-group": "Duration + LR schedule"
         },
