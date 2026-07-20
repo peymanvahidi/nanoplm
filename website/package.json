@@ -6,7 +6,8 @@
     "dev": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:toc": "node tools/check-toc.mjs"
   },
   "dependencies": {
     "@astrojs/starlight": "^0.41.3",
