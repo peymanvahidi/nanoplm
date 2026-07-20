@@ -80,7 +80,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Astro 7 declares `"node": ">=22.12.0"` and refuses to build on
+          # anything older, so the previous '20' pin now fails outright. Tracks
+          # the active LTS rather than that 22.12 floor: Node 20 reached EOL in
+          # April 2026, and pinning the floor only buys a warning the moment the
+          # next Astro major raises it again.
+          node-version: '24'
           cache: npm
           cache-dependency-path: website/package-lock.json
       # `npm ci` (not `install`) so the build is reproducible and a package.json
@@ -88,6 +93,13 @@ jobs:
       - run: npm ci
       - run: npm run test
       - run: npm run build
+
+      # Reads the built HTML back to prove the config reference's ToC still lists
+      # the field groups. They are spliced in against Starlight's route data API,
+      # and when that API changed shape the patch went quiet rather than loud: the
+      # build passed and the link check passed while two thirds of the ToC went
+      # missing. This is the only step that would have caught it.
+      - run: npm run test:toc
 
       # Internal (offline) broken-link check.
       #

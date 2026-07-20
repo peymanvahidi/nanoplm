@@ -18,18 +18,23 @@ export default defineConfig({
       },
       description:
         'Pretrain a protein language model from a FASTA file. Three YAML files, three commands.',
-      social: { github: 'https://github.com/peymanvahidi/nanoplm' },
+      social: [
+        {
+          icon: 'github',
+          label: 'GitHub',
+          href: 'https://github.com/peymanvahidi/nanoplm',
+        },
+      ],
       customCss: ['./src/styles/custom.css'],
       // The config reference nests three levels: the file, its `model:` /
       // `pretraining:` / `resume:` blocks, and the field groups inside each.
       // Starlight stops at 3 by default, which would cut the groups off.
       tableOfContents: { minHeadingLevel: 2, maxHeadingLevel: 4 },
-      // Both ToC components are patched to include the field groups, which are
-      // rendered from the generated schema and so are invisible to remark.
-      components: {
-        TableOfContents: './src/components/TableOfContents.astro',
-        MobileTableOfContents: './src/components/MobileTableOfContents.astro',
-      },
+      // Patches the field groups into the ToC. They are rendered from the
+      // generated schema and so are invisible to remark. Route middleware, not a
+      // TableOfContents override: the desktop and mobile ToC share one
+      // `starlightRoute.toc`, so one pass here feeds both. See src/routeData.ts.
+      routeMiddleware: './src/routeData.ts',
       expressiveCode: { themes: ['github-dark', 'github-light'] },
       editLink: {
         baseUrl: 'https://github.com/peymanvahidi/nanoplm/edit/master/website/',
