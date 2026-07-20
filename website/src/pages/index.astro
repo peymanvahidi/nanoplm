@@ -12,6 +12,9 @@
 import fs from 'node:fs';
 import { Image } from 'astro:assets';
 import logo from '../assets/nanoplm-logo.png';
+import tumLogo from '../assets/logo-tum.svg';
+import helmholtzLogo from '../assets/logo-helmholtz-munich.png';
+import julichLogo from '../assets/logo-julich.png';
 import PipelineDiagram from '../components/PipelineDiagram.astro';
 import '../styles/custom.css';
 
@@ -126,6 +129,17 @@ const REQUIREMENTS = [
 // acid letters in the alphabet nanoPLM actually tokenizes, repeated to fill a
 // marquee. It is a texture, not a real sequence, so it makes no claim.
 const ALPHABET = 'MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKR';
+
+// The institutions behind the project. Each source shipped in its own palette
+// and its own format, so all three were flattened to one grey (#747a79) in the
+// asset files themselves rather than tinted in CSS. `k` is an optical scale,
+// since matching heights would leave the dense TUM monogram looking heavier
+// than the two wordmarks beside it.
+const AFFILIATIONS = [
+  { img: tumLogo, k: 0.85, name: 'Technical University of Munich' },
+  { img: helmholtzLogo, k: 0.94, name: 'Helmholtz Munich' },
+  { img: julichLogo, k: 0.95, name: 'Forschungszentrum Jülich' },
+];
 ---
 
 <!doctype html>
@@ -318,6 +332,31 @@ const ALPHABET = 'MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKAL
               </div>
             ))
           }
+        </div>
+
+        <!-- Same banded treatment as the hero strip, but static: a logo the
+             reader has to chase across the screen defeats the point of showing
+             it. No caption, so each alt string is the only thing naming these
+             institutions. -->
+        <div class="affil">
+          <ul class="shell affil-logos">
+            {
+              AFFILIATIONS.map((a) => (
+                <li>
+                  <img
+                    class="affil-logo"
+                    style={`--k: ${a.k}`}
+                    src={a.img.src}
+                    width={a.img.width}
+                    height={a.img.height}
+                    alt={a.name}
+                    loading="lazy"
+                    decoding="async"
+                  />
+                </li>
+              ))
+            }
+          </ul>
         </div>
       </section>
 
@@ -1431,6 +1470,61 @@ const ALPHABET = 'MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKAL
         font-size: 0.83rem;
         line-height: 1.45;
         color: var(--sl-color-gray-3);
+      }
+
+      /* --- Affiliations ------------------------------------------------------ */
+      /* Only a top rule: the band closes against the border-bottom .facts
+         already carries, so a border-block here would double the line. The
+         tint is what stops a row of three logos from reading as an empty gap
+         below the facts; three items cannot fill 72rem without looking
+         stranded, so the band is given a floor instead of being stretched. */
+      .affil {
+        border-top: 1px solid var(--sl-color-hairline-shade);
+        padding-block: 2rem;
+        background: color-mix(in srgb, var(--sl-color-gray-6) 40%, var(--sl-color-bg));
+      }
+      :global([data-theme='light']) .affil {
+        background: var(--sl-color-gray-6);
+      }
+      /* The column gap scales hard with the viewport on purpose. Three logos
+         are only ~430px of artwork, so at a fixed gap they huddle in the middle
+         of a 72rem shell and read as a leftover gap rather than a row; opening
+         the gap carries them out to roughly half the shell instead. */
+      .affil-logos {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        gap: 1.25rem clamp(1.5rem, 6vw, 5.5rem);
+        /* margin-block only: this element is also .shell, and a blanket
+           `margin: 0` would win on source order and kill its margin-inline:
+           auto, pinning the row to the left edge instead of centring it. */
+        margin-block: 0;
+        list-style: none;
+      }
+      /* The artwork supplies the silhouette, the token supplies the colour, so
+         all three read as one family and both themes are handled by swapping a
+         single value. --r keeps each logo's own proportions; --k trims the
+         dense ones so the row is optically even rather than merely equal-height. */
+      /* Plain images, with the grey baked into the files themselves. An earlier
+         version tinted the artwork with a CSS mask, which let one asset serve
+         both themes but fails to a solid rectangle in Safari when the mask does
+         not apply. #747a79 was chosen to clear 3:1 against both theme
+         backgrounds, so the images are correct with no CSS colour work at all;
+         the filters below only sharpen them, and losing those costs contrast
+         rather than the logo.
+
+         Height tracks the viewport: held at 3.5rem the row needs three stacked
+         lines at 320px and the band grows past 300px tall, which is more space
+         than an affiliations strip has any claim to. */
+      .affil-logo {
+        display: block;
+        height: calc(clamp(2.125rem, 1.5rem + 3.125vw, 3.5rem) * var(--k, 1));
+        width: auto;
+        filter: brightness(1.19);
+      }
+      :global([data-theme='light']) .affil-logo {
+        filter: brightness(0.78);
       }
 
       /* --- Section scaffolding ---------------------------------------------- */
