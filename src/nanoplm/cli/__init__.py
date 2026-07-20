@@ -3,6 +3,7 @@ import click
 from nanoplm.cli.data import data
 from nanoplm.cli.distill import distill
 from nanoplm.cli.eval import eval as eval_cmd
+from nanoplm.cli.deps import deps
 from nanoplm.cli.pretrain import pretrain
 
 
@@ -22,3 +23,4 @@ cli.add_command(data)
 cli.add_command(distill)
 cli.add_command(pretrain)
 cli.add_command(eval_cmd)
+cli.add_command(deps)

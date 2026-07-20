@@ -39,7 +39,7 @@ dependencies = [
     "safetensors>=0.4.0",
     "seaborn>=0.13.2",
     "sentencepiece>=0.2.0",
-    "torch>=2.8.0",
+    "torch==2.12.1",
     "tqdm>=4.67.1",
     "transformers>=4.50.2",
     "wandb>=0.19.11,<0.20.0",
@@ -64,11 +64,16 @@ docs = ["pyyaml>=6"]
 "Homepage" = "https://github.com/peymanvahidi/nanoplm"
 
 [tool.setuptools.package-data]
+"nanoplm.deps" = ["*.sh"]
 "nanoplm.models.student" = ["*.csv"]
 "nanoplm.pretraining" = ["csrc/*.c"]
 "nanoplm.data" = ["csrc/*.c"]
 "nanoplm.pretraining.models.modern_bert" = ["csrc/*.cpp", "csrc/*.cu"]
 "nanoplm.cli.templates" = ["*.yaml"]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+extra-index-url = ["https://download.pytorch.org/whl/cu130"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

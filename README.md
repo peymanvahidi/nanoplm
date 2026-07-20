@@ -4,7 +4,7 @@
 
 <img src="https://github.com/user-attachments/assets/dd520214-1f12-44c6-a6da-716934e4e981" alt="logo" width="600"/>
 
-**F**rom **F**ASTA to **F**oundation model — **F**ast.
+**F**rom **F**ASTA to **F**oundation model - **F**ast.
 
 [![GitHub Actions](https://img.shields.io/github/actions/workflow/status/peymanvahidi/nanoplm/publish-to-pypi.yml?style=plastic&logo=github-actions&label=CI)](https://github.com/peymanvahidi/nanoplm/actions/workflows/publish-to-pypi.yml)
 [![License](https://img.shields.io/github/license/peymanvahidi/nanoplm?style=plastic&color=orange&logo=github&label=License)](./LICENSE)
@@ -14,11 +14,11 @@
 
 ### 📖 [Read the documentation →](https://peymanvahidi.github.io/nanoplm/)
 
-<p> nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a simple YAML files to control everything. THE FOCUS IS ON HAVING A SIMPLIFIED ENCODER ONLY TRAINING PIPELINE SIMILAR TO NANOCHAT, by no means is this project is producing SOTA models, this is mostly an educational playground to experiment on various aspects of encoder model training e2e pipeline</p>
+<p>🚀 Ship a protein language model easier and faster. nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a simple YAML files to control everything.</p>
 
 </div>
 
-## What makes nanoPLM different?
+## 🧬 What makes nanoPLM different?
 
 - **Control everything with simple YAML files**: Prepare your data and Pretrain your model, with YAML files.
 - **Data you can trust**: Using Data Version Control (DVC) under the hood.
@@ -28,12 +28,10 @@
 
 ## 🛠️ Install
 
-> **Supported platform:** Linux x86_64 or aarch64 · NVIDIA **Hopper** GPU
-> (H100/H200/GH200, sm90) · CUDA ≥ 13.0. Every full install carries the same
-> stack: torch 2.12.1+cu130, TransformerEngine 2.16 (FP8), FlashAttention-3,
-> SonicMoE/QuACK, and Dion. Other GPUs or OSes may partially work but are
-> unsupported. Step-by-step docs:
-> [Install](https://peymanvahidi.github.io/nanoplm/start/install/).
+> **Supported platform:** Linux x86_64 · NVIDIA **Hopper** GPU (H100/H200, sm90) ·
+> CUDA ≥ 13.0 driver. Every install carries the full feature set, torch 2.12.1+cu130,
+> TransformerEngine 2.16 (FP8), FlashAttention-3, SonicMoE/QuACK kernels, and Dion.
+> Other GPUs or OSes may partially work but are unsupported.
 
 ```bash
 uv venv && source .venv/bin/activate
@@ -42,31 +40,27 @@ uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \
 nanoplm deps install
 ```
 
-Contributors: clone and use `uv pip install -e .` (add
-`--extra-index-url https://download.pytorch.org/whl/cu130` so torch resolves to
-the cu130 wheel), then `nanoplm deps install`. Once nanoPLM is public on PyPI
-this becomes `uv pip install nanoplm`.
+Contributors: clone and use `uv pip install -e .` (add `--extra-index-url https://download.pytorch.org/whl/cu130` to skip a duplicate torch download), then `nanoplm deps install`. Once nanoPLM is public on PyPI this becomes `uv pip install nanoplm`.
 
-**On clusters (e.g. JURECA):** load the toolchain first, then install from a
-**login node** (needs internet; no GPU; the TransformerEngine source build takes
-~10 min):
+**On clusters (e.g. JURECA):** load the toolchain first, then install from a **login node** (needs internet; no GPU; the TransformerEngine source build takes ~10 min):
 
 ```bash
 module load CUDA/13 NCCL cuDNN Ninja    # do NOT module purge
 nanoplm deps install
 ```
 
-Verify on a GPU node with `nanoplm deps verify`.
-
 ### Benchmarking extra
 
-`nanoplm eval` runs on [biotrainer](https://github.com/sacdallago/biotrainer)'s
-autoeval pipeline, so the `eval` extra pulls in **biotrainer 1.4.0**:
+`nanoplm eval` runs on [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline, so the `eval` extra pulls in **biotrainer 1.4.0**:
 
 ```bash
-uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
-# or, for an editable checkout:
-uv pip install -e ".[eval]"
+uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"   # or: uv pip install -e ".[eval]"
+```
+
+To take biotrainer straight from source instead, use the command below:
+
+```bash
+uv pip install biotrainer
 ```
 
 ---
@@ -91,19 +85,13 @@ Use the command below to prepare your data for pLM pretraining (you'll get train
 nanoplm data from-yaml
 ```
 
-> By default, this uses `params.yaml` in your current directory. You can optionally specify a different path argument (relative or absolute) if needed.
-Like: `nanoplm data from-yaml <path/to/params.yaml>`
-
-> For pretraining shard generation, nanoPLM auto-uses a native C tokenizer/writer backend (OpenMP-enabled if available) when using the default protein tokenizer.  
-> Disable it with `NANOPLM_DISABLE_NATIVE_SHARD_WRITER=1`.
->
-> `shuffle`, `filter`, and `split` also use native C FASTA backends when available.  
-> Disable them with `NANOPLM_DISABLE_NATIVE_FASTA_OPS=1`.
+> By default, this picks up `data.yaml` in your current directory. You can optionally specify a different path argument (relative or absolute) if needed.
+Like: `nanoplm data from-yaml <path/to/data.yaml>`
 
 
 📊 Now your data is ready! Let's start the training.
 
-### 3. Get a pretrain or distillation YAML file
+### 3. Get a pretrain YAML file
 
 ```bash
 nanoplm pretrain get-yaml
@@ -118,7 +106,7 @@ nanoplm distill get-yaml
 > This writes `distill.yaml` to your current directory. The distillation pipeline is
 > [unmaintained](https://peymanvahidi.github.io/nanoplm/distillation/) — use pretraining instead.
 
-### 4. Start your pretraining or distillation
+### 4. Start your pretraining
 
 ```bash
 nanoplm pretrain from-yaml
@@ -152,9 +140,8 @@ Paths inside a config are resolved relative to the config file's directory.
 
 ## Requirements
 
-- Python 3.12+
-- macOS or Linux
-- GPU recommended (CPU is fine for tiny tests)
+- Python 3.11+, which backs `nanoplm eval` (it also caps below 3.14, so 3.11–3.13). Developed and tested on 3.12.
+- Linux x86_64 with an NVIDIA Hopper GPU; see the supported-platform note under [Install](#️-install).
 
 ---
 
