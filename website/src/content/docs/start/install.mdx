@@ -1,0 +1,172 @@
+---
+title: Install
+description: Install nanoPLM and the full pinned GPU dependency stack with two commands, then verify on Hopper + CUDA 13.
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Supported platform
+
+nanoPLM's supported training environment is fixed:
+
+| Requirement | Value |
+| --- | --- |
+| OS / CPU | Linux **x86_64** or **aarch64** (GH200 / JUPITER) |
+| GPU | NVIDIA **Hopper** (H100 / H200 / GH200, sm90) |
+| CUDA driver / toolkit | **CUDA ≥ 13.0** (`nvcc` release 13.x on `PATH` for the deps build) |
+| Python | **3.11–3.13** (developed and tested on **3.12**) |
+
+Every full install carries the same hard-dependency stack: **torch 2.12.1+cu130**, **TransformerEngine 2.16** (FP8), **FlashAttention-3**, **SonicMoE / QuACK**, and **Dion**. Other GPUs or OSes may partially work; they are unsupported.
+
+## Install nanoPLM
+
+Two steps: put the package in a virtualenv, then install the pinned GPU stack.
+
+<Steps>
+
+1. **Create and activate a virtualenv**, then install nanoPLM.
+
+   <Tabs>
+   <TabItem label="From GitHub (recommended)">
+
+   ```bash
+   uv venv && source .venv/bin/activate
+   uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \
+       --extra-index-url https://download.pytorch.org/whl/cu130
+   ```
+
+   </TabItem>
+   <TabItem label="Editable (contributors)">
+
+   ```bash
+   git clone https://github.com/peymanvahidi/nanoplm.git
+   cd nanoplm
+   uv venv && source .venv/bin/activate
+   uv pip install -e . \
+       --extra-index-url https://download.pytorch.org/whl/cu130
+   ```
+
+   The `--extra-index-url` points `uv` at the cu130 PyTorch index so torch resolves to the CUDA 13 build instead of a CPU wheel. Once nanoPLM is public on PyPI this becomes `uv pip install nanoplm`.
+
+   </TabItem>
+   </Tabs>
+
+2. **Install the hard GPU dependencies** into the same virtualenv:
+
+   ```bash
+   nanoplm deps install
+   ```
+
+   That command is idempotent. It installs (or skips if already satisfied):
+
+   | Component | Pin / source |
+   | --- | --- |
+   | PyTorch | `2.12.1+cu130` from the official cu130 wheel index |
+   | Dion | pinned commit (Muon-family optimizers) |
+   | TransformerEngine | **v2.16 built from source** (~7–10 min) |
+   | FlashAttention-3 | pinned prebuilt wheel (sha256-checked) |
+   | QuACK + SonicMoE | `quack-kernels[cu13]==0.5.0` + pinned sonic-moe commit |
+
+   Run it from a **login / build node if you are on a cluster**: it needs internet and a CUDA 13 toolkit, not a GPU. On a machine with a non-Hopper GPU visible, install still proceeds with a warning; the hard Hopper check runs in `nanoplm deps verify` on the job node.
+
+</Steps>
+
+`nanoplm deps install` refuses to run outside a virtualenv. Create one first (`uv venv` or `python3 -m venv .venv`).
+
+### On clusters (for example JURECA)
+
+Load the CUDA 13 toolchain **before** the deps install. Do **not** `module purge` afterward if your session still needs that toolkit on `PATH`:
+
+```bash
+module load CUDA/13 NCCL cuDNN Ninja    # do NOT module purge
+nanoplm deps install
+```
+
+`nvcc` must report CUDA 13.x and `ninja` must be on `PATH` (TE's source build needs both). On EasyBuild clusters, `CUDA_HOME` is taken from `EBROOTCUDA` automatically.
+
+### Flags
+
+```bash
+nanoplm deps install --arch 90      # default: Hopper sm90 (NVTE_CUDA_ARCHS)
+nanoplm deps install --force      # reinstall every component even if already satisfied
+```
+
+If the build host has no outbound internet for the FlashAttention-3 wheel, download it elsewhere, set `NANOPLM_FA3_WHEEL=/path/to/wheel.whl`, and re-run.
+
+## Benchmarking extra
+
+`nanoplm eval` runs [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline. That dependency is **not** part of `nanoplm deps install`; pull it with the `eval` extra:
+
+<Tabs>
+<TabItem label="From GitHub (recommended)">
+
+```bash
+uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
+```
+
+</TabItem>
+<TabItem label="Editable (contributors)">
+
+```bash
+uv pip install -e ".[eval]"
+```
+
+</TabItem>
+</Tabs>
+
+Without it, `nanoplm eval from-yaml` fails at import time.
+
+## Verify your install
+
+<Steps>
+
+1. **Check the hard-dependency stack** (fresh interpreter; re-run this on a **GPU node** so the Hopper row is real):
+
+   ```bash
+   nanoplm deps verify
+   ```
+
+   ```
+     ✓ torch==2.12.1+cu130              2.12.1+cu130
+     ✓ dion                             imports cleanly
+     ✓ transformer_engine.pytorch       imports cleanly
+     ✓ flash_attn_interface             imports cleanly
+     ✓ quack                            imports cleanly
+     ✓ sonicmoe                         imports cleanly
+     ✓ GPU (Hopper sm90)                NVIDIA H100 ... (sm90)
+   verify: OK
+   ```
+
+   On a login node with no GPU, the GPU row is skipped with a note. Re-run verify on the compute node before a training job.
+
+2. **Check that the CLI is on your `PATH`.**
+
+   ```bash
+   nanoplm --version
+   # nanoplm, version 0.2.0
+   ```
+
+3. **Scaffold a config** to confirm the package data ships correctly.
+
+   ```bash
+   nanoplm pretrain get-yaml
+   # Template written to: <cwd>/pretrain.yaml
+   ```
+
+</Steps>
+
+If all three work, go train something: [Your first PLM](/nanoplm/start/first-plm/).
+
+## What you get vs what you still choose
+
+After a successful `nanoplm deps install`, Muon-family optimizers, token packing (FlashAttention-3), FP8 / pure-TE, and the SonicMoE expert backend are **available**. You still turn features on in YAML (`optimizer`, `use_packing`, `fp8`, `moe_kernel_backend`, …); the installer only guarantees the packages are present.
+
+| Feature | Still needs in config / hardware |
+| --- | --- |
+| Pretraining (pure-torch, the default) | Hopper GPU for the supported path |
+| Token packing (`use_packing: true`, the default) | FA3 is installed; set `use_packing: false` only if you want padding instead |
+| `fp8: true` / `--pure-te` | TE is installed; FP8 tensor cores need Hopper+; `mxfp8` / `nvfp4` need Blackwell+ |
+| `optimizer: muon \| normuon \| muonh \| aurora` | Dion is installed; see [Choose an optimizer](/nanoplm/guides/optimizers/) |
+| `moe_kernel_backend: sonicmoe` | QuACK + SonicMoE are installed; still Hopper-only |
+
+Multi-GPU runs are launched with `torchrun`: see [Scale up](/nanoplm/guides/scale-up/).

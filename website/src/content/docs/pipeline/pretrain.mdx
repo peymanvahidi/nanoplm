@@ -1,0 +1,248 @@
+---
+title: 2. Pretrain
+description: "Train a masked language model on your shards: the token budget, the WSD schedule, and the dozen keys in pretrain.yaml that actually matter."
+---
+
+import { FileTree, Steps } from '@astrojs/starlight/components';
+
+The pretraining stage reads the shards and `.data_manifest` the [data stage](/nanoplm/pipeline/data/) produced, trains a masked-language model on them, and writes self-describing checkpoints.
+
+`nanoplm pretrain get-yaml` writes a scaffold of about 360 lines, split into labelled blocks. That number is not a warning: it is the whole surface of the codebase, exposed so that nothing is hidden from you. **A real run touches multiple of those keys.** Everything else has a working default, and this page is a tour of the handful you may edit.
+
+## Run it
+
+<Steps>
+
+1. Scaffold the config.
+
+   ```sh
+   nanoplm pretrain get-yaml
+   ```
+
+   ```text title="Output"
+   Template written to: <cwd>/pretrain.yaml
+   ```
+
+2. Edit `pretrain.yaml`. Point `dataset_dir` at the data stage's `output_dir`, set the model size, set the budget.
+
+3. Start training your model.
+
+   ```sh
+   nanoplm pretrain from-yaml
+   ```
+
+   ```text title="Output (trimmed)"
+   Loaded config from manifest: output/data/pretrain_data
+     train_shards: output/data/pretrain_data/train
+     val_shards: output/data/pretrain_data/val
+     max_length: 512
+     train_sequences: 18000
+     val_sequences: 2000
+   # ...
+   [stable] Budget: 60,030,976 tokens → ≈9.4 passes over the train set (each sample seen ~9.4×)
+   [decay] Budget: 6,029,312 tokens → ≈0.9 passes over the train set (each sample seen ~0.9×)
+   [total] Budget: 66,060,288 tokens → ≈10.3 passes over the train set (each sample seen ~10.3×)
+   Starting pure-torch training: total_steps=504 (token-budget driven), warmup_steps=100, global_batch_warmup_steps=0, grad_accum=8, achieved_global_batch_tokens=131,072 tokens
+   # ...
+   Checkpoint saved -> output/pretraining_checkpoints/run-14071932/checkpoint-final
+   Pure-torch pretraining complete.
+   ```
+
+</Steps>
+
+Read those startup lines. They are the config after nanoPLM has resolved it: the sequence length came from the manifest, the gradient accumulation was inferred, and your token budget became 504 optimizer steps. If any of those numbers surprise you, stop the run now rather than in six hours.
+
+## Pick a backend
+
+The stock template ships `pure_torch: true` at the bottom of `pretrain.yaml`, so `nanoplm pretrain from-yaml` already runs the pure-torch backend. You do **not** need `--pure-torch` for a normal YAML run.
+
+Pure-torch is the hand-written training loop, the only backend that supports the default `wsd` schedule, and the only one whose checkpoints the [eval stage](/nanoplm/pipeline/eval/) can load. Switch to Transformer Engine only when you need it: set `pure_te: true` **and** `pure_torch: false` (or pass `--pure-te` after clearing the YAML pure-torch key). The two backends are mutually exclusive. See [Choose a backend](/nanoplm/guides/backends/) for the full comparison.
+
+## A config that really runs
+
+This is a complete, valid `pretrain.yaml` for a single GPU. Nothing has been elided.
+
+```yaml title="pretrain.yaml"
+model:
+  hidden_size: 768
+  intermediate_size: 1536      # ~2x hidden_size is a reasonable SwiGLU width
+  num_hidden_layers: 12
+  num_attention_heads: 8       # head_dim = 768 / 8 = 96
+
+pretraining:
+  dataset_dir: "output/data/pretrain_data"        # the data stage's output_dir
+  ckp_dir: "output/pretraining_checkpoints"
+
+  micro_batch_seqs: 32          # SEQUENCES per GPU per forward: turn this down when you hit OOM
+  global_batch_tokens: 131072   # TOKENS per optimizer step: grad accum is inferred from it
+
+  optimizer: "adamw"            # set explicitly: the template ships normuon, which needs dion
+  adam_learning_rate: 1e-4
+
+  lr_schedule: "wsd"            # warmup -> stable -> decay, all inside one run
+  warmup_steps: 100
+  stable_tokens: 60000000       # tokens up to the decay boundary: warmup is INSIDE this
+  decay_tokens: 6000000         # extra tokens spent annealing the LR down
+
+pure_torch: true                # template default; omit only if you switch backends
+```
+
+Those four `model:` keys are the only ones you must supply; the rest of the block is optional. The [reference](/nanoplm/reference/pretrain/) lists a value for them, but that is the number the template pre-fills, not a fallback: leave them out of a hand-written config and the run stops. In `pretraining:`, only `dataset_dir` is strictly required: but a `wsd` schedule needs a budget, so `stable_tokens` and `decay_tokens` come with it.
+
+One key deserves the explicit setting it gets above: `optimizer`. The default is `normuon`, a Muon-family optimizer that needs Microsoft's `dion` package and a second learning rate to tune. A full [install](/nanoplm/start/install/) (`nanoplm deps install`) already includes dion, so `normuon` is a fine choice: this config spells out `adamw` only to keep the first run dependency-free and single-LR. See [Choose an optimizer](/nanoplm/guides/optimizers/).
+
+## Duration is a token budget
+
+There are **no epochs** in nanoPLM. There is no `num_epochs` key. You state how many **tokens** the model should see, and the dataset is replayed as many times as that takes. The startup log tells you how many passes that worked out to.
+
+This is the single most common source of confusion, so be precise about units:
+
+| Key | Unit |
+| --- | --- |
+| [`micro_batch_seqs`](/nanoplm/reference/pretrain/#pretrain-pretraining-micro_batch_seqs) | **sequences** per GPU per forward pass |
+| [`global_batch_tokens`](/nanoplm/reference/pretrain/#pretrain-pretraining-global_batch_tokens) | **tokens** per optimizer step (a target: rounded up) |
+| [`stable_tokens`](/nanoplm/reference/pretrain/#pretrain-pretraining-stable_tokens), [`decay_tokens`](/nanoplm/reference/pretrain/#pretrain-pretraining-decay_tokens), `train_tokens` | **tokens** (total budget) |
+| [`warmup_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-warmup_steps), [`global_batch_warmup_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-global_batch_warmup_steps) | **optimizer steps** |
+| `stable_steps`, `decay_steps`, `max_steps` | **optimizer steps** (advanced overrides for their `*_tokens` twin) |
+| [`logging_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-logging_steps), [`eval_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-eval_steps), [`save_steps`](/nanoplm/reference/pretrain/#pretrain-pretraining-save_steps) | **optimizer steps** |
+| [`lr_decay_to_fraction`](/nanoplm/reference/pretrain/#pretrain-pretraining-lr_decay_to_fraction) | fraction of peak LR |
+
+Note that `micro_batch_seqs` counts *sequences* while `global_batch_tokens` counts *tokens*. They are not two spellings of the same thing: one is the VRAM knob, the other is the optimization knob.
+
+### Gradient accumulation is inferred, never set
+
+nanoPLM derives the accumulation count from the two batch keys and the sequence length in the manifest:
+
+```
+grad_accum = ceil( global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size) )
+
+achieved_global_batch_tokens = grad_accum × micro_batch_seqs × max_seq_len × world_size
+```
+
+`global_batch_tokens` is a **target**. The achieved value is rounded up to a whole number of micro-steps, and it is the *achieved* value that divides your token budget into steps.
+
+Working through the config above, on one GPU with `max_seq_len: 512` from the manifest:
+
+```
+tokens per micro-step  = 32 × 512 × 1        = 16,384
+grad_accum             = ceil(131,072 / 16,384) = 8
+achieved global batch  = 8 × 16,384          = 131,072 tokens
+stable_steps           = ceil(60,000,000 / 131,072) = 458
+decay_steps            = ceil( 6,000,000 / 131,072) =  46
+total_steps                                          = 504
+```
+
+Which is exactly what the startup log printed. Setting the accumulation count yourself is a hard error:
+
+```text title="Output"
+Error: gradient_accumulation_steps is inferred automatically from global_batch_tokens, micro_batch_seqs, max_seq_len, and world_size. Remove gradient_accumulation_steps from your pretraining config.
+```
+
+To fit a bigger model, lower `micro_batch_seqs` and leave `global_batch_tokens` alone. Accumulation absorbs the difference and the optimization is unchanged: you trade wall-clock for memory, not quality.
+
+## The learning-rate schedule
+
+[`lr_schedule`](/nanoplm/reference/pretrain/#pretrain-pretraining-lr_schedule) defaults to `wsd` (warmup-stable-decay) and runs all three phases **in a single run**:
+
+```
+|<---------------- stable_tokens ---------------->|<-- decay_tokens -->|
+|<-- warmup_steps -->|                            |                    |
+ 0 ---------------> peak ------------------> peak ---------> lr_decay_to_fraction × peak
+                                                  ^
+                                                  checkpoint-stable-end saved here
+```
+
+The trap is in the units, and it is worth reading twice: **`stable_tokens` includes warmup.** It is the number of tokens spent getting *to* the decay boundary, ramp-in included. `decay_tokens` is a length *added on top*. Total duration is `stable_tokens + decay_tokens`.
+
+The four allowed values:
+
+| `lr_schedule` | Shape | Budget keys |
+| --- | --- | --- |
+| `wsd` *(default)* | warmup, flat, then anneal | `stable_tokens` + `decay_tokens` |
+| `warmup_stable` | warmup, then flat forever: no decay | `train_tokens` |
+| `cosine` | warmup, then a cosine to the floor | `train_tokens` |
+| `linear` | warmup, then a straight line to the floor | `train_tokens` |
+
+Mixing the two budget families is rejected at load time (`wsd uses stable_*/decay_* budgets; remove train_tokens/max_steps.`), so you cannot half-configure a schedule.
+
+Two knobs shape the anneal. [`decay_shape`](/nanoplm/reference/pretrain/#pretrain-pretraining-decay_shape) is `1-sqrt` (default: a fast initial drop and a long tail) or `linear`; it applies to `wsd` only. [`lr_decay_to_fraction`](/nanoplm/reference/pretrain/#pretrain-pretraining-lr_decay_to_fraction) (default `0.1`) is the floor, as a fraction of peak.
+
+At the stable→decay boundary the run saves a `checkpoint-stable-end` automatically. That checkpoint is a *trunk*: it is a model at full learning rate, ready to be annealed. You can branch several different cooldowns off one trunk without retraining it, which is the cheapest way to try two data mixes or two decay lengths. That workflow is [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
+
+## The `model:` block
+
+Four keys decide the size of your model, and they are the four you must always supply. The table shows what the config above uses next to what `get-yaml` pre-fills, so you can see the range:
+
+| Key | This config | `get-yaml` | Notes |
+| --- | --- | --- | --- |
+| [`hidden_size`](/nanoplm/reference/pretrain/#pretrain-model-hidden_size) | `768` | `1024` | Residual stream width. The dominant parameter-count knob. |
+| [`intermediate_size`](/nanoplm/reference/pretrain/#pretrain-model-intermediate_size) | `1536` | `2048` | MLP width. |
+| [`num_hidden_layers`](/nanoplm/reference/pretrain/#pretrain-model-num_hidden_layers) | `12` | `16` | Depth. |
+| [`num_attention_heads`](/nanoplm/reference/pretrain/#pretrain-model-num_attention_heads) | `8` | `16` | `hidden_size` must divide evenly by this. |
+
+The rest of the block is a long tail of `use_*` flags: alternative attention schemes, mixture-of-experts, low-rank branches, weight-tied recurrence. **They all default to off**, and none of them is needed for a good model. Each is documented in the [pretrain.yaml reference](/nanoplm/reference/pretrain/), and which ones can be combined with which backend is in the [compatibility matrix](/nanoplm/reference/compatibility/). Get a baseline trained first; then turn one on and measure.
+
+Two keys are conspicuously absent from `model:`, and now you know why: `max_seq_len` and `num_register_tokens` come from `.data_manifest`. The data stage decided them; the model inherits them.
+
+## Resuming
+
+The `resume:` block has its own guide ([Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/)) because "continue an interrupted run" and "anneal a trunk into a finished model" are different jobs that happen to share a block.
+
+:::caution[The scaffold ships `mode: "decay"`]
+```yaml title="pretrain.yaml"
+# ...
+resume:
+  is_resume: false
+  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
+  mode: "decay"          # <- not "continue"
+  decay_tokens: 1000000
+  decay_shape: "1-sqrt"
+  lr_decay_to_fraction: 0.1
+```
+Flipping **only** `is_resume: true` therefore starts a *decay* run (a short anneal that resets the step counter), not a continuation of your interrupted training. To pick the interrupted run back up, set `mode: "continue"` **and delete the three `decay_*` fields**; `continue` mode rejects them.
+:::
+
+## What a run writes
+
+<FileTree>
+
+- output/pretraining_checkpoints/
+  - run-14071932/ the run name plus a DDMMHHMM stamp
+    - run_name.txt
+    - wandb_run_id.txt
+    - checkpoint-500/ saved every `save_steps`
+      - pytorch_model.bin
+      - optimizer.pt
+      - scheduler.pt
+      - rng_state.pth
+      - training_state.json
+      - **model_config.yaml** the architecture: this is what eval reads
+      - **pretrain_config.yaml** the training config
+      - **data_manifest.yaml** a copy of the data manifest
+    - checkpoint-stable-end/ the WSD trunk, saved at the decay boundary
+    - checkpoint-final/
+
+</FileTree>
+
+Each checkpoint carries the three configs that produced it, so it can be evaluated, resumed, or handed to a colleague without any of your YAML files travelling with it.
+
+## More than one GPU
+
+Launch with `torchrun`. Nothing in the config changes: `world_size: 'auto'` picks the process count up from the environment, and `grad_accum` is re-inferred so that `global_batch_tokens` stays the batch you asked for:
+
+```sh
+torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml
+```
+
+```text title="Output (trimmed)"
+Distributed config: multi_gpu=True mode=fsdp
+Starting pure-torch training: total_steps=504 (token-budget driven), warmup_steps=100, global_batch_warmup_steps=0, grad_accum=2, achieved_global_batch_tokens=131,072 tokens
+```
+
+`grad_accum` fell from 8 to 2 because four GPUs each contribute a micro-batch. The optimizer still sees 131,072 tokens per step; it reaches them four times faster. Your model does not change when you add GPUs: only the wall-clock does. Sharding strategies, HSDP, and activation checkpointing are covered in [Scale up](/nanoplm/guides/scale-up/).
+
+## Next
+
+You have a checkpoint. Find out whether it learned anything: [3. Evaluate](/nanoplm/pipeline/eval/).
+
+Every key in `pretrain.yaml`, with its type, default, and backend constraints, is in the [pretrain.yaml reference](/nanoplm/reference/pretrain/).

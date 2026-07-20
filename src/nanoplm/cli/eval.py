@@ -316,47 +316,12 @@ def get_yaml(output: Optional[str], force: bool):
 
     create_dirs(output_path)
 
-    template = (
-        "# Evaluation configuration for nanoPLM\n"
-        "#\n"
-        "# Runs biotrainer's autoeval pipeline on a pure-torch nanoPLM checkpoint.\n"
-        "# Requires:  pip install nanoplm[eval]\n"
-        "#\n"
-        "# The model config is loaded from <checkpoint_dir>/model_config.yaml.\n"
-        "# Checkpoints without that file are not supported.\n"
-        "\n"
-        "eval:\n"
-        "  # Checkpoint path. Accepts a checkpoint-* directory or a run-*\n"
-        "  # directory (the latest checkpoint inside the run-* is used).\n"
-        '  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"\n'
-        "\n"
-        "  # One or more of: pbc, flip, pgym. 'pgym' is zero-shot ProteinGym.\n"
-        "  framework: [pbc]\n"
-        "\n"
-        '  output_dir: "autoeval_output"\n'
-        "\n"
-        "  batch_size: 16\n"
-        "  min_seq_length: 0\n"
-        "  max_seq_length: 2000\n"
-        "\n"
-        "  # device: cuda                     # auto-detected when omitted\n"
-        "  # embedder_name: my-run            # defaults to checkpoint dir stem\n"
-        "  parallel_tasks: 0                  # 0 = sequential, >0 = parallel workers\n"
-        "\n"
-        "  # Zero-shot scoring method when framework includes 'pgym'.\n"
-        "  zero_shot_method: masked_marginals  # masked_marginals | wt_marginals | pseudoperplexity\n"
-        "\n"
-        "  # Optional whitelist of task names. Parallel mode only.\n"
-        "  # tasks: [PBC-secondary_structure]\n"
-        "\n"
-        "  # Re-download framework datasets (use when new tasks land upstream).\n"
-        "  force_download: false\n"
-    )
+    from nanoplm.cli.templates import load_template
 
     if output_path.exists() and not force:
         raise click.ClickException(
             f"File already exists: {output_path}. Use --force to overwrite."
         )
 
-    output_path.write_text(template, encoding="utf-8")
+    output_path.write_text(load_template("eval"), encoding="utf-8")
     click.echo(f"Template written to: {output_path}")

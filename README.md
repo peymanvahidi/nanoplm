@@ -10,6 +10,9 @@
 [![License](https://img.shields.io/github/license/peymanvahidi/nanoplm?style=plastic&color=orange&logo=github&label=License)](./LICENSE)
 [![PyPI Version](https://img.shields.io/pypi/v/nanoplm?style=plastic&color=4b8bbe&logo=pypi&logoColor=white&label=PyPI)](https://pypi.org/project/nanoplm/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=plastic)](https://github.com/psf/black)
+[![Docs](https://img.shields.io/badge/docs-nanoPLM-14b8a6?style=plastic&logo=readthedocs&logoColor=white)](https://peymanvahidi.github.io/nanoplm/)
+
+### 📖 [Read the documentation →](https://peymanvahidi.github.io/nanoplm/)
 
 <p> nanoPLM gives you a batteries‑included CLI, reproducible data workflows, and a simple YAML files to control everything. THE FOCUS IS ON HAVING A SIMPLIFIED ENCODER ONLY TRAINING PIPELINE SIMILAR TO NANOCHAT, by no means is this project is producing SOTA models, this is mostly an educational playground to experiment on various aspects of encoder model training e2e pipeline</p>
 
@@ -25,92 +28,46 @@
 
 ## 🛠️ Install
 
-Install the package from PyPI:
+> **Supported platform:** Linux x86_64 or aarch64 · NVIDIA **Hopper** GPU
+> (H100/H200/GH200, sm90) · CUDA ≥ 13.0. Every full install carries the same
+> stack: torch 2.12.1+cu130, TransformerEngine 2.16 (FP8), FlashAttention-3,
+> SonicMoE/QuACK, and Dion. Other GPUs or OSes may partially work but are
+> unsupported. Step-by-step docs:
+> [Install](https://peymanvahidi.github.io/nanoplm/start/install/).
 
 ```bash
-pip install nanoplm
+uv venv && source .venv/bin/activate
+uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \
+    --extra-index-url https://download.pytorch.org/whl/cu130
+nanoplm deps install
 ```
 
-For a local editable install:
+Contributors: clone and use `uv pip install -e .` (add
+`--extra-index-url https://download.pytorch.org/whl/cu130` so torch resolves to
+the cu130 wheel), then `nanoplm deps install`. Once nanoPLM is public on PyPI
+this becomes `uv pip install nanoplm`.
+
+**On clusters (e.g. JURECA):** load the toolchain first, then install from a
+**login node** (needs internet; no GPU; the TransformerEngine source build takes
+~10 min):
 
 ```bash
-uv pip install -e .
-```
-For benchmarking you also need Biotrainer.
-```bash
-pip install git+https://github.com/sacdallago/biotrainer@main
+module load CUDA/13 NCCL cuDNN Ninja    # do NOT module purge
+nanoplm deps install
 ```
 
-For CUDA training, install Dion manually from the Microsoft repository:
+Verify on a GPU node with `nanoplm deps verify`.
 
-```bash
-pip install git+https://github.com/microsoft/dion.git
-```
+### Benchmarking extra
 
-MoE training now uses an in-tree CUTLASS grouped GEMM extension instead of the
-external `grouped_gemm` package. The extension is JIT-built on first use, so
-you only need a CUDA toolkit that matches `torch.version.cuda`.
-
-1. Check your active PyTorch CUDA version:
+`nanoplm eval` runs on [biotrainer](https://github.com/sacdallago/biotrainer)'s
+autoeval pipeline, so the `eval` extra pulls in **biotrainer 1.4.0**:
 
 ```bash
-uv run python -c "import torch; print(torch.__version__, torch.version.cuda)"
+uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
+# or, for an editable checkout:
+uv pip install -e ".[eval]"
 ```
-
-2. Point `CUDA_HOME` at the matching toolkit and set the architectures you want
-to build for:
-
-```bash
-export CUDA_HOME=/path/to/cuda-matching-torch
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export TORCH_CUDA_ARCH_LIST="9.0"  # H100; adjust for your GPU
-```
-
-3. Run nanoPLM normally. The first CUDA MoE call will compile the vendored
-CUTLASS backend and cache it under `.cache/torch_extensions`:
-
-```bash
-nanoplm pretrain from-yaml --pure-torch
-```
-
-If you need different architectures, override `TORCH_CUDA_ARCH_LIST` before
-running your first MoE job. If CUTLASS is not checked out under
-`third_party/cutlass`, set `NANOPLM_CUTLASS_ROOT` or `CUTLASS_ROOT` to a CUTLASS
-checkout.
-
-### TransformerEngine on JURECA (JSC)
-
-The prebuilt `transformer_engine` wheels (2.14–2.16) fail to import on JURECA
-(`undefined symbol: cublasLtGroupedMatrixLayoutInit_internal`) because they link
-a newer cublasLt than `module load CUDA/13` provides. Build it from source once,
-from a **login node** (needs internet; no GPU required):
-
-```bash
-bash install_te_jureca.sh
-```
-
-This clones TE 2.16, builds it for sm90 + sm120 against the cluster's CUDA,
-installs it into `.venv`, and verifies the import. Override `NVTE_CUDA_ARCHS`
-(e.g. `NVTE_CUDA_ARCHS=90`) to retarget. Only needed for the FP8 / `--pure-te`
-pipelines; the default bf16 / `--pure-torch` path does not require TE.
-
-### Optional: SonicMoE expert backend
-
-Set `moe_kernel_backend: sonicmoe` in the pretraining YAML to run the routed
-experts on the [SonicMoE](https://github.com/Dao-AILab/sonic-moe) /
-[QuACK](https://github.com/Dao-AILab/quack) fused kernels (sync-free forward and
-backward, dispatch fused into the GEMM). It requires our SonicMoE fork, which
-adds squared-ReLU (`srelu`) support on top of upstream (PR
-[Dao-AILab/sonic-moe#64](https://github.com/Dao-AILab/sonic-moe/pull/64)):
-
-```bash
-pip install quack-kernels            # use quack-kernels[cu13] on CUDA 13
-pip install git+https://github.com/alint77/sonic-moe.git@feat/srelu-relu_sq-support
-```
-
-Requires a Hopper (SM90) or newer GPU. The default `moe_kernel_backend: cutlass`
-needs none of this.
 
 ---
 
@@ -122,7 +79,7 @@ needs none of this.
 nanoplm data get-yaml
 ```
 
->You'll get [params.yaml](#data-preparation-yaml) and a dvc.yaml files. Just edit the params.yaml if you want.
+>You'll get [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) and a dvc.yaml files. Just edit the params.yaml if you want.
 
 > We're using DVC under the hood, so you can track your data version.
 
@@ -152,289 +109,44 @@ Like: `nanoplm data from-yaml <path/to/params.yaml>`
 nanoplm pretrain get-yaml
 ```
 
-> This writes [pretraining YAML file](#pretraining-yaml) to your current directory.
+> This writes [pretrain.yaml](https://peymanvahidi.github.io/nanoplm/reference/pretrain/) to your current directory.
 
 ```bash
 nanoplm distill get-yaml
 ```
 
-> This writes [distillation YAML file](#distill-yaml) to your current directory.
+> This writes `distill.yaml` to your current directory. The distillation pipeline is
+> [unmaintained](https://peymanvahidi.github.io/nanoplm/distillation/) — use pretraining instead.
 
 ### 4. Start your pretraining or distillation
 
 ```bash
 nanoplm pretrain from-yaml
 ```
-or
-```bash
-nanoplm distill from-yaml
-```
+
+The stock `pretrain.yaml` sets `pure_torch: true`, so no backend flag is needed. For Transformer Engine, set `pure_te: true` and turn off pure-torch — see [Choose a backend](https://peymanvahidi.github.io/nanoplm/guides/backends/).
 
 ---
 
-## Data Preparation YAML
+## Configuration
 
-```yaml
-data_params:
-  # Pipeline mode: 'pretrain', 'distillation', or 'none'
-  # - 'pretrain': Generate HDF5 shards for MLM pretraining
-  # - 'distillation': Generate teacher embeddings for knowledge distillation
-  # - 'none': Only run data preparation (download, filter, split)
-  pipeline_mode: "pretrain"
+Everything is controlled by three YAML files. Scaffold one, edit it, run it:
 
-  seqs_num: 20000
-  min_seq_len: 20
-  max_seq_len: 512
-  val_ratio: 0.1
-  device: "auto"
+| Stage | Scaffold | Run | Reference |
+|---|---|---|---|
+| Data | `nanoplm data get-yaml` | `nanoplm data from-yaml` | [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) |
+| Pretraining | `nanoplm pretrain get-yaml` | `nanoplm pretrain from-yaml` | [pretrain.yaml](https://peymanvahidi.github.io/nanoplm/reference/pretrain/) |
+| Evaluation | `nanoplm eval get-yaml` | `nanoplm eval from-yaml` | [eval.yaml](https://peymanvahidi.github.io/nanoplm/reference/eval/) |
 
-  shuffle_backend: "auto"  # auto -> seqkit if available, else fast
-  shuffle: true
-  shuffle_seed: 24
-  filter_skip_n: 0
+The reference tables are generated directly from the `get-yaml` templates and the config
+dataclasses, and CI fails if they drift — so they cannot go stale the way a hand-written
+README section can.
 
-# Pretrain config (used when pipeline_mode: 'pretrain')
-# A .data_manifest file will be created in output_dir for use by pretrain pipeline
-pretrain_config:
-  output_dir: "output/data/pretrain_data"  # Will contain train/ and val/ subdirs
-  samples_per_shard: 2000
-  max_workers: 2  # -1 to use all available CPUs
-  force: false
+**Start here:** [How the pipeline fits together](https://peymanvahidi.github.io/nanoplm/pipeline/)
+· [Your first PLM](https://peymanvahidi.github.io/nanoplm/start/first-plm/)
+· [Troubleshooting](https://peymanvahidi.github.io/nanoplm/troubleshooting/)
 
-# Distillation config (used when pipeline_mode: 'distillation')
-# A .data_manifest file will be created in output_dir for use by distill pipeline
-distillation_config:
-  output_dir: "output/data/distillation_data"  # Will contain train/ and val/ subdirs
-  on_the_fly: false  # If true, skip embedding generation (embeddings computed during training)
-  samples_per_shard: 2000  # -1 for single file (no sharding)
-  teacher_model: "prott5"
-  embed_calc_batch_size: 4
-
-# Data directories
-data_dirs:
-  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
-  # swissprot: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
-  # trembl: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz"
-  # uniref50: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
-  # uniref90: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz"
-  # uniref100: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz"
-  compressed_fasta: "output/data/raw/uniref50.fasta.gz"
-  extracted_fasta: "output/data/raw/uniref50.fasta"
-  shuffled_fasta: "output/data/raw/uniref50_shuffled.fasta"
-  filtered_fasta: "output/data/filter/uniref50_filtered.fasta"
-  splitted_fasta_dir: "output/data/split"
-```
-
-## Pretraining YAML
-
-```yaml
-# Pretraining configuration for nanoPLM
-#
-# IMPORTANT: Before running pretraining, ensure you have prepared your data with:
-#   1. Set pipeline_mode: 'pretrain' in params.yaml
-#   2. Run: nanoplm data from-yaml
-# This will generate binary shards and a .data_manifest file.
-
-model:
-  hidden_size: 768
-  intermediate_size: 1536
-  num_hidden_layers: 12
-  num_attention_heads: 8
-  vocab_size: 32
-  mlp_activation: "swiglu"
-  mlp_dropout: 0.0
-  mlp_bias: false
-  attention_bias: false
-  attention_dropout: 0.0
-  classifier_activation: "gelu"
-  # The options below only work on pure-torch and TE pipelines
-  use_resid_lambdas: true  # scales residual stream per layer
-  use_x0_lambdas: true  # blends initial embedding x0 per layer
-  use_qk_norm: false  # applies RMS norm to Q/K in attention
-  use_canon_layers: true  # enables bidirectional Canon-ABCD (pure_torch only)
-  canon_layers_mode: "ac"  # subset of Canon sites (A/B/C/D); "ac" is lighter/faster than full "abcd"
-  canon_layers_kernel_size: 5  # symmetric Canon kernel size (allowed: 3/5/7, default: 5)
-
-pretraining:
-  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
-  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.
-  dataset_dir: "output/data/pretrain_data"
-
-  # Output model path
-  ckp_dir: "output/pretraining_checkpoints"
-
-  # Hyperparameters
-  micro_batch_size: 64
-  global_batch_size: 1048576  # 2^20 ≈ 1M tokens/step (based on PLM best practices)
-  #   micro_batch_size: samples per GPU per forward pass (limited by GPU memory)
-  #   global_batch_size: total tokens per optimizer step across all GPUs
-  #   gradient_accumulation_steps is inferred automatically:
-  #     grad_accum = ceil(global_batch_size / (micro_batch_size * max_seq_len * num_gpus))
-  num_epochs: 10
-  warmup_ratio: 0.05
-
-  optimizer: "adamw"  # adamw, stable_adamw, muon, normuon
-  # AdamW hyperparameters (also used for AdamW side [1D and embedding/unembed params] when optimizer=muon or normuon)
-  adam_beta1: 0.9
-  adam_beta2: 0.999
-  adam_epsilon: 1e-8
-  adam_learning_rate: 1e-4  # AdamW LR (Muon uses muon_learning_rate)
-  max_grad_norm: .inf  # set to .inf (equivalent to float("inf")) to disable clipping
-  warmup_steps: 302
-  lr_decay_to_fraction: 0.1
-  lr_schedule: "cosine" # Linear or Cosine
-  adam_weight_decay: 0.0
-  # Muon/NorMuon hyperparameters (used only when optimizer: muon or normuon)
-  muon_learning_rate: 1e-3
-  muon_weight_decay: 0.01
-  muon_cautious_weight_decay: true
-  muon_use_polar_express: true
-  muon_momentum: 0.95
-  muon_nesterov: true
-  muon_eps: 1e-7
-  mlm_probability: 0.3
-  mlm_masking_strategy: "token" # token or span
-  mlm_span_mean_length: 3.0 # used only when mlm_masking_strategy: "span"
-  mlm_span_max_length: 10 # used only when mlm_masking_strategy: "span"
-  mask_replace_prob: 0.8
-  random_token_prob: 0.1
-  keep_probability: 0.1
-  logging_steps: 1
-  eval_steps: 250
-  save_steps: 5000
-  seed: 42
-  num_workers: "auto"
-  prefetch_factor: 2
-  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate
-  # padding waste and increase GPU utilization. Requires flash attention and --pure-torch/--pure-te
-  use_packing: true
-  # Experimental throughput optimization: with packing, enables static input sizes which enables the use of torch.compile(dynamic=False) and cudagraphs
-  use_static_inp_size: true
-
-  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)
-  # When bf16 is true, automatically selects the best precision for your hardware:
-  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32
-  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback
-  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)
-  #   - CPU: fp32 (no mixed precision)
-  bf16: true
-  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)
-             # Provides 3x faster fp32 matmuls with negligible precision loss
-  fp8: false  # Enable FP8 Linear matmuls in pure_torch/pure_te paths (CUDA, best on H100+)
-
-  multi_gpu: true
-  world_size: 'auto'  # Use "auto" if you want to use all available GPUs
-  project_name: "nanoplm-pretraining"
-
-# Pure-torch training loop settings (alternative to HF Trainer).
-pure_torch:
-  enabled: false
-  # torch.compile: compile the model for faster training. Disable for debugging,
-  # unsupported hardware (e.g. Apple Silicon), or to avoid warmup overhead.
-  use_compile: true
-  # Sequence packing: concatenates shorter sequences into fewer rows to eliminate
-  # padding waste and increase GPU utilization. Requires flash attention.
-  use_packing: false
-  # Fixed row count for static-shape compilation when use_packing is true (enables torch.compile dynamic=False).
-  # Set to ceil(micro_batch_size * avg_len / max_seq_len) + margin. Leave null for dynamic=True.
-  target_packed_rows: null
-
-resume:
-  # Set is_resume: true to resume training from a checkpoint
-  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir
-  # extra_epochs: adds to 'pretraining.num_epochs' to define total epochs.
-  is_resume: false
-  checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
-  extra_epochs: 0
-```
-
-## Distill YAML
-
-```yaml
-# Distillation configuration for nanoPLM
-#
-# IMPORTANT: Before running distillation, ensure you have prepared your data with:
-#   1. Set pipeline_mode: 'distillation' in params.yaml
-#   2. Set distillation_config.on_the_fly in params.yaml:
-#      - false (default): Pre-compute teacher embeddings during data preparation
-#      - true: Generate teacher embeddings on-the-fly during training
-#   3. Run: nanoplm data from-yaml
-# This will generate a .data_manifest file with the appropriate configuration.
-
-model:
-  hidden_size: 1024
-  intermediate_size: 2048
-  num_hidden_layers: 16
-  num_attention_heads: 16
-  mlp_activation: "swiglu"
-  mlp_dropout: 0.0
-  mlp_bias: false
-  attention_bias: false
-  attention_dropout: 0.0
-  classifier_activation: "gelu"
-  projection_layer: true  # Set to false if student hidden_size matches teacher (1024)
-
-distillation:
-
-  # Dataset directory (contains .data_manifest from nanoplm data from-yaml)
-  # The manifest automatically provides:
-  #   - max_seq_len, max_seqs_num, val_ratio
-  #   - on_the_fly mode and dataset paths (FASTA or H5)
-  # Note: paths are RELATIVE to where you RUN the command, NOT the YAML file.
-  dataset_dir: "output/data/distillation_data"
-
-  # Output checkpoint path
-  ckp_dir: "output/distillation_checkpoints"
-
-  # Training hyperparameters
-  num_epochs: 10
-  batch_size: 32
-  learning_rate: 1e-3
-  gradient_accumulation_steps: 1
-  warmup_ratio: 0.05
-
-  # LR scheduler
-  lr_scheduler: "cosine"  # cosine, linear, polynomial, constant
-  lr_scheduler_kwargs: {}
-
-  # Data loader optimization
-  max_open_files: 5
-  chunk_size: 32
-  prefetch_batches: 2
-  use_threading: true
-  num_workers: 4
-
-  # Checkpointing
-  project_name: "nanoplm-distillation"
-  logging_steps: 1
-  eval_steps: 250
-  save_steps: 5000
-
-  # Mixed precision training (recommended: keep enabled for 1.5-3x speedup)
-  # When bf16 is true, automatically selects the best precision for your hardware:
-  #   - CUDA Ampere+ (A100, RTX 3090+): bf16 + TF32
-  #   - CUDA Volta/Turing (V100, RTX 2080): fp16 fallback
-  #   - Apple Silicon (M1/M2/M3): fp16 (hardware accelerated)
-  #   - CPU: fp32 (no mixed precision)
-  bf16: true
-  tf32: true  # TF32 mode on Ampere+ CUDA GPUs only (automatically not used on MPS/CPU)
-             # Provides 3x faster fp32 matmuls with negligible precision loss
-
-  # Distributed training
-  multi_gpu: false
-  world_size: 1
-  seed: 42
-
-resume:
-  # Set is_resume: true to resume training from a checkpoint
-  # When resuming, the model, tokenizer, and training state will be loaded from checkpoint_dir
-  # extra_epochs: adds to 'distillation.num_epochs' to define total epochs.
-  is_resume: false
-  checkpoint_dir: "output/distillation/run-1/checkpoint-1"
-  extra_epochs: 0
-```
-
-Tip: Paths are resolved relative to where you run the command (not where the YAML lives).
+Paths inside a config are resolved relative to the config file's directory.
 
 ---
 

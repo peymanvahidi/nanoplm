@@ -739,7 +739,7 @@ def kd_reshard(input_file: str, n_shards: int, output_dir: str, total_sequences:
 @click.help_option("--help", "-h")
 def get_yaml(output, distillation, force):
     """Generate template data.yaml + dvc.yaml for the data pipeline."""
-    from nanoplm.cli._templates import PRETRAIN_DATA_YAML, DISTILL_DATA_YAML
+    from nanoplm.cli.templates import load_template
     from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
     import yaml
 
@@ -748,11 +748,11 @@ def get_yaml(output, distillation, force):
 
     if distillation:
         params_filename = "distillation_data.yaml"
-        params_content = DISTILL_DATA_YAML
+        params_content = load_template("data_distill")
         kind = "distillation"
     else:
         params_filename = "data.yaml"
-        params_content = PRETRAIN_DATA_YAML
+        params_content = load_template("data_pretrain")
         kind = "pretrain"
 
     params_path = output_path / params_filename

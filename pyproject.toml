@@ -58,6 +58,7 @@ nanoplm-eval = "nanoplm.cli.eval:eval"
 
 [project.optional-dependencies]
 eval = ["biotrainer==1.4.0"]
+docs = ["pyyaml>=6"]
 
 [project.urls]
 "Homepage" = "https://github.com/peymanvahidi/nanoplm"
@@ -67,6 +68,7 @@ eval = ["biotrainer==1.4.0"]
 "nanoplm.pretraining" = ["csrc/*.c"]
 "nanoplm.data" = ["csrc/*.c"]
 "nanoplm.pretraining.models.modern_bert" = ["csrc/*.cpp", "csrc/*.cu"]
+"nanoplm.cli.templates" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -1,0 +1,18 @@
+---
+title: eval.yaml
+description: Every field in the evaluation config, extracted from the EvalConfig dataclass.
+---
+
+import ReferenceFields from '../../../components/ReferenceFields.astro';
+
+`eval.yaml` scores a trained checkpoint on downstream benchmarks. Scaffold it with `nanoplm eval get-yaml`, edit it, then run `nanoplm eval from-yaml`. See [Evaluate](/nanoplm/pipeline/eval/) for the walkthrough.
+
+The surface is flat (a single `eval:` block) and it is short because a checkpoint is self-describing. It carries its own `model_config.yaml`, so the one field you must supply is [`checkpoint_dir`](#eval-checkpoint_dir), which accepts either a `checkpoint-*` directory or a `run-*` directory (in which case the newest checkpoint inside it is used). Required fields carry a teal asterisk.
+
+Two constraints are worth knowing before you run it. Evaluation needs the `eval` extra
+(`uv pip install -e ".[eval]"` or the GitHub form in [Install](/nanoplm/start/install/)), and it
+loads **pure-torch checkpoints only**. [`tasks`](#eval-tasks) is honored only when
+[`parallel_tasks`](#eval-parallel_tasks) is greater than `0` (default `0`); in sequential mode it is
+ignored with a warning.
+
+<ReferenceFields surface="eval" />

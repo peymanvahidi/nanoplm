@@ -1,0 +1,104 @@
+/* website/src/styles/custom.css
+   nanoPLM "lab-instrument" theme — protein-teal accent, near-black dark mode,
+   monospace code, restrained scientific-tool aesthetic. */
+
+:root {
+  /* Protein-teal accent ramp (dark-mode tuned) */
+  --sl-color-accent-low: #052e2b;
+  --sl-color-accent: #14b8a6;
+  --sl-color-accent-high: #99f6e4;
+
+  /* Near-black "instrument" surface palette */
+  --sl-color-white: #f3f6f6;
+  --sl-color-gray-1: #e1e7e7;
+  --sl-color-gray-2: #c0c8c8;
+  --sl-color-gray-3: #8a9596;
+  --sl-color-gray-4: #56625f;
+  --sl-color-gray-5: #364240;
+  --sl-color-gray-6: #1d2426;
+  --sl-color-black: #14181c;
+
+  /* Page + chrome backgrounds */
+  --sl-color-bg: #14181c;
+  --sl-color-bg-sidebar: #11151a;
+  --sl-color-hairline-shade: #232b2e;
+
+  /* Typography */
+  --sl-font: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --sl-font-mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, "SF Mono",
+    Menlo, Consolas, "Liberation Mono", monospace;
+
+  --sl-text-code: 0.875em;
+}
+
+/* Light mode — paper-white instrument panel */
+:root[data-theme="light"] {
+  --sl-color-accent-low: #c7f5ee;
+  --sl-color-accent: #0d9488;
+  --sl-color-accent-high: #134e4a;
+
+  --sl-color-white: #14181c;
+  --sl-color-gray-1: #1d2426;
+  --sl-color-gray-2: #364240;
+  --sl-color-gray-3: #56625f;
+  --sl-color-gray-4: #8a9596;
+  --sl-color-gray-5: #c0c8c8;
+  --sl-color-gray-6: #eef2f2;
+  --sl-color-gray-7: #f6f8f8;
+  --sl-color-black: #ffffff;
+
+  --sl-color-bg: #fbfdfd;
+  --sl-color-bg-sidebar: #f4f7f7;
+  --sl-color-hairline-shade: #e3e9e9;
+}
+
+/* A touch more breathing room + crisp monospace for code/config */
+:root {
+  --sl-content-width: 50rem;
+}
+
+/* Cap the right "On this page" rail. By default Starlight hands it half of all
+   leftover space on wide screens, so it balloons past 30rem. Match it to the
+   left sidebar width and keep the article centered between the two rails. */
+@media (min-width: 72rem) {
+  .right-sidebar-container {
+    width: var(--sl-sidebar-width);
+  }
+  [data-has-sidebar][data-has-toc] .main-pane {
+    width: calc(100% - var(--sl-sidebar-width));
+    --sl-content-margin-inline: auto;
+  }
+}
+
+.sl-markdown-content code:not(:where(.expressive-code *)) {
+  font-family: var(--sl-font-mono);
+  font-size: var(--sl-text-code);
+  border: 1px solid var(--sl-color-hairline-shade);
+  border-radius: 0.25rem;
+  padding: 0.1em 0.35em;
+}
+
+/* Slightly tighter, more "instrument readout" table styling for the reference pages */
+.sl-markdown-content table {
+  font-size: 0.9rem;
+}
+.sl-markdown-content th {
+  font-family: var(--sl-font-mono);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+/* Starlight's reset gives every <code> `overflow-wrap: anywhere`, which drops its
+   min-content width to a single character. Inside a table that lets the auto
+   layout squeeze code columns to nothing, splitting `data.yaml` into "data.yam"
+   + "l". `break-word` keeps min-content at the full token, so the column sizes
+   itself to fit, while still breaking a token too long for the column at all
+   (e.g. the UniProt URLs) instead of overflowing. */
+.sl-markdown-content :is(td, th) code:not(:where(.expressive-code *)) {
+  overflow-wrap: break-word;
+}
+
+/* Accent the site title to reinforce the protein-teal identity */
+.site-title {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}

@@ -1,0 +1,338 @@
+---
+// website/src/components/PipelineDiagram.astro
+// The one diagram on the site: three stages, each with the same three-step
+// loop (get-yaml → edit the config → from-yaml), and the artifacts that flow
+// between them. Used on the home page and the pipeline overview.
+// Zero JS; styled entirely with Starlight's own theme variables so it tracks
+// light/dark automatically.
+
+const STAGES = [
+  {
+    n: '1',
+    name: 'Prepare data',
+    verb: 'data',
+    file: 'data.yaml',
+    blurb: 'FASTA in, tokenized shards out.',
+    href: '/nanoplm/pipeline/data/',
+  },
+  {
+    n: '2',
+    name: 'Pretrain',
+    verb: 'pretrain',
+    file: 'pretrain.yaml',
+    blurb: 'Shards in, a trained model out.',
+    href: '/nanoplm/pipeline/pretrain/',
+  },
+  {
+    n: '3',
+    name: 'Evaluate',
+    verb: 'eval',
+    file: 'eval.yaml',
+    blurb: 'A checkpoint in, benchmark scores out.',
+    href: '/nanoplm/pipeline/eval/',
+  },
+];
+
+// What each stage hands to the next. These are the real filenames on disk,
+// they are the whole point of the diagram.
+const ARTIFACTS = ['shard_*.bin\n.data_manifest', 'checkpoint-N/\nmodel_config.yaml'];
+---
+
+<div class="pipe-wrap">
+  <div class="pipe">
+    {
+      STAGES.map((s, i) => (
+        <>
+          <a class="pipe-stage" href={s.href}>
+            <span class="pipe-head">
+              <span class="pipe-n">{s.n}</span>
+              <span class="pipe-name">{s.name}</span>
+            </span>
+            <span class="pipe-blurb">{s.blurb}</span>
+            <span class="pipe-loop">
+              <code class="pipe-cmd">nanoplm {s.verb} get-yaml</code>
+              <span class="pipe-edit">
+                edit <code class="pipe-file">{s.file}</code>
+              </span>
+              <code class="pipe-cmd">nanoplm {s.verb} from-yaml</code>
+            </span>
+          </a>
+          {i < ARTIFACTS.length && (
+            <div class="pipe-arrow" aria-hidden="true">
+              <span class="pipe-artifact">{ARTIFACTS[i]}</span>
+              <span class="pipe-line" />
+            </div>
+          )}
+        </>
+      ))
+    }
+  </div>
+</div>
+
+<style>
+  /* The wrapper is a container-query root: the grid goes 3-across only when
+     the diagram is wide enough for one-line commands; otherwise it stacks.
+     It stays exactly as wide as the prose column, no breakout. */
+  .pipe-wrap {
+    container-type: inline-size;
+    margin: 1.75rem 0 2.25rem;
+  }
+
+  /* Default: stacked. The arrows become short vertical connectors. */
+  .pipe {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.4rem;
+  }
+
+  /* Cards sit a step above the page background: a faint top-lit gradient in
+     dark mode (overridden to flat white in light mode below). */
+  .pipe-stage {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    padding: 1rem 1.05rem;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.625rem;
+    background: linear-gradient(
+      180deg,
+      var(--sl-color-gray-6) 0%,
+      color-mix(in srgb, var(--sl-color-gray-6) 55%, var(--sl-color-black)) 100%
+    );
+    text-decoration: none;
+    color: var(--sl-color-white);
+    transition:
+      border-color 0.15s ease,
+      box-shadow 0.15s ease,
+      transform 0.15s ease;
+  }
+  :global([data-theme='light']) .pipe-stage {
+    background: var(--sl-color-black);
+    box-shadow: 0 1px 2px rgba(20, 24, 28, 0.04);
+  }
+  .pipe-stage:hover {
+    border-color: var(--sl-color-accent);
+    box-shadow: 0 6px 20px color-mix(in srgb, var(--sl-color-accent) 14%, transparent);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .pipe-stage:hover {
+      transform: translateY(-2px);
+    }
+  }
+  .pipe-stage:focus-visible {
+    outline: 2px solid var(--sl-color-accent);
+    outline-offset: 2px;
+  }
+
+  /* Cards are links, with a quiet affordance in the corner that answers on hover. */
+  .pipe-stage::after {
+    content: '→';
+    position: absolute;
+    top: 0.8rem;
+    right: 0.9rem;
+    font-size: 0.8rem;
+    line-height: 1;
+    color: var(--sl-color-gray-4);
+    transition:
+      color 0.15s ease,
+      transform 0.15s ease;
+  }
+  .pipe-stage:hover::after {
+    color: var(--sl-color-accent);
+    transform: translateX(2px);
+  }
+
+  .pipe-head {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+  }
+  .pipe-n {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 1.35rem;
+    height: 1.35rem;
+    border-radius: 999px;
+    background: var(--sl-color-accent-low);
+    font-family: var(--sl-font-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--sl-color-accent-high);
+    transition:
+      background-color 0.15s ease,
+      color 0.15s ease;
+  }
+  .pipe-stage:hover .pipe-n {
+    background: var(--sl-color-accent);
+    color: var(--sl-color-black);
+  }
+  .pipe-name {
+    font-weight: 600;
+    font-size: 0.95rem;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+  }
+  .pipe-blurb {
+    font-size: 0.8rem;
+    color: var(--sl-color-gray-3);
+    line-height: 1.45;
+  }
+
+  /* The same three-step loop every stage has, typeset like a shell session:
+     `$` for the two commands, `#` for the human step between them. */
+  .pipe-loop {
+    display: flex;
+    flex-direction: column;
+    gap: 0.32rem;
+    margin-top: auto;
+    padding-top: 0.65rem;
+    border-top: 1px solid var(--sl-color-hairline-shade);
+    font-size: 0.72rem;
+    line-height: 1.45;
+  }
+  /* Qualified selectors so these beat the site-wide inline-code chip style
+     (border + padding) from custom.css: plain mono, no chrome. */
+  .pipe-stage .pipe-cmd {
+    font-family: var(--sl-font-mono);
+    font-size: inherit;
+    color: var(--sl-color-gray-2);
+    background: none;
+    border: none;
+    padding: 0;
+  }
+  .pipe-cmd::before {
+    content: '$ ';
+    color: var(--sl-color-accent);
+  }
+  .pipe-edit {
+    font-family: var(--sl-font-mono);
+    color: var(--sl-color-gray-3);
+  }
+  .pipe-edit::before {
+    content: '# ';
+    color: var(--sl-color-gray-4);
+  }
+  .pipe-stage .pipe-file {
+    font-family: var(--sl-font-mono);
+    font-size: inherit;
+    color: var(--sl-color-accent-high);
+    background: none;
+    border: none;
+    padding: 0;
+  }
+
+  /* The arrow carries the artifact name: the handoff IS the content.
+     Stacked: a file chip beside a short dashed drop line. */
+  .pipe-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.7rem;
+    min-height: 2.9rem;
+  }
+  .pipe-artifact {
+    font-family: var(--sl-font-mono);
+    font-size: 0.66rem;
+    line-height: 1.5;
+    white-space: pre-line;
+    text-align: center;
+    color: var(--sl-color-gray-2);
+    background: var(--sl-color-gray-6);
+    border: 1px solid var(--sl-color-hairline-shade);
+    border-radius: 0.4rem;
+    padding: 0.25rem 0.6rem;
+  }
+  :global([data-theme='light']) .pipe-artifact {
+    background: var(--sl-color-black);
+  }
+  .pipe-line {
+    display: block;
+    position: relative;
+    width: 0;
+    height: 2.1rem;
+    border-left: 1px dashed var(--sl-color-gray-4);
+  }
+  .pipe-line::after {
+    content: '';
+    position: absolute;
+    left: -4px;
+    bottom: -1px;
+    border-left: 3.5px solid transparent;
+    border-right: 3.5px solid transparent;
+    border-top: 6px solid var(--sl-color-gray-4);
+  }
+
+  /* Three-across, but only once the cards genuinely fit their commands on
+     one line, tuned so the full prose column (~50rem) qualifies. Below
+     that the stacked layout stays, since stacked beats wrapped
+     mid-command. The prompt glyphs and chip chrome are dropped here: at
+     these sizes every character of width goes to the commands themselves. */
+  @container (min-width: 49rem) {
+    .pipe {
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: stretch;
+      gap: 0.4rem;
+    }
+    /* Inline padding is deliberately tight: every recovered fraction of a rem
+       goes to keeping the command text at a legible size. */
+    .pipe-stage {
+      padding: 0.85rem 0.65rem;
+    }
+    .pipe-stage::after {
+      top: 0.75rem;
+      right: 0.65rem;
+      font-size: 0.75rem;
+    }
+    .pipe-blurb {
+      font-size: 0.76rem;
+    }
+    .pipe-loop {
+      font-size: 0.68rem;
+      gap: 0.28rem;
+    }
+    .pipe-stage .pipe-cmd {
+      font-size: 0.65rem;
+      white-space: nowrap;
+    }
+    .pipe-cmd::before,
+    .pipe-edit::before {
+      content: none;
+    }
+    .pipe-arrow {
+      flex-direction: column;
+      gap: 0.35rem;
+      min-width: 4rem;
+      padding-inline: 0.05rem;
+    }
+    .pipe-artifact {
+      font-size: 0.6rem;
+      line-height: 1.4;
+      background: none;
+      border: none;
+      padding: 0;
+      color: var(--sl-color-gray-2);
+    }
+    :global([data-theme='light']) .pipe-artifact {
+      background: none;
+    }
+    .pipe-line {
+      width: 100%;
+      height: 0;
+      border-left: none;
+      border-top: 1px dashed var(--sl-color-gray-4);
+    }
+    .pipe-line::after {
+      left: auto;
+      right: -1px;
+      top: -4px;
+      bottom: auto;
+      border-left: 6px solid var(--sl-color-gray-4);
+      border-top: 3.5px solid transparent;
+      border-bottom: 3.5px solid transparent;
+      border-right: none;
+    }
+  }
+</style>

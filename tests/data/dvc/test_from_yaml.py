@@ -49,9 +49,9 @@ data_params:
 
 def test_from_yaml_regenerates_dvc_yaml(tmp_path, monkeypatch):
     """from-yaml should rewrite dvc.yaml to match the current data.yaml."""
-    from nanoplm.cli._templates import PRETRAIN_DATA_YAML
+    from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
-    cfg.write_text(PRETRAIN_DATA_YAML)
+    cfg.write_text(load_template("data_pretrain"))
     # Stub out dvc subprocess
     monkeypatch.setattr("subprocess.run", lambda *a, **k: type("R", (), {"returncode": 0})())
     monkeypatch.chdir(tmp_path)
@@ -65,10 +65,10 @@ def test_from_yaml_regenerates_dvc_yaml(tmp_path, monkeypatch):
 def test_from_yaml_summary_uses_yaml_manifest(tmp_path, monkeypatch):
     """_print_summary should successfully read the YAML-formatted manifest."""
     import yaml as _yaml
-    from nanoplm.cli._templates import PRETRAIN_DATA_YAML
+    from nanoplm.cli.templates import load_template
 
     # Materialize config and override output_dir to tmp_path
-    cfg_dict = _yaml.safe_load(PRETRAIN_DATA_YAML)
+    cfg_dict = _yaml.safe_load(load_template("data_pretrain"))
     cfg_dict["data_dirs"]["output_dir"] = str(tmp_path / "pretrain_out")
     cfg = tmp_path / "data.yaml"
     cfg.write_text(_yaml.safe_dump(cfg_dict))
@@ -106,10 +106,10 @@ def test_from_yaml_summary_uses_yaml_manifest(tmp_path, monkeypatch):
 
 def test_from_yaml_fix_preserves_comments(tmp_path):
     """--fix must not destroy YAML comments in the user's data.yaml."""
-    from nanoplm.cli._templates import PRETRAIN_DATA_YAML
+    from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
-    cfg.write_text(PRETRAIN_DATA_YAML)
-    # PRETRAIN_DATA_YAML has commented-out alt-URL lines starting with "# swissprot"
+    cfg.write_text(load_template("data_pretrain"))
+    # data_pretrain.yaml has commented-out alt-URL lines starting with "# swissprot"
     assert "# swissprot:" in cfg.read_text()
 
     # Stub dvc subprocess

@@ -1,0 +1,225 @@
+---
+title: 1. Prepare data
+description: Turn a FASTA file into tokenized binary shards and a manifest, with nanoplm data get-yaml and nanoplm data from-yaml.
+---
+
+import { FileTree, Steps } from '@astrojs/starlight/components';
+
+The data stage takes a FASTA file (a URL or a local path) and produces the two things pretraining consumes: **tokenized binary shards** and a **`.data_manifest`**.
+
+In between, it runs a fixed sequence of steps:
+
+```
+download → extract → validate → shuffle → filter → split → tokenize → write manifest
+```
+
+## Run it
+
+<Steps>
+
+1. Scaffold the config.
+
+   ```sh
+   nanoplm data get-yaml
+   ```
+
+   ```text title="Output"
+   Wrote data.yaml and dvc.yaml in <cwd>.
+   Edit data.yaml and run `nanoplm data from-yaml` to execute.
+   ```
+
+2. Edit `data.yaml` (the whole file is shown below; it is short).
+
+3. Run the pipeline.
+
+   ```sh
+   nanoplm data from-yaml
+   ```
+
+   ```text title="Output (trimmed)"
+   Regenerated dvc.yaml in <cwd>
+   Running dvc repro (full pipeline)...
+   # ...
+   Successfully created 9 shard files:
+     output/data/pretrain_data/train/shard_0000.bin
+   # ...
+   Wrote manifest: output/data/pretrain_data/.data_manifest
+
+   Pretraining data pipeline complete.
+
+     Source:          https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz
+     Total sequences: 20000
+       Train:         18000
+       Val:           2000
+     Manifest:        output/data/pretrain_data/.data_manifest
+   ```
+
+</Steps>
+
+Under the hood those steps are a [DVC](https://dvc.org/) DAG: `from-yaml` regenerates `dvc.yaml` from your config and runs `dvc repro`. You do not have to think about DVC, but it explains two behaviours you will notice. Re-running after an edit only redoes the stages your edit affected, and an interrupted run picks up where it stopped instead of re-downloading 60 GB of TrEMBL.
+
+## The whole config
+
+`data.yaml` is about 25 lines, so here it is in full.
+
+```yaml title="data.yaml"
+data_dirs:
+  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
+  local_fasta: null          # set this INSTEAD of url to use a file already on disk
+
+  compressed_fasta:   "output/data/raw/uniprot_sprot.fasta.gz"  # only used when the source is .gz
+  extracted_fasta:    "output/data/raw/uniprot_sprot.fasta"
+  validation_dir:     "output/data/validation"
+  shuffled_fasta:     "output/data/raw/uniprot_sprot_shuffled.fasta"
+  filtered_fasta:     "output/data/filter/uniprot_sprot_filtered.fasta"
+  splitted_fasta_dir: "output/data/split"
+  output_dir:         "output/data/pretrain_data"   # pretrain.yaml's dataset_dir points here
+
+data_params:
+  seqs_num: 20000            # -1 keeps every sequence; start small and scale up once the loop works
+  min_seq_len: 20            # fragments below this teach the model nothing
+  max_seq_len: 512           # truncation length AND the length pretraining does its token math with
+  val_ratio: 0.1
+  shuffle: true
+  shuffle_seed: 24           # same seed, same split: so two runs stay comparable
+  drop_invalid_sequences: false   # false = an invalid sequence FAILS the run instead of vanishing
+
+  samples_per_shard: 2000    # more, smaller shards give the dataloader more to parallelise over
+  max_workers: 2             # -1 uses every core; tokenization is the slow stage
+  register_tokens: 0         # 0-2 learnable scratch tokens after EOS; recorded in the manifest
+```
+
+## Choosing a source
+
+Set **exactly one** of `url` or `local_fasta`. Setting both, or neither, is an error:
+
+```text title="Output"
+Error: Set either data_dirs.url or data_dirs.local_fasta, not both.
+```
+
+A `local_fasta` is hard-linked rather than copied, so a 200 GB file costs nothing to "download". `compressed_fasta` only matters when the source ends in `.gz`; with a plain `.fasta` the extract step is not even added to the DAG, and the value is ignored.
+
+The scaffold ships the five built-in datasets as commented-out lines. Paste one into `url`:
+
+| Dataset | URL |
+| --- | --- |
+| `swissprot` | `https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz` |
+| `trembl` | `https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz` |
+| `uniref50` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz` |
+| `uniref90` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` |
+| `uniref100` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz` |
+
+Start with SwissProt (about 570k sequences). It downloads in minutes and is enough to prove your pipeline works before you commit to a UniRef-scale run.
+
+## The parameters that matter
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| [`seqs_num`](/nanoplm/reference/data/#data-data_params-seqs_num) | `20000` | How many sequences to keep after filtering. `-1` keeps all of them. |
+| [`min_seq_len`](/nanoplm/reference/data/#data-data_params-min_seq_len) | `20` | Sequences shorter than this are dropped. |
+| [`max_seq_len`](/nanoplm/reference/data/#data-data_params-max_seq_len) | `512` | Sequences are truncated to this length. See the callout below. |
+| [`val_ratio`](/nanoplm/reference/data/#data-data_params-val_ratio) | `0.1` | Fraction held out for validation loss. |
+| [`samples_per_shard`](/nanoplm/reference/data/#data-data_params-samples_per_shard) | `2000` | Sequences per `shard_NNNN.bin`. |
+| [`max_workers`](/nanoplm/reference/data/#data-data_params-max_workers) | `2` | Processes used for tokenization. `-1` uses every core. |
+| [`register_tokens`](/nanoplm/reference/data/#data-data_params-register_tokens) | `0` | 0, 1, or 2 learnable scratch tokens appended after EOS. Recorded in the manifest and injected into the model at pretrain time. |
+| [`drop_invalid_sequences`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences) | `false` | Whether a sequence with an unrecognised residue kills the run or gets excluded. See below. |
+
+:::caution[max_seq_len is set here and nowhere else]
+`max_seq_len` is written into `.data_manifest`, and pretraining reads it back to compute gradient accumulation: `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`. There is no `max_seq_len` key in `pretrain.yaml`. If you want longer sequences, change it here and re-run the data stage: the shards themselves have to change.
+:::
+
+Longer sequences cost quadratically in attention and linearly in memory, so `512` is a deliberate starting point rather than a limitation. Raise it when your proteins genuinely need the context.
+
+## Invalid sequences will stop you once
+
+Real FASTA files contain residues outside the 20 standard amino acids. The `check` stage finds them, and with the default `drop_invalid_sequences: false` it **fails the pipeline** rather than quietly changing your dataset:
+
+```sh
+nanoplm data from-yaml
+```
+
+```text title="Output (trimmed)"
+Running dvc repro (full pipeline)...
+# ...
+Error: Validation found 37 problematic sequence(s).
+  Inspect: output/data/validation/invalid.fasta
+  Summary: output/data/validation/validation.json
+
+To exclude these sequences and continue the pipeline:
+    nanoplm data from-yaml --fix
+```
+
+Look at `invalid.fasta` first: a large invalid count usually means the file is not what you thought it was. When the sequences are genuinely unusable, take the offer:
+
+```sh
+nanoplm data from-yaml --fix
+```
+
+```text title="Output (trimmed)"
+Set data.yaml: data_params.drop_invalid_sequences=true
+Regenerated dvc.yaml in <cwd>
+Running dvc repro (full pipeline)...
+# ...
+```
+
+`--fix` rewrites `drop_invalid_sequences: true` in your `data.yaml` **in place** and re-runs. The `filter` stage then excludes the IDs listed in `validation_dir/invalid_ids.txt`. Your config on disk now reflects what actually happened, which is the point: the change is visible in `git diff`, not hidden in a flag you forgot you passed.
+
+## What you get
+
+<FileTree>
+
+- output/data/
+  - raw/
+    - uniprot_sprot.fasta.gz downloaded
+    - uniprot_sprot.fasta extracted
+    - uniprot_sprot_shuffled.fasta
+  - validation/
+    - validation.json
+    - invalid.fasta
+    - invalid_ids.txt consumed by `filter --exclude-ids`
+  - filter/
+    - uniprot_sprot_filtered.fasta
+  - split/
+    - train.fasta
+    - val.fasta
+  - **pretrain_data/** point pretraining.dataset_dir here
+    - train/
+      - shard_0000.bin uint8 token ids
+      - shard_0000.idx.npy per-sequence lengths
+      - …
+    - val/
+      - …
+    - .data_manifest
+
+</FileTree>
+
+The manifest is the handoff to the next stage:
+
+```yaml title="output/data/pretrain_data/.data_manifest"
+# This file is AUTO-GENERATED by 'nanoplm data from-yaml'.
+# DO NOT EDIT THIS FILE MANUALLY.
+# To regenerate, run 'nanoplm data from-yaml' again with updated params.yaml.
+
+pipeline_mode: pretrain
+seqs_num: 20000
+min_seq_len: 20
+max_seq_len: 512
+val_ratio: 0.1
+train_dir: train
+val_dir: val
+train_sequences: 18000
+val_sequences: 2000
+num_register_tokens: 0
+created_at: '2026-07-14T19:32:04.118273'
+sharded: true
+samples_per_shard: 2000
+total_train_tokens: 6392418
+```
+
+You never edit this file. Pretraining reads `max_seq_len` and `num_register_tokens` out of it, which is exactly why those keys are absent from `pretrain.yaml`.
+
+## Next
+
+The manifest exists, so the pretraining stage now has everything it needs about your data. Move on to [2. Pretrain](/nanoplm/pipeline/pretrain/), and point `pretraining.dataset_dir` at the `output_dir` above.
+
+Every key in `data.yaml`, with its type and default, is in the [data.yaml reference](/nanoplm/reference/data/).

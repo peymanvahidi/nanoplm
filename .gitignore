@@ -64,30 +64,17 @@ scripts/
 # Planning directory (local only)
 .planning/
 
-docs/
+# Root-level scratch docs dir only. NOT anchored = would also match
+# website/src/content/docs/, which is the actual documentation source.
+/docs/
 
 # Local extension build cache
 .cache/
 agent_space/
 CLAUDE.md
+CLAUDE.local.md
 AGENTS.md
 
-old_baseline_src/
-autoeval_output_mlm_ab/
-autoeval_output_mlm_ab_max512/
-autoeval_output_lr5e4_pgym_max512/
-
-pretrain*.yaml
-sbatch*.sh
-
-# Local-only experimentation artifacts (not part of the repo)
-dion/
-.dvc/
-dvc.yaml
-dvc.lock
-params.yaml
-wandb_sync_daemon.py
-wandb_sync_daemon.lock
-wandb_sync_daemon.state.json
-Screenshot*.png
-canon_cutedsl.md
+# Docs site (Astro/Starlight)
+node_modules/
+website/.astro/*

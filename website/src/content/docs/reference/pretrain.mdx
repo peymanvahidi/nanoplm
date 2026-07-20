@@ -1,0 +1,53 @@
+---
+title: pretrain.yaml
+description: "Every field in the pretraining config, extracted from the nanoplm pretrain get-yaml template: model, pretraining, and resume."
+---
+
+import ReferenceFields from '../../../components/ReferenceFields.astro';
+
+`nanoplm pretrain get-yaml` writes a ~360-line `pretrain.yaml` with three blocks: `model:` (architecture), `pretraining:` (the training loop), and `resume:` (restarting from a checkpoint), plus a top-level `pure_torch: true` default. The fields below are extracted from that template and the config dataclasses behind it, so they cannot drift from the tool. Launch with `nanoplm pretrain from-yaml`.
+
+## Where to start
+
+A normal run touches roughly a dozen keys. The rest have defaults that work.
+
+- **Point at the data**: [`dataset_dir`](#pretrain-pretraining-dataset_dir) and [`ckp_dir`](#pretrain-pretraining-ckp_dir). Sequence length is **not** here: it comes from the dataset's `.data_manifest`.
+- **Size the model**: [`hidden_size`](#pretrain-model-hidden_size), [`intermediate_size`](#pretrain-model-intermediate_size), [`num_hidden_layers`](#pretrain-model-num_hidden_layers), [`num_attention_heads`](#pretrain-model-num_attention_heads).
+- **Size the batch**: [`micro_batch_seqs`](#pretrain-pretraining-micro_batch_seqs) is **sequences** per GPU per forward pass (the VRAM knob); [`global_batch_tokens`](#pretrain-pretraining-global_batch_tokens) is **tokens** per optimizer step. Gradient accumulation is inferred from those two plus the manifest's sequence length and your world size: you never set it.
+- **Set the duration**: a **token budget**, not epochs. With the default [`lr_schedule`](#pretrain-pretraining-lr_schedule) of `wsd`, the budget is [`stable_tokens`](#pretrain-pretraining-stable_tokens) plus [`decay_tokens`](#pretrain-pretraining-decay_tokens). With `warmup_stable`, `cosine`, or `linear` it is a single [`train_tokens`](#pretrain-pretraining-train_tokens) budget instead.
+- **Pick an optimizer**: [`optimizer`](#pretrain-pretraining-optimizer) and its learning rate: [`adam_learning_rate`](#pretrain-pretraining-adam_learning_rate), or [`muon_learning_rate`](#pretrain-pretraining-muon_learning_rate) for the Muon family. See [Choose an optimizer](/nanoplm/guides/optimizers/).
+
+Two semantics catch people out. **`stable_tokens` includes warmup**: it is the point at which decay begins, not a length added after warmup. `decay_tokens` *is* a length, added on top of it. See [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
+
+Every token budget has a step-based twin ([`stable_steps`](#pretrain-pretraining-stable_steps), [`decay_steps`](#pretrain-pretraining-decay_steps), [`max_steps`](#pretrain-pretraining-max_steps)) that replaces it. Set exactly one of each pair, never both. The template ships these (and `train_tokens`) commented out, because a template that set both forms at once would fail to load; they are documented below all the same.
+
+:::caution[Two traps that bite on the first run]
+The stock `resume:` block ships `mode: "decay"` with the decay fields filled in, so flipping only [`is_resume`](#pretrain-resume-is_resume) to `true` gives you a **decay** run rather than a continuation: set [`mode`](#pretrain-resume-mode) explicitly. Separately, the default [`optimizer`](#pretrain-pretraining-optimizer) is `normuon`, which needs Microsoft's `dion` package: a stock template will not start without a full `nanoplm deps install`.
+:::
+
+## Reading the reference
+
+The reference is laid out like the file it documents. Each of the three blocks is broken into the same labelled groups the template uses, carrying the template's own heading and its intro note, so a group you find here is the group you will scroll to in your editor. The panel on the right lists all of them.
+
+Every field is listed, including the ones a normal run never touches. Those are mostly:
+
+- The experimental architecture features and their tuning knobs: Canon layers, RePO, mHC-lite, differential attention, paired-head attention, NOBLE, MoE, recycling.
+- The FP8, `torch.compile`, and layerwise-debug knobs.
+- The step-based duration overrides (`train_tokens`, `stable_steps`, `decay_steps`, `max_steps`).
+
+Most of them are pure-torch only, but not all: a few FP8 fields are Transformer Engine recipe knobs. The backend marker next to a field name is the authoritative per-field answer; a field with no marker works on both backends. Pure-TE supports a strictly smaller surface than pure-torch; see [Choose a backend](/nanoplm/guides/backends/) and the [compatibility matrix](/nanoplm/reference/compatibility/).
+
+## The fields
+
+### model
+<ReferenceFields surface="pretrain" section="model" />
+
+### pretraining
+<ReferenceFields surface="pretrain" section="pretraining" />
+
+### resume
+<ReferenceFields surface="pretrain" section="resume" />
+
+The `resume:` block's template comment calls `lr_decay_to_fraction` an optional override for `mode: decay`. That comment is wrong: decay mode **requires** it, and the run raises `resume decay requires lr_decay_to_fraction` without it. `decay_shape` genuinely is optional and falls back to `1-sqrt`.
+
+Backend selection lives outside all three blocks, as the top-level `pure_torch:` / `pure_te:` booleans at the bottom of the template. The scaffold ships `pure_torch: true`; leave it alone for a normal run. A CLI flag can force a backend on but does not clear the other YAML key, so switch by editing those booleans (only one may be true). When a config fails to load, [Troubleshooting](/nanoplm/troubleshooting/) lists every validation error with its fix.

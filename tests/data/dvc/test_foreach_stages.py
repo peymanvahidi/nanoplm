@@ -8,9 +8,9 @@ from nanoplm.cli.data import data
 
 def test_dvc_dag_contains_foreach_variants(tmp_path, monkeypatch):
     """Verify the regenerated dvc.yaml has pre-tokenize@train / @val."""
-    from nanoplm.cli._templates import PRETRAIN_DATA_YAML
+    from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
-    cfg.write_text(PRETRAIN_DATA_YAML)
+    cfg.write_text(load_template("data_pretrain"))
     monkeypatch.setattr("subprocess.run",
                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.chdir(tmp_path)

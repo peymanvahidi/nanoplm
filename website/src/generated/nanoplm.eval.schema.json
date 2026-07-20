@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "x-nanoplm-surface": "eval",
+  "type": "object",
+  "properties": {
+    "checkpoint_dir": {
+      "type": "string",
+      "description": "Checkpoint path. Accepts a checkpoint-* directory or a run-* directory (the latest checkpoint inside the run-* is used)."
+    },
+    "framework": {
+      "type": "array",
+      "default": [
+        "pbc"
+      ],
+      "description": "Benchmark framework(s) to evaluate on. One or more of: pbc, flip, pgym."
+    },
+    "output_dir": {
+      "type": "string",
+      "default": "autoeval_output",
+      "description": "Directory where autoeval results, H5 embeddings, and per-task outputs are written."
+    },
+    "batch_size": {
+      "type": "integer",
+      "default": 16,
+      "description": "Batch size for embedding computation."
+    },
+    "min_seq_length": {
+      "type": "integer",
+      "default": 0,
+      "description": "Sequence length filters applied to benchmark datasets."
+    },
+    "max_seq_length": {
+      "type": "integer",
+      "default": 2000
+    },
+    "device": {
+      "type": "string",
+      "default": null,
+      "description": "Device override. When None, picks 'cuda' if available else 'cpu'."
+    },
+    "embedder_name": {
+      "type": "string",
+      "default": null,
+      "description": "Embedder name shown in the autoeval report. When None, defaults to the checkpoint directory stem."
+    },
+    "parallel_tasks": {
+      "type": "integer",
+      "default": 0,
+      "description": "Number of parallel workers for downstream task training. 0 = sequential (runs through biotrainer.autoeval_pipeline). >0 = parallel mode (GPU embedding first, then CPU task training in a ThreadPoolExecutor)."
+    },
+    "zero_shot_method": {
+      "type": "string",
+      "default": "masked_marginals",
+      "enum": [
+        "masked_marginals",
+        "wt_marginals",
+        "pseudoperplexity"
+      ],
+      "description": "Zero-shot scoring method when framework includes 'pgym'. One of: masked_marginals, wt_marginals, pseudoperplexity."
+    },
+    "tasks": {
+      "type": "array",
+      "default": null,
+      "description": "Optional whitelist of task names (e.g. PBC-secondary_structure). Parallel mode only \u2014 sequential mode warns and ignores."
+    },
+    "force_download": {
+      "type": "boolean",
+      "default": false,
+      "description": "Force re-download of framework datasets (use when new tasks land upstream)."
+    }
+  },
+  "required": [
+    "checkpoint_dir"
+  ]
+}

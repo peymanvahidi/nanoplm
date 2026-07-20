@@ -1,0 +1,29 @@
+---
+title: Compatibility matrix
+description: Which model and pipeline flags may be combined with Huginn-style recycling, and which are rejected at config load.
+---
+
+import CompatibilityMatrix from '../../../components/CompatibilityMatrix.astro';
+
+Huginn-style recycling activates when `model.recycling_loop_count` is greater than `1` (default `1`, meaning off). Recycling weight-ties and loops part of the layer stack, which is incompatible with several other architecture features. This page is the list.
+
+## How to read it
+
+Each flag below carries one of four verdicts:
+
+- **Rejected**: the combination is refused at **config load**, before training starts. You get an error and a non-zero exit, not a degraded run.
+- **Warning**: the run proceeds, but the combination is untested. Read the note and decide.
+- **Caveat**: the run proceeds and the flag works, with a correctness or performance qualifier attached.
+- **Compatible**: known to work with recycling.
+
+The **Condition** column matters: some entries fire only in a particular state. `pure_torch` is listed as rejected *when it is false*, which is the matrix's way of saying recycling requires the pure-torch backend.
+
+The matrix is generated from `recycling_compatibility.yaml` (the same rules file the trainer reads when it validates your config), so what you see here is exactly what the tool enforces.
+
+## Recycling is pure-torch only
+
+That is one instance of a broader rule: **Transformer Engine supports a strictly smaller surface than pure-torch.** Canon layers, RePO, differential attention, paired-head attention, NOBLE, MoE, `mlp_activation: glu`, unfused QKV, `lr_schedule: wsd`, and `resume.mode: decay` are pure-torch only as well, and none of them appear in this matrix because it scopes to recycling alone. See [Choose a backend](/nanoplm/guides/backends/) for the full split, and [Recycling](/nanoplm/guides/recycling/) for what the feature does and when it pays off.
+
+If one of these combinations fails your run, [Troubleshooting](/nanoplm/troubleshooting/) has the exact error text and the fix.
+
+<CompatibilityMatrix />
