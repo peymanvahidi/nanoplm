@@ -46,7 +46,12 @@
     "parallel_tasks": {
       "type": "integer",
       "default": 0,
-      "description": "Number of parallel workers for downstream task training. 0 = sequential (runs through biotrainer.autoeval_pipeline). >0 = parallel mode (GPU embedding first, then CPU task training in a ThreadPoolExecutor)."
+      "description": "Number of parallel workers for downstream task training. 0 = sequential (runs through biotrainer's AutoEval, which also deduplicates and computes embeddings once across every requested framework). >0 = parallel mode (GPU embedding first, then CPU task training in a ThreadPoolExecutor)."
+    },
+    "development_mode": {
+      "type": "boolean",
+      "default": false,
+      "description": "When True, biotrainer evaluates on data SUBSETS only. biotrainer defaults this to True; nanoPLM defaults to False so a plain run is a full evaluation."
     },
     "zero_shot_method": {
       "type": "string",
