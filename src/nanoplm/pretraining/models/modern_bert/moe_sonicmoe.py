@@ -46,10 +46,25 @@ def sonicmoe_routed_experts(
     scores = (weights.reshape(-1).float() * routed_scaling_factor).contiguous()
 
     # nanoplm (E, in, out) -> sonicmoe (out, in, E) view.
-    w1 = Wi.permute(2, 1, 0)  # (I_out, H, E)
-    w2 = Wo.permute(2, 1, 0)  # (H,     I, E)
-
-    activation = ActivationType.RELU_SQ if srelu else ActivationType.SWIGLU
+    if srelu:
+        activation = ActivationType.RELU_SQ
+        w1_src = Wi
+    else:
+        activation = ActivationType.SWIGLU
+        # nanoplm stores the gated Wi as CHUNKED [up(I) | gate(I)] on the last
+        # axis (see MoELayer / the cutlass path's `x_proj, gate = wi.chunk(2)`),
+        # but sonicmoe's gated kernels expect the halves INTERLEAVED as
+        # [g0,u0,g1,u1,...] with even lanes = gate, odd = up (sonicmoe.moe._swiglu:
+        # `u = x[...,1::2]; g = x[...,::2]; u*silu(g)`). Reinterleave here so the
+        # fused SwiGLU silu()s the correct half; without this the output is wrong
+        # (silu applied to the wrong columns). Grads flow back to the chunked Wi.
+        # NB: this allocates a fresh (E,H,2I) tensor per forward; store Wi
+        # interleaved natively if this shows up in profiles.
+        I = Wi.shape[-1] // 2
+        up, gate = Wi[..., :I], Wi[..., I:]
+        w1_src = torch.stack([gate, up], dim=-1).reshape(*Wi.shape[:-1], 2 * I)
+    w1 = w1_src.permute(2, 1, 0)  # (I_out, H, E)
+    w2 = Wo.permute(2, 1, 0)      # (H,     I, E)
     stream_id = torch.cuda.current_stream().cuda_stream
 
     out, _ = moe_general_routing_inputs(
