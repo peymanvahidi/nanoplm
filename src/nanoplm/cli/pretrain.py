@@ -55,7 +55,7 @@ from nanoplm.utils.logger import logger
 def _check_muon_available(optimizer: str) -> None:
     """Abort early when a Muon variant is requested but ``dion`` is not installed."""
     optimizer_name = optimizer.lower()
-    if optimizer_name in {"muon", "normuon", "muonh", "aurora"}:
+    if optimizer_name in {"muon", "normuon", "nordion2"}:
         try:
             import dion
         except ImportError:
@@ -63,7 +63,7 @@ def _check_muon_available(optimizer: str) -> None:
                 f"Optimizer '{optimizer}' requires the 'dion' package which is not installed.\n"
                 "Install it with:  pip install nanoplm[cuda]"
             )
-        required_class = {"muon": "Muon", "normuon": "NorMuon", "muonh": "MuonH", "aurora": "Aurora"}[optimizer_name]
+        required_class = {"muon": "Muon", "normuon": "NorMuon", "nordion2": "NorDion2"}[optimizer_name]
         if not hasattr(dion, required_class):
             raise click.ClickException(
                 f"Optimizer '{optimizer}' requires dion.{required_class}, but this Dion build does not expose it."
@@ -154,21 +154,6 @@ def _validate_distributed_mode(
     if cfg.distributed_mode != "ddp" and cfg.ddp_bucket_cap_mb != 25:
         raise click.ClickException(
             "ddp_bucket_cap_mb applies only when distributed_mode=ddp."
-        )
-
-
-def _validate_muonh_wo_init_compat(
-    pretrain_cfg: PretrainingConfig,
-    model_cfg: ProtModernBertMLMConfig,
-) -> None:
-    optimizer = str(pretrain_cfg.optimizer).strip().lower()
-    wo_init = str(getattr(model_cfg, "wo_init", "zero")).strip().lower()
-    if optimizer == "muonh" and wo_init == "zero":
-        raise click.ClickException(
-            "optimizer=muonh is incompatible with model.wo_init='zero'. "
-            "MuonH initializes each matrix hyperball radius from ||W_init||_F, "
-            "so zero-initialized Wo matrices are locked at zero. "
-            "Set model.wo_init='kaiming' (or --wo-init kaiming)."
         )
 
 
@@ -340,7 +325,7 @@ def pretrain():
 @click.option(
     "--optimizer",
     type=click.Choice(
-        ["adamw", "stable_adamw", "muon", "normuon", "muonh", "aurora"], case_sensitive=False
+        ["adamw", "stable_adamw", "muon", "normuon", "nordion2"], case_sensitive=False
     ),
     default="normuon",
     help="Optimizer to use",
@@ -352,13 +337,13 @@ def pretrain():
     "--muon-learning-rate",
     type=float,
     default=1e-3,
-    help="Muon-family LR (used when optimizer=muon, normuon, muonh, or aurora; learning-rate remains AdamW LR)",
+    help="Matrix-optimizer LR (used when optimizer=muon, normuon, or nordion2; learning-rate remains AdamW LR)",
 )
 @click.option(
     "--muon-weight-decay",
     type=float,
     default=0.01,
-    help="Muon-family matrix weight decay (used when optimizer=muon, normuon, muonh, or aurora)",
+    help="Matrix-optimizer weight decay (used when optimizer=muon, normuon, or nordion2)",
 )
 @click.option(
     "--muon-cautious-weight-decay/--no-muon-cautious-weight-decay",
@@ -388,11 +373,43 @@ def pretrain():
     help="Muon-family epsilon",
 )
 @click.option(
-    "--muonh-normalization",
-    type=click.Choice(["neuron", "short_axis", "none"], case_sensitive=False),
-    default="neuron",
-    help="MuonH update normalization (used only when optimizer=muonh): "
-    "'neuron' = per-row, 'short_axis' = along the shorter matrix axis, 'none' = disabled.",
+    "--muon-adjust-lr",
+    type=click.Choice(["rms_norm", "spectral_norm", "none"], case_sensitive=False),
+    default="rms_norm",
+    help="Update LR adjustment for the matrix optimizer (muon/normuon/nordion2).",
+)
+@click.option(
+    "--muon-beta2",
+    type=float,
+    default=0.95,
+    help="Second-moment beta for NorMuon/NorDion2 (ignored by plain Muon)",
+)
+@click.option(
+    "--muon-use-gram-newton-schulz/--no-muon-use-gram-newton-schulz",
+    default=False,
+    help="Use the Gram-Newton-Schulz orthogonalization kernels where supported",
+)
+@click.option(
+    "--muon-triton-post-ortho/--no-muon-triton-post-ortho",
+    default=False,
+    help="NorDion2: run the post-orthogonalization step in Triton",
+)
+@click.option(
+    "--muon-flatten/--no-muon-flatten",
+    default=False,
+    help="Flatten >2D matrix params before orthogonalization where supported",
+)
+@click.option(
+    "--nordion2-fraction",
+    type=float,
+    default=0.25,
+    help="NorDion2 low-rank fraction (used only when optimizer=nordion2)",
+)
+@click.option(
+    "--nordion2-selection-scope",
+    type=click.Choice(["local", "global"], case_sensitive=False),
+    default="local",
+    help="NorDion2 FSDP2 row-shard selection scope (used only when optimizer=nordion2)",
 )
 @click.option("--mlm-probability", type=float, default=0.3, help="MLM probability")
 @click.option(
@@ -947,7 +964,13 @@ def run(
     muon_momentum: float,
     muon_nesterov: bool,
     muon_eps: float,
-    muonh_normalization: str,
+    muon_adjust_lr: str,
+    muon_beta2: float,
+    muon_use_gram_newton_schulz: bool,
+    muon_triton_post_ortho: bool,
+    muon_flatten: bool,
+    nordion2_fraction: float,
+    nordion2_selection_scope: str,
     mlm_probability: float,
     mlm_masking_strategy: str,
     mlm_span_mean_length: float,
@@ -1077,7 +1100,13 @@ def run(
         muon_momentum=muon_momentum,
         muon_nesterov=muon_nesterov,
         muon_eps=muon_eps,
-        muonh_normalization=muonh_normalization,
+        muon_adjust_lr=muon_adjust_lr,
+        muon_beta2=muon_beta2,
+        muon_use_gram_newton_schulz=muon_use_gram_newton_schulz,
+        muon_triton_post_ortho=muon_triton_post_ortho,
+        muon_flatten=muon_flatten,
+        nordion2_fraction=nordion2_fraction,
+        nordion2_selection_scope=nordion2_selection_scope,
         mlm_probability=mlm_probability,
         mlm_masking_strategy=mlm_masking_strategy,
         mlm_span_mean_length=mlm_span_mean_length,
@@ -1207,8 +1236,6 @@ def run(
         wo_init=wo_init,
         moe_kernel_backend=moe_kernel_backend.lower(),
     )
-
-    _validate_muonh_wo_init_compat(cfg, model_cfg)
 
     _set_seed_for_init(seed)
     if use_diff_attn_v2 and not pure_torch:
@@ -1354,7 +1381,6 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
     _validate_resume_config_modes(resume_config)
-    _validate_muonh_wo_init_compat(pretrain_config, model_config)
     if getattr(model_config, "use_noble", False) and not pure_torch:
         raise click.ClickException(
             "model.use_noble=true requires pure_torch: true (or --pure-torch). "
@@ -1588,6 +1614,8 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_weight_decay",
         "muon_momentum",
         "muon_eps",
+        "muon_beta2",
+        "nordion2_fraction",
         "min_lr",
         "noble_base_lr",
         "noble_lr_gamma",
@@ -1664,6 +1692,9 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_nesterov",
         "muon_cautious_weight_decay",
         "muon_use_polar_express",
+        "muon_use_gram_newton_schulz",
+        "muon_triton_post_ortho",
+        "muon_flatten",
         "use_packing",
         "use_static_inp_size",
         "use_compile_max_autotune",

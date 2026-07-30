@@ -303,12 +303,12 @@ def run_pretraining(
             betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
             eps=pretrain_config.adam_epsilon,
         )
-    elif optimizer_name in {"muon", "normuon", "muonh", "aurora"}:
+    elif optimizer_name in {"muon", "normuon", "nordion2"}:
         optimizer = build_muon_optimizer(model, pretrain_config)
     else:
         raise ValueError(
             f"Invalid optimizer: {pretrain_config.optimizer}. "
-            f"Currently supported: [adamw, stable_adamw, muon, normuon, muonh, aurora]"
+            f"Currently supported: [adamw, stable_adamw, muon, normuon, nordion2]"
         )
 
     scheduler = _create_scheduler(

@@ -2167,9 +2167,8 @@ class ModernBertForMaskedLM(nn.Module):
 
         width = self.config.hidden_size
         bound = math.sqrt(3.0 / width)
-        # Residual-branch out-projections (attn.Wo, mlp.Wo) are configurable.
-        # For MuonH, zero-init is invalid because ||W_init||_F defines a hard
-        # hyperball radius and a zero-initialized matrix would be locked at zero.
+        # Residual-branch out-projections (attn.Wo, mlp.Wo) are configurable:
+        # 'zero' for zero-init residual branches, 'kaiming' otherwise.
         wo_init = self.config.wo_init
         mlp_out_bound = math.sqrt(3.0 / self.config.intermediate_size)
         # NOBLE half-Kaiming: halve init scale for layers that use Kaiming

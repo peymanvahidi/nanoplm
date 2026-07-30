@@ -5,7 +5,7 @@ def test_optimizer_enum_present():
     o = overlay.load()
     entry = o["pretraining.optimizer"]
     # Must match click.Choice in cli/pretrain.py::run --optimizer.
-    assert entry["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "muonh", "aurora"]
+    assert entry["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "nordion2"]
 
 def test_lr_schedule_enum_matches_validator():
     # click.Choice --lr-schedule and _validate_duration_config's `valid` set.

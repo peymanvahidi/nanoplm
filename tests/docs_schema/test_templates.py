@@ -27,7 +27,7 @@ def test_parse_fields_captures_section_key_default_and_comments():
     # quoted string default + its enum-listing end-of-line comment
     opt = by_key[("pretraining", "optimizer")]
     assert opt.raw_default == '"normuon"'
-    assert "adamw | stable_adamw | muon | normuon | muonh | aurora" in opt.description
+    assert "adamw | stable_adamw | muon | normuon | nordion2" in opt.description
 
     # preceding full-line comment block becomes part of the description
     canon = by_key[("model", "use_canon_layers")]
@@ -59,7 +59,7 @@ def test_commented_out_step_override_is_not_attached_as_description():
     assert "Advanced step overrides" not in opt.description
     # ...while optimizer's own end-of-line enum comment survives (plus optional
     # intentional preceding note about adam_* / Muon side params).
-    assert "adamw | stable_adamw | muon | normuon | muonh | aurora" in opt.description
+    assert "adamw | stable_adamw | muon | normuon | nordion2" in opt.description
 
 def test_same_key_comment_prose_is_kept():
     by_key = {(f.section, f.key): f for f in templates.parse_fields(templates.load_template_text("pretrain"))}
