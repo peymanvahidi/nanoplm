@@ -17,7 +17,7 @@
 # ---------------------------------------------------------------- pretraining
 # click.Choice --optimizer
 pretraining.optimizer:
-  enum: [adamw, stable_adamw, muon, normuon, muonh, aurora]
+  enum: [adamw, stable_adamw, muon, normuon, nordion2]
 # click.Choice --lr-schedule + _validate_duration_config's `valid` set
 pretraining.lr_schedule:
   enum: [wsd, warmup_stable, cosine, linear]
@@ -29,12 +29,12 @@ pretraining.fsdp_shard_granularity:
 # click.Choice --decay-shape
 pretraining.decay_shape:
   enum: ["1-sqrt", linear]
-# click.Choice --muonh-normalization
-pretraining.muonh_normalization:
-  enum: [neuron, short_axis, "none"]
-# PretrainingConfig.__post_init__ -> {all, mlp}
-pretraining.muonh_scope:
-  enum: [all, mlp]
+# click.Choice --muon-adjust-lr + __post_init__ -> {rms_norm, spectral_norm, none}
+pretraining.muon_adjust_lr:
+  enum: [rms_norm, spectral_norm, "none"]
+# click.Choice --nordion2-selection-scope + __post_init__ -> {local, global}
+pretraining.nordion2_selection_scope:
+  enum: [local, global]
 # click.Choice --mlm-masking-strategy + __post_init__ -> {token, span}
 pretraining.mlm_masking_strategy:
   enum: [token, span]

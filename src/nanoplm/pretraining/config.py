@@ -81,23 +81,26 @@ class PretrainingConfig:
     adam_weight_decay: float = 0.0
     # Gradient clipping threshold (L2 norm). Set float("inf") to disable clipping.
     max_grad_norm: float = float("inf")
-    # Muon-family hyperparameters (used when optimizer is muon/normuon/muonh/aurora).
+    # Matrix-optimizer hyperparameters (used when optimizer is muon/normuon/nordion2).
     # adam_* fields are used for the AdamW sub-optimizer.
     muon_learning_rate: float = 1e-3
     muon_weight_decay: float = 0.01
-    muon_cautious_weight_decay: bool = True
+    muon_cautious_weight_decay: bool = True  # Muon/NorMuon only (NorDion2 has no cautious_wd)
     muon_use_polar_express: bool = True
     muon_momentum: float = 0.95
-    muon_nesterov: bool = True
+    muon_nesterov: bool = True  # Muon/NorMuon only (NorDion2 has no nesterov)
     muon_eps: float = 1e-7
-    # MuonH-specific. Only used when optimizer == "muonh".
-    # 'neuron' normalizes along the last axis; 'short_axis' along the shorter
-    # matrix axis. Set to "none" to disable update normalization in MuonH.
-    muonh_normalization: str = "neuron"
-    # Hyperball optimizer scope for experiments: "all" applies MuonH/Aurora to
-    # all eligible matrix params; "mlp" applies MuonH/Aurora only to MLP
-    # matrices and keeps other matrices on NorMuon.
-    muonh_scope: str = "all"
+    # Shared matrix-optimizer knobs (passed to each Dion optimizer only where its
+    # signature accepts it). muon_adjust_lr default 'rms_norm' preserves the prior
+    # hardcoded muon/normuon behavior; dion's native default is 'spectral_norm'.
+    muon_adjust_lr: str = "rms_norm"  # rms_norm | spectral_norm | none
+    muon_beta2: float = 0.95  # NorMuon/NorDion2 second-moment beta (ignored by plain Muon)
+    muon_use_gram_newton_schulz: bool = False
+    muon_triton_post_ortho: bool = False  # NorDion2 only in the current dion build
+    muon_flatten: bool = False
+    # NorDion2-specific. Only used when optimizer == "nordion2".
+    nordion2_fraction: float = 0.25  # low-rank fraction of the Dion2 update
+    nordion2_selection_scope: str = "local"  # local | global (FSDP2 row-shard selection)
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_tokens: int = 256000
@@ -359,11 +362,18 @@ class PretrainingConfig:
 
         self.fp8_target = _normalize_fp8_targets(self.fp8_target)
 
-        self.muonh_scope = str(self.muonh_scope).strip().lower()
-        if self.muonh_scope not in {"all", "mlp"}:
+        self.muon_adjust_lr = str(self.muon_adjust_lr).strip().lower()
+        if self.muon_adjust_lr not in {"rms_norm", "spectral_norm", "none"}:
             raise ValueError(
-                "muonh_scope must be one of: all, mlp "
-                f"(got {self.muonh_scope!r})"
+                "muon_adjust_lr must be one of: rms_norm, spectral_norm, none "
+                f"(got {self.muon_adjust_lr!r})"
+            )
+
+        self.nordion2_selection_scope = str(self.nordion2_selection_scope).strip().lower()
+        if self.nordion2_selection_scope not in {"local", "global"}:
+            raise ValueError(
+                "nordion2_selection_scope must be one of: local, global "
+                f"(got {self.nordion2_selection_scope!r})"
             )
 
 

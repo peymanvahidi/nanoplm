@@ -66,7 +66,7 @@ model:
   attn_layer_pattern: 'F'               # F=full, S=sliding; tiles over num_layers (e.g. 'FSS')
   fused_qkv: true                       # false = separate Wq / Wk / Wv
   fused_up_gate: true                   # false = separate W_up / W_gate (SwiGLU/GLU)
-  wo_init: "kaiming"                    # residual out-proj init: kaiming | zero (muonh forbids zero)
+  wo_init: "kaiming"                    # residual out-proj init: kaiming | zero
 
   # ── Canon (pure_torch only) ───────────────────────────────────────────────
 
@@ -199,8 +199,8 @@ pretraining:
   # ── Optimizer — shared & Adam side ────────────────────────────────────────
 
   # adam_* also drives the AdamW side (1D params + embeddings/unembed) when
-  # optimizer is muon | normuon | muonh | aurora.
-  optimizer: "normuon"                  # adamw | stable_adamw | muon | normuon | muonh | aurora
+  # optimizer is muon | normuon | nordion2.
+  optimizer: "normuon"                  # adamw | stable_adamw | muon | normuon | nordion2
   adam_beta1: 0.9
   adam_beta2: 0.95
   adam_epsilon: 1e-8
@@ -208,17 +208,24 @@ pretraining:
   adam_weight_decay: 0.0
   max_grad_norm: 1
 
-  # ── Optimizer — Muon family ───────────────────────────────────────────────
+  # ── Optimizer — matrix optimizers (muon | normuon | nordion2) ─────────────
 
   muon_learning_rate: 1e-3
   muon_weight_decay: 0.01
-  muon_cautious_weight_decay: true
+  muon_cautious_weight_decay: true      # Muon/NorMuon only (NorDion2 ignores)
   muon_use_polar_express: true
   muon_momentum: 0.95
-  muon_nesterov: true
+  muon_nesterov: true                   # Muon/NorMuon only (NorDion2 ignores)
   muon_eps: 1e-7
-  muonh_normalization: "neuron"         # muonh only: neuron | short_axis | none
-  muonh_scope: "all"                    # muonh|aurora: all = all matrices; mlp = MLP only (rest on NorMuon)
+  # Shared matrix-optimizer knobs (applied per-optimizer where supported):
+  muon_adjust_lr: "rms_norm"            # rms_norm | spectral_norm | none
+  muon_beta2: 0.95                      # NorMuon/NorDion2 second-moment beta
+  muon_use_gram_newton_schulz: false
+  muon_triton_post_ortho: false         # NorDion2 only in the current dion build
+  muon_flatten: false
+  # NorDion2-specific (used only when optimizer: nordion2):
+  nordion2_fraction: 0.25               # low-rank fraction of the Dion2 update
+  nordion2_selection_scope: "local"     # local | global
 
   # ── RePO training (when model.use_repo: true) ─────────────────────────────
 

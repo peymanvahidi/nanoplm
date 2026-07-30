@@ -168,7 +168,7 @@
             "kaiming",
             "zero"
           ],
-          "description": "residual out-proj init: kaiming | zero (muonh forbids zero)"
+          "description": "residual out-proj init: kaiming | zero"
         },
         "use_canon_layers": {
           "type": "boolean",
@@ -725,10 +725,9 @@
             "stable_adamw",
             "muon",
             "normuon",
-            "muonh",
-            "aurora"
+            "nordion2"
           ],
-          "description": "adamw | stable_adamw | muon | normuon | muonh | aurora"
+          "description": "adamw | stable_adamw | muon | normuon | nordion2"
         },
         "adam_beta1": {
           "type": "number",
@@ -763,58 +762,88 @@
         "muon_learning_rate": {
           "type": "number",
           "default": 0.001,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
         "muon_weight_decay": {
           "type": "number",
           "default": 0.01,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
         "muon_cautious_weight_decay": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "Muon/NorMuon only (NorDion2 ignores)"
         },
         "muon_use_polar_express": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
         "muon_momentum": {
           "type": "number",
           "default": 0.95,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
         "muon_nesterov": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "Muon/NorMuon only (NorDion2 ignores)"
         },
         "muon_eps": {
           "type": "number",
           "default": 1e-07,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
-        "muonh_normalization": {
+        "muon_adjust_lr": {
           "type": "string",
-          "default": "neuron",
-          "x-nanoplm-group": "Optimizer \u2014 Muon family",
+          "default": "rms_norm",
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
           "enum": [
-            "neuron",
-            "short_axis",
+            "rms_norm",
+            "spectral_norm",
             "none"
           ],
-          "description": "muonh only: neuron | short_axis | none"
+          "description": "Shared matrix-optimizer knobs (applied per-optimizer where supported): rms_norm | spectral_norm | none"
         },
-        "muonh_scope": {
+        "muon_beta2": {
+          "type": "number",
+          "default": 0.95,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "NorMuon/NorDion2 second-moment beta"
+        },
+        "muon_use_gram_newton_schulz": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
+        },
+        "muon_triton_post_ortho": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "NorDion2 only in the current dion build"
+        },
+        "muon_flatten": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
+        },
+        "nordion2_fraction": {
+          "type": "number",
+          "default": 0.25,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "NorDion2-specific (used only when optimizer: nordion2): low-rank fraction of the Dion2 update"
+        },
+        "nordion2_selection_scope": {
           "type": "string",
-          "default": "all",
-          "x-nanoplm-group": "Optimizer \u2014 Muon family",
+          "default": "local",
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
           "enum": [
-            "all",
-            "mlp"
+            "local",
+            "global"
           ],
-          "description": "muonh|aurora: all = all matrices; mlp = MLP only (rest on NorMuon)"
+          "description": "local | global"
         },
         "repo_rope_warmup_steps": {
           "type": "integer",
@@ -1325,7 +1354,7 @@
       "x-nanoplm-group-notes": {
         "Batch (token-budget surface)": "micro_batch_seqs     = sequences per GPU per forward  (the VRAM knob)\nglobal_batch_tokens  = tokens per optimizer step\nGradient accumulation is inferred from those two + manifest seq_len +\nworld_size. You never set grad_accum yourself.",
         "Duration + LR schedule": "Token budget, not epochs.\n  lr_schedule: wsd\n    set stable_tokens + decay_tokens\n    stable_tokens INCLUDES warmup \u2014 it is the point where decay begins,\n    not a length added after warmup. decay_tokens IS a length after that.\n  lr_schedule: warmup_stable | cosine | linear\n    comment out stable_tokens / decay_tokens; uncomment train_tokens\nwarmup_steps is used by ALL schedules.\nPrefer tokens over steps. Step overrides (below) replace their *_tokens twin \u2014 never set both of a pair.",
-        "Optimizer \u2014 shared & Adam side": "adam_* also drives the AdamW side (1D params + embeddings/unembed) when\noptimizer is muon | normuon | muonh | aurora.",
+        "Optimizer \u2014 shared & Adam side": "adam_* also drives the AdamW side (1D params + embeddings/unembed) when\noptimizer is muon | normuon | nordion2.",
         "Precision": "Recommended: keep bf16 enabled (~1.5\u20133\u00d7 speedup).\nWhen bf16: true, hardware picks the best path:\n  CUDA Ampere+ (A100, RTX 3090+)  \u2192  bf16 + TF32\n  CUDA Volta/Turing (V100, 2080)  \u2192  fp16 fallback\n  Apple Silicon (M1/M2/M3/\u2026)      \u2192  fp16 (hardware accelerated)\n  CPU                             \u2192  fp32 (no mixed precision)"
       }
     },

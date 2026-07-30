@@ -10,7 +10,7 @@ def test_pretrain_schema_shape():
     mb = props["pretraining"]["properties"]["micro_batch_seqs"]
     assert mb["type"] == "integer" and mb["default"] == 128
     opt = props["pretraining"]["properties"]["optimizer"]
-    assert opt["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "muonh", "aurora"]
+    assert opt["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "nordion2"]
     sched = props["pretraining"]["properties"]["lr_schedule"]
     assert sched["enum"] == ["wsd", "warmup_stable", "cosine", "linear"]
     assert sched["default"] == "wsd"

@@ -20,14 +20,10 @@ try:
 except ImportError:
     NorMuon = None  # type: ignore[assignment,misc]
 try:
-    from dion import MuonH
+    from dion import NorDion2
 except ImportError:
-    MuonH = None  # type: ignore[assignment,misc]
-try:
-    from dion import Aurora
-except ImportError:
-    Aurora = None  # type: ignore[assignment,misc]
-_DION_OPTIMIZER_TYPES = tuple(t for t in (Muon, NorMuon, MuonH, Aurora) if t is not None)
+    NorDion2 = None  # type: ignore[assignment,misc]
+_DION_OPTIMIZER_TYPES = tuple(t for t in (Muon, NorMuon, NorDion2) if t is not None)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -83,7 +79,6 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import (
-    OptimizerGroup,
     build_muon_optimizer,
     is_muon_optimizer,
     MuonAdamWGroup,
@@ -995,7 +990,7 @@ def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = Non
 
 def _create_optimizer(model, cfg, distributed_mesh=None):
     name = str(cfg.optimizer).lower()
-    if name in {"muon", "normuon", "muonh", "aurora"}:
+    if name in {"muon", "normuon", "nordion2"}:
         return build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
     from nanoplm.pretraining.optim import _classify_noble_param
@@ -1055,7 +1050,7 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
             logger.warning("StableAdamW unavailable; falling back to AdamW.")
             return torch.optim.AdamW(**kwargs)
         return cls(**kwargs)
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon, muonh, aurora]")
+    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon, nordion2]")
 
 
 def _mlm_extra_excluded_token_ids(tokenizer, cfg):
@@ -1209,8 +1204,6 @@ def _create_scheduler(
         return LambdaLR(opt, lr_lambda, last_epoch=last_ep)
 
     def _make_scheduler_any(opt, last_ep):
-        if isinstance(opt, OptimizerGroup):
-            return [_make_scheduler(inner, last_ep) for inner in opt.optimizers]
         return _make_scheduler(opt, last_ep)
 
     if isinstance(optimizer, MuonAdamWGroup):
@@ -3018,10 +3011,7 @@ def run_pure_pretraining(
 
                     if scaler is not None and scaler.is_enabled():
                         if isinstance(optimizer, MuonAdamWGroup):
-                            # optimizer.muon may be an OptimizerGroup (muonh_scope=mlp:
-                            # NorMuon + Hyperball); GradScaler needs each real optimizer.
-                            for _o in (optimizer.muon.optimizers if isinstance(optimizer.muon, OptimizerGroup) else [optimizer.muon]):
-                                scaler.unscale_(_o)
+                            scaler.unscale_(optimizer.muon)
                             scaler.unscale_(optimizer.adamw)
                         else:
                             scaler.unscale_(optimizer)
@@ -3037,8 +3027,7 @@ def run_pure_pretraining(
                     if scaler is not None and scaler.is_enabled():
                         old_scale = scaler.get_scale()
                         if isinstance(optimizer, MuonAdamWGroup):
-                            for _o in (optimizer.muon.optimizers if isinstance(optimizer.muon, OptimizerGroup) else [optimizer.muon]):
-                                scaler.step(_o)
+                            scaler.step(optimizer.muon)
                             scaler.step(optimizer.adamw)
                         else:
                             scaler.step(optimizer)
