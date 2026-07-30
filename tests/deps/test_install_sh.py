@@ -87,7 +87,7 @@ def test_source_safe():
 
 def test_all_pins_present():
     text = SCRIPT.read_text()
-    assert "0333cc1136cd456b3fe3a56407d4ff104cfef604" in text          # dion
+    assert "dd6c02f5173dc43cc7a0974535d7011a74bda494" in text          # dion
     assert "4923037d858aebfe5738ebb17d02f88d7871c333" in text          # sonic-moe
     assert "Dao-AILab/sonic-moe" in text
     assert "quack-kernels[cu13]==0.5.0" in text                        # 0.5.0 = compile-under-flock fix
@@ -176,7 +176,7 @@ def test_dry_run_prints_full_pinned_sequence(tmp_path):
     # 1. torch (forced, regardless of what's already satisfied)
     assert "pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu130" in out
     # 2. dion @ SHA
-    assert "git+https://github.com/microsoft/dion.git@0333cc1136cd456b3fe3a56407d4ff104cfef604" in out
+    assert "git+https://github.com/microsoft/dion.git@dd6c02f5173dc43cc7a0974535d7011a74bda494" in out
     # 3. TE: pre-install runtime deps, clone tag, no-isolation no-deps build
     assert "nvdlfw-inspect" in out
     assert "--branch v2.16" in out
