@@ -2732,6 +2732,10 @@ def run_pure_pretraining(
                 f"MoE routing bias correction enabled: "
                 f"{len(_moe_layers)} MoE layers, {_moe_num_experts} experts"
             )
+    # Per-layer load-balance stats [entropy, max_frac, dead_experts], computed
+    # from the globally reduced expert counts in the bias-correction block.
+    # Piggybacks on bias correction: no stats when moe_use_bias_correction=False.
+    _moe_lb_stats: Optional[torch.Tensor] = None
     window_loss = torch.zeros((), device=device)
     window_steps = 0
     discard_accumulation = False
@@ -3196,6 +3200,19 @@ def run_pure_pretraining(
                                     moe_layer.router.correction_bias.add_(
                                         delta.to(moe_layer.router.correction_bias.device)
                                     )
+                                # Load-balance stats from the same globally reduced
+                                # counts, captured before the zero_() below. Stays
+                                # on GPU; host transfer deferred to the log window.
+                                _lb_totals = _moe_count_accum.sum(dim=1, keepdim=True).clamp_min(1.0)
+                                _lb_frac = _moe_count_accum / _lb_totals
+                                _lb_ent = -(
+                                    _lb_frac.clamp_min(1e-12).log() * _lb_frac
+                                ).sum(dim=1) / math.log(_moe_num_experts)
+                                _moe_lb_stats = torch.stack([
+                                    _lb_ent,
+                                    _lb_frac.amax(dim=1),
+                                    (_moe_count_accum == 0).float().sum(dim=1),
+                                ])
                         _moe_count_accum.zero_()
 
                     consecutive_nonfinite_skips = 0
@@ -3297,6 +3314,45 @@ def run_pure_pretraining(
                     if should_log and is_main:
                         waste = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
                         muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
+                        moe_str = ""
+                        moe_payload: dict = {}
+                        if _moe_layers:
+                            # Divide by the execution count so a looped layer
+                            # reports the same per-execution mean that
+                            # modeling.py folds into the loss, not the sum.
+                            _aux_vals = [
+                                l.last_aux_loss / l.last_aux_count
+                                for l in _moe_layers
+                                if l.last_aux_loss is not None
+                            ]
+                            _z_vals = [
+                                l.last_z_loss / l.last_aux_count
+                                for l in _moe_layers
+                                if l.last_z_loss is not None
+                            ]
+                            if _aux_vals:
+                                moe_payload["moe/aux_loss"] = float(
+                                    torch.stack([a.detach() for a in _aux_vals]).mean()
+                                )
+                            if _z_vals:
+                                moe_payload["moe/router_z_loss"] = float(
+                                    torch.stack(_z_vals).mean()
+                                )
+                            if _moe_lb_stats is not None:
+                                _lb = _moe_lb_stats.cpu()
+                                moe_payload["moe/load_entropy_mean"] = float(_lb[0].mean())
+                                moe_payload["moe/load_entropy_min"] = float(_lb[0].min())
+                                moe_payload["moe/max_expert_frac"] = float(_lb[1].max())
+                                moe_payload["moe/dead_experts"] = float(_lb[2].sum())
+                                for _j in range(_lb.shape[1]):
+                                    moe_payload[f"moe/lb_entropy/layer_{_j:02d}"] = float(_lb[0, _j])
+                            if moe_payload:
+                                moe_str = (
+                                    f"moe_z={moe_payload.get('moe/router_z_loss', float('nan')):.3f} "
+                                    f"moe_ent={moe_payload.get('moe/load_entropy_min', float('nan')):.3f} "
+                                    f"moe_maxf={moe_payload.get('moe/max_expert_frac', float('nan')):.3f} "
+                                    f"moe_dead={moe_payload.get('moe/dead_experts', 0):.0f} "
+                                )
                         wall_elapsed = time.perf_counter() - _run_t0
                         epoch_progress = epoch + (
                             micro_step + ((sub_batch_idx + 1) / max(1, total_sub_batches))
@@ -3307,7 +3363,7 @@ def run_pure_pretraining(
                             f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} real_tok/s={real_tps_log:,} "
                             f"real_tok/step={step_tok:,.0f} "
                             f"dt={avg_step_ms:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
-                            f"h100_mfu={mfu:.2%} {vram_log}"
+                            f"h100_mfu={mfu:.2%} {moe_str}{vram_log}"
                         )
                         payload = {
                             "train/global_step": global_step,
@@ -3325,6 +3381,8 @@ def run_pure_pretraining(
                         }
                         if muon_lr is not None:
                             payload["train/muon_lr"] = muon_lr
+                        if moe_payload:
+                            payload.update(moe_payload)
                         if wandb_enabled and wandb.run is not None:
                             try:
                                 if recycling_scheduler is not None and sampled_r is not None:

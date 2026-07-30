@@ -2497,6 +2497,7 @@ class ModernBertForMaskedLM(nn.Module):
                 if isinstance(_module, _MoELayer):
                     _module.last_expert_counts = None
                     _module.last_aux_loss = None
+                    _module.last_z_loss = None
                     _module.last_aux_count = None
 
         # ---- static packed path (pre-flattened by collator) ---------------

@@ -546,6 +546,7 @@ class MoELayer(nn.Module):
         # iteration index and per distinct loop count.
         self.last_expert_counts: Optional[torch.Tensor] = None
         self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_z_loss: Optional[torch.Tensor] = None
         self.last_aux_count: Optional[torch.Tensor] = None
 
         # Gate/up storage convention marker (persistent, so it lands in the
@@ -763,11 +764,14 @@ class MoELayer(nn.Module):
         # router gate, and summing across recurrent iterations is what lets
         # every iteration's routing decision train the gate.
         aux = aux.squeeze()
+        z_detached = z_loss.detach()
         if self.last_aux_loss is None:
             self.last_aux_loss = aux
+            self.last_z_loss = z_detached
             self.last_aux_count = torch.ones((), device=aux.device, dtype=aux.dtype)
         else:
             self.last_aux_loss = self.last_aux_loss + aux
+            self.last_z_loss = self.last_z_loss + z_detached
             self.last_aux_count = self.last_aux_count + 1
 
         out = expert_out + shared_out
