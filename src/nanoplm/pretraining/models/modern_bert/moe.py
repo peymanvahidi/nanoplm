@@ -215,6 +215,7 @@ class MoELayer(nn.Module):
         # Bookkeeping set during forward for external consumption.
         self.last_expert_counts: Optional[torch.Tensor] = None
         self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_z_loss: Optional[torch.Tensor] = None
 
     def _ensure_dispatch_buffers(
         self,
@@ -337,6 +338,7 @@ class MoELayer(nn.Module):
         if self.z_loss_coef > 0:
             aux = aux + self.z_loss_coef * z_loss
         self.last_aux_loss = aux.squeeze()
+        self.last_z_loss = z_loss.detach()
 
         out = expert_out + shared_out
         if len(orig_shape) == 3:
