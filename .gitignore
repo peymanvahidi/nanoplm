@@ -78,3 +78,27 @@ AGENTS.md
 # Docs site (Astro/Starlight)
 node_modules/
 website/.astro/*
+
+# Eval / benchmark run output (autoeval_output_jul22_pbc_max512 alone is ~45G)
+autoeval_output*/
+
+# Third-party clones kept beside the repo for development.
+# NB: a `dion/` directory at the repo root shadows the installed dion package
+# (cwd precedes site-packages on sys.path), which makes dion expose nothing.
+dion/
+gram-newton-schulz/
+old_baseline_src/
+
+# Generated run configs and cluster scratch
+/pretrain.yaml
+/pretrain_abl_baseline.yaml
+hold_*.sh
+sbatch_*.sh
+claude-*.sh
+Screenshot*.png
+
+# Local-only notes and tooling (kept out of the repo on purpose)
+canon_cutedsl.md
+te_cpu_act_offload.md
+a2a_nvlink_sweep_prompt.md
+wandb_sync_daemon.*
