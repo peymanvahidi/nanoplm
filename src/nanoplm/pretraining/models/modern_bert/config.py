@@ -281,10 +281,10 @@ class ModernBertConfig:
             self.rope_dim = self.head_dim
         self.sliding_window = self.local_attention // 2
         self.mlp_activation = self.mlp_activation.lower()
-        if self.mlp_activation not in {"swiglu", "glu", "srelu"}:
+        if self.mlp_activation not in {"swiglu", "geglu", "srelu"}:
             raise ValueError(
                 f"Unsupported mlp_activation: {self.mlp_activation}. "
-                "Supported: ['swiglu', 'glu', 'srelu']"
+                "Supported: ['swiglu', 'geglu', 'srelu']"
             )
         self.canon_layers_kernel_size = _resolve_canon_kernel_size(
             self.canon_layers_kernel_size,

@@ -282,7 +282,7 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 
 **`rope_dim_fraction must be in (0.0, 1.0], got 1.5`**
 
-**`Unsupported mlp_activation: gelu. Supported: ['swiglu', 'glu', 'srelu']`**: note `glu` is pure-torch only; Transformer Engine does not implement it.
+**`Unsupported mlp_activation: gelu. Supported: ['swiglu', 'geglu', 'srelu']`**: `geglu` is the gated gelu MLP used by stock ModernBERT (`gelu(up) * gate`). It was called `glu` before, which was inaccurate.
 
 **`norm_bias=True is not compatible with norm_type='rmsnorm'. RMSNorm does not support bias. Set norm_bias=False.`**
 

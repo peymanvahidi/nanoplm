@@ -110,7 +110,7 @@ model.norm_type:
 model.classifier_activation:
   enum: [relu, gelu, srelu]
 model.mlp_activation:
-  enum: [swiglu, glu, srelu]
+  enum: [swiglu, geglu, srelu]
 # ModernBertConfig.__post_init__ / click.Choice --wo-init
 model.wo_init:
   enum: [kaiming, zero]

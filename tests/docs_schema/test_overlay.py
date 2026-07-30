@@ -40,9 +40,9 @@ def test_unknown_key_returns_empty_overlay():
     assert overlay.for_field(o, "pretraining.does_not_exist") == {}
 
 def test_mlp_activation_enum_matches_validator():
-    # Must match the authoritative validator (modeling.py: {swiglu, glu, srelu}),
+    # Must match the authoritative validator (config.py: {swiglu, geglu, srelu}),
     # NOT gelu/relu which are rejected at config-build time.
-    assert overlay.load()["model.mlp_activation"]["enum"] == ["swiglu", "glu", "srelu"]
+    assert overlay.load()["model.mlp_activation"]["enum"] == ["swiglu", "geglu", "srelu"]
 
 def test_for_field_does_not_alias_cached_overlay():
     # Mutating a for_field result must not corrupt the lru_cache'd overlay.

@@ -80,7 +80,7 @@ and it rejects these model and training features outright:
 | `use_diff_attn_v2` | `model:` |
 | `use_paired_head_attention` | `model:` |
 | `recycling_loop_count > 1` | `model:` |
-| `mlp_activation: glu` | `model:` |
+| `mlp_activation: geglu` | `model:` |
 | `fused_qkv: false`, `fused_up_gate: false` | `model:` |
 | `mhc_lite_wrapping_level: sublayers` | `model:` |
 | `debug_layerwise_metrics: true` | `pretraining:` |
@@ -99,7 +99,7 @@ and it rejects these model and training features outright:
 | FSDP2 / HSDP / DDP | yes | yes |
 | MoE, NOBLE, Canon, RePO, DiffAttnV2, paired-head attention | yes | no |
 | [Recycling](/nanoplm/guides/recycling/) | yes | no |
-| `mlp_activation: glu` | yes | no |
+| `mlp_activation: geglu` | yes | no |
 | `debug_layerwise_metrics` | yes | no |
 | `torch.compile` autotune + Triton reduction flags | yes | no |
 
