@@ -529,6 +529,16 @@ def _first_nonfinite_grad(model) -> tuple[str, torch.Tensor] | None:
     return None
 
 
+# When the loss goes non-finite we skip the optimizer step to survive a
+# transient bad batch. But if the *weights* are already corrupted (a prior
+# overflowing step wrote NaN/Inf into params), every subsequent forward is
+# non-finite and skipping can never recover -- the run would spin forever at
+# one step. This bounds that: a skip caused by corrupted weights aborts
+# immediately (naming the param), and even with finite weights we abort after
+# this many consecutive skips rather than hang indefinitely.
+_MAX_CONSECUTIVE_NONFINITE_SKIPS = 5
+
+
 def _first_nonfinite_param(model) -> tuple[str, torch.Tensor] | None:
     for name, param in model.named_parameters():
         data = _local_tensor(param.detach())
@@ -2676,6 +2686,7 @@ def run_pure_pretraining(
     window_flops = torch.zeros((), dtype=torch.float64, device=device)
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
+    consecutive_nonfinite_skips = 0
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
     loss_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
     param_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
@@ -2979,13 +2990,59 @@ def run_pure_pretraining(
                         else:
                             loss.backward()
 
-                    if loss_finite_check is not None and loss_finite_check.poll():
+                    # Reach a single global verdict on loss finiteness so all ranks
+                    # skip (or don't) together -- a rank-local `continue` here while
+                    # peers enter the optimizer's collectives would desync/deadlock.
+                    # Only runs when the debug guard is enabled, so production runs
+                    # (loss_finite_check is None) pay no collective or host sync.
+                    loss_nonfinite = False
+                    if loss_finite_check is not None:
+                        loss_nonfinite = loss_finite_check.poll()
+                        if distributed and dist.is_initialized():
+                            _lf = torch.tensor(
+                                [1.0 if loss_nonfinite else 0.0], device=device
+                            )
+                            dist.all_reduce(_lf, op=dist.ReduceOp.MAX)
+                            loss_nonfinite = bool(_lf.item() > 0)
+                    if loss_nonfinite:
+                        consecutive_nonfinite_skips += 1
                         rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                         logger.error(
                             "Skipping optimizer step %d due to non-finite loss on rank %d "
-                            "(epoch=%d micro_step=%d sub_batch=%d).",
+                            "(epoch=%d micro_step=%d sub_batch=%d, consecutive=%d).",
                             upcoming_step, rank, epoch, micro_step, sub_batch_idx,
+                            consecutive_nonfinite_skips,
                         )
+                        # A non-finite loss from FINITE weights is a transient bad
+                        # batch -> skip and recover. From CORRUPTED weights it can
+                        # never recover (every forward is non-finite), so abort
+                        # instead of spinning forever. Decide globally.
+                        _nf = _nonfinite_check_tensor(list(orig_model.parameters()))
+                        weights_corrupt = bool(_nf.item()) if _nf is not None else False
+                        if distributed and dist.is_initialized():
+                            _cf = torch.tensor(
+                                [1.0 if weights_corrupt else 0.0], device=device
+                            )
+                            dist.all_reduce(_cf, op=dist.ReduceOp.MAX)
+                            weights_corrupt = bool(_cf.item() > 0)
+                        if (
+                            weights_corrupt
+                            or consecutive_nonfinite_skips >= _MAX_CONSECUTIVE_NONFINITE_SKIPS
+                        ):
+                            bad = _first_nonfinite_param(orig_model)
+                            bad_name = bad[0] if bad is not None else "<none on this rank>"
+                            reason = (
+                                "model weights are non-finite (a prior optimizer step "
+                                "overflowed); skipping cannot recover"
+                                if weights_corrupt else
+                                f"{consecutive_nonfinite_skips} consecutive non-finite-loss "
+                                "skips with finite weights (not recovering)"
+                            )
+                            raise RuntimeError(
+                                f"Aborting at step {upcoming_step} on rank {rank}: "
+                                f"{reason}. First non-finite param: {bad_name}. "
+                                "Lower the learning rate or add grad/update clipping."
+                            )
                         # backward() already ran on the non-finite loss; zero_grad
                         # below discards those gradients along with any accumulation.
                         optimizer.zero_grad(set_to_none=True)
@@ -3082,6 +3139,7 @@ def run_pure_pretraining(
                                     )
                         _moe_count_accum.zero_()
 
+                    consecutive_nonfinite_skips = 0
                     global_step += 1
                     tokens_seen += int(achieved_global_batch_tokens)
                     profiler_step_cb(global_step)
