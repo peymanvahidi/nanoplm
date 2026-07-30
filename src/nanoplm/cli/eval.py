@@ -96,9 +96,10 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
     if "tasks" in kwargs:
         kwargs["tasks"] = _coerce_list_of_str(kwargs["tasks"], "tasks")
 
-    # Boolean flag.
-    if "force_download" in kwargs:
-        kwargs["force_download"] = bool(kwargs["force_download"])
+    # Boolean flags.
+    for key in ("force_download", "development_mode"):
+        if key in kwargs:
+            kwargs[key] = bool(kwargs[key])
 
     # Validate zero_shot_method against the allowed set.
     if "zero_shot_method" in kwargs and kwargs["zero_shot_method"] not in _VALID_ZERO_SHOT_METHODS:
@@ -212,6 +213,15 @@ def eval():
     default=False,
     help="Force re-download of framework datasets (use when new tasks land upstream).",
 )
+@click.option(
+    "--development-mode",
+    is_flag=True,
+    default=False,
+    help=(
+        "Evaluate on data subsets only (fast, not comparable to a full run). "
+        "Off by default, so a plain run is a full evaluation."
+    ),
+)
 def run(
     checkpoint_dir: str,
     framework: tuple,
@@ -225,6 +235,7 @@ def run(
     parallel_tasks: int,
     tasks: tuple,
     force_download: bool,
+    development_mode: bool,
 ):
     """Run downstream evaluation directly from CLI flags."""
     frameworks_list = list(framework)
@@ -244,6 +255,7 @@ def run(
         zero_shot_method=zero_shot_method,
         tasks=list(tasks) if tasks else None,
         force_download=force_download,
+        development_mode=development_mode,
     )
 
     from nanoplm.eval.pipeline import run_eval

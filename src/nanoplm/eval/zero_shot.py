@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -51,6 +51,10 @@ class NanoPLMBioEngineer:
                 return "nanoPLM"
 
             def supported_methods(self):
+                # JACOBIAN_CONTACT is deliberately absent: biotrainer's
+                # _compute_categorical_jacobian slices logits as [1:-1], which assumes a
+                # leading BOS token. This tokenizer has none (see strip_special_tokens),
+                # so the Jacobian would be off by one residue.
                 return [
                     ZeroShotMethod.MASKED_MARGINALS,
                     ZeroShotMethod.WT_MARGINALS,
@@ -64,14 +68,25 @@ class NanoPLMBioEngineer:
                     enc["attention_mask"].to(self._device),
                 )
 
-            def run_model(self, input_ids, attention_mask=None):
+            def _forward(self, input_ids, attention_mask):
                 with torch.no_grad(), torch.amp.autocast(
                     "cuda",
                     dtype=torch.bfloat16,
                     enabled=self._device.type == "cuda",
                 ):
                     outputs = self._model(input_ids=input_ids, attention_mask=attention_mask)
-                return outputs["logits"].squeeze(0)
+                return outputs["logits"]
+
+            def run_model(self, input_ids, attention_mask=None):
+                # Single-sequence contract: biotrainer expects [seq_len, vocab_size].
+                return self._forward(input_ids, attention_mask).squeeze(0)
+
+            def run_model_batched(self, input_ids, attention_mask=None):
+                # Batched contract: [batch_size, seq_len, vocab_size]. Overriding this is
+                # what makes masked-marginals actually batch — the default implementation
+                # in CustomBioEngineerModel loops over the batch calling run_model once
+                # per row, which would leave the scoring just as slow as before.
+                return self._forward(input_ids, attention_mask)
 
             def get_mask_token_id(self):
                 return self._tokenizer.mask_token_id
@@ -88,3 +103,33 @@ class NanoPLMBioEngineer:
                 return tensor[0:-1]
 
         return BioEngineer.from_custom_model(_Impl(), device=device)
+
+
+class NanoPLMEmbedder:
+    """Factory for a biotrainer ``CustomEmbedder`` backed by the nanoPLM model.
+
+    Same lazy-construction pattern as ``NanoPLMBioEngineer``: biotrainer is an
+    optional extra, so the base class is only resolved at build time.
+    """
+
+    @staticmethod
+    def build(
+        model: PureProtModernBertMLM,
+        tokenizer: ProtModernBertTokenizer,
+        device: torch.device,
+        batch_size: int,
+        biotrainer: dict[str, Any],
+    ):
+        """Return a ``CustomEmbedder`` yielding per-residue/per-sequence embeddings."""
+        from nanoplm.eval.embedders import embed_per_residue, embed_per_sequence
+
+        CustomEmbedder = biotrainer["CustomEmbedder"]
+
+        class _Impl(CustomEmbedder):
+            def per_residue(self, sequences: List[str]):
+                return embed_per_residue(model, tokenizer, sequences, device, batch_size)
+
+            def per_sequence(self, sequences: List[str]):
+                return embed_per_sequence(model, tokenizer, sequences, device, batch_size)
+
+        return _Impl()

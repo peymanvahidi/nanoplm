@@ -24,6 +24,10 @@ eval:
   # embedder_name: my-run            # defaults to checkpoint dir stem
   parallel_tasks: 0                  # 0 = sequential, >0 = parallel workers
 
+  # When true, biotrainer evaluates on data SUBSETS only (fast, not comparable
+  # to a full run). biotrainer itself defaults this to true; nanoPLM does not.
+  development_mode: false
+
   # Zero-shot scoring method when framework includes 'pgym'.
   zero_shot_method: masked_marginals  # masked_marginals | wt_marginals | pseudoperplexity
 

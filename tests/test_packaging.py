@@ -37,7 +37,7 @@ def test_installer_script_ships_as_package_data():
 
 
 def test_eval_extra_unchanged():
-    assert _load()["project"]["optional-dependencies"]["eval"] == ["biotrainer==1.4.0"]
+    assert _load()["project"]["optional-dependencies"]["eval"] == ["biotrainer==2.0.0"]
 
 
 def test_readme_documents_the_install_path_and_the_platform():

@@ -32,9 +32,14 @@ class EvalConfig:
     embedder_name: Optional[str] = None
 
     # Number of parallel workers for downstream task training.
-    # 0 = sequential (runs through biotrainer.autoeval_pipeline).
+    # 0 = sequential (runs through biotrainer's AutoEval, which also deduplicates
+    #     and computes embeddings once across every requested framework).
     # >0 = parallel mode (GPU embedding first, then CPU task training in a ThreadPoolExecutor).
     parallel_tasks: int = 0
+
+    # When True, biotrainer evaluates on data SUBSETS only. biotrainer defaults this
+    # to True; nanoPLM defaults to False so a plain run is a full evaluation.
+    development_mode: bool = False
 
     # Zero-shot scoring method when framework includes 'pgym'.
     # One of: masked_marginals, wt_marginals, pseudoperplexity.
