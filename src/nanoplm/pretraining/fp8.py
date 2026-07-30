@@ -7,6 +7,7 @@ from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 
 from nanoplm.pretraining.cpu_offload import run_target
 
@@ -179,8 +180,18 @@ def _te_layernorm_mlp_activation(layer: nn.Module) -> str | None:
             return None
         if wi.bias is None and wo.bias is not None:
             return None
-        if wi.out_features == 2 * wo.in_features:
+        if wi.out_features != 2 * wo.in_features:
+            return None
+        # ModernBertMLP (geglu) and ModernBertSwiGLUMLP are shape-identical, so
+        # the shapes above cannot tell them apart -- only ModernBertMLP carries
+        # an explicit `.act`, while the SwiGLU module hardcodes silu. Getting
+        # this wrong silently trains a different activation under fp8, so an
+        # unrecognised gate falls back to eager rather than guessing.
+        act = getattr(mlp, "act", None)
+        if act is None:
             return "swiglu"
+        if act is F.gelu:
+            return "geglu"
         return None
 
     wo_weight = getattr(mlp, "Wo_weight", None)
@@ -207,7 +218,8 @@ def _copy_mlp_branch_to_te_layernorm_mlp(layer: nn.Module, *, name: str | None =
     activation = _te_layernorm_mlp_activation(layer)
     if activation is None:
         raise ValueError("Layer is not eligible for Transformer Engine LayerNormMLP conversion.")
-    gated_activation = activation == "swiglu"
+    gated_activation = activation in {"swiglu", "geglu"}
+    swap_gate_halves = activation == "swiglu"
     ffn_hidden_size = mlp.Wo.in_features if gated_activation else mlp.Wo_weight.shape[0]
     normalization = "RMSNorm" if isinstance(mlp_norm, nn.RMSNorm) else "LayerNorm"
     new_mlp = te_mod.LayerNormMLP(
@@ -226,16 +238,26 @@ def _copy_mlp_branch_to_te_layernorm_mlp(layer: nn.Module, *, name: str | None =
         if normalization == "LayerNorm" and getattr(mlp_norm, "bias", None) is not None:
             new_mlp.layer_norm_bias.copy_(mlp_norm.bias)
         if gated_activation:
-            up_weight, gate_weight = wi.weight.chunk(2, dim=0)
-            new_mlp.fc1_weight.copy_(torch.cat([gate_weight, up_weight], dim=0))
+            # TE applies the nonlinearity to the FIRST half of fc1 for both
+            # gated forms. ModernBertMLP (geglu) already does that, so its
+            # halves carry over as-is; ModernBertSwiGLUMLP applies silu to the
+            # SECOND half, so its halves have to swap on the way in.
+            if swap_gate_halves:
+                up_weight, gate_weight = wi.weight.chunk(2, dim=0)
+                new_mlp.fc1_weight.copy_(torch.cat([gate_weight, up_weight], dim=0))
+            else:
+                new_mlp.fc1_weight.copy_(wi.weight)
             new_mlp.fc2_weight.copy_(mlp.Wo.weight)
         else:
             new_mlp.fc1_weight.copy_(wi.weight)
             new_mlp.fc2_weight.copy_(mlp.Wo_weight.T)
         if wi.bias is not None:
             if gated_activation:
-                up_bias, gate_bias = wi.bias.chunk(2, dim=0)
-                new_mlp.fc1_bias.copy_(torch.cat([gate_bias, up_bias], dim=0))
+                if swap_gate_halves:
+                    up_bias, gate_bias = wi.bias.chunk(2, dim=0)
+                    new_mlp.fc1_bias.copy_(torch.cat([gate_bias, up_bias], dim=0))
+                else:
+                    new_mlp.fc1_bias.copy_(wi.bias)
                 new_mlp.fc2_bias.copy_(mlp.Wo.bias)
             else:
                 new_mlp.fc1_bias.copy_(wi.bias)
