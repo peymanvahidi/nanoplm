@@ -264,6 +264,7 @@ pretraining:
   logging_steps: 1
   eval_steps: 1000
   save_steps: 2500
+  # max_wallclock_hours: 3.0            # stop + checkpoint after N hours of training; for wall-clock-matched ablations
   seed: 42
 
   # ── Debug ─────────────────────────────────────────────────────────────────

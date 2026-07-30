@@ -202,6 +202,20 @@ x-extra-fields:
           cosine | linear): train for this many optimizer steps instead of for a
           token budget. Set exactly one of train_tokens or max_steps, never
           both; neither is valid with lr_schedule: wsd.
+      max_wallclock_hours:
+        type: number
+        default: null
+        advanced: true
+        group: Logging, eval, checkpoints
+        description: >-
+          Wall-clock budget for training, in hours. The run writes a checkpoint
+          and stops at the first optimizer step past the deadline, even if the
+          token budget is not spent, which is how wall-clock-matched ablations
+          are run. The clock starts a couple of optimizer steps in so that
+          torch.compile, autotuning and warmup are excluded, meaning total job
+          time is longer than the budget; it also restarts on resume rather than
+          accumulating across resumes. Unset (the default) runs the full token
+          budget.
       stable_steps:
         type: integer
         default: null

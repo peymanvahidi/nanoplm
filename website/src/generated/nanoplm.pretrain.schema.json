@@ -1096,6 +1096,13 @@
           "default": 42,
           "x-nanoplm-group": "Logging, eval, checkpoints"
         },
+        "max_wallclock_hours": {
+          "type": "number",
+          "default": null,
+          "description": "Wall-clock budget for training, in hours. The run writes a checkpoint and stops at the first optimizer step past the deadline, even if the token budget is not spent, which is how wall-clock-matched ablations are run. The clock starts a couple of optimizer steps in so that torch.compile, autotuning and warmup are excluded, meaning total job time is longer than the budget; it also restarts on resume rather than accumulating across resumes. Unset (the default) runs the full token budget.",
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-group": "Logging, eval, checkpoints"
+        },
         "debug_non_finite_params": {
           "type": "boolean",
           "default": false,
