@@ -455,6 +455,16 @@ def pretrain():
     default=2500,
     help="Number of steps between checkpoint saves",
 )
+@click.option(
+    "--max-wallclock-hours",
+    type=float,
+    default=None,
+    help="Stop training after this many hours, checkpointing at the first "
+    "optimizer step past the deadline, even if the token budget is unspent. "
+    "For wall-clock-matched ablations. The clock starts a couple of optimizer "
+    "steps in, so compile/warmup is excluded and total job time is longer; it "
+    "also restarts on resume rather than accumulating.",
+)
 @click.option("--seed", type=int, default=42, help="Random seed")
 @click.option(
     "--debug-non-finite-params/--no-debug-non-finite-params",
@@ -979,6 +989,7 @@ def run(
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
+    max_wallclock_hours: Optional[float],
     seed: int,
     debug_non_finite_params: bool,
     debug_layerwise_metrics: bool,
@@ -1118,6 +1129,7 @@ def run(
         logging_steps=logging_steps,
         eval_steps=eval_steps,
         save_steps=save_steps,
+        max_wallclock_hours=max_wallclock_hours,
         seed=seed,
         debug_non_finite_params=debug_non_finite_params,
         debug_layerwise_metrics=debug_layerwise_metrics,
@@ -1616,6 +1628,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_eps",
         "muon_beta2",
         "nordion2_fraction",
+        "max_wallclock_hours",
         "min_lr",
         "noble_base_lr",
         "noble_lr_gamma",

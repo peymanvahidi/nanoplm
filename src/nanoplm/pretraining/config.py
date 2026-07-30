@@ -154,6 +154,14 @@ class PretrainingConfig:
     logging_steps: int = 1
     eval_steps: int = 250
     save_steps: int = 5000
+    # Wall-clock budget for training, in hours. When set, the run checkpoints
+    # and exits at the first optimizer step past the deadline, before the
+    # token-budget horizon is reached. Intended for wall-clock-matched
+    # ablations. The clock starts a couple of optimizer steps in, so compile,
+    # autotune and warmup are excluded and the budget measures steady-state
+    # training: expect total job time to exceed it. It also restarts from zero
+    # on resume, measuring this run rather than cumulative time across resumes.
+    max_wallclock_hours: Optional[float] = None
     seed: int = 42
     debug_non_finite_params: bool = True
     debug_layerwise_metrics: bool = False

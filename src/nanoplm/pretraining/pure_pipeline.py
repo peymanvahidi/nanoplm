@@ -116,6 +116,13 @@ N_PREFETCH_LAYERS_FSDP2 = 1
 # host and device once per micro-step.
 BATCH_COORD_TAIL_STEPS = 64
 
+# Optimizer steps to run before the max_wallclock_hours clock starts.  Step 1
+# triggers the torch.compile forward+backward build and kernel autotuning; step
+# 2 absorbs the recompiles those guards usually trigger.  From step 3 on the
+# loop is at steady state, which is the throughput a wall-clock-matched
+# ablation is trying to compare.
+_WALLCLOCK_WARMUP_STEPS = 2
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2578,6 +2585,27 @@ def run_pure_pretraining(
     logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
 
     _run_t0 = time.perf_counter()
+    # Wall-clock stop. The clock is NOT started here: the first optimizer steps
+    # pay for torch.compile, autotune and cuDNN/NCCL warmup, which would make the
+    # budget measure setup instead of throughput and would differ between the
+    # arms of an ablation. It is armed after _WALLCLOCK_WARMUP_STEPS steps of
+    # THIS run (so a resume gets a fresh budget), and is only read at optimizer-
+    # step boundaries, where a checkpoint has a consistent resume position.
+    _wallclock_hours = getattr(pretrain_config, "max_wallclock_hours", None)
+    wallclock_limit_sec = (
+        float(_wallclock_hours) * 3600.0
+        if _wallclock_hours is not None and float(_wallclock_hours) > 0
+        else None
+    )
+    wallclock_t0 = None
+    if wallclock_limit_sec is not None:
+        logger.info(
+            "Wall-clock stop enabled: training will checkpoint and exit after "
+            f"{_wallclock_hours}h ({wallclock_limit_sec:,.0f}s) of steady-state "
+            f"training even if total_steps={total_steps} has not been reached. "
+            f"The clock starts after step {start_step + _WALLCLOCK_WARMUP_STEPS}, "
+            f"so compile/warmup is excluded and total job time is longer."
+        )
     logger.info(
         f"Starting pure-torch training: total_steps={total_steps} (token-budget driven), "
         f"warmup_steps={warmup_steps}, global_batch_warmup_steps={global_batch_warmup_steps}, "
@@ -2742,6 +2770,8 @@ def run_pure_pretraining(
     # until the token-budget total_steps is reached. The horizon is driven by
     # global_step, not a fixed epoch count.
     epoch = start_epoch
+    wallclock_stop = False
+    wallclock_stop_ckpt = ""
 
     # Single entry point for every checkpoint write. The common kwargs are
     # captured by reference (resolved at call time); per-call-site differences
@@ -3372,6 +3402,35 @@ def run_pure_pretraining(
                     at_terminal = (global_step == total_steps)
                     do_periodic = global_step % save_steps == 0
 
+                    # Wall-clock budget. The clock is armed once, after the
+                    # compile/autotune warmup steps, so the budget measures
+                    # steady-state training. Ranks read their own clocks and can
+                    # straddle the deadline, so the verdict is reduced to a single
+                    # global answer -- a rank-local stop would leave peers waiting
+                    # in the next collective. At total_steps the post-loop save
+                    # already handles the exit, so don't double up.
+                    hit_wallclock = False
+                    if wallclock_limit_sec is not None and wallclock_t0 is None:
+                        if global_step >= start_step + _WALLCLOCK_WARMUP_STEPS:
+                            wallclock_t0 = time.perf_counter()
+                            if is_main:
+                                logger.info(
+                                    "Wall-clock budget clock started at step %d "
+                                    "(%.1fs of setup/compile excluded); stopping at "
+                                    "+%.3fh of training.",
+                                    global_step,
+                                    wallclock_t0 - _run_t0,
+                                    wallclock_limit_sec / 3600.0,
+                                )
+                    elif wallclock_limit_sec is not None and not at_terminal:
+                        hit_wallclock = (time.perf_counter() - wallclock_t0) >= wallclock_limit_sec
+                        if distributed and dist.is_initialized():
+                            _wc = torch.tensor(
+                                [1.0 if hit_wallclock else 0.0], device=device
+                            )
+                            dist.all_reduce(_wc, op=dist.ReduceOp.MAX)
+                            hit_wallclock = bool(_wc.item() > 0)
+
                     if global_step % eval_steps == 0 or at_wsd_stable_end:
                         _raise_on_nonfinite_params(f"before eval at step {global_step}")
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
@@ -3417,11 +3476,12 @@ def run_pure_pretraining(
                                         logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
-                    # In-loop saves: the forced wsd stable-end boundary and the
-                    # periodic save_steps cadence. Skip the periodic save at the
-                    # terminal step -- the post-loop save writes the role-named
-                    # terminal checkpoint there for every schedule.
-                    if at_wsd_stable_end or (do_periodic and not at_terminal):
+                    # In-loop saves: the forced wsd stable-end boundary, the
+                    # wall-clock deadline, and the periodic save_steps cadence.
+                    # Skip the periodic save at the terminal step -- the post-loop
+                    # save writes the role-named terminal checkpoint there for
+                    # every schedule.
+                    if at_wsd_stable_end or hit_wallclock or (do_periodic and not at_terminal):
                         _raise_on_nonfinite_params(f"before checkpoint at step {global_step}")
                         next_data_step = micro_step
                         next_sub_batch_step = sub_batch_idx + 1
@@ -3435,12 +3495,36 @@ def run_pure_pretraining(
                             epoch_sub_batch_step=next_sub_batch_step,
                             batch_split_divisor=next_batch_split_divisor,
                         )
-                        _save("stable-end" if at_wsd_stable_end else "periodic", **_pos)
+                        _phase = "stable-end" if at_wsd_stable_end else "periodic"
+                        _save(_phase, **_pos)
                         # When the wsd stable-end coincides with the periodic
                         # cadence, also write the periodic checkpoint so the
                         # save_steps trail is unbroken.
                         if at_wsd_stable_end and do_periodic:
                             _save("periodic", **_pos)
+
+                    # Leave immediately after the save so the checkpoint on disk
+                    # matches the final in-memory state: later sub-batches in this
+                    # macro-batch would otherwise take further optimizer steps.
+                    if hit_wallclock:
+                        wallclock_stop = True
+                        wallclock_stop_ckpt = _checkpoint_dir_name(global_step, _phase)
+                        if is_main:
+                            logger.info(
+                                "Wall-clock limit of %.3fh reached after %.1fs of training "
+                                "(%.1fs since process start) at step %d/%d (%.1f%% of the "
+                                "token budget); wrote %s, stopping.",
+                                wallclock_limit_sec / 3600.0,
+                                time.perf_counter() - wallclock_t0,
+                                time.perf_counter() - _run_t0,
+                                global_step, total_steps,
+                                100.0 * global_step / max(1, total_steps),
+                                wallclock_stop_ckpt,
+                            )
+                        break
+
+                if wallclock_stop:
+                    break
 
                 if epoch == resume_epoch and micro_step == resume_data_step:
                     resume_data_step = 0
@@ -3487,9 +3571,9 @@ def run_pure_pretraining(
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
 
-            # Stop once the token-budget horizon is met; otherwise replay the
-            # DataLoader for another pass.
-            if global_step >= total_steps:
+            # Stop once the token-budget horizon is met (or the wall-clock budget
+            # ran out); otherwise replay the DataLoader for another pass.
+            if wallclock_stop or global_step >= total_steps:
                 break
             epoch += 1
 
@@ -3511,7 +3595,18 @@ def run_pure_pretraining(
             else "final"
         )
     )
-    _save(_terminal_phase)
+    # A wall-clock stop never reaches the end of the LR schedule, so the run has
+    # no terminal checkpoint to write: naming a mid-decay snapshot "final" would
+    # misrepresent it (and clobber a real final from an earlier run in the same
+    # output dir). The in-loop save at the deadline is the run's output.
+    if wallclock_stop:
+        logger.info(
+            "Stopped on the wall-clock budget at step %d/%d; skipping the terminal "
+            "'%s' checkpoint. Latest state is %s.",
+            global_step, total_steps, _terminal_phase, wallclock_stop_ckpt,
+        )
+    else:
+        _save(_terminal_phase)
 
     if debug_tracker is not None:
         debug_tracker.close()
