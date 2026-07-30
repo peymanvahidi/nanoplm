@@ -33,7 +33,7 @@
           "default": "swiglu",
           "enum": [
             "swiglu",
-            "glu",
+            "geglu",
             "srelu"
           ]
         },

@@ -189,6 +189,16 @@ class ModernBertEmbeddings(nn.Module):
 
 
 class ModernBertMLP(nn.Module):
+    """Gated MLP: ``act(first half) * second half``.
+
+    This is what ``mlp_activation="geglu"`` builds. The gate nonlinearity comes
+    from ``hidden_activation`` (gelu, and not settable from the run config), so
+    in practice this is GEGLU and matches stock ModernBERT. Note the operand
+    order is the opposite of :class:`ModernBertSwiGLUMLP`, which applies its
+    nonlinearity to the *second* half -- see ``fp8.py`` where that difference
+    decides whether the fused ``Wi`` halves swap on conversion to TE.
+    """
+
     def __init__(self, config: ModernBertConfig):
         super().__init__()
         self.fused_up_gate = config.fused_up_gate
@@ -801,6 +811,8 @@ class ModernBertEncoderLayer(nn.Module):
                 elif mlp_config.mlp_activation == "swiglu":
                     self.mlp = ModernBertSwiGLUMLP(mlp_config)
                 else:
+                    # geglu: ModernBertMLP gates on `hidden_activation`, which is
+                    # gelu and is not settable from the run config.
                     self.mlp = ModernBertMLP(mlp_config)
         else:
             self.mlp_norm = nn.Identity()

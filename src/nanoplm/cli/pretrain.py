@@ -739,7 +739,7 @@ def pretrain():
 )
 @click.option(
     "--mlp-activation",
-    type=click.Choice(["swiglu", "glu", "srelu"], case_sensitive=False),
+    type=click.Choice(["swiglu", "geglu", "srelu"], case_sensitive=False),
     default="swiglu",
     help="MLP activation",
 )

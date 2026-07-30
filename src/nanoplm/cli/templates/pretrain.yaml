@@ -38,7 +38,7 @@ model:
   # ── Norms & MLP ───────────────────────────────────────────────────────────
 
   norm_type: "rmsnorm"                  # layernorm | rmsnorm  (rmsnorm: slightly faster, no bias)
-  mlp_activation: "swiglu"              # swiglu | glu | srelu
+  mlp_activation: "swiglu"              # swiglu | geglu | srelu  (geglu = stock ModernBERT)
   mlp_dropout: 0.0
   mlp_bias: false
   no_mlp_on_first_layer: false

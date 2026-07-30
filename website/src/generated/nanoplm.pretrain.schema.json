@@ -53,10 +53,10 @@
           "x-nanoplm-group": "Norms & MLP",
           "enum": [
             "swiglu",
-            "glu",
+            "geglu",
             "srelu"
           ],
-          "description": "swiglu | glu | srelu"
+          "description": "swiglu | geglu | srelu  (geglu = stock ModernBERT)"
         },
         "mlp_dropout": {
           "type": "number",
