@@ -95,7 +95,7 @@ If the build host has no outbound internet for the FlashAttention-3 wheel, downl
 
 ## Benchmarking extra
 
-`nanoplm eval` runs [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline. That dependency is **not** part of `nanoplm deps install`; pull it with the `eval` extra:
+`nanoplm eval` runs [biotrainer](https://github.com/sacdallago/biotrainer) 2.0.0's autoeval pipeline. That dependency is **not** part of `nanoplm deps install`; pull it with the `eval` extra (it requires Python 3.12–3.13):
 
 <Tabs>
 <TabItem label="From GitHub (recommended)">
@@ -115,6 +115,10 @@ uv pip install -e ".[eval]"
 </Tabs>
 
 Without it, `nanoplm eval from-yaml` fails at import time.
+
+The extra also pulls `biotrainer-core`, which `nanoplm.eval` imports directly. Installing biotrainer
+can move shared pins (notably `quack-kernels` and `nvidia-cutlass-dsl`); re-run `nanoplm deps install`
+afterwards to restore the MoE kernel versions.
 
 ## Verify your install
 

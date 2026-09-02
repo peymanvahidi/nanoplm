@@ -311,7 +311,7 @@ Flag-driven pretraining without a YAML file. `--dataset-dir` is the only require
 
 ## eval
 
-`nanoplm eval` scores a checkpoint on downstream benchmarks through biotrainer's autoeval. It needs the `eval` extra (`uv pip install -e ".[eval]"` or the GitHub equivalent; see [Install](/nanoplm/start/install/)), and it loads **pure-torch checkpoints only**. Fields are documented in the [eval.yaml reference](/nanoplm/reference/eval/).
+`nanoplm eval` scores a checkpoint on zero-shot benchmarks through biotrainer 2.0.0's autoeval. It needs the `eval` extra (`uv pip install -e ".[eval]"` or the GitHub equivalent; see [Install](/nanoplm/start/install/)), and it loads **pure-torch checkpoints only**. Fields are documented in the [eval.yaml reference](/nanoplm/reference/eval/). The supervised probe suites (`pbc`, `flip`) were dropped in the biotrainer 2.0.0 migration; passing them fails with a message naming the supported frameworks.
 
 ### eval get-yaml
 
@@ -341,7 +341,7 @@ nanoplm eval from-yaml
 # ...
 Resolved checkpoint: output/pretraining_checkpoints/run-14071932/checkpoint-5000
 # ...
-Results written to autoeval_output/checkpoint-5000/
+Results written to autoeval_output/autoeval_report_checkpoint-5000.json
 ```
 
 ### eval run
@@ -353,16 +353,14 @@ nanoplm eval run --checkpoint-dir DIR [OPTIONS]
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--checkpoint-dir TEXT` | **Required.** A `checkpoint-*` directory, or a `run-*` directory (the newest checkpoint inside is used) | - |
-| `--framework [pbc\|flip\|pgym]` | Benchmark suite; repeat the flag to run several | `pbc` |
+| `--framework [pgym\|pbc_zeroshot_contact]` | Benchmark suite; repeat the flag to run several | `pgym` |
 | `--zero-shot-method [masked_marginals\|wt_marginals\|pseudoperplexity]` | Scoring method, used only when `--framework` includes `pgym` | `masked_marginals` |
 | `--output-dir TEXT` | Where results are written | `autoeval_output` |
-| `--batch-size INTEGER` | Embedding batch size | `16` |
-| `--min-seq-length INTEGER` | Benchmark sequence-length filter | `0` |
-| `--max-seq-length INTEGER` | Benchmark sequence-length filter | `2000` |
+| `--zero-shot-batch-size INTEGER` | Sequences per forward pass; batches masked positions and Jacobian rows | `60` |
 | `--device TEXT` | Device override | auto-detected |
 | `--embedder-name TEXT` | Name used in the report and output directory | checkpoint directory name |
-| `--parallel-tasks INTEGER` | Parallel probe workers; `0` runs sequentially | `0` |
-| `--tasks TEXT` | Whitelist of task names; repeat the flag. Honored in parallel mode only | none |
+| `--development-mode / --full-eval` | Subsampled task sets, or the full benchmark | `--development-mode` |
+| `--dataset-dir TEXT` | Pre-downloaded benchmark datasets, for offline machines. Mutually exclusive with `--force-download` | none |
 | `--force-download` | Re-download benchmark datasets | off |
 
 ---
