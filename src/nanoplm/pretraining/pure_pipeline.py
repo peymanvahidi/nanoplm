@@ -2150,20 +2150,16 @@ def run_pure_pretraining(
                 
         _encoder = base_model.model
         _recycling_active = int(getattr(_encoder.config, "recycling_loop_count", 1) or 1) > 1
-        _loopie_active = bool(getattr(_encoder.config, "use_loopie", False))
-        if _loopie_active:
-            # Under Loopie every layer executes more than once per forward, so
-            # skip per-layer sharding entirely and let all layers fall into the
-            # root FSDP group: one unshard covering the whole forward/backward,
-            # gradients from all repeats accumulating into a single
-            # reduce-scatter. Same reasoning as the recurrent-layer exclusion.
-            _recurrent_ids = {id(l) for l in _encoder.layers}
-        else:
-            _recurrent_ids = (
-                {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
-                if _recycling_active
-                else set()
-            )
+        # Huginn recycling calls each recurrent layer once per iteration, so
+        # per-layer sharding would re-all-gather it every iteration. Leaving
+        # those layers to the root FSDP group buys one unshard for the whole
+        # forward/backward and a single reduce-scatter for the accumulated
+        # gradients.
+        _recurrent_ids = (
+            {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
+            if _recycling_active
+            else set()
+        )
         for layer in _encoder.layers:
             if id(layer) in _recurrent_ids:
                 continue

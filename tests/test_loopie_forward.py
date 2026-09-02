@@ -37,9 +37,10 @@ def _perturb(model):
 
 
 def test_layer_repeats_reflects_config():
-    assert PureProtModernBertMLM(_cfg()).model._layer_repeats == 1
+    plain = PureProtModernBertMLM(_cfg())
+    assert all(l.repeats == 1 for l in plain.model.layers)
     m = PureProtModernBertMLM(_cfg(use_loopie=True, loopie_loop_count=3))
-    assert m.model._layer_repeats == 3
+    assert all(l.repeats == 3 for l in m.model.layers)
 
 
 def test_loopie_adds_no_parameters():
@@ -66,8 +67,9 @@ def test_loopie_matches_manual_double_application():
         cos_sin = enc.rotary_emb.forward_full(input_ids.shape[1], x.device, x.dtype)
         for layer in enc.layers:
             for _ in range(2):
-                x = layer(x, attn_mask=None, cos_sin=cos_sin, position_ids=None,
-                          token_mask=attention_mask, repo_active=False, prores_alpha=1.0)
+                x = layer._forward_once(
+                    x, attn_mask=None, cos_sin=cos_sin, position_ids=None,
+                    token_mask=attention_mask, repo_active=False, prores_alpha=1.0)
         want = model.decoder(model.head(enc.final_norm(x)))
 
     torch.testing.assert_close(got, want, rtol=0, atol=0)
@@ -87,8 +89,9 @@ def test_loopie_differs_from_single_pass():
         x = enc.embeddings(input_ids)
         cos_sin = enc.rotary_emb.forward_full(input_ids.shape[1], x.device, x.dtype)
         for layer in enc.layers:
-            x = layer(x, attn_mask=None, cos_sin=cos_sin, position_ids=None,
-                      token_mask=attention_mask, repo_active=False, prores_alpha=1.0)
+            x = layer._forward_once(
+                x, attn_mask=None, cos_sin=cos_sin, position_ids=None,
+                token_mask=attention_mask, repo_active=False, prores_alpha=1.0)
         once = model.decoder(model.head(enc.final_norm(x)))
 
     assert (looped - once).abs().max() > 1e-4
