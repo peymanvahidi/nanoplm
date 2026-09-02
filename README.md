@@ -57,6 +57,8 @@ nanoplm deps install
 uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"   # or: uv pip install -e ".[eval]"
 ```
 
+The `pbc_zeroshot_contact` framework needs fixes not yet in biotrainer 2.0.0. Run `tools/install_biotrainer_pr.sh` after the extra installs to layer PR #192 on top, with `--no-deps` so it doesn't touch nanoPLM's pinned MoE kernels.
+
 To take biotrainer straight from source instead, use the command below:
 
 ```bash
