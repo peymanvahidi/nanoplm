@@ -74,7 +74,9 @@ describe('toRows', () => {
     expect(rows.find((r) => r.key === 'mlm_masking_strategy')?.description).toContain(
       'BERT-style',
     );
-    expect(rows.find((r) => r.key === 'muonh_scope')?.description).toContain('rest on NorMuon');
+    expect(rows.find((r) => r.key === 'muon_adjust_lr')?.description).toContain(
+      'Shared matrix-optimizer knobs',
+    );
     // The mid-sentence case ("size (allowed: a/b, default: b)") no longer occurs
     // in the real template, so it is exercised by the unit tests below instead.
   });
@@ -118,7 +120,15 @@ describe('toRows', () => {
       const pre = pretrain as Surface;
       const groups = toGroups(toRows(pre, 'model'), pre, 'model');
       expect(groups[0].title).toBe('Architecture (edit these first)');
-      expect(groups.at(-1)!.title).toContain('Recycling');
+      // Block intros are keyed in template order, independent of the field order
+      // that builds the groups, so the two orderings have to agree.
+      const noted = Object.keys(
+        (pre.properties.model as SectionSchema)['x-nanoplm-group-notes'] ?? {},
+      );
+      const titles = groups.map((g) => g.title);
+      expect(titles.filter((t) => noted.includes(t))).toEqual(
+        noted.filter((t) => titles.includes(t)),
+      );
       // Every field lands in exactly one block, and none is left ungrouped.
       expect(groups.flatMap((g) => g.rows)).toHaveLength(toRows(pre, 'model').length);
       expect(groups.every((g) => g.title)).toBe(true);
