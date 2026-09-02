@@ -533,8 +533,8 @@
         "use_huginn_looping": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
-          "description": "master switch; must agree with recycling_loop_count (>= 2 when true)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "description": "master switch; needs recycling_loop_count >= 2",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
@@ -543,7 +543,7 @@
         "recycling_num_prelude_layers": {
           "type": "integer",
           "default": 0,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "P",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -554,7 +554,7 @@
         "recycling_num_coda_layers": {
           "type": "integer",
           "default": 0,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "C",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -565,7 +565,7 @@
         "recycling_loop_count": {
           "type": "integer",
           "default": 1,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "target mean loop count (1 = off)",
           "x-nanoplm-backend": [
             "pure_torch"
@@ -575,7 +575,7 @@
         "recycling_adapter_bias": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "bias on 2h\u2192h adapter (Huginn: no bias)",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -586,7 +586,7 @@
         "recycling_s0_noise_sigma": {
           "type": "number",
           "default": 0.6324555320336759,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "sqrt(2/5) \u2014 Huginn s\u2080 noise scale",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -597,7 +597,7 @@
         "recycling_use_takase_init": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "Takase spike init on recurrent block + adapter",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -609,7 +609,7 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
-          "description": "master switch for layer-loop recurrence",
+          "description": "master switch",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
@@ -619,7 +619,7 @@
           "type": "integer",
           "default": 2,
           "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
-          "description": "consecutive applications per stored layer (>= 2 when enabled)",
+          "description": "times each layer is applied (>= 2 when enabled)",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
@@ -636,8 +636,8 @@
         "mHC-lite (pure_torch only)": "Multi-stream residual with doubly stochastic mixing.\nIncompatible with use_resid_lambdas.",
         "NOBLE (pure_torch only)": "Nonlinear low-rank branches on linear layers.\nTraining LR scaling lives under pretraining.noble_* (active when use_noble).",
         "MoE \u2014 Mixture-of-Experts (pure_torch only)": "Requires: pretraining.use_packing: true  and  use_static_inp_size: true\nAlways-on: one shared expert; routing is always sigmoid.",
-        "Recycling / Huginn architecture (pure_torch only)": "use_huginn_looping: false  \u2192  recycling OFF (default).\nSplits the L-layer stack into:\n  prelude  P  \u2014 first P layers, run once\n  recurrent   \u2014 layers P .. L-C-1, weight-tied and looped\n  coda     C  \u2014 last C layers, run once\nA learned 2h\u2192h adapter consumes [s, e] at each recycling iteration.\nTraining-time knobs live under pretraining.recycling_* (when recycling_loop_count > 1).",
-        "Loopie layer looping (pure_torch only)": "Every stored layer is applied loopie_loop_count times consecutively\n(L1,L1,L2,L2,\u2026), weight-tied, with full backprop through every repeat.\nNo prelude/coda, no adapter, no s\u2080 noise, no loop-count scheduler \u2014 the\nloop count is a fixed constant. Effective depth = num_hidden_layers \u00d7\nloopie_loop_count. Mutually exclusive with Huginn recycling above.\nReference: \"Loop the Loopies!\" (arXiv 2607.16051)."
+        "Recycling / Huginn looping (pure_torch only)": "Runs a block of middle layers in a loop, reusing the same weights.\nTraining knobs: pretraining.recycling_*",
+        "Loopie layer looping (pure_torch only)": "Runs each layer N times in a row, reusing the same weights.\nCannot be used together with Huginn recycling above."
       }
     },
     "pretraining": {
