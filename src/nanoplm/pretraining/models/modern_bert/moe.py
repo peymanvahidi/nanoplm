@@ -548,6 +548,10 @@ class MoELayer(nn.Module):
         self.last_aux_loss: Optional[torch.Tensor] = None
         self.last_z_loss: Optional[torch.Tensor] = None
         self.last_aux_count: Optional[torch.Tensor] = None
+        # Number of real (non-padding) rows in the packed batch, set once per
+        # forward by ModernBertForMaskedLM. A 0-d tensor, not an int, so
+        # torch.compile does not guard on its value and recompile per batch.
+        self.valid_token_count: Optional[torch.Tensor] = None
 
         # Gate/up storage convention marker (persistent, so it lands in the
         # checkpoint). Only gated activations have a convention to get wrong;
@@ -658,6 +662,17 @@ class MoELayer(nn.Module):
             x = x.reshape(-1, x.shape[-1])
         T, H = x.shape
 
+        # The collator pads the packed batch to a fixed token budget with a
+        # trailing dummy sequence, so the real tokens are always the prefix
+        # [0, valid_token_count). Comparing against arange keeps the shape
+        # static, which the MoE path requires.
+        valid_mask = None
+        if self.valid_token_count is not None:
+            valid_mask = (
+                torch.arange(T, device=x.device)
+                < self.valid_token_count.to(x.device)
+            ).unsqueeze(1)
+
         # --- shared expert (processes all tokens) ---
         shared_out = self.shared_expert(
             x,
@@ -701,6 +716,15 @@ class MoELayer(nn.Module):
             # stays mandatory: on the cutlass path `counts` may be a reused
             # workspace buffer.
             _new_counts = counts.detach().clone()
+            if valid_mask is not None:
+                # `counts` itself must keep the padding rows: it doubles as the
+                # group sizes for moe_grouped_gemm below. Only the copy the
+                # bias-correction loop and the telemetry read gets corrected.
+                _pad_w = (~valid_mask).to(torch.int64).expand(-1, self.top_k)
+                _pad_counts = torch.zeros_like(_new_counts).scatter_add_(
+                    0, expert_flat, _pad_w.reshape(-1),
+                )
+                _new_counts = _new_counts - _pad_counts
             self.last_expert_counts = (
                 _new_counts
                 if self.last_expert_counts is None
@@ -751,7 +775,11 @@ class MoELayer(nn.Module):
         # not produce useful router gradients.
         if self.aux_loss_coef > 0:
             router_mass = router_scores / router_scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-            mean_mass = router_mass.mean(dim=0)
+            if valid_mask is None:
+                mean_mass = router_mass.mean(dim=0)
+            else:
+                _m = valid_mask.to(router_mass.dtype)
+                mean_mass = (router_mass * _m).sum(dim=0) / _m.sum().clamp_min(1.0)
             target = torch.ones_like(mean_mass) / self.num_experts
             aux = aux + self.aux_loss_coef * ((mean_mass - target) ** 2).sum() * self.num_experts
         # Z-loss: prevents sigmoid saturation in the router.

@@ -3014,6 +3014,11 @@ def run_pure_pretraining(
                     with sync_ctx:
                         with amp_ctx, fp8_ctx:
                             fwd_kwargs = dict(input_ids=batch["input_ids"], labels=batch["labels"])
+                            if "num_valid_tokens" in batch:
+                                fwd_kwargs["num_valid_tokens"] = torch.as_tensor(
+                                    batch["num_valid_tokens"], dtype=torch.long,
+                                    device=batch["input_ids"].device,
+                                )
                             if "attention_mask" in batch:
                                 fwd_kwargs["attention_mask"] = batch["attention_mask"]
                             if "cu_seqlens" in batch:

@@ -2485,6 +2485,7 @@ class ModernBertForMaskedLM(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         recycling_loop_count: Optional[int] = None,
         recycling_bptt: Optional[int] = None,
+        num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> MLMOutput:
         # Reset the per-layer MoE bookkeeping that MoELayer.forward accumulates
         # (aux loss, execution count, expert counts). Doing it once here, before
@@ -2499,6 +2500,7 @@ class ModernBertForMaskedLM(nn.Module):
                     _module.last_aux_loss = None
                     _module.last_z_loss = None
                     _module.last_aux_count = None
+                    _module.valid_token_count = num_valid_tokens
 
         # ---- static packed path (pre-flattened by collator) ---------------
         # When both cu_seqlens and position_ids are provided and input_ids is

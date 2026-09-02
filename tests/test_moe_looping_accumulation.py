@@ -111,3 +111,34 @@ def test_loopie_accumulates_per_repeat():
             continue
         assert moe.last_aux_count.item() == 2
         assert moe.last_expert_counts.sum().item() == 2 * TOKENS * TOP_K
+
+
+def test_valid_token_count_excludes_padding_from_expert_counts():
+    """`num_valid_tokens` must keep the collator's pad rows out of the histogram.
+
+    The prefix layout matches production, where MoE requires sequence packing and
+    the collator appends its pad run as a trailing dummy sequence.
+    """
+    torch.manual_seed(0)
+    model = _model()
+    ids = torch.randint(0, 32, (BATCH, SEQ), device="cuda")
+    kwargs = dict(input_ids=ids, attention_mask=torch.ones_like(ids), labels=ids.clone())
+
+    model(**kwargs)
+    baseline = [
+        _moe_of(l).last_expert_counts.sum().item()
+        for l in model.model.layers if _moe_of(l) is not None
+    ]
+    assert baseline and all(c == TOKENS * TOP_K for c in baseline)
+
+    n_valid = TOKENS // 2
+    model(**kwargs, num_valid_tokens=torch.tensor(n_valid, device="cuda"))
+    for layer in model.model.layers:
+        moe = _moe_of(layer)
+        if moe is None:
+            continue
+        assert moe.last_expert_counts.sum().item() == n_valid * TOP_K, (
+            f"expected {n_valid * TOP_K} routed slots from {n_valid} real tokens, "
+            f"got {moe.last_expert_counts.sum().item()}"
+        )
+        assert (moe.last_expert_counts >= 0).all(), "pad subtraction went negative"
