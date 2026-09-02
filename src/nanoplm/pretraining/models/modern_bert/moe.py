@@ -736,11 +736,16 @@ class MoELayer(nn.Module):
             # up-projection GEMM, and the down-projection scatters/combines with
             # the router weights — all driven by nanoplm's routing decisions.
             from .moe_sonicmoe import sonicmoe_routed_experts
+            # quack's SM90 GEMM takes 16- or 8-bit operands of a single dtype.
+            # Training's bf16 autocast already hands the residual stream over
+            # that way, but a custom op is invisible to autocast, so an fp32
+            # caller reaches the kernel unconverted and trips its dtype check.
+            # Both casts are no-ops when the dtypes already agree.
             expert_out = sonicmoe_routed_experts(
-                x, indices, weights,
+                x.to(self.Wi.dtype), indices, weights,
                 self.Wi, self.Wo, self.num_experts, self.top_k,
                 self.srelu, self.routed_scaling_factor,
-            )  # (T, H)
+            ).to(x.dtype)  # (T, H)
         else:
             # --- expert MLP via cutlass grouped_gemm ---
             token_idx = (sorted_idx // self.top_k).to(torch.int32)
