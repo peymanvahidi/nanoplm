@@ -131,16 +131,11 @@ model:
   moe_leading_dense_layers: 1           # first N layers stay dense (DeepSeek uses 1)
   moe_kernel_backend: 'sonicmoe'        # cutlass | sonicmoe  (SonicMoE/quack fused path)
 
-  # ── Recycling / Huginn architecture (pure_torch only) ─────────────────────
+  # ── Recycling / Huginn looping (pure_torch only) ──────────────────────────
 
-  # use_huginn_looping: false  →  recycling OFF (default).
-  # Splits the L-layer stack into:
-  #   prelude  P  — first P layers, run once
-  #   recurrent   — layers P .. L-C-1, weight-tied and looped
-  #   coda     C  — last C layers, run once
-  # A learned 2h→h adapter consumes [s, e] at each recycling iteration.
-  # Training-time knobs live under pretraining.recycling_* (when recycling_loop_count > 1).
-  use_huginn_looping: false             # master switch; must agree with recycling_loop_count (>= 2 when true)
+  # Runs a block of middle layers in a loop, reusing the same weights.
+  # Training knobs: pretraining.recycling_*
+  use_huginn_looping: false             # master switch; needs recycling_loop_count >= 2
   recycling_num_prelude_layers: 0       # P
   recycling_num_coda_layers: 0          # C
   recycling_loop_count: 1               # target mean loop count (1 = off)
@@ -150,14 +145,10 @@ model:
 
   # ── Loopie layer looping (pure_torch only) ────────────────────────────────
 
-  # Every stored layer is applied loopie_loop_count times consecutively
-  # (L1,L1,L2,L2,…), weight-tied, with full backprop through every repeat.
-  # No prelude/coda, no adapter, no s₀ noise, no loop-count scheduler — the
-  # loop count is a fixed constant. Effective depth = num_hidden_layers ×
-  # loopie_loop_count. Mutually exclusive with Huginn recycling above.
-  # Reference: "Loop the Loopies!" (arXiv 2607.16051).
-  use_loopie: false                     # master switch for layer-loop recurrence
-  loopie_loop_count: 2                  # consecutive applications per stored layer (>= 2 when enabled)
+  # Runs each layer N times in a row, reusing the same weights.
+  # Cannot be used together with Huginn recycling above.
+  use_loopie: false                     # master switch
+  loopie_loop_count: 2                  # times each layer is applied (>= 2 when enabled)
 
 
 # =============================================================================
