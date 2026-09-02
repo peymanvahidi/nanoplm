@@ -5,6 +5,15 @@ on GPU and expert GEMMs run as a single grouped kernel instead of a host loop.
 
 Only supports the packed flat-token static-shape forward path
 (``use_packing=True``, ``use_static_inp_size=True``).
+
+Routed-expert ``Wi`` gate/up layout
+-----------------------------------
+For SwiGLU, ``Wi (E, H, 2I)``'s output columns are stored **interleaved, gate
+first**: column ``2j`` is gate unit ``j``, column ``2j+1`` is up unit ``j``.
+This is QuACK/SonicMoE's native gated-GEMM split, so the ``sonicmoe`` backend
+consumes ``Wi`` with no reordering; the ``cutlass``/eager branch reads the two
+strided slices. ``Wo`` is indexed by unit ``j`` under both conventions and is
+unaffected. See ``WI_GATED_LAYOUT_VERSION``.
 """
 
 from __future__ import annotations
@@ -12,6 +21,7 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
+import torch.library
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -21,6 +31,257 @@ from .moe_triton_ops import (
     moe_gather_combine,
     moe_scatter_dispatch,
 )
+
+# Storage convention for the gated routed-expert input projection ``Wi``.
+#
+#   1  block-concat ``[up | gate]``  (nanoPLM <= 2026-08-06)
+#   2  interleaved gate-first ``[gate_0, up_0, gate_1, up_1, ...]``  (current)
+#
+# Version 2 is QuACK/SonicMoE's native layout, which removes a full
+# ``(E, H, 2I)`` gather in the forward and its inverse in the backward on the
+# ``sonicmoe`` path (measured 0.362 ms/layer/step at the production shape).
+#
+# The two conventions are *different functions of the same weights*, so a v1
+# checkpoint loaded by v2 code would silently re-pair gate/up and destroy the
+# run. Every gated ``MoELayer`` therefore carries the version as a persistent
+# buffer and refuses to load a state_dict that does not match; use
+# ``convert_wi_state_dict_v1_to_v2`` to migrate.
+WI_GATED_LAYOUT_VERSION = 2
+_WI_LAYOUT_BUFFER = "_wi_gated_layout_version"
+
+
+def _interleave_gate_first(wi: torch.Tensor) -> torch.Tensor:
+    """``[up | gate]`` block-concat -> ``[gate_0, up_0, gate_1, up_1, ...]``."""
+    half = wi.shape[-1] // 2
+    out = torch.empty_like(wi)
+    out[..., 0::2] = wi[..., half:]   # gate
+    out[..., 1::2] = wi[..., :half]   # up
+    return out
+
+
+def convert_wi_state_dict_v1_to_v2(
+    state_dict: dict,
+    optimizer_state_dict: Optional[dict] = None,
+) -> list[str]:
+    """Migrate a pre-2026-08-06 checkpoint's gated routed-expert ``Wi`` in place.
+
+    ``[up | gate]`` block-concat  ->  ``[gate_0, up_0, gate_1, up_1, ...]``::
+
+        I = Wi.shape[-1] // 2
+        Wi_v2[..., 0::2] = Wi_v1[..., I:]    # gate
+        Wi_v2[..., 1::2] = Wi_v1[..., :I]    # up
+
+    ``Wo`` is indexed by intermediate unit under both conventions and is left
+    alone.  A ``Wi`` is treated as gated iff its sibling ``Wo`` says so
+    (``Wi.shape[-1] == 2 * Wo.shape[-2]``), so an sReLU checkpoint is a no-op
+    and this is safe to run over anything.
+
+    **Pass ``optimizer_state_dict`` too when resuming training.**  Muon/NorMuon
+    momentum and second moments are per-element, so they carry the old column
+    order; every optimizer state tensor shaped like a converted ``Wi`` is
+    permuted the same way.  (Newton-Schulz itself is exactly equivariant under a
+    column permutation, so no other optimizer surgery is needed.)  Omitting it
+    is only correct if the optimizer state is being discarded.
+
+    Usage::
+
+        from nanoplm.pretraining.models.modern_bert.moe import (
+            convert_wi_state_dict_v1_to_v2,
+        )
+        msd = torch.load(ckpt / "pytorch_model.bin", weights_only=True)
+        osd = torch.load(ckpt / "optimizer.pt", weights_only=False)
+        convert_wi_state_dict_v1_to_v2(msd, osd)
+        torch.save(msd, ckpt / "pytorch_model.bin")
+        torch.save(osd, ckpt / "optimizer.pt")
+
+    Returns the list of converted ``Wi`` keys.
+    """
+    converted: list[str] = []
+    shapes: dict[str, torch.Size] = {}
+    for key in [k for k in state_dict if k.endswith("Wi")]:
+        wi = state_dict[key]
+        if not torch.is_tensor(wi) or wi.ndim != 3:
+            continue  # dense nn.Linear Wi (2-D) — different convention, skip
+        wo = state_dict.get(key[: -len("Wi")] + "Wo")
+        if not torch.is_tensor(wo) or wo.ndim != 3:
+            continue
+        if wi.shape[0] != wo.shape[0] or wi.shape[-1] != 2 * wo.shape[-2]:
+            continue  # ungated (sReLU) or not a routed-expert pair
+        state_dict[key] = _interleave_gate_first(wi)
+        state_dict[key[: -len("Wi")] + _WI_LAYOUT_BUFFER] = torch.tensor(
+            [WI_GATED_LAYOUT_VERSION], dtype=torch.int64
+        )
+        converted.append(key)
+        shapes[key] = wi.shape
+
+    if not converted:
+        raise ValueError(
+            "convert_wi_state_dict_v1_to_v2 found no gated MoE routed-expert "
+            "Wi/Wo pair in this state_dict — it is either already converted, "
+            "an sReLU model, or not a MoE checkpoint."
+        )
+
+    if optimizer_state_dict is not None:
+        opt_state = optimizer_state_dict.get("state", optimizer_state_dict)
+        for key in converted:
+            entry = opt_state.get(key)
+            if not isinstance(entry, dict):
+                continue
+            for name, val in entry.items():
+                if torch.is_tensor(val) and val.shape == shapes[key]:
+                    entry[name] = _interleave_gate_first(val)
+    return converted
+
+# ── Fused router top-k + expert histogram ────────────────────────────────────
+#
+# ``torch.topk`` on the router's (T, E) score matrix is pathologically slow at
+# MoE shapes: picking 3 of 47 over 131,072 rows measures **470 us** on a GH200
+# (24.6 MB read => 6.7 us at 3,668 GB/s, i.e. 1.4% of HBM roofline), split
+# across ``sbtopk::gatherTopK`` and a ``bitonicSortKVInPlace`` that only exists
+# because ``sorted=True`` is the default.  A single-pass Triton kernel that
+# keeps the whole row in registers does the same job in **63 us** (7.5x), and
+# gets the per-expert assignment histogram almost for free: the one-hot mask
+# used to knock the winner out for the next round is exactly the histogram
+# contribution, so it costs one extra column reduction and one vectorised
+# atomic per tile instead of ``T*top_k`` colliding atomics on ``E`` addresses
+# (measured 137 us for the ``ones_like``/``zeros``/``scatter_add_`` triple).
+#
+# The kernel returns *indices only*; the caller gathers the values from the
+# source tensor, which is bit-identical to ``torch.topk``'s values and keeps
+# the differentiable path in plain ATen ops.
+try:  # pragma: no cover - exercised on GPU builds
+    import triton
+    import triton.language as tl
+
+    _HAVE_TRITON = True
+except ImportError:  # pragma: no cover
+    _HAVE_TRITON = False
+
+
+if _HAVE_TRITON:
+
+    @triton.jit
+    def _router_topk_kernel(
+        X, IDX, CNT,
+        M,
+        E_: tl.constexpr,
+        K_: tl.constexpr,
+        COUNT: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_E: tl.constexpr,
+    ):
+        """Top-K over the last dim of a (M, E_) row-major tensor.
+
+        One program owns BLOCK_M rows and holds the full row in registers.
+        Round ``i`` takes the row max, records the *lowest* column index that
+        attains it (deterministic tie-break), then masks that column to -inf.
+        Values are recomputed by the caller via ``gather``.
+        """
+        pid = tl.program_id(0)
+        rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BLOCK_E)
+        rmask = rows < M
+        cmask = cols < E_
+        x = tl.load(
+            X + rows[:, None] * E_ + cols[None, :],
+            mask=rmask[:, None] & cmask[None, :],
+            other=float("-inf"),
+        )
+        acc = tl.zeros((BLOCK_E,), dtype=tl.int32)
+        for i in tl.static_range(K_):
+            m = tl.max(x, axis=1)
+            eq = x == m[:, None]
+            idx = tl.min(tl.where(eq, cols[None, :], E_), axis=1)
+            tl.store(IDX + rows * K_ + i, idx, mask=rmask)
+            hit = cols[None, :] == idx[:, None]
+            if COUNT:
+                acc += tl.sum((hit & rmask[:, None]).to(tl.int32), axis=0)
+            x = tl.where(hit, float("-inf"), x)
+        if COUNT:
+            tl.atomic_add(CNT + cols, acc, mask=cmask)
+
+
+_lib = torch.library.Library("nanoplm_router", "DEF")
+_lib.define("topk_counts(Tensor scores, int k, bool want_counts) -> (Tensor, Tensor)")
+
+
+@torch.library.register_fake("nanoplm_router::topk_counts")
+def _topk_counts_fake(scores, k, want_counts):
+    m, e = scores.shape
+    return (
+        scores.new_empty((m, k), dtype=torch.int64),
+        scores.new_empty((e,), dtype=torch.int64),
+    )
+
+
+@torch.library.impl(_lib, "topk_counts", "CUDA")
+def _topk_counts_cuda(scores, k, want_counts):
+    scores = scores.contiguous()
+    m, e = scores.shape
+    idx = torch.empty((m, k), device=scores.device, dtype=torch.int64)
+    cnt32 = torch.zeros((e,), device=scores.device, dtype=torch.int32)
+    if m == 0:
+        return idx, cnt32.to(torch.int64)
+    block_e = triton.next_power_of_2(e)
+    block_m = max(16, min(128, 8192 // block_e))
+    num_warps = 8 if block_m >= 128 else 4
+    _router_topk_kernel[(triton.cdiv(m, block_m),)](
+        scores, idx, cnt32, m, e, k, bool(want_counts),
+        BLOCK_M=block_m, BLOCK_E=block_e,
+        num_warps=num_warps, num_stages=1,
+    )
+    return idx, cnt32.to(torch.int64)
+
+
+@torch.library.impl(_lib, "topk_counts", "CPU")
+def _topk_counts_fallback(scores, k, want_counts):
+    """Reference path (CPU). Mirrors the kernel, including its tie-break.
+
+    ``argmax`` does not promise a tie-break, so the winning column is picked
+    explicitly as the lowest index attaining the row max — the same rule the
+    Triton kernel uses.
+    """
+    e = scores.shape[-1]
+    work = scores.clone()
+    cols_ar = torch.arange(e, device=scores.device)
+    picks = []
+    for _ in range(k):
+        m = work.max(dim=-1, keepdim=True).values
+        i = torch.where(work == m, cols_ar, e).min(dim=-1, keepdim=True).values
+        picks.append(i)
+        work.scatter_(-1, i, float("-inf"))
+    idx = torch.cat(picks, dim=-1)
+    flat = idx.reshape(-1)
+    cnt = torch.zeros(e, device=scores.device, dtype=torch.int64)
+    if want_counts:
+        cnt.scatter_add_(0, flat, torch.ones_like(flat))
+    return idx, cnt
+
+
+def _router_topk_indices(
+    scores: torch.Tensor, k: int, want_counts: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Top-k expert indices (and optionally the assignment histogram).
+
+    Falls back to ``torch.topk`` for shapes the fused kernel cannot hold in
+    registers, keeping the exact same tie-break and output layout.
+    """
+    e = scores.shape[-1]
+    supported = (
+        0 < k <= e <= 1024
+        and scores.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    )
+    use_fused = supported and (_HAVE_TRITON if scores.is_cuda else True)
+    if use_fused:
+        idx, cnt = torch.ops.nanoplm_router.topk_counts(scores, k, want_counts)
+        return idx, (cnt if want_counts else None)
+    idx = torch.topk(scores, k, dim=-1).indices
+    if not want_counts:
+        return idx, None
+    flat = idx.reshape(-1)
+    cnt = torch.zeros(e, device=scores.device, dtype=torch.int64)
+    cnt.scatter_add_(0, flat, torch.ones_like(flat))
+    return idx, cnt
 
 
 class Router(nn.Module):
@@ -37,9 +298,22 @@ class Router(nn.Module):
     ):
         super().__init__()
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        self.num_experts = num_experts
         self.top_k = top_k
         self.n_group = n_group
         self.topk_group = topk_group
+        # cuBLAS has no sm90 kernel for a bf16 GEMM whose N (fwd) / K (dgrad) /
+        # M (wgrad) is 47: the odd extent forces an `align1` tile and it falls
+        # back to an Ampere-class `cutlass_75_..._s1688` kernel. Inductor's
+        # pad_mm already pads the *forward* to 48 (visible in the trace as
+        # `triton_poi_fused_mm_t` -> a `nvjet_sm90_tst_48x512` GEMM) but not
+        # the two backward GEMMs. Padding the weight here forces all three onto
+        # the sm90 path: measured 348->110 us (fwd), 556->394 us (dgrad),
+        # 230->111 us (wgrad) at T=131072, H=1024.
+        self._gate_pad = (-num_experts) % 8
+        # Only the routed experts consume the counts; skip the histogram
+        # entirely when nothing reads it (see MoELayer.last_expert_counts).
+        self.track_expert_counts = bool(bias_correction)
         if n_group > 1:
             assert num_experts % n_group == 0, (
                 f"num_experts ({num_experts}) must be divisible by n_group ({n_group})"
@@ -56,7 +330,9 @@ class Router(nn.Module):
 
     def forward(
         self, x: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
+    ]:
         """Route tokens to experts.
 
         Args:
@@ -68,9 +344,18 @@ class Router(nn.Module):
             indices: ``(total_tokens, top_k)`` — selected expert indices.
             z_loss:  scalar — mean squared pre-sigmoid logit (prevents
                      sigmoid saturation / vanishing router gradients).
+            logits:  ``(total_tokens, num_experts)`` — raw sigmoid scores.
+            counts:  ``(num_experts,)`` int64 assignment histogram, or ``None``
+                     when ``track_expert_counts`` is off. Produced by the fused
+                     top-k kernel, so it costs one reduction instead of
+                     ``total_tokens * top_k`` colliding atomics.
         """
         # Router runs in fp32 for stability (Ling-V2 / DeepSeek-V3 style).
-        raw_logits = self.gate(x).float()  # (T, E) — cast to fp32 after projection
+        if self._gate_pad:
+            w = F.pad(self.gate.weight, (0, 0, 0, self._gate_pad))
+            raw_logits = F.linear(x, w)[:, : self.num_experts].float()
+        else:
+            raw_logits = self.gate(x).float()  # (T, E)
         logits = raw_logits.sigmoid()  # (T, E)
 
         # Z-loss: penalise large pre-sigmoid logits to keep sigmoid in its
@@ -105,11 +390,18 @@ class Router(nn.Module):
                 expert_mask == 0, torch.finfo(selection_logits.dtype).min,
             )
 
-        weights, indices = torch.topk(selection_logits, self.top_k, dim=-1)
+        # Fused single-pass top-k. Values are gathered rather than returned by
+        # the kernel: `selection_logits.gather(-1, indices)` is bit-identical to
+        # `torch.topk(...).values` and keeps autograd on plain ATen ops.
+        indices, counts = _router_topk_indices(
+            selection_logits, self.top_k, self.track_expert_counts,
+        )
 
         # Combine weights come from the *unbiased* sigmoid scores.
         if self.correction_bias is not None:
             weights = logits.gather(dim=-1, index=indices)
+        else:
+            weights = selection_logits.gather(dim=-1, index=indices)
 
         # Renormalize so combine weights sum to 1 per token. Clamp the
         # denominator to keep backward stable when selected sigmoid scores are
@@ -117,7 +409,7 @@ class Router(nn.Module):
         denom = weights.sum(dim=-1, keepdim=True).clamp_min(1e-9)
         weights = weights / denom
 
-        return weights, indices, z_loss, logits
+        return weights, indices, z_loss, logits, counts
 
 
 class MoELayer(nn.Module):
@@ -150,7 +442,20 @@ class MoELayer(nn.Module):
         # Routed expert weights — stacked for grouped_gemm.
         # Layout: (num_experts, in_features, out_features).
         # This is transposed relative to nn.Linear's (out, in).
+        #
         # SwiGLU's Wi emits gate+up (2*inter); sReLU is non-gated (just inter).
+        # ``Wi``'s output columns are stored **interleaved, gate first**:
+        # column ``2j`` is gate unit ``j``, column ``2j+1`` is up unit ``j``
+        # (``WI_GATED_LAYOUT``).  That is exactly the split QuACK/SonicMoE's
+        # gated GEMM applies (``gate = preact[..., ::2]; up = preact[..., 1::2]``),
+        # so the ``sonicmoe`` backend can consume ``Wi`` with no reordering at
+        # all.  ``Wo`` is indexed by *unit* ``j``, which both backends agree on,
+        # so it is unaffected by this convention.
+        #
+        # NOTE: this differs from the *dense* SwiGLU MLPs (including this
+        # layer's own ``shared_expert``), which keep nn.Linear's block-concat
+        # ``[up | gate]``.  Do not copy weights between the two without
+        # permuting — see ``convert_wi_concat_to_interleaved``.
         inter_out = config.intermediate_size if self.srelu else 2 * config.intermediate_size
         self.Wi = nn.Parameter(
             torch.empty(self.num_experts, config.hidden_size, inter_out),
@@ -213,8 +518,90 @@ class MoELayer(nn.Module):
         )
 
         # Bookkeeping set during forward for external consumption.
+        # `last_expert_counts` only exists for the expert-bias load-balancing
+        # update in pure_pipeline.py, which is gated on moe_use_bias_correction.
+        self._track_expert_counts: bool = bool(config.moe_use_bias_correction)
+        # The cutlass path has to build `counts` for the grouped GEMM anyway, so
+        # only the sonicmoe path needs the router to emit the histogram.
+        self.router.track_expert_counts = (
+            self._track_expert_counts and self.moe_kernel_backend == "sonicmoe"
+        )
         self.last_expert_counts: Optional[torch.Tensor] = None
         self.last_aux_loss: Optional[torch.Tensor] = None
+
+        # Gate/up storage convention marker (persistent, so it lands in the
+        # checkpoint). Only gated activations have a convention to get wrong;
+        # sReLU's Wi is ungated, so it stays byte-compatible with every older
+        # checkpoint and gets no buffer at all. 1-D on purpose: DCP's
+        # `_distribute_state_dict` special-cases 0-dim tensors onto the CPU.
+        if not self.srelu:
+            self.register_buffer(
+                _WI_LAYOUT_BUFFER,
+                torch.tensor([WI_GATED_LAYOUT_VERSION], dtype=torch.int64),
+                persistent=True,
+            )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Refuse a state_dict whose ``Wi`` uses a different gate/up layout.
+
+        A v1 (``[up | gate]`` block-concat) checkpoint is numerically valid but
+        means something *different* under v2 code: gate and up get re-paired, so
+        the model would silently resume as a different function and the loss
+        would blow up (or, worse, slowly recover into a different optimum).
+        Missing marker == v1, because v1 never wrote one.
+
+        The message goes into ``error_msgs``, which ``nn.Module.load_state_dict``
+        raises regardless of ``strict`` — this is a correctness mismatch, not a
+        tolerable partial load. ``srelu`` is ungated and never checked.
+        """
+        if not self.srelu:
+            key = prefix + _WI_LAYOUT_BUFFER
+            found = state_dict.get(key)
+            if found is None:
+                version = 1          # v1 never wrote a marker
+            else:
+                try:
+                    version = int(found.reshape(-1)[0])
+                except Exception:
+                    # Present but not a plain readable tensor (some exotic
+                    # loader). Presence alone proves it is not v1, which is the
+                    # case that matters; do not block the load on the value.
+                    version = WI_GATED_LAYOUT_VERSION
+            if version != WI_GATED_LAYOUT_VERSION:
+                error_msgs.append(
+                    f"MoE routed-expert Wi layout mismatch at {prefix}Wi: the "
+                    f"checkpoint was written with layout version {version}, this "
+                    f"build expects {WI_GATED_LAYOUT_VERSION}. Version 1 stored "
+                    f"Wi's last dim as block-concat [up | gate]; version 2 stores "
+                    f"it interleaved gate-first [gate_0, up_0, gate_1, up_1, ...]. "
+                    f"Loading it as-is would silently re-pair gate/up and train a "
+                    f"different function. Migrate the checkpoint with "
+                    f"nanoplm.pretraining.models.modern_bert.moe."
+                    f"convert_wi_state_dict_v1_to_v2(state_dict)."
+                )
+            if found is None:
+                # Supply the expected value so the generic machinery does not
+                # *also* report a bare "Missing key(s)" and bury the message
+                # above. If we reached here the load is already failing.
+                state_dict[key] = getattr(self, _WI_LAYOUT_BUFFER).clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _ensure_dispatch_buffers(
         self,
@@ -260,18 +647,16 @@ class MoELayer(nn.Module):
         )
 
         # --- routing ---
-        weights, indices, z_loss, router_scores = self.router(x)  # (T, top_k), (T, top_k), scalar, (T, E)
+        # counts is the (E,) assignment histogram, produced for free by the
+        # fused top-k kernel; None when nothing consumes it.
+        weights, indices, z_loss, router_scores, router_counts = self.router(x)
 
         # --- dispatch metadata ---
         expert_flat = indices.reshape(-1)  # (T*top_k,)
         if self.moe_kernel_backend == "sonicmoe":
-            count_ones = torch.ones_like(expert_flat, dtype=torch.int64)
-            counts = torch.zeros(
-                self.num_experts,
-                device=expert_flat.device,
-                dtype=torch.int64,
-            )
-            counts.scatter_add_(0, expert_flat, count_ones)
+            # SonicMoE builds its own expert-grouped dispatch, so the only
+            # consumer of `counts` on this path is `last_expert_counts`.
+            counts = router_counts
         elif self._reuse_dispatch_workspaces:
             num_assignments = expert_flat.numel()
             sort_vals, sorted_idx, count_ones, counts = self._ensure_dispatch_buffers(
@@ -286,8 +671,13 @@ class MoELayer(nn.Module):
             sorted_idx = expert_flat.argsort(stable=True)
             counts = expert_flat.bincount(minlength=self.num_experts).to(torch.int64)
 
-        # Store for external bias-update logic.
-        self.last_expert_counts = counts.detach().clone()
+        # Store for external bias-update logic. The pure-torch loop accumulates
+        # this every micro-step (pure_pipeline.py `_moe_count_accum`), so it
+        # cannot be gated on the bias-update cadence without changing the
+        # load-balancing semantics — but it is pure overhead when bias
+        # correction is off, in which case nothing reads it at all.
+        if self._track_expert_counts and counts is not None:
+            self.last_expert_counts = counts.detach().clone()
 
         if self.moe_kernel_backend == "sonicmoe":
             # SonicMoE/quack fused expert path: dispatch gather is fused into the
@@ -309,7 +699,10 @@ class MoELayer(nn.Module):
                 h = F.relu(wi)
                 activated = h * h  # (T*top_k, inter)
             else:
-                x_proj, gate = wi.chunk(2, dim=-1)
+                # Wi's columns are interleaved gate-first (WI_GATED_LAYOUT),
+                # so unit j is the pair (2j, 2j+1) = (gate_j, up_j). Same
+                # function as the old `[up | gate]` chunk, different storage.
+                gate, x_proj = wi[..., 0::2], wi[..., 1::2]
                 activated = F.silu(gate) * x_proj  # (T*top_k, inter)
             expert_out_sorted = moe_grouped_gemm(
                 self.drop(activated),

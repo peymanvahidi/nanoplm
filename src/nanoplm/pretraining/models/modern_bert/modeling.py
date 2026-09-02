@@ -759,6 +759,39 @@ class ModernBertAttention(nn.Module):
         return self.out_drop(self.Wo(y))
 
 
+def _residual_add(
+    x: torch.Tensor,
+    branch_out: torch.Tensor,
+    alpha: "torch.Tensor | float",
+) -> torch.Tensor:
+    """``x + alpha * branch_out``, skipping the multiply when ``alpha`` is 1.0.
+
+    ProRes alphas live in a **tensor** buffer on purpose (``ModernBertModel``:
+    non-persistent, so torch.compile treats the values as dynamic and does not
+    recompile per unique float).  The side effect is that inductor cannot
+    constant-fold the multiply even when ProRes is disabled and every alpha is
+    exactly 1.0: the residual backward then keeps a standalone
+    ``grad_out * alpha`` kernel over the full (tokens, hidden) activation — it
+    cannot fuse, because its only consumer is the branch's first GEMM.  At
+    (131072, 1024) bf16 that measured 154.6 us/layer backward plus 286.7 us
+    forward (the forward multiply is fused into the add, so only its share is
+    recovered), i.e. ~3.08 ms/step across all 20 layers of the 4-node baseline.
+
+    ``ModernBertModel.forward`` therefore hands the layers the Python literal
+    ``1.0`` when ``use_prores`` is False, and this helper turns that into a
+    plain add.  ``isinstance`` is a compile-time test for Dynamo, so neither
+    branch introduces a graph break, and the ProRes-enabled path is untouched.
+
+    Numerically exact: IEEE-754 multiplication by 1.0 is the identity for every
+    finite value, for +/-0.0, for +/-inf and for NaN payloads, and a Python
+    float does not promote the operand's dtype — so ``x + 1.0 * y`` and
+    ``x + y`` are bit-identical.
+    """
+    if not isinstance(alpha, torch.Tensor) and alpha == 1.0:
+        return x + branch_out
+    return x + alpha * branch_out
+
+
 class ModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
@@ -892,7 +925,7 @@ class ModernBertEncoderLayer(nn.Module):
                 attn_out = _checkpoint(_attn_branch, x, use_reentrant=False)
             except TypeError:  # older torch checkpoint API
                 attn_out = _checkpoint(_attn_branch, x)
-            x = x + prores_alpha * attn_out
+            x = _residual_add(x, attn_out, prores_alpha)
         else:
             fuse_ln_a = (
                 self.canon_a is not None
@@ -928,7 +961,7 @@ class ModernBertEncoderLayer(nn.Module):
                 token_mask=token_mask,
                 repo_active=repo_active,
             )
-            x = x + prores_alpha * attn_out
+            x = _residual_add(x, attn_out, prores_alpha)
         if self.mlp is not None:
             do_ckpt_mlp = (
                 self.activation_checkpointing
@@ -979,7 +1012,7 @@ class ModernBertEncoderLayer(nn.Module):
                     mlp_out = _checkpoint(_mlp_branch, x, use_reentrant=False)
                 except TypeError:  # older torch checkpoint API
                     mlp_out = _checkpoint(_mlp_branch, x)
-                x = x + prores_alpha * mlp_out
+                x = _residual_add(x, mlp_out, prores_alpha)
             else:
                 fuse_ln_c = (
                     self.canon_c is not None
@@ -1010,7 +1043,7 @@ class ModernBertEncoderLayer(nn.Module):
                     cu_seqlens=cu_seqlens,
                     attention_mask=token_mask,
                 )
-                x = x + prores_alpha * mlp_out
+                x = _residual_add(x, mlp_out, prores_alpha)
         return x
 
 
@@ -1473,6 +1506,13 @@ class ModernBertModel(nn.Module):
             torch.full((config.num_hidden_layers,), _init_val),
             persistent=False,
         )
+        # ProRes disabled => every alpha is *permanently* exactly 1.0
+        # (`use_prores` is read once here and never mutated, and
+        # `update_prores_alphas` is only called when it is True). A tensor
+        # alpha of value 1.0 still costs a real elementwise multiply in the
+        # residual backward that inductor cannot fold away, so hand the layers
+        # a plain Python list of literals instead — see `_residual_add`.
+        self._prores_alphas_off: list[float] = [1.0] * config.num_hidden_layers
 
     def update_prores_alphas(self, step: int) -> None:
         """Recompute per-layer ProRes alphas. Call once per optimizer step.
@@ -1509,7 +1549,7 @@ class ModernBertModel(nn.Module):
         window_sliding,
         position_ids: torch.Tensor,
         repo_active: bool,
-        prores_alphas: torch.Tensor,
+        prores_alphas: "torch.Tensor | list[float]",
     ) -> torch.Tensor:
         """One iteration of the recurrent block (varlen / flash path).
 
@@ -1553,7 +1593,7 @@ class ModernBertModel(nn.Module):
         attn_mask_sliding,
         token_mask: torch.Tensor,
         repo_active: bool,
-        prores_alphas: torch.Tensor,
+        prores_alphas: "torch.Tensor | list[float]",
     ) -> torch.Tensor:
         """One iteration of the recurrent block (SDPA fallback path).
 
@@ -1776,7 +1816,13 @@ class ModernBertModel(nn.Module):
             }
 
             repo_active = self.repo_active
-            prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
+            # (num_layers,) tensor buffer when ProRes is on; a list of Python
+            # 1.0 literals when it is off, so `_residual_add` can drop the
+            # multiply entirely instead of leaving a dead (T, H) kernel in the
+            # backward of every layer.
+            prores_alphas = (
+                self._prores_alphas if self.use_prores else self._prores_alphas_off
+            )
 
             _recycle = (
                 self.config.recycling_loop_count > 1 or recycling_loop_count is not None
@@ -1987,7 +2033,11 @@ class ModernBertModel(nn.Module):
         }
 
         repo_active = self.repo_active
-        prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
+        # See the varlen path: tensor buffer when ProRes is on, Python 1.0
+        # literals when it is off.
+        prores_alphas = (
+            self._prores_alphas if self.use_prores else self._prores_alphas_off
+        )
 
         _recycle = (
             self.config.recycling_loop_count > 1 or recycling_loop_count is not None
