@@ -133,19 +133,31 @@ model:
 
   # ── Recycling / Huginn architecture (pure_torch only) ─────────────────────
 
-  # recycling_loop_count: 1  →  recycling OFF (default).
+  # use_huginn_looping: false  →  recycling OFF (default).
   # Splits the L-layer stack into:
   #   prelude  P  — first P layers, run once
   #   recurrent   — layers P .. L-C-1, weight-tied and looped
   #   coda     C  — last C layers, run once
   # A learned 2h→h adapter consumes [s, e] at each recycling iteration.
   # Training-time knobs live under pretraining.recycling_* (when recycling_loop_count > 1).
+  use_huginn_looping: false             # master switch; must agree with recycling_loop_count (>= 2 when true)
   recycling_num_prelude_layers: 0       # P
   recycling_num_coda_layers: 0          # C
   recycling_loop_count: 1               # target mean loop count (1 = off)
   recycling_adapter_bias: false         # bias on 2h→h adapter (Huginn: no bias)
   recycling_s0_noise_sigma: 0.6324555320336759  # sqrt(2/5) — Huginn s₀ noise scale
   recycling_use_takase_init: true       # Takase spike init on recurrent block + adapter
+
+  # ── Loopie layer looping (pure_torch only) ────────────────────────────────
+
+  # Every stored layer is applied loopie_loop_count times consecutively
+  # (L1,L1,L2,L2,…), weight-tied, with full backprop through every repeat.
+  # No prelude/coda, no adapter, no s₀ noise, no loop-count scheduler — the
+  # loop count is a fixed constant. Effective depth = num_hidden_layers ×
+  # loopie_loop_count. Mutually exclusive with Huginn recycling above.
+  # Reference: "Loop the Loopies!" (arXiv 2607.16051).
+  use_loopie: false                     # master switch for layer-loop recurrence
+  loopie_loop_count: 2                  # consecutive applications per stored layer (>= 2 when enabled)
 
 
 # =============================================================================

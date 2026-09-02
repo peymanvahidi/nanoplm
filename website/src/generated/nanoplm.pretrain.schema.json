@@ -530,6 +530,16 @@
           "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
           "description": "cutlass | sonicmoe  (SonicMoE/quack fused path)"
         },
+        "use_huginn_looping": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "description": "master switch; must agree with recycling_loop_count (>= 2 when true)",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true
+        },
         "recycling_num_prelude_layers": {
           "type": "integer",
           "default": 0,
@@ -594,6 +604,31 @@
             "op": ">",
             "value": 1
           }
+        },
+        "use_loopie": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "description": "master switch for layer-loop recurrence",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true
+        },
+        "loopie_loop_count": {
+          "type": "integer",
+          "default": 2,
+          "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "description": "consecutive applications per stored layer (>= 2 when enabled)",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-visible-when": {
+            "field": "use_loopie",
+            "op": "==",
+            "value": true
+          }
         }
       },
       "x-nanoplm-group-notes": {
@@ -601,7 +636,8 @@
         "mHC-lite (pure_torch only)": "Multi-stream residual with doubly stochastic mixing.\nIncompatible with use_resid_lambdas.",
         "NOBLE (pure_torch only)": "Nonlinear low-rank branches on linear layers.\nTraining LR scaling lives under pretraining.noble_* (active when use_noble).",
         "MoE \u2014 Mixture-of-Experts (pure_torch only)": "Requires: pretraining.use_packing: true  and  use_static_inp_size: true\nAlways-on: one shared expert; routing is always sigmoid.",
-        "Recycling / Huginn architecture (pure_torch only)": "recycling_loop_count: 1  \u2192  recycling OFF (default).\nSplits the L-layer stack into:\n  prelude  P  \u2014 first P layers, run once\n  recurrent   \u2014 layers P .. L-C-1, weight-tied and looped\n  coda     C  \u2014 last C layers, run once\nA learned 2h\u2192h adapter consumes [s, e] at each recycling iteration.\nTraining-time knobs live under pretraining.recycling_* (when recycling_loop_count > 1)."
+        "Recycling / Huginn architecture (pure_torch only)": "use_huginn_looping: false  \u2192  recycling OFF (default).\nSplits the L-layer stack into:\n  prelude  P  \u2014 first P layers, run once\n  recurrent   \u2014 layers P .. L-C-1, weight-tied and looped\n  coda     C  \u2014 last C layers, run once\nA learned 2h\u2192h adapter consumes [s, e] at each recycling iteration.\nTraining-time knobs live under pretraining.recycling_* (when recycling_loop_count > 1).",
+        "Loopie layer looping (pure_torch only)": "Every stored layer is applied loopie_loop_count times consecutively\n(L1,L1,L2,L2,\u2026), weight-tied, with full backprop through every repeat.\nNo prelude/coda, no adapter, no s\u2080 noise, no loop-count scheduler \u2014 the\nloop count is a fixed constant. Effective depth = num_hidden_layers \u00d7\nloopie_loop_count. Mutually exclusive with Huginn recycling above.\nReference: \"Loop the Loopies!\" (arXiv 2607.16051)."
       }
     },
     "pretraining": {
@@ -1428,11 +1464,6 @@
     "feature": "huggin_style_recycling",
     "model_reject": [
       {
-        "flag": "use_moe",
-        "reason": "MoE per-layer state (last_expert_counts, last_aux_loss) is overwritten on every recurrent iteration; only the last iteration's routing decisions would reach the pipeline's expert-bias correction. Disable use_moe or recycling_loop_count > 1.",
-        "condition": ""
-      },
-      {
         "flag": "use_x0_lambdas",
         "reason": "x0 captured once before the loop; per-physical-layer rescaling re-applied every recurrent iteration has unvalidated semantics.",
         "condition": ""
@@ -1449,6 +1480,11 @@
       }
     ],
     "model_warn": [
+      {
+        "flag": "use_moe",
+        "message": "MoE per-layer state now accumulates across recurrent iterations: aux/z-loss sums and the loss takes the per-execution mean (same scale as an unlooped run), and expert counts sum over iterations (the pipeline's bias update is relative and zero-meaned, so it is invariant to that scale). Aux gradients reach the router gate only through the last recycling_bptt iterations. Cutlass dispatch-workspace reuse is disabled under looping.",
+        "condition": "use_moe is True"
+      },
       {
         "flag": "use_repo",
         "message": "RePO will re-predict per-head positions every recurrent iteration. This hasn't been ablated; consider setting repo_after_n_layers >= recycling_num_prelude_layers + (num_hidden_layers - recycling_num_prelude_layers - recycling_num_coda_layers) so RePO stays in the coda.",

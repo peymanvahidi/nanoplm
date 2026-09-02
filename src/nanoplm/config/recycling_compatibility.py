@@ -56,6 +56,13 @@ def _check_model_flags(model_config, matrix: dict[str, Any]) -> None:
                 _logger.warning(
                     "recycling: %s — %s", entry["condition"], entry["message"]
                 )
+        else:
+            # Unconditional warn: the flag being set is the whole condition.
+            _logger.warning(
+                "recycling: %s — %s",
+                entry.get("condition", flag),
+                entry["message"],
+            )
 
 
 def _check_pipeline_flags(pipeline_config, matrix: dict[str, Any]) -> None:

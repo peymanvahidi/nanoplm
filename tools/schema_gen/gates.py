@@ -42,6 +42,7 @@ def visibility_gates() -> dict:
               "recycling_num_coda_layers", "recycling_adapter_bias", "recycling_s0_noise_sigma",
               "recycling_use_takase_init"):
         g[f] = gt1
+    g["loopie_loop_count"] = eq_true("use_loopie")
     for f in ("canon_layers_mode", "canon_layers_kernel_size"):
         g[f] = eq_true("use_canon_layers")
     for f in ("noble_rank", "noble_alpha", "noble_half_kaiming", "noble_targets",

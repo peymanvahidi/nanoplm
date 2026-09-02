@@ -1467,6 +1467,14 @@ class ModernBertModel(nn.Module):
         self.recurrent_layers: list[nn.Module] = list(self.layers[P:L - C]) if (L - P - C) > 0 else []
         self.coda_layers: list[nn.Module] = list(self.layers[L - C:]) if C > 0 else []
 
+        # Loopie layer-loop: how many times each stored layer is applied
+        # consecutively. 1 = off, so `range(1)` leaves the non-Loopie graph
+        # byte-identical. A trace-time constant, so Dynamo unrolls the repeat
+        # rather than treating it as a dynamic loop.
+        self._layer_repeats: int = (
+            int(config.loopie_loop_count) if config.use_loopie else 1
+        )
+
         # Adapter only when recycling is active.
         if config.recycling_loop_count > 1:
             self.adapter = nn.Linear(
@@ -1708,32 +1716,50 @@ class ModernBertModel(nn.Module):
         def _trunc_init(tensor: torch.Tensor, std: float) -> None:
             torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
+        def _init_proj(obj, std: float) -> None:
+            """Init a projection given either an nn.Linear or a raw Parameter.
+
+            MoE layers keep their fused expert weights as raw Parameters
+            (``Wi``/``Wo`` of shape [num_experts, ...]) rather than Linears, so
+            a plain ``.weight`` lookup would fail on a recurrent MoE block.
+            """
+            w = getattr(obj, "weight", obj)
+            if isinstance(w, torch.Tensor):
+                _trunc_init(w, std)
+
         for layer in self.recurrent_layers:
             attn = getattr(layer, "attn", None)
             if attn is not None:
                 if getattr(attn, "Wo", None) is not None:
-                    _trunc_init(attn.Wo.weight, std_out)
+                    _init_proj(attn.Wo, std_out)
                 # Attention input projections: fused Wqkv OR separate Wq/Wq2/Wk/Wv
                 if getattr(attn, "Wqkv", None) is not None:
-                    _trunc_init(attn.Wqkv.weight, std_general)
+                    _init_proj(attn.Wqkv, std_general)
                 else:
                     for name in ("Wq", "Wq2", "Wk", "Wv"):
                         proj = getattr(attn, name, None)
                         if proj is not None:
-                            _trunc_init(proj.weight, std_general)
+                            _init_proj(proj, std_general)
 
-            mlp = getattr(layer, "mlp", None)
-            if mlp is not None:
+            # MoE layers expose the same Wi/Wo names as the dense MLP (as raw
+            # per-expert Parameters) plus an optional dense shared expert, so
+            # both get the recurrent-block treatment.
+            mlps = [m for m in (getattr(layer, "mlp", None),) if m is not None]
+            for _m in list(mlps):
+                shared = getattr(_m, "shared_expert", None)
+                if shared is not None:
+                    mlps.append(shared)
+            for mlp in mlps:
                 # MLP input projections: fused Wi OR separate W_up/W_gate
                 if getattr(mlp, "Wi", None) is not None:
-                    _trunc_init(mlp.Wi.weight, std_general)
+                    _init_proj(mlp.Wi, std_general)
                 elif getattr(mlp, "W_up", None) is not None:
-                    _trunc_init(mlp.W_up.weight, std_general)
+                    _init_proj(mlp.W_up, std_general)
                     if getattr(mlp, "W_gate", None) is not None:
-                        _trunc_init(mlp.W_gate.weight, std_general)
+                        _init_proj(mlp.W_gate, std_general)
                 # MLP output: Linear `Wo` OR raw Parameter `Wo_weight` (SReLU MLP)
                 if getattr(mlp, "Wo", None) is not None:
-                    _trunc_init(mlp.Wo.weight, std_out)
+                    _init_proj(mlp.Wo, std_out)
                 elif getattr(mlp, "Wo_weight", None) is not None:
                     _trunc_init(mlp.Wo_weight, std_out)
 
@@ -1920,56 +1946,64 @@ class ModernBertModel(nn.Module):
                         x = x + self.x0_lambdas[i] * x0
                     alpha = prores_alphas[i]
                     lt = layer.attention_type
-                    if (
-                        self.config.activation_checkpointing
-                        and self.training
-                        and str(self.config.activation_checkpointing_mode).strip().lower()
-                        == "layer"
-                    ):
-                        cos_sin = rope[lt]
-                        cu_seqlens = _cu_seqlens
-                        max_seqlen = _max_seqlen
-                        window_size = windows[lt]
-                        position_ids = _position_ids
+                    # Loopie: apply this stored layer loopie_loop_count times
+                    # consecutively (L1,L1,L2,L2,...), weight-tied. _layer_repeats is 1
+                    # unless use_loopie, so the non-Loopie graph is unchanged. The
+                    # per-index state above (resid/x0 lambdas -- rejected under Loopie --
+                    # and prores alpha) is resolved once per stored layer and shared by
+                    # every repeat; attention type and RoPE come off the layer itself, so
+                    # a repeated layer keeps them.
+                    for _rep in range(self._layer_repeats):
+                        if (
+                            self.config.activation_checkpointing
+                            and self.training
+                            and str(self.config.activation_checkpointing_mode).strip().lower()
+                            == "layer"
+                        ):
+                            cos_sin = rope[lt]
+                            cu_seqlens = _cu_seqlens
+                            max_seqlen = _max_seqlen
+                            window_size = windows[lt]
+                            position_ids = _position_ids
 
-                        def _layer_forward(
-                            x_in: torch.Tensor,
-                            *,
-                            _layer: nn.Module = layer,
-                            _cos_sin=cos_sin,
-                            _cu_seqlens=cu_seqlens,
-                            _max_seqlen=max_seqlen,
-                            _window_size=window_size,
-                            _position_ids=position_ids,
-                            _repo_active: bool = repo_active,
-                            _prores_alpha=alpha,
-                        ) -> torch.Tensor:
-                            return _layer(
-                                x_in,
-                                cos_sin=_cos_sin,
+                            def _layer_forward(
+                                x_in: torch.Tensor,
+                                *,
+                                _layer: nn.Module = layer,
+                                _cos_sin=cos_sin,
+                                _cu_seqlens=cu_seqlens,
+                                _max_seqlen=max_seqlen,
+                                _window_size=window_size,
+                                _position_ids=position_ids,
+                                _repo_active: bool = repo_active,
+                                _prores_alpha=alpha,
+                            ) -> torch.Tensor:
+                                return _layer(
+                                    x_in,
+                                    cos_sin=_cos_sin,
+                                    cu_seqlens=_cu_seqlens,
+                                    max_seqlen=_max_seqlen,
+                                    window_size=_window_size,
+                                    position_ids=_position_ids,
+                                    repo_active=_repo_active,
+                                    prores_alpha=_prores_alpha,
+                                )
+
+                            try:
+                                x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                            except TypeError:  # older torch checkpoint API
+                                x = _checkpoint(_layer_forward, x)
+                        else:
+                            x = layer(
+                                x,
+                                cos_sin=rope[lt],
                                 cu_seqlens=_cu_seqlens,
                                 max_seqlen=_max_seqlen,
-                                window_size=_window_size,
+                                window_size=windows[lt],
                                 position_ids=_position_ids,
-                                repo_active=_repo_active,
-                                prores_alpha=_prores_alpha,
+                                repo_active=repo_active,
+                                prores_alpha=alpha,
                             )
-
-                        try:
-                            x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                        except TypeError:  # older torch checkpoint API
-                            x = _checkpoint(_layer_forward, x)
-                    else:
-                        x = layer(
-                            x,
-                            cos_sin=rope[lt],
-                            cu_seqlens=_cu_seqlens,
-                            max_seqlen=_max_seqlen,
-                            window_size=windows[lt],
-                            position_ids=_position_ids,
-                            repo_active=repo_active,
-                            prores_alpha=alpha,
-                        )
 
             if self.config.use_mhc_lite:
                 x = x[..., 0, :]  # compress: take stream 0
@@ -2127,50 +2161,58 @@ class ModernBertModel(nn.Module):
                     x = x + self.x0_lambdas[i] * x0
                 alpha = prores_alphas[i]
                 layer_type = layer.attention_type
-                if (
-                    self.config.activation_checkpointing
-                    and self.training
-                    and str(self.config.activation_checkpointing_mode).strip().lower()
-                    == "layer"
-                ):
-                    attn_mask = attn_masks[layer_type]
-                    cos_sin = rope[layer_type]
-                    token_mask = attention_mask
+                # Loopie: apply this stored layer loopie_loop_count times
+                # consecutively (L1,L1,L2,L2,...), weight-tied. _layer_repeats is 1
+                # unless use_loopie, so the non-Loopie graph is unchanged. The
+                # per-index state above (resid/x0 lambdas -- rejected under Loopie --
+                # and prores alpha) is resolved once per stored layer and shared by
+                # every repeat; attention type and RoPE come off the layer itself, so
+                # a repeated layer keeps them.
+                for _rep in range(self._layer_repeats):
+                    if (
+                        self.config.activation_checkpointing
+                        and self.training
+                        and str(self.config.activation_checkpointing_mode).strip().lower()
+                        == "layer"
+                    ):
+                        attn_mask = attn_masks[layer_type]
+                        cos_sin = rope[layer_type]
+                        token_mask = attention_mask
 
-                    def _layer_forward(
-                        x_in: torch.Tensor,
-                        *,
-                        _layer: nn.Module = layer,
-                        _attn_mask=attn_mask,
-                        _cos_sin=cos_sin,
-                        _token_mask=token_mask,
-                        _repo_active: bool = repo_active,
-                        _prores_alpha=alpha,
-                    ) -> torch.Tensor:
-                        return _layer(
-                            x_in,
-                            attn_mask=_attn_mask,
-                            cos_sin=_cos_sin,
+                        def _layer_forward(
+                            x_in: torch.Tensor,
+                            *,
+                            _layer: nn.Module = layer,
+                            _attn_mask=attn_mask,
+                            _cos_sin=cos_sin,
+                            _token_mask=token_mask,
+                            _repo_active: bool = repo_active,
+                            _prores_alpha=alpha,
+                        ) -> torch.Tensor:
+                            return _layer(
+                                x_in,
+                                attn_mask=_attn_mask,
+                                cos_sin=_cos_sin,
+                                position_ids=None,
+                                token_mask=_token_mask,
+                                repo_active=_repo_active,
+                                prores_alpha=_prores_alpha,
+                            )
+
+                        try:
+                            x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                        except TypeError:  # older torch checkpoint API
+                            x = _checkpoint(_layer_forward, x)
+                    else:
+                        x = layer(
+                            x,
+                            attn_mask=attn_masks[layer_type],
+                            cos_sin=rope[layer_type],
                             position_ids=None,
-                            token_mask=_token_mask,
-                            repo_active=_repo_active,
-                            prores_alpha=_prores_alpha,
+                            token_mask=attention_mask,
+                            repo_active=repo_active,
+                            prores_alpha=alpha,
                         )
-
-                    try:
-                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                    except TypeError:  # older torch checkpoint API
-                        x = _checkpoint(_layer_forward, x)
-                else:
-                    x = layer(
-                        x,
-                        attn_mask=attn_masks[layer_type],
-                        cos_sin=rope[layer_type],
-                        position_ids=None,
-                        token_mask=attention_mask,
-                        repo_active=repo_active,
-                        prores_alpha=alpha,
-                    )
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]  # compress: take stream 0
@@ -2444,6 +2486,19 @@ class ModernBertForMaskedLM(nn.Module):
         recycling_loop_count: Optional[int] = None,
         recycling_bptt: Optional[int] = None,
     ) -> MLMOutput:
+        # Reset the per-layer MoE bookkeeping that MoELayer.forward accumulates
+        # (aux loss, execution count, expert counts). Doing it once here, before
+        # any path branches, is what makes the accumulation safe when a layer
+        # runs more than once per forward -- Huginn recycling iterations or
+        # Loopie repeats -- instead of each execution clobbering the last.
+        if self.config.use_moe:
+            from .moe import MoELayer as _MoELayer
+            for _module in self.modules():
+                if isinstance(_module, _MoELayer):
+                    _module.last_expert_counts = None
+                    _module.last_aux_loss = None
+                    _module.last_aux_count = None
+
         # ---- static packed path (pre-flattened by collator) ---------------
         # When both cu_seqlens and position_ids are provided and input_ids is
         # already 1-D (flat), the collator has done all unpadding / position-id
@@ -2474,8 +2529,11 @@ class ModernBertForMaskedLM(nn.Module):
                 # MoE auxiliary losses (balance + z-loss, coefficients baked in).
                 if self.config.use_moe:
                     from .moe import MoELayer as _MoELayer
+                    # Per-execution mean: a layer that ran r times contributed
+                    # r aux terms, so divide by its execution count to keep the
+                    # scale identical to a single-execution (non-looped) run.
                     aux_losses = [
-                        module.last_aux_loss
+                        module.last_aux_loss / module.last_aux_count
                         for module in self.modules()
                         if isinstance(module, _MoELayer)
                         and module.last_aux_loss is not None

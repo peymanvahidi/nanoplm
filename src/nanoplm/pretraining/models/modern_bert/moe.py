@@ -488,8 +488,19 @@ class MoELayer(nn.Module):
         # when the MLP branch itself is checkpointed. Attention-only
         # checkpointing does not re-enter MoE, so keep workspace reuse enabled
         # there to avoid the slower bincount fallback.
+        #
+        # Looping (Huginn recycling / Loopie layer-loop) also executes the same
+        # MoELayer more than once per forward. `moe_grouped_gemm` stashes the
+        # dispatch histogram via `ctx.save_for_backward(a, b, batch_sizes)`, and
+        # with reuse enabled `batch_sizes` *is* the persistent `_dispatch_counts`
+        # buffer — a second execution would mutate it in place and invalidate
+        # the first execution's saved tensor.
+        _looping = (
+            int(getattr(config, "recycling_loop_count", 1) or 1) > 1
+            or bool(getattr(config, "use_loopie", False))
+        )
         self._reuse_dispatch_workspaces = not (
-            ckpt_enabled and ckpt_mode in {"layer", "attn+mlp"}
+            (ckpt_enabled and ckpt_mode in {"layer", "attn+mlp"}) or _looping
         )
 
         # Reuse small dispatch metadata buffers across steps to reduce allocator
@@ -526,8 +537,16 @@ class MoELayer(nn.Module):
         self.router.track_expert_counts = (
             self._track_expert_counts and self.moe_kernel_backend == "sonicmoe"
         )
+        # These accumulate across every execution of this layer within a single
+        # ModernBertForMaskedLM.forward (one execution normally; `r` under
+        # Huginn recycling; `loopie_loop_count` under Loopie), and are reset to
+        # None at the top of that forward. `last_aux_count` is a 0-d *tensor*,
+        # not a Python int: an int attribute read inside a compiled region gets
+        # an EQUALS_MATCH value guard, which would force a recompile per
+        # iteration index and per distinct loop count.
         self.last_expert_counts: Optional[torch.Tensor] = None
         self.last_aux_loss: Optional[torch.Tensor] = None
+        self.last_aux_count: Optional[torch.Tensor] = None
 
         # Gate/up storage convention marker (persistent, so it lands in the
         # checkpoint). Only gated activations have a convention to get wrong;
@@ -677,7 +696,15 @@ class MoELayer(nn.Module):
         # load-balancing semantics — but it is pure overhead when bias
         # correction is off, in which case nothing reads it at all.
         if self._track_expert_counts and counts is not None:
-            self.last_expert_counts = counts.detach().clone()
+            # Sum over executions within this forward (see __init__). The clone
+            # stays mandatory: on the cutlass path `counts` may be a reused
+            # workspace buffer.
+            _new_counts = counts.detach().clone()
+            self.last_expert_counts = (
+                _new_counts
+                if self.last_expert_counts is None
+                else self.last_expert_counts + _new_counts
+            )
 
         if self.moe_kernel_backend == "sonicmoe":
             # SonicMoE/quack fused expert path: dispatch gather is fused into the
@@ -729,7 +756,19 @@ class MoELayer(nn.Module):
         # Z-loss: prevents sigmoid saturation in the router.
         if self.z_loss_coef > 0:
             aux = aux + self.z_loss_coef * z_loss
-        self.last_aux_loss = aux.squeeze()
+        # Sum aux (and count executions) across every execution of this layer
+        # within one forward; the reader takes the per-execution mean so the
+        # loss contribution stays on the same scale as a single-execution run.
+        # Kept graph-connected -- this is the only gradient channel into the
+        # router gate, and summing across recurrent iterations is what lets
+        # every iteration's routing decision train the gate.
+        aux = aux.squeeze()
+        if self.last_aux_loss is None:
+            self.last_aux_loss = aux
+            self.last_aux_count = torch.ones((), device=aux.device, dtype=aux.dtype)
+        else:
+            self.last_aux_loss = self.last_aux_loss + aux
+            self.last_aux_count = self.last_aux_count + 1
 
         out = expert_out + shared_out
         if len(orig_shape) == 3:

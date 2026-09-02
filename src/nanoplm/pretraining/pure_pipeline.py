@@ -997,6 +997,13 @@ def _recycling_flops_per_token(components, loop_count: int, bptt: int | None = N
 def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = None) -> int:
     """Training FLOPs/token at the TARGET recycling loop count (startup estimate)."""
     components = _recycling_flops_components(config, seq_len)
+    if getattr(config, "use_loopie", False):
+        # Loopie has no prelude/coda (P=C=0), so the recycling decomposition
+        # already describes it exactly: forward = R x stack, and bptt=None means
+        # full backprop through every repeat (2 x forward).
+        return _recycling_flops_per_token(
+            components, max(1, int(getattr(config, "loopie_loop_count", 2))), bptt=None
+        )
     loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
     return _recycling_flops_per_token(components, loop_count, bptt=bptt)
 
@@ -1776,6 +1783,11 @@ def _configure_fp8_cpu_activation_offload(
         raise ValueError(
             "fp8_cpu_activation_offload is not supported with recycling_loop_count > 1."
         )
+    if bool(getattr(model_config, "use_loopie", False)):
+        raise ValueError(
+            "fp8_cpu_activation_offload is not supported with use_loopie=true "
+            "(each layer executes more than once per forward)."
+        )
 
     targets = list(iter_te_cpu_offload_target_wrappers(model))
     if not targets:
@@ -2138,11 +2150,20 @@ def run_pure_pretraining(
                 
         _encoder = base_model.model
         _recycling_active = int(getattr(_encoder.config, "recycling_loop_count", 1) or 1) > 1
-        _recurrent_ids = (
-            {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
-            if _recycling_active
-            else set()
-        )
+        _loopie_active = bool(getattr(_encoder.config, "use_loopie", False))
+        if _loopie_active:
+            # Under Loopie every layer executes more than once per forward, so
+            # skip per-layer sharding entirely and let all layers fall into the
+            # root FSDP group: one unshard covering the whole forward/backward,
+            # gradients from all repeats accumulating into a single
+            # reduce-scatter. Same reasoning as the recurrent-layer exclusion.
+            _recurrent_ids = {id(l) for l in _encoder.layers}
+        else:
+            _recurrent_ids = (
+                {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
+                if _recycling_active
+                else set()
+            )
         for layer in _encoder.layers:
             if id(layer) in _recurrent_ids:
                 continue
@@ -2576,11 +2597,19 @@ def run_pure_pretraining(
     # iters (see _drive_recurrence / _recycling_flops_per_token), so the FLOPs
     # estimator must know K or it overcounts backward and inflates MFU for r > K.
     _bptt = max(1, int(getattr(pretrain_config, "recycling_bptt", 1)))
+    if getattr(_cfg, "use_loopie", False):
+        # Loopie backprops through every repeat; bptt=None keeps the estimator
+        # from truncating the backward cost.
+        _bptt = None
     _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len, bptt=_bptt)
     # Components for per-step FLOPs at the *actual* loop count (curriculum-accurate
     # MFU). _flops_per_token above is the nominal estimate at the target loop count.
     _flops_components = _recycling_flops_components(_cfg, manifest.max_seq_len)
-    _static_loop_count = max(1, int(getattr(_cfg, "recycling_loop_count", 1)))
+    _static_loop_count = (
+        max(1, int(getattr(_cfg, "loopie_loop_count", 2)))
+        if getattr(_cfg, "use_loopie", False)
+        else max(1, int(getattr(_cfg, "recycling_loop_count", 1)))
+    )
     _peak_flops = H100_PEAK_TFLOPS * 1e12
     logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
 

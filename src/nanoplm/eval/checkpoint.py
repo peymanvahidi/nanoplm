@@ -58,6 +58,12 @@ def _model_config_from_dict(m: dict) -> ProtModernBertMLMConfig:
             + ", ".join(sorted(missing_required))
         )
 
+    # Checkpoints written before use_huginn_looping existed encode "recycling is
+    # on" solely as recycling_loop_count > 1. Infer the flag so those configs
+    # still validate under the now-explicit switch.
+    if "use_huginn_looping" not in m:
+        kwargs["use_huginn_looping"] = int(m.get("recycling_loop_count", 1) or 1) > 1
+
     return ProtModernBertMLMConfig(**kwargs)
 
 

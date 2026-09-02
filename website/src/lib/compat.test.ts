@@ -3,10 +3,16 @@ import { describe, it, expect } from 'vitest';
 import { loadCompat } from './compat';
 
 describe('loadCompat', () => {
-  it('marks use_moe as rejected with its reason', () => {
+  it('marks use_moe as allowed-with-warning', () => {
     const moe = loadCompat().model.find((f) => f.flag === 'use_moe')!;
-    expect(moe.status).toBe('reject');
-    expect(moe.reason).toContain('MoE');
+    expect(moe.status).toBe('warn');
+    expect(moe.message).toContain('MoE');
+  });
+
+  it('marks use_x0_lambdas as rejected with its reason', () => {
+    const lam = loadCompat().model.find((f) => f.flag === 'use_x0_lambdas')!;
+    expect(lam.status).toBe('reject');
+    expect(lam.reason).toBeTruthy();
   });
 
   it('keeps the inverted-polarity condition on pure_torch', () => {

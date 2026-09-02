@@ -24,6 +24,7 @@ def _recycling_cfg(tokenizer, **overrides):
         vocab_size=tokenizer.vocab_size,
         recycling_num_prelude_layers=1,
         recycling_num_coda_layers=1,
+        use_huginn_looping=True,
         recycling_loop_count=3,
         recycling_use_takase_init=False,  # off here for shape tests; tested in test_recycling_init.py
         wo_init="kaiming",  # non-zero Wo so gradients flow through attention blocks
@@ -66,6 +67,7 @@ def test_adapter_none_raises_on_forward_kwarg_override(tokenizer, device):
     not crash inside _recurrent_step with TypeError(NoneType not callable)."""
     cfg = _recycling_cfg(
         tokenizer,
+        use_huginn_looping=False,
         recycling_loop_count=1,
         recycling_num_prelude_layers=0,
         recycling_num_coda_layers=0,

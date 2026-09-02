@@ -4,10 +4,16 @@ from tools.schema_gen import gates
 def test_reject_rules_loaded_from_matrix():
     rules = gates.compat_rules()
     rejected = {r["flag"] for r in rules["model_reject"]}
-    assert {"use_moe", "use_x0_lambdas", "use_resid_lambdas", "use_mhc_lite"} <= rejected
+    assert {"use_x0_lambdas", "use_resid_lambdas", "use_mhc_lite"} <= rejected
     # each carries the human reason for the validator UI
-    moe = next(r for r in rules["model_reject"] if r["flag"] == "use_moe")
-    assert "MoE" in moe["reason"]
+    lam = next(r for r in rules["model_reject"] if r["flag"] == "use_x0_lambdas")
+    assert lam["reason"]
+    # MoE is allowed under recycling (per-layer aux/count state accumulates
+    # across iterations) but still warns about the changed semantics.
+    warned = {r["flag"] for r in rules["model_warn"]}
+    assert "use_moe" in warned
+    moe = next(r for r in rules["model_warn"] if r["flag"] == "use_moe")
+    assert "MoE" in moe["message"]
 
 def test_visibility_gate_for_recycling_fields():
     g = gates.visibility_gates()
