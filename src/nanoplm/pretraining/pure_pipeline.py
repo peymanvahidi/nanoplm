@@ -106,9 +106,6 @@ torch.backends.cudnn.allow_tf32 = True
 # H100 SXM peak BF16 tensor-core throughput (TFLOPS).
 H100_PEAK_TFLOPS = 989.4
 
-# https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
-N_PREFETCH_LAYERS_FSDP2 = 1
-
 # How many micro-steps before the synced epoch end the per-step batch
 # exhaustion allreduce kicks in.  synced_len is the all-rank MIN of exact
 # per-rank loader lengths, so ranks can only run dry inside this window;
@@ -2178,15 +2175,6 @@ def run_pure_pretraining(
         )
         fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
         # optimizer_dist was set above (full mesh for fsdp, "shard" sub-mesh for hsdp)
-
-        # Explicit prefetching for FSDP2
-        if N_PREFETCH_LAYERS_FSDP2 > 1:
-            layers = base_model.model.layers
-            for i, layer in enumerate(layers):
-                if i + 1 < len(layers):
-                    layer.set_modules_to_forward_prefetch(layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2])
-                if i - 1 >= 0:
-                    layer.set_modules_to_backward_prefetch(list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i])))
 
     # Keep base_model for checkpointing/eval (eval changes shapes → recompilation).
     orig_model = base_model
