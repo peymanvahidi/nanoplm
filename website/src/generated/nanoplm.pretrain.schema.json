@@ -1367,6 +1367,12 @@
           "x-nanoplm-group": "Distributed",
           "description": "FSDP2 reshard_after_forward (pure_torch / pure_te)"
         },
+        "fsdp_reduce_dtype": {
+          "type": "string",
+          "default": "fp32",
+          "x-nanoplm-group": "Distributed",
+          "description": "fp32 (exact) | bf16 (halves reduce-scatter bytes; cross-rank sum rounds to bf16)"
+        },
         "world_size": {
           "type": "string",
           "default": "auto",

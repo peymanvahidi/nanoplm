@@ -2117,7 +2117,12 @@ def run_pure_pretraining(
     if distributed and _is_fsdp(distributed_mode):
         fsdp_kwargs: dict = {}
         if use_bf16:
-            fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+            reduce_dtype = (
+                torch.bfloat16
+                if str(getattr(pretrain_config, "fsdp_reduce_dtype", "fp32")).lower() == "bf16"
+                else torch.float32
+            )
+            fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
         if distributed_mode == "hsdp":
             # 2D mesh: FSDP2 auto-enables HSDP — all-gather/reduce-scatter within
             # the "shard" dim (intra-node), all-reduce grads across "replicate"

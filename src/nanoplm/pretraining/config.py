@@ -219,6 +219,10 @@ class PretrainingConfig:
     # finer-grained comm/compute overlap — better for slow interconnects like PCIe).
     fsdp_shard_granularity: str = "layer"
     fsdp_reshard_after_forward: bool = False
+    # FSDP2 MixedPrecisionPolicy.reduce_dtype for the gradient reduce-scatter:
+    # "fp32" (exact) or "bf16" (half the bytes of the largest collective on the
+    # wire; the sum across ranks then rounds to bf16).
+    fsdp_reduce_dtype: str = "fp32"
     ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
     run_name: str = "run"

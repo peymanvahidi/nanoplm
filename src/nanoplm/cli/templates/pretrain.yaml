@@ -320,6 +320,7 @@ pretraining:
   hsdp_shard_size: 'auto'               # hsdp only: GPUs per replica; 'auto'=LOCAL_WORLD_SIZE; must divide world_size
   fsdp_shard_granularity: "layer"       # layer (NVLink/SXM) | sublayer (PCIe overlap)
   fsdp_reshard_after_forward: false     # FSDP2 reshard_after_forward (pure_torch / pure_te)
+  fsdp_reduce_dtype: "fp32"             # fp32 (exact) | bf16 (halves reduce-scatter bytes; cross-rank sum rounds to bf16)
   world_size: 'auto'
   ddp_bucket_cap_mb: 25                 # only when distributed_mode: ddp
 
