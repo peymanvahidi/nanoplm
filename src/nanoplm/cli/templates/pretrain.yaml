@@ -47,12 +47,12 @@ model:
 
   attention_bias: false
   attention_dropout: 0.0
-  classifier_activation: "gelu"         # relu | gelu | srelu  (srelu: pure_torch / pure_te)
+  classifier_activation: "gelu"         # relu | gelu | srelu
   tie_word_embeddings: false            # share input embedding ↔ output decoder weights
 
   # ── QK-norm & residual scales ─────────────────────────────────────────────
 
-  # Available on pure_torch and pure_te unless a feature banner says otherwise.
+  # Available on pure_torch unless a feature banner says otherwise.
   use_qk_norm: false                    # RMS-norm Q and K in attention
   reorder_RoPE_QKNorm: false            # true = norm BEFORE RoPE (LLaMA-style, better fusion); needs use_qk_norm
   use_resid_lambdas: false              # per-layer residual scale; incompatible with use_mhc_lite
@@ -273,7 +273,7 @@ pretraining:
   # ── Debug ─────────────────────────────────────────────────────────────────
 
   debug_non_finite_params: false        # NaN/Inf check on params after every step
-  debug_layerwise_metrics: false        # per-layer grad/weight norms, residual RMS, logits; overhead; breaks compile; not pure_te
+  debug_layerwise_metrics: false        # per-layer grad/weight norms, residual RMS, logits; overhead; breaks compile
   debug_layerwise_log_every: 100        # log layerwise metrics every N optimizer steps
 
   # ── Data loading ──────────────────────────────────────────────────────────
@@ -300,15 +300,15 @@ pretraining:
   bf16: true
   tf32: true
 
-  # FP8 — pure_torch targets vs TE recipe knobs (see field comments)
+  # FP8 — target selection and recipe knobs (see field comments)
   fp8: false
-  fp8_target: "mlp"                     # pure_torch: mlp | attn_wqkv | attn_wo; combine as "attn_wqkv,mlp" or YAML list
-  fp8_skip_last_n_layers: 0             # pure_torch FP8: keep final N layers in bf16
-  fp8_recipe: "delayed"                 # TE only: delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)
-  fp8_format: "hybrid"                  # TE only: hybrid | e4m3; ignored by nvfp4
-  fp8_amax_history_len: 64              # TE DelayedScaling only: amax history window
-  fp8_reduce_amax: true                 # TE DelayedScaling: sync amax across FP8 group
-  fp8_cpu_activation_offload: false     # pure_torch FP8: TE CPU activation offload hooks
+  fp8_target: "mlp"                     # mlp | attn_wqkv | attn_wo; combine as "attn_wqkv,mlp" or YAML list
+  fp8_skip_last_n_layers: 0             # FP8: keep final N layers in bf16
+  fp8_recipe: "delayed"                 # delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)
+  fp8_format: "hybrid"                  # hybrid | e4m3; ignored by nvfp4
+  fp8_amax_history_len: 64              # DelayedScaling only: amax history window
+  fp8_reduce_amax: true                 # DelayedScaling: sync amax across FP8 group
+  fp8_cpu_activation_offload: false     # FP8: TE CPU activation offload hooks
   # Offload knobs below were hand-tuned for 4×GH200; other systems not guaranteed.
   fp8_cpu_activation_offload_layers: "auto"  # reserved; offloads eligible TE LayerNormLinear + LayerNormMLP wrappers
   fp8_cpu_activation_offload_retain_buffers: false  # reuse pinned CPU buffers across iters (stable shapes)
@@ -316,10 +316,10 @@ pretraining:
   # ── Distributed ───────────────────────────────────────────────────────────
 
   multi_gpu: true
-  distributed_mode: "fsdp"              # fsdp | hsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)
+  distributed_mode: "fsdp"              # fsdp | hsdp | ddp (pure_torch honors this; HF path ignores it)
   hsdp_shard_size: 'auto'               # hsdp only: GPUs per replica; 'auto'=LOCAL_WORLD_SIZE; must divide world_size
   fsdp_shard_granularity: "layer"       # layer (NVLink/SXM) | sublayer (PCIe overlap)
-  fsdp_reshard_after_forward: false     # FSDP2 reshard_after_forward (pure_torch / pure_te)
+  fsdp_reshard_after_forward: false     # FSDP2 reshard_after_forward
   fsdp_reduce_dtype: "fp32"             # fp32 (exact) | bf16 (halves reduce-scatter bytes; cross-rank sum rounds to bf16)
   world_size: 'auto'
   ddp_bucket_cap_mb: 25                 # only when distributed_mode: ddp
@@ -367,4 +367,3 @@ resume:
 # Backend selection (CLI flags override these)
 # =============================================================================
 pure_torch: true
-# pure_te: false

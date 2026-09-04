@@ -92,7 +92,7 @@
             "gelu",
             "srelu"
           ],
-          "description": "relu | gelu | srelu  (srelu: pure_torch / pure_te)"
+          "description": "relu | gelu | srelu"
         },
         "tie_word_embeddings": {
           "type": "boolean",
@@ -258,8 +258,7 @@
           "default": false,
           "x-nanoplm-group": "mHC-lite (pure_torch only)",
           "x-nanoplm-backend": [
-            "pure_torch",
-            "pure_te"
+            "pure_torch"
           ],
           "x-nanoplm-advanced": true
         },
@@ -632,7 +631,7 @@
         }
       },
       "x-nanoplm-group-notes": {
-        "QK-norm & residual scales": "Available on pure_torch and pure_te unless a feature banner says otherwise.",
+        "QK-norm & residual scales": "Available on pure_torch unless a feature banner says otherwise.",
         "mHC-lite (pure_torch only)": "Multi-stream residual with doubly stochastic mixing.\nIncompatible with use_resid_lambdas.",
         "NOBLE (pure_torch only)": "Nonlinear low-rank branches on linear layers.\nTraining LR scaling lives under pretraining.noble_* (active when use_noble).",
         "MoE \u2014 Mixture-of-Experts (pure_torch only)": "Requires: pretraining.use_packing: true  and  use_static_inp_size: true\nAlways-on: one shared expert; routing is always sigmoid.",
@@ -1149,7 +1148,7 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Debug",
-          "description": "per-layer grad/weight norms, residual RMS, logits; overhead; breaks compile; not pure_te",
+          "description": "per-layer grad/weight norms, residual RMS, logits; overhead; breaks compile",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
@@ -1230,13 +1229,13 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Precision",
-          "description": "FP8 \u2014 pure_torch targets vs TE recipe knobs (see field comments)"
+          "description": "FP8 \u2014 target selection and recipe knobs (see field comments)"
         },
         "fp8_target": {
           "type": "string",
           "default": "mlp",
           "x-nanoplm-group": "Precision",
-          "description": "pure_torch: mlp | attn_wqkv | attn_wo; combine as \"attn_wqkv,mlp\" or YAML list",
+          "description": "mlp | attn_wqkv | attn_wo; combine as \"attn_wqkv,mlp\" or YAML list",
           "x-nanoplm-backend": [
             "pure_torch"
           ]
@@ -1245,7 +1244,7 @@
           "type": "integer",
           "default": 0,
           "x-nanoplm-group": "Precision",
-          "description": "pure_torch FP8: keep final N layers in bf16",
+          "description": "FP8: keep final N layers in bf16",
           "x-nanoplm-backend": [
             "pure_torch"
           ]
@@ -1261,9 +1260,9 @@
             "mxfp8",
             "nvfp4"
           ],
-          "description": "TE only: delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)",
+          "description": "delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)",
           "x-nanoplm-backend": [
-            "pure_te"
+            "pure_torch"
           ]
         },
         "fp8_format": {
@@ -1274,18 +1273,18 @@
             "hybrid",
             "e4m3"
           ],
-          "description": "TE only: hybrid | e4m3; ignored by nvfp4",
+          "description": "hybrid | e4m3; ignored by nvfp4",
           "x-nanoplm-backend": [
-            "pure_te"
+            "pure_torch"
           ]
         },
         "fp8_amax_history_len": {
           "type": "integer",
           "default": 64,
           "x-nanoplm-group": "Precision",
-          "description": "TE DelayedScaling only: amax history window",
+          "description": "DelayedScaling only: amax history window",
           "x-nanoplm-backend": [
-            "pure_te"
+            "pure_torch"
           ],
           "x-nanoplm-advanced": true
         },
@@ -1293,9 +1292,9 @@
           "type": "boolean",
           "default": true,
           "x-nanoplm-group": "Precision",
-          "description": "TE DelayedScaling: sync amax across FP8 group",
+          "description": "DelayedScaling: sync amax across FP8 group",
           "x-nanoplm-backend": [
-            "pure_te"
+            "pure_torch"
           ],
           "x-nanoplm-advanced": true
         },
@@ -1303,7 +1302,7 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Precision",
-          "description": "pure_torch FP8: TE CPU activation offload hooks",
+          "description": "FP8: TE CPU activation offload hooks",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
@@ -1343,7 +1342,7 @@
             "hsdp",
             "ddp"
           ],
-          "description": "fsdp | hsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)"
+          "description": "fsdp | hsdp | ddp (pure_torch honors this; HF path ignores it)"
         },
         "hsdp_shard_size": {
           "type": "string",
@@ -1365,7 +1364,7 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Distributed",
-          "description": "FSDP2 reshard_after_forward (pure_torch / pure_te)"
+          "description": "FSDP2 reshard_after_forward"
         },
         "fsdp_reduce_dtype": {
           "type": "string",
@@ -1511,11 +1510,6 @@
       "attn_layer_pattern"
     ],
     "pipeline_reject": [
-      {
-        "flag": "pure_te",
-        "reason": "te_pipeline.py is out of scope for the v1 recycling implementation. Use pure_torch.",
-        "condition": "pure_te is True"
-      },
       {
         "flag": "pure_torch",
         "reason": "Recycling lands only in pure_pipeline.py for v1; the HF path is out of scope.",

@@ -125,18 +125,10 @@ def test_repo_outside_recurrent_block_no_warning(monkeypatch):
     assert not any("RePO" in w for w in warnings_seen)
 
 
-def test_pipeline_flag_rejects_pure_te():
-    cfg = _pipeline_model_cfg()
-    from types import SimpleNamespace
-    pipeline_cfg = SimpleNamespace(pure_te=True, pure_torch=True, fp8=False, use_compile_max_autotune=False)
-    with pytest.raises(ValueError, match="te_pipeline"):
-        validate_recycling_compatibility(cfg, pipeline_cfg)
-
-
 def test_pipeline_flag_rejects_hf_path():
     cfg = _pipeline_model_cfg()
     from types import SimpleNamespace
-    pipeline_cfg = SimpleNamespace(pure_te=False, pure_torch=False, fp8=False, use_compile_max_autotune=False)
+    pipeline_cfg = SimpleNamespace(pure_torch=False, fp8=False, use_compile_max_autotune=False)
     with pytest.raises(ValueError, match="HF path"):
         validate_recycling_compatibility(cfg, pipeline_cfg)
 
@@ -144,7 +136,7 @@ def test_pipeline_flag_rejects_hf_path():
 def test_pipeline_flag_warns_on_fp8(monkeypatch):
     cfg = _pipeline_model_cfg()
     from types import SimpleNamespace
-    pipeline_cfg = SimpleNamespace(pure_te=False, pure_torch=True, fp8=True, use_compile_max_autotune=False)
+    pipeline_cfg = SimpleNamespace(pure_torch=True, fp8=True, use_compile_max_autotune=False)
     # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
     warnings_seen = []
     from nanoplm.utils.logger import logger as _nplm_logger

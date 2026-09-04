@@ -63,7 +63,6 @@ export default defineConfig({
         {
           label: 'Going further',
           items: [
-            { label: 'Choose a backend', link: '/guides/backends/' },
             { label: 'Scale up', link: '/guides/scale-up/' },
             { label: 'Choose an optimizer', link: '/guides/optimizers/' },
             { label: 'Cooldown and resuming', link: '/guides/cooldown-and-resume/' },

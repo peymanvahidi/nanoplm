@@ -35,8 +35,6 @@ Flash attention available: True
 # ...
 ```
 
-Running it with `--pure-te` stops the config load: `recycling: incompatible pipeline flag 'pure_te'. te_pipeline.py is out of scope for the v1 recycling implementation. Use pure_torch.`
-
 ## Split the stack
 
 Three `model:` keys define the shape.
@@ -85,8 +83,6 @@ Recycling's compatibility rules are enforced at config load, not written down as
 | `use_mhc_lite` | mHC-lite's stability guarantees have not been tested against a recycled residual stream. |
 
 The error names the flag: `recycling: incompatible model flag 'use_x0_lambdas=True'. ...`
-
-And the pure-TE backend is rejected, as above.
 
 Four are **allowed with a warning**:
 
@@ -151,6 +147,5 @@ If the two eval losses stay close, the extra loops are not earning their compute
 
 ## Where to go next
 
-- [Choose a backend](/nanoplm/guides/backends/): recycling is pure-torch only.
 - [Compatibility matrix](/nanoplm/reference/compatibility/): every flag recycling rejects or warns on.
 - [pretrain.yaml reference](/nanoplm/reference/pretrain/): every `recycling_*` key, with defaults.

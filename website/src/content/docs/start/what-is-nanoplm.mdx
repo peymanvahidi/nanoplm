@@ -76,9 +76,8 @@ is exactly where `pretrain.yaml` looks for them. The one value the defaults cann
 `eval.checkpoint_dir`: open `eval.yaml` and point it at the run you trained above.
 
 :::note
-The stock `pretrain.yaml` sets `pure_torch: true`, so `from-yaml` needs no backend flag. To use
-Transformer Engine instead, set `pure_te: true` and turn off pure-torch in the YAML. See
-[Choose a backend](/nanoplm/guides/backends/).
+The stock `pretrain.yaml` sets `pure_torch: true`, so `from-yaml` needs no backend flag.
+Pure-torch is the only pretraining backend.
 :::
 
 For the real thing (a tiny model trained and evaluated end to end, with the edits spelled out),
@@ -91,8 +90,8 @@ follow [Your first PLM](/nanoplm/start/first-plm/).
 - **The three YAMLs**: [how the pipeline fits together](/nanoplm/pipeline/), then one page each for
   [data](/nanoplm/pipeline/data/), [pretraining](/nanoplm/pipeline/pretrain/), and
   [evaluation](/nanoplm/pipeline/eval/).
-- **Going further**: goal-shaped guides: [choose a backend](/nanoplm/guides/backends/),
-  [scale up](/nanoplm/guides/scale-up/), [choose an optimizer](/nanoplm/guides/optimizers/),
+- **Going further**: goal-shaped guides: [scale up](/nanoplm/guides/scale-up/),
+  [choose an optimizer](/nanoplm/guides/optimizers/),
   [cooldown and resuming](/nanoplm/guides/cooldown-and-resume/), and
   [recycling](/nanoplm/guides/recycling/).
 - **Reference and Troubleshooting**: every key of every config, generated from the code

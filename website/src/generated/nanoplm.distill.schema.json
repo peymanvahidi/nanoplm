@@ -98,8 +98,7 @@
           "default": false,
           "description": "mHC-lite multi-stream residual mixing",
           "x-nanoplm-backend": [
-            "pure_torch",
-            "pure_te"
+            "pure_torch"
           ],
           "x-nanoplm-advanced": true
         },
@@ -471,11 +470,6 @@
       "attn_layer_pattern"
     ],
     "pipeline_reject": [
-      {
-        "flag": "pure_te",
-        "reason": "te_pipeline.py is out of scope for the v1 recycling implementation. Use pure_torch.",
-        "condition": "pure_te is True"
-      },
       {
         "flag": "pure_torch",
         "reason": "Recycling lands only in pure_pipeline.py for v1; the HF path is out of scope.",

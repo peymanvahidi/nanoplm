@@ -163,9 +163,7 @@ You now have binary token shards and the manifest that describes them:
 
 :::note
 The scaffolded `pretrain.yaml` already sets `pure_torch: true`, so no `--pure-torch` flag is needed.
-That is the fully-featured path and the only one `nanoplm eval` can load. To use Transformer Engine
-instead, edit the YAML (`pure_te: true` and `pure_torch: false`); see
-[Choose a backend](/nanoplm/guides/backends/).
+Pure-torch is the only pretraining backend, and its checkpoints are what `nanoplm eval` loads.
 :::
 
 The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:

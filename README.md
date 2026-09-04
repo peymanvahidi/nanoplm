@@ -114,7 +114,7 @@ nanoplm distill get-yaml
 nanoplm pretrain from-yaml
 ```
 
-The stock `pretrain.yaml` sets `pure_torch: true`, so no backend flag is needed. For Transformer Engine, set `pure_te: true` and turn off pure-torch — see [Choose a backend](https://peymanvahidi.github.io/nanoplm/guides/backends/).
+The stock `pretrain.yaml` sets `pure_torch: true`, so no backend flag is needed.
 
 ---
 

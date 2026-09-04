@@ -39,16 +39,17 @@ pretraining.nordion2_selection_scope:
 pretraining.mlm_masking_strategy:
   enum: [token, span]
 
-# FP8, Transformer-Engine-only knobs (recipe/format/amax are TE constructs).
+# FP8 recipe knobs (recipe/format/amax are Transformer-Engine constructs, read
+# by fp8.py's te_fp8_recipe_from_config on the pure-torch path).
 pretraining.fp8_recipe:
   enum: [delayed, current, block, mxfp8, nvfp4]
-  backend: [pure_te]
+  backend: [pure_torch]
 pretraining.fp8_format:
   enum: [hybrid, e4m3]
-  backend: [pure_te]
-pretraining.fp8_amax_history_len: { backend: [pure_te], advanced: true }
-pretraining.fp8_reduce_amax: { backend: [pure_te], advanced: true }
-# FP8, pure-torch-only knobs. fp8_target gets NO enum on purpose: any
+  backend: [pure_torch]
+pretraining.fp8_amax_history_len: { backend: [pure_torch], advanced: true }
+pretraining.fp8_reduce_amax: { backend: [pure_torch], advanced: true }
+# More FP8 knobs. fp8_target gets NO enum on purpose: any
 # COMBINATION of mlp / attn_wqkv / attn_wo is legal (_normalize_fp8_targets),
 # so a closed value list would be a lie.
 pretraining.fp8_target: { backend: [pure_torch] }
@@ -62,16 +63,15 @@ pretraining.use_compile_max_autotune: { backend: [pure_torch], advanced: true }
 pretraining.compile_triton_persistent_reductions: { backend: [pure_torch], advanced: true }
 pretraining.compile_triton_mix_order_reduction: { backend: [pure_torch], advanced: true }
 
-# Layerwise debug hooks are explicitly rejected under pure_te
-# (_validate_debug_layerwise_metrics_compat).
+# Layerwise debug hooks exist only on the pure-torch path.
 pretraining.debug_layerwise_metrics: { backend: [pure_torch], advanced: true }
 pretraining.debug_layerwise_log_every: { backend: [pure_torch], advanced: true }
 
 # RePO exists only on the pure-torch path.
 pretraining.repo_rope_warmup_steps: { backend: [pure_torch], advanced: true }
 
-# Huginn-style recycling: pure-torch only (both ProtModernBertMLM and
-# TEProtModernBertMLM reject recycling_loop_count > 1). Enums come from
+# Huginn-style recycling: pure-torch only (ProtModernBertMLM rejects
+# recycling_loop_count > 1). Enums come from
 # pretraining/recycling/scheduler.py's validators.
 pretraining.recycling_bptt: { backend: [pure_torch], advanced: true }
 pretraining.recycling_loop_count_sampling:
@@ -125,9 +125,7 @@ model.canon_layers_kernel_size:
 model.canon_layers_mode: { backend: [pure_torch], advanced: true }
 model.use_canon_layers: { backend: [pure_torch], advanced: true }
 model.use_repo: { backend: [pure_torch], advanced: true }
-# mHC-lite itself runs on pure_torch AND pure_te; only pure_torch honors a
-# wrapping level other than "layer" (TEProtModernBertMLM rejects 'sublayers').
-model.use_mhc_lite: { backend: [pure_torch, pure_te], advanced: true }
+model.use_mhc_lite: { backend: [pure_torch], advanced: true }
 model.mhc_lite_wrapping_level:
   enum: [layer, sublayers]
   backend: [pure_torch]
