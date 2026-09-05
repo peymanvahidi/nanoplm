@@ -868,20 +868,61 @@ class ModernBertEncoderLayer(nn.Module):
         token_mask: Optional[torch.Tensor] = None,
         repo_active: bool = False,
         prores_alpha: "torch.Tensor | float" = 1.0,
+        loop_count: "torch.Tensor | int | None" = None,
     ) -> torch.Tensor:
-        for _ in range(self.repeats):
-            x = self._forward_once(
-                x,
-                attn_mask=attn_mask,
-                cos_sin=cos_sin,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                window_size=window_size,
-                position_ids=position_ids,
-                token_mask=token_mask,
-                repo_active=repo_active,
-                prores_alpha=prores_alpha,
-            )
+        if loop_count is None:
+            for _ in range(self.repeats):
+                x = self._forward_once(
+                    x,
+                    attn_mask=attn_mask,
+                    cos_sin=cos_sin,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    window_size=window_size,
+                    position_ids=position_ids,
+                    token_mask=token_mask,
+                    repo_active=repo_active,
+                    prores_alpha=prores_alpha,
+                )
+            return x
+        return self._forward_repeats(
+            x,
+            loop_count,
+            attn_mask=attn_mask,
+            cos_sin=cos_sin,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            window_size=window_size,
+            position_ids=position_ids,
+            token_mask=token_mask,
+            repo_active=repo_active,
+            prores_alpha=prores_alpha,
+        )
+
+    @torch._dynamo.disable(recursive=False)
+    def _forward_repeats(
+        self,
+        x: torch.Tensor,
+        loop_count: "torch.Tensor | int",
+        **kwargs,
+    ) -> torch.Tensor:
+        """Apply this layer ``loop_count`` times, driven from eager Python.
+
+        Same contract and same reason as ``ModernBertModel._drive_recurrence``:
+        a variable trip count inside a traced graph makes Dynamo specialize on
+        the Python int, so every distinct count costs a guard miss + fresh
+        trace + autotune pass. Compiled callers pass a 0-d int64 tensor, which
+        installs no equality guard at this disable boundary, and
+        ``recursive=False`` lets each ``_forward_once`` re-enter Dynamo and
+        compile as its own cached graph.
+
+        ``forward`` keeps its own unrolled ``range(self.repeats)`` branch
+        instead of delegating here, so a fixed-depth run traces exactly the
+        graph it traced before this method existed.
+        """
+        r = int(loop_count.item()) if isinstance(loop_count, torch.Tensor) else int(loop_count)
+        for _ in range(r):
+            x = self._forward_once(x, **kwargs)
         return x
 
     def _forward_once(
@@ -1806,7 +1847,7 @@ class ModernBertModel(nn.Module):
         _cu_seqlens: Optional[torch.Tensor] = None,
         _max_seqlen: Optional[int] = None,
         _position_ids: Optional[torch.Tensor] = None,
-        recycling_loop_count: Optional[int] = None,
+        loop_count: "torch.Tensor | int | None" = None,
         recycling_bptt: Optional[int] = None,
     ) -> torch.Tensor:
         # ---- varlen (flash-attention) path --------------------------------
@@ -1874,8 +1915,8 @@ class ModernBertModel(nn.Module):
                 self._prores_alphas if self.use_prores else self._prores_alphas_off
             )
 
-            _recycle = (
-                self.config.recycling_loop_count > 1 or recycling_loop_count is not None
+            _recycle = (not self.config.use_loopie) and (
+                self.config.recycling_loop_count > 1 or loop_count is not None
             )
             if _recycle:
                 if self.adapter is None:
@@ -1885,7 +1926,7 @@ class ModernBertModel(nn.Module):
                         "config.recycling_loop_count == 1. Rebuild the model with "
                         "config.recycling_loop_count > 1 before passing the kwarg."
                     )
-                r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
+                r = loop_count if loop_count is not None else self.config.recycling_loop_count
                 K = recycling_bptt if recycling_bptt is not None else 8
 
             # Path-specific tensors hoisted once per forward so the unrolled
@@ -1993,6 +2034,7 @@ class ModernBertModel(nn.Module):
                             _position_ids=position_ids,
                             _repo_active: bool = repo_active,
                             _prores_alpha=alpha,
+                            _loop_count=loop_count,
                         ) -> torch.Tensor:
                             return _layer(
                                 x_in,
@@ -2003,6 +2045,7 @@ class ModernBertModel(nn.Module):
                                 position_ids=_position_ids,
                                 repo_active=_repo_active,
                                 prores_alpha=_prores_alpha,
+                                loop_count=_loop_count,
                             )
 
                         try:
@@ -2019,6 +2062,7 @@ class ModernBertModel(nn.Module):
                             position_ids=_position_ids,
                             repo_active=repo_active,
                             prores_alpha=alpha,
+                            loop_count=loop_count,
                         )
 
             if self.config.use_mhc_lite:
@@ -2089,8 +2133,8 @@ class ModernBertModel(nn.Module):
             self._prores_alphas if self.use_prores else self._prores_alphas_off
         )
 
-        _recycle = (
-            self.config.recycling_loop_count > 1 or recycling_loop_count is not None
+        _recycle = (not self.config.use_loopie) and (
+            self.config.recycling_loop_count > 1 or loop_count is not None
         )
         if _recycle:
             if self.adapter is None:
@@ -2100,7 +2144,7 @@ class ModernBertModel(nn.Module):
                     "config.recycling_loop_count == 1. Rebuild the model with "
                     "config.recycling_loop_count > 1 before passing the kwarg."
                 )
-            r = recycling_loop_count if recycling_loop_count is not None else self.config.recycling_loop_count
+            r = loop_count if loop_count is not None else self.config.recycling_loop_count
             K = recycling_bptt if recycling_bptt is not None else 8
 
         # Path-specific tensors hoisted once per forward — see varlen path
@@ -2196,6 +2240,7 @@ class ModernBertModel(nn.Module):
                         _token_mask=token_mask,
                         _repo_active: bool = repo_active,
                         _prores_alpha=alpha,
+                        _loop_count=loop_count,
                     ) -> torch.Tensor:
                         return _layer(
                             x_in,
@@ -2205,6 +2250,7 @@ class ModernBertModel(nn.Module):
                             token_mask=_token_mask,
                             repo_active=_repo_active,
                             prores_alpha=_prores_alpha,
+                            loop_count=_loop_count,
                         )
 
                     try:
@@ -2220,6 +2266,7 @@ class ModernBertModel(nn.Module):
                         token_mask=attention_mask,
                         repo_active=repo_active,
                         prores_alpha=alpha,
+                        loop_count=loop_count,
                     )
 
         if self.config.use_mhc_lite:
@@ -2491,7 +2538,7 @@ class ModernBertForMaskedLM(nn.Module):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
         position_ids: Optional[torch.Tensor] = None,
-        recycling_loop_count: Optional[int] = None,
+        loop_count: "torch.Tensor | int | None" = None,
         recycling_bptt: Optional[int] = None,
         num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> MLMOutput:
@@ -2525,7 +2572,7 @@ class ModernBertForMaskedLM(nn.Module):
                 _cu_seqlens=cu_seqlens,
                 _max_seqlen=max_seqlen,  # pass int directly — no tensor
                 _position_ids=position_ids,
-                recycling_loop_count=recycling_loop_count,
+                loop_count=loop_count,
                 recycling_bptt=recycling_bptt,
             )
             # x: (F, hidden) where F is fixed flat length
@@ -2588,7 +2635,7 @@ class ModernBertForMaskedLM(nn.Module):
                 _cu_seqlens=cu_seqlens,
                 _max_seqlen=max_seqlen_t,
                 _position_ids=position_ids,
-                recycling_loop_count=recycling_loop_count,
+                loop_count=loop_count,
                 recycling_bptt=recycling_bptt,
             )
             # x: (total_tokens, hidden) — flat, no padding
@@ -2617,7 +2664,7 @@ class ModernBertForMaskedLM(nn.Module):
         x = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            recycling_loop_count=recycling_loop_count,
+            loop_count=loop_count,
             recycling_bptt=recycling_bptt,
         )
 

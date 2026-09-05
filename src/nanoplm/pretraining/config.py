@@ -242,6 +242,12 @@ class PretrainingConfig:
     recycling_loop_count_curriculum: str = "1_sqrt"           # "none" | "linear" | "1_sqrt"
     recycling_loop_count_curriculum_steps: int = -1           # -1 = auto (25% of total training steps)
     recycling_pretraining_eval_loop_counts: Optional[list[int]] = None  # None = single r at target mean
+
+    # Loopie stochastic depth. Inactive when model.use_loopie is false.
+    # 0 = fixed depth; j >= 1 draws R uniformly from
+    # {loopie_loop_count - j, ..., loopie_loop_count + j} once per micro-batch,
+    # shared by every stored layer and locked-step across DP ranks.
+    loopie_loop_count_jitter: int = 0
     def __post_init__(self) -> None:
         for name in (
             "mlm_probability",

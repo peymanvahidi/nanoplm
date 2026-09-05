@@ -48,3 +48,9 @@ class EvalConfig:
 
     # Force re-download of framework datasets (use when new tasks land upstream).
     force_download: bool = False
+
+    # Refinement depth to run this checkpoint at, overriding the depth it was
+    # trained with. None = the depth in the checkpoint's model_config.yaml.
+    # Works for both loopie and huginn checkpoints; a checkpoint with no
+    # looping rejects it.
+    loop_count: Optional[int] = None

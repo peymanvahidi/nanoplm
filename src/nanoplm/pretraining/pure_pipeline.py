@@ -801,6 +801,28 @@ def _make_pure_profiler(
     return prof, lambda _: prof.step()
 
 
+def _loop_count_fwd_kwargs(model_config, sampled_r: int, recycling_bptt: int,
+                           device: torch.device) -> dict:
+    """Forward kwargs carrying this micro-step's loop count to the model.
+
+    The count is a 0-d tensor, never a Python int: at the Dynamo-disable
+    boundary (``_drive_recurrence`` for Huginn, ``_forward_repeats`` for
+    Loopie) an int installs an equality guard, so the compiled segment that
+    calls the driver recompiles for every distinct r and thrashes the cache.
+
+    Loopie's tensor stays on CPU because its driver reads ``.item()`` once per
+    stored layer per forward — on a device tensor that is L host syncs a step.
+    Huginn reads it once per forward and keeps the device tensor. Truncated
+    BPTT is Huginn-only; Loopie backprops through every repeat.
+    """
+    if getattr(model_config, "use_loopie", False):
+        return {"loop_count": torch.tensor(sampled_r, dtype=torch.int64)}
+    return {
+        "loop_count": torch.tensor(sampled_r, dtype=torch.int64, device=device),
+        "recycling_bptt": torch.tensor(recycling_bptt, dtype=torch.int64, device=device),
+    }
+
+
 # ---------------------------------------------------------------------------
 # FLOPs estimation
 # ---------------------------------------------------------------------------
@@ -1287,7 +1309,7 @@ def _sync_train_loader_len(
 @torch.inference_mode()
 def _evaluate(
     model, eval_loader, device, distributed, amp_dtype,
-    recycling_loop_count: int | None = None,
+    loop_count: int | None = None,
     recycling_bptt: int | None = None,
 ) -> float:
     # Eval intentionally stays eager. The eval loader uses the padded path
@@ -1305,8 +1327,8 @@ def _evaluate(
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
-            if recycling_loop_count is not None:
-                fwd_kwargs["recycling_loop_count"] = recycling_loop_count
+            if loop_count is not None:
+                fwd_kwargs["loop_count"] = loop_count
                 fwd_kwargs["recycling_bptt"] = recycling_bptt
             out = model(**fwd_kwargs)
         loss = out["loss"] if isinstance(out, dict) else out.loss
@@ -2324,7 +2346,7 @@ def run_pure_pretraining(
             global_batch_warmup_steps,
         )
 
-    # ---- Recycling scheduler (no-op when recycling_loop_count == 1) ----
+    # ---- Loop-count scheduler (no-op unless huginn recycling or loopie jitter) ----
     from nanoplm.pretraining.recycling import RecyclingScheduler
     from nanoplm.pretraining.recycling.logging import (
         RecyclingMetricsBuffer,
@@ -2335,7 +2357,22 @@ def run_pure_pretraining(
     recycling_scheduler = None
     recycling_rng = None
     recycling_metrics_buffer = None
-    if model.model_config.recycling_loop_count > 1:
+    _model_cfg = model.model_config
+    _loopie_jitter = int(getattr(pretrain_config, "loopie_loop_count_jitter", 0))
+    if _model_cfg.use_loopie and _loopie_jitter > 0:
+        # curriculum_complete pins current_mean at the target from step 0: there
+        # is nothing to ramp over a support of {R-j, ..., R+j} around R=2.
+        recycling_scheduler = RecyclingScheduler(
+            pretrain_config,
+            target_loop_count=_model_cfg.loopie_loop_count,
+            total_training_steps=total_steps,
+            curriculum_complete=True,
+            sampling="uniform",
+            jitter=_loopie_jitter,
+        )
+        recycling_rng = torch.Generator(device=device).manual_seed(int(pretrain_config.seed) + 999)
+        recycling_metrics_buffer = RecyclingMetricsBuffer(window=100)
+    elif model.model_config.recycling_loop_count > 1:
         # Resume semantics for the loop-count curriculum (spec §17):
         #   - `continue` keeps the curriculum on the ORIGINAL horizon, read from
         #     the checkpoint's training_state.json (not the locally recomputed
@@ -3018,21 +3055,10 @@ def run_pure_pretraining(
                             if "position_ids" in batch:
                                 fwd_kwargs["position_ids"] = batch["position_ids"]
                             if sampled_r is not None:
-                                # Pass as 0-d int tensors (not Python ints) so
-                                # Dynamo does NOT install a value guard at the
-                                # _drive_recurrence disable boundary. With Python
-                                # ints the compiled segment that calls the eager
-                                # driver recompiles for every unique sampled r,
-                                # thrashing the compile cache under Poisson
-                                # sampling.
-                                fwd_kwargs["recycling_loop_count"] = torch.tensor(
-                                    sampled_r, dtype=torch.int64, device=device
-                                )
-                                fwd_kwargs["recycling_bptt"] = torch.tensor(
-                                    pretrain_config.recycling_bptt,
-                                    dtype=torch.int64,
-                                    device=device,
-                                )
+                                fwd_kwargs.update(_loop_count_fwd_kwargs(
+                                    _cfg, sampled_r,
+                                    pretrain_config.recycling_bptt, device,
+                                ))
                             out = model(**fwd_kwargs)
 
                         loss = out["loss"] if isinstance(out, dict) else out.loss
@@ -3464,7 +3490,7 @@ def run_pure_pretraining(
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
                             eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
                         elif recycling_scheduler is not None:
-                            eval_loop_counts = [model.model_config.recycling_loop_count]
+                            eval_loop_counts = [_static_loop_count]
                         else:
                             eval_loop_counts = [None]
 
@@ -3473,7 +3499,7 @@ def run_pure_pretraining(
                         for r_value in eval_loop_counts:
                             eval_loss = _evaluate(
                                 orig_model, eval_loader, device, distributed, amp_dtype,
-                                recycling_loop_count=r_value,
+                                loop_count=r_value,
                                 recycling_bptt=pretrain_config.recycling_bptt if r_value is not None else None,
                             )
                             if r_value is not None:
@@ -3487,7 +3513,7 @@ def run_pure_pretraining(
                                     try:
                                         p = {"train/global_step": global_step}
                                         p.update(inloop_eval_payload(losses_by_r))
-                                        target = model.model_config.recycling_loop_count
+                                        target = _static_loop_count
                                         if target in losses_by_r:
                                             p["eval/loss"] = losses_by_r[target]
                                         wandb.log(p)

@@ -86,6 +86,9 @@ pretraining.recycling_loop_count_curriculum:
 pretraining.recycling_loop_count_curriculum_steps: { backend: [pure_torch], advanced: true }
 pretraining.recycling_pretraining_eval_loop_counts: { backend: [pure_torch], advanced: true }
 
+# Loopie stochastic depth: only meaningful with model.use_loopie, pure-torch only.
+pretraining.loopie_loop_count_jitter: { backend: [pure_torch], advanced: true, minimum: 0 }
+
 # NOBLE LR scaling: only meaningful with model.use_noble, which is pure-torch only.
 pretraining.noble_base_lr: { backend: [pure_torch], advanced: true }
 pretraining.noble_lr_gamma: { backend: [pure_torch], advanced: true }
@@ -153,6 +156,7 @@ distillation.lr_scheduler:
 # ----------------------------------------------------------------------- eval
 eval.zero_shot_method:
   enum: [masked_marginals, wt_marginals, pseudoperplexity]
+eval.loop_count: { backend: [pure_torch], advanced: true, minimum: 1 }
 
 # =============================================================================
 # x-extra-fields: RESERVED KEY (not a "<section>.<field>" annotation).

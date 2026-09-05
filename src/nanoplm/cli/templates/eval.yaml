@@ -37,3 +37,6 @@ eval:
 
   # Re-download framework datasets (use when new tasks land upstream).
   force_download: false
+
+  # Refinement depth override for a looped checkpoint.
+  loop_count: null                    # null = the depth it was trained at

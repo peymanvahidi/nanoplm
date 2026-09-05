@@ -46,6 +46,7 @@ class NanoPLMBioEngineer:
         device: torch.device,
         biotrainer: Dict[str, Any],
         batch_size: int = 60,
+        loop_count: Optional[int] = None,
     ):
         """Return a ``BioEngineer`` wrapping ``model`` for zero-shot scoring.
 
@@ -58,6 +59,8 @@ class NanoPLMBioEngineer:
             batch_size: Sequences per forward pass. Masked-marginals batches this
                 many masked positions together; the categorical Jacobian batches
                 this many mutated sequences.
+            loop_count: Refinement depth override; None runs the checkpoint at
+                the depth it was trained with.
         """
         CustomBioEngineerModel = biotrainer["CustomBioEngineerModel"]
         CustomBioEngineerModelWrapper = biotrainer["CustomBioEngineerModelWrapper"]
@@ -102,7 +105,8 @@ class NanoPLMBioEngineer:
                     enabled=self._device.type == "cuda",
                 ):
                     outputs = self._model(
-                        input_ids=input_ids, attention_mask=attention_mask
+                        input_ids=input_ids, attention_mask=attention_mask,
+                        loop_count=loop_count,
                     )
                 return outputs["logits"]
 

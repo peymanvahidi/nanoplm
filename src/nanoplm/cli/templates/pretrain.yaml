@@ -251,6 +251,11 @@ pretraining:
   recycling_loop_count_curriculum_steps: -1           # -1 = auto (25% of total steps)
   recycling_pretraining_eval_loop_counts: null        # null = single r at target mean; e.g. [1, 4] for eval sweep
 
+  # ── Loopie stochastic depth (only when model.use_loopie: true) ────────────
+
+  # Draws R uniformly from loopie_loop_count ± jitter, fresh per micro-batch.
+  loopie_loop_count_jitter: 0           # 0 = fixed depth; 1 at count 2 gives R in {1,2,3}
+
   # ── MLM objective ─────────────────────────────────────────────────────────
 
   mlm_probability: 0.3

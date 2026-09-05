@@ -197,6 +197,7 @@ def run_eval(eval_config: EvalConfig) -> None:
         device,
         biotrainer,
         batch_size=eval_config.zero_shot_batch_size,
+        loop_count=eval_config.loop_count,
     )
 
     autoeval = biotrainer["AutoEval"](
