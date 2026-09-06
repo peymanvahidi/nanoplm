@@ -227,7 +227,6 @@ def run_pretraining(
         run_name,
         wandb_run_name,
         output_dir,
-        num_epochs,
         logging_steps,
         eval_steps,
         save_steps,
@@ -235,13 +234,15 @@ def run_pretraining(
     ) = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
-        train_samples=train_sequences,
-        global_batch_seqs=global_batch_seqs,
     )
 
-    steps_per_epoch = (train_sequences + global_batch_seqs - 1) // global_batch_seqs
-    total_steps = num_epochs * steps_per_epoch
-    warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+    raise NotImplementedError(
+        "The HF Trainer pretraining path has no training horizon to run to: "
+        "PretrainingConfig carries a token budget, not an epoch count, and "
+        "resolve_total_steps lives in the pure-torch pipeline. nanoplm's CLI "
+        "already refuses this path in _check_pipeline_supported. Use "
+        "pure_torch=True."
+    )
 
     # Configure Weights & Biases via environment variables so HF Trainer attaches correctly
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name

@@ -280,29 +280,20 @@ def _job_stamp() -> str:
 def prepare_run_and_steps(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig],
-    train_samples: int,
-    global_batch_seqs: int,
-) -> Tuple[str, str, str, None, int, int, int, Optional[int]]:
+) -> Tuple[str, str, str, int, int, int, Optional[int]]:
     """Prepare run naming/dirs and resolve the raw logging/eval/save intervals.
 
-    The training horizon (total_steps) is no longer derived from epochs here:
-    it comes from the token budget and is computed by the caller via
-    ``resolve_total_steps``. This helper therefore returns the *raw* configured
-    intervals (un-clamped); the caller clamps them to the token-budget
-    total_steps once the horizon is known.
+    The training horizon (total_steps) is not derived here: it comes from the
+    token budget and is computed by the caller via ``resolve_total_steps``. This
+    helper therefore returns the *raw* configured intervals (un-clamped); the
+    caller clamps them to the token-budget total_steps once the horizon is known.
 
     Args:
         pretrain_config: Pretraining configuration
         resume_config: Resume configuration (if resuming)
-        train_samples: Number of training samples (from manifest) [unused for
-            horizon now; kept for signature stability]
-        global_batch_seqs: Effective samples per optimizer step [unused for
-            horizon now; kept for signature stability]
 
-    Returns a tuple: (run_name, wandb_run_name, output_dir, None,
+    Returns a tuple: (run_name, wandb_run_name, output_dir,
                       logging_steps, eval_steps, save_steps, resume_step).
-    The 4th return slot is always ``None`` (now unused): the horizon is
-    token-budget driven and resolved by the caller.
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
@@ -385,5 +376,4 @@ def prepare_run_and_steps(
                 # Fall back to the raw configured intervals computed above.
                 pass
 
-    # 4th return slot (now unused) is None: horizon is token-budget driven.
-    return run_name, wandb_run_name, output_dir, None, logging_steps, eval_steps, save_steps, resume_step
+    return run_name, wandb_run_name, output_dir, logging_steps, eval_steps, save_steps, resume_step

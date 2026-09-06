@@ -1953,7 +1953,6 @@ def run_pure_pretraining(
         _run_name,
         wandb_run_name,
         output_dir,
-        _,  # 4th slot is always None: horizon is token-budget driven
         logging_steps,
         eval_steps,
         save_steps,
@@ -1961,8 +1960,6 @@ def run_pure_pretraining(
     ) = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
-        train_samples=manifest.train_sequences,
-        global_batch_seqs=global_batch_seqs,
     )
 
     num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
