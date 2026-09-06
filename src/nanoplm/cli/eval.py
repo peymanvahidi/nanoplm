@@ -6,7 +6,12 @@ from typing import Any, Dict, List, Optional
 
 import click
 
-from nanoplm.cli._common import ConfigErrorGroup, unknown_keys_message
+from nanoplm.cli._common import (
+    YAML_FIRST_SECTIONS,
+    ConfigErrorGroup,
+    log_level_option,
+    unknown_keys_message,
+)
 from nanoplm.eval.config import EvalConfig
 from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
@@ -124,7 +129,7 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
     return EvalConfig(**kwargs)
 
 
-@click.group(name="eval", cls=ConfigErrorGroup)
+@click.group(name="eval", cls=ConfigErrorGroup, sections=YAML_FIRST_SECTIONS)
 @click.help_option("--help", "-h")
 def eval():
     """Group of commands for downstream evaluation."""
@@ -132,6 +137,7 @@ def eval():
 
 
 @eval.command("run")
+@log_level_option
 @click.help_option("--help", "-h")
 @click.option(
     "--checkpoint-dir",
@@ -265,6 +271,7 @@ def run(
 
 
 @eval.command("from-yaml")
+@log_level_option
 @click.help_option("--help", "-h")
 @click.argument(
     "config",

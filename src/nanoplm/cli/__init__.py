@@ -1,5 +1,6 @@
 import click
 
+from nanoplm.cli._common import SectionedGroup
 from nanoplm.cli.data import data
 from nanoplm.cli.distill import distill
 from nanoplm.cli.eval import eval as eval_cmd
@@ -7,7 +8,7 @@ from nanoplm.cli.deps import deps
 from nanoplm.cli.pretrain import pretrain
 
 
-@click.group(invoke_without_command=True)
+@click.group(invoke_without_command=True, cls=SectionedGroup)
 @click.version_option()
 @click.help_option("--help", "-h")
 @click.pass_context

@@ -34,7 +34,12 @@ from nanoplm.data.infra.validation import validate_pretrain_dataset
 from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline, DataManifest
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.cli.templates import load_template
-from nanoplm.cli._common import ConfigErrorGroup, unknown_keys_message
+from nanoplm.cli._common import (
+    YAML_FIRST_SECTIONS,
+    ConfigErrorGroup,
+    log_level_option,
+    unknown_keys_message,
+)
 from nanoplm.utils.logger import logger
 
 
@@ -154,7 +159,7 @@ def _check_pipeline_supported(pure_torch: bool) -> None:
         )
 
 
-@click.group(name="pretrain", cls=ConfigErrorGroup)
+@click.group(name="pretrain", cls=ConfigErrorGroup, sections=YAML_FIRST_SECTIONS)
 @click.help_option("--help", "-h")
 def pretrain():
     """Group of commands for model pretraining."""
@@ -162,6 +167,7 @@ def pretrain():
 
 
 @pretrain.command("run")
+@log_level_option
 @click.help_option("--help", "-h")
 # Dataset and output
 @click.option(
@@ -1270,6 +1276,7 @@ def run(
 
 
 @pretrain.command("from-yaml")
+@log_level_option
 @click.help_option("--help", "-h")
 @click.argument(
     "config",
