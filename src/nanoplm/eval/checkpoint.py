@@ -3,23 +3,104 @@
 from __future__ import annotations
 
 import json
-from dataclasses import MISSING, fields
+from dataclasses import MISSING, asdict, dataclass, fields
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import torch
 import yaml
 
+from nanoplm.data.infra.atomic import atomic_write_path
 from nanoplm.pretraining.fp8 import convert_fp8_targets
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.utils import checkpoint_step as _checkpoint_step
+from nanoplm.utils.common import git_sha
 from nanoplm.utils.logger import logger
 
 
 def _safe_load_checkpoint_yaml(path: Path) -> Any:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _read_run_manifest(run_root: Path) -> Optional[dict[str, Any]]:
+    """Read ``run.json`` from a run root, if the run left one.
+
+    Every checkpoint already on disk predates run.json, so its absence is
+    normal rather than an error. Returns ``None`` when the file is missing,
+    unreadable, malformed, or does not hold a JSON object.
+    """
+    manifest_path = run_root / "run.json"
+    try:
+        loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+@dataclass(frozen=True)
+class EvalProvenance:
+    """Which artifact an autoeval report came from.
+
+    biotrainer's ``AutoEvalReport`` carries only ``embedder_name`` and a
+    ``training_date`` stamped with the eval date, so the report names neither
+    the checkpoint, the step, nor the training run. This is the record that
+    does.
+    """
+
+    embedder_name: str
+    checkpoint_dir: Path
+    checkpoint_step: int
+    run_name: str
+    loop_count: Optional[int]
+    eval_git_sha: Optional[str]
+    eval_started_at: str
+    training_run: Optional[dict[str, Any]]
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        checkpoint_dir: Union[str, Path],
+        embedder_name: str,
+        loop_count: Optional[int],
+    ) -> "EvalProvenance":
+        checkpoint_dir = Path(checkpoint_dir).resolve()
+        return cls(
+            embedder_name=embedder_name,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_step=_checkpoint_step(checkpoint_dir),
+            run_name=checkpoint_dir.parent.name,
+            loop_count=loop_count,
+            eval_git_sha=git_sha(Path(__file__).resolve().parent),
+            eval_started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            training_run=_read_run_manifest(checkpoint_dir.parent),
+        )
+
+
+def write_eval_provenance(
+    provenance: EvalProvenance, report_path: Union[str, Path]
+) -> Optional[Path]:
+    """Write the provenance sidecar next to an autoeval report.
+
+    The sidecar shares the report's stem, so ``ls`` lists the pair together and
+    a reader holding a report path finds it by appending one suffix. Returns
+    the sidecar path, or ``None`` when it could not be written.
+    """
+    report_path = Path(report_path)
+    sidecar_path = report_path.with_name(
+        report_path.name.removesuffix(".json") + ".provenance.json"
+    )
+    record = asdict(provenance) | {"checkpoint_dir": str(provenance.checkpoint_dir)}
+    try:
+        with atomic_write_path(sidecar_path) as tmp:
+            tmp.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"Could not write eval provenance to {sidecar_path}: {exc}")
+        return None
+    return sidecar_path
 
 
 def load_model_config_from_checkpoint(

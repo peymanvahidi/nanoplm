@@ -9,9 +9,11 @@ from typing import Any, Optional
 import torch
 
 from nanoplm.eval.checkpoint import (
+    EvalProvenance,
     load_checkpoint,
     load_model_config_from_checkpoint,
     resolve_checkpoint_dir,
+    write_eval_provenance,
 )
 from nanoplm.eval.config import EvalConfig
 from nanoplm.eval.embedder import NanoPLMCustomEmbedder
@@ -100,8 +102,7 @@ def _resolve_zero_shot_method(name: str, biotrainer: dict[str, Any]):
 def _warn_about_cached_frameworks(
     *,
     biotrainer: dict[str, Any],
-    embedder_name: str,
-    output_dir: Path,
+    report_path: Path,
     frameworks: list[str],
 ) -> None:
     """Warn when an existing report will short-circuit a framework.
@@ -110,7 +111,6 @@ def _warn_about_cached_frameworks(
     registers no runner for it, so a re-run into the same ``output_dir`` can
     silently evaluate nothing. Surface that up front.
     """
-    report_path = output_dir / biotrainer["AutoEvalReport"].get_file_name(embedder_name)
     if not report_path.exists():
         return
     try:
@@ -137,8 +137,10 @@ def run_eval(eval_config: EvalConfig) -> None:
     encoder's embeddings. The zero-shot pair runs through a ``BioEngineer`` and
     the supervised one through a ``CustomEmbedder``, both wrapping the same
     GPU-resident model, and all accumulate into one ``AutoEvalReport`` at
-    ``<output_dir>/autoeval_report_<embedder>.json``. Per-framework artefacts
-    land under ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``.
+    ``<output_dir>/autoeval_report_<embedder>.json``, alongside a
+    ``autoeval_report_<embedder>.provenance.json`` sidecar naming the checkpoint
+    that produced it. Per-framework artefacts land under
+    ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``.
     """
     _disable_h100_triton_srelu()
 
@@ -190,12 +192,23 @@ def run_eval(eval_config: EvalConfig) -> None:
 
     output_dir = Path(eval_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / biotrainer["AutoEvalReport"].get_file_name(embedder_name)
     _warn_about_cached_frameworks(
         biotrainer=biotrainer,
-        embedder_name=embedder_name,
-        output_dir=output_dir,
+        report_path=report_path,
         frameworks=frameworks,
     )
+
+    # Written before autoeval.run() so a crashed eval still leaves provenance
+    # beside the partial report biotrainer wrote.
+    provenance = EvalProvenance.resolve(
+        checkpoint_dir=checkpoint_dir,
+        embedder_name=embedder_name,
+        loop_count=eval_config.loop_count,
+    )
+    sidecar = write_eval_provenance(provenance, report_path)
+    if sidecar is not None:
+        logger.info(f"Wrote eval provenance sidecar: {sidecar}")
 
     bio_engineer = NanoPLMBioEngineer.build(
         model,
