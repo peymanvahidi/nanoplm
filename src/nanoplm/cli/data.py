@@ -890,11 +890,14 @@ def from_yaml(
         params_filename=config_path.name,
     )
     dvc_yaml_path.write_text(dvc_content, encoding="utf-8")
-    logger.info(f"Regenerated {dvc_yaml_path}")
-    click.echo(f"Regenerated dvc.yaml in {cwd}")
+    # click.echo, not logger.info: this must still print at --log-level error.
+    click.echo(f"Regenerated {dvc_yaml_path}")
 
     dvc_dir = cwd / ".dvc"
-    if not dvc_dir.exists():
+    # --dry-run is a read-only preview and must not mutate the directory by
+    # running 'dvc init' on its own; if that turns out to be required, the
+    # 'dvc repro' call below fails with an explanation instead.
+    if not dvc_dir.exists() and not dry_run:
         if no_auto_init:
             raise click.ClickException(
                 f"DVC is not initialized in {cwd}. Run 'dvc init' first or omit --no-auto-init."
@@ -938,7 +941,14 @@ def from_yaml(
     try:
         result = subprocess.run(cmd, cwd=str(cwd), env=repro_env)
         if result.returncode != 0:
-            raise click.ClickException(f"dvc repro exited with code {result.returncode}")
+            hint = ""
+            if dry_run and not dvc_dir.exists():
+                hint = (
+                    f" (DVC is not initialized in {cwd}, and --dry-run does not "
+                    "auto-initialize it; run 'nanoplm data from-yaml' once "
+                    "without --dry-run, or 'dvc init', first)"
+                )
+            raise click.ClickException(f"dvc repro exited with code {result.returncode}{hint}")
     except FileNotFoundError:
         raise click.ClickException(
             "'dvc' command not found. Please install DVC (pip install dvc)."

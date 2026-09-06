@@ -99,3 +99,48 @@ def test_extract_pigz_logs_heartbeat(tmp_path, monkeypatch):
     assert dst.read_bytes() == payload
     assert any("Extracting FASTA (pigz) started" in msg for msg in seen)
     assert any("completed in" in msg for msg in seen)
+
+
+def test_from_yaml_dry_run_does_not_init_dvc(tmp_path, monkeypatch):
+    import re
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    from nanoplm.cli.templates import load_template
+
+    fasta = tmp_path / "tiny.fasta"
+    fasta.write_text(">a\nMAGVAGM\n")
+
+    template = load_template("data_pretrain")
+    template = template.replace("local_fasta: null", f"local_fasta: {fasta}")
+    template = re.sub(r"^\s*url:.*$", "  url: null", template, count=1, flags=re.MULTILINE)
+
+    cfg = tmp_path / "data.yaml"
+    cfg.write_text(template)
+
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
+
+    assert not (tmp_path / ".dvc").exists()
+    assert result.exit_code != 0
+    assert "dvc init" in result.output.lower() or "not initialized" in result.output.lower()
+
+
+def test_from_yaml_regenerated_message_appears_once(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    from nanoplm.cli.templates import load_template
+
+    cfg = tmp_path / "data.yaml"
+    cfg.write_text(load_template("data_pretrain"))
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})(),
+    )
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
+
+    assert result.output.count("Regenerated") == 1
+    assert result.exit_code == 0, result.output
