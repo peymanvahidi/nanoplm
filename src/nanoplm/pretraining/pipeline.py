@@ -149,6 +149,13 @@ def run_pretraining(
     manifest: DataManifest,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
+    # This path has no training horizon to run to: PretrainingConfig carries a
+    # token budget rather than an epoch count, and resolve_total_steps lives in
+    # the pure-torch pipeline. The CLI already refuses it in
+    # _check_pipeline_supported; the code below is what it used to do.
+    raise NotImplementedError(
+        "The HF Trainer pretraining path is no longer supported. Use pure_torch=True."
+    )
 
     device = get_device()
 
@@ -235,14 +242,6 @@ def run_pretraining(
     eval_steps = run.eval_steps
     save_steps = run.save_steps
     resume_step = run.resume_step
-
-    raise NotImplementedError(
-        "The HF Trainer pretraining path has no training horizon to run to: "
-        "PretrainingConfig carries a token budget, not an epoch count, and "
-        "resolve_total_steps lives in the pure-torch pipeline. nanoplm's CLI "
-        "already refuses this path in _check_pipeline_supported. Use "
-        "pure_torch=True."
-    )
 
     # Configure Weights & Biases via environment variables so HF Trainer attaches correctly
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name

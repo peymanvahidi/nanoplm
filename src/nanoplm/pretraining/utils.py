@@ -11,7 +11,7 @@ import torch
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from nanoplm.data.infra.atomic import atomic_write_path
 from nanoplm.utils.common import git_sha, is_global_main, job_stamp
