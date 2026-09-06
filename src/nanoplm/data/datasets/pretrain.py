@@ -9,6 +9,7 @@ from pathlib import Path
 from torch.utils.data import Dataset
 
 from nanoplm.utils import logger
+from nanoplm.data.infra.validation import ValidationError
 
 
 class ShardedDataset(Dataset):
@@ -75,6 +76,18 @@ class ShardedDataset(Dataset):
                 )
 
             sizes = np.load(str(idx_path))  # int32 array of sequence lengths
+
+            # np.memmap slicing clamps silently past EOF, so a bin/idx size
+            # mismatch would otherwise surface as truncated reads at access
+            # time with no error. Catch it here, once, while sizes is in hand.
+            expected_bytes = int(sizes.sum())
+            actual_bytes = bin_path.stat().st_size
+            if actual_bytes != expected_bytes:
+                raise ValidationError(
+                    f"Size mismatch in shard {bin_path.name}: "
+                    f"index declares {expected_bytes} bytes but .bin is {actual_bytes} bytes."
+                )
+
             offsets = np.concatenate([[0], np.cumsum(sizes)])
 
             self._offsets.append(offsets)
