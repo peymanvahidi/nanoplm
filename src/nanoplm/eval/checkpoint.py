@@ -26,41 +26,41 @@ def _safe_load_checkpoint_yaml(path: Path) -> Any:
 
 
 def _read_run_manifest(run_root: Path) -> Optional[dict[str, Any]]:
-    """Read ``run.json`` from a run root, if the run left one.
+    """Read the training run's ``run.json``.
 
-    Every checkpoint already on disk predates run.json, so its absence is
-    normal rather than an error. Returns ``None`` when the file is missing,
-    unreadable, malformed, or does not hold a JSON object.
+    A run predating run.json left none, so absence is normal rather than an
+    error. A manifest that is present but unreadable is not, so it warns.
     """
     manifest_path = run_root / "run.json"
+    if not manifest_path.exists():
+        return None
     try:
         loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        logger.warning(f"Ignoring unreadable run manifest {manifest_path}: {exc}")
         return None
     return loaded if isinstance(loaded, dict) else None
 
 
 def _resolved_step(checkpoint_dir: Path) -> Optional[int]:
-    """The checkpoint's optimizer step, or ``None`` when it cannot be resolved.
+    """The one place ``checkpoint_step``'s ``-1`` sentinel becomes ``None``.
 
-    ``pretraining.utils.checkpoint_step`` signals "unresolvable" with ``-1``,
-    and a sidecar reader would misread ``-1`` as a step, so ``None`` is what the
-    record carries. This is the single place that sentinel is translated.
+    A sidecar reader would take ``-1`` for a step.
     """
     step = _checkpoint_step(checkpoint_dir)
     return None if step < 0 else step
 
 
 def default_embedder_name(checkpoint_dir: Union[str, Path]) -> str:
-    """The name to evaluate a checkpoint under when the config names none.
+    """Name a checkpoint's eval after its run and step.
 
     ``checkpoint-27500`` is the same name under every run, so the bare
     directory stem collides between runs evaluated into one ``output_dir``.
-    Prefixing the run directory and spelling the step is the
-    ``<run>-ckpt<step>`` convention every eval config in this repo types by
-    hand. A role-named directory takes its step from ``training_state.json``,
-    and a directory whose step cannot be resolved at all falls back to its
-    role, so ``checkpoint-final`` gives ``<run>-final``.
+    ``<run>-ckpt<step>`` is the convention the cluster-experiments skill
+    documents and every eval config under the gitignored ``experiments/`` types
+    by hand. A step no name carries falls back to the checkpoint's role, so a
+    ``checkpoint-final`` with no readable ``training_state.json`` gives
+    ``<run>-final``.
     """
     path = Path(checkpoint_dir).resolve()
     step = _resolved_step(path)
@@ -79,10 +79,9 @@ class EvalProvenance:
     the checkpoint, the step, nor the training run. This is the record that
     does.
 
-    ``run_name`` is the directory the checkpoint sits in, which is what
-    identifies the run on disk even when ``run.json`` is missing, so it can
-    disagree with ``training_run["run_name"]`` when the run directory was moved
-    or renamed.
+    ``run_name`` is the directory the checkpoint sits in, which still names the
+    run when ``run.json`` is absent, so it can disagree with
+    ``training_run["run_name"]`` after the run directory was moved.
     """
 
     embedder_name: str
@@ -118,11 +117,10 @@ class EvalProvenance:
 def write_eval_provenance(
     provenance: EvalProvenance, report_path: Union[str, Path]
 ) -> Optional[Path]:
-    """Write the provenance sidecar next to an autoeval report.
+    """Write the provenance record beside the report it annotates.
 
-    The sidecar shares the report's stem, so ``ls`` lists the pair together and
-    a reader holding a report path finds it by appending one suffix. Returns
-    the sidecar path, or ``None`` when it could not be written.
+    It shares the report's stem so a reader holding a report path finds it by
+    appending one suffix.
     """
     report_path = Path(report_path)
     sidecar_path = report_path.with_name(

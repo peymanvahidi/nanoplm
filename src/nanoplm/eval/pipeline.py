@@ -112,8 +112,7 @@ def _reused_frameworks(
     for this run unless it covers only a filtered subset of tasks or was
     produced in development mode while this run wants the full benchmark. A
     reused framework registers no runner, so an invocation whose every framework
-    is reused evaluates nothing. This predicate is a copy of an upstream rule
-    and has to be kept in step with it.
+    is reused evaluates nothing.
     """
     if not report_path.exists():
         return []
@@ -142,12 +141,7 @@ def _reused_frameworks(
 def _completion_message(
     *, computed: list[str], reused: list[str], elapsed_s: float
 ) -> str:
-    """Say what this invocation actually computed.
-
-    ``AutoEval`` registers no runner for a reused framework, so a re-run into a
-    populated ``output_dir`` finishes in 0.0s having evaluated nothing, and a
-    bare "complete" line reads identically in both cases.
-    """
+    """Say what this invocation computed, so a 0.0s finish cannot read as a run."""
     if not computed:
         return (
             f"AUTOEVAL COMPUTED NOTHING in {elapsed_s:.1f}s: every requested "
@@ -171,9 +165,9 @@ def run_eval(eval_config: EvalConfig) -> None:
     encoder's embeddings. The zero-shot pair runs through a ``BioEngineer`` and
     the supervised one through a ``CustomEmbedder``, both wrapping the same
     GPU-resident model, and all accumulate into one ``AutoEvalReport`` at
-    ``<output_dir>/autoeval_report_<embedder>.json``, alongside a
+    ``<output_dir>/autoeval_report_<embedder>.json``, beside an
     ``autoeval_report_<embedder>.provenance.json`` sidecar naming the checkpoint
-    that produced it. Per-framework artefacts land under
+    behind it. Per-framework artefacts land under
     ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``.
     """
     _disable_h100_triton_srelu()
@@ -239,8 +233,8 @@ def run_eval(eval_config: EvalConfig) -> None:
         development_mode=eval_config.development_mode,
     )
 
-    # Written before autoeval.run() so a crashed eval still leaves provenance
-    # beside the partial report biotrainer wrote.
+    # Written before the run so an eval that dies partway still records which
+    # checkpoint it was running.
     sidecar = write_eval_provenance(provenance, report_path)
     if sidecar is not None:
         logger.info(f"Wrote eval provenance sidecar: {sidecar}")

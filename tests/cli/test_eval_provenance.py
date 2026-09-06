@@ -1,8 +1,5 @@
-"""Covers the eval provenance sidecar: where it lands, what it records about the
-checkpoint that produced a report, the ``<run>-ckpt<step>`` embedder name it
-derives when a config names none, which frameworks a re-run reuses instead of
-recomputing, what the completion banner then claims, and that none of it needs
-either a GPU or biotrainer.
+"""Eval provenance and cache reporting. Must stay runnable with no GPU and no
+biotrainer, so use stubs rather than importing either.
 """
 
 import importlib
@@ -112,6 +109,17 @@ def test_missing_run_manifest_leaves_training_run_null(tmp_path):
     assert record["training_run"] is None
     assert record["loop_count"] is None
     assert record["checkpoint_step"] == 27500
+
+
+def test_unreadable_run_manifest_leaves_training_run_null(tmp_path):
+    checkpoint_dir = _make_checkpoint(tmp_path, run_manifest=None)
+    (checkpoint_dir.parent / "run.json").write_text("{ not json", encoding="utf-8")
+
+    provenance = EvalProvenance.resolve(
+        checkpoint_dir=checkpoint_dir, embedder_name="corrupt", loop_count=None
+    )
+
+    assert provenance.training_run is None
 
 
 def test_role_named_checkpoint_takes_its_step_from_training_state(tmp_path):
