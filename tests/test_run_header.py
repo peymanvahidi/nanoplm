@@ -1,5 +1,6 @@
 from nanoplm.pretraining.pure_pipeline import (
     _RunHeader, _RunProgress, _format_run_header, _format_run_exit, _format_token_count,
+    _node_count,
 )
 
 RUN_ROOT = "output/checkpoints/loop-imp-abl-baseline-l10/loop-imp-abl-baseline-l10-1684851-3"
@@ -106,3 +107,28 @@ def test_exit_line_without_a_checkpoint():
         wall_sec=36000.0,
     )
     assert "last=" not in text
+
+
+def test_node_count_prefers_slurms_own_count(monkeypatch):
+    monkeypatch.setenv("SLURM_NNODES", "4")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    assert _node_count(16) == 4
+
+
+def test_node_count_falls_back_to_local_world_size(monkeypatch):
+    monkeypatch.delenv("SLURM_NNODES", raising=False)
+    monkeypatch.delenv("SLURM_JOB_NUM_NODES", raising=False)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    assert _node_count(16) == 4
+
+
+def test_node_count_is_one_when_the_launcher_says_nothing(monkeypatch):
+    for key in ("SLURM_NNODES", "SLURM_JOB_NUM_NODES", "LOCAL_WORLD_SIZE"):
+        monkeypatch.delenv(key, raising=False)
+    assert _node_count(16) == 1
+
+
+def test_node_count_ignores_a_malformed_value(monkeypatch):
+    monkeypatch.setenv("SLURM_NNODES", "four")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    assert _node_count(16) == 4

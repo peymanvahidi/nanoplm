@@ -413,6 +413,29 @@ class _RunHeader:
     stop: str
 
 
+def _node_count(world_size: int) -> int:
+    """Nodes this job spans.
+
+    The pretraining launcher is bare ``srun``, not torchrun, so it exports
+    RANK/LOCAL_RANK/WORLD_SIZE itself and LOCAL_WORLD_SIZE is absent. SLURM's own
+    node count is therefore the only reliable source, with the torchrun-derived
+    value kept as a fallback for a torchrun-launched run.
+    """
+    for key in ("SLURM_NNODES", "SLURM_JOB_NUM_NODES"):
+        raw = os.environ.get(key)
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+    raw = os.environ.get("LOCAL_WORLD_SIZE")
+    try:
+        local = int(raw) if raw else 0
+    except ValueError:
+        local = 0
+    return max(1, world_size // local) if local else 1
+
+
 def _format_run_header(h: _RunHeader) -> str:
     resume = "" if h.resume_step is None else f" (resume from step {h.resume_step:,})"
     return "\n".join([
@@ -2898,12 +2921,6 @@ def run_pure_pretraining(
         _run_manifest = json.loads(_manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         _run_manifest = {}
-    # torchrun sets LOCAL_WORLD_SIZE; a malformed value must not kill the run
-    # over a cosmetic header line.
-    try:
-        _local_ws = int(os.environ.get("LOCAL_WORLD_SIZE") or 0) or effective_world_size
-    except ValueError:
-        _local_ws = effective_world_size
     run_progress = _RunProgress(
         total_steps=total_steps,
         run_root=output_dir,
@@ -2924,7 +2941,7 @@ def run_pure_pretraining(
             val_seqs=manifest.val_sequences,
             max_seq_len=manifest.max_seq_len,
             world_size=effective_world_size,
-            nodes=max(1, effective_world_size // _local_ws),
+            nodes=_node_count(effective_world_size),
             dist_mode=distributed_mode if distributed else "single",
             global_batch_tokens=achieved_global_batch_tokens,
             grad_accum=inferred_grad_accum_steps,
