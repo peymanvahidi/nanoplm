@@ -4,6 +4,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+_RANK = int(os.environ.get("RANK") or 0)
+_LOG_ALL_RANKS = os.environ.get("NANOPLM_LOG_ALL_RANKS", "").strip().lower() not in ("", "0", "false", "no")
+_SPEAKS = _RANK == 0 or _LOG_ALL_RANKS
+_RANK_TAG = "" if _RANK == 0 else f"[rank {_RANK}] "
+
 
 class _LazyFileHandler(logging.FileHandler):
     """FileHandler that defers opening the file (and creating its directory)
@@ -35,17 +40,30 @@ class _LazyFileHandler(logging.FileHandler):
         super().emit(record)
 
 
+class _RankFilter(logging.Filter):
+    # Lives on the handler, not the logger: records from child loggers such as
+    # nanoplm.collator reach us by propagation, which runs handler filters only.
+    def filter(self, record) -> bool:
+        if _SPEAKS:
+            return True
+        return record.levelno >= logging.WARNING
+
+
 # File handler (lazy)
 file_handler = _LazyFileHandler()
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 file_handler._nanoplm_role = "file"  # sentinel for idempotency check across re-imports
 
-# Console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter("%(message)s"))
-console_handler._nanoplm_role = "console"  # sentinel for idempotency check across re-imports
+console_handler.setFormatter(
+    logging.Formatter(
+        f"%(asctime)s %(levelname)-7s {_RANK_TAG}%(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+)
+console_handler.addFilter(_RankFilter())
+console_handler._nanoplm_role = "console"
 
 logger = logging.getLogger("nanoplm")
 logger.setLevel(logging.INFO)
