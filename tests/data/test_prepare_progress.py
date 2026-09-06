@@ -139,6 +139,7 @@ def test_from_yaml_regenerated_message_appears_once(tmp_path, monkeypatch):
         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})(),
     )
     monkeypatch.chdir(tmp_path)
+    (tmp_path / ".dvc").mkdir(exist_ok=True)
     runner = CliRunner()
     result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
 

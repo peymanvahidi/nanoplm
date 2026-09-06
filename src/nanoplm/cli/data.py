@@ -924,6 +924,15 @@ def from_yaml(
     if device is not None:
         repro_env["NANOPLM_DEVICE"] = str(device)
 
+    # dvc repro --dry needs an initialized repo, and --dry-run will not create
+    # one, so say that here rather than letting dvc say it less helpfully first.
+    if dry_run and not dvc_dir.exists():
+        raise click.ClickException(
+            f"--dry-run needs an initialized DVC repo and will not create one. "
+            f"{cwd} has no .dvc/. Run 'nanoplm data from-yaml' once without "
+            f"--dry-run, or 'dvc init', then retry."
+        )
+
     # Build repro command
     if dry_run:
         cmd: list[str] = _DVC + ["repro", "--dry", "--allow-missing"]
@@ -941,14 +950,7 @@ def from_yaml(
     try:
         result = subprocess.run(cmd, cwd=str(cwd), env=repro_env)
         if result.returncode != 0:
-            hint = ""
-            if dry_run and not dvc_dir.exists():
-                hint = (
-                    f" (DVC is not initialized in {cwd}, and --dry-run does not "
-                    "auto-initialize it; run 'nanoplm data from-yaml' once "
-                    "without --dry-run, or 'dvc init', first)"
-                )
-            raise click.ClickException(f"dvc repro exited with code {result.returncode}{hint}")
+            raise click.ClickException(f"dvc repro exited with code {result.returncode}")
     except FileNotFoundError:
         raise click.ClickException(
             "'dvc' command not found. Please install DVC (pip install dvc)."
