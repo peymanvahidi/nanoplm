@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
-from nanoplm.utils.common import create_dirs
+from nanoplm.utils.common import is_global_main
 from nanoplm.utils.logger import logger
 
 if TYPE_CHECKING:
@@ -252,6 +252,31 @@ def _read_checkpoint_epoch(checkpoint_dir: Union[str, Path]) -> int:
     )
 
 
+def _job_stamp() -> str:
+    """Return a token identifying this job that every rank derives identically.
+
+    ``prepare_run_and_steps`` runs before ``dist.init_process_group``, so ranks
+    cannot settle on one run directory by broadcasting a name. Each must compute
+    the same name from the environment alone, which rules out both a wall-clock
+    reading and probing the filesystem for an unused name.
+    """
+    for key in ("SLURM_JOB_ID", "TORCHELASTIC_RUN_ID"):
+        stamp = os.environ.get(key)
+        if stamp:
+            return stamp
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        raise RuntimeError(
+            f"WORLD_SIZE={world_size} but neither SLURM_JOB_ID nor "
+            "TORCHELASTIC_RUN_ID is set, so there is no job id the ranks can "
+            "agree on. Each would stamp the run directory with its own clock "
+            "reading and scatter one job across several directories. Launch "
+            "under srun or torchrun, or export a shared TORCHELASTIC_RUN_ID."
+        )
+    return datetime.now().strftime("%d%m%H%M")
+
+
 def prepare_run_and_steps(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig],
@@ -281,43 +306,37 @@ def prepare_run_and_steps(
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
-    is_local_main = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    is_main = is_global_main()
 
-    # Determine run directory and name
+    # Determine run directory and name. Every rank must land on the same name
+    # without communicating, so the name is a pure function of the environment
+    # and only the global main touches the filesystem.
     if resume_config and resume_config.is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
-        original_run_name = checkpoint_path.parent.name
-        run_name = original_run_name  # Continue in same directory
+        run_name = checkpoint_path.parent.name  # Continue in same directory
         run_root = ckp_root / run_name
+        wandb_run_name = run_name
+        resume_step = None
 
-        # Track resume counter for W&B run naming
-        counter_file = run_root / ".resume_counter"
-        if counter_file.exists():
+        # The resume counter, the archival and the directory itself are all
+        # once-per-job effects. run_root is derived from the checkpoint's name,
+        # not from where the checkpoint lives, so it does not exist yet when
+        # resuming into a fresh ckp_dir -- which is what you do to keep the
+        # source run read-only.
+        if is_main:
+            run_root.mkdir(parents=True, exist_ok=True)
+            counter_file = run_root / ".resume_counter"
             try:
                 resume_counter = int(counter_file.read_text().strip()) + 1
-            except (ValueError, FileNotFoundError):
+            except (OSError, ValueError):
                 resume_counter = 1
-        else:
-            resume_counter = 1
-
-        # Save updated counter and archive future checkpoints (rank 0 only).
-        # run_root is derived from the checkpoint's name, not from where the
-        # checkpoint lives, so it does not exist yet when resuming into a fresh
-        # ckp_dir -- which is what you do to keep the source run read-only.
-        if is_local_main:
-            run_root.mkdir(parents=True, exist_ok=True)
             counter_file.write_text(str(resume_counter), encoding="utf-8")
+            wandb_run_name = f"{run_name}-re{resume_counter}"
+            logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
 
-        # Create W&B run name with counter
-        wandb_run_name = f"{run_name}-re{resume_counter}"
-        logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
-
-        # Archive any future checkpoints to prevent conflicts (rank 0 only).
-        # Use checkpoint_step so resuming from a role-named dir (e.g.
-        # checkpoint-stable-end) resolves its true step from training_state.json
-        # instead of failing to parse the name.
-        resume_step = None
-        if is_local_main:
+            # Use checkpoint_step so resuming from a role-named dir (e.g.
+            # checkpoint-stable-end) resolves its true step from
+            # training_state.json instead of failing to parse the name.
             step = checkpoint_step(checkpoint_path)
             if step >= 0:
                 resume_step = step
@@ -328,28 +347,16 @@ def prepare_run_and_steps(
                     f"Skipping future checkpoint archival."
                 )
     else:
-        slurm_job_id = os.environ.get("SLURM_JOB_ID")
-        base_stamp = slurm_job_id if slurm_job_id else datetime.now().strftime("%d%m%H%M")
-        base_name = f"{pretrain_config.run_name}-{base_stamp}"
-        candidate = base_name
-        if ckp_root.exists():
-            suffix = 2
-            while (ckp_root / candidate).exists():
-                candidate = f"{base_name}-{suffix}"
-                suffix += 1
-        run_name = candidate
+        run_name = f"{pretrain_config.run_name}-{_job_stamp()}"
         run_root = ckp_root / run_name
         wandb_run_name = run_name  # Same as directory name for new runs
         resume_step = None
 
-    if is_local_main:
-        create_dirs(str(run_root))
     output_dir = str(run_root)
-
-    # Persist run metadata for future resumes (rank 0 only)
-    if is_local_main:
+    if is_main:
+        run_root.mkdir(parents=True, exist_ok=True)
         try:
-            (Path(output_dir) / "run_name.txt").write_text(run_name, encoding="utf-8")
+            (run_root / "run_name.txt").write_text(run_name, encoding="utf-8")
         except Exception:
             pass
 

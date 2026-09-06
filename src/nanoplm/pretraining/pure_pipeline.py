@@ -1927,7 +1927,6 @@ def run_pure_pretraining(
             raise ValueError("MoE requires use_static_inp_size=True")
 
     # ---- Batch sizing ----
-    create_dirs(pretrain_config.ckp_dir)
     effective_world_size = _resolve_world_size(pretrain_config)
 
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
@@ -3654,11 +3653,12 @@ def run_pure_pretraining(
     # misrepresent it (and clobber a real final from an earlier run in the same
     # output dir). The in-loop save at the deadline is the run's output.
     if wallclock_stop:
-        logger.info(
-            "Stopped on the wall-clock budget at step %d/%d; skipping the terminal "
-            "'%s' checkpoint. Latest state is %s.",
-            global_step, total_steps, _terminal_phase, wallclock_stop_ckpt,
-        )
+        if is_main:
+            logger.info(
+                "Stopped on the wall-clock budget at step %d/%d; skipping the terminal "
+                "'%s' checkpoint. Latest state is %s.",
+                global_step, total_steps, _terminal_phase, wallclock_stop_ckpt,
+            )
     else:
         _save(_terminal_phase)
 
@@ -3675,4 +3675,5 @@ def run_pure_pretraining(
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
-    logger.info("Pure-torch pretraining complete.")
+    if is_main:
+        logger.info("Pure-torch pretraining complete.")

@@ -134,6 +134,16 @@ def inside_git_repo(work_dir: Path) -> bool:
     except FileNotFoundError:
         return False
 
+def is_global_main() -> bool:
+    """True on the single rank that owns once-per-job side effects.
+
+    Reads ``RANK`` rather than ``LOCAL_RANK``, which restarts at 0 on every node
+    and so is true once per *node*. Usable before ``dist.init_process_group``,
+    where ``dist.get_rank()`` is not yet available.
+    """
+    return int(os.environ.get("RANK", 0)) == 0
+
+
 def resolve_world_size(multi_gpu: bool, world_size: Union[int, str]) -> int:
     """Resolve effective world size from config values and environment."""
     if not multi_gpu:
