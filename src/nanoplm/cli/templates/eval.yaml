@@ -18,7 +18,7 @@ eval:
   output_dir: "autoeval_output"
 
   # device: cuda                     # auto-detected when omitted
-  # embedder_name: my-run            # defaults to checkpoint dir stem
+  # embedder_name: my-run            # defaults to <run-dir>-ckpt<step>
 
   # Zero-shot scoring method for the 'pgym' framework.
   zero_shot_method: masked_marginals  # masked_marginals | wt_marginals | pseudoperplexity

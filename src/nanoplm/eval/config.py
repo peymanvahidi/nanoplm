@@ -24,8 +24,10 @@ class EvalConfig:
     # Device override. When None, picks 'cuda' if available else 'cpu'.
     device: Optional[str] = None
 
-    # Embedder name shown in the autoeval report. When None, defaults to the
-    # checkpoint directory stem.
+    # Embedder name shown in the autoeval report and in its filename. When
+    # None, defaults to '<run-dir>-ckpt<step>' resolved from the checkpoint, so
+    # two runs evaluated into one output_dir do not overwrite each other's
+    # report; a role-named checkpoint takes its step from training_state.json.
     embedder_name: Optional[str] = None
 
     # Zero-shot scoring method for the 'pgym' framework. One of:

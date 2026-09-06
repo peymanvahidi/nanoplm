@@ -187,7 +187,12 @@ def run_eval(eval_config: EvalConfig) -> None:
     model = load_checkpoint(checkpoint_dir, model_config, device)
     tokenizer = model.tokenizer
 
-    embedder_name = eval_config.embedder_name or checkpoint_dir.stem
+    provenance = EvalProvenance.resolve(
+        checkpoint_dir=checkpoint_dir,
+        embedder_name=eval_config.embedder_name,
+        loop_count=eval_config.loop_count,
+    )
+    embedder_name = provenance.embedder_name
     logger.info(f"Embedder name: {embedder_name}")
 
     output_dir = Path(eval_config.output_dir)
@@ -201,11 +206,6 @@ def run_eval(eval_config: EvalConfig) -> None:
 
     # Written before autoeval.run() so a crashed eval still leaves provenance
     # beside the partial report biotrainer wrote.
-    provenance = EvalProvenance.resolve(
-        checkpoint_dir=checkpoint_dir,
-        embedder_name=embedder_name,
-        loop_count=eval_config.loop_count,
-    )
     sidecar = write_eval_provenance(provenance, report_path)
     if sidecar is not None:
         logger.info(f"Wrote eval provenance sidecar: {sidecar}")

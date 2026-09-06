@@ -1,5 +1,6 @@
 """Covers the eval provenance sidecar: where it lands, what it records about the
-checkpoint that produced a report, and that writing it needs neither a GPU nor
+checkpoint that produced a report, the ``<run>-ckpt<step>`` embedder name it
+derives when a config names none, and that writing it needs neither a GPU nor
 biotrainer.
 """
 
@@ -11,7 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from nanoplm.eval.checkpoint import EvalProvenance, write_eval_provenance
+from nanoplm.eval.checkpoint import (
+    EvalProvenance,
+    default_embedder_name,
+    write_eval_provenance,
+)
 
 RUN_NAME = "loop-imp-abl-baseline-l20-1564242-3"
 RUN_SHA = "9f3c1a2b4d5e6f708192a3b4c5d6e7f809111213"
@@ -123,6 +128,65 @@ def test_eval_started_at_is_a_timezone_aware_iso_timestamp(tmp_path):
 
     assert stamped.tzinfo is not None
     assert stamped.utcoffset() is not None
+
+
+def test_default_name_for_a_numeric_checkpoint_is_run_dir_and_step(tmp_path):
+    checkpoint_dir = _make_checkpoint(tmp_path, run_manifest=RUN_MANIFEST)
+
+    assert default_embedder_name(checkpoint_dir) == f"{RUN_NAME}-ckpt27500"
+
+
+def test_two_runs_at_the_same_step_get_different_default_names(tmp_path):
+    first = _make_checkpoint(tmp_path, run_name=RUN_NAME)
+    second = _make_checkpoint(tmp_path, run_name="loop-imp-abl-l40-1564243-1")
+    assert first.name == second.name == "checkpoint-27500"
+
+    first_name = default_embedder_name(first)
+    second_name = default_embedder_name(second)
+
+    assert first_name != second_name
+    assert first_name != "checkpoint-27500"
+    assert second_name != "checkpoint-27500"
+
+
+def test_role_named_checkpoint_defaults_to_the_step_in_training_state(tmp_path):
+    checkpoint_dir = _make_checkpoint(
+        tmp_path, checkpoint_name="checkpoint-final", global_step=30000
+    )
+
+    assert default_embedder_name(checkpoint_dir) == f"{RUN_NAME}-ckpt30000"
+
+
+def test_unresolvable_step_falls_back_to_the_checkpoint_role(tmp_path):
+    checkpoint_dir = _make_checkpoint(
+        tmp_path, checkpoint_name="checkpoint-final", global_step=None
+    )
+
+    assert default_embedder_name(checkpoint_dir) == f"{RUN_NAME}-final"
+
+
+def test_unresolvable_step_is_null_in_the_sidecar(tmp_path):
+    checkpoint_dir = _make_checkpoint(
+        tmp_path, checkpoint_name="checkpoint-final", global_step=None
+    )
+    provenance = EvalProvenance.resolve(
+        checkpoint_dir=checkpoint_dir, embedder_name=None, loop_count=None
+    )
+
+    report_name = f"autoeval_report_{provenance.embedder_name}.json"
+    sidecar = write_eval_provenance(provenance, tmp_path / "out" / report_name)
+    record = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    assert record["checkpoint_step"] is None
+
+
+def test_explicit_embedder_name_wins_over_the_default(tmp_path):
+    checkpoint_dir = _make_checkpoint(tmp_path)
+    provenance = EvalProvenance.resolve(
+        checkpoint_dir=checkpoint_dir, embedder_name="hand-picked", loop_count=None
+    )
+
+    assert provenance.embedder_name == "hand-picked"
 
 
 def test_eval_modules_import_without_biotrainer():

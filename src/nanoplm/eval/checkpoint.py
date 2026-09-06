@@ -40,6 +40,36 @@ def _read_run_manifest(run_root: Path) -> Optional[dict[str, Any]]:
     return loaded if isinstance(loaded, dict) else None
 
 
+def _resolved_step(checkpoint_dir: Path) -> Optional[int]:
+    """The checkpoint's optimizer step, or ``None`` when it cannot be resolved.
+
+    ``pretraining.utils.checkpoint_step`` signals "unresolvable" with ``-1``,
+    and a sidecar reader would misread ``-1`` as a step, so ``None`` is what the
+    record carries. This is the single place that sentinel is translated.
+    """
+    step = _checkpoint_step(checkpoint_dir)
+    return None if step < 0 else step
+
+
+def default_embedder_name(checkpoint_dir: Union[str, Path]) -> str:
+    """The name to evaluate a checkpoint under when the config names none.
+
+    ``checkpoint-27500`` is the same name under every run, so the bare
+    directory stem collides between runs evaluated into one ``output_dir``.
+    Prefixing the run directory and spelling the step is the
+    ``<run>-ckpt<step>`` convention every eval config in this repo types by
+    hand. A role-named directory takes its step from ``training_state.json``,
+    and a directory whose step cannot be resolved at all falls back to its
+    role, so ``checkpoint-final`` gives ``<run>-final``.
+    """
+    path = Path(checkpoint_dir).resolve()
+    step = _resolved_step(path)
+    suffix = (
+        f"ckpt{step}" if step is not None else path.name.removeprefix("checkpoint-")
+    )
+    return f"{path.parent.name}-{suffix}"
+
+
 @dataclass(frozen=True)
 class EvalProvenance:
     """Which artifact an autoeval report came from.
@@ -48,11 +78,16 @@ class EvalProvenance:
     ``training_date`` stamped with the eval date, so the report names neither
     the checkpoint, the step, nor the training run. This is the record that
     does.
+
+    ``run_name`` is the directory the checkpoint sits in, which is what
+    identifies the run on disk even when ``run.json`` is missing, so it can
+    disagree with ``training_run["run_name"]`` when the run directory was moved
+    or renamed.
     """
 
     embedder_name: str
     checkpoint_dir: Path
-    checkpoint_step: int
+    checkpoint_step: Optional[int]
     run_name: str
     loop_count: Optional[int]
     eval_git_sha: Optional[str]
@@ -64,14 +99,14 @@ class EvalProvenance:
         cls,
         *,
         checkpoint_dir: Union[str, Path],
-        embedder_name: str,
+        embedder_name: Optional[str],
         loop_count: Optional[int],
     ) -> "EvalProvenance":
         checkpoint_dir = Path(checkpoint_dir).resolve()
         return cls(
-            embedder_name=embedder_name,
+            embedder_name=embedder_name or default_embedder_name(checkpoint_dir),
             checkpoint_dir=checkpoint_dir,
-            checkpoint_step=_checkpoint_step(checkpoint_dir),
+            checkpoint_step=_resolved_step(checkpoint_dir),
             run_name=checkpoint_dir.parent.name,
             loop_count=loop_count,
             eval_git_sha=git_sha(Path(__file__).resolve().parent),

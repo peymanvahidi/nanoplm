@@ -27,7 +27,7 @@
     "embedder_name": {
       "type": "string",
       "default": null,
-      "description": "Embedder name shown in the autoeval report. When None, defaults to the checkpoint directory stem."
+      "description": "Embedder name shown in the autoeval report and in its filename. When None, defaults to '<run-dir>-ckpt<step>' resolved from the checkpoint, so two runs evaluated into one output_dir do not overwrite each other's report; a role-named checkpoint takes its step from training_state.json."
     },
     "zero_shot_method": {
       "type": "string",
