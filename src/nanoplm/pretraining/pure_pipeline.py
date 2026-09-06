@@ -2330,6 +2330,15 @@ def run_pure_pretraining(
     eval_steps = max(1, min(total_steps, eval_steps))
     save_steps = max(1, min(total_steps, save_steps))
 
+    if is_main and eval_steps % logging_steps != 0:
+        logger.warning(
+            "eval_steps=%d is not a multiple of logging_steps=%d, so no step "
+            "will satisfy both cadences and the vram=/peak= fields will never "
+            "be logged (and the peak counter will never reset). Pick a "
+            "logging_steps that divides eval_steps.",
+            eval_steps, logging_steps,
+        )
+
     if global_batch_warmup_steps > 0:
         logger.warning(
             "global_batch_warmup_steps=%d > 0: the token budget is approximate "
