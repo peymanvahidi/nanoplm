@@ -277,9 +277,7 @@ def _write_run_manifest(
     pretrain_config: PretrainingConfig,
     effective_world_size: int,
 ) -> None:
-    """Record in the run root what a checkpoint cannot tell you afterwards.
-
-    A checkpoint's ``pretrain_config.yaml`` stores the config as written, so
+    """A checkpoint's ``pretrain_config.yaml`` stores the config as written, so
     ``world_size: auto`` stays "auto" and the directories stay CWD-relative, and
     nothing anywhere records which commit ran or what was typed to start it.
     """
@@ -325,21 +323,18 @@ def prepare_run_and_steps(
     is_main = is_global_main()
     is_resume = bool(resume_config and resume_config.is_resume)
 
-    # Determine run directory and name. Every rank must land on the same name
-    # without communicating, so the name is a pure function of the environment
-    # and only the global main touches the filesystem.
+    # Every rank must land on the same name without communicating, so the name
+    # is a pure function of the environment and only the global main writes.
     if is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
-        run_name = checkpoint_path.parent.name  # Continue in same directory
+        run_name = checkpoint_path.parent.name
         run_root = ckp_root / run_name
         wandb_run_name = run_name
         resume_step = None
 
-        # The resume counter, the archival and the directory itself are all
-        # once-per-job effects. run_root is derived from the checkpoint's name,
-        # not from where the checkpoint lives, so it does not exist yet when
-        # resuming into a fresh ckp_dir -- which is what you do to keep the
-        # source run read-only.
+        # run_root is derived from the checkpoint's name, not from where the
+        # checkpoint lives, so it does not exist yet when resuming into a fresh
+        # ckp_dir -- which is what you do to keep the source run read-only.
         if is_main:
             run_root.mkdir(parents=True, exist_ok=True)
             counter_file = run_root / ".resume_counter"
@@ -351,9 +346,9 @@ def prepare_run_and_steps(
             wandb_run_name = f"{run_name}-re{resume_counter}"
             logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
 
-            # Use checkpoint_step so resuming from a role-named dir (e.g.
-            # checkpoint-stable-end) resolves its true step from
-            # training_state.json instead of failing to parse the name.
+            # checkpoint_step resolves a role-named dir (e.g.
+            # checkpoint-stable-end) from training_state.json rather than
+            # failing to parse its name.
             step = checkpoint_step(checkpoint_path)
             if step >= 0:
                 resume_step = step
@@ -366,7 +361,7 @@ def prepare_run_and_steps(
     else:
         run_name = f"{pretrain_config.run_name}-{job_stamp()}"
         run_root = ckp_root / run_name
-        wandb_run_name = run_name  # Same as directory name for new runs
+        wandb_run_name = run_name
         resume_step = None
 
     if is_main:
@@ -376,16 +371,12 @@ def prepare_run_and_steps(
         except Exception:
             pass
 
-    # Resolve raw logging/eval/save intervals. The token-budget total_steps is
-    # computed by the caller (run_pure_pretraining via resolve_total_steps);
-    # the caller clamps these intervals to it once the horizon is known.
     logging_steps = max(1, pretrain_config.logging_steps)
     eval_steps = max(1, pretrain_config.eval_steps)
     save_steps = max(1, pretrain_config.save_steps)
 
-    # On resume, preserve the original logging/eval/save intervals recorded in
-    # the checkpoint's training_args.bin when available, so cadence is stable
-    # across resume sessions.
+    # A resumed run keeps the cadence recorded in the checkpoint, so logging
+    # and saving stay aligned across resume sessions.
     if is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
         if training_args_path.exists():
@@ -398,7 +389,6 @@ def prepare_run_and_steps(
                     f"Resuming with preserved intervals: save_steps={save_steps}, eval_steps={eval_steps}"
                 )
             except Exception:
-                # Fall back to the raw configured intervals computed above.
                 pass
 
     run = RunIdentity(

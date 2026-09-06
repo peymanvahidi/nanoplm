@@ -222,20 +222,16 @@ def _prepare_run_and_steps(
 
     is_main = is_global_main()
 
-    # Determine run directory and name. Every rank must land on the same name
-    # without communicating, so the name is a pure function of the environment
-    # and only the global main touches the filesystem.
+    # Every rank must land on the same name without communicating, so the name
+    # is a pure function of the environment and only the global main writes.
     if resume_config and resume_config.is_resume:
-        # Resume in SAME directory
         checkpoint_path = Path(resume_config.checkpoint_dir)
-        run_root = checkpoint_path.parent  # Use original directory
+        run_root = checkpoint_path.parent
 
-        # Read original run name from metadata
         run_name_file = run_root / "run_name.txt"
         if run_name_file.exists():
             run_name = run_name_file.read_text().strip()
         else:
-            # Fallback to directory name if file missing
             run_name = run_root.name
             logger.warning(f"run_name.txt not found, using directory name: {run_name}")
 
@@ -249,7 +245,6 @@ def _prepare_run_and_steps(
                 f"Skipping future checkpoint archival. Error: {e}"
             )
 
-        # The resume counter and the archival are once-per-job effects.
         if is_main:
             counter_file = run_root / ".resume_counter"
             try:
@@ -264,12 +259,11 @@ def _prepare_run_and_steps(
     else:
         run_name = f"run-{job_stamp()}"
         run_root = ckp_root / run_name
-        wandb_run_name = run_name  # Same as directory name for new runs
+        wandb_run_name = run_name
         resume_step = None
 
     output_dir = str(run_root)
 
-    # Persist run metadata for future resumes (only for new runs)
     if is_main:
         run_root.mkdir(parents=True, exist_ok=True)
         if not (resume_config and resume_config.is_resume):
@@ -278,7 +272,6 @@ def _prepare_run_and_steps(
             except Exception:
                 pass
 
-    # Compute epochs and step intervals
     num_epochs = distill_config.num_epochs
     if (
         resume_config
@@ -597,11 +590,9 @@ def run_distillation(
     model = ProtX(model_config)
     model.to(device)
 
-    # Get distributed training info
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_main_process = is_global_main()
 
-    # Calculate effective world size
     if distill_config.multi_gpu:
         if distill_config.world_size == "auto":
             env_ws = os.environ.get("WORLD_SIZE")

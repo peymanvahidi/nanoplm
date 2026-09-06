@@ -1926,7 +1926,6 @@ def run_pure_pretraining(
         if not use_static_inp_size:
             raise ValueError("MoE requires use_static_inp_size=True")
 
-    # ---- Batch sizing ----
     effective_world_size = _resolve_world_size(pretrain_config)
 
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
@@ -1948,7 +1947,6 @@ def run_pure_pretraining(
         f"effective_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
 
-    # ---- Run naming / output dir ----
     run = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
