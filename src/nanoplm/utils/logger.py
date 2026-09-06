@@ -67,20 +67,15 @@ console_handler._nanoplm_role = "console"
 
 logger = logging.getLogger("nanoplm")
 logger.setLevel(logging.INFO)
-# Idempotent: avoid accumulating duplicate handlers across re-imports.
-# (logging.getLogger returns a process-global singleton; isinstance checks
-# cannot be used here because sys.modules.pop re-creates the class object,
-# making old instances appear as a different type to the new import.)
-# For the file handler, replace any existing one so each import starts fresh
-# (the lazy handler is uninitialized and will resolve its path on first emit).
+# logging.getLogger returns a process-global singleton, so re-imports would otherwise
+# accumulate handlers. isinstance cannot identify ours: sys.modules.pop re-creates the
+# class object, making handlers from an earlier import look like a different type.
 for _h in list(logger.handlers):
-    if getattr(_h, "_nanoplm_role", None) == "file":
+    if getattr(_h, "_nanoplm_role", None) in ("file", "console"):
         logger.removeHandler(_h)
-        break
+logger.addHandler(console_handler)
 if _SPEAKS:
     logger.addHandler(file_handler)
-if not any(getattr(h, "_nanoplm_role", None) == "console" for h in logger.handlers):
-    logger.addHandler(console_handler)
 logger.propagate = False
 
 
