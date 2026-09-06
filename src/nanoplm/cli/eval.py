@@ -280,11 +280,7 @@ def from_yaml(config: str):
             framework: [pgym]
             ...
     """
-    config_path = Path(config)
-    if config_path.is_absolute():
-        eval_yaml = config_path
-    else:
-        eval_yaml = Path.cwd() / config_path
+    eval_yaml = Path(config).resolve()
 
     raw = read_yaml(eval_yaml) or {}
     if not isinstance(raw, dict):

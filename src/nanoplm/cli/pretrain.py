@@ -1291,14 +1291,7 @@ def from_yaml(config: str, pure_torch: bool):
     If resume.is_resume is True, training will resume from the given
     checkpoint using the hyperparameters in the 'pretraining' block.
     """
-    config = Path(config)
-
-    if config.is_absolute():
-        cwd = config.parent
-        pretrain_yaml = config
-    else:
-        cwd = Path.cwd()
-        pretrain_yaml = cwd / config
+    pretrain_yaml = Path(config).resolve()
 
     raw = read_yaml(pretrain_yaml)
 
@@ -1313,6 +1306,12 @@ def from_yaml(config: str, pure_torch: bool):
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
+    # A relative dataset_dir or ckp_dir resolves against the process working
+    # directory, not against the config file. Resolving here is what makes the
+    # downstream "Validating pretraining dataset: ..." log name a path a reader
+    # can still find weeks later.
+    pretrain_config.dataset_dir = str(Path(pretrain_config.dataset_dir).resolve())
+    pretrain_config.ckp_dir = str(Path(pretrain_config.ckp_dir).resolve())
     _check_muon_available(pretrain_config.optimizer)
 
     model_config = _load_model_config(model_dict)
