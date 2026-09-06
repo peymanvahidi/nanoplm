@@ -489,6 +489,21 @@ def _format_run_exit(p: _RunProgress, wall_sec: float) -> str:
     ])
 
 
+def _should_log_step(global_step: int, logging_steps: int, start_step: int) -> bool:
+    """Log on the cadence, plus this run's very first step.
+
+    The first optimizer step pays for torch.compile, autotuning and NCCL warmup.
+    Folding it into the first cadence window would make that window's dt, tok/s
+    and h100_mfu measure setup rather than training, so it gets a line of its own
+    and the next window starts clean. It also confirms the loop turned over
+    without waiting a whole window, which on a short run is most of the run.
+
+    Every rank derives this from global_step alone, so ranks never disagree about
+    a step that gates a collective.
+    """
+    return global_step % logging_steps == 0 or global_step == start_step + 1
+
+
 def _install_sigterm_reporter(progress: _RunProgress, wall_sec: Callable[[], float]) -> None:
     """Leave one line in the log saying where a SLURM kill landed.
 
@@ -3520,7 +3535,7 @@ def run_pure_pretraining(
                     window_steps += 1
                     accum_loss.zero_()
 
-                    should_log = global_step % logging_steps == 0
+                    should_log = _should_log_step(global_step, logging_steps, start_step)
                     run_progress.step = global_step
                     run_progress.tokens = tokens_seen
                     vram_log = ""
