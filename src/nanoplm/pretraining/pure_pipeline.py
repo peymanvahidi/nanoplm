@@ -2553,11 +2553,11 @@ def run_pure_pretraining(
 
     if is_main and eval_steps % logging_steps != 0:
         logger.warning(
-            "eval_steps=%d is not a multiple of logging_steps=%d, so no step "
-            "will satisfy both cadences and the vram=/peak= fields will never "
-            "be logged (and the peak counter will never reset). Pick a "
-            "logging_steps that divides eval_steps.",
-            eval_steps, logging_steps,
+            "eval_steps=%d is not a multiple of logging_steps=%d. The vram=/peak= "
+            "fields need a step divisible by both, so they will appear every %d "
+            "steps instead of every %d, and the peak counter resets that rarely. "
+            "Pick a logging_steps that divides eval_steps.",
+            eval_steps, logging_steps, math.lcm(logging_steps, eval_steps), eval_steps,
         )
 
     if global_batch_warmup_steps > 0:

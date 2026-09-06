@@ -9,8 +9,9 @@ def test_logging_steps_default_is_25():
 def test_eval_steps_default_is_a_multiple_of_logging_steps_default():
     cfg = PretrainingConfig(dataset_dir="/tmp")
     assert cfg.eval_steps % cfg.logging_steps == 0, (
-        "eval_steps must be a multiple of logging_steps or the vram=/peak= "
-        "fields never get logged and the peak counter never resets"
+        "eval_steps must be a multiple of logging_steps, or the vram=/peak= "
+        "fields appear every lcm(logging_steps, eval_steps) steps instead of "
+        "every eval, because they need a step divisible by both"
     )
 
 
