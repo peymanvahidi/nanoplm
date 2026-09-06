@@ -34,6 +34,7 @@ from nanoplm.data.infra.validation import validate_pretrain_dataset
 from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline, DataManifest
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.cli.templates import load_template
+from nanoplm.cli._common import ConfigErrorGroup, unknown_keys_message
 from nanoplm.utils.logger import logger
 
 
@@ -153,7 +154,7 @@ def _check_pipeline_supported(pure_torch: bool) -> None:
         )
 
 
-@click.group(name="pretrain")
+@click.group(name="pretrain", cls=ConfigErrorGroup)
 @click.help_option("--help", "-h")
 def pretrain():
     """Group of commands for model pretraining."""
@@ -1507,9 +1508,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             kwargs[key] = value
 
     if extra:
-        raise ValueError(
-            f"Unexpected training configuration keys: {', '.join(sorted(extra))}"
-        )
+        raise ValueError(unknown_keys_message("training", extra, expected_keys))
 
     # Explicitly convert float-like fields if they are strings (handles scientific notation).
     float_fields = [
