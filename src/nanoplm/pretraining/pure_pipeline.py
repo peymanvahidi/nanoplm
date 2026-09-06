@@ -8,6 +8,7 @@ import gc
 import json
 import math
 import os
+import signal
 import yaml
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -35,8 +36,9 @@ os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
 import random
 import time
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -119,6 +121,15 @@ BATCH_COORD_TAIL_STEPS = 64
 # loop is at steady state, which is the throughput a wall-clock-matched
 # ablation is trying to compare.
 _WALLCLOCK_WARMUP_STEPS = 2
+
+# Seconds of a SLURM job's remaining time to leave unused when the wall-clock
+# deadline is defaulted from the environment. Measured on job 1684851 (16 ranks,
+# 4 nodes, 650M params): a checkpoint write costs 6.8-26.4s (median 22.8s over 21
+# writes), an eval 1.9-6.4s, and the median optimizer step is 200ms, so the tail
+# after a deadline trips is under a minute. 300s is 5x that, and _save_checkpoint
+# writes straight into the final checkpoint-N/ directory with no temp-and-rename,
+# so a SIGKILL mid-write would leave a partial directory that looks complete.
+_SLURM_DEADLINE_MARGIN_SEC = 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +487,104 @@ def _format_run_exit(p: _RunProgress, wall_sec: float) -> str:
         f"out     {p.run_root}{last}   wandb={p.wandb_run_id}",
         _RUN_RULE,
     ])
+
+
+def _install_sigterm_reporter(progress: _RunProgress, wall_sec: Callable[[], float]) -> None:
+    """Leave one line in the log saying where a SLURM kill landed.
+
+    SLURM sends SIGTERM before SIGKILL (KillWait is 30s on this cluster, and job
+    1684851's .err shows srun waiting 32s), and today a killed run's log just
+    stops mid-step-line with the only explanation in the .err file, which
+    --error routes elsewhere. A handler runs on the main thread between
+    bytecodes, so this does the least it can: mutate an already-built record,
+    emit one already-formatted line, then restore the default disposition and
+    re-raise so the process's exit status is unchanged. No collective and no
+    checkpoint write, both of which would hang or tear at this point.
+    """
+    owner_pid = os.getpid()
+
+    def _on_sigterm(signum, frame) -> None:
+        if os.getpid() == owner_pid:
+            progress.reason = "sigterm"
+            logger.warning("%s", _format_run_exit(progress, wall_sec()))
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:
+        logger.debug("SIGTERM reporter not installed: not running on the main thread.")
+
+
+class _StopPolicy(NamedTuple):
+    """When this run stops early, and which input decided it.
+
+    At most one of the two stops is ever set, because an explicit config value
+    always wins over the environment. ``limit_sec`` is a duration of steady-state
+    training, which is what a wall-clock-matched ablation wants and which
+    deliberately excludes compile and autotune. ``deadline_ts`` is an absolute
+    unix time, because SLURM's job end does not care what the run spent on setup.
+    ``slurm_deadline_ts`` records what SLURM said whether or not it won, so the
+    header can warn when a configured budget overruns the job.
+    """
+    limit_sec: Optional[float]
+    deadline_ts: Optional[float]
+    source: str
+    slurm_deadline_ts: Optional[float]
+
+    @property
+    def enabled(self) -> bool:
+        return self.limit_sec is not None or self.deadline_ts is not None
+
+
+def _slurm_deadline_ts(margin_sec: float, now: float) -> Optional[float]:
+    """Absolute unix time to stop by, from SLURM's projected job end.
+
+    SLURM_JOB_END_TIME is documented as an output environment variable holding a
+    unix timestamp, but nothing in this repo has ever recorded it, so an absent,
+    unparseable or already-passed value falls back to no deadline rather than
+    guessing at one.
+    """
+    raw = os.environ.get("SLURM_JOB_END_TIME")
+    if not raw:
+        return None
+    try:
+        stop_ts = float(raw) - margin_sec
+    except ValueError:
+        return None
+    return stop_ts if stop_ts > now else None
+
+
+def _resolve_stop_policy(hours: Optional[float], margin_sec: float, now: float) -> _StopPolicy:
+    slurm_ts = _slurm_deadline_ts(margin_sec, now)
+    if hours is not None and float(hours) > 0:
+        return _StopPolicy(float(hours) * 3600.0, None, "config", slurm_ts)
+    if slurm_ts is not None:
+        return _StopPolicy(None, slurm_ts, "slurm", slurm_ts)
+    return _StopPolicy(None, None, "unset", None)
+
+
+def _describe_stop_policy(p: _StopPolicy, now: float) -> str:
+    if p.source == "config":
+        text = (
+            f"max_wallclock_hours={p.limit_sec / 3600.0:.3g}h of steady-state "
+            f"training (source=config)"
+        )
+        if p.slurm_deadline_ts is not None and now + p.limit_sec > p.slurm_deadline_ts:
+            over = (now + p.limit_sec - p.slurm_deadline_ts) / 3600.0
+            text += f"  ** {over:.2f}h PAST the SLURM deadline, this run will be killed **"
+        return text
+    if p.source == "slurm":
+        left = (p.deadline_ts - now) / 3600.0
+        when = datetime.fromtimestamp(p.deadline_ts).strftime("%Y-%m-%dT%H:%M:%S")
+        return (
+            f"SLURM deadline {when}, {left:.2f}h from now "
+            f"(margin {_SLURM_DEADLINE_MARGIN_SEC / 60:.0f}m, source=SLURM_JOB_END_TIME)"
+        )
+    return (
+        "none; SLURM_JOB_END_TIME unset, unparseable or too close to use, so the "
+        "job's time limit will kill this run"
+    )
 
 
 def _format_vram_for_log(
@@ -2741,27 +2850,23 @@ def run_pure_pretraining(
     logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
 
     _run_t0 = time.perf_counter()
-    # Wall-clock stop. The clock is NOT started here: the first optimizer steps
+    # Wall-clock stop, from the config's duration or else SLURM's job end. A
+    # configured duration's clock is NOT started here: the first optimizer steps
     # pay for torch.compile, autotune and cuDNN/NCCL warmup, which would make the
     # budget measure setup instead of throughput and would differ between the
     # arms of an ablation. It is armed after _WALLCLOCK_WARMUP_STEPS steps of
     # THIS run (so a resume gets a fresh budget), and is only read at optimizer-
-    # step boundaries, where a checkpoint has a consistent resume position.
-    _wallclock_hours = getattr(pretrain_config, "max_wallclock_hours", None)
-    wallclock_limit_sec = (
-        float(_wallclock_hours) * 3600.0
-        if _wallclock_hours is not None and float(_wallclock_hours) > 0
-        else None
+    # step boundaries, where a checkpoint has a consistent resume position. A
+    # SLURM deadline is an absolute time, so it needs no arming and is read from
+    # the first log step on.
+    stop_policy = _resolve_stop_policy(
+        getattr(pretrain_config, "max_wallclock_hours", None),
+        _SLURM_DEADLINE_MARGIN_SEC,
+        time.time(),
     )
+    wallclock_limit_sec = stop_policy.limit_sec
+    wallclock_deadline_ts = stop_policy.deadline_ts
     wallclock_t0 = None
-    if wallclock_limit_sec is not None:
-        logger.info(
-            "Wall-clock stop enabled: training will checkpoint and exit after "
-            f"{_wallclock_hours}h ({wallclock_limit_sec:,.0f}s) of steady-state "
-            f"training even if total_steps={total_steps} has not been reached. "
-            f"The clock starts after step {start_step + _WALLCLOCK_WARMUP_STEPS}, "
-            f"so compile/warmup is excluded and total job time is longer."
-        )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
         f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, fp8={pretrain_config.fp8}"
@@ -2929,6 +3034,7 @@ def run_pure_pretraining(
         tokens=tokens_seen,
     )
     if is_main:
+        _install_sigterm_reporter(run_progress, lambda: time.perf_counter() - _run_t0)
         logger.info("%s", _format_run_header(_RunHeader(
             run_name=_run_manifest.get("run_name") or Path(output_dir).name,
             resume_step=_run_manifest.get("resume_step"),
@@ -2951,11 +3057,7 @@ def run_pure_pretraining(
             logging_steps=logging_steps,
             eval_steps=eval_steps,
             save_steps=save_steps,
-            stop=(
-                f"max_wallclock_hours={_wallclock_hours} (steady-state training time)"
-                if wallclock_limit_sec is not None
-                else "none configured; the job's SLURM time limit will kill this run"
-            ),
+            stop=_describe_stop_policy(stop_policy, time.time()),
         )))
 
     # Step-driven outer loop: repeat the DataLoader (one pass == one "epoch")
@@ -3620,8 +3722,15 @@ def run_pure_pretraining(
                                     wallclock_t0 - _run_t0,
                                     wallclock_limit_sec / 3600.0,
                                 )
-                    elif wallclock_limit_sec is not None and not at_terminal:
-                        hit_wallclock = (time.perf_counter() - wallclock_t0) >= wallclock_limit_sec
+                    elif stop_policy.enabled and should_log and not at_terminal:
+                        # Read only on log steps. That step already pays a device
+                        # sync and a collective, so the reduce below is free there,
+                        # and the stop overshoots the deadline by at most
+                        # logging_steps steps (5s at 25 steps of 200ms).
+                        if wallclock_limit_sec is not None:
+                            hit_wallclock = (time.perf_counter() - wallclock_t0) >= wallclock_limit_sec
+                        else:
+                            hit_wallclock = time.time() >= wallclock_deadline_ts
                         if distributed and dist.is_initialized():
                             _wc = torch.tensor(
                                 [1.0 if hit_wallclock else 0.0], device=device
@@ -3708,12 +3817,23 @@ def run_pure_pretraining(
                         wallclock_stop = True
                         wallclock_stop_ckpt = _checkpoint_dir_name(global_step, _phase)
                         if is_main:
+                            _budget = (
+                                f"limit of {wallclock_limit_sec / 3600.0:.3f}h"
+                                if wallclock_limit_sec is not None
+                                else "deadline"
+                            )
+                            _trained = (
+                                f"after {time.perf_counter() - wallclock_t0:.1f}s of training "
+                                if wallclock_t0 is not None
+                                else ""
+                            )
                             logger.info(
-                                "Wall-clock limit of %.3fh reached after %.1fs of training "
+                                "Wall-clock %s (source=%s) reached %s"
                                 "(%.1fs since process start) at step %d/%d (%.1f%% of the "
                                 "token budget); wrote %s, stopping.",
-                                wallclock_limit_sec / 3600.0,
-                                time.perf_counter() - wallclock_t0,
+                                _budget,
+                                stop_policy.source,
+                                _trained,
                                 time.perf_counter() - _run_t0,
                                 global_step, total_steps,
                                 100.0 * global_step / max(1, total_steps),
@@ -3818,6 +3938,6 @@ def run_pure_pretraining(
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
-    run_progress.reason = "wallclock" if wallclock_stop else "complete"
+    run_progress.reason = f"wallclock-{stop_policy.source}" if wallclock_stop else "complete"
     if is_main:
         logger.info("%s", _format_run_exit(run_progress, time.perf_counter() - _run_t0))
