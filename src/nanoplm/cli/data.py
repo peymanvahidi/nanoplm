@@ -17,6 +17,7 @@ from nanoplm.data.preparation.shuffler import FastaShuffler, ShufflingError
 from nanoplm.data.preparation.filterer import Filterer, FilterError
 from nanoplm.data.preparation.splitor import Splitor, SplitError
 from nanoplm.data.infra.manifest import PretrainManifest, DistillationManifest, write_manifest
+from nanoplm.data.infra.validation import ValidationError
 from nanoplm.data.sharding.distill_shard_writer import SaveKDDataset, shard_h5_file
 from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.data.sharding.pretrain_shard_writer import ShardWriter
@@ -26,17 +27,27 @@ from nanoplm.utils import create_dirs, logger
 from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml, is_flash_attention_available
 
 
+# Exceptions that mean "the pipeline hit an expected, describable problem"
+# (bad input, missing file, corrupt archive, native/hardware backend failure)
+# as opposed to a bug in our own dispatch code. Only these get collapsed to a
+# clean "Error: ..." line; anything else keeps its traceback.
+_DOMAIN_ERRORS = (
+    DownloadError, ExtractionError, ShufflingError, FilterError, SplitError, ValidationError,
+    OSError, EOFError, RuntimeError, ValueError,
+)
+
+
 class _GroupedDataCommand(click.Group):
     _GROUPS = [
         ("Main commands (most users only need these — they orchestrate the rest "
-         "of the pipeline through DVC under the hood):",
+         "of the pipeline through DVC under the hood)",
          ["get-yaml", "from-yaml"]),
         ("Pipeline stages (invoked by 'from-yaml' via DVC; can also be run "
-         "directly for debugging):",
+         "directly for debugging)",
          ["get-file", "extract", "check", "shuffle", "filter", "split"]),
-        ("Pretraining-specific:",
+        ("Pretraining-specific",
          ["pre-tokenize"]),
-        ("Knowledge-distillation-specific:",
+        ("Knowledge-distillation-specific",
          ["kd-embed", "kd-reshard"]),
     ]
 
@@ -60,6 +71,21 @@ class _GroupedDataCommand(click.Group):
         if leftover:
             with formatter.section("Other"):
                 formatter.write_dl([(n, c.get_short_help_str() or "") for n, c in leftover])
+
+    def invoke(self, ctx):
+        # Centralizes failure presentation for every 'data' subcommand: an
+        # expected domain error becomes one clean line instead of each
+        # subcommand carrying its own try/except (or none at all).
+        try:
+            return super().invoke(ctx)
+        except (click.exceptions.Exit, click.Abort):
+            # Both subclass RuntimeError (Click's own quirk), but are clean
+            # exits (--help, ctx.exit(), Ctrl-C prompts), not domain errors.
+            raise
+        except _DOMAIN_ERRORS as e:
+            if os.environ.get("NANOPLM_DEBUG"):
+                raise
+            raise click.ClickException(str(e)) from e
 
 
 @click.group(name="data", cls=_GroupedDataCommand)
@@ -145,10 +171,7 @@ def get_file(dataset, url, local_fasta, output, force):
         click.echo(f"Linked local file: {local_fasta} -> {output_path}")
         return
     chosen_url = DATASET_URLS[dataset] if dataset else url
-    try:
-        Downloader(url=chosen_url, output_path=output_path).download()
-    except DownloadError as e:
-        raise click.ClickException(f"Download failed: {e}")
+    Downloader(url=chosen_url, output_path=output_path).download()
     click.echo(f"Downloaded to: {output_path}")
 
 
@@ -196,24 +219,9 @@ def extract(input: str, output: str, force: bool):
             return
 
     # Extract dataset
-    try:
-        extractor = Extractor(input_path=input_path, output_path=output_path)
-        extractor.extract()
-        click.echo(f"Extraction completed successfully. Output: {output_path}")
-
-    except (ExtractionError, EOFError, OSError) as e:
-        if isinstance(e, EOFError):
-            raise click.ClickException(
-                "Extraction failed: Corrupted or incomplete gzip file"
-            )
-        elif isinstance(e, OSError):
-            raise click.ClickException(f"Extraction failed: {e}")
-        else:
-            raise click.ClickException(f"Extraction failed: {e}")
-    except Exception as e:
-        raise click.ClickException(
-            f"An unexpected error occurred during extraction: {e}"
-        )
+    extractor = Extractor(input_path=input_path, output_path=output_path)
+    extractor.extract()
+    click.echo(f"Extraction completed successfully. Output: {output_path}")
 
 
 @data.command("shuffle")
@@ -265,20 +273,13 @@ def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str)
 
     do_shuffle = shuffle_flag.lower() == "true"
 
-    try:
-        shuffler = FastaShuffler(
-            input_path=input_path,
-            output_path=output_path,
-            seed=seed,
-            do_shuffle=do_shuffle,
-        )
-        shuffler.shuffle()
-    except ShufflingError as e:
-        raise click.ClickException(f"FASTA shuffling failed: {e}")
-    except Exception as e:
-        raise click.ClickException(
-            f"An unexpected error occurred during shuffling: {e}"
-        )
+    shuffler = FastaShuffler(
+        input_path=input_path,
+        output_path=output_path,
+        seed=seed,
+        do_shuffle=do_shuffle,
+    )
+    shuffler.shuffle()
 
 
 @data.command("filter")
@@ -345,23 +346,16 @@ def filter(
     if output_path.is_dir():
         output_path = output_path / input_path.name.replace(".fasta", "_filtered.fasta")
 
-    try:
-        filterer = Filterer(
-            input_path=input_path,
-            output_path=output_path,
-            min_seq_len=min_seq_len,
-            max_seq_len=max_seq_len,
-            seqs_num=seqs_num,
-            exclude_ids=Path(exclude_ids) if exclude_ids else None,
-        )
-        filterer.filter()
-        click.echo("Filtering completed successfully")
-    except FilterError as e:
-        raise click.ClickException(f"Filtering failed: {e}")
-    except Exception as e:
-        raise click.ClickException(
-            f"An unexpected error occurred during filtering: {e}"
-        )
+    filterer = Filterer(
+        input_path=input_path,
+        output_path=output_path,
+        min_seq_len=min_seq_len,
+        max_seq_len=max_seq_len,
+        seqs_num=seqs_num,
+        exclude_ids=Path(exclude_ids) if exclude_ids else None,
+    )
+    filterer.filter()
+    click.echo("Filtering completed successfully")
 
 
 @data.command("check")
@@ -442,24 +436,16 @@ def split(
     train_file_path = output_path / "train.fasta"
     val_file_path = output_path / "val.fasta"
 
-    try:
-        splitor = Splitor(
-            input_file=input_path,
-            train_file=train_file_path,
-            val_file=val_file_path,
-            val_ratio=val_ratio,
-        )
-        train_size, val_size = splitor.split()
-        click.echo(
-            f"Splitting completed successfully.\nTrain file: {train_file_path}\nVal file: {val_file_path}\nTrain size: {train_size}, Val size: {val_size}"
-        )
-
-    except SplitError as e:
-        raise click.ClickException(f"Splitting failed: {e}")
-    except Exception as e:
-        raise click.ClickException(
-            f"An unexpected error occurred during splitting: {e}"
-        )
+    splitor = Splitor(
+        input_file=input_path,
+        train_file=train_file_path,
+        val_file=val_file_path,
+        val_ratio=val_ratio,
+    )
+    train_size, val_size = splitor.split()
+    click.echo(
+        f"Splitting completed successfully.\nTrain file: {train_file_path}\nVal file: {val_file_path}\nTrain size: {train_size}, Val size: {val_size}"
+    )
 
 
 @data.command("kd-embed")
