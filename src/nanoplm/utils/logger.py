@@ -23,10 +23,11 @@ class _LazyFileHandler(logging.FileHandler):
         self._initialized = False
 
     def _initialize(self) -> None:
-        log_dir = Path("output") / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.baseFilename = str(log_dir / f"nanoplm_{ts}_{os.getpid()}.log")
+        directory = Path(os.environ.get("NANOPLM_LOG_DIR") or "output/logs")
+        directory.mkdir(parents=True, exist_ok=True)
+        job = os.environ.get("SLURM_JOB_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = f"_rank{_RANK}" if _LOG_ALL_RANKS else ""
+        self.baseFilename = str(directory / f"nanoplm_{job}{suffix}.log")
         self.mode = "a"
         self.encoding = "utf-8"
         self.delay = False
@@ -49,11 +50,10 @@ class _RankFilter(logging.Filter):
         return record.levelno >= logging.WARNING
 
 
-# File handler (lazy)
 file_handler = _LazyFileHandler()
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-file_handler._nanoplm_role = "file"  # sentinel for idempotency check across re-imports
+file_handler._nanoplm_role = "file"
 
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
@@ -77,7 +77,8 @@ for _h in list(logger.handlers):
     if getattr(_h, "_nanoplm_role", None) == "file":
         logger.removeHandler(_h)
         break
-logger.addHandler(file_handler)
+if _SPEAKS:
+    logger.addHandler(file_handler)
 if not any(getattr(h, "_nanoplm_role", None) == "console" for h in logger.handlers):
     logger.addHandler(console_handler)
 logger.propagate = False
