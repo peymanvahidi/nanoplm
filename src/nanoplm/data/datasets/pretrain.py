@@ -84,7 +84,7 @@ class ShardedDataset(Dataset):
             actual_bytes = bin_path.stat().st_size
             if actual_bytes != expected_bytes:
                 raise ValidationError(
-                    f"Size mismatch in shard {bin_path.name}: "
+                    f"Size mismatch in shard {bin_path}: "
                     f"index declares {expected_bytes} bytes but .bin is {actual_bytes} bytes."
                 )
 
