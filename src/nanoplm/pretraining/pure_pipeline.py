@@ -10,7 +10,7 @@ import math
 import os
 import yaml
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 try:
     from dion import Muon
 except ImportError:
@@ -372,6 +372,87 @@ def _build_compiled_training_model(
             ddp_kwargs["output_device"] = local_rank
         compiled_model = DistributedDataParallel(compiled_model, **ddp_kwargs)
     return compiled_model
+
+
+_RUN_RULE = "=" * 80
+
+
+def _format_token_count(n: int) -> str:
+    if n >= 1e12:
+        return f"{n/1e12:.2f}T"
+    if n >= 1e9:
+        return f"{n/1e9:.1f}B"
+    if n >= 1e6:
+        return f"{n/1e6:.1f}M"
+    return f"{n:,}"
+
+
+@dataclass(frozen=True)
+class _RunHeader:
+    run_name: str
+    resume_step: Optional[int]
+    job_id: str
+    git_sha: str
+    wandb_run_id: str
+    run_root: str
+    dataset_dir: str
+    train_seqs: int
+    val_seqs: int
+    max_seq_len: int
+    world_size: int
+    nodes: int
+    dist_mode: str
+    global_batch_tokens: int
+    grad_accum: int
+    total_steps: int
+    total_tokens: int
+    warmup_steps: int
+    logging_steps: int
+    eval_steps: int
+    save_steps: int
+    stop: str
+
+
+def _format_run_header(h: _RunHeader) -> str:
+    resume = "" if h.resume_step is None else f" (resume from step {h.resume_step:,})"
+    return "\n".join([
+        _RUN_RULE,
+        f"run     {h.run_name}{resume}   job={h.job_id} code={h.git_sha} wandb={h.wandb_run_id}",
+        f"out     {h.run_root}",
+        f"data    {h.dataset_dir}   train_seqs={h.train_seqs:,} "
+        f"val_seqs={h.val_seqs:,} max_len={h.max_seq_len}",
+        f"scale   ranks={h.world_size} nodes={h.nodes} mode={h.dist_mode}   "
+        f"global_batch={h.global_batch_tokens:,} tok grad_accum={h.grad_accum}",
+        f"budget  total_steps={h.total_steps:,} = {_format_token_count(h.total_tokens)} tokens   "
+        f"warmup={h.warmup_steps:,}   "
+        f"log/eval/save={h.logging_steps}/{h.eval_steps}/{h.save_steps}",
+        f"stop    {h.stop}",
+        _RUN_RULE,
+    ])
+
+
+@dataclass
+class _RunProgress:
+    """Run state as already-computed values, so a signal handler can read it."""
+    total_steps: int
+    run_root: str
+    wandb_run_id: str
+    step: int = 0
+    tokens: int = 0
+    reason: str = "running"
+    last_checkpoint: str = ""
+
+
+def _format_run_exit(p: _RunProgress, wall_sec: float) -> str:
+    pct = 100.0 * p.step / max(1, p.total_steps)
+    last = "" if not p.last_checkpoint else f"   last={p.last_checkpoint}"
+    return "\n".join([
+        _RUN_RULE,
+        f"exit    reason={p.reason} step={p.step:,}/{p.total_steps:,} ({pct:.1f}%) "
+        f"wall={wall_sec / 3600.0:.2f}h tokens={_format_token_count(p.tokens)}",
+        f"out     {p.run_root}{last}   wandb={p.wandb_run_id}",
+        _RUN_RULE,
+    ])
 
 
 def _format_vram_for_log(
@@ -1877,13 +1958,6 @@ def run_pure_pretraining(
         if not d.exists():
             raise FileNotFoundError(f"Shard directory not found: {d}")
 
-    logger.info(f"Loaded config from manifest: {dataset_dir}")
-    logger.info(f"  train_shards: {train_shard_dir}")
-    logger.info(f"  val_shards: {val_shard_dir}")
-    logger.info(f"  max_length: {manifest.max_seq_len}")
-    logger.info(f"  train_sequences: {manifest.train_sequences}")
-    logger.info(f"  val_sequences: {manifest.val_sequences}")
-
     logger.info("Using ShardedDataset for pre-tokenized binary shards")
     train_ds = ShardedDataset(data_dir=str(train_shard_dir))
     val_ds = ShardedDataset(data_dir=str(val_shard_dir))
@@ -2573,6 +2647,7 @@ def run_pure_pretraining(
 
     # ---- W&B ----
     wandb_enabled = False
+    wandb_run_id = ""
     if is_main:
         try:
             wandb.init(
@@ -2587,7 +2662,9 @@ def run_pure_pretraining(
                 wandb.define_metric("time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("train/time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
+                wandb_run_id = wandb.run.id
                 upload_run_source_snapshot()
+                (Path(output_dir) / "wandb_run_id.txt").write_text(wandb.run.id, encoding="utf-8")
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
 
@@ -2662,12 +2739,6 @@ def run_pure_pretraining(
             f"The clock starts after step {start_step + _WALLCLOCK_WARMUP_STEPS}, "
             f"so compile/warmup is excluded and total job time is longer."
         )
-    logger.info(
-        f"Starting pure-torch training: total_steps={total_steps} (token-budget driven), "
-        f"warmup_steps={warmup_steps}, global_batch_warmup_steps={global_batch_warmup_steps}, "
-        f"grad_accum={inferred_grad_accum_steps}, "
-        f"achieved_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
-    )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
         f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, fp8={pretrain_config.fp8}"
@@ -2822,6 +2893,54 @@ def run_pure_pretraining(
             mbs_divisor,
         )
 
+    _manifest_path = Path(output_dir) / "run.json"
+    try:
+        _run_manifest = json.loads(_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _run_manifest = {}
+    # torchrun sets LOCAL_WORLD_SIZE; a malformed value must not kill the run
+    # over a cosmetic header line.
+    try:
+        _local_ws = int(os.environ.get("LOCAL_WORLD_SIZE") or 0) or effective_world_size
+    except ValueError:
+        _local_ws = effective_world_size
+    run_progress = _RunProgress(
+        total_steps=total_steps,
+        run_root=output_dir,
+        wandb_run_id=wandb_run_id or "off",
+        step=start_step,
+        tokens=tokens_seen,
+    )
+    if is_main:
+        logger.info("%s", _format_run_header(_RunHeader(
+            run_name=_run_manifest.get("run_name") or Path(output_dir).name,
+            resume_step=_run_manifest.get("resume_step"),
+            job_id=_run_manifest.get("slurm_job_id") or "-",
+            git_sha=_run_manifest.get("git_sha") or "-",
+            wandb_run_id=run_progress.wandb_run_id,
+            run_root=output_dir,
+            dataset_dir=_run_manifest.get("dataset_dir") or str(dataset_dir),
+            train_seqs=manifest.train_sequences,
+            val_seqs=manifest.val_sequences,
+            max_seq_len=manifest.max_seq_len,
+            world_size=effective_world_size,
+            nodes=max(1, effective_world_size // _local_ws),
+            dist_mode=distributed_mode if distributed else "single",
+            global_batch_tokens=achieved_global_batch_tokens,
+            grad_accum=inferred_grad_accum_steps,
+            total_steps=total_steps,
+            total_tokens=total_steps * achieved_global_batch_tokens,
+            warmup_steps=warmup_steps,
+            logging_steps=logging_steps,
+            eval_steps=eval_steps,
+            save_steps=save_steps,
+            stop=(
+                f"max_wallclock_hours={_wallclock_hours} (steady-state training time)"
+                if wallclock_limit_sec is not None
+                else "none configured; the job's SLURM time limit will kill this run"
+            ),
+        )))
+
     # Step-driven outer loop: repeat the DataLoader (one pass == one "epoch")
     # until the token-budget total_steps is reached. The horizon is driven by
     # global_step, not a fixed epoch count.
@@ -2846,6 +2965,7 @@ def run_pure_pretraining(
             phase=phase,
             **over,
         )
+        run_progress.last_checkpoint = _checkpoint_dir_name(global_step, phase)
 
     with profiler_ctx:
         while global_step < total_steps:
@@ -3282,11 +3402,13 @@ def run_pure_pretraining(
                     accum_loss.zero_()
 
                     should_log = global_step % logging_steps == 0
+                    run_progress.step = global_step
+                    run_progress.tokens = tokens_seen
                     vram_log = ""
                     tps = mfu = tok = raw_tok = 0.0
                     step_tok = step_raw_tok = 0.0
                     real_tps = real_tps_log = 0.0
-                    avg_step_ms = 0.0
+                    avg_step_ms = eta_hours = 0.0
                     if should_log:
                         if device.type == "cuda":
                             torch.cuda.synchronize()
@@ -3294,6 +3416,9 @@ def run_pure_pretraining(
                         window_dt = max(1e-9, t1 - log_window_t0)
                         log_window_t0 = t1
                         avg_step_ms = (window_dt * 1000.0) / max(1, window_steps)
+                        eta_hours = (
+                            (total_steps - global_step) * (window_dt / max(1, window_steps)) / 3600.0
+                        )
                         log_buf[0] = window_loss / max(1, window_steps)
                         log_buf[1] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
                         log_vals = log_buf.cpu()
@@ -3383,7 +3508,8 @@ def run_pure_pretraining(
                             f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
                             f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} real_tok/s={real_tps_log:,} "
                             f"real_tok/step={step_tok:,.0f} "
-                            f"dt={avg_step_ms:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
+                            f"dt={avg_step_ms:.2f}ms eta={eta_hours:.2f}h "
+                            f"wall={wall_elapsed:.1f}s waste={waste:.1f}% "
                             f"h100_mfu={mfu:.2%} {moe_str}{vram_log}"
                         )
                         payload = {
@@ -3668,7 +3794,6 @@ def run_pure_pretraining(
 
     if is_main and wandb_enabled and wandb.run is not None:
         try:
-            (Path(output_dir) / "wandb_run_id.txt").write_text(wandb.run.id, encoding="utf-8")
             wandb.finish()
         except Exception as exc:
             logger.warning(f"W&B finalize failed. Error: {exc}")
@@ -3676,4 +3801,6 @@ def run_pure_pretraining(
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
-    logger.info("Pure-torch pretraining complete.")
+    run_progress.reason = "wallclock" if wallclock_stop else "complete"
+    if is_main:
+        logger.info("%s", _format_run_exit(run_progress, time.perf_counter() - _run_t0))
