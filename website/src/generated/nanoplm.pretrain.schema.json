@@ -661,7 +661,7 @@
           "type": "string",
           "default": "run",
           "x-nanoplm-group": "Paths & run identity",
-          "description": "on-disk name: DDMMHHMM-<run_name>"
+          "description": "The run writes to <ckp_dir>/<run_name>-<stamp>. <stamp> is SLURM_JOB_ID, or TORCHELASTIC_RUN_ID when that is unset, or DDMMHHMM from the clock when neither is set."
         },
         "micro_batch_seqs": {
           "type": "integer",

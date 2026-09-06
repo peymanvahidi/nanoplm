@@ -161,7 +161,10 @@ pretraining:
   dataset_dir: "output/data/pretrain_data"
   ckp_dir: "output/pretraining_checkpoints"
   project_name: "nanoplm-pretraining"
-  run_name: "run"                       # on-disk name: DDMMHHMM-<run_name>
+  # The run writes to <ckp_dir>/<run_name>-<stamp>. <stamp> is SLURM_JOB_ID, or
+  # TORCHELASTIC_RUN_ID when that is unset, or DDMMHHMM from the clock when
+  # neither is set.
+  run_name: "run"
 
   # ── Batch (token-budget surface) ──────────────────────────────────────────
 
