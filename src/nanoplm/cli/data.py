@@ -22,7 +22,7 @@ from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.data.sharding.pretrain_shard_writer import ShardWriter
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
-from nanoplm.utils import create_dirs
+from nanoplm.utils import create_dirs, logger
 from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml, is_flash_attention_available
 
 
@@ -849,7 +849,7 @@ def from_yaml(
     regenerates dvc.yaml to match the current settings, then runs dvc repro.
     """
     import yaml as _yaml
-    from nanoplm.utils import set_log_level, logger
+    from nanoplm.utils import set_log_level
     from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
 
     set_log_level(log_level)
@@ -863,11 +863,11 @@ def from_yaml(
         raise click.ClickException(f"Failed to read {config_path}: {e}") from e
 
     data_params = params.get("data_params", {})
+    kind = _detect_kind(data_params, config_path.name)
 
     _reject_legacy_pipeline_mode(data_params)
     _validate_source_fields(params.get("data_dirs", {}))
-
-    kind = _detect_kind(data_params, config_path.name)
+    _validate_pipeline_fields(params.get("data_dirs", {}), data_params, kind, config_path)
 
     if fix:
         _flip_drop_invalid(config_path, True)
@@ -991,7 +991,6 @@ def _validate_source_fields(data_dirs: dict) -> None:
       In plain-.fasta mode it is optional; warn if it's set anyway.
     """
     from nanoplm.cli._dvc_yaml_gen import _source_is_compressed
-    from nanoplm.utils.logger import logger
 
     url = data_dirs.get("url") or None
     local_fasta = data_dirs.get("local_fasta") or None
@@ -1028,6 +1027,89 @@ def _validate_source_fields(data_dirs: dict) -> None:
             "data_dirs.compressed_fasta is unused when source is a plain .fasta file; "
             "it can be removed."
         )
+
+
+# data_dirs path keys that generate_dvc_yaml (_dvc_yaml_gen.py) substitutes as
+# ${data_dirs.X} into every pipeline stage, for both kinds. url/local_fasta,
+# extracted_fasta and compressed_fasta are covered by _validate_source_fields.
+_DATA_DIRS_REQUIRED = [
+    "validation_dir", "shuffled_fasta", "filtered_fasta", "splitted_fasta_dir", "output_dir",
+]
+
+
+def _int_at_least(lo: int):
+    return lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= lo
+
+
+def _int_in_range(lo: int, hi: int):
+    return lambda v: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+
+
+def _shard_count(v) -> bool:
+    """-1 (no sharding) or a positive shard size, matching kd-embed's own check."""
+    return isinstance(v, int) and not isinstance(v, bool) and (v == -1 or v > 0)
+
+
+def _unit_float(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 1
+
+
+def _optional_int(v) -> bool:
+    return v is None or (isinstance(v, int) and not isinstance(v, bool))
+
+
+def _is_bool(v) -> bool:
+    return isinstance(v, bool)
+
+
+def _nonempty_str(v) -> bool:
+    return isinstance(v, str) and bool(v)
+
+
+_PRETRAIN = frozenset({"pretrain"})
+_DISTILLATION = frozenset({"distillation"})
+_BOTH = _PRETRAIN | _DISTILLATION
+
+# data_params keys generate_dvc_yaml substitutes as ${data_params.X}, one row
+# per (field, kinds-that-need-it, validator). A field needed by both kinds with
+# a kind-specific rule (samples_per_shard) gets one row per kind.
+_DATA_PARAMS_TABLE = [
+    ("drop_invalid_sequences", _BOTH, _is_bool),
+    ("shuffle", _BOTH, _is_bool),
+    ("shuffle_seed", _BOTH, _optional_int),
+    ("min_seq_len", _BOTH, _int_at_least(0)),
+    ("max_seq_len", _BOTH, _int_at_least(0)),
+    ("seqs_num", _BOTH, _int_at_least(-1)),
+    ("val_ratio", _BOTH, _unit_float),
+    ("samples_per_shard", _PRETRAIN, _int_at_least(1)),
+    ("samples_per_shard", _DISTILLATION, _shard_count),
+    ("register_tokens", _PRETRAIN, _int_in_range(0, 2)),
+    ("teacher_model", _DISTILLATION, _nonempty_str),
+    ("embed_calc_batch_size", _DISTILLATION, _int_at_least(1)),
+]
+
+
+def _validate_pipeline_fields(data_dirs: dict, data_params: dict, kind: str, config_path: Path) -> None:
+    """Check every data_dirs/data_params key generate_dvc_yaml substitutes for *kind*.
+
+    A missing or mistyped key here reaches DVC only as an unresolved
+    ${...} template, so a typo would otherwise surface mid-`dvc repro`
+    instead of before it runs.
+    """
+    for key in _DATA_DIRS_REQUIRED:
+        if not data_dirs.get(key):
+            raise click.ClickException(f"{config_path.name}: data_dirs.{key} is required.")
+
+    for field, kinds, is_valid in _DATA_PARAMS_TABLE:
+        if kind not in kinds:
+            continue
+        if field not in data_params:
+            raise click.ClickException(f"{config_path.name}: data_params.{field} is required.")
+        value = data_params[field]
+        if not is_valid(value):
+            raise click.ClickException(
+                f"{config_path.name}: data_params.{field} has an invalid value: {value!r}"
+            )
 
 
 def _detect_kind(data_params: dict, filename: str) -> str:
