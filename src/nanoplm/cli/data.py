@@ -939,7 +939,7 @@ def from_yaml(
         )
 
     if not dry_run:
-        _print_summary(cwd, params, kind)
+        _print_summary(cwd, params, kind, config_path)
 
 
 # ---------------------------------------------------------------------------
@@ -1053,18 +1053,27 @@ def _flip_drop_invalid(config_path: Path, value: bool) -> None:
     config_path.write_text(new_text)
 
 
-def _print_summary(cwd: Path, params: dict, kind: str) -> None:
+def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path) -> None:
     """Print a human-readable summary using .data_manifest if present."""
     import yaml as _yaml
-    output_dir = Path(params["data_dirs"]["output_dir"])
+    data_dirs = params.get("data_dirs") or {}
+    output_dir_value = data_dirs.get("output_dir")
+    if not output_dir_value:
+        raise click.ClickException(
+            f"{config_path.name}: data_dirs.output_dir is missing; cannot locate the pipeline output."
+        )
+    output_dir = Path(output_dir_value)
     manifest_path = (cwd / output_dir / ".data_manifest") if not output_dir.is_absolute() \
         else (output_dir / ".data_manifest")
     if not manifest_path.exists():
         click.echo("Pipeline completed (no manifest found).")
         return
-    m = _yaml.safe_load(manifest_path.read_text())
+    try:
+        m = _yaml.safe_load(manifest_path.read_text()) or {}
+    except _yaml.YAMLError as e:
+        raise click.ClickException(f"{manifest_path}: failed to parse manifest: {e}")
     title = "Pretraining" if kind == "pretrain" else "Distillation"
-    src = params["data_dirs"].get("url") or params["data_dirs"].get("local_fasta")
+    src = data_dirs.get("url") or data_dirs.get("local_fasta")
     click.echo(
         f"\n{title} data pipeline complete.\n\n"
         f"  Source:          {src}\n"
