@@ -416,7 +416,7 @@ def check(input: str, output: str, drop_invalid: str):
     "-o",
     required=True,
     type=click.Path(exists=False),
-    help="Output file path / directory for the train split",
+    help="Output directory for the train/val split (train.fasta and val.fasta are written here)",
 )
 @click.option(
     "--val-ratio",
@@ -437,10 +437,10 @@ def split(
     create_dirs(output_path)
 
     if not output_path.is_dir():
-        click.echo("Output must be a directory")
-    else:
-        train_file_path = output_path / "train.fasta"
-        val_file_path = output_path / "val.fasta"
+        raise click.ClickException(f"--output must be a directory, got: {output_path}")
+
+    train_file_path = output_path / "train.fasta"
+    val_file_path = output_path / "val.fasta"
 
     try:
         splitor = Splitor(
