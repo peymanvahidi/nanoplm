@@ -1,7 +1,8 @@
 """Covers the eval provenance sidecar: where it lands, what it records about the
 checkpoint that produced a report, the ``<run>-ckpt<step>`` embedder name it
-derives when a config names none, and that writing it needs neither a GPU nor
-biotrainer.
+derives when a config names none, which frameworks a re-run reuses instead of
+recomputing, what the completion banner then claims, and that none of it needs
+either a GPU or biotrainer.
 """
 
 import importlib
@@ -9,6 +10,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +19,14 @@ from nanoplm.eval.checkpoint import (
     default_embedder_name,
     write_eval_provenance,
 )
+from nanoplm.eval.pipeline import (
+    FRAMEWORK_REPORT_NAMES,
+    _completion_message,
+    _reused_frameworks,
+)
+
+LONG_DASH = "\u2014"
+PGYM_REPORT_NAME = FRAMEWORK_REPORT_NAMES["pgym"]
 
 RUN_NAME = "loop-imp-abl-baseline-l20-1564242-3"
 RUN_SHA = "9f3c1a2b4d5e6f708192a3b4c5d6e7f809111213"
@@ -187,6 +197,111 @@ def test_explicit_embedder_name_wins_over_the_default(tmp_path):
     )
 
     assert provenance.embedder_name == "hand-picked"
+
+
+class _FakeResult:
+    def __init__(self, *, dev_mode: bool, task_filter_applied: bool = False):
+        self._dev_mode = dev_mode
+        self.task_filter_applied = task_filter_applied
+
+    def used_development_mode(self) -> bool:
+        return self._dev_mode
+
+
+class _FakeReport:
+    def __init__(self, results: dict):
+        self._results = results
+
+    def maybe_framework_result(self, framework_name: str):
+        return self._results.get(framework_name)
+
+
+def _fake_biotrainer(results: dict) -> dict:
+    return {
+        "AutoEvalReport": SimpleNamespace(
+            from_json_file=lambda path: _FakeReport(results)
+        )
+    }
+
+
+def test_completion_message_names_what_ran_when_nothing_was_reused():
+    message = _completion_message(
+        computed=["pgym", "pbc_zeroshot_contact"], reused=[], elapsed_s=1837.2
+    )
+
+    assert "AUTOEVAL COMPLETE" in message
+    assert "COMPUTED NOTHING" not in message
+    assert "pgym" in message
+    assert "pbc_zeroshot_contact" in message
+    assert LONG_DASH not in message
+
+
+def test_completion_message_names_both_lists_when_some_were_reused():
+    message = _completion_message(
+        computed=["pbc_zeroshot_contact"], reused=["pgym"], elapsed_s=1837.2
+    )
+
+    assert "AUTOEVAL COMPLETE" in message
+    assert "pbc_zeroshot_contact" in message
+    assert "pgym" in message
+
+
+def test_completion_message_refuses_to_claim_completion_when_all_were_reused():
+    message = _completion_message(
+        computed=[], reused=["pgym", "pbc_zeroshot_contact"], elapsed_s=0.04
+    )
+
+    assert "AUTOEVAL COMPUTED NOTHING" in message
+    assert "AUTOEVAL COMPLETE" not in message
+    assert "pgym" in message
+    assert "pbc_zeroshot_contact" in message
+    assert "output_dir" in message
+    assert LONG_DASH not in message
+
+
+@pytest.mark.parametrize(
+    "stored, development_mode, expected",
+    [
+        (_FakeResult(dev_mode=False), False, ["pgym"]),
+        (_FakeResult(dev_mode=False), True, ["pgym"]),
+        (_FakeResult(dev_mode=True), True, ["pgym"]),
+        (_FakeResult(dev_mode=True), False, []),
+        (_FakeResult(dev_mode=False, task_filter_applied=True), False, []),
+        (None, False, []),
+    ],
+    ids=[
+        "full_result_full_run_is_reused",
+        "full_result_dev_run_is_reused",
+        "dev_result_dev_run_is_reused",
+        "dev_result_full_run_is_recomputed",
+        "filtered_result_is_recomputed",
+        "absent_result_is_recomputed",
+    ],
+)
+def test_reuse_follows_biotrainers_rule(tmp_path, stored, development_mode, expected):
+    report_path = tmp_path / "autoeval_report_a-run-ckpt27500.json"
+    report_path.touch()
+    results = {} if stored is None else {PGYM_REPORT_NAME: stored}
+
+    reused = _reused_frameworks(
+        biotrainer=_fake_biotrainer(results),
+        report_path=report_path,
+        frameworks=["pgym"],
+        development_mode=development_mode,
+    )
+
+    assert reused == expected
+
+
+def test_nothing_is_reused_when_no_report_exists(tmp_path):
+    reused = _reused_frameworks(
+        biotrainer=_fake_biotrainer({PGYM_REPORT_NAME: _FakeResult(dev_mode=False)}),
+        report_path=tmp_path / "absent" / "autoeval_report_a-run-ckpt27500.json",
+        frameworks=["pgym"],
+        development_mode=False,
+    )
+
+    assert reused == []
 
 
 def test_eval_modules_import_without_biotrainer():
