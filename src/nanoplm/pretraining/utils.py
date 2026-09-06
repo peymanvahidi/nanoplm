@@ -6,13 +6,15 @@ import json
 import math
 import os
 import shutil
+import sys
 import torch
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
-from nanoplm.utils.common import is_global_main
+from nanoplm.data.infra.atomic import atomic_write_path
+from nanoplm.utils.common import git_sha, is_global_main
 from nanoplm.utils.logger import logger
 
 if TYPE_CHECKING:
@@ -252,6 +254,54 @@ def _read_checkpoint_epoch(checkpoint_dir: Union[str, Path]) -> int:
     )
 
 
+@dataclass(frozen=True)
+class RunIdentity:
+    """Which run this process belongs to, and the cadence it runs at.
+
+    ``wandb_run_name`` names a W&B session, which only the global main opens, so
+    on every other rank it is just ``run_name``. Likewise ``resume_step`` is the
+    step the global main archived forward from, and is None elsewhere.
+    """
+    run_name: str
+    run_root: Path
+    wandb_run_name: str
+    is_resume: bool
+    resume_step: Optional[int]
+    logging_steps: int
+    eval_steps: int
+    save_steps: int
+
+
+def _write_run_manifest(
+    run: RunIdentity,
+    pretrain_config: PretrainingConfig,
+    effective_world_size: int,
+) -> None:
+    """Record in the run root what a checkpoint cannot tell you afterwards.
+
+    A checkpoint's ``pretrain_config.yaml`` stores the config as written, so
+    ``world_size: auto`` stays "auto" and the directories stay CWD-relative, and
+    nothing anywhere records which commit ran or what was typed to start it.
+    """
+    manifest = {
+        "run_name": run.run_name,
+        "wandb_run_name": run.wandb_run_name,
+        "is_resume": run.is_resume,
+        "resume_step": run.resume_step,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "world_size": effective_world_size,
+        "git_sha": git_sha(Path(__file__).resolve().parent),
+        "argv": sys.argv,
+        "dataset_dir": str(Path(pretrain_config.dataset_dir).resolve()),
+        "ckp_dir": str(Path(pretrain_config.ckp_dir).resolve()),
+    }
+    try:
+        with atomic_write_path(run.run_root / "run.json") as tmp:
+            tmp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"Could not write run.json into {run.run_root}: {exc}")
+
+
 def _job_stamp() -> str:
     """Return a token identifying this job that every rank derives identically.
 
@@ -280,29 +330,30 @@ def _job_stamp() -> str:
 def prepare_run_and_steps(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig],
-) -> Tuple[str, str, str, int, int, int, Optional[int]]:
+    effective_world_size: int,
+) -> RunIdentity:
     """Prepare run naming/dirs and resolve the raw logging/eval/save intervals.
 
     The training horizon (total_steps) is not derived here: it comes from the
-    token budget and is computed by the caller via ``resolve_total_steps``. This
-    helper therefore returns the *raw* configured intervals (un-clamped); the
+    token budget and is computed by the caller via ``resolve_total_steps``. The
+    returned intervals are therefore the *raw* configured ones (un-clamped); the
     caller clamps them to the token-budget total_steps once the horizon is known.
 
     Args:
         pretrain_config: Pretraining configuration
         resume_config: Resume configuration (if resuming)
-
-    Returns a tuple: (run_name, wandb_run_name, output_dir,
-                      logging_steps, eval_steps, save_steps, resume_step).
+        effective_world_size: Ranks this job actually runs on, already resolved
+            from the config's ``world_size`` (which may be the string "auto")
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
     is_main = is_global_main()
+    is_resume = bool(resume_config and resume_config.is_resume)
 
     # Determine run directory and name. Every rank must land on the same name
     # without communicating, so the name is a pure function of the environment
     # and only the global main touches the filesystem.
-    if resume_config and resume_config.is_resume:
+    if is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
         run_name = checkpoint_path.parent.name  # Continue in same directory
         run_root = ckp_root / run_name
@@ -343,7 +394,6 @@ def prepare_run_and_steps(
         wandb_run_name = run_name  # Same as directory name for new runs
         resume_step = None
 
-    output_dir = str(run_root)
     if is_main:
         run_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -361,7 +411,7 @@ def prepare_run_and_steps(
     # On resume, preserve the original logging/eval/save intervals recorded in
     # the checkpoint's training_args.bin when available, so cadence is stable
     # across resume sessions.
-    if resume_config and resume_config.is_resume:
+    if is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
         if training_args_path.exists():
             try:
@@ -376,4 +426,16 @@ def prepare_run_and_steps(
                 # Fall back to the raw configured intervals computed above.
                 pass
 
-    return run_name, wandb_run_name, output_dir, logging_steps, eval_steps, save_steps, resume_step
+    run = RunIdentity(
+        run_name=run_name,
+        run_root=run_root,
+        wandb_run_name=wandb_run_name,
+        is_resume=is_resume,
+        resume_step=resume_step,
+        logging_steps=logging_steps,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+    )
+    if is_main:
+        _write_run_manifest(run, pretrain_config, effective_world_size)
+    return run

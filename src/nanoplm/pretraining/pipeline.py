@@ -223,18 +223,18 @@ def run_pretraining(
     global_batch_seqs = batch.global_batch_seqs
 
     # Prepare run info and step intervals in a single place
-    (
-        run_name,
-        wandb_run_name,
-        output_dir,
-        logging_steps,
-        eval_steps,
-        save_steps,
-        resume_step,
-    ) = prepare_run_and_steps(
+    run = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
+        effective_world_size=effective_world_size,
     )
+    run_name = run.run_name
+    wandb_run_name = run.wandb_run_name
+    output_dir = str(run.run_root)
+    logging_steps = run.logging_steps
+    eval_steps = run.eval_steps
+    save_steps = run.save_steps
+    resume_step = run.resume_step
 
     raise NotImplementedError(
         "The HF Trainer pretraining path has no training horizon to run to: "

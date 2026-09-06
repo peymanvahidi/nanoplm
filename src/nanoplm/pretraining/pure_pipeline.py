@@ -1949,18 +1949,16 @@ def run_pure_pretraining(
     )
 
     # ---- Run naming / output dir ----
-    (
-        _run_name,
-        wandb_run_name,
-        output_dir,
-        logging_steps,
-        eval_steps,
-        save_steps,
-        _resume_step,
-    ) = prepare_run_and_steps(
+    run = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
+        effective_world_size=effective_world_size,
     )
+    wandb_run_name = run.wandb_run_name
+    output_dir = str(run.run_root)
+    logging_steps = run.logging_steps
+    eval_steps = run.eval_steps
+    save_steps = run.save_steps
 
     num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
     pin_memory = device.type == "cuda"

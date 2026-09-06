@@ -8,7 +8,7 @@ import time
 import threading
 from IPython import get_ipython
 from pathlib import Path
-from typing import Dict, Any, Union, Callable, TypeVar
+from typing import Dict, Any, Optional, Union, Callable, TypeVar
 
 from nanoplm.utils.logger import logger
 
@@ -152,6 +152,32 @@ def resolve_world_size(multi_gpu: bool, world_size: Union[int, str]) -> int:
         env_ws = os.environ.get("WORLD_SIZE")
         return int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
     return int(world_size) if world_size else 1
+
+
+def git_sha(work_dir: Path) -> Optional[str]:
+    """
+    Resolve the HEAD commit of the Git checkout containing work_dir.
+
+    Args:
+        work_dir: Directory path to resolve from
+
+    Returns:
+        Optional[str]: The full commit hash, or None when work_dir is not in a
+        checkout and when git is unavailable.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(work_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
 
 
 def is_git_subdir(work_dir: Path) -> bool:
