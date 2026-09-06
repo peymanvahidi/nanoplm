@@ -27,14 +27,20 @@ from nanoplm.utils import create_dirs, logger
 from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml, is_flash_attention_available
 
 
-# Exceptions that mean "the pipeline hit an expected, describable problem"
-# (bad input, missing file, corrupt archive, native/hardware backend failure)
-# as opposed to a bug in our own dispatch code. Only these get collapsed to a
-# clean "Error: ..." line; anything else keeps its traceback.
-_DOMAIN_ERRORS = (
+# Our own pipeline exceptions. Their messages are written for a user, so they
+# stand alone as a one-line error.
+_PIPELINE_ERRORS = (
     DownloadError, ExtractionError, ShufflingError, FilterError, SplitError, ValidationError,
-    OSError, EOFError, RuntimeError, ValueError,
 )
+
+# Third-party and builtin types the stages raise for real input problems: h5py
+# and the native backends surface corrupt files as OSError and RuntimeError.
+# These same types are also what a bug in our own code raises, and we cannot
+# tell the two apart from the type alone, so their message carries a pointer to
+# the traceback rather than pretending the cause is understood.
+_OPAQUE_ERRORS = (OSError, EOFError, RuntimeError, ValueError)
+
+_DEBUG_HINT = "Re-run with NANOPLM_DEBUG=1 for the full traceback."
 
 
 class _GroupedDataCommand(click.Group):
@@ -82,10 +88,16 @@ class _GroupedDataCommand(click.Group):
             # Both subclass RuntimeError (Click's own quirk), but are clean
             # exits (--help, ctx.exit(), Ctrl-C prompts), not domain errors.
             raise
-        except _DOMAIN_ERRORS as e:
+        except _PIPELINE_ERRORS as e:
             if os.environ.get("NANOPLM_DEBUG"):
                 raise
             raise click.ClickException(str(e)) from e
+        except _OPAQUE_ERRORS as e:
+            if os.environ.get("NANOPLM_DEBUG"):
+                raise
+            raise click.ClickException(
+                f"{type(e).__name__}: {e}\n{_DEBUG_HINT}"
+            ) from e
 
 
 @click.group(name="data", cls=_GroupedDataCommand)
