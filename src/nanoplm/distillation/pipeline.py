@@ -222,8 +222,6 @@ def _prepare_run_and_steps(
 
     is_main = is_global_main()
 
-    # Every rank must land on the same name without communicating, so the name
-    # is a pure function of the environment and only the global main writes.
     if resume_config and resume_config.is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
         run_root = checkpoint_path.parent
@@ -269,8 +267,8 @@ def _prepare_run_and_steps(
         if not (resume_config and resume_config.is_resume):
             try:
                 (run_root / "run_name.txt").write_text(run_name, encoding="utf-8")
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.warning(f"Could not write run_name.txt into {run_root}: {exc}")
 
     num_epochs = distill_config.num_epochs
     if (

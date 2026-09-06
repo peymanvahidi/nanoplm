@@ -277,7 +277,9 @@ def _write_run_manifest(
     pretrain_config: PretrainingConfig,
     effective_world_size: int,
 ) -> None:
-    """A checkpoint's ``pretrain_config.yaml`` stores the config as written, so
+    """Record in the run root what a checkpoint cannot tell you afterwards.
+
+    A checkpoint's ``pretrain_config.yaml`` stores the config as written, so
     ``world_size: auto`` stays "auto" and the directories stay CWD-relative, and
     nothing anywhere records which commit ran or what was typed to start it.
     """
@@ -323,8 +325,6 @@ def prepare_run_and_steps(
     is_main = is_global_main()
     is_resume = bool(resume_config and resume_config.is_resume)
 
-    # Every rank must land on the same name without communicating, so the name
-    # is a pure function of the environment and only the global main writes.
     if is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
         run_name = checkpoint_path.parent.name
@@ -368,8 +368,8 @@ def prepare_run_and_steps(
         run_root.mkdir(parents=True, exist_ok=True)
         try:
             (run_root / "run_name.txt").write_text(run_name, encoding="utf-8")
-        except Exception:
-            pass
+        except OSError as exc:
+            logger.warning(f"Could not write run_name.txt into {run_root}: {exc}")
 
     logging_steps = max(1, pretrain_config.logging_steps)
     eval_steps = max(1, pretrain_config.eval_steps)

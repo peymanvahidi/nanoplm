@@ -3646,12 +3646,11 @@ def run_pure_pretraining(
     # misrepresent it (and clobber a real final from an earlier run in the same
     # output dir). The in-loop save at the deadline is the run's output.
     if wallclock_stop:
-        if is_main:
-            logger.info(
-                "Stopped on the wall-clock budget at step %d/%d; skipping the terminal "
-                "'%s' checkpoint. Latest state is %s.",
-                global_step, total_steps, _terminal_phase, wallclock_stop_ckpt,
-            )
+        logger.info(
+            "Stopped on the wall-clock budget at step %d/%d; skipping the terminal "
+            "'%s' checkpoint. Latest state is %s.",
+            global_step, total_steps, _terminal_phase, wallclock_stop_ckpt,
+        )
     else:
         _save(_terminal_phase)
 
@@ -3668,5 +3667,4 @@ def run_pure_pretraining(
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
-    if is_main:
-        logger.info("Pure-torch pretraining complete.")
+    logger.info("Pure-torch pretraining complete.")

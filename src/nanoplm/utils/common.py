@@ -188,22 +188,30 @@ def git_sha(work_dir: Path) -> Optional[str]:
         work_dir: Directory path to resolve from
 
     Returns:
-        Optional[str]: The full commit hash, or None when work_dir is not in a
-        checkout and when git is unavailable.
+        Optional[str]: The full commit hash, suffixed "-dirty" when the tree
+        has uncommitted changes. None when work_dir is not in a checkout and
+        when git is unavailable.
     """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(work_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-    except (FileNotFoundError, NotADirectoryError, OSError):
+    def _git(*args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=str(work_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    sha = _git("rev-parse", "HEAD")
+    if not sha:
         return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip() or None
+    # An uncommitted edit means the sha does not describe the code that ran, and
+    # a provenance record that can silently lie is worse than none.
+    dirty = _git("status", "--porcelain")
+    return f"{sha}-dirty" if dirty else sha
 
 
 def is_git_subdir(work_dir: Path) -> bool:
