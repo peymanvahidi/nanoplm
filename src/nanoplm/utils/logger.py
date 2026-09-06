@@ -79,11 +79,6 @@ if _SPEAKS:
 logger.propagate = False
 
 
-def log_stage(stage_name: str) -> None:
-    separator = "=" * 20
-    logger.info(f"{separator}STAGE: {stage_name}{separator}")
-
-
 def set_log_level(level: str) -> None:
     """Set the logger level by string ('debug'|'info'|'warning'|'error')."""
     numeric = getattr(logging, level.upper(), None)
