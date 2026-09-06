@@ -7,6 +7,7 @@ import click
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 from nanoplm.config.datasets import DATASET_URLS
@@ -25,6 +26,13 @@ from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertToken
 
 from nanoplm.utils import create_dirs, logger
 from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml, is_flash_attention_available
+
+
+# dvc is a declared dependency, so the interpreter running nanoplm always has
+# it importable. A bare "dvc" on PATH does not: the documented cluster launch
+# is "$REPO_ROOT/.venv/bin/nanoplm" with the venv unactivated, where PATH has
+# no dvc at all.
+_DVC = [sys.executable, "-m", "dvc"]
 
 
 # Our own pipeline exceptions. Their messages are written for a user, so they
@@ -892,7 +900,7 @@ def from_yaml(
                 f"DVC is not initialized in {cwd}. Run 'dvc init' first or omit --no-auto-init."
             )
         try:
-            init_cmd = ["dvc", "init", "-q"]
+            init_cmd = _DVC + ["init", "-q"]
             if not inside_git_repo(cwd):
                 init_cmd.append("--no-scm")
             elif is_git_subdir(cwd):
@@ -901,7 +909,7 @@ def from_yaml(
             click.echo(f"Initialized DVC repository in: {cwd}")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             raise click.ClickException(
-                f"Failed to initialize DVC in {cwd}. Ensure DVC is installed. Details: {e}"
+                f"Failed to initialize DVC in {cwd}. Details: {e}"
             )
 
     # Build environment for repro
@@ -915,9 +923,9 @@ def from_yaml(
 
     # Build repro command
     if dry_run:
-        cmd: list[str] = ["dvc", "repro", "--dry", "--allow-missing"]
+        cmd: list[str] = _DVC + ["repro", "--dry", "--allow-missing"]
     else:
-        cmd = ["dvc", "repro"]
+        cmd = _DVC + ["repro"]
     if verbose:
         cmd.append("-v")
     if force_repro:
