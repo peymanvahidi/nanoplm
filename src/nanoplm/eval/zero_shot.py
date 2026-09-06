@@ -14,9 +14,9 @@ from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertToken
 from nanoplm.utils.logger import logger
 
 # Upper bound on tokens per batched forward pass. The effective batch is
-# ``min(zero_shot_batch_size, _TOKEN_BUDGET // window_len)``, so long windows
+# ``min(zero_shot_batch_size, TOKEN_BUDGET // window_len)``, so long windows
 # shrink the batch instead of running out of memory.
-_TOKEN_BUDGET = 65_536
+TOKEN_BUDGET = 65_536
 
 
 def special_token_offsets(tokenizer: ProtModernBertTokenizer) -> Tuple[int, int]:
@@ -140,7 +140,7 @@ class NanoPLMBioEngineer:
                 self._batch_size = max(1, int(batch_size))
 
             def _chunk_size(self, row_len: int) -> int:
-                return max(1, min(self._batch_size, _TOKEN_BUDGET // max(1, row_len)))
+                return max(1, min(self._batch_size, TOKEN_BUDGET // max(1, row_len)))
 
             def _get_masked_log_probabilities(self, sequence: str) -> torch.Tensor:
                 """Batched masked-marginals.

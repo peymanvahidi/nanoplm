@@ -10,11 +10,11 @@ from nanoplm.eval.config import EvalConfig
 from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
 
-_VALID_FRAMEWORKS = {"pgym", "pbc_zeroshot_contact"}
+_VALID_FRAMEWORKS = {"pgym", "pbc_zeroshot_contact", "pbc_supervised"}
 _VALID_ZERO_SHOT_METHODS = {"masked_marginals", "wt_marginals", "pseudoperplexity"}
 
-# Supervised frameworks dropped in the biotrainer 2.0.0 migration.
-_REMOVED_FRAMEWORKS = {"pbc", "pbc_supervised", "flip"}
+# Frameworks dropped in the biotrainer 2.0.0 migration.
+_REMOVED_FRAMEWORKS = {"pbc", "flip"}
 
 
 def _check_biotrainer_available() -> None:
@@ -36,7 +36,7 @@ def _validate_frameworks(frameworks: List[str]) -> None:
         if fw in _REMOVED_FRAMEWORKS:
             raise click.ClickException(
                 f"Framework {fw!r} is no longer supported. nanoplm eval moved to "
-                "biotrainer 2.0.0 and now covers the zero-shot frameworks only: "
+                "biotrainer 2.0.0 and now covers: "
                 f"{sorted(_VALID_FRAMEWORKS)}."
             )
         if fw not in _VALID_FRAMEWORKS:
@@ -147,8 +147,8 @@ def eval():
     multiple=True,
     default=("pgym",),
     help=(
-        "Zero-shot benchmark framework(s) to evaluate on. Pass multiple times to "
-        "run several, e.g. --framework pgym --framework pbc_zeroshot_contact."
+        "Benchmark framework(s) to evaluate on. Pass multiple times to run "
+        "several, e.g. --framework pgym --framework pbc_supervised."
     ),
     show_default=True,
 )

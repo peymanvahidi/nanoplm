@@ -12,9 +12,10 @@ class EvalConfig:
     checkpoint_dir: Union[str, Path]
 
     # Benchmark framework(s) to evaluate on. One or more of: pgym,
-    # pbc_zeroshot_contact. Both are zero-shot: 'pgym' scores ProteinGym DMS
-    # variants, 'pbc_zeroshot_contact' predicts contact maps from the
-    # categorical Jacobian.
+    # pbc_zeroshot_contact, pbc_supervised. 'pgym' scores ProteinGym DMS
+    # variants zero-shot, 'pbc_zeroshot_contact' predicts contact maps from the
+    # categorical Jacobian, 'pbc_supervised' trains task heads on the frozen
+    # encoder's embeddings.
     framework: List[str] = field(default_factory=lambda: ["pgym"])
 
     # Directory where autoeval results and per-framework outputs are written.
@@ -29,12 +30,14 @@ class EvalConfig:
 
     # Zero-shot scoring method for the 'pgym' framework. One of:
     # masked_marginals, wt_marginals, pseudoperplexity. Ignored by
-    # pbc_zeroshot_contact, which always uses the categorical Jacobian.
+    # pbc_zeroshot_contact, which always uses the categorical Jacobian, and by
+    # pbc_supervised, which trains on embeddings.
     zero_shot_method: str = "masked_marginals"
 
     # Sequences scored per forward pass. Masked-marginals masks one position at
     # a time, so this batches that many masked positions into a single forward
-    # (biotrainer scores them one-by-one); it also sizes the Jacobian batches.
+    # (biotrainer scores them one-by-one); it also sizes the Jacobian batches
+    # and the pbc_supervised embedding batches.
     zero_shot_batch_size: int = 60
 
     # Evaluate on subsampled task sets instead of the full benchmark. Much

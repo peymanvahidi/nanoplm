@@ -14,6 +14,7 @@ from nanoplm.eval.checkpoint import (
     resolve_checkpoint_dir,
 )
 from nanoplm.eval.config import EvalConfig
+from nanoplm.eval.embedder import NanoPLMCustomEmbedder
 from nanoplm.eval.zero_shot import NanoPLMBioEngineer
 from nanoplm.utils.logger import logger
 
@@ -21,11 +22,12 @@ from nanoplm.utils.logger import logger
 FRAMEWORK_REPORT_NAMES = {
     "pgym": "PGYM",
     "pbc_zeroshot_contact": "PBC_ZEROSHOT_CONTACT",
+    "pbc_supervised": "PBC_SUPERVISED",
 }
 
 # Frameworks that existed before the biotrainer 2.0.0 migration. Kept only to
 # produce an actionable error instead of a bare "unsupported framework".
-REMOVED_FRAMEWORKS = {"pbc", "pbc_supervised", "flip"}
+REMOVED_FRAMEWORKS = {"pbc", "flip"}
 
 
 def _load_biotrainer_symbols() -> dict[str, Any]:
@@ -37,6 +39,7 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
             CustomBioEngineerModelWrapper,
         )
         from biotrainer.bioengineer.bioengineer_utils import get_optimal_window
+        from biotrainer.embedding import CustomEmbedder
         from biotrainer_core.data_classes import ZeroShotMethod
         from biotrainer_core.data_classes.autoeval import AutoEvalReport
         from biotrainer_core.utils.constants import STANDARD_AAS
@@ -53,6 +56,7 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
         "BioEngineer": BioEngineer,
         "CustomBioEngineerModel": CustomBioEngineerModel,
         "CustomBioEngineerModelWrapper": CustomBioEngineerModelWrapper,
+        "CustomEmbedder": CustomEmbedder,
         "get_optimal_window": get_optimal_window,
         "ZeroShotMethod": ZeroShotMethod,
         "STANDARD_AAS": STANDARD_AAS,
@@ -127,11 +131,13 @@ def _warn_about_cached_frameworks(
 def run_eval(eval_config: EvalConfig) -> None:
     """Run biotrainer autoeval on a pure-torch nanoPLM checkpoint.
 
-    Supports one or more zero-shot frameworks per invocation: 'pgym' scores
-    ProteinGym DMS variants, 'pbc_zeroshot_contact' predicts contact maps from
-    the categorical Jacobian. Both run against the same GPU-resident model
-    through a single ``BioEngineer``, and accumulate into one ``AutoEvalReport``
-    at ``<output_dir>/autoeval_report_<embedder>.json``. Per-framework artefacts
+    Supports one or more frameworks per invocation: 'pgym' scores ProteinGym DMS
+    variants zero-shot, 'pbc_zeroshot_contact' predicts contact maps from the
+    categorical Jacobian, and 'pbc_supervised' trains task heads on the frozen
+    encoder's embeddings. The zero-shot pair runs through a ``BioEngineer`` and
+    the supervised one through a ``CustomEmbedder``, both wrapping the same
+    GPU-resident model, and all accumulate into one ``AutoEvalReport`` at
+    ``<output_dir>/autoeval_report_<embedder>.json``. Per-framework artefacts
     land under ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``.
     """
     _disable_h100_triton_srelu()
@@ -142,8 +148,8 @@ def run_eval(eval_config: EvalConfig) -> None:
     removed = [f for f in frameworks if f in REMOVED_FRAMEWORKS]
     if removed:
         raise ValueError(
-            f"Framework(s) {removed} are no longer supported. nanoplm eval moved to "
-            "biotrainer 2.0.0 and now covers the zero-shot frameworks only: "
+            f"Framework(s) {removed} are no longer supported. nanoplm eval moved "
+            "to biotrainer 2.0.0 and now covers: "
             f"{sorted(FRAMEWORK_REPORT_NAMES)}."
         )
     unknown = [f for f in frameworks if f not in FRAMEWORK_REPORT_NAMES]
@@ -199,6 +205,14 @@ def run_eval(eval_config: EvalConfig) -> None:
         batch_size=eval_config.zero_shot_batch_size,
         loop_count=eval_config.loop_count,
     )
+    custom_embedder = NanoPLMCustomEmbedder.build(
+        model,
+        tokenizer,
+        device,
+        biotrainer,
+        batch_size=eval_config.zero_shot_batch_size,
+        loop_count=eval_config.loop_count,
+    )
 
     autoeval = biotrainer["AutoEval"](
         embedder_name=embedder_name,
@@ -206,6 +220,7 @@ def run_eval(eval_config: EvalConfig) -> None:
         force_download=eval_config.force_download,
         custom_storage_path=eval_config.dataset_dir,
         custom_bioengineer=bio_engineer,
+        custom_embedder=custom_embedder,
         development_mode=eval_config.development_mode,
     )
 
@@ -223,6 +238,13 @@ def run_eval(eval_config: EvalConfig) -> None:
                 f"batch_size={eval_config.zero_shot_batch_size}"
             )
             autoeval.pbc_zeroshot_contact()
+        elif framework == "pbc_supervised":
+            logger.info(
+                "Adding PBC supervised: task heads trained on frozen "
+                f"per-residue/per-sequence embeddings, batch_size="
+                f"{eval_config.zero_shot_batch_size}"
+            )
+            autoeval.pbc_supervised()
 
     logger.info(
         f"Starting autoeval: frameworks={frameworks}, "
