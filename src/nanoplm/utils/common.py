@@ -6,6 +6,7 @@ import sys
 import subprocess
 import time
 import threading
+from datetime import datetime
 from IPython import get_ipython
 from pathlib import Path
 from typing import Dict, Any, Optional, Union, Callable, TypeVar
@@ -142,6 +143,31 @@ def is_global_main() -> bool:
     where ``dist.get_rank()`` is not yet available.
     """
     return int(os.environ.get("RANK", 0)) == 0
+
+
+def job_stamp() -> str:
+    """Return a token identifying this job that every rank derives identically.
+
+    Run directories are named before ``dist.init_process_group``, so ranks
+    cannot settle on one name by broadcasting it. Each must compute the same
+    name from the environment alone, which rules out both a wall-clock reading
+    and probing the filesystem for an unused name.
+    """
+    for key in ("SLURM_JOB_ID", "TORCHELASTIC_RUN_ID"):
+        stamp = os.environ.get(key)
+        if stamp:
+            return stamp
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        raise RuntimeError(
+            f"WORLD_SIZE={world_size} but neither SLURM_JOB_ID nor "
+            "TORCHELASTIC_RUN_ID is set, so there is no job id the ranks can "
+            "agree on. Each would stamp the run directory with its own clock "
+            "reading and scatter one job across several directories. Launch "
+            "under srun or torchrun, or export a shared TORCHELASTIC_RUN_ID."
+        )
+    return datetime.now().strftime("%d%m%H%M")
 
 
 def resolve_world_size(multi_gpu: bool, world_size: Union[int, str]) -> int:

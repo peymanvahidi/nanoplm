@@ -41,7 +41,8 @@ from nanoplm.data.datasets.distill import (
 from nanoplm.data.infra.manifest import get_dataset_paths
 from nanoplm.data.infra.validation import validate_distillation_dataset, ValidationError
 from nanoplm.pretraining.utils import _read_checkpoint_epoch
-from nanoplm.utils import get_device, logger, create_dirs
+from nanoplm.utils import get_device, logger
+from nanoplm.utils.common import is_global_main, job_stamp
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 
 
@@ -219,7 +220,11 @@ def _prepare_run_and_steps(
     """
     ckp_root = Path(distill_config.ckp_dir)
 
-    # Determine run directory and name
+    is_main = is_global_main()
+
+    # Determine run directory and name. Every rank must land on the same name
+    # without communicating, so the name is a pure function of the environment
+    # and only the global main touches the filesystem.
     if resume_config and resume_config.is_resume:
         # Resume in SAME directory
         checkpoint_path = Path(resume_config.checkpoint_dir)
@@ -234,57 +239,44 @@ def _prepare_run_and_steps(
             run_name = run_root.name
             logger.warning(f"run_name.txt not found, using directory name: {run_name}")
 
-        # Track resume counter for W&B run naming
-        counter_file = run_root / ".resume_counter"
-        if counter_file.exists():
-            try:
-                resume_counter = int(counter_file.read_text().strip()) + 1
-            except (ValueError, FileNotFoundError):
-                resume_counter = 1
-        else:
-            resume_counter = 1
-
-        # Save updated counter
-        counter_file.write_text(str(resume_counter), encoding="utf-8")
-
-        # Create W&B run name with counter
-        wandb_run_name = f"{run_name}-re{resume_counter}"
-        logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
-
-        # Archive any future checkpoints to prevent conflicts
+        wandb_run_name = run_name
         resume_step = None
         try:
             resume_step = int(checkpoint_path.name.split("-")[1])
-            _archive_future_checkpoints(run_root, resume_step)
         except (IndexError, ValueError) as e:
             logger.warning(
                 f"Could not extract step number from checkpoint path: {checkpoint_path.name}. "
                 f"Skipping future checkpoint archival. Error: {e}"
             )
+
+        # The resume counter and the archival are once-per-job effects.
+        if is_main:
+            counter_file = run_root / ".resume_counter"
+            try:
+                resume_counter = int(counter_file.read_text().strip()) + 1
+            except (OSError, ValueError):
+                resume_counter = 1
+            counter_file.write_text(str(resume_counter), encoding="utf-8")
+            wandb_run_name = f"{run_name}-re{resume_counter}"
+            logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
+            if resume_step is not None:
+                _archive_future_checkpoints(run_root, resume_step)
     else:
-        # New run: create unique directory with timestamp
-        base_stamp = datetime.now().strftime("%d%m%H%M")
-        base_name = f"run-{base_stamp}"
-        candidate = base_name
-        if ckp_root.exists():
-            suffix = 2
-            while (ckp_root / candidate).exists():
-                candidate = f"{base_name}-{suffix}"
-                suffix += 1
-        run_name = candidate
+        run_name = f"run-{job_stamp()}"
         run_root = ckp_root / run_name
         wandb_run_name = run_name  # Same as directory name for new runs
         resume_step = None
 
-    create_dirs(str(run_root))
     output_dir = str(run_root)
 
     # Persist run metadata for future resumes (only for new runs)
-    if not (resume_config and resume_config.is_resume):
-        try:
-            (Path(output_dir) / "run_name.txt").write_text(run_name, encoding="utf-8")
-        except Exception:
-            pass
+    if is_main:
+        run_root.mkdir(parents=True, exist_ok=True)
+        if not (resume_config and resume_config.is_resume):
+            try:
+                (run_root / "run_name.txt").write_text(run_name, encoding="utf-8")
+            except Exception:
+                pass
 
     # Compute epochs and step intervals
     num_epochs = distill_config.num_epochs
@@ -607,8 +599,7 @@ def run_distillation(
 
     # Get distributed training info
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    is_main_process = local_rank == 0
+    is_main_process = is_global_main()
 
     # Calculate effective world size
     if distill_config.multi_gpu:

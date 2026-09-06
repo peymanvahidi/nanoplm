@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 from nanoplm.data.infra.atomic import atomic_write_path
-from nanoplm.utils.common import git_sha, is_global_main
+from nanoplm.utils.common import git_sha, is_global_main, job_stamp
 from nanoplm.utils.logger import logger
 
 if TYPE_CHECKING:
@@ -302,31 +302,6 @@ def _write_run_manifest(
         logger.warning(f"Could not write run.json into {run.run_root}: {exc}")
 
 
-def _job_stamp() -> str:
-    """Return a token identifying this job that every rank derives identically.
-
-    ``prepare_run_and_steps`` runs before ``dist.init_process_group``, so ranks
-    cannot settle on one run directory by broadcasting a name. Each must compute
-    the same name from the environment alone, which rules out both a wall-clock
-    reading and probing the filesystem for an unused name.
-    """
-    for key in ("SLURM_JOB_ID", "TORCHELASTIC_RUN_ID"):
-        stamp = os.environ.get(key)
-        if stamp:
-            return stamp
-
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    if world_size > 1:
-        raise RuntimeError(
-            f"WORLD_SIZE={world_size} but neither SLURM_JOB_ID nor "
-            "TORCHELASTIC_RUN_ID is set, so there is no job id the ranks can "
-            "agree on. Each would stamp the run directory with its own clock "
-            "reading and scatter one job across several directories. Launch "
-            "under srun or torchrun, or export a shared TORCHELASTIC_RUN_ID."
-        )
-    return datetime.now().strftime("%d%m%H%M")
-
-
 def prepare_run_and_steps(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig],
@@ -389,7 +364,7 @@ def prepare_run_and_steps(
                     f"Skipping future checkpoint archival."
                 )
     else:
-        run_name = f"{pretrain_config.run_name}-{_job_stamp()}"
+        run_name = f"{pretrain_config.run_name}-{job_stamp()}"
         run_root = ckp_root / run_name
         wandb_run_name = run_name  # Same as directory name for new runs
         resume_step = None
