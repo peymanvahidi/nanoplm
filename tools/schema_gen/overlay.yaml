@@ -219,6 +219,18 @@ x-extra-fields:
           time is longer than the budget; it also restarts on resume rather than
           accumulating across resumes. Unset (the default) runs the full token
           budget.
+      peak_tflops:
+        type: number
+        default: null
+        advanced: true
+        group: Logging, eval, checkpoints
+        description: >-
+          Device peak BF16 tensor-core throughput in TFLOP/s, used as the
+          denominator of the reported MFU. Unset (the default) uses the H100 SXM
+          figure of 989.4, which is wrong for any other accelerator: on a GH200
+          booster capped at 630 it understates MFU by 1.57x. Set it per cluster
+          so the logged MFU means what it says. Affects reporting only, never
+          the computation.
       stable_steps:
         type: integer
         default: null

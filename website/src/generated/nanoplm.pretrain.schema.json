@@ -1139,6 +1139,13 @@
           "x-nanoplm-advanced": true,
           "x-nanoplm-group": "Logging, eval, checkpoints"
         },
+        "peak_tflops": {
+          "type": "number",
+          "default": null,
+          "description": "Device peak BF16 tensor-core throughput in TFLOP/s, used as the denominator of the reported MFU. Unset (the default) uses the H100 SXM figure of 989.4, which is wrong for any other accelerator: on a GH200 booster capped at 630 it understates MFU by 1.57x. Set it per cluster so the logged MFU means what it says. Affects reporting only, never the computation.",
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-group": "Logging, eval, checkpoints"
+        },
         "debug_non_finite_params": {
           "type": "boolean",
           "default": false,
