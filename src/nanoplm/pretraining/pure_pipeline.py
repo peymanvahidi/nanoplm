@@ -2610,8 +2610,9 @@ def run_pure_pretraining(
         if getattr(_cfg, "use_loopie", False)
         else max(1, int(getattr(_cfg, "recycling_loop_count", 1)))
     )
-    _peak_flops = H100_PEAK_TFLOPS * 1e12
-    logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
+    _peak_tflops = float(getattr(pretrain_config, "peak_tflops", None) or H100_PEAK_TFLOPS)
+    _peak_flops = _peak_tflops * 1e12
+    logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, device peak = {_peak_tflops} TFLOPS")
 
     _run_t0 = time.perf_counter()
     # Wall-clock stop. The clock is NOT started here: the first optimizer steps
@@ -2739,6 +2740,9 @@ def run_pure_pretraining(
     window_loss = torch.zeros((), device=device)
     window_steps = 0
     discard_accumulation = False
+    # Set by the (sync-free) per-micro-step finite poll; consumed once
+    # per accumulation window, at the boundary.
+    local_nonfinite = False
     token_count = torch.zeros((), dtype=torch.long, device=device)
     raw_token_count = torch.zeros((), dtype=torch.long, device=device)
     # Sum over the logging window of flops_per_token(actual r) * valid_tokens, so
@@ -2952,6 +2956,7 @@ def run_pure_pretraining(
                     if discard_accumulation:
                         if at_accum_boundary:
                             discard_accumulation = False
+                            local_nonfinite = False
                             accum_micro_count = 0
                             effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
                                 global_step,
@@ -3063,15 +3068,27 @@ def run_pure_pretraining(
                     # peers enter the optimizer's collectives would desync/deadlock.
                     # Only runs when the debug guard is enabled, so production runs
                     # (loss_finite_check is None) pay no collective or host sync.
+                    # poll() is event-based and does NOT sync the stream, so it is
+                    # safe every micro-step.  The global verdict is not: its
+                    # `.item()` is a stream-wide cudaStreamSynchronize issued after
+                    # backward, draining the pipeline and resetting CPU run-ahead --
+                    # the exact cost _DeferredFiniteCheck exists to avoid (31 ms per
+                    # step on GH200).  So accumulate locally and reach the global
+                    # verdict once per window, at the boundary, where a step is
+                    # taken or the whole window is discarded anyway.
                     loss_nonfinite = False
                     if loss_finite_check is not None:
-                        loss_nonfinite = loss_finite_check.poll()
-                        if distributed and dist.is_initialized():
-                            _lf = torch.tensor(
-                                [1.0 if loss_nonfinite else 0.0], device=device
-                            )
-                            dist.all_reduce(_lf, op=dist.ReduceOp.MAX)
-                            loss_nonfinite = bool(_lf.item() > 0)
+                        if loss_finite_check.poll():
+                            local_nonfinite = True
+                        if at_accum_boundary:
+                            loss_nonfinite = local_nonfinite
+                            local_nonfinite = False
+                            if distributed and dist.is_initialized():
+                                _lf = torch.tensor(
+                                    [1.0 if loss_nonfinite else 0.0], device=device
+                                )
+                                dist.all_reduce(_lf, op=dist.ReduceOp.MAX)
+                                loss_nonfinite = bool(_lf.item() > 0)
                     if loss_nonfinite:
                         consecutive_nonfinite_skips += 1
                         rank = dist.get_rank() if distributed and dist.is_initialized() else 0

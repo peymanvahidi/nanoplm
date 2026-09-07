@@ -269,6 +269,7 @@ pretraining:
   save_steps: 2500
   # max_wallclock_hours: 3.0            # stop + checkpoint after N hours of training; for wall-clock-matched ablations
   seed: 42
+  # peak_tflops: 630.0                # MFU denominator; unset = H100 SXM 989.4 (GH200 booster = 630)
 
   # ── Debug ─────────────────────────────────────────────────────────────────
 

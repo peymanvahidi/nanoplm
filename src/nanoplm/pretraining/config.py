@@ -163,6 +163,10 @@ class PretrainingConfig:
     # on resume, measuring this run rather than cumulative time across resumes.
     max_wallclock_hours: Optional[float] = None
     seed: int = 42
+    # Device peak BF16 tensor-core TFLOP/s used as the MFU denominator.
+    # None = the H100 SXM figure (989.4).  Set it per cluster: the GH200
+    # booster caps at 630, against which 989.4 understates MFU by 1.57x.
+    peak_tflops: Optional[float] = None
     debug_non_finite_params: bool = True
     debug_layerwise_metrics: bool = False
     debug_layerwise_log_every: int = 20
