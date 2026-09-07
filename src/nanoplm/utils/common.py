@@ -180,6 +180,90 @@ def resolve_world_size(multi_gpu: bool, world_size: Union[int, str]) -> int:
     return int(world_size) if world_size else 1
 
 
+def _head_sha_from_git_files(work_dir: Path) -> Optional[str]:
+    """Read HEAD's commit out of the ``.git`` metadata, with no git binary.
+
+    Reading refs cannot see uncommitted changes, so a sha from here says
+    nothing about whether the tree was modified.
+    """
+    hexdigits = "0123456789abcdef"
+
+    def sha_or_none(text: Optional[str]) -> Optional[str]:
+        if not text:
+            return None
+        text = text.strip()
+        if len(text) in (40, 64) and all(char in hexdigits for char in text):
+            return text
+        return None
+
+    def line_of(path: Path) -> Optional[str]:
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    try:
+        start = work_dir.resolve()
+    except OSError:
+        return None
+
+    dot_git = next(
+        (p / ".git" for p in [start, *start.parents] if (p / ".git").exists()), None
+    )
+    if dot_git is None:
+        return None
+
+    if dot_git.is_dir():
+        git_dir = dot_git
+    else:
+        pointer = line_of(dot_git)
+        if not pointer or not pointer.startswith("gitdir:"):
+            return None
+        # Path.__truediv__ keeps an absolute right-hand side, so this covers
+        # both the absolute and the relative spelling of a worktree pointer.
+        git_dir = dot_git.parent / pointer[len("gitdir:") :].strip()
+
+    # A worktree keeps its own HEAD but shares refs/heads and packed-refs.
+    common_dir = git_dir
+    commondir = line_of(git_dir / "commondir")
+    if commondir:
+        common_dir = git_dir / commondir
+
+    head = line_of(git_dir / "HEAD")
+    if not head:
+        return None
+
+    detached = sha_or_none(head)
+    if detached:
+        return detached
+    if not head.startswith("ref: "):
+        return None
+    ref = head[len("ref: ") :].strip()
+    if not ref:
+        return None
+
+    for loose in (git_dir / ref, common_dir / ref):
+        sha = sha_or_none(line_of(loose))
+        if sha:
+            return sha
+
+    for packed in (common_dir / "packed-refs", git_dir / "packed-refs"):
+        try:
+            text = packed.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in text.splitlines():
+            if line.startswith("#") or line.startswith("^"):
+                continue
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == ref:
+                sha = sha_or_none(fields[0])
+                if sha:
+                    return sha
+
+    return None
+
+
 def git_sha(work_dir: Path) -> Optional[str]:
     """
     Resolve the HEAD commit of the Git checkout containing work_dir.
@@ -188,9 +272,12 @@ def git_sha(work_dir: Path) -> Optional[str]:
         work_dir: Directory path to resolve from
 
     Returns:
-        Optional[str]: The full commit hash, suffixed "-dirty" when the tree
-        has uncommitted changes. None when work_dir is not in a checkout and
-        when git is unavailable.
+        Optional[str]: one of four shapes. ``"<sha>"`` when git confirmed the
+        tree clean. ``"<sha>-dirty"`` when git reported uncommitted changes.
+        ``"<sha>-dirty-unknown"`` when the sha is trustworthy but its
+        modification state is not, either because the sha was read out of
+        ``.git`` with no git binary available or because ``git status`` failed.
+        None when no sha could be resolved at all.
     """
     def _git(*args: str) -> Optional[str]:
         try:
@@ -207,11 +294,15 @@ def git_sha(work_dir: Path) -> Optional[str]:
 
     sha = _git("rev-parse", "HEAD")
     if not sha:
-        return None
+        sha = _head_sha_from_git_files(work_dir)
+        return f"{sha}-dirty-unknown" if sha else None
+
     # An uncommitted edit means the sha does not describe the code that ran, and
     # a provenance record that can silently lie is worse than none.
-    dirty = _git("status", "--porcelain")
-    return f"{sha}-dirty" if dirty else sha
+    status = _git("status", "--porcelain")
+    if status is None:
+        return f"{sha}-dirty-unknown"
+    return f"{sha}-dirty" if status else sha
 
 
 def is_git_subdir(work_dir: Path) -> bool:
