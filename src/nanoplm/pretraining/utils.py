@@ -119,21 +119,26 @@ def format_passes_hint(budget_tokens: int, total_train_tokens: int,
             f"train set (each sample seen ~{passes:.1f}×){tag}")
 
 
-def get_num_workers(user_value: Union[int, str], world_size: int) -> int:
+def get_num_workers(user_value: Union[int, str]) -> int:
+    """Resolve ``num_workers``, expanding ``"auto"`` to 4 workers for this rank.
 
+    DataLoader workers are spawned per process, so the count must never be
+    derived from a rank count. Every rank sharing a node pays it separately, and
+    scaling by the global world size put 256 worker processes on a 4-node host
+    and OOM-killed job 1702372. The only ceiling that belongs here is this
+    task's own CPU budget, which ``sched_getaffinity`` reports and ``cpu_count``
+    does not, since ``cpu_count`` sees the whole node through a SLURM binding.
+    """
     if isinstance(user_value, str) and user_value == "auto":
-        cpu_cores = os.cpu_count() or 1
+        get_affinity = getattr(os, "sched_getaffinity", None)
+        task_cpus = len(get_affinity(0)) if get_affinity else (os.cpu_count() or 1)
 
-        # Leave some room for OS / other processes
-        max_reasonable = max(1, cpu_cores - 2)
+        workers = max(1, min(4, task_cpus - 1))
 
-        # Heuristic: 4 workers per GPU is a good starting point
-        workers_per_gpu = 4
-        target = workers_per_gpu * max(1, world_size)
-
-        workers = max(1, min(target, max_reasonable))
-
-        logger.info(f"Auto-setting num_workers to {workers} for {world_size} GPU(s).")
+        logger.info(
+            f"Auto-setting num_workers to {workers} per rank "
+            f"(task CPU budget {task_cpus}, node CPUs {os.cpu_count()})."
+        )
 
         return workers
 

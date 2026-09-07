@@ -247,7 +247,7 @@ def run_pretraining(
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name
     os.environ["WANDB_NAME"] = wandb_run_name
 
-    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers)
 
     training_dict = {
         "output_dir": output_dir,

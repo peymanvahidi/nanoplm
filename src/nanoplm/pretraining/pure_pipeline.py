@@ -2179,7 +2179,7 @@ def run_pure_pretraining(
     eval_steps = run.eval_steps
     save_steps = run.save_steps
 
-    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers)
     pin_memory = device.type == "cuda"
     # Disable persistent workers when packing: TokenPackingDataset + persistent_workers
     # can cause hangs near epoch boundaries (set_epoch doesn't reach workers, worker
