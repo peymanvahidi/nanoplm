@@ -263,7 +263,7 @@ def _split_packed_batch(
             "labels": batch["labels"].new_full((effective_tokens_per_split,), -100),
             "cu_seqlens": sub_cu,
             "max_seqlen": max(actual_max_seqlen, pad_tokens),
-            "num_valid_tokens": actual_tokens,
+            "num_valid_tokens": torch.tensor(actual_tokens, dtype=torch.long),
         }
         if actual_tokens > effective_tokens_per_split:
             raise ValueError(
