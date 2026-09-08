@@ -270,6 +270,26 @@ pretraining:
   keep_probability: 0.1
   mlm_standard_amino_acids_only: true   # true = 20 standard AAs for targets/random; false = all non-special tokens
 
+  # ── Eval-side masking (optional; unset = same as training) ────────────────
+  #
+  # The eval collator otherwise inherits the whole masking recipe above. That
+  # is fine for a single run, and wrong when comparing runs that differ in it:
+  # a model trained at 15% masking is then also SCORED at 15% while a 30% model
+  # is scored at 30%. Those are different tasks and the losses do not compare.
+  # Pin these to score every run on the same task.
+  #
+  # eval_mlm_probability: 0.15
+  # eval_mlm_masking_strategy: "token"  # token | span
+  # eval_mask_replace_prob: 0.8
+  # eval_random_token_prob: 0.1
+  # eval_keep_probability: 0.1
+  #
+  # Seed for eval masking. Set it and an eval batch's mask becomes a pure
+  # function of its own token ids: identical across runs, across dataloader
+  # worker counts, and across batch order. Unset, every eval draws fresh masks
+  # from global RNG, so eval loss carries mask noise on top of real change.
+  # eval_mask_seed: 1234
+
   # ── Logging, eval, checkpoints ────────────────────────────────────────────
 
   logging_steps: 25                     # step line reports means over this many steps; should divide eval_steps
