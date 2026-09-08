@@ -149,6 +149,24 @@ class PretrainingConfig:
     # random replacements. Set false to reproduce the legacy all-non-special
     # token behavior.
     mlm_standard_amino_acids_only: bool = True
+    # Eval-side masking, held separate from training on purpose.
+    #
+    # The eval collator used to inherit these straight from training, so an arm
+    # trained at 15% masking was also SCORED at 15% while the base was scored
+    # at 30%. Those are different tasks and the losses are not comparable, which
+    # made any ablation on the masking recipe uninterpretable. Pin these and
+    # every arm is scored on the same task.
+    #
+    # None means "same as training", which is the old behaviour.
+    eval_mlm_probability: Optional[float] = None
+    eval_mask_replace_prob: Optional[float] = None
+    eval_random_token_prob: Optional[float] = None
+    eval_keep_probability: Optional[float] = None
+    eval_mlm_masking_strategy: Optional[str] = None
+    # Seed for eval masking. When set, an eval batch's mask is a pure function
+    # of its own token ids, so it is identical across arms, runs, worker counts
+    # and batch order. Leave None to keep drawing fresh masks from global RNG.
+    eval_mask_seed: Optional[int] = None
 
     # Logging/checkpointing
     # At 1, the step line is 94% of a run log and every step pays a

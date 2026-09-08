@@ -61,6 +61,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from nanoplm.data.infra.manifest import validate_manifest_for_pipeline, DataManifest
 from nanoplm.pretraining.collator import (
+    eval_masking_kwargs_from_config,
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
     build_power_of_two_buckets,
@@ -2487,15 +2488,15 @@ def run_pure_pretraining(
         optimizer_dist = dist.group.WORLD
 
     # ---- DataLoaders ----
+    # Eval masking is deliberately NOT the training masking. See
+    # eval_masking_kwargs_from_config: scoring an arm on the task it was
+    # trained on makes masking-recipe arms incomparable to the base.
     eval_collator = ProtDataCollatorForLM(
         tokenizer=tokenizer,
-        mlm_probability=pretrain_config.mlm_probability,
-        mask_token_probability=pretrain_config.mask_replace_prob,
-        random_token_probability=pretrain_config.random_token_prob,
-        keep_probability=pretrain_config.keep_probability,
         standard_amino_acids_only=mlm_standard_amino_acids_only,
         extra_excluded_token_ids=mlm_extra_excluded_token_ids,
-        **mlm_masking_kwargs_from_config(pretrain_config),
+        deterministic_seed=getattr(pretrain_config, "eval_mask_seed", None),
+        **eval_masking_kwargs_from_config(pretrain_config),
     )
 
     dl_kwargs = dict(

@@ -5,6 +5,7 @@ Key classes:
     ``ProtDataCollatorForLM`` -- standard padding-based MLM collator used for masking.
 """
 
+import hashlib
 import logging
 import math
 import torch
@@ -18,6 +19,48 @@ logger = logging.getLogger(__name__)
 def mlm_masking_kwargs_from_config(cfg) -> Dict[str, Any]:
     return {
         "masking_strategy": getattr(cfg, "mlm_masking_strategy", "token"),
+        "span_mean_length": getattr(cfg, "mlm_span_mean_length", 3.0),
+        "span_max_length": getattr(cfg, "mlm_span_max_length", 10),
+    }
+
+
+def _eval_or_train(cfg, eval_name: str, train_name: str, default):
+    """Eval-side masking setting, falling back to the training one.
+
+    Every eval_* key defaults to None, which means "same as training" and
+    preserves the old behaviour for anyone not setting them.
+    """
+    value = getattr(cfg, eval_name, None)
+    return getattr(cfg, train_name, default) if value is None else value
+
+
+def eval_masking_kwargs_from_config(cfg) -> Dict[str, Any]:
+    """Masking settings for the EVAL collator.
+
+    Held separate from training on purpose. The eval collator used to inherit
+    mlm_probability and the 80/10/10 split straight from training, which means
+    an arm trained at 15% masking was also *scored* at 15% while the base was
+    scored at 30%. Those are different tasks and their losses are not
+    comparable, so any ablation on the masking recipe was uninterpretable.
+
+    Pin these in the config and every arm is scored on the same task.
+    """
+    return {
+        "mlm_probability": _eval_or_train(
+            cfg, "eval_mlm_probability", "mlm_probability", 0.15
+        ),
+        "mask_token_probability": _eval_or_train(
+            cfg, "eval_mask_replace_prob", "mask_replace_prob", 0.8
+        ),
+        "random_token_probability": _eval_or_train(
+            cfg, "eval_random_token_prob", "random_token_prob", 0.1
+        ),
+        "keep_probability": _eval_or_train(
+            cfg, "eval_keep_probability", "keep_probability", 0.1
+        ),
+        "masking_strategy": _eval_or_train(
+            cfg, "eval_mlm_masking_strategy", "mlm_masking_strategy", "token"
+        ),
         "span_mean_length": getattr(cfg, "mlm_span_mean_length", 3.0),
         "span_max_length": getattr(cfg, "mlm_span_max_length", 10),
     }
@@ -51,6 +94,7 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         masking_strategy: str = "token",
         span_mean_length: float = 3.0,
         span_max_length: int = 10,
+        deterministic_seed: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(
@@ -76,6 +120,9 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         self.masking_strategy = masking_strategy
         self.span_mean_length = span_mean_length
         self.span_max_length = span_max_length
+        self.deterministic_seed = (
+            None if deterministic_seed is None else int(deterministic_seed)
+        )
 
         total = mask_token_probability + random_token_probability + keep_probability
         self.p_mask = mask_token_probability / total
@@ -109,7 +156,9 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         self.standard_amino_acids_only = standard_amino_acids_only
         self._excluded_token_ids = frozenset(excluded_token_ids)
 
-    def _sample_span_length(self, device: torch.device) -> int:
+    def _sample_span_length(
+        self, device: torch.device, generator: Optional[torch.Generator] = None
+    ) -> int:
         if self.span_max_length <= 1 or self.span_mean_length <= 1.0:
             return 1
 
@@ -117,12 +166,40 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         if p >= 1.0:
             return 1
 
-        u = float(torch.rand((), device=device).item())
+        u = float(torch.rand((), device=device, generator=generator).item())
         u = min(max(u, 1e-12), 1.0 - 1e-12)
         length = math.ceil(math.log1p(-u) / math.log1p(-p))
         return max(1, min(self.span_max_length, int(length)))
 
-    def _sample_span_mask(self, candidate_mask: torch.Tensor) -> torch.Tensor:
+    def _generator(self, inputs: torch.Tensor) -> Optional[torch.Generator]:
+        """Per-batch RNG seeded from the batch's own content, or None.
+
+        Returns None unless deterministic_seed is set, in which case callers
+        keep using global RNG exactly as before.
+
+        The seed is a hash of the token ids, NOT a call counter, so the mask a
+        sequence gets depends only on the sequence itself. That makes it stable
+        across arms, across runs, across dataloader worker counts and batch
+        order, and independent of how much global RNG training has consumed.
+        Without it every eval draws fresh masks, so eval loss carries mask
+        noise on top of the model differences we are trying to measure.
+
+        Call this BEFORE mutating inputs: torch_mask_tokens writes into it.
+        """
+        if self.deterministic_seed is None:
+            return None
+        digest = hashlib.blake2b(
+            inputs.detach().to("cpu", torch.int64).numpy().tobytes(),
+            digest_size=8,
+        ).digest()
+        seed = self.deterministic_seed ^ int.from_bytes(digest, "little")
+        gen = torch.Generator(device=inputs.device)
+        gen.manual_seed(seed % (2**63 - 1))
+        return gen
+
+    def _sample_span_mask(
+        self, candidate_mask: torch.Tensor, generator: Optional[torch.Generator] = None
+    ) -> torch.Tensor:
         masked_indices = torch.zeros_like(candidate_mask, dtype=torch.bool)
         mlm_probability = float(self.mlm_probability)
         if mlm_probability <= 0.0:
@@ -139,9 +216,9 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
 
             expected = mlm_probability * n_eligible
             target = int(math.floor(expected))
-            if float(torch.rand((), device=candidate_mask.device).item()) < (
-                expected - target
-            ):
+            if float(
+                torch.rand((), device=candidate_mask.device, generator=generator).item()
+            ) < (expected - target):
                 target += 1
             target = max(0, min(n_eligible, target))
             if target == 0:
@@ -161,10 +238,11 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
                             high=remaining.numel(),
                             size=(1,),
                             device=candidate_mask.device,
+                            generator=generator,
                         ).item()
                     ].item()
                 )
-                span_len = self._sample_span_length(candidate_mask.device)
+                span_len = self._sample_span_length(candidate_mask.device, generator)
                 for pos in range(start, candidate_mask.size(1)):
                     if not bool(eligible[pos].item()) or bool(selected[pos].item()):
                         break
@@ -180,6 +258,7 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
     ):
         """Mirrors HF logic but uses custom p_mask/p_rand/p_keep and a restricted random pool."""
         labels = inputs.clone()
+        generator = self._generator(inputs)
 
         probability_matrix = torch.full(
             labels.shape, self.mlm_probability, device=inputs.device,
@@ -199,13 +278,17 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
 
         if self.masking_strategy == "span":
-            masked_indices = self._sample_span_mask(~special_tokens_mask)
+            masked_indices = self._sample_span_mask(~special_tokens_mask, generator)
         else:
-            masked_indices = torch.bernoulli(probability_matrix).to(torch.bool)
+            masked_indices = torch.bernoulli(
+                probability_matrix, generator=generator
+            ).to(torch.bool)
         labels[~masked_indices] = -100
 
         if masked_indices.any():
-            dice = torch.rand(size=inputs.shape, device=inputs.device)
+            dice = torch.rand(
+                size=inputs.shape, device=inputs.device, generator=generator
+            )
 
             mask_choice = (dice < self.p_mask) & masked_indices
             rand_choice = (
@@ -221,6 +304,7 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
                 n = rand_choice.sum().item()
                 idxs = torch.randint(
                     low=0, high=pool.numel(), size=(n,), device=inputs.device,
+                    generator=generator,
                 )
                 inputs[rand_choice] = pool[idxs]
 
