@@ -35,7 +35,28 @@ _ALLOWED_NON_FORWARDED_KEYWORDS = {
 }
 
 
-def test_every_model_config_field_is_forwarded():
+def test_mapping_is_invariant_to_num_register_tokens():
+    """`num_register_tokens` is NOT_FORWARDED by design: register tokens occupy
+    fixed vocab slots and never move pad/eos/unk/mask, so two configs that
+    differ ONLY in `num_register_tokens` must map to an identical
+    `ModernBertConfig`. This pins that invariance in code rather than losing
+    the reason as tribal knowledge."""
+    base = dict(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+    )
+    mapped_0 = modernbert_config_from(
+        ProtModernBertMLMConfig(num_register_tokens=0, **base)
+    )
+    mapped_2 = modernbert_config_from(
+        ProtModernBertMLMConfig(num_register_tokens=2, **base)
+    )
+    assert mapped_0 == mapped_2
+
+
+def test_mapped_config_exposes_every_field():
     mapped = modernbert_config_from(
         ProtModernBertMLMConfig(
             hidden_size=64,
@@ -54,7 +75,7 @@ def test_every_model_config_field_is_forwarded():
 
 # --- AST-level structural guard -------------------------------------------
 #
-# `test_every_model_config_field_is_forwarded` above only checks `hasattr` on
+# `test_mapped_config_exposes_every_field` above only checks `hasattr` on
 # the *result*. `ModernBertConfig` is a dataclass where essentially every field
 # already has a class-level default, so if a future edit silently drops a
 # `x=config.x` line from the call, the resulting object still has attribute

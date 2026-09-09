@@ -32,26 +32,24 @@ except Exception as exc:  # pragma: no cover - depends on TE availability
             ) from _TE_IMPORT_ERROR
 
 
-def modernbert_config_from(
-    config: ProtModernBertMLMConfig,
-    *,
-    num_register_tokens: int | None = None,
-) -> ModernBertConfig:
+def modernbert_config_from(config: ProtModernBertMLMConfig) -> ModernBertConfig:
     """Map the user-facing model config onto the internal ModernBertConfig.
 
     Single source of truth. `nanoplm.hf` builds the exported model through this
     same function, so a newly added model flag reaches the exported model
     without a second edit.
 
-    num_register_tokens defaults to config.num_register_tokens and exists so
-    callers holding a manifest can override it.
+    The tokenizer built below is not consulted for `num_register_tokens`
+    (register tokens occupy fixed vocab slots and never move pad/eos/unk/mask);
+    it exists solely to read those four fixed special-token ids into
+    `ModernBertConfig`.
+
+    Callers: a `moe_kernel_backend` of "sonicmoe" must be remapped to
+    "cutlass" by the CALLER before calling this function — never inside it.
+    This function forwards `moe_kernel_backend` faithfully by design, and the
+    export path performs that remap upstream.
     """
-    n_reg = (
-        config.num_register_tokens
-        if num_register_tokens is None
-        else num_register_tokens
-    )
-    tokenizer = ProtModernBertTokenizer(num_register_tokens=n_reg)
+    tokenizer = ProtModernBertTokenizer(num_register_tokens=config.num_register_tokens)
     return ModernBertConfig(
         vocab_size=config.vocab_size,
         hidden_size=config.hidden_size,
