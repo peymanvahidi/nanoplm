@@ -1,4 +1,5 @@
 """Static packaging assertions (stdlib tomllib; no build, no network)."""
+import fnmatch
 import tomllib
 from pathlib import Path
 
@@ -81,3 +82,65 @@ def test_config_data_files_exist_on_disk():
     cfg_dir = ROOT / "src" / "nanoplm" / "config"
     assert (cfg_dir / "recycling_compatibility.yaml").exists()
     assert (cfg_dir / "recycling_wandb_dashboard.json").exists()
+
+
+# --- Generic gate: every shipped non-.py file must be package-data-covered --
+#
+# Hardcoding one assertion per data file (as the tests above do) only catches
+# a defect after it's already been hit once — that's how the stale
+# "nanoplm.pretraining"/"nanoplm.data" keys survived: both named directories
+# containing no csrc/ at all, while the real C sources
+# (data/preparation/csrc/fast_fasta_ops.c, data/sharding/csrc/
+# fast_fasta_shard_writer.c) went completely unmatched and were silently
+# dropped from the wheel. Walk the source tree instead and require every
+# shipped non-.py file to be matched by *some* package-data pattern for its
+# nearest enclosing package — this kills the whole defect class rather than
+# one instance at a time, and would have caught both that bug and this one.
+
+
+def _iter_shipped_non_py_files():
+    src_root = ROOT / "src" / "nanoplm"
+    for path in sorted(src_root.rglob("*")):
+        if path.is_dir():
+            continue
+        if "__pycache__" in path.parts:
+            continue
+        if path.suffix == ".py":
+            continue
+        if path.name == ".gitkeep":
+            continue
+        yield path
+
+
+def _enclosing_package(path: Path) -> tuple[str, Path]:
+    """Walk up from `path`'s parent to the nearest directory that is a
+    Python package (has __init__.py) under src/. Returns (dotted package
+    name, that directory)."""
+    src_dir = ROOT / "src"
+    d = path.parent
+    while True:
+        if (d / "__init__.py").exists():
+            return ".".join(d.relative_to(src_dir).parts), d
+        if d == src_dir or d == d.parent:
+            raise AssertionError(
+                f"{path.relative_to(ROOT)}: no ancestor package (__init__.py) found"
+            )
+        d = d.parent
+
+
+def test_every_shipped_non_py_file_is_covered_by_package_data():
+    pkg_data = _load()["tool"]["setuptools"]["package-data"]
+    uncovered = []
+    for path in _iter_shipped_non_py_files():
+        pkg_name, pkg_dir = _enclosing_package(path)
+        rel = path.relative_to(pkg_dir).as_posix()
+        patterns = pkg_data.get(pkg_name, [])
+        if not any(fnmatch.fnmatch(rel, pat) for pat in patterns):
+            uncovered.append(
+                f"{path.relative_to(ROOT)} (package {pkg_name!r} has no pattern "
+                f"matching {rel!r}; patterns={patterns})"
+            )
+    assert uncovered == [], (
+        "shipped non-.py files not matched by any package-data pattern — "
+        f"these would be silently dropped from a wheel: {uncovered}"
+    )
