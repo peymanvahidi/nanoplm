@@ -1,4 +1,5 @@
-"""Fused Triton kernels for MoE dispatch and combine.
+"""Torch custom ops for MoE dispatch/combine Triton kernels (see
+``moe_triton_kernels.py``).
 
 Provides custom ops registered via ``torch.library``:
   - ``scatter_dispatch``: fuses repeat_interleave + permute into a single gather
@@ -144,7 +145,7 @@ def _moe_autotune_status_end(
         )
 
 
-# ── Eager fallbacks (CPU only) ───────────────────────────────────────────────
+# ── Eager fallbacks (CPU and MPS) ────────────────────────────────────────────
 
 
 def _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale):

@@ -137,8 +137,12 @@ def _grouped_gemm_mps(
     trans_b: bool = False,
 ):
     # No fused MPS kernel exists; the reference implementation is a per-expert
-    # loop of plain matmuls, which Metal handles fine. Correctness over speed:
-    # MPS is an inference target, never a training one.
+    # loop of plain matmuls, which Metal handles fine. Correctness over speed.
+    # Note this op's backward works on MPS too "for free": grouped_gemm's
+    # backward (below) is expressed in terms of grouped_gemm itself, so it
+    # inherits this same MPS registration. The actual inference-only boundary
+    # is enforced further downstream, at scatter_add_bwd and
+    # gather_combine_bwd (moe_triton_ops.py), which have no MPS key.
     return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
 
 

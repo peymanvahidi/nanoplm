@@ -1,7 +1,11 @@
 """The exported model must run with no Triton, no TE, no flash-attn."""
+import ast
+from pathlib import Path
+
 import pytest
 import torch
 
+from nanoplm.pretraining.models.modern_bert import moe_triton_ops
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 
@@ -52,6 +56,7 @@ def test_grouped_gemm_dispatches_on_mps():
 def test_scatter_dispatch_matches_cpu_on_mps():
     import nanoplm.pretraining.models.modern_bert.moe_triton_ops  # noqa: F401
 
+    torch.manual_seed(0)
     T, H = 6, 16
     top_k = 2
     x = torch.randn(T, H)
@@ -74,6 +79,7 @@ def test_gather_combine_matches_cpu_on_mps():
         build_inverse_map,
     )
 
+    torch.manual_seed(0)
     T, C = 6, 16
     top_k = 2
     M = T * top_k
@@ -126,3 +132,44 @@ def test_moe_model_logits_match_between_cpu_and_mps():
         ).logits
 
     torch.testing.assert_close(mps_logits.cpu(), cpu_logits, rtol=1e-3, atol=1e-3)
+
+
+# --- AST-level structural guard --------------------------------------------
+#
+# `test_moe_model_runs_without_triton[cpu]` above only fails on a machine that
+# actually lacks Triton installed; re-add a module-scope `import triton` to
+# moe_triton_ops.py on a Linux/Hopper box and every test here still passes.
+# CI (`.github/workflows/docs.yml`) runs only `tests/docs_schema`, so it
+# catches nothing either. The invariant the module split exists to establish
+# — that importing `moe_triton_ops` never requires Triton, because the only
+# Triton-dependent code paths (the CUDA launch functions) import it lazily
+# inside a function body via `from . import moe_triton_kernels as k` — is
+# therefore unguarded exactly where it would be broken. Parse the source
+# instead of importing it, mirroring `test_config_mapping.py`'s
+# `_modernbert_config_call`/AST idiom (itself following
+# `tools/schema_gen/dataclass_ast.py` + `tests/docs_schema/test_parity.py`).
+
+
+def test_moe_triton_ops_has_no_module_scope_triton_import():
+    """A guarded import nested inside a function or an `if` is fine and must
+    NOT be flagged — only `tree.body` (module scope) is checked."""
+    source = Path(moe_triton_ops.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    offending = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Import)
+            and any(alias.name.split(".")[0] == "triton" for alias in node.names)
+        )
+        or (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and node.module.split(".")[0] == "triton"
+        )
+    ]
+    assert offending == [], (
+        "module-scope `import triton` in moe_triton_ops.py reintroduces the "
+        "hard Triton dependency the CPU/MPS portability task removed"
+    )
