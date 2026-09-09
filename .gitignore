@@ -78,3 +78,6 @@ AGENTS.md
 # Docs site (Astro/Starlight)
 node_modules/
 website/.astro/*
+
+# SDD scratch (ledger, briefs, review packages)
+.superpowers/
