@@ -70,6 +70,7 @@ docs = ["pyyaml>=6"]
 "nanoplm.data" = ["csrc/*.c"]
 "nanoplm.pretraining.models.modern_bert" = ["csrc/*.cpp", "csrc/*.cu"]
 "nanoplm.cli.templates" = ["*.yaml"]
+"nanoplm.config" = ["*.yaml", "*.json"]
 
 [tool.uv]
 index-strategy = "unsafe-best-match"

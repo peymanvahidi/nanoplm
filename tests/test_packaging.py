@@ -65,3 +65,19 @@ def test_readme_drops_manual_per_dep_installs():
     text = README.read_text()
     assert "pip install git+https://github.com/microsoft/dion.git" not in text
     assert "alint77/sonic-moe" not in text
+
+
+def test_config_yaml_ships_as_package_data():
+    # recycling_compatibility.yaml is opened at ModernBertConfig.__post_init__
+    # time, so a wheel without it breaks every recycling model.
+    pkg_data = _load()["tool"]["setuptools"]["package-data"]
+    assert "nanoplm.config" in pkg_data, "nanoplm.config needs a package-data entry"
+    patterns = pkg_data["nanoplm.config"]
+    assert "*.yaml" in patterns
+    assert "*.json" in patterns
+
+
+def test_config_data_files_exist_on_disk():
+    cfg_dir = ROOT / "src" / "nanoplm" / "config"
+    assert (cfg_dir / "recycling_compatibility.yaml").exists()
+    assert (cfg_dir / "recycling_wandb_dashboard.json").exists()
