@@ -128,6 +128,20 @@ def _grouped_gemm_cpu(
     return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
 
 
+@torch.library.impl(_lib, "grouped_gemm", "MPS")
+def _grouped_gemm_mps(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    batch_sizes: torch.Tensor,
+    trans_a: bool = False,
+    trans_b: bool = False,
+):
+    # No fused MPS kernel exists; the reference implementation is a per-expert
+    # loop of plain matmuls, which Metal handles fine. Correctness over speed:
+    # MPS is an inference target, never a training one.
+    return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
+
+
 def _setup_context(ctx, inputs, output):
     a, b, batch_sizes, trans_a, trans_b = inputs
     ctx.save_for_backward(a, b, batch_sizes)
