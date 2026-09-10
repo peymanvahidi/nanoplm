@@ -10,11 +10,11 @@ from nanoplm.eval.config import EvalConfig
 from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
 
-_VALID_FRAMEWORKS = {"pgym", "pbc_zeroshot_contact"}
+_VALID_FRAMEWORKS = {"pgym", "pbc_zeroshot_contact", "pbc_supervised"}
 _VALID_ZERO_SHOT_METHODS = {"masked_marginals", "wt_marginals", "pseudoperplexity"}
 
-# Supervised frameworks dropped in the biotrainer 2.0.0 migration.
-_REMOVED_FRAMEWORKS = {"pbc", "pbc_supervised", "flip"}
+# Frameworks dropped in the biotrainer 2.0.0 migration.
+_REMOVED_FRAMEWORKS = {"pbc", "flip"}
 
 
 def _check_biotrainer_available() -> None:
@@ -36,7 +36,7 @@ def _validate_frameworks(frameworks: List[str]) -> None:
         if fw in _REMOVED_FRAMEWORKS:
             raise click.ClickException(
                 f"Framework {fw!r} is no longer supported. nanoplm eval moved to "
-                "biotrainer 2.0.0 and now covers the zero-shot frameworks only: "
+                "biotrainer 2.0.0 and now covers: "
                 f"{sorted(_VALID_FRAMEWORKS)}."
             )
         if fw not in _VALID_FRAMEWORKS:
@@ -83,7 +83,7 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
             kwargs[key] = value
 
     # Integer fields.
-    for key in ("zero_shot_batch_size",):
+    for key in ("zero_shot_batch_size", "loop_count"):
         if key in kwargs:
             try:
                 kwargs[key] = int(kwargs[key])
@@ -147,8 +147,8 @@ def eval():
     multiple=True,
     default=("pgym",),
     help=(
-        "Zero-shot benchmark framework(s) to evaluate on. Pass multiple times to "
-        "run several, e.g. --framework pgym --framework pbc_zeroshot_contact."
+        "Benchmark framework(s) to evaluate on. Pass multiple times to run "
+        "several, e.g. --framework pgym --framework pbc_supervised."
     ),
     show_default=True,
 )
@@ -214,6 +214,15 @@ def eval():
     default=False,
     help="Force re-download of framework datasets (use when new tasks land upstream).",
 )
+@click.option(
+    "--loop-count",
+    type=int,
+    default=None,
+    help=(
+        "Refinement depth to run the checkpoint at, overriding the depth it was "
+        "trained with. Requires a looped (loopie or huginn) checkpoint."
+    ),
+)
 def run(
     checkpoint_dir: str,
     framework: tuple,
@@ -225,6 +234,7 @@ def run(
     development_mode: bool,
     dataset_dir: Optional[str],
     force_download: bool,
+    loop_count: Optional[int],
 ):
     """Run downstream evaluation directly from CLI flags."""
     frameworks_list = list(framework)
@@ -246,6 +256,7 @@ def run(
         development_mode=development_mode,
         dataset_dir=dataset_dir,
         force_download=force_download,
+        loop_count=loop_count,
     )
 
     from nanoplm.eval.pipeline import run_eval

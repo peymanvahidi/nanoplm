@@ -14,9 +14,9 @@ from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertToken
 from nanoplm.utils.logger import logger
 
 # Upper bound on tokens per batched forward pass. The effective batch is
-# ``min(zero_shot_batch_size, _TOKEN_BUDGET // window_len)``, so long windows
+# ``min(zero_shot_batch_size, TOKEN_BUDGET // window_len)``, so long windows
 # shrink the batch instead of running out of memory.
-_TOKEN_BUDGET = 65_536
+TOKEN_BUDGET = 65_536
 
 
 def special_token_offsets(tokenizer: ProtModernBertTokenizer) -> Tuple[int, int]:
@@ -46,6 +46,7 @@ class NanoPLMBioEngineer:
         device: torch.device,
         biotrainer: Dict[str, Any],
         batch_size: int = 60,
+        loop_count: Optional[int] = None,
     ):
         """Return a ``BioEngineer`` wrapping ``model`` for zero-shot scoring.
 
@@ -58,6 +59,8 @@ class NanoPLMBioEngineer:
             batch_size: Sequences per forward pass. Masked-marginals batches this
                 many masked positions together; the categorical Jacobian batches
                 this many mutated sequences.
+            loop_count: Refinement depth override; None runs the checkpoint at
+                the depth it was trained with.
         """
         CustomBioEngineerModel = biotrainer["CustomBioEngineerModel"]
         CustomBioEngineerModelWrapper = biotrainer["CustomBioEngineerModelWrapper"]
@@ -102,7 +105,8 @@ class NanoPLMBioEngineer:
                     enabled=self._device.type == "cuda",
                 ):
                     outputs = self._model(
-                        input_ids=input_ids, attention_mask=attention_mask
+                        input_ids=input_ids, attention_mask=attention_mask,
+                        loop_count=loop_count,
                     )
                 return outputs["logits"]
 
@@ -136,7 +140,7 @@ class NanoPLMBioEngineer:
                 self._batch_size = max(1, int(batch_size))
 
             def _chunk_size(self, row_len: int) -> int:
-                return max(1, min(self._batch_size, _TOKEN_BUDGET // max(1, row_len)))
+                return max(1, min(self._batch_size, TOKEN_BUDGET // max(1, row_len)))
 
             def _get_masked_log_probabilities(self, sequence: str) -> torch.Tensor:
                 """Batched masked-marginals.

@@ -11,10 +11,9 @@ eval:
   # directory (the latest checkpoint inside the run-* is used).
   checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
 
-  # One or more of: pgym, pbc_zeroshot_contact. Both are zero-shot —
-  # 'pgym' scores ProteinGym DMS variants, 'pbc_zeroshot_contact'
-  # predicts contact maps from the categorical Jacobian.
-  framework: [pgym]
+  # pgym and pbc_zeroshot_contact score the model as-is; pbc_supervised
+  # trains task heads on its frozen embeddings.
+  framework: [pgym]     # pgym | pbc_zeroshot_contact | pbc_supervised
 
   output_dir: "autoeval_output"
 
@@ -37,3 +36,6 @@ eval:
 
   # Re-download framework datasets (use when new tasks land upstream).
   force_download: false
+
+  # Refinement depth override for a looped checkpoint.
+  loop_count: null                    # null = the depth it was trained at

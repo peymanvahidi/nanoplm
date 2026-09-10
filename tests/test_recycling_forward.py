@@ -76,7 +76,7 @@ def test_adapter_none_raises_on_forward_kwarg_override(tokenizer, device):
     input_ids = torch.randint(0, tokenizer.vocab_size, (1, 8), device=device)
     import pytest
     with pytest.raises(ValueError, match="adapter is None"):
-        model(input_ids=input_ids, recycling_loop_count=4, recycling_bptt=2)
+        model(input_ids=input_ids, loop_count=4, recycling_bptt=2)
 
 
 def test_adapter_module_shape_and_bias(tokenizer):
@@ -138,7 +138,7 @@ def test_prelude_receives_gradients_through_loop(tokenizer, device):
 
     out = model(
         input_ids=input_ids, attention_mask=attention_mask, labels=labels,
-        recycling_loop_count=4, recycling_bptt=2,
+        loop_count=4, recycling_bptt=2,
     )
     out.loss.backward()
 
@@ -170,7 +170,7 @@ def test_bptt_window_limits_recurrent_grad_to_last_k_iters(tokenizer, device):
         torch.manual_seed(7)
         out = model(
             input_ids=input_ids, attention_mask=attention_mask, labels=labels,
-            recycling_loop_count=8, recycling_bptt=K,
+            loop_count=8, recycling_bptt=K,
         )
         out.loss.backward()
         grads[K] = recurrent_param.grad.abs().sum().item()

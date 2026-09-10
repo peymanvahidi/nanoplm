@@ -90,6 +90,25 @@ def tiny_model(tokenizer):
     return model
 
 
+@pytest.fixture
+def make_counting_backend():
+    """Factory for a torch.compile backend that counts the graphs it is handed.
+
+    Returns a callable producing ``(backend, counter)`` where ``counter[0]`` is
+    the number of compile events so far.
+    """
+    def _make():
+        n = [0]
+
+        def backend(gm, example_inputs):
+            n[0] += 1
+            return gm.forward
+
+        return backend, n
+
+    return _make
+
+
 @pytest.fixture(autouse=True)
 def set_random_seed():
     """Set random seed for reproducible tests."""
