@@ -59,3 +59,11 @@ class EvalConfig:
     # Works for both loopie and huginn checkpoints; a checkpoint with no
     # looping rejects it.
     loop_count: Optional[int] = None
+
+    # Run the model through torch.compile. Zero-shot scoring is thousands of
+    # forward passes, and eager spends only ~28% of its time in matmuls: the
+    # rest is unfused elementwise work (RoPE, gating, residuals). Compiling
+    # fuses it and roughly doubles throughput (185k -> 375k tok/s on a GH200).
+    # Compiled with dynamic shapes, because every protein is a different
+    # length; warmup is a few seconds and does not recur per shape.
+    torch_compile: bool = True

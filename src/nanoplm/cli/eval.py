@@ -109,7 +109,7 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
         kwargs["framework"] = _coerce_list_of_str(kwargs["framework"], "framework")
 
     # Boolean flags.
-    for key in ("force_download", "development_mode"):
+    for key in ("force_download", "development_mode", "torch_compile"):
         if key in kwargs:
             kwargs[key] = bool(kwargs[key])
 
@@ -230,6 +230,15 @@ def eval():
         "trained with. Requires a looped (loopie or huginn) checkpoint."
     ),
 )
+@click.option(
+    "--torch-compile/--no-torch-compile",
+    default=True,
+    help=(
+        "Run the model through torch.compile with dynamic shapes. Roughly 2x "
+        "faster; eager spends most of its time in unfused elementwise kernels."
+    ),
+    show_default=True,
+)
 def run(
     checkpoint_dir: str,
     framework: tuple,
@@ -242,6 +251,7 @@ def run(
     dataset_dir: Optional[str],
     force_download: bool,
     loop_count: Optional[int],
+    torch_compile: bool,
 ):
     """Run downstream evaluation directly from CLI flags."""
     frameworks_list = list(framework)
@@ -264,6 +274,7 @@ def run(
         dataset_dir=dataset_dir,
         force_download=force_download,
         loop_count=loop_count,
+        torch_compile=torch_compile,
     )
 
     from nanoplm.eval.pipeline import run_eval

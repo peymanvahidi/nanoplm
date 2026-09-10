@@ -39,3 +39,8 @@ eval:
 
   # Refinement depth override for a looped checkpoint.
   loop_count: null                    # null = the depth it was trained at
+
+  # Compile the model (dynamic shapes) before scoring. Zero-shot is thousands
+  # of forwards, and eager leaves ~2x on the table in unfused elementwise
+  # kernels. Turn off only to reproduce an older eager run exactly.
+  torch_compile: true

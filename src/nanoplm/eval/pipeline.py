@@ -216,6 +216,12 @@ def run_eval(eval_config: EvalConfig) -> None:
 
     model = load_checkpoint(checkpoint_dir, model_config, device)
     tokenizer = model.tokenizer
+    if eval_config.torch_compile:
+        # dynamic=True on purpose: shapes vary per protein and per batch, and a
+        # static compile would recompile for each one. Attribute access falls
+        # through to the wrapped module, so `.tokenizer` and friends still work.
+        logger.info("Compiling the model (dynamic shapes) ...")
+        model = torch.compile(model, dynamic=True)
 
     provenance = EvalProvenance.resolve(
         checkpoint_dir=checkpoint_dir,
