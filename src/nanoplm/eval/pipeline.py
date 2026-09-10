@@ -9,9 +9,11 @@ from typing import Any, Optional
 import torch
 
 from nanoplm.eval.checkpoint import (
+    EvalProvenance,
     load_checkpoint,
     load_model_config_from_checkpoint,
     resolve_checkpoint_dir,
+    write_eval_provenance,
 )
 from nanoplm.eval.config import EvalConfig
 from nanoplm.eval.embedder import NanoPLMCustomEmbedder
@@ -97,35 +99,61 @@ def _resolve_zero_shot_method(name: str, biotrainer: dict[str, Any]):
     return method_map[name]
 
 
-def _warn_about_cached_frameworks(
+def _reused_frameworks(
     *,
     biotrainer: dict[str, Any],
-    embedder_name: str,
-    output_dir: Path,
+    report_path: Path,
     frameworks: list[str],
-) -> None:
-    """Warn when an existing report will short-circuit a framework.
+    development_mode: bool,
+) -> list[str]:
+    """The frameworks ``AutoEval`` will reuse from an existing report.
 
-    ``AutoEval`` skips any framework already present in the report on disk and
-    registers no runner for it, so a re-run into the same ``output_dir`` can
-    silently evaluate nothing. Surface that up front.
+    Mirrors ``AutoEval._general_task_setup``, where a stored result stands in
+    for this run unless it covers only a filtered subset of tasks or was
+    produced in development mode while this run wants the full benchmark. A
+    reused framework registers no runner, so an invocation whose every framework
+    is reused evaluates nothing.
     """
-    report_path = output_dir / biotrainer["AutoEvalReport"].get_file_name(embedder_name)
     if not report_path.exists():
-        return
+        return []
+    reused: list[str] = []
     try:
         existing = biotrainer["AutoEvalReport"].from_json_file(report_path)
-        cached = [f for f in frameworks
-                  if existing.maybe_framework_result(FRAMEWORK_REPORT_NAMES[f])]
+        for framework in frameworks:
+            result = existing.maybe_framework_result(FRAMEWORK_REPORT_NAMES[framework])
+            if not result or result.task_filter_applied:
+                continue
+            if result.used_development_mode() and not development_mode:
+                continue
+            reused.append(framework)
     except Exception:
         logger.warning(f"Could not read the existing report at {report_path}.")
-        return
-    if cached:
+        return []
+    if reused:
         logger.warning(
-            f"Existing report {report_path} already holds results for {cached}; "
+            f"Existing report {report_path} already holds results for {reused}; "
             "those frameworks will be reused, not recomputed. Delete the report "
             "or use a fresh output_dir to force a re-run."
         )
+    return reused
+
+
+def _completion_message(
+    *, computed: list[str], reused: list[str], elapsed_s: float
+) -> str:
+    """Say what this invocation computed, so a 0.0s finish cannot read as a run."""
+    if not computed:
+        return (
+            f"AUTOEVAL COMPUTED NOTHING in {elapsed_s:.1f}s: every requested "
+            f"framework {reused} was reused from the existing report. Delete "
+            "the report or use a fresh output_dir to force a re-run."
+        )
+    if reused:
+        return (
+            f"AUTOEVAL COMPLETE in {elapsed_s:.1f}s. "
+            f"Computed {computed}, reused {reused}."
+        )
+    return f"AUTOEVAL COMPLETE in {elapsed_s:.1f}s. Computed {computed}."
 
 
 def run_eval(eval_config: EvalConfig) -> None:
@@ -137,8 +165,10 @@ def run_eval(eval_config: EvalConfig) -> None:
     encoder's embeddings. The zero-shot pair runs through a ``BioEngineer`` and
     the supervised one through a ``CustomEmbedder``, both wrapping the same
     GPU-resident model, and all accumulate into one ``AutoEvalReport`` at
-    ``<output_dir>/autoeval_report_<embedder>.json``. Per-framework artefacts
-    land under ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``.
+    ``<output_dir>/autoeval_report_<embedder>.json``, beside an
+    ``autoeval_report_<embedder>.provenance.json`` sidecar naming the checkpoint
+    behind it. Per-framework artefacts land under
+    ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``.
     """
     _disable_h100_triton_srelu()
 
@@ -185,17 +215,29 @@ def run_eval(eval_config: EvalConfig) -> None:
     model = load_checkpoint(checkpoint_dir, model_config, device)
     tokenizer = model.tokenizer
 
-    embedder_name = eval_config.embedder_name or checkpoint_dir.stem
+    provenance = EvalProvenance.resolve(
+        checkpoint_dir=checkpoint_dir,
+        embedder_name=eval_config.embedder_name,
+        loop_count=eval_config.loop_count,
+    )
+    embedder_name = provenance.embedder_name
     logger.info(f"Embedder name: {embedder_name}")
 
     output_dir = Path(eval_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _warn_about_cached_frameworks(
+    report_path = output_dir / biotrainer["AutoEvalReport"].get_file_name(embedder_name)
+    reused = _reused_frameworks(
         biotrainer=biotrainer,
-        embedder_name=embedder_name,
-        output_dir=output_dir,
+        report_path=report_path,
         frameworks=frameworks,
+        development_mode=eval_config.development_mode,
     )
+
+    # Written before the run so an eval that dies partway still records which
+    # checkpoint it was running.
+    sidecar = write_eval_provenance(provenance, report_path)
+    if sidecar is not None:
+        logger.info(f"Wrote eval provenance sidecar: {sidecar}")
 
     bio_engineer = NanoPLMBioEngineer.build(
         model,
@@ -256,7 +298,14 @@ def run_eval(eval_config: EvalConfig) -> None:
     report = autoeval.run(device=device)
 
     logger.info("=" * 60)
-    logger.info(f"AUTOEVAL COMPLETE in {time.time() - started:.1f}s — Final Report Summary")
+    computed = [f for f in frameworks if f not in reused]
+    message = _completion_message(
+        computed=computed, reused=reused, elapsed_s=time.time() - started
+    )
+    if computed:
+        logger.info(message)
+    else:
+        logger.warning(message)
     logger.info(f"Frameworks in report: {sorted(report.all_framework_names())}")
     logger.info("=" * 60)
     report.summary(development_mode=eval_config.development_mode)

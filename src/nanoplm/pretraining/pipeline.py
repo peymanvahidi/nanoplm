@@ -149,6 +149,13 @@ def run_pretraining(
     manifest: DataManifest,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
+    # This path has no training horizon to run to: PretrainingConfig carries a
+    # token budget rather than an epoch count, and resolve_total_steps lives in
+    # the pure-torch pipeline. The CLI already refuses it in
+    # _check_pipeline_supported; the code below is what it used to do.
+    raise NotImplementedError(
+        "The HF Trainer pretraining path is no longer supported. Use pure_torch=True."
+    )
 
     device = get_device()
 
@@ -223,31 +230,24 @@ def run_pretraining(
     global_batch_seqs = batch.global_batch_seqs
 
     # Prepare run info and step intervals in a single place
-    (
-        run_name,
-        wandb_run_name,
-        output_dir,
-        num_epochs,
-        logging_steps,
-        eval_steps,
-        save_steps,
-        resume_step,
-    ) = prepare_run_and_steps(
+    run = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
-        train_samples=train_sequences,
-        global_batch_seqs=global_batch_seqs,
+        effective_world_size=effective_world_size,
     )
-
-    steps_per_epoch = (train_sequences + global_batch_seqs - 1) // global_batch_seqs
-    total_steps = num_epochs * steps_per_epoch
-    warmup_steps = min(pretrain_config.warmup_steps, total_steps)
+    run_name = run.run_name
+    wandb_run_name = run.wandb_run_name
+    output_dir = str(run.run_root)
+    logging_steps = run.logging_steps
+    eval_steps = run.eval_steps
+    save_steps = run.save_steps
+    resume_step = run.resume_step
 
     # Configure Weights & Biases via environment variables so HF Trainer attaches correctly
     os.environ["WANDB_PROJECT"] = pretrain_config.project_name
     os.environ["WANDB_NAME"] = wandb_run_name
 
-    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers)
 
     training_dict = {
         "output_dir": output_dir,

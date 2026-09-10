@@ -34,6 +34,12 @@ from nanoplm.data.infra.validation import validate_pretrain_dataset
 from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline, DataManifest
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.cli.templates import load_template
+from nanoplm.cli._common import (
+    YAML_FIRST_SECTIONS,
+    ConfigErrorGroup,
+    log_level_option,
+    unknown_keys_message,
+)
 from nanoplm.utils.logger import logger
 
 
@@ -153,7 +159,7 @@ def _check_pipeline_supported(pure_torch: bool) -> None:
         )
 
 
-@click.group(name="pretrain")
+@click.group(name="pretrain", cls=ConfigErrorGroup, sections=YAML_FIRST_SECTIONS)
 @click.help_option("--help", "-h")
 def pretrain():
     """Group of commands for model pretraining."""
@@ -161,6 +167,7 @@ def pretrain():
 
 
 @pretrain.command("run")
+@log_level_option
 @click.help_option("--help", "-h")
 # Dataset and output
 @click.option(
@@ -1269,6 +1276,7 @@ def run(
 
 
 @pretrain.command("from-yaml")
+@log_level_option
 @click.help_option("--help", "-h")
 @click.argument(
     "config",
@@ -1291,14 +1299,7 @@ def from_yaml(config: str, pure_torch: bool):
     If resume.is_resume is True, training will resume from the given
     checkpoint using the hyperparameters in the 'pretraining' block.
     """
-    config = Path(config)
-
-    if config.is_absolute():
-        cwd = config.parent
-        pretrain_yaml = config
-    else:
-        cwd = Path.cwd()
-        pretrain_yaml = cwd / config
+    pretrain_yaml = Path(config).resolve()
 
     raw = read_yaml(pretrain_yaml)
 
@@ -1313,6 +1314,12 @@ def from_yaml(config: str, pure_torch: bool):
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
+    # A relative dataset_dir or ckp_dir resolves against the process working
+    # directory, not against the config file. Resolving here is what makes the
+    # downstream "Validating pretraining dataset: ..." log name a path a reader
+    # can still find weeks later.
+    pretrain_config.dataset_dir = str(Path(pretrain_config.dataset_dir).resolve())
+    pretrain_config.ckp_dir = str(Path(pretrain_config.ckp_dir).resolve())
     _check_muon_available(pretrain_config.optimizer)
 
     model_config = _load_model_config(model_dict)
@@ -1508,9 +1515,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             kwargs[key] = value
 
     if extra:
-        raise ValueError(
-            f"Unexpected training configuration keys: {', '.join(sorted(extra))}"
-        )
+        raise ValueError(unknown_keys_message("training", extra, expected_keys))
 
     # Explicitly convert float-like fields if they are strings (handles scientific notation).
     float_fields = [

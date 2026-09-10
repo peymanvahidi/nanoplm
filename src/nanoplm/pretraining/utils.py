@@ -6,13 +6,15 @@ import json
 import math
 import os
 import shutil
+import sys
 import torch
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Union
 
-from nanoplm.utils.common import create_dirs
+from nanoplm.data.infra.atomic import atomic_write_path
+from nanoplm.utils.common import git_sha, is_global_main, job_stamp
 from nanoplm.utils.logger import logger
 
 if TYPE_CHECKING:
@@ -117,21 +119,26 @@ def format_passes_hint(budget_tokens: int, total_train_tokens: int,
             f"train set (each sample seen ~{passes:.1f}×){tag}")
 
 
-def get_num_workers(user_value: Union[int, str], world_size: int) -> int:
+def get_num_workers(user_value: Union[int, str]) -> int:
+    """Resolve ``num_workers``, expanding ``"auto"`` to 4 workers for this rank.
 
+    DataLoader workers are spawned per process, so the count must never be
+    derived from a rank count. Every rank sharing a node pays it separately, and
+    scaling by the global world size put 256 worker processes on a 4-node host
+    and OOM-killed job 1702372. The only ceiling that belongs here is this
+    task's own CPU budget, which ``sched_getaffinity`` reports and ``cpu_count``
+    does not, since ``cpu_count`` sees the whole node through a SLURM binding.
+    """
     if isinstance(user_value, str) and user_value == "auto":
-        cpu_cores = os.cpu_count() or 1
+        get_affinity = getattr(os, "sched_getaffinity", None)
+        task_cpus = len(get_affinity(0)) if get_affinity else (os.cpu_count() or 1)
 
-        # Leave some room for OS / other processes
-        max_reasonable = max(1, cpu_cores - 2)
+        workers = max(1, min(4, task_cpus - 1))
 
-        # Heuristic: 4 workers per GPU is a good starting point
-        workers_per_gpu = 4
-        target = workers_per_gpu * max(1, world_size)
-
-        workers = max(1, min(target, max_reasonable))
-
-        logger.info(f"Auto-setting num_workers to {workers} for {world_size} GPU(s).")
+        logger.info(
+            f"Auto-setting num_workers to {workers} per rank "
+            f"(task CPU budget {task_cpus}, node CPUs {os.cpu_count()})."
+        )
 
         return workers
 
@@ -252,72 +259,101 @@ def _read_checkpoint_epoch(checkpoint_dir: Union[str, Path]) -> int:
     )
 
 
+@dataclass(frozen=True)
+class RunIdentity:
+    """Which run this process belongs to, and the cadence it runs at.
+
+    ``wandb_run_name`` names a W&B session, which only the global main opens, so
+    on every other rank it is just ``run_name``. Likewise ``resume_step`` is the
+    step the global main archived forward from, and is None elsewhere.
+    """
+    run_name: str
+    run_root: Path
+    wandb_run_name: str
+    is_resume: bool
+    resume_step: Optional[int]
+    logging_steps: int
+    eval_steps: int
+    save_steps: int
+
+
+def _write_run_manifest(
+    run: RunIdentity,
+    pretrain_config: PretrainingConfig,
+    effective_world_size: int,
+) -> None:
+    """Record in the run root what a checkpoint cannot tell you afterwards.
+
+    A checkpoint's ``pretrain_config.yaml`` stores the config as written, so
+    ``world_size: auto`` stays "auto" and the directories stay CWD-relative, and
+    nothing anywhere records which commit ran or what was typed to start it.
+    """
+    manifest = {
+        "run_name": run.run_name,
+        "wandb_run_name": run.wandb_run_name,
+        "is_resume": run.is_resume,
+        "resume_step": run.resume_step,
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "world_size": effective_world_size,
+        "git_sha": git_sha(Path(__file__).resolve().parent),
+        "argv": sys.argv,
+        "dataset_dir": str(Path(pretrain_config.dataset_dir).resolve()),
+        "ckp_dir": str(Path(pretrain_config.ckp_dir).resolve()),
+    }
+    try:
+        with atomic_write_path(run.run_root / "run.json") as tmp:
+            tmp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"Could not write run.json into {run.run_root}: {exc}")
+
+
 def prepare_run_and_steps(
     pretrain_config: PretrainingConfig,
     resume_config: Optional[ResumeConfig],
-    train_samples: int,
-    global_batch_seqs: int,
-) -> Tuple[str, str, str, None, int, int, int, Optional[int]]:
+    effective_world_size: int,
+) -> RunIdentity:
     """Prepare run naming/dirs and resolve the raw logging/eval/save intervals.
 
-    The training horizon (total_steps) is no longer derived from epochs here:
-    it comes from the token budget and is computed by the caller via
-    ``resolve_total_steps``. This helper therefore returns the *raw* configured
-    intervals (un-clamped); the caller clamps them to the token-budget
-    total_steps once the horizon is known.
+    The training horizon (total_steps) is not derived here: it comes from the
+    token budget and is computed by the caller via ``resolve_total_steps``. The
+    returned intervals are therefore the *raw* configured ones (un-clamped); the
+    caller clamps them to the token-budget total_steps once the horizon is known.
 
     Args:
         pretrain_config: Pretraining configuration
         resume_config: Resume configuration (if resuming)
-        train_samples: Number of training samples (from manifest) [unused for
-            horizon now; kept for signature stability]
-        global_batch_seqs: Effective samples per optimizer step [unused for
-            horizon now; kept for signature stability]
-
-    Returns a tuple: (run_name, wandb_run_name, output_dir, None,
-                      logging_steps, eval_steps, save_steps, resume_step).
-    The 4th return slot is always ``None`` (now unused): the horizon is
-    token-budget driven and resolved by the caller.
+        effective_world_size: Ranks this job actually runs on, already resolved
+            from the config's ``world_size`` (which may be the string "auto")
     """
     ckp_root = Path(pretrain_config.ckp_dir)
 
-    is_local_main = int(os.environ.get("LOCAL_RANK", 0)) == 0
+    is_main = is_global_main()
+    is_resume = bool(resume_config and resume_config.is_resume)
 
-    # Determine run directory and name
-    if resume_config and resume_config.is_resume:
+    if is_resume:
         checkpoint_path = Path(resume_config.checkpoint_dir)
-        original_run_name = checkpoint_path.parent.name
-        run_name = original_run_name  # Continue in same directory
+        run_name = checkpoint_path.parent.name
         run_root = ckp_root / run_name
+        wandb_run_name = run_name
+        resume_step = None
 
-        # Track resume counter for W&B run naming
-        counter_file = run_root / ".resume_counter"
-        if counter_file.exists():
-            try:
-                resume_counter = int(counter_file.read_text().strip()) + 1
-            except (ValueError, FileNotFoundError):
-                resume_counter = 1
-        else:
-            resume_counter = 1
-
-        # Save updated counter and archive future checkpoints (rank 0 only).
         # run_root is derived from the checkpoint's name, not from where the
         # checkpoint lives, so it does not exist yet when resuming into a fresh
         # ckp_dir -- which is what you do to keep the source run read-only.
-        if is_local_main:
+        if is_main:
             run_root.mkdir(parents=True, exist_ok=True)
+            counter_file = run_root / ".resume_counter"
+            try:
+                resume_counter = int(counter_file.read_text().strip()) + 1
+            except (OSError, ValueError):
+                resume_counter = 1
             counter_file.write_text(str(resume_counter), encoding="utf-8")
+            wandb_run_name = f"{run_name}-re{resume_counter}"
+            logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
 
-        # Create W&B run name with counter
-        wandb_run_name = f"{run_name}-re{resume_counter}"
-        logger.info(f"Resume session #{resume_counter}: W&B run name = {wandb_run_name}")
-
-        # Archive any future checkpoints to prevent conflicts (rank 0 only).
-        # Use checkpoint_step so resuming from a role-named dir (e.g.
-        # checkpoint-stable-end) resolves its true step from training_state.json
-        # instead of failing to parse the name.
-        resume_step = None
-        if is_local_main:
+            # checkpoint_step resolves a role-named dir (e.g.
+            # checkpoint-stable-end) from training_state.json rather than
+            # failing to parse its name.
             step = checkpoint_step(checkpoint_path)
             if step >= 0:
                 resume_step = step
@@ -328,42 +364,25 @@ def prepare_run_and_steps(
                     f"Skipping future checkpoint archival."
                 )
     else:
-        slurm_job_id = os.environ.get("SLURM_JOB_ID")
-        base_stamp = slurm_job_id if slurm_job_id else datetime.now().strftime("%d%m%H%M")
-        base_name = f"{pretrain_config.run_name}-{base_stamp}"
-        candidate = base_name
-        if ckp_root.exists():
-            suffix = 2
-            while (ckp_root / candidate).exists():
-                candidate = f"{base_name}-{suffix}"
-                suffix += 1
-        run_name = candidate
+        run_name = f"{pretrain_config.run_name}-{job_stamp()}"
         run_root = ckp_root / run_name
-        wandb_run_name = run_name  # Same as directory name for new runs
+        wandb_run_name = run_name
         resume_step = None
 
-    if is_local_main:
-        create_dirs(str(run_root))
-    output_dir = str(run_root)
-
-    # Persist run metadata for future resumes (rank 0 only)
-    if is_local_main:
+    if is_main:
+        run_root.mkdir(parents=True, exist_ok=True)
         try:
-            (Path(output_dir) / "run_name.txt").write_text(run_name, encoding="utf-8")
-        except Exception:
-            pass
+            (run_root / "run_name.txt").write_text(run_name, encoding="utf-8")
+        except OSError as exc:
+            logger.warning(f"Could not write run_name.txt into {run_root}: {exc}")
 
-    # Resolve raw logging/eval/save intervals. The token-budget total_steps is
-    # computed by the caller (run_pure_pretraining via resolve_total_steps);
-    # the caller clamps these intervals to it once the horizon is known.
     logging_steps = max(1, pretrain_config.logging_steps)
     eval_steps = max(1, pretrain_config.eval_steps)
     save_steps = max(1, pretrain_config.save_steps)
 
-    # On resume, preserve the original logging/eval/save intervals recorded in
-    # the checkpoint's training_args.bin when available, so cadence is stable
-    # across resume sessions.
-    if resume_config and resume_config.is_resume:
+    # A resumed run keeps the cadence recorded in the checkpoint, so logging
+    # and saving stay aligned across resume sessions.
+    if is_resume:
         training_args_path = Path(resume_config.checkpoint_dir) / "training_args.bin"
         if training_args_path.exists():
             try:
@@ -375,8 +394,18 @@ def prepare_run_and_steps(
                     f"Resuming with preserved intervals: save_steps={save_steps}, eval_steps={eval_steps}"
                 )
             except Exception:
-                # Fall back to the raw configured intervals computed above.
                 pass
 
-    # 4th return slot (now unused) is None: horizon is token-budget driven.
-    return run_name, wandb_run_name, output_dir, None, logging_steps, eval_steps, save_steps, resume_step
+    run = RunIdentity(
+        run_name=run_name,
+        run_root=run_root,
+        wandb_run_name=wandb_run_name,
+        is_resume=is_resume,
+        resume_step=resume_step,
+        logging_steps=logging_steps,
+        eval_steps=eval_steps,
+        save_steps=save_steps,
+    )
+    if is_main:
+        _write_run_manifest(run, pretrain_config, effective_world_size)
+    return run

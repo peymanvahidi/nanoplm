@@ -6,6 +6,12 @@ from typing import Any, Dict, List, Optional
 
 import click
 
+from nanoplm.cli._common import (
+    YAML_FIRST_SECTIONS,
+    ConfigErrorGroup,
+    log_level_option,
+    unknown_keys_message,
+)
 from nanoplm.eval.config import EvalConfig
 from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
@@ -69,9 +75,9 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
     expected_keys = set(EvalConfig.__annotations__.keys())
     present_keys = set(config.keys())
 
-    extra = sorted(present_keys - expected_keys)
+    extra = present_keys - expected_keys
     if extra:
-        raise ValueError(f"Unexpected eval configuration keys: {', '.join(extra)}")
+        raise ValueError(unknown_keys_message("eval", extra, expected_keys))
 
     if "checkpoint_dir" not in config or not config["checkpoint_dir"]:
         raise ValueError("checkpoint_dir is required in eval configuration")
@@ -123,7 +129,7 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
     return EvalConfig(**kwargs)
 
 
-@click.group(name="eval")
+@click.group(name="eval", cls=ConfigErrorGroup, sections=YAML_FIRST_SECTIONS)
 @click.help_option("--help", "-h")
 def eval():
     """Group of commands for downstream evaluation."""
@@ -131,6 +137,7 @@ def eval():
 
 
 @eval.command("run")
+@log_level_option
 @click.help_option("--help", "-h")
 @click.option(
     "--checkpoint-dir",
@@ -264,6 +271,7 @@ def run(
 
 
 @eval.command("from-yaml")
+@log_level_option
 @click.help_option("--help", "-h")
 @click.argument(
     "config",
@@ -280,11 +288,7 @@ def from_yaml(config: str):
             framework: [pgym]
             ...
     """
-    config_path = Path(config)
-    if config_path.is_absolute():
-        eval_yaml = config_path
-    else:
-        eval_yaml = Path.cwd() / config_path
+    eval_yaml = Path(config).resolve()
 
     raw = read_yaml(eval_yaml) or {}
     if not isinstance(raw, dict):
@@ -293,10 +297,7 @@ def from_yaml(config: str):
         )
     eval_dict = raw.get("eval")
 
-    try:
-        eval_config = _load_eval_config(eval_dict)
-    except ValueError as e:
-        raise click.ClickException(str(e)) from e
+    eval_config = _load_eval_config(eval_dict)
 
     _validate_frameworks(eval_config.framework)
     _check_biotrainer_available()

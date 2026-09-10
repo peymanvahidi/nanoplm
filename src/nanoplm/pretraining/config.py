@@ -151,7 +151,10 @@ class PretrainingConfig:
     mlm_standard_amino_acids_only: bool = True
 
     # Logging/checkpointing
-    logging_steps: int = 1
+    # At 1, the step line is 94% of a run log and every step pays a
+    # cuda.synchronize(), a D2H copy and an all_reduce. 25 divides the
+    # default eval_steps (250), which the VRAM/peak-reset line depends on.
+    logging_steps: int = 25
     eval_steps: int = 250
     save_steps: int = 5000
     # Wall-clock budget for training, in hours. When set, the run checkpoints
@@ -161,6 +164,10 @@ class PretrainingConfig:
     # autotune and warmup are excluded and the budget measures steady-state
     # training: expect total job time to exceed it. It also restarts from zero
     # on resume, measuring this run rather than cumulative time across resumes.
+    # Left unset, the deadline instead defaults to SLURM's projected job end
+    # minus a margin for the final checkpoint write, so a job that runs out of
+    # time stops and checkpoints itself rather than being killed mid-step. This
+    # value overrides that, which is why an ablation should set it explicitly.
     max_wallclock_hours: Optional[float] = None
     seed: int = 42
     debug_non_finite_params: bool = True

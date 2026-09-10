@@ -8,9 +8,10 @@ import gc
 import json
 import math
 import os
+import signal
 import yaml
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 try:
     from dion import Muon
 except ImportError:
@@ -35,8 +36,9 @@ os.environ.setdefault("TORCHINDUCTOR_MIX_ORDER_REDUCTION", "0")
 import random
 import time
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -119,6 +121,15 @@ BATCH_COORD_TAIL_STEPS = 64
 # loop is at steady state, which is the throughput a wall-clock-matched
 # ablation is trying to compare.
 _WALLCLOCK_WARMUP_STEPS = 2
+
+# Seconds of a SLURM job's remaining time to leave unused when the wall-clock
+# deadline is defaulted from the environment. Measured on job 1684851 (16 ranks,
+# 4 nodes, 650M params): a checkpoint write costs 6.8-26.4s (median 22.8s over 21
+# writes), an eval 1.9-6.4s, and the median optimizer step is 200ms, so the tail
+# after a deadline trips is under a minute. 300s is 5x that, and _save_checkpoint
+# writes straight into the final checkpoint-N/ directory with no temp-and-rename,
+# so a SIGKILL mid-write would leave a partial directory that looks complete.
+_SLURM_DEADLINE_MARGIN_SEC = 300.0
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +383,223 @@ def _build_compiled_training_model(
             ddp_kwargs["output_device"] = local_rank
         compiled_model = DistributedDataParallel(compiled_model, **ddp_kwargs)
     return compiled_model
+
+
+_RUN_RULE = "=" * 80
+
+
+def _format_token_count(n: int) -> str:
+    if n >= 1e12:
+        return f"{n/1e12:.2f}T"
+    if n >= 1e9:
+        return f"{n/1e9:.1f}B"
+    if n >= 1e6:
+        return f"{n/1e6:.1f}M"
+    return f"{n:,}"
+
+
+@dataclass(frozen=True)
+class _RunHeader:
+    run_name: str
+    resume_step: Optional[int]
+    job_id: str
+    git_sha: str
+    wandb_run_id: str
+    run_root: str
+    dataset_dir: str
+    train_seqs: int
+    val_seqs: int
+    max_seq_len: int
+    world_size: int
+    nodes: int
+    dist_mode: str
+    global_batch_tokens: int
+    grad_accum: int
+    total_steps: int
+    total_tokens: int
+    warmup_steps: int
+    logging_steps: int
+    eval_steps: int
+    save_steps: int
+    stop: str
+
+
+def _node_count(world_size: int) -> int:
+    """Nodes this job spans.
+
+    The pretraining launcher is bare ``srun``, not torchrun, so it exports
+    RANK/LOCAL_RANK/WORLD_SIZE itself and LOCAL_WORLD_SIZE is absent. SLURM's own
+    node count is therefore the only reliable source, with the torchrun-derived
+    value kept as a fallback for a torchrun-launched run.
+    """
+    for key in ("SLURM_NNODES", "SLURM_JOB_NUM_NODES"):
+        raw = os.environ.get(key)
+        if raw:
+            try:
+                return max(1, int(raw))
+            except ValueError:
+                pass
+    raw = os.environ.get("LOCAL_WORLD_SIZE")
+    try:
+        local = int(raw) if raw else 0
+    except ValueError:
+        local = 0
+    return max(1, world_size // local) if local else 1
+
+
+def _format_run_header(h: _RunHeader) -> str:
+    resume = "" if h.resume_step is None else f" (resume from step {h.resume_step:,})"
+    return "\n".join([
+        _RUN_RULE,
+        f"run     {h.run_name}{resume}   job={h.job_id} code={h.git_sha} wandb={h.wandb_run_id}",
+        f"out     {h.run_root}",
+        f"data    {h.dataset_dir}   train_seqs={h.train_seqs:,} "
+        f"val_seqs={h.val_seqs:,} max_len={h.max_seq_len}",
+        f"scale   ranks={h.world_size} nodes={h.nodes} mode={h.dist_mode}   "
+        f"global_batch={h.global_batch_tokens:,} tok grad_accum={h.grad_accum}",
+        f"budget  total_steps={h.total_steps:,} = {_format_token_count(h.total_tokens)} tokens   "
+        f"warmup={h.warmup_steps:,}   "
+        f"log/eval/save={h.logging_steps}/{h.eval_steps}/{h.save_steps}",
+        f"stop    {h.stop}",
+        _RUN_RULE,
+    ])
+
+
+@dataclass
+class _RunProgress:
+    """Run state as already-computed values, so a signal handler can read it."""
+    total_steps: int
+    run_root: str
+    wandb_run_id: str
+    step: int = 0
+    tokens: int = 0
+    reason: str = "running"
+    last_checkpoint: str = ""
+
+
+def _format_run_exit(p: _RunProgress, wall_sec: float) -> str:
+    pct = 100.0 * p.step / max(1, p.total_steps)
+    last = "" if not p.last_checkpoint else f"   last={p.last_checkpoint}"
+    return "\n".join([
+        _RUN_RULE,
+        f"exit    reason={p.reason} step={p.step:,}/{p.total_steps:,} ({pct:.1f}%) "
+        f"wall={wall_sec / 3600.0:.2f}h tokens={_format_token_count(p.tokens)}",
+        f"out     {p.run_root}{last}   wandb={p.wandb_run_id}",
+        _RUN_RULE,
+    ])
+
+
+def _should_log_step(global_step: int, logging_steps: int, start_step: int) -> bool:
+    """Log on the cadence, plus this run's very first step.
+
+    The first optimizer step pays for torch.compile, autotuning and NCCL warmup.
+    Folding it into the first cadence window would make that window's dt, tok/s
+    and h100_mfu measure setup rather than training, so it gets a line of its own
+    and the next window starts clean. It also confirms the loop turned over
+    without waiting a whole window, which on a short run is most of the run.
+
+    Every rank derives this from global_step alone, so ranks never disagree about
+    a step that gates a collective.
+    """
+    return global_step % logging_steps == 0 or global_step == start_step + 1
+
+
+def _install_sigterm_reporter(progress: _RunProgress, wall_sec: Callable[[], float]) -> None:
+    """Leave one line in the log saying where a SLURM kill landed.
+
+    SLURM sends SIGTERM before SIGKILL (KillWait is 30s on this cluster, and job
+    1684851's .err shows srun waiting 32s), and today a killed run's log just
+    stops mid-step-line with the only explanation in the .err file, which
+    --error routes elsewhere. A handler runs on the main thread between
+    bytecodes, so this does the least it can: mutate an already-built record,
+    emit one already-formatted line, then restore the default disposition and
+    re-raise so the process's exit status is unchanged. No collective and no
+    checkpoint write, both of which would hang or tear at this point.
+    """
+    owner_pid = os.getpid()
+
+    def _on_sigterm(signum, frame) -> None:
+        if os.getpid() == owner_pid:
+            progress.reason = "sigterm"
+            logger.warning("%s", _format_run_exit(progress, wall_sec()))
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError:
+        logger.debug("SIGTERM reporter not installed: not running on the main thread.")
+
+
+class _StopPolicy(NamedTuple):
+    """When this run stops early, and which input decided it.
+
+    At most one of the two stops is ever set, because an explicit config value
+    always wins over the environment. ``limit_sec`` is a duration of steady-state
+    training, which is what a wall-clock-matched ablation wants and which
+    deliberately excludes compile and autotune. ``deadline_ts`` is an absolute
+    unix time, because SLURM's job end does not care what the run spent on setup.
+    ``slurm_deadline_ts`` records what SLURM said whether or not it won, so the
+    header can warn when a configured budget overruns the job.
+    """
+    limit_sec: Optional[float]
+    deadline_ts: Optional[float]
+    source: str
+    slurm_deadline_ts: Optional[float]
+
+    @property
+    def enabled(self) -> bool:
+        return self.limit_sec is not None or self.deadline_ts is not None
+
+
+def _slurm_deadline_ts(margin_sec: float, now: float) -> Optional[float]:
+    """Absolute unix time to stop by, from SLURM's projected job end.
+
+    SLURM_JOB_END_TIME is documented as an output environment variable holding a
+    unix timestamp, but nothing in this repo has ever recorded it, so an absent,
+    unparseable or already-passed value falls back to no deadline rather than
+    guessing at one.
+    """
+    raw = os.environ.get("SLURM_JOB_END_TIME")
+    if not raw:
+        return None
+    try:
+        stop_ts = float(raw) - margin_sec
+    except ValueError:
+        return None
+    return stop_ts if stop_ts > now else None
+
+
+def _resolve_stop_policy(hours: Optional[float], margin_sec: float, now: float) -> _StopPolicy:
+    slurm_ts = _slurm_deadline_ts(margin_sec, now)
+    if hours is not None and float(hours) > 0:
+        return _StopPolicy(float(hours) * 3600.0, None, "config", slurm_ts)
+    if slurm_ts is not None:
+        return _StopPolicy(None, slurm_ts, "slurm", slurm_ts)
+    return _StopPolicy(None, None, "unset", None)
+
+
+def _describe_stop_policy(p: _StopPolicy, now: float) -> str:
+    if p.source == "config":
+        text = (
+            f"max_wallclock_hours={p.limit_sec / 3600.0:.3g}h of steady-state "
+            f"training (source=config)"
+        )
+        if p.slurm_deadline_ts is not None and now + p.limit_sec > p.slurm_deadline_ts:
+            over = (now + p.limit_sec - p.slurm_deadline_ts) / 3600.0
+            text += f"  ** {over:.2f}h PAST the SLURM deadline, this run will be killed **"
+        return text
+    if p.source == "slurm":
+        left = (p.deadline_ts - now) / 3600.0
+        when = datetime.fromtimestamp(p.deadline_ts).strftime("%Y-%m-%dT%H:%M:%S")
+        return (
+            f"SLURM deadline {when}, {left:.2f}h from now "
+            f"(margin {_SLURM_DEADLINE_MARGIN_SEC / 60:.0f}m, source=SLURM_JOB_END_TIME)"
+        )
+    return (
+        "none; SLURM_JOB_END_TIME unset, unparseable or too close to use, so the "
+        "job's time limit will kill this run"
+    )
 
 
 def _format_vram_for_log(
@@ -1877,13 +2105,6 @@ def run_pure_pretraining(
         if not d.exists():
             raise FileNotFoundError(f"Shard directory not found: {d}")
 
-    logger.info(f"Loaded config from manifest: {dataset_dir}")
-    logger.info(f"  train_shards: {train_shard_dir}")
-    logger.info(f"  val_shards: {val_shard_dir}")
-    logger.info(f"  max_length: {manifest.max_seq_len}")
-    logger.info(f"  train_sequences: {manifest.train_sequences}")
-    logger.info(f"  val_sequences: {manifest.val_sequences}")
-
     logger.info("Using ShardedDataset for pre-tokenized binary shards")
     train_ds = ShardedDataset(data_dir=str(train_shard_dir))
     val_ds = ShardedDataset(data_dir=str(val_shard_dir))
@@ -1926,8 +2147,6 @@ def run_pure_pretraining(
         if not use_static_inp_size:
             raise ValueError("MoE requires use_static_inp_size=True")
 
-    # ---- Batch sizing ----
-    create_dirs(pretrain_config.ckp_dir)
     effective_world_size = _resolve_world_size(pretrain_config)
 
     inferred_grad_accum_steps = pretrain_config.inferred_grad_accum_steps
@@ -1949,24 +2168,18 @@ def run_pure_pretraining(
         f"effective_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
 
-    # ---- Run naming / output dir ----
-    (
-        _run_name,
-        wandb_run_name,
-        output_dir,
-        _,  # 4th slot is always None: horizon is token-budget driven
-        logging_steps,
-        eval_steps,
-        save_steps,
-        _resume_step,
-    ) = prepare_run_and_steps(
+    run = prepare_run_and_steps(
         pretrain_config=pretrain_config,
         resume_config=resume_config,
-        train_samples=manifest.train_sequences,
-        global_batch_seqs=global_batch_seqs,
+        effective_world_size=effective_world_size,
     )
+    wandb_run_name = run.wandb_run_name
+    output_dir = str(run.run_root)
+    logging_steps = run.logging_steps
+    eval_steps = run.eval_steps
+    save_steps = run.save_steps
 
-    num_workers = get_num_workers(pretrain_config.num_workers, effective_world_size)
+    num_workers = get_num_workers(pretrain_config.num_workers)
     pin_memory = device.type == "cuda"
     # Disable persistent workers when packing: TokenPackingDataset + persistent_workers
     # can cause hangs near epoch boundaries (set_epoch doesn't reach workers, worker
@@ -2338,6 +2551,15 @@ def run_pure_pretraining(
     eval_steps = max(1, min(total_steps, eval_steps))
     save_steps = max(1, min(total_steps, save_steps))
 
+    if is_main and eval_steps % logging_steps != 0:
+        logger.warning(
+            "eval_steps=%d is not a multiple of logging_steps=%d. The vram=/peak= "
+            "fields need a step divisible by both, so they will appear every %d "
+            "steps instead of every %d, and the peak counter resets that rarely. "
+            "Pick a logging_steps that divides eval_steps.",
+            eval_steps, logging_steps, math.lcm(logging_steps, eval_steps), eval_steps,
+        )
+
     if global_batch_warmup_steps > 0:
         logger.warning(
             "global_batch_warmup_steps=%d > 0: the token budget is approximate "
@@ -2572,6 +2794,7 @@ def run_pure_pretraining(
 
     # ---- W&B ----
     wandb_enabled = False
+    wandb_run_id = ""
     if is_main:
         try:
             wandb.init(
@@ -2586,7 +2809,9 @@ def run_pure_pretraining(
                 wandb.define_metric("time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("train/time_elapsed_sec", step_metric="train/global_step", step_sync=True)
                 wandb.define_metric("*", step_metric="train/global_step", step_sync=True)
+                wandb_run_id = wandb.run.id
                 upload_run_source_snapshot()
+                (Path(output_dir) / "wandb_run_id.txt").write_text(wandb.run.id, encoding="utf-8")
         except Exception as exc:
             logger.warning(f"W&B init failed, continuing without logging. Error: {exc}")
 
@@ -2640,33 +2865,23 @@ def run_pure_pretraining(
     logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
 
     _run_t0 = time.perf_counter()
-    # Wall-clock stop. The clock is NOT started here: the first optimizer steps
+    # Wall-clock stop, from the config's duration or else SLURM's job end. A
+    # configured duration's clock is NOT started here: the first optimizer steps
     # pay for torch.compile, autotune and cuDNN/NCCL warmup, which would make the
     # budget measure setup instead of throughput and would differ between the
     # arms of an ablation. It is armed after _WALLCLOCK_WARMUP_STEPS steps of
     # THIS run (so a resume gets a fresh budget), and is only read at optimizer-
-    # step boundaries, where a checkpoint has a consistent resume position.
-    _wallclock_hours = getattr(pretrain_config, "max_wallclock_hours", None)
-    wallclock_limit_sec = (
-        float(_wallclock_hours) * 3600.0
-        if _wallclock_hours is not None and float(_wallclock_hours) > 0
-        else None
+    # step boundaries, where a checkpoint has a consistent resume position. A
+    # SLURM deadline is an absolute time, so it needs no arming and is read from
+    # the first log step on.
+    stop_policy = _resolve_stop_policy(
+        getattr(pretrain_config, "max_wallclock_hours", None),
+        _SLURM_DEADLINE_MARGIN_SEC,
+        time.time(),
     )
+    wallclock_limit_sec = stop_policy.limit_sec
+    wallclock_deadline_ts = stop_policy.deadline_ts
     wallclock_t0 = None
-    if wallclock_limit_sec is not None:
-        logger.info(
-            "Wall-clock stop enabled: training will checkpoint and exit after "
-            f"{_wallclock_hours}h ({wallclock_limit_sec:,.0f}s) of steady-state "
-            f"training even if total_steps={total_steps} has not been reached. "
-            f"The clock starts after step {start_step + _WALLCLOCK_WARMUP_STEPS}, "
-            f"so compile/warmup is excluded and total job time is longer."
-        )
-    logger.info(
-        f"Starting pure-torch training: total_steps={total_steps} (token-budget driven), "
-        f"warmup_steps={warmup_steps}, global_batch_warmup_steps={global_batch_warmup_steps}, "
-        f"grad_accum={inferred_grad_accum_steps}, "
-        f"achieved_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
-    )
     logger.info(
         f"Precision config: bf16={use_bf16}, fp16={use_fp16}, "
         f"tf32={(pretrain_config.tf32 and device.type == 'cuda')}, fp8={pretrain_config.fp8}"
@@ -2821,6 +3036,45 @@ def run_pure_pretraining(
             mbs_divisor,
         )
 
+    _manifest_path = Path(output_dir) / "run.json"
+    try:
+        _run_manifest = json.loads(_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        _run_manifest = {}
+    run_progress = _RunProgress(
+        total_steps=total_steps,
+        run_root=output_dir,
+        wandb_run_id=wandb_run_id or "off",
+        step=start_step,
+        tokens=tokens_seen,
+    )
+    if is_main:
+        _install_sigterm_reporter(run_progress, lambda: time.perf_counter() - _run_t0)
+        logger.info("%s", _format_run_header(_RunHeader(
+            run_name=_run_manifest.get("run_name") or Path(output_dir).name,
+            resume_step=_run_manifest.get("resume_step"),
+            job_id=_run_manifest.get("slurm_job_id") or "-",
+            git_sha=_run_manifest.get("git_sha") or "-",
+            wandb_run_id=run_progress.wandb_run_id,
+            run_root=output_dir,
+            dataset_dir=_run_manifest.get("dataset_dir") or str(dataset_dir),
+            train_seqs=manifest.train_sequences,
+            val_seqs=manifest.val_sequences,
+            max_seq_len=manifest.max_seq_len,
+            world_size=effective_world_size,
+            nodes=_node_count(effective_world_size),
+            dist_mode=distributed_mode if distributed else "single",
+            global_batch_tokens=achieved_global_batch_tokens,
+            grad_accum=inferred_grad_accum_steps,
+            total_steps=total_steps,
+            total_tokens=total_steps * achieved_global_batch_tokens,
+            warmup_steps=warmup_steps,
+            logging_steps=logging_steps,
+            eval_steps=eval_steps,
+            save_steps=save_steps,
+            stop=_describe_stop_policy(stop_policy, time.time()),
+        )))
+
     # Step-driven outer loop: repeat the DataLoader (one pass == one "epoch")
     # until the token-budget total_steps is reached. The horizon is driven by
     # global_step, not a fixed epoch count.
@@ -2845,6 +3099,7 @@ def run_pure_pretraining(
             phase=phase,
             **over,
         )
+        run_progress.last_checkpoint = _checkpoint_dir_name(global_step, phase)
 
     with profiler_ctx:
         while global_step < total_steps:
@@ -3280,12 +3535,14 @@ def run_pure_pretraining(
                     window_steps += 1
                     accum_loss.zero_()
 
-                    should_log = global_step % logging_steps == 0
+                    should_log = _should_log_step(global_step, logging_steps, start_step)
+                    run_progress.step = global_step
+                    run_progress.tokens = tokens_seen
                     vram_log = ""
                     tps = mfu = tok = raw_tok = 0.0
                     step_tok = step_raw_tok = 0.0
                     real_tps = real_tps_log = 0.0
-                    avg_step_ms = 0.0
+                    avg_step_ms = eta_hours = 0.0
                     if should_log:
                         if device.type == "cuda":
                             torch.cuda.synchronize()
@@ -3293,6 +3550,9 @@ def run_pure_pretraining(
                         window_dt = max(1e-9, t1 - log_window_t0)
                         log_window_t0 = t1
                         avg_step_ms = (window_dt * 1000.0) / max(1, window_steps)
+                        eta_hours = (
+                            (total_steps - global_step) * (window_dt / max(1, window_steps)) / 3600.0
+                        )
                         log_buf[0] = window_loss / max(1, window_steps)
                         log_buf[1] = grad_norm.full_tensor() if isinstance(grad_norm, DTensor) else (grad_norm if isinstance(grad_norm, torch.Tensor) else float(grad_norm))
                         log_vals = log_buf.cpu()
@@ -3382,7 +3642,8 @@ def run_pure_pretraining(
                             f"loss={avg_loss:.4f} lr={learning_rate:.2e} {muon_str}"
                             f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} real_tok/s={real_tps_log:,} "
                             f"real_tok/step={step_tok:,.0f} "
-                            f"dt={avg_step_ms:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
+                            f"dt={avg_step_ms:.2f}ms eta={eta_hours:.2f}h "
+                            f"wall={wall_elapsed:.1f}s waste={waste:.1f}% "
                             f"h100_mfu={mfu:.2%} {moe_str}{vram_log}"
                         )
                         payload = {
@@ -3476,8 +3737,15 @@ def run_pure_pretraining(
                                     wallclock_t0 - _run_t0,
                                     wallclock_limit_sec / 3600.0,
                                 )
-                    elif wallclock_limit_sec is not None and not at_terminal:
-                        hit_wallclock = (time.perf_counter() - wallclock_t0) >= wallclock_limit_sec
+                    elif stop_policy.enabled and should_log and not at_terminal:
+                        # Read only on log steps. That step already pays a device
+                        # sync and a collective, so the reduce below is free there,
+                        # and the stop overshoots the deadline by at most
+                        # logging_steps steps (5s at 25 steps of 200ms).
+                        if wallclock_limit_sec is not None:
+                            hit_wallclock = (time.perf_counter() - wallclock_t0) >= wallclock_limit_sec
+                        else:
+                            hit_wallclock = time.time() >= wallclock_deadline_ts
                         if distributed and dist.is_initialized():
                             _wc = torch.tensor(
                                 [1.0 if hit_wallclock else 0.0], device=device
@@ -3564,12 +3832,23 @@ def run_pure_pretraining(
                         wallclock_stop = True
                         wallclock_stop_ckpt = _checkpoint_dir_name(global_step, _phase)
                         if is_main:
+                            _budget = (
+                                f"limit of {wallclock_limit_sec / 3600.0:.3f}h"
+                                if wallclock_limit_sec is not None
+                                else "deadline"
+                            )
+                            _trained = (
+                                f"after {time.perf_counter() - wallclock_t0:.1f}s of training "
+                                if wallclock_t0 is not None
+                                else ""
+                            )
                             logger.info(
-                                "Wall-clock limit of %.3fh reached after %.1fs of training "
+                                "Wall-clock %s (source=%s) reached %s"
                                 "(%.1fs since process start) at step %d/%d (%.1f%% of the "
                                 "token budget); wrote %s, stopping.",
-                                wallclock_limit_sec / 3600.0,
-                                time.perf_counter() - wallclock_t0,
+                                _budget,
+                                stop_policy.source,
+                                _trained,
                                 time.perf_counter() - _run_t0,
                                 global_step, total_steps,
                                 100.0 * global_step / max(1, total_steps),
@@ -3667,7 +3946,6 @@ def run_pure_pretraining(
 
     if is_main and wandb_enabled and wandb.run is not None:
         try:
-            (Path(output_dir) / "wandb_run_id.txt").write_text(wandb.run.id, encoding="utf-8")
             wandb.finish()
         except Exception as exc:
             logger.warning(f"W&B finalize failed. Error: {exc}")
@@ -3675,4 +3953,6 @@ def run_pure_pretraining(
     if distributed and dist.is_initialized():
         _dist_barrier(local_rank)
 
-    logger.info("Pure-torch pretraining complete.")
+    run_progress.reason = f"wallclock-{stop_policy.source}" if wallclock_stop else "complete"
+    if is_main:
+        logger.info("%s", _format_run_exit(run_progress, time.perf_counter() - _run_t0))

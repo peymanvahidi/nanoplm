@@ -55,6 +55,7 @@ def test_from_yaml_regenerates_dvc_yaml(tmp_path, monkeypatch):
     # Stub out dvc subprocess
     monkeypatch.setattr("subprocess.run", lambda *a, **k: type("R", (), {"returncode": 0})())
     monkeypatch.chdir(tmp_path)
+    (tmp_path / ".dvc").mkdir(exist_ok=True)
     runner = CliRunner()
     result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
     assert (tmp_path / "dvc.yaml").exists()
@@ -95,6 +96,7 @@ def test_from_yaml_summary_uses_yaml_manifest(tmp_path, monkeypatch):
 
     monkeypatch.setattr("subprocess.run", lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.chdir(tmp_path)
+    (tmp_path / ".dvc").mkdir(exist_ok=True)
     runner = CliRunner()
     result = runner.invoke(data, ["from-yaml", str(cfg)])
     assert result.exit_code == 0, result.output
@@ -111,6 +113,7 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     cfg.write_text(load_template("data_pretrain"))
     # data_pretrain.yaml has commented-out alt-URL lines starting with "# swissprot"
     assert "# swissprot:" in cfg.read_text()
+    (tmp_path / ".dvc").mkdir(exist_ok=True)
 
     # Stub dvc subprocess
     import subprocess as _sp
@@ -202,6 +205,7 @@ def test_from_yaml_warns_when_compressed_fasta_set_in_plain_mode(tmp_path, monke
     monkeypatch.setattr("subprocess.run",
                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.chdir(tmp_path)
+    (tmp_path / ".dvc").mkdir(exist_ok=True)
 
     # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
     warnings_seen = []
@@ -224,6 +228,7 @@ def test_from_yaml_plain_local_omits_compressed_fasta_ok(tmp_path, monkeypatch):
     monkeypatch.setattr("subprocess.run",
                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.chdir(tmp_path)
+    (tmp_path / ".dvc").mkdir(exist_ok=True)
     runner = CliRunner()
     result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
     assert result.exit_code == 0, result.output
@@ -249,6 +254,7 @@ def test_from_yaml_plain_local_dryrun_emits_pipeline_without_extract(tmp_path, m
     monkeypatch.setattr("subprocess.run",
                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
     monkeypatch.chdir(tmp_path)
+    (tmp_path / ".dvc").mkdir(exist_ok=True)
     runner = CliRunner()
     result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
     assert result.exit_code == 0, result.output

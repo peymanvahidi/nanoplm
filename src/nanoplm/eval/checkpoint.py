@@ -3,23 +3,137 @@
 from __future__ import annotations
 
 import json
-from dataclasses import MISSING, fields
+from dataclasses import MISSING, asdict, dataclass, fields
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 
 import torch
 import yaml
 
+from nanoplm.data.infra.atomic import atomic_write_path
 from nanoplm.pretraining.fp8 import convert_fp8_targets
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.utils import checkpoint_step as _checkpoint_step
+from nanoplm.utils.common import git_sha
 from nanoplm.utils.logger import logger
 
 
 def _safe_load_checkpoint_yaml(path: Path) -> Any:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _read_run_manifest(run_root: Path) -> Optional[dict[str, Any]]:
+    """Read the training run's ``run.json``.
+
+    A run predating run.json left none, so absence is normal rather than an
+    error. A manifest that is present but unreadable is not, so it warns.
+    """
+    manifest_path = run_root / "run.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(f"Ignoring unreadable run manifest {manifest_path}: {exc}")
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _resolved_step(checkpoint_dir: Path) -> Optional[int]:
+    """The one place ``checkpoint_step``'s ``-1`` sentinel becomes ``None``.
+
+    A sidecar reader would take ``-1`` for a step.
+    """
+    step = _checkpoint_step(checkpoint_dir)
+    return None if step < 0 else step
+
+
+def default_embedder_name(checkpoint_dir: Union[str, Path]) -> str:
+    """Name a checkpoint's eval after its run and step.
+
+    ``checkpoint-27500`` is the same name under every run, so the bare
+    directory stem collides between runs evaluated into one ``output_dir``.
+    ``<run>-ckpt<step>`` is the convention the cluster-experiments skill
+    documents and every eval config under the gitignored ``experiments/`` types
+    by hand. A step no name carries falls back to the checkpoint's role, so a
+    ``checkpoint-final`` with no readable ``training_state.json`` gives
+    ``<run>-final``.
+    """
+    path = Path(checkpoint_dir).resolve()
+    step = _resolved_step(path)
+    suffix = (
+        f"ckpt{step}" if step is not None else path.name.removeprefix("checkpoint-")
+    )
+    return f"{path.parent.name}-{suffix}"
+
+
+@dataclass(frozen=True)
+class EvalProvenance:
+    """Which artifact an autoeval report came from.
+
+    biotrainer's ``AutoEvalReport`` carries only ``embedder_name`` and a
+    ``training_date`` stamped with the eval date, so the report names neither
+    the checkpoint, the step, nor the training run. This is the record that
+    does.
+
+    ``run_name`` is the directory the checkpoint sits in, which still names the
+    run when ``run.json`` is absent, so it can disagree with
+    ``training_run["run_name"]`` after the run directory was moved.
+    """
+
+    embedder_name: str
+    checkpoint_dir: Path
+    checkpoint_step: Optional[int]
+    run_name: str
+    loop_count: Optional[int]
+    eval_git_sha: Optional[str]
+    eval_started_at: str
+    training_run: Optional[dict[str, Any]]
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        checkpoint_dir: Union[str, Path],
+        embedder_name: Optional[str],
+        loop_count: Optional[int],
+    ) -> "EvalProvenance":
+        checkpoint_dir = Path(checkpoint_dir).resolve()
+        return cls(
+            embedder_name=embedder_name or default_embedder_name(checkpoint_dir),
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_step=_resolved_step(checkpoint_dir),
+            run_name=checkpoint_dir.parent.name,
+            loop_count=loop_count,
+            eval_git_sha=git_sha(Path(__file__).resolve().parent),
+            eval_started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            training_run=_read_run_manifest(checkpoint_dir.parent),
+        )
+
+
+def write_eval_provenance(
+    provenance: EvalProvenance, report_path: Union[str, Path]
+) -> Optional[Path]:
+    """Write the provenance record beside the report it annotates.
+
+    It shares the report's stem so a reader holding a report path finds it by
+    appending one suffix.
+    """
+    report_path = Path(report_path)
+    sidecar_path = report_path.with_name(
+        report_path.name.removesuffix(".json") + ".provenance.json"
+    )
+    record = asdict(provenance) | {"checkpoint_dir": str(provenance.checkpoint_dir)}
+    try:
+        with atomic_write_path(sidecar_path) as tmp:
+            tmp.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning(f"Could not write eval provenance to {sidecar_path}: {exc}")
+        return None
+    return sidecar_path
 
 
 def load_model_config_from_checkpoint(

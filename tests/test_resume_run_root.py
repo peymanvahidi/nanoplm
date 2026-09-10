@@ -27,18 +27,19 @@ def test_resume_into_fresh_ckp_dir_creates_run_root(tmp_path):
     ckpt = _source_checkpoint(tmp_path / "source")
     fresh = tmp_path / "fresh"
 
-    run_name, wandb_run_name, _out, _none, *_rest = prepare_run_and_steps(
+    run = prepare_run_and_steps(
         PretrainingConfig(dataset_dir=str(tmp_path / "data"), ckp_dir=str(fresh)),
         ResumeConfig(is_resume=True, checkpoint_dir=str(ckpt)),
-        train_samples=128,
-        global_batch_seqs=8,
+        effective_world_size=1,
     )
 
     run_root = fresh / "src-run"
     assert run_root.is_dir(), "run_root was not created"
     assert (run_root / ".resume_counter").read_text().strip() == "1"
-    assert run_name == "src-run"
-    assert wandb_run_name == "src-run-re1"
+    assert run.run_name == "src-run"
+    assert run.wandb_run_name == "src-run-re1"
+    assert run.run_root == run_root
+    assert run.is_resume and run.resume_step == 500
 
 
 def test_second_resume_increments_the_counter(tmp_path):
@@ -48,9 +49,7 @@ def test_second_resume_increments_the_counter(tmp_path):
         PretrainingConfig(dataset_dir=str(tmp_path / "data"), ckp_dir=str(fresh)),
         ResumeConfig(is_resume=True, checkpoint_dir=str(ckpt)),
     )
-    prepare_run_and_steps(*args, train_samples=128, global_batch_seqs=8)
-    _run, wandb_run_name, *_ = prepare_run_and_steps(
-        *args, train_samples=128, global_batch_seqs=8
-    )
-    assert wandb_run_name == "src-run-re2"
+    prepare_run_and_steps(*args, effective_world_size=1)
+    run = prepare_run_and_steps(*args, effective_world_size=1)
+    assert run.wandb_run_name == "src-run-re2"
     assert (fresh / "src-run" / ".resume_counter").read_text().strip() == "2"

@@ -136,7 +136,11 @@ README section can.
 · [Your first PLM](https://peymanvahidi.github.io/nanoplm/start/first-plm/)
 · [Troubleshooting](https://peymanvahidi.github.io/nanoplm/troubleshooting/)
 
-Paths inside a config are resolved relative to the config file's directory.
+`nanoplm data from-yaml` resolves a relative path in its config against the directory that
+holds the config file. `nanoplm pretrain from-yaml` and `nanoplm eval from-yaml` resolve a
+relative path against the working directory you run them from, not against the config file.
+Run those two from the directory their relative paths belong to. In an sbatch script, set
+`#SBATCH --chdir` to that directory. An absolute path in a config is used as written.
 
 ---
 
