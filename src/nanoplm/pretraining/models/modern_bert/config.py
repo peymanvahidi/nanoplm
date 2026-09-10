@@ -166,12 +166,20 @@ class ModernBertConfig:
     # regions. The recurrent block (R = L - P - C layers) is weight-tied and
     # looped recycling_loop_count times per forward pass. See docs/superpowers/
     # specs/2026-05-24-huggin-style-recycling-design.md.
+    use_huginn_looping: bool = False          # explicit switch; must agree with recycling_loop_count
     recycling_num_prelude_layers: int = 0     # P; first P layers, run once
     recycling_num_coda_layers: int = 0        # C; last C layers, run once
     recycling_loop_count: int = 1             # inference loop count; target mean at training. 1 = recycling off
     recycling_adapter_bias: bool = False      # Linear(2h, h) adapter bias (Huginn: no bias)
     recycling_s0_noise_sigma: float = 0.6324555320336759  # sqrt(2/5), Huginn σ²_s = 2/5
     recycling_use_takase_init: bool = True    # Overrides wo_init for recurrent block; rescales Wo by sqrt(1/(5·h·l))
+
+    # Loopie layer-loop (arXiv 2607.16051): every stored layer is applied
+    # loopie_loop_count times consecutively (L1,L1,L2,L2,...), weight-tied, with
+    # full backprop and no prelude/coda/adapter/s0-noise/scheduler. Mutually
+    # exclusive with Huginn recycling.
+    use_loopie: bool = False
+    loopie_loop_count: int = 2                # consecutive applications per stored layer (>= 2 when enabled)
 
     head_dim: int = field(init=False)
     rope_dim: int = field(init=False)
@@ -201,6 +209,20 @@ class ModernBertConfig:
             raise ValueError(
                 f"recycling_num_coda_layers must be int >= 0, got {self.recycling_num_coda_layers!r}"
             )
+        # use_huginn_looping is the explicit on/off switch; recycling_loop_count
+        # is the depth. They must agree, so a config can never look enabled and
+        # silently run unlooped (or vice versa).
+        if self.use_huginn_looping and self.recycling_loop_count <= 1:
+            raise ValueError(
+                "use_huginn_looping=true requires recycling_loop_count >= 2 "
+                f"(got {self.recycling_loop_count}). Set the loop count, or "
+                "use_huginn_looping: false to disable recycling."
+            )
+        if not self.use_huginn_looping and self.recycling_loop_count > 1:
+            raise ValueError(
+                f"recycling_loop_count={self.recycling_loop_count} enables Huginn-style "
+                "recycling, which now requires an explicit use_huginn_looping: true."
+            )
         if self.recycling_loop_count == 1:
             if self.recycling_num_prelude_layers != 0 or self.recycling_num_coda_layers != 0:
                 raise ValueError(
@@ -218,6 +240,30 @@ class ModernBertConfig:
             # Delegate flag-compat checks to the YAML-driven validator.
             from nanoplm.config.recycling_compatibility import validate_recycling_compatibility
             validate_recycling_compatibility(self)
+        # Loopie layer-loop validation. Kept here rather than in the YAML matrix,
+        # which is explicitly scoped to Huginn-style recycling.
+        if self.use_loopie:
+            if self.use_huginn_looping or self.recycling_loop_count > 1:
+                raise ValueError(
+                    "use_loopie and Huginn-style recycling are mutually exclusive; "
+                    "enable exactly one looping strategy."
+                )
+            if not isinstance(self.loopie_loop_count, int) or self.loopie_loop_count < 2:
+                raise ValueError(
+                    f"loopie_loop_count must be int >= 2 when use_loopie=true, got {self.loopie_loop_count!r}"
+                )
+            for _flag in ("use_resid_lambdas", "use_x0_lambdas", "use_mhc_lite"):
+                if getattr(self, _flag, False):
+                    raise ValueError(
+                        f"use_loopie is incompatible with {_flag}=True: per-layer state "
+                        "re-applied on every repeat of a layer has unvalidated semantics "
+                        "(same reasoning as the Huginn recycling rejects)."
+                    )
+        elif self.loopie_loop_count != 2:
+            raise ValueError(
+                f"loopie_loop_count={self.loopie_loop_count} has no effect when use_loopie=false; "
+                "set use_loopie: true or leave loopie_loop_count at its default of 2."
+            )
         # GQA: resolve num_kv_heads (None = MHA, i.e. same as num_attention_heads).
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_attention_heads
@@ -281,10 +327,10 @@ class ModernBertConfig:
             self.rope_dim = self.head_dim
         self.sliding_window = self.local_attention // 2
         self.mlp_activation = self.mlp_activation.lower()
-        if self.mlp_activation not in {"swiglu", "glu", "srelu"}:
+        if self.mlp_activation not in {"swiglu", "geglu", "srelu"}:
             raise ValueError(
                 f"Unsupported mlp_activation: {self.mlp_activation}. "
-                "Supported: ['swiglu', 'glu', 'srelu']"
+                "Supported: ['swiglu', 'geglu', 'srelu']"
             )
         self.canon_layers_kernel_size = _resolve_canon_kernel_size(
             self.canon_layers_kernel_size,

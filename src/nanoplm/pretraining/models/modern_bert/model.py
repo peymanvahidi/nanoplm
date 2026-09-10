@@ -106,20 +106,29 @@ class ProtModernBertMLMConfig:
     moe_leading_dense_layers: int = 0
     moe_kernel_backend: str = "cutlass"  # cutlass | sonicmoe (routed-expert compute)
     # Huginn-style recycling (pure-torch path only). See ModernBertConfig for field semantics.
+    use_huginn_looping: bool = False
     recycling_num_prelude_layers: int = 0
     recycling_num_coda_layers: int = 0
     recycling_loop_count: int = 1
     recycling_adapter_bias: bool = False
     recycling_s0_noise_sigma: float = 0.6324555320336759
     recycling_use_takase_init: bool = True
+    # Loopie layer-loop (pure-torch path only). See ModernBertConfig.
+    use_loopie: bool = False
+    loopie_loop_count: int = 2
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):
     def __init__(self, config: ProtModernBertMLMConfig):
-        if config.recycling_loop_count != 1:
+        if config.recycling_loop_count != 1 or config.use_huginn_looping:
             raise ValueError(
                 "Huginn-style recycling (recycling_loop_count > 1) is implemented only "
                 "in the pure-torch path. Use --pure-torch with recycling_loop_count>1."
+            )
+        if config.use_loopie:
+            raise ValueError(
+                "Loopie layer looping (use_loopie=true) is implemented only in the "
+                "pure-torch path. Use --pure-torch."
             )
         if config.use_noble:
             raise ValueError(

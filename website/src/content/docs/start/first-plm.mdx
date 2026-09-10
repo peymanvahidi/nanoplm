@@ -202,35 +202,38 @@ The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:
    ```yaml title="eval.yaml"
    eval:
      checkpoint_dir: "output/pretraining_checkpoints/run-14071932/checkpoint-final"
-     framework: [pbc]    # protein benchmark collection; downstream probing tasks
+     framework: [pgym]   # ProteinGym, zero-shot: the model scores mutants directly
      output_dir: "autoeval_output"
-     batch_size: 16
+     development_mode: true
      # ...
    ```
 
-3. **Run the benchmark.** nanoPLM embeds the benchmark sequences with your model, then trains a probe
-   on top of those embeddings for each task.
+3. **Run the benchmark.** nanoPLM scores the benchmark's mutants with your model's MLM head — no
+   probe is trained on top.
 
    ```bash
    nanoplm eval from-yaml
-   # Starting autoeval pipeline (sequential): framework=pbc
+   # Adding PGYM zero-shot: method=masked_marginals, batch_size=60
+   # Starting autoeval: frameworks=['pgym'], development_mode=True
    # ============================================================
-   # [0/5] PBC: secondary_structure
    # ...
    # ============================================================
-   # AUTOEVAL COMPLETE: Final Report Summary
+   # AUTOEVAL COMPLETE in 812.4s — Final Report Summary
+   # Frameworks in report: ['PGYM']
    # ============================================================
    ```
 
 </Steps>
 
-The report lands under your embedder's directory, which defaults to the checkpoint's directory name:
+The combined report lands at the top of `output_dir`, with per-framework artefacts under the
+embedder's directory, which defaults to the checkpoint's directory name:
 
 <FileTree>
 
 - autoeval_output/
+  - autoeval_report_checkpoint-final.json
   - checkpoint-final/
-    - PBC/ per-task results
+    - PGYM/ per-task results
     - ...
 
 </FileTree>
@@ -244,7 +247,7 @@ You are done when all three are true:
   10M tokens will not be state of the art; a falling loss is what proves the pipeline works.
 - `output/pretraining_checkpoints/<your-run>/checkpoint-final/pytorch_model.bin` exists. **That file
   is your protein language model**, and `model_config.yaml` beside it describes its architecture.
-- `autoeval_output/checkpoint-final/` holds a benchmark report.
+- `autoeval_output/autoeval_report_checkpoint-final.json` holds a benchmark report.
 
 ## Next steps
 

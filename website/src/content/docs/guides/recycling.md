@@ -76,21 +76,21 @@ pretraining:
 
 ## Check compatibility before you run
 
-Recycling's compatibility rules are enforced at config load, not written down as advice. Four model flags are **rejected**:
+Recycling's compatibility rules are enforced at config load, not written down as advice. Three model flags are **rejected**:
 
 | Rejected flag | Why |
 | --- | --- |
-| `use_moe` | MoE's per-layer routing state is overwritten on every iteration; only the last iteration's decisions would survive. |
 | `use_x0_lambdas` | `x0` is captured once before the loop; re-applying the blend every iteration has unvalidated semantics. |
 | `use_resid_lambdas` | Per-layer residual scaling re-applied every iteration interacts with the adapter and the `s_0` noise in untested ways. |
 | `use_mhc_lite` | mHC-lite's stability guarantees have not been tested against a recycled residual stream. |
 
-The error names the flag: `recycling: incompatible model flag 'use_moe=True'. ...`
+The error names the flag: `recycling: incompatible model flag 'use_x0_lambdas=True'. ...`
 
 And the pure-TE backend is rejected, as above.
 
-Three more are **allowed with a warning**: they run, but nobody has validated them:
+Four are **allowed with a warning**:
 
+- `use_moe`: supported. Each MoE layer's aux loss and expert counts accumulate across the recurrent iterations instead of being overwritten — the loss takes the per-execution mean (so the aux term keeps the same scale as an unlooped run), and the expert-bias correction sees counts summed over iterations, which it is invariant to because its update is relative and zero-meaned. Aux gradients reach the router gate only through the last `recycling_bptt` iterations.
 - `use_repo`: RePO re-predicts head positions on every iteration. Set `repo_after_n_layers` so RePO lands in the coda.
 - `fp8`: FP8 combined with truncated BPTT is not validated for gradient correctness.
 - `use_compile_max_autotune`: compiles the recurrent *step* rather than the unrolled loop, and triggers an extra smoke test at startup.
@@ -115,7 +115,7 @@ model:
   recycling_num_prelude_layers: 2
   recycling_num_coda_layers: 2
   recycling_loop_count: 4
-  use_moe: false          # rejected under recycling
+  use_moe: false          # allowed (warns); set true to combine MoE with recycling
   use_resid_lambdas: false  # rejected under recycling
   use_x0_lambdas: false     # rejected under recycling
   use_mhc_lite: false       # rejected under recycling

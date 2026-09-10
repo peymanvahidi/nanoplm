@@ -11,18 +11,14 @@ class EvalConfig:
     # (the latest checkpoint inside the run-* is used).
     checkpoint_dir: Union[str, Path]
 
-    # Benchmark framework(s) to evaluate on. One or more of: pbc, flip, pgym.
-    framework: List[str] = field(default_factory=lambda: ["pbc"])
+    # Benchmark framework(s) to evaluate on. One or more of: pgym,
+    # pbc_zeroshot_contact. Both are zero-shot: 'pgym' scores ProteinGym DMS
+    # variants, 'pbc_zeroshot_contact' predicts contact maps from the
+    # categorical Jacobian.
+    framework: List[str] = field(default_factory=lambda: ["pgym"])
 
-    # Directory where autoeval results, H5 embeddings, and per-task outputs are written.
+    # Directory where autoeval results and per-framework outputs are written.
     output_dir: Union[str, Path] = "autoeval_output"
-
-    # Batch size for embedding computation.
-    batch_size: int = 16
-
-    # Sequence length filters applied to benchmark datasets.
-    min_seq_length: int = 0
-    max_seq_length: int = 2000
 
     # Device override. When None, picks 'cuda' if available else 'cpu'.
     device: Optional[str] = None
@@ -31,18 +27,24 @@ class EvalConfig:
     # checkpoint directory stem.
     embedder_name: Optional[str] = None
 
-    # Number of parallel workers for downstream task training.
-    # 0 = sequential (runs through biotrainer.autoeval_pipeline).
-    # >0 = parallel mode (GPU embedding first, then CPU task training in a ThreadPoolExecutor).
-    parallel_tasks: int = 0
-
-    # Zero-shot scoring method when framework includes 'pgym'.
-    # One of: masked_marginals, wt_marginals, pseudoperplexity.
+    # Zero-shot scoring method for the 'pgym' framework. One of:
+    # masked_marginals, wt_marginals, pseudoperplexity. Ignored by
+    # pbc_zeroshot_contact, which always uses the categorical Jacobian.
     zero_shot_method: str = "masked_marginals"
 
-    # Optional whitelist of task names (e.g. PBC-secondary_structure).
-    # Parallel mode only — sequential mode warns and ignores.
-    tasks: Optional[List[str]] = None
+    # Sequences scored per forward pass. Masked-marginals masks one position at
+    # a time, so this batches that many masked positions into a single forward
+    # (biotrainer scores them one-by-one); it also sizes the Jacobian batches.
+    zero_shot_batch_size: int = 60
+
+    # Evaluate on subsampled task sets instead of the full benchmark. Much
+    # faster; use false for final numbers.
+    development_mode: bool = True
+
+    # Pre-downloaded benchmark dataset directory, passed to biotrainer as
+    # custom_storage_path. Set this on machines without internet access.
+    # Mutually exclusive with force_download.
+    dataset_dir: Optional[str] = None
 
     # Force re-download of framework datasets (use when new tasks land upstream).
     force_download: bool = False

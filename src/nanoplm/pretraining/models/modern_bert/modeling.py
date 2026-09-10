@@ -189,6 +189,16 @@ class ModernBertEmbeddings(nn.Module):
 
 
 class ModernBertMLP(nn.Module):
+    """Gated MLP: ``act(first half) * second half``.
+
+    This is what ``mlp_activation="geglu"`` builds. The gate nonlinearity comes
+    from ``hidden_activation`` (gelu, and not settable from the run config), so
+    in practice this is GEGLU and matches stock ModernBERT. Note the operand
+    order is the opposite of :class:`ModernBertSwiGLUMLP`, which applies its
+    nonlinearity to the *second* half -- see ``fp8.py`` where that difference
+    decides whether the fused ``Wi`` halves swap on conversion to TE.
+    """
+
     def __init__(self, config: ModernBertConfig):
         super().__init__()
         self.fused_up_gate = config.fused_up_gate
@@ -749,6 +759,39 @@ class ModernBertAttention(nn.Module):
         return self.out_drop(self.Wo(y))
 
 
+def _residual_add(
+    x: torch.Tensor,
+    branch_out: torch.Tensor,
+    alpha: "torch.Tensor | float",
+) -> torch.Tensor:
+    """``x + alpha * branch_out``, skipping the multiply when ``alpha`` is 1.0.
+
+    ProRes alphas live in a **tensor** buffer on purpose (``ModernBertModel``:
+    non-persistent, so torch.compile treats the values as dynamic and does not
+    recompile per unique float).  The side effect is that inductor cannot
+    constant-fold the multiply even when ProRes is disabled and every alpha is
+    exactly 1.0: the residual backward then keeps a standalone
+    ``grad_out * alpha`` kernel over the full (tokens, hidden) activation — it
+    cannot fuse, because its only consumer is the branch's first GEMM.  At
+    (131072, 1024) bf16 that measured 154.6 us/layer backward plus 286.7 us
+    forward (the forward multiply is fused into the add, so only its share is
+    recovered), i.e. ~3.08 ms/step across all 20 layers of the 4-node baseline.
+
+    ``ModernBertModel.forward`` therefore hands the layers the Python literal
+    ``1.0`` when ``use_prores`` is False, and this helper turns that into a
+    plain add.  ``isinstance`` is a compile-time test for Dynamo, so neither
+    branch introduces a graph break, and the ProRes-enabled path is untouched.
+
+    Numerically exact: IEEE-754 multiplication by 1.0 is the identity for every
+    finite value, for +/-0.0, for +/-inf and for NaN payloads, and a Python
+    float does not promote the operand's dtype — so ``x + 1.0 * y`` and
+    ``x + y`` are bit-identical.
+    """
+    if not isinstance(alpha, torch.Tensor) and alpha == 1.0:
+        return x + branch_out
+    return x + alpha * branch_out
+
+
 class ModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
@@ -801,6 +844,8 @@ class ModernBertEncoderLayer(nn.Module):
                 elif mlp_config.mlp_activation == "swiglu":
                     self.mlp = ModernBertSwiGLUMLP(mlp_config)
                 else:
+                    # geglu: ModernBertMLP gates on `hidden_activation`, which is
+                    # gelu and is not settable from the run config.
                     self.mlp = ModernBertMLP(mlp_config)
         else:
             self.mlp_norm = nn.Identity()
@@ -880,7 +925,7 @@ class ModernBertEncoderLayer(nn.Module):
                 attn_out = _checkpoint(_attn_branch, x, use_reentrant=False)
             except TypeError:  # older torch checkpoint API
                 attn_out = _checkpoint(_attn_branch, x)
-            x = x + prores_alpha * attn_out
+            x = _residual_add(x, attn_out, prores_alpha)
         else:
             fuse_ln_a = (
                 self.canon_a is not None
@@ -916,7 +961,7 @@ class ModernBertEncoderLayer(nn.Module):
                 token_mask=token_mask,
                 repo_active=repo_active,
             )
-            x = x + prores_alpha * attn_out
+            x = _residual_add(x, attn_out, prores_alpha)
         if self.mlp is not None:
             do_ckpt_mlp = (
                 self.activation_checkpointing
@@ -967,7 +1012,7 @@ class ModernBertEncoderLayer(nn.Module):
                     mlp_out = _checkpoint(_mlp_branch, x, use_reentrant=False)
                 except TypeError:  # older torch checkpoint API
                     mlp_out = _checkpoint(_mlp_branch, x)
-                x = x + prores_alpha * mlp_out
+                x = _residual_add(x, mlp_out, prores_alpha)
             else:
                 fuse_ln_c = (
                     self.canon_c is not None
@@ -998,7 +1043,7 @@ class ModernBertEncoderLayer(nn.Module):
                     cu_seqlens=cu_seqlens,
                     attention_mask=token_mask,
                 )
-                x = x + prores_alpha * mlp_out
+                x = _residual_add(x, mlp_out, prores_alpha)
         return x
 
 
@@ -1422,6 +1467,14 @@ class ModernBertModel(nn.Module):
         self.recurrent_layers: list[nn.Module] = list(self.layers[P:L - C]) if (L - P - C) > 0 else []
         self.coda_layers: list[nn.Module] = list(self.layers[L - C:]) if C > 0 else []
 
+        # Loopie layer-loop: how many times each stored layer is applied
+        # consecutively. 1 = off, so `range(1)` leaves the non-Loopie graph
+        # byte-identical. A trace-time constant, so Dynamo unrolls the repeat
+        # rather than treating it as a dynamic loop.
+        self._layer_repeats: int = (
+            int(config.loopie_loop_count) if config.use_loopie else 1
+        )
+
         # Adapter only when recycling is active.
         if config.recycling_loop_count > 1:
             self.adapter = nn.Linear(
@@ -1461,6 +1514,13 @@ class ModernBertModel(nn.Module):
             torch.full((config.num_hidden_layers,), _init_val),
             persistent=False,
         )
+        # ProRes disabled => every alpha is *permanently* exactly 1.0
+        # (`use_prores` is read once here and never mutated, and
+        # `update_prores_alphas` is only called when it is True). A tensor
+        # alpha of value 1.0 still costs a real elementwise multiply in the
+        # residual backward that inductor cannot fold away, so hand the layers
+        # a plain Python list of literals instead — see `_residual_add`.
+        self._prores_alphas_off: list[float] = [1.0] * config.num_hidden_layers
 
     def update_prores_alphas(self, step: int) -> None:
         """Recompute per-layer ProRes alphas. Call once per optimizer step.
@@ -1497,7 +1557,7 @@ class ModernBertModel(nn.Module):
         window_sliding,
         position_ids: torch.Tensor,
         repo_active: bool,
-        prores_alphas: torch.Tensor,
+        prores_alphas: "torch.Tensor | list[float]",
     ) -> torch.Tensor:
         """One iteration of the recurrent block (varlen / flash path).
 
@@ -1541,7 +1601,7 @@ class ModernBertModel(nn.Module):
         attn_mask_sliding,
         token_mask: torch.Tensor,
         repo_active: bool,
-        prores_alphas: torch.Tensor,
+        prores_alphas: "torch.Tensor | list[float]",
     ) -> torch.Tensor:
         """One iteration of the recurrent block (SDPA fallback path).
 
@@ -1656,32 +1716,50 @@ class ModernBertModel(nn.Module):
         def _trunc_init(tensor: torch.Tensor, std: float) -> None:
             torch.nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
+        def _init_proj(obj, std: float) -> None:
+            """Init a projection given either an nn.Linear or a raw Parameter.
+
+            MoE layers keep their fused expert weights as raw Parameters
+            (``Wi``/``Wo`` of shape [num_experts, ...]) rather than Linears, so
+            a plain ``.weight`` lookup would fail on a recurrent MoE block.
+            """
+            w = getattr(obj, "weight", obj)
+            if isinstance(w, torch.Tensor):
+                _trunc_init(w, std)
+
         for layer in self.recurrent_layers:
             attn = getattr(layer, "attn", None)
             if attn is not None:
                 if getattr(attn, "Wo", None) is not None:
-                    _trunc_init(attn.Wo.weight, std_out)
+                    _init_proj(attn.Wo, std_out)
                 # Attention input projections: fused Wqkv OR separate Wq/Wq2/Wk/Wv
                 if getattr(attn, "Wqkv", None) is not None:
-                    _trunc_init(attn.Wqkv.weight, std_general)
+                    _init_proj(attn.Wqkv, std_general)
                 else:
                     for name in ("Wq", "Wq2", "Wk", "Wv"):
                         proj = getattr(attn, name, None)
                         if proj is not None:
-                            _trunc_init(proj.weight, std_general)
+                            _init_proj(proj, std_general)
 
-            mlp = getattr(layer, "mlp", None)
-            if mlp is not None:
+            # MoE layers expose the same Wi/Wo names as the dense MLP (as raw
+            # per-expert Parameters) plus an optional dense shared expert, so
+            # both get the recurrent-block treatment.
+            mlps = [m for m in (getattr(layer, "mlp", None),) if m is not None]
+            for _m in list(mlps):
+                shared = getattr(_m, "shared_expert", None)
+                if shared is not None:
+                    mlps.append(shared)
+            for mlp in mlps:
                 # MLP input projections: fused Wi OR separate W_up/W_gate
                 if getattr(mlp, "Wi", None) is not None:
-                    _trunc_init(mlp.Wi.weight, std_general)
+                    _init_proj(mlp.Wi, std_general)
                 elif getattr(mlp, "W_up", None) is not None:
-                    _trunc_init(mlp.W_up.weight, std_general)
+                    _init_proj(mlp.W_up, std_general)
                     if getattr(mlp, "W_gate", None) is not None:
-                        _trunc_init(mlp.W_gate.weight, std_general)
+                        _init_proj(mlp.W_gate, std_general)
                 # MLP output: Linear `Wo` OR raw Parameter `Wo_weight` (SReLU MLP)
                 if getattr(mlp, "Wo", None) is not None:
-                    _trunc_init(mlp.Wo.weight, std_out)
+                    _init_proj(mlp.Wo, std_out)
                 elif getattr(mlp, "Wo_weight", None) is not None:
                     _trunc_init(mlp.Wo_weight, std_out)
 
@@ -1764,7 +1842,13 @@ class ModernBertModel(nn.Module):
             }
 
             repo_active = self.repo_active
-            prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
+            # (num_layers,) tensor buffer when ProRes is on; a list of Python
+            # 1.0 literals when it is off, so `_residual_add` can drop the
+            # multiply entirely instead of leaving a dead (T, H) kernel in the
+            # backward of every layer.
+            prores_alphas = (
+                self._prores_alphas if self.use_prores else self._prores_alphas_off
+            )
 
             _recycle = (
                 self.config.recycling_loop_count > 1 or recycling_loop_count is not None
@@ -1862,56 +1946,64 @@ class ModernBertModel(nn.Module):
                         x = x + self.x0_lambdas[i] * x0
                     alpha = prores_alphas[i]
                     lt = layer.attention_type
-                    if (
-                        self.config.activation_checkpointing
-                        and self.training
-                        and str(self.config.activation_checkpointing_mode).strip().lower()
-                        == "layer"
-                    ):
-                        cos_sin = rope[lt]
-                        cu_seqlens = _cu_seqlens
-                        max_seqlen = _max_seqlen
-                        window_size = windows[lt]
-                        position_ids = _position_ids
+                    # Loopie: apply this stored layer loopie_loop_count times
+                    # consecutively (L1,L1,L2,L2,...), weight-tied. _layer_repeats is 1
+                    # unless use_loopie, so the non-Loopie graph is unchanged. The
+                    # per-index state above (resid/x0 lambdas -- rejected under Loopie --
+                    # and prores alpha) is resolved once per stored layer and shared by
+                    # every repeat; attention type and RoPE come off the layer itself, so
+                    # a repeated layer keeps them.
+                    for _rep in range(self._layer_repeats):
+                        if (
+                            self.config.activation_checkpointing
+                            and self.training
+                            and str(self.config.activation_checkpointing_mode).strip().lower()
+                            == "layer"
+                        ):
+                            cos_sin = rope[lt]
+                            cu_seqlens = _cu_seqlens
+                            max_seqlen = _max_seqlen
+                            window_size = windows[lt]
+                            position_ids = _position_ids
 
-                        def _layer_forward(
-                            x_in: torch.Tensor,
-                            *,
-                            _layer: nn.Module = layer,
-                            _cos_sin=cos_sin,
-                            _cu_seqlens=cu_seqlens,
-                            _max_seqlen=max_seqlen,
-                            _window_size=window_size,
-                            _position_ids=position_ids,
-                            _repo_active: bool = repo_active,
-                            _prores_alpha=alpha,
-                        ) -> torch.Tensor:
-                            return _layer(
-                                x_in,
-                                cos_sin=_cos_sin,
+                            def _layer_forward(
+                                x_in: torch.Tensor,
+                                *,
+                                _layer: nn.Module = layer,
+                                _cos_sin=cos_sin,
+                                _cu_seqlens=cu_seqlens,
+                                _max_seqlen=max_seqlen,
+                                _window_size=window_size,
+                                _position_ids=position_ids,
+                                _repo_active: bool = repo_active,
+                                _prores_alpha=alpha,
+                            ) -> torch.Tensor:
+                                return _layer(
+                                    x_in,
+                                    cos_sin=_cos_sin,
+                                    cu_seqlens=_cu_seqlens,
+                                    max_seqlen=_max_seqlen,
+                                    window_size=_window_size,
+                                    position_ids=_position_ids,
+                                    repo_active=_repo_active,
+                                    prores_alpha=_prores_alpha,
+                                )
+
+                            try:
+                                x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                            except TypeError:  # older torch checkpoint API
+                                x = _checkpoint(_layer_forward, x)
+                        else:
+                            x = layer(
+                                x,
+                                cos_sin=rope[lt],
                                 cu_seqlens=_cu_seqlens,
                                 max_seqlen=_max_seqlen,
-                                window_size=_window_size,
+                                window_size=windows[lt],
                                 position_ids=_position_ids,
-                                repo_active=_repo_active,
-                                prores_alpha=_prores_alpha,
+                                repo_active=repo_active,
+                                prores_alpha=alpha,
                             )
-
-                        try:
-                            x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                        except TypeError:  # older torch checkpoint API
-                            x = _checkpoint(_layer_forward, x)
-                    else:
-                        x = layer(
-                            x,
-                            cos_sin=rope[lt],
-                            cu_seqlens=_cu_seqlens,
-                            max_seqlen=_max_seqlen,
-                            window_size=windows[lt],
-                            position_ids=_position_ids,
-                            repo_active=repo_active,
-                            prores_alpha=alpha,
-                        )
 
             if self.config.use_mhc_lite:
                 x = x[..., 0, :]  # compress: take stream 0
@@ -1975,7 +2067,11 @@ class ModernBertModel(nn.Module):
         }
 
         repo_active = self.repo_active
-        prores_alphas = self._prores_alphas  # (num_layers,) tensor buffer
+        # See the varlen path: tensor buffer when ProRes is on, Python 1.0
+        # literals when it is off.
+        prores_alphas = (
+            self._prores_alphas if self.use_prores else self._prores_alphas_off
+        )
 
         _recycle = (
             self.config.recycling_loop_count > 1 or recycling_loop_count is not None
@@ -2065,50 +2161,58 @@ class ModernBertModel(nn.Module):
                     x = x + self.x0_lambdas[i] * x0
                 alpha = prores_alphas[i]
                 layer_type = layer.attention_type
-                if (
-                    self.config.activation_checkpointing
-                    and self.training
-                    and str(self.config.activation_checkpointing_mode).strip().lower()
-                    == "layer"
-                ):
-                    attn_mask = attn_masks[layer_type]
-                    cos_sin = rope[layer_type]
-                    token_mask = attention_mask
+                # Loopie: apply this stored layer loopie_loop_count times
+                # consecutively (L1,L1,L2,L2,...), weight-tied. _layer_repeats is 1
+                # unless use_loopie, so the non-Loopie graph is unchanged. The
+                # per-index state above (resid/x0 lambdas -- rejected under Loopie --
+                # and prores alpha) is resolved once per stored layer and shared by
+                # every repeat; attention type and RoPE come off the layer itself, so
+                # a repeated layer keeps them.
+                for _rep in range(self._layer_repeats):
+                    if (
+                        self.config.activation_checkpointing
+                        and self.training
+                        and str(self.config.activation_checkpointing_mode).strip().lower()
+                        == "layer"
+                    ):
+                        attn_mask = attn_masks[layer_type]
+                        cos_sin = rope[layer_type]
+                        token_mask = attention_mask
 
-                    def _layer_forward(
-                        x_in: torch.Tensor,
-                        *,
-                        _layer: nn.Module = layer,
-                        _attn_mask=attn_mask,
-                        _cos_sin=cos_sin,
-                        _token_mask=token_mask,
-                        _repo_active: bool = repo_active,
-                        _prores_alpha=alpha,
-                    ) -> torch.Tensor:
-                        return _layer(
-                            x_in,
-                            attn_mask=_attn_mask,
-                            cos_sin=_cos_sin,
+                        def _layer_forward(
+                            x_in: torch.Tensor,
+                            *,
+                            _layer: nn.Module = layer,
+                            _attn_mask=attn_mask,
+                            _cos_sin=cos_sin,
+                            _token_mask=token_mask,
+                            _repo_active: bool = repo_active,
+                            _prores_alpha=alpha,
+                        ) -> torch.Tensor:
+                            return _layer(
+                                x_in,
+                                attn_mask=_attn_mask,
+                                cos_sin=_cos_sin,
+                                position_ids=None,
+                                token_mask=_token_mask,
+                                repo_active=_repo_active,
+                                prores_alpha=_prores_alpha,
+                            )
+
+                        try:
+                            x = _checkpoint(_layer_forward, x, use_reentrant=False)
+                        except TypeError:  # older torch checkpoint API
+                            x = _checkpoint(_layer_forward, x)
+                    else:
+                        x = layer(
+                            x,
+                            attn_mask=attn_masks[layer_type],
+                            cos_sin=rope[layer_type],
                             position_ids=None,
-                            token_mask=_token_mask,
-                            repo_active=_repo_active,
-                            prores_alpha=_prores_alpha,
+                            token_mask=attention_mask,
+                            repo_active=repo_active,
+                            prores_alpha=alpha,
                         )
-
-                    try:
-                        x = _checkpoint(_layer_forward, x, use_reentrant=False)
-                    except TypeError:  # older torch checkpoint API
-                        x = _checkpoint(_layer_forward, x)
-                else:
-                    x = layer(
-                        x,
-                        attn_mask=attn_masks[layer_type],
-                        cos_sin=rope[layer_type],
-                        position_ids=None,
-                        token_mask=attention_mask,
-                        repo_active=repo_active,
-                        prores_alpha=alpha,
-                    )
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]  # compress: take stream 0
@@ -2167,9 +2271,8 @@ class ModernBertForMaskedLM(nn.Module):
 
         width = self.config.hidden_size
         bound = math.sqrt(3.0 / width)
-        # Residual-branch out-projections (attn.Wo, mlp.Wo) are configurable.
-        # For MuonH, zero-init is invalid because ||W_init||_F defines a hard
-        # hyperball radius and a zero-initialized matrix would be locked at zero.
+        # Residual-branch out-projections (attn.Wo, mlp.Wo) are configurable:
+        # 'zero' for zero-init residual branches, 'kaiming' otherwise.
         wo_init = self.config.wo_init
         mlp_out_bound = math.sqrt(3.0 / self.config.intermediate_size)
         # NOBLE half-Kaiming: halve init scale for layers that use Kaiming
@@ -2382,7 +2485,23 @@ class ModernBertForMaskedLM(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         recycling_loop_count: Optional[int] = None,
         recycling_bptt: Optional[int] = None,
+        num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> MLMOutput:
+        # Reset the per-layer MoE bookkeeping that MoELayer.forward accumulates
+        # (aux loss, execution count, expert counts). Doing it once here, before
+        # any path branches, is what makes the accumulation safe when a layer
+        # runs more than once per forward -- Huginn recycling iterations or
+        # Loopie repeats -- instead of each execution clobbering the last.
+        if self.config.use_moe:
+            from .moe import MoELayer as _MoELayer
+            for _module in self.modules():
+                if isinstance(_module, _MoELayer):
+                    _module.last_expert_counts = None
+                    _module.last_aux_loss = None
+                    _module.last_z_loss = None
+                    _module.last_aux_count = None
+                    _module.valid_token_count = num_valid_tokens
+
         # ---- static packed path (pre-flattened by collator) ---------------
         # When both cu_seqlens and position_ids are provided and input_ids is
         # already 1-D (flat), the collator has done all unpadding / position-id
@@ -2413,8 +2532,11 @@ class ModernBertForMaskedLM(nn.Module):
                 # MoE auxiliary losses (balance + z-loss, coefficients baked in).
                 if self.config.use_moe:
                     from .moe import MoELayer as _MoELayer
+                    # Per-execution mean: a layer that ran r times contributed
+                    # r aux terms, so divide by its execution count to keep the
+                    # scale identical to a single-execution (non-looped) run.
                     aux_losses = [
-                        module.last_aux_loss
+                        module.last_aux_loss / module.last_aux_count
                         for module in self.modules()
                         if isinstance(module, _MoELayer)
                         and module.last_aux_loss is not None

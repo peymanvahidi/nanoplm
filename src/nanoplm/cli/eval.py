@@ -10,17 +10,21 @@ from nanoplm.eval.config import EvalConfig
 from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
 
-_VALID_FRAMEWORKS = {"pbc", "flip", "pgym"}
+_VALID_FRAMEWORKS = {"pgym", "pbc_zeroshot_contact"}
 _VALID_ZERO_SHOT_METHODS = {"masked_marginals", "wt_marginals", "pseudoperplexity"}
+
+# Supervised frameworks dropped in the biotrainer 2.0.0 migration.
+_REMOVED_FRAMEWORKS = {"pbc", "pbc_supervised", "flip"}
 
 
 def _check_biotrainer_available() -> None:
     """Abort early when biotrainer is requested but the extra is not installed."""
     try:
         import biotrainer.autoeval  # noqa: F401
+        import biotrainer_core.data_classes  # noqa: F401
     except ImportError:
         raise click.ClickException(
-            "biotrainer is required for nanoplm eval but is not installed.\n"
+            "biotrainer 2.0.x is required for nanoplm eval but is not installed.\n"
             "Install it with:  pip install nanoplm[eval]"
         )
 
@@ -29,6 +33,12 @@ def _validate_frameworks(frameworks: List[str]) -> None:
     if not frameworks:
         raise click.ClickException("At least one framework must be specified.")
     for fw in frameworks:
+        if fw in _REMOVED_FRAMEWORKS:
+            raise click.ClickException(
+                f"Framework {fw!r} is no longer supported. nanoplm eval moved to "
+                "biotrainer 2.0.0 and now covers the zero-shot frameworks only: "
+                f"{sorted(_VALID_FRAMEWORKS)}."
+            )
         if fw not in _VALID_FRAMEWORKS:
             raise click.ClickException(
                 f"Unsupported framework: {fw!r}. "
@@ -73,8 +83,7 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
             kwargs[key] = value
 
     # Integer fields.
-    int_fields = ("batch_size", "min_seq_length", "max_seq_length", "parallel_tasks")
-    for key in int_fields:
+    for key in ("zero_shot_batch_size",):
         if key in kwargs:
             try:
                 kwargs[key] = int(kwargs[key])
@@ -84,7 +93,7 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
                 ) from exc
 
     # Scalar string fields.
-    str_fields = ("device", "embedder_name", "zero_shot_method")
+    str_fields = ("device", "embedder_name", "zero_shot_method", "dataset_dir")
     for key in str_fields:
         if key in kwargs and kwargs[key] is not None:
             kwargs[key] = str(kwargs[key])
@@ -93,18 +102,22 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
     if "framework" in kwargs:
         kwargs["framework"] = _coerce_list_of_str(kwargs["framework"], "framework")
 
-    if "tasks" in kwargs:
-        kwargs["tasks"] = _coerce_list_of_str(kwargs["tasks"], "tasks")
-
-    # Boolean flag.
-    if "force_download" in kwargs:
-        kwargs["force_download"] = bool(kwargs["force_download"])
+    # Boolean flags.
+    for key in ("force_download", "development_mode"):
+        if key in kwargs:
+            kwargs[key] = bool(kwargs[key])
 
     # Validate zero_shot_method against the allowed set.
     if "zero_shot_method" in kwargs and kwargs["zero_shot_method"] not in _VALID_ZERO_SHOT_METHODS:
         raise ValueError(
             f"Invalid zero_shot_method: {kwargs['zero_shot_method']!r}. "
             f"Expected one of: {sorted(_VALID_ZERO_SHOT_METHODS)}"
+        )
+
+    if kwargs.get("force_download") and kwargs.get("dataset_dir"):
+        raise ValueError(
+            "force_download and dataset_dir are mutually exclusive: a pre-populated "
+            "dataset_dir does not use the download cache that force_download clears."
         )
 
     return EvalConfig(**kwargs)
@@ -132,10 +145,10 @@ def eval():
     "--framework",
     type=click.Choice(sorted(_VALID_FRAMEWORKS)),
     multiple=True,
-    default=("pbc",),
+    default=("pgym",),
     help=(
-        "Benchmark framework(s) to evaluate on. Pass multiple times to run "
-        "multiple frameworks, e.g. --framework pbc --framework pgym."
+        "Zero-shot benchmark framework(s) to evaluate on. Pass multiple times to "
+        "run several, e.g. --framework pgym --framework pbc_zeroshot_contact."
     ),
     show_default=True,
 )
@@ -154,24 +167,14 @@ def eval():
     show_default=True,
 )
 @click.option(
-    "--batch-size",
+    "--zero-shot-batch-size",
     type=int,
-    default=16,
-    help="Batch size for embedding computation.",
-    show_default=True,
-)
-@click.option(
-    "--min-seq-length",
-    type=int,
-    default=0,
-    help="Minimum sequence length filter for benchmark datasets.",
-    show_default=True,
-)
-@click.option(
-    "--max-seq-length",
-    type=int,
-    default=2000,
-    help="Maximum sequence length filter for benchmark datasets.",
+    default=60,
+    help=(
+        "Sequences per forward pass. Batches masked positions (masked-marginals) "
+        "and mutated sequences (categorical Jacobian) that biotrainer would "
+        "otherwise score one at a time."
+    ),
     show_default=True,
 )
 @click.option(
@@ -187,23 +190,22 @@ def eval():
     help="Name for the embedder in the report. Defaults to checkpoint dir name.",
 )
 @click.option(
-    "--parallel-tasks",
-    type=int,
-    default=0,
+    "--development-mode/--full-eval",
+    default=True,
     help=(
-        "Number of parallel workers for downstream task training. "
-        "0 = sequential, >0 = parallel mode."
+        "Evaluate on subsampled task sets (fast) or the full benchmark "
+        "(final numbers)."
     ),
     show_default=True,
 )
 @click.option(
-    "--tasks",
+    "--dataset-dir",
     type=str,
-    multiple=True,
-    default=(),
+    default=None,
     help=(
-        "Whitelist of task names (e.g. PBC-secondary_structure). "
-        "Parallel mode only — sequential mode warns and ignores."
+        "Pre-downloaded benchmark dataset directory (biotrainer's "
+        "custom_storage_path). Use on machines without internet access. "
+        "Mutually exclusive with --force-download."
     ),
 )
 @click.option(
@@ -217,32 +219,32 @@ def run(
     framework: tuple,
     zero_shot_method: str,
     output_dir: str,
-    batch_size: int,
-    min_seq_length: int,
-    max_seq_length: int,
+    zero_shot_batch_size: int,
     device: Optional[str],
     embedder_name: Optional[str],
-    parallel_tasks: int,
-    tasks: tuple,
+    development_mode: bool,
+    dataset_dir: Optional[str],
     force_download: bool,
 ):
     """Run downstream evaluation directly from CLI flags."""
     frameworks_list = list(framework)
     _validate_frameworks(frameworks_list)
+    if force_download and dataset_dir:
+        raise click.ClickException(
+            "--force-download and --dataset-dir are mutually exclusive."
+        )
     _check_biotrainer_available()
 
     eval_config = EvalConfig(
         checkpoint_dir=checkpoint_dir,
         framework=frameworks_list,
         output_dir=output_dir,
-        batch_size=batch_size,
-        min_seq_length=min_seq_length,
-        max_seq_length=max_seq_length,
         device=device,
         embedder_name=embedder_name,
-        parallel_tasks=parallel_tasks,
         zero_shot_method=zero_shot_method,
-        tasks=list(tasks) if tasks else None,
+        zero_shot_batch_size=zero_shot_batch_size,
+        development_mode=development_mode,
+        dataset_dir=dataset_dir,
         force_download=force_download,
     )
 
@@ -264,7 +266,7 @@ def from_yaml(config: str):
 
         eval:
             checkpoint_dir: ...
-            framework: [pbc]
+            framework: [pgym]
             ...
     """
     config_path = Path(config)

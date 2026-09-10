@@ -17,7 +17,7 @@ set -euo pipefail
 # ---- pins: THE single source of truth (the spec table mirrors this block) ----
 TORCH_PIN="2.12.1+cu130"
 TORCH_INDEX="https://download.pytorch.org/whl/cu130"
-DION_SHA="0333cc1136cd456b3fe3a56407d4ff104cfef604"           # microsoft/dion PR #90 head
+DION_SHA="dd6c02f5173dc43cc7a0974535d7011a74bda494"           # microsoft/dion main (upstream)
 TE_TAG="${TE_TAG:-v2.16}"
 SONICMOE_SHA="4923037d858aebfe5738ebb17d02f88d7871c333"       # Dao-AILab/sonic-moe PR #64 head
 SONICMOE_URL="git+https://github.com/Dao-AILab/sonic-moe.git@${SONICMOE_SHA}"

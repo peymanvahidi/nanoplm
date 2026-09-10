@@ -300,8 +300,12 @@ def prepare_run_and_steps(
         else:
             resume_counter = 1
 
-        # Save updated counter and archive future checkpoints (rank 0 only)
+        # Save updated counter and archive future checkpoints (rank 0 only).
+        # run_root is derived from the checkpoint's name, not from where the
+        # checkpoint lives, so it does not exist yet when resuming into a fresh
+        # ckp_dir -- which is what you do to keep the source run read-only.
         if is_local_main:
+            run_root.mkdir(parents=True, exist_ok=True)
             counter_file.write_text(str(resume_counter), encoding="utf-8")
 
         # Create W&B run name with counter

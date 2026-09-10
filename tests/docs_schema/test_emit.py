@@ -10,7 +10,7 @@ def test_pretrain_schema_shape():
     mb = props["pretraining"]["properties"]["micro_batch_seqs"]
     assert mb["type"] == "integer" and mb["default"] == 128
     opt = props["pretraining"]["properties"]["optimizer"]
-    assert opt["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "muonh", "aurora"]
+    assert opt["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "nordion2"]
     sched = props["pretraining"]["properties"]["lr_schedule"]
     assert sched["enum"] == ["wsd", "warmup_stable", "cosine", "linear"]
     assert sched["default"] == "wsd"
@@ -21,7 +21,7 @@ def test_pretrain_schema_shape():
     canon = props["model"]["properties"]["use_canon_layers"]
     assert "pure_torch" in canon["x-nanoplm-backend"]
     # compat rules attached at surface level
-    assert any(r["flag"] == "use_moe" for r in s["x-nanoplm-compat"]["model_reject"])
+    assert any(r["flag"] == "use_moe" for r in s["x-nanoplm-compat"]["model_warn"])
 
 
 def test_extra_fields_are_folded_into_their_section():
@@ -63,7 +63,7 @@ def test_eval_schema_built_from_dataclass():
     s = emit.build_surface("eval")
     props = s["properties"]
     assert "framework" in props
-    assert "pbc, flip, pgym" in props["framework"]["description"]
+    assert "pgym, pbc_zeroshot_contact" in props["framework"]["description"]
 
 
 def test_eval_required_field_has_no_fabricated_default():
@@ -77,7 +77,7 @@ def test_eval_factory_default_is_resolved():
     props = emit.build_surface("eval")["properties"]
     fr = props["framework"]
     assert fr["type"] == "array"
-    assert fr["default"] == ["pbc"]       # the resolved value, not the lambda source string
+    assert fr["default"] == ["pgym"]      # the resolved value, not the lambda source string
 
 def test_eval_none_default_is_json_null():
     props = emit.build_surface("eval")["properties"]
@@ -86,7 +86,14 @@ def test_eval_none_default_is_json_null():
 
 def test_eval_scalar_defaults_and_enum():
     props = emit.build_surface("eval")["properties"]
-    assert props["batch_size"]["type"] == "integer" and props["batch_size"]["default"] == 16
+    assert (
+        props["zero_shot_batch_size"]["type"] == "integer"
+        and props["zero_shot_batch_size"]["default"] == 60
+    )
+    assert (
+        props["development_mode"]["type"] == "boolean"
+        and props["development_mode"]["default"] is True
+    )
     zsm = props["zero_shot_method"]
     assert zsm["default"] == "masked_marginals"
     assert zsm["enum"] == ["masked_marginals", "wt_marginals", "pseudoperplexity"]

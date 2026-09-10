@@ -56,53 +56,6 @@ class MuonAdamWGroup:
             )
 
 
-class OptimizerGroup:
-    """Small optimizer-like wrapper for stepping multiple inner optimizers."""
-
-    def __init__(self, optimizers):
-        self.optimizers = list(optimizers)
-        if not self.optimizers:
-            raise ValueError("OptimizerGroup requires at least one optimizer.")
-        self.defaults = getattr(self.optimizers[0], "defaults", {})
-
-    @property
-    def param_groups(self):
-        groups = []
-        for opt in self.optimizers:
-            groups.extend(opt.param_groups)
-        return groups
-
-    def __iter__(self):
-        return iter(self.optimizers)
-
-    def __len__(self):
-        return len(self.optimizers)
-
-    def step(self, closure=None):
-        loss = None
-        for opt in self.optimizers:
-            loss = opt.step(closure)
-        return loss
-
-    def zero_grad(self, set_to_none: bool = True):
-        for opt in self.optimizers:
-            opt.zero_grad(set_to_none=set_to_none)
-
-    def state_dict(self):
-        return {"optimizers": [opt.state_dict() for opt in self.optimizers]}
-
-    def load_state_dict(self, state_dict):
-        states = state_dict.get("optimizers")
-        if not isinstance(states, list) or len(states) != len(self.optimizers):
-            logger.warning(
-                "Composite Muon optimizer checkpoint does not match current optimizer "
-                "layout. Skipping Muon-side optimizer state restore."
-            )
-            return
-        for opt, sd in zip(self.optimizers, states):
-            opt.load_state_dict(sd)
-
-
 def is_muon_optimizer(optimizer) -> bool:
     """Return True if *optimizer* is a Dion matrix optimizer or a MuonAdamWGroup."""
     if isinstance(optimizer, MuonAdamWGroup):
@@ -119,13 +72,8 @@ def is_muon_optimizer(optimizer) -> bool:
     except ImportError:
         pass
     try:
-        from dion import MuonH as DionMuonH
-        classes.append(DionMuonH)
-    except ImportError:
-        pass
-    try:
-        from dion import Aurora as DionAurora
-        classes.append(DionAurora)
+        from dion import NorDion2 as DionNorDion2
+        classes.append(DionNorDion2)
     except ImportError:
         pass
     return bool(classes) and isinstance(optimizer, tuple(classes))
@@ -194,11 +142,6 @@ def _is_router_param(name: str) -> bool:
 def _is_moe_routed_expert_param(name: str) -> bool:
     parts = name.split(".")
     return len(parts) >= 2 and parts[-2:] in (["mlp", "Wi"], ["mlp", "Wo"])
-
-
-def _is_mlp_matrix_param(name: str) -> bool:
-    lname = name.lower()
-    return ".mlp." in lname or ".mhc_mlp." in lname or ".shared_expert." in lname
 
 
 def _env_flag_enabled(name: str, *, default: bool) -> bool:
@@ -270,17 +213,9 @@ def build_muon_optimizer(
     distributed_mesh=None,
 ) -> MuonAdamWGroup:
     raw_model = unwrap_model(model)
-    hyperball_mlp_only = (
-        str(pretrain_config.optimizer).lower() in {"muonh", "aurora"}
-        and str(getattr(pretrain_config, "muonh_scope", "all")).lower() == "mlp"
-    )
-    hyperball_all = (
-        str(pretrain_config.optimizer).lower() in {"muonh", "aurora"}
-        and not hyperball_mlp_only
-    )
+    variant = str(pretrain_config.optimizer).lower()
 
     muon_params: list[torch.nn.Parameter] = []
-    hyperball_params: list[torch.nn.Parameter] = []
     adamw_params: list[torch.nn.Parameter] = []
     resid_params: list[torch.nn.Parameter] = []
     x0_params: list[torch.nn.Parameter] = []
@@ -314,40 +249,32 @@ def build_muon_optimizer(
         elif param.ndim == 2:
             if _is_zero_init_fragile_param(name) or _is_router_param(name):
                 adamw_params.append(param)
-            elif hyperball_mlp_only and _is_mlp_matrix_param(name):
-                hyperball_params.append(param)
-            elif hyperball_all:
-                hyperball_params.append(param)
             else:
                 muon_params.append(param)
         elif param.ndim == 3 and _is_moe_routed_expert_param(name):
             # MoE routed experts are stored as stacked 3D tensors for grouped_mm.
-            # NorMuon supports batched 2D updates, so keep these on the Muon side
-            # instead of falling back to AdamW just because of the storage layout.
-            if hyperball_mlp_only and _is_mlp_matrix_param(name):
-                hyperball_params.append(param)
-            elif hyperball_all:
-                hyperball_params.append(param)
-            else:
-                muon_params.append(param)
+            # NorMuon/NorDion2 support batched updates, so keep these on the matrix
+            # side instead of falling back to AdamW just because of the storage layout.
+            muon_params.append(param)
         else:
             adamw_params.append(param)
 
-    if not muon_params and not hyperball_params:
+    if not muon_params:
         raise ValueError(
-            "No eligible matrix parameters found for Muon (expected 2D hidden-layer weights)."
+            "No eligible matrix parameters found for the matrix optimizer "
+            "(expected 2D hidden-layer weights)."
         )
 
     # Route fused QKV weights on the Muon/NorMuon side into per-split_sizes
     # groups so q/k/v are orthogonalized independently. Set
     # NANOPLM_MUON_SPLIT_FUSED_QKV=0 to leave fused Wqkv in the plain Muon group,
-    # causing the whole fused matrix to be orthogonalized together. Hyperball
-    # params are left untouched: MuonH/Aurora do not support split_sizes and
-    # would silently ignore the group option.
+    # causing the whole fused matrix to be orthogonalized together. NorDion2 does
+    # not support split_sizes (it raises), so the split is always disabled for it
+    # and fused Wqkv weights are orthogonalized as whole matrices.
     muon_split_groups: dict[tuple[int, ...], list[torch.nn.Parameter]] = {}
-    use_qkv_split_sizes = _env_flag_enabled(
-        "NANOPLM_MUON_SPLIT_FUSED_QKV",
-        default=True,
+    use_qkv_split_sizes = (
+        variant != "nordion2"
+        and _env_flag_enabled("NANOPLM_MUON_SPLIT_FUSED_QKV", default=True)
     )
     qkv_split_map = (
         _collect_qkv_split_sizes(raw_model)
@@ -355,10 +282,14 @@ def build_muon_optimizer(
         else {}
     )
     if not use_qkv_split_sizes:
+        reason = (
+            "optimizer=nordion2 (NorDion2 does not support split_sizes)"
+            if variant == "nordion2"
+            else "NANOPLM_MUON_SPLIT_FUSED_QKV"
+        )
         logger.info(
-            "Fused-QKV Muon split_sizes disabled by "
-            "NANOPLM_MUON_SPLIT_FUSED_QKV; fused Wqkv weights will be "
-            "orthogonalized as whole matrices."
+            f"Fused-QKV matrix split_sizes disabled by {reason}; fused Wqkv "
+            "weights will be orthogonalized as whole matrices."
         )
     if qkv_split_map and muon_params:
         remaining: list[torch.nn.Parameter] = []
@@ -379,7 +310,6 @@ def build_muon_optimizer(
             )
 
     muon_numel = sum(p.numel() for p in muon_params)
-    hyperball_numel = sum(p.numel() for p in hyperball_params)
     adamw_numel = sum(p.numel() for p in adamw_params)
     resid_numel = sum(p.numel() for p in resid_params)
     x0_numel = sum(p.numel() for p in x0_params)
@@ -395,12 +325,11 @@ def build_muon_optimizer(
         + sum(p.numel() for p in noble_phase_params)
     )
     logger.info(
-        f"Muon grouping: muon_params={len(muon_params)} tensors, "
-        f"hyperball_params={len(hyperball_params)} tensors, "
+        f"Matrix-optimizer grouping: muon_params={len(muon_params)} tensors, "
         f"adamw_params={len(adamw_params)} tensors, "
         f"resid_scalar_params={len(resid_params)} tensors, "
         f"x0_scalar_params={len(x0_params)} tensors; "
-        f"muon_numel={muon_numel:,}, hyperball_numel={hyperball_numel:,}, "
+        f"muon_numel={muon_numel:,}, "
         f"adamw_numel={adamw_numel:,}, "
         f"resid_numel={resid_numel:,}, x0_numel={x0_numel:,}"
         + (f", noble_params={noble_total} tensors (wup={len(noble_wup_params)}, "
@@ -444,7 +373,6 @@ def build_muon_optimizer(
     return build_optimizer(
         muon_params=muon_params,
         muon_split_groups=muon_split_groups,
-        muonh_params=hyperball_params,
         adamw_params=adamw_params,
         resid_params=resid_params,
         x0_params=x0_params,
@@ -461,8 +389,14 @@ def build_muon_optimizer(
         muon_momentum=pretrain_config.muon_momentum,
         muon_nesterov=pretrain_config.muon_nesterov,
         muon_eps=pretrain_config.muon_eps,
-        muon_variant=str(pretrain_config.optimizer).lower(),
-        muonh_normalization=pretrain_config.muonh_normalization,
+        muon_adjust_lr=pretrain_config.muon_adjust_lr,
+        muon_beta2=pretrain_config.muon_beta2,
+        muon_use_gram_newton_schulz=pretrain_config.muon_use_gram_newton_schulz,
+        muon_triton_post_ortho=pretrain_config.muon_triton_post_ortho,
+        muon_flatten=pretrain_config.muon_flatten,
+        muon_variant=variant,
+        nordion2_fraction=pretrain_config.nordion2_fraction,
+        nordion2_selection_scope=pretrain_config.nordion2_selection_scope,
         adamw_learning_rate=pretrain_config.adam_learning_rate,
         adamw_weight_decay=pretrain_config.adam_weight_decay,
         adamw_betas=(pretrain_config.adam_beta1, pretrain_config.adam_beta2),
@@ -506,7 +440,6 @@ def _polar_express_paper(G: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor
 
 def build_optimizer(
     muon_params: list[torch.nn.Parameter],
-    muonh_params: list[torch.nn.Parameter] | None,
     adamw_params: list[torch.nn.Parameter],
     muon_learning_rate: float,
     muon_weight_decay: float,
@@ -527,16 +460,21 @@ def build_optimizer(
     noble_freq_params: list[torch.nn.Parameter] | None = None,
     noble_phase_params: list[torch.nn.Parameter] | None = None,
     noble_lrs: dict | None = None,
-    muon_variant: str = "muon",
-    muonh_normalization: str = "neuron",
+    muon_variant: str = "normuon",
+    muon_adjust_lr: str = "rms_norm",
+    muon_beta2: float = 0.95,
+    muon_use_gram_newton_schulz: bool = False,
+    muon_triton_post_ortho: bool = False,
+    muon_flatten: bool = False,
+    nordion2_fraction: float = 0.25,
+    nordion2_selection_scope: str = "local",
     muon_split_groups: dict[tuple[int, ...], list[torch.nn.Parameter]] | None = None,
     distributed_mesh=None,
 ) -> MuonAdamWGroup:
-    """Build a MuonAdamWGroup: Dion matrix optimizer(s) + torch.optim.AdamW(fused=True)."""
-    muonh_params = muonh_params or []
+    """Build a MuonAdamWGroup: a Dion matrix optimizer + torch.optim.AdamW(fused=True)."""
     muon_split_groups = muon_split_groups or {}
-    if not muon_params and not muon_split_groups and not muonh_params:
-        raise ValueError("Muon optimizer requires at least one matrix parameter.")
+    if not muon_params and not muon_split_groups:
+        raise ValueError("Matrix optimizer requires at least one matrix parameter.")
     resid_params = resid_params or []
     x0_params = x0_params or []
     noble_wup_params = noble_wup_params or []
@@ -555,8 +493,6 @@ def build_optimizer(
         if dist.is_available() and dist.is_initialized():
             distributed_mesh = dist.group.WORLD
 
-    ns_func = _polar_express_paper if muon_use_polar_express else None
-
     # Param groups for the Dion Muon/NorMuon side: plain matrix params plus
     # one group per distinct split_sizes (fused QKV weights whose q/k/v row
     # blocks are orthogonalized independently).
@@ -574,84 +510,73 @@ def build_optimizer(
     NANOCHAT_X0_BETAS = (0.96, 0.95)
     NANOCHAT_SCALAR_EPS = 1e-10
 
-    # -- Dion Muon/NorMuon/MuonH/Aurora: matrix params -----------------------
+    # -- Dion matrix optimizer: muon / normuon / nordion2 --------------------
     import inspect
     from dion import Muon as DionMuon
     from dion import NorMuon as DionNorMuon
 
     variant = str(muon_variant).lower()
-    if variant not in {"muon", "normuon", "muonh", "aurora"}:
+    if variant not in {"muon", "normuon", "nordion2"}:
         raise ValueError(
-            f"Unknown muon_variant: {muon_variant!r}. Expected one of: muon, normuon, muonh, aurora."
+            f"Unknown optimizer variant: {muon_variant!r}. Expected one of: "
+            "muon, normuon, nordion2."
         )
 
-    common_kwargs = dict(
+    ns_func = _polar_express_paper if muon_use_polar_express else None
+
+    if variant == "nordion2":
+        try:
+            from dion import NorDion2 as MatrixCls
+        except ImportError as e:
+            raise ImportError(
+                "optimizer='nordion2' requires a dion build that exposes NorDion2."
+            ) from e
+    else:
+        MatrixCls = DionNorMuon if variant == "normuon" else DionMuon
+
+    adjust_lr = str(muon_adjust_lr).strip().lower()
+    adjust_lr = None if adjust_lr == "none" else adjust_lr
+
+    # Base kwargs shared by every Dion matrix optimizer. Knobs that only some
+    # variants accept are added below, guarded by the class signature so an
+    # unsupported knob is simply skipped rather than raising.
+    sig = inspect.signature(MatrixCls).parameters
+    kwargs: dict = dict(
         distributed_mesh=distributed_mesh,
         lr=float(muon_learning_rate),
         mu=float(muon_momentum),
         epsilon=float(muon_eps),
-        nesterov=bool(muon_nesterov),
+        weight_decay=float(muon_weight_decay),
         use_triton=True,
         newton_schulz_func=ns_func,
-        adjust_lr="rms_norm",
-        # use_gram_newton_schulz=True,
     )
-    if variant in {"muonh", "aurora"}:
-        if variant == "muonh":
-            try:
-                from dion import MuonH as HyperballCls
-            except ImportError as e:
-                raise ImportError(
-                    "optimizer='muonh' requires a dion build that exposes MuonH."
-                ) from e
-        else:
-            try:
-                from dion import Aurora as HyperballCls
-            except ImportError as e:
-                raise ImportError(
-                    "optimizer='aurora' requires a dion build that exposes Aurora."
-                ) from e
-        optimizers = []
-        if muon_params or muon_split_groups:
-            normuon_kwargs = {
-                **common_kwargs,
-                "weight_decay": float(muon_weight_decay),
-                "cautious_wd": bool(muon_cautious_weight_decay),
-                "muon_beta2": 0.95,
-            }
-            if "normalization" in inspect.signature(DionNorMuon).parameters:
-                normuon_kwargs["normalization"] = "neuron"
-            optimizers.append(DionNorMuon(_muon_param_groups(), **normuon_kwargs))
-        if muonh_params:
-            hyperball_kwargs = {
-                **common_kwargs,
-                "betas": (0.9, 0.95),
-                "weight_decay": float(muon_weight_decay),
-            }
-            if variant == "muonh":
-                normalization = str(muonh_normalization).strip().lower()
-                hyperball_kwargs["normalization"] = None if normalization == "none" else normalization
-                hyperball_kwargs["muon_beta2"] = 0.95
-                if "use_polar_express" in inspect.signature(HyperballCls).parameters:
-                    hyperball_kwargs["use_polar_express"] = bool(muon_use_polar_express)
-            else:
-                if "cautious_wd" in inspect.signature(HyperballCls).parameters:
-                    hyperball_kwargs["cautious_wd"] = bool(muon_cautious_weight_decay)
-            optimizers.append(HyperballCls([dict(params=muonh_params)], **hyperball_kwargs))
-        muon_opt = OptimizerGroup(optimizers) if len(optimizers) > 1 else optimizers[0]
-    else:
-        Cls = DionNorMuon if variant == "normuon" else DionMuon
-        kwargs = {
-            **common_kwargs,
-            "weight_decay": float(muon_weight_decay),
-            "cautious_wd": bool(muon_cautious_weight_decay),
-        }
-        if variant == "normuon":
-            kwargs["muon_beta2"] = 0.95
-            # `normalization` is only on the NorMuon PR branch; skip if absent.
-            if "normalization" in inspect.signature(DionNorMuon).parameters:
-                kwargs["normalization"] = "neuron"
-        muon_opt = Cls(_muon_param_groups(), **kwargs)
+    if "adjust_lr" in sig:
+        kwargs["adjust_lr"] = adjust_lr
+    if "use_polar_express" in sig:
+        kwargs["use_polar_express"] = bool(muon_use_polar_express)
+    if "use_gram_newton_schulz" in sig:
+        kwargs["use_gram_newton_schulz"] = bool(muon_use_gram_newton_schulz)
+    if "flatten" in sig:
+        kwargs["flatten"] = bool(muon_flatten)
+    if "muon_beta2" in sig:  # NorMuon / NorDion2 second-moment beta
+        kwargs["muon_beta2"] = float(muon_beta2)
+    if "nesterov" in sig:  # Muon / NorMuon only
+        kwargs["nesterov"] = bool(muon_nesterov)
+    if "cautious_wd" in sig:  # Muon / NorMuon only
+        kwargs["cautious_wd"] = bool(muon_cautious_weight_decay)
+    if "triton_post_ortho" in sig:  # NorDion2 in the current dion build
+        kwargs["triton_post_ortho"] = bool(muon_triton_post_ortho)
+    # NorMuon per-neuron normalization (only present on the NorMuon PR branch).
+    if variant == "normuon" and "normalization" in sig:
+        kwargs["normalization"] = "neuron"
+    # NorDion2-specific low-rank knobs.
+    if variant == "nordion2":
+        if "fraction" in sig:
+            kwargs["fraction"] = float(nordion2_fraction)
+        if "selection_scope" in sig:
+            kwargs["selection_scope"] = str(nordion2_selection_scope)
+
+    muon_opt = MatrixCls(_muon_param_groups(), **kwargs)
 
     # -- torch.optim.AdamW(fused=True): adamw / resid / x0 params -------------
     adamw_groups: list[dict] = []
@@ -667,7 +592,13 @@ def build_optimizer(
         adamw_groups.append(dict(
             params=resid_params,
             lr=NANOCHAT_RESID_LR,
-            weight_decay=0.0,
+            # nanochat gives resid_lambdas weight_decay=0.05 (gpt.py), and that
+            # decay is the actuator: the final norm() makes the loss invariant to
+            # the residual *magnitude*, so resid_lambdas gets ~no gradient to
+            # shrink it -- only this WD pulls it below 1.0 to bound the residual
+            # stream. With wd=0.0 enabling resid_lambdas does nothing for the
+            # squared-ReLU runaway.
+            weight_decay=0.05,
             betas=NANOCHAT_RESID_BETAS,
             eps=NANOCHAT_SCALAR_EPS,
         ))

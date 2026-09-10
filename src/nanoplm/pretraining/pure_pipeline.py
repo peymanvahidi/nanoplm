@@ -20,14 +20,10 @@ try:
 except ImportError:
     NorMuon = None  # type: ignore[assignment,misc]
 try:
-    from dion import MuonH
+    from dion import NorDion2
 except ImportError:
-    MuonH = None  # type: ignore[assignment,misc]
-try:
-    from dion import Aurora
-except ImportError:
-    Aurora = None  # type: ignore[assignment,misc]
-_DION_OPTIMIZER_TYPES = tuple(t for t in (Muon, NorMuon, MuonH, Aurora) if t is not None)
+    NorDion2 = None  # type: ignore[assignment,misc]
+_DION_OPTIMIZER_TYPES = tuple(t for t in (Muon, NorMuon, NorDion2) if t is not None)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # Default to safer Inductor reduction codegen. Inductor's async compile uses
 # subprocess workers that read these env vars at process start, so setting them
@@ -83,7 +79,6 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import (
-    OptimizerGroup,
     build_muon_optimizer,
     is_muon_optimizer,
     MuonAdamWGroup,
@@ -120,6 +115,13 @@ N_PREFETCH_LAYERS_FSDP2 = 1
 # running the (blocking) coordination allreduce every step would serialize
 # host and device once per micro-step.
 BATCH_COORD_TAIL_STEPS = 64
+
+# Optimizer steps to run before the max_wallclock_hours clock starts.  Step 1
+# triggers the torch.compile forward+backward build and kernel autotuning; step
+# 2 absorbs the recompiles those guards usually trigger.  From step 3 on the
+# loop is at steady state, which is the throughput a wall-clock-matched
+# ablation is trying to compare.
+_WALLCLOCK_WARMUP_STEPS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +534,16 @@ def _first_nonfinite_grad(model) -> tuple[str, torch.Tensor] | None:
         if not torch.isfinite(grad).all():
             return name, grad
     return None
+
+
+# When the loss goes non-finite we skip the optimizer step to survive a
+# transient bad batch. But if the *weights* are already corrupted (a prior
+# overflowing step wrote NaN/Inf into params), every subsequent forward is
+# non-finite and skipping can never recover -- the run would spin forever at
+# one step. This bounds that: a skip caused by corrupted weights aborts
+# immediately (naming the param), and even with finite weights we abort after
+# this many consecutive skips rather than hang indefinitely.
+_MAX_CONSECUTIVE_NONFINITE_SKIPS = 5
 
 
 def _first_nonfinite_param(model) -> tuple[str, torch.Tensor] | None:
@@ -985,6 +997,13 @@ def _recycling_flops_per_token(components, loop_count: int, bptt: int | None = N
 def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = None) -> int:
     """Training FLOPs/token at the TARGET recycling loop count (startup estimate)."""
     components = _recycling_flops_components(config, seq_len)
+    if getattr(config, "use_loopie", False):
+        # Loopie has no prelude/coda (P=C=0), so the recycling decomposition
+        # already describes it exactly: forward = R x stack, and bptt=None means
+        # full backprop through every repeat (2 x forward).
+        return _recycling_flops_per_token(
+            components, max(1, int(getattr(config, "loopie_loop_count", 2))), bptt=None
+        )
     loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
     return _recycling_flops_per_token(components, loop_count, bptt=bptt)
 
@@ -995,7 +1014,7 @@ def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = Non
 
 def _create_optimizer(model, cfg, distributed_mesh=None):
     name = str(cfg.optimizer).lower()
-    if name in {"muon", "normuon", "muonh", "aurora"}:
+    if name in {"muon", "normuon", "nordion2"}:
         return build_muon_optimizer(model, cfg, distributed_mesh=distributed_mesh)
 
     from nanoplm.pretraining.optim import _classify_noble_param
@@ -1055,7 +1074,7 @@ def _create_optimizer(model, cfg, distributed_mesh=None):
             logger.warning("StableAdamW unavailable; falling back to AdamW.")
             return torch.optim.AdamW(**kwargs)
         return cls(**kwargs)
-    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon, muonh, aurora]")
+    raise ValueError(f"Invalid optimizer: {cfg.optimizer}. Supported: [adamw, stable_adamw, muon, normuon, nordion2]")
 
 
 def _mlm_extra_excluded_token_ids(tokenizer, cfg):
@@ -1209,8 +1228,6 @@ def _create_scheduler(
         return LambdaLR(opt, lr_lambda, last_epoch=last_ep)
 
     def _make_scheduler_any(opt, last_ep):
-        if isinstance(opt, OptimizerGroup):
-            return [_make_scheduler(inner, last_ep) for inner in opt.optimizers]
         return _make_scheduler(opt, last_ep)
 
     if isinstance(optimizer, MuonAdamWGroup):
@@ -1766,6 +1783,11 @@ def _configure_fp8_cpu_activation_offload(
         raise ValueError(
             "fp8_cpu_activation_offload is not supported with recycling_loop_count > 1."
         )
+    if bool(getattr(model_config, "use_loopie", False)):
+        raise ValueError(
+            "fp8_cpu_activation_offload is not supported with use_loopie=true "
+            "(each layer executes more than once per forward)."
+        )
 
     targets = list(iter_te_cpu_offload_target_wrappers(model))
     if not targets:
@@ -2128,11 +2150,20 @@ def run_pure_pretraining(
                 
         _encoder = base_model.model
         _recycling_active = int(getattr(_encoder.config, "recycling_loop_count", 1) or 1) > 1
-        _recurrent_ids = (
-            {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
-            if _recycling_active
-            else set()
-        )
+        _loopie_active = bool(getattr(_encoder.config, "use_loopie", False))
+        if _loopie_active:
+            # Under Loopie every layer executes more than once per forward, so
+            # skip per-layer sharding entirely and let all layers fall into the
+            # root FSDP group: one unshard covering the whole forward/backward,
+            # gradients from all repeats accumulating into a single
+            # reduce-scatter. Same reasoning as the recurrent-layer exclusion.
+            _recurrent_ids = {id(l) for l in _encoder.layers}
+        else:
+            _recurrent_ids = (
+                {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
+                if _recycling_active
+                else set()
+            )
         for layer in _encoder.layers:
             if id(layer) in _recurrent_ids:
                 continue
@@ -2566,15 +2597,44 @@ def run_pure_pretraining(
     # iters (see _drive_recurrence / _recycling_flops_per_token), so the FLOPs
     # estimator must know K or it overcounts backward and inflates MFU for r > K.
     _bptt = max(1, int(getattr(pretrain_config, "recycling_bptt", 1)))
+    if getattr(_cfg, "use_loopie", False):
+        # Loopie backprops through every repeat; bptt=None keeps the estimator
+        # from truncating the backward cost.
+        _bptt = None
     _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len, bptt=_bptt)
     # Components for per-step FLOPs at the *actual* loop count (curriculum-accurate
     # MFU). _flops_per_token above is the nominal estimate at the target loop count.
     _flops_components = _recycling_flops_components(_cfg, manifest.max_seq_len)
-    _static_loop_count = max(1, int(getattr(_cfg, "recycling_loop_count", 1)))
+    _static_loop_count = (
+        max(1, int(getattr(_cfg, "loopie_loop_count", 2)))
+        if getattr(_cfg, "use_loopie", False)
+        else max(1, int(getattr(_cfg, "recycling_loop_count", 1)))
+    )
     _peak_flops = H100_PEAK_TFLOPS * 1e12
     logger.info(f"MFU estimation: {_flops_per_token:,} training FLOPs/token, H100 peak = {H100_PEAK_TFLOPS} TFLOPS")
 
     _run_t0 = time.perf_counter()
+    # Wall-clock stop. The clock is NOT started here: the first optimizer steps
+    # pay for torch.compile, autotune and cuDNN/NCCL warmup, which would make the
+    # budget measure setup instead of throughput and would differ between the
+    # arms of an ablation. It is armed after _WALLCLOCK_WARMUP_STEPS steps of
+    # THIS run (so a resume gets a fresh budget), and is only read at optimizer-
+    # step boundaries, where a checkpoint has a consistent resume position.
+    _wallclock_hours = getattr(pretrain_config, "max_wallclock_hours", None)
+    wallclock_limit_sec = (
+        float(_wallclock_hours) * 3600.0
+        if _wallclock_hours is not None and float(_wallclock_hours) > 0
+        else None
+    )
+    wallclock_t0 = None
+    if wallclock_limit_sec is not None:
+        logger.info(
+            "Wall-clock stop enabled: training will checkpoint and exit after "
+            f"{_wallclock_hours}h ({wallclock_limit_sec:,.0f}s) of steady-state "
+            f"training even if total_steps={total_steps} has not been reached. "
+            f"The clock starts after step {start_step + _WALLCLOCK_WARMUP_STEPS}, "
+            f"so compile/warmup is excluded and total job time is longer."
+        )
     logger.info(
         f"Starting pure-torch training: total_steps={total_steps} (token-budget driven), "
         f"warmup_steps={warmup_steps}, global_batch_warmup_steps={global_batch_warmup_steps}, "
@@ -2672,6 +2732,10 @@ def run_pure_pretraining(
                 f"MoE routing bias correction enabled: "
                 f"{len(_moe_layers)} MoE layers, {_moe_num_experts} experts"
             )
+    # Per-layer load-balance stats [entropy, max_frac, dead_experts], computed
+    # from the globally reduced expert counts in the bias-correction block.
+    # Piggybacks on bias correction: no stats when moe_use_bias_correction=False.
+    _moe_lb_stats: Optional[torch.Tensor] = None
     window_loss = torch.zeros((), device=device)
     window_steps = 0
     discard_accumulation = False
@@ -2683,6 +2747,7 @@ def run_pure_pretraining(
     window_flops = torch.zeros((), dtype=torch.float64, device=device)
     log_window_t0 = time.perf_counter()
     first_step_of_run = True
+    consecutive_nonfinite_skips = 0
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
     loss_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
     param_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
@@ -2734,6 +2799,8 @@ def run_pure_pretraining(
     # until the token-budget total_steps is reached. The horizon is driven by
     # global_step, not a fixed epoch count.
     epoch = start_epoch
+    wallclock_stop = False
+    wallclock_stop_ckpt = ""
 
     # Single entry point for every checkpoint write. The common kwargs are
     # captured by reference (resolved at call time); per-call-site differences
@@ -2947,6 +3014,11 @@ def run_pure_pretraining(
                     with sync_ctx:
                         with amp_ctx, fp8_ctx:
                             fwd_kwargs = dict(input_ids=batch["input_ids"], labels=batch["labels"])
+                            if "num_valid_tokens" in batch:
+                                fwd_kwargs["num_valid_tokens"] = torch.as_tensor(
+                                    batch["num_valid_tokens"], dtype=torch.long,
+                                    device=batch["input_ids"].device,
+                                )
                             if "attention_mask" in batch:
                                 fwd_kwargs["attention_mask"] = batch["attention_mask"]
                             if "cu_seqlens" in batch:
@@ -2986,13 +3058,59 @@ def run_pure_pretraining(
                         else:
                             loss.backward()
 
-                    if loss_finite_check is not None and loss_finite_check.poll():
+                    # Reach a single global verdict on loss finiteness so all ranks
+                    # skip (or don't) together -- a rank-local `continue` here while
+                    # peers enter the optimizer's collectives would desync/deadlock.
+                    # Only runs when the debug guard is enabled, so production runs
+                    # (loss_finite_check is None) pay no collective or host sync.
+                    loss_nonfinite = False
+                    if loss_finite_check is not None:
+                        loss_nonfinite = loss_finite_check.poll()
+                        if distributed and dist.is_initialized():
+                            _lf = torch.tensor(
+                                [1.0 if loss_nonfinite else 0.0], device=device
+                            )
+                            dist.all_reduce(_lf, op=dist.ReduceOp.MAX)
+                            loss_nonfinite = bool(_lf.item() > 0)
+                    if loss_nonfinite:
+                        consecutive_nonfinite_skips += 1
                         rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                         logger.error(
                             "Skipping optimizer step %d due to non-finite loss on rank %d "
-                            "(epoch=%d micro_step=%d sub_batch=%d).",
+                            "(epoch=%d micro_step=%d sub_batch=%d, consecutive=%d).",
                             upcoming_step, rank, epoch, micro_step, sub_batch_idx,
+                            consecutive_nonfinite_skips,
                         )
+                        # A non-finite loss from FINITE weights is a transient bad
+                        # batch -> skip and recover. From CORRUPTED weights it can
+                        # never recover (every forward is non-finite), so abort
+                        # instead of spinning forever. Decide globally.
+                        _nf = _nonfinite_check_tensor(list(orig_model.parameters()))
+                        weights_corrupt = bool(_nf.item()) if _nf is not None else False
+                        if distributed and dist.is_initialized():
+                            _cf = torch.tensor(
+                                [1.0 if weights_corrupt else 0.0], device=device
+                            )
+                            dist.all_reduce(_cf, op=dist.ReduceOp.MAX)
+                            weights_corrupt = bool(_cf.item() > 0)
+                        if (
+                            weights_corrupt
+                            or consecutive_nonfinite_skips >= _MAX_CONSECUTIVE_NONFINITE_SKIPS
+                        ):
+                            bad = _first_nonfinite_param(orig_model)
+                            bad_name = bad[0] if bad is not None else "<none on this rank>"
+                            reason = (
+                                "model weights are non-finite (a prior optimizer step "
+                                "overflowed); skipping cannot recover"
+                                if weights_corrupt else
+                                f"{consecutive_nonfinite_skips} consecutive non-finite-loss "
+                                "skips with finite weights (not recovering)"
+                            )
+                            raise RuntimeError(
+                                f"Aborting at step {upcoming_step} on rank {rank}: "
+                                f"{reason}. First non-finite param: {bad_name}. "
+                                "Lower the learning rate or add grad/update clipping."
+                            )
                         # backward() already ran on the non-finite loss; zero_grad
                         # below discards those gradients along with any accumulation.
                         optimizer.zero_grad(set_to_none=True)
@@ -3018,10 +3136,7 @@ def run_pure_pretraining(
 
                     if scaler is not None and scaler.is_enabled():
                         if isinstance(optimizer, MuonAdamWGroup):
-                            # optimizer.muon may be an OptimizerGroup (muonh_scope=mlp:
-                            # NorMuon + Hyperball); GradScaler needs each real optimizer.
-                            for _o in (optimizer.muon.optimizers if isinstance(optimizer.muon, OptimizerGroup) else [optimizer.muon]):
-                                scaler.unscale_(_o)
+                            scaler.unscale_(optimizer.muon)
                             scaler.unscale_(optimizer.adamw)
                         else:
                             scaler.unscale_(optimizer)
@@ -3037,8 +3152,7 @@ def run_pure_pretraining(
                     if scaler is not None and scaler.is_enabled():
                         old_scale = scaler.get_scale()
                         if isinstance(optimizer, MuonAdamWGroup):
-                            for _o in (optimizer.muon.optimizers if isinstance(optimizer.muon, OptimizerGroup) else [optimizer.muon]):
-                                scaler.step(_o)
+                            scaler.step(optimizer.muon)
                             scaler.step(optimizer.adamw)
                         else:
                             scaler.step(optimizer)
@@ -3091,8 +3205,22 @@ def run_pure_pretraining(
                                     moe_layer.router.correction_bias.add_(
                                         delta.to(moe_layer.router.correction_bias.device)
                                     )
+                                # Load-balance stats from the same globally reduced
+                                # counts, captured before the zero_() below. Stays
+                                # on GPU; host transfer deferred to the log window.
+                                _lb_totals = _moe_count_accum.sum(dim=1, keepdim=True).clamp_min(1.0)
+                                _lb_frac = _moe_count_accum / _lb_totals
+                                _lb_ent = -(
+                                    _lb_frac.clamp_min(1e-12).log() * _lb_frac
+                                ).sum(dim=1) / math.log(_moe_num_experts)
+                                _moe_lb_stats = torch.stack([
+                                    _lb_ent,
+                                    _lb_frac.amax(dim=1),
+                                    (_moe_count_accum == 0).float().sum(dim=1),
+                                ])
                         _moe_count_accum.zero_()
 
+                    consecutive_nonfinite_skips = 0
                     global_step += 1
                     tokens_seen += int(achieved_global_batch_tokens)
                     profiler_step_cb(global_step)
@@ -3191,6 +3319,45 @@ def run_pure_pretraining(
                     if should_log and is_main:
                         waste = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
                         muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
+                        moe_str = ""
+                        moe_payload: dict = {}
+                        if _moe_layers:
+                            # Divide by the execution count so a looped layer
+                            # reports the same per-execution mean that
+                            # modeling.py folds into the loss, not the sum.
+                            _aux_vals = [
+                                l.last_aux_loss / l.last_aux_count
+                                for l in _moe_layers
+                                if l.last_aux_loss is not None
+                            ]
+                            _z_vals = [
+                                l.last_z_loss / l.last_aux_count
+                                for l in _moe_layers
+                                if l.last_z_loss is not None
+                            ]
+                            if _aux_vals:
+                                moe_payload["moe/aux_loss"] = float(
+                                    torch.stack([a.detach() for a in _aux_vals]).mean()
+                                )
+                            if _z_vals:
+                                moe_payload["moe/router_z_loss"] = float(
+                                    torch.stack(_z_vals).mean()
+                                )
+                            if _moe_lb_stats is not None:
+                                _lb = _moe_lb_stats.cpu()
+                                moe_payload["moe/load_entropy_mean"] = float(_lb[0].mean())
+                                moe_payload["moe/load_entropy_min"] = float(_lb[0].min())
+                                moe_payload["moe/max_expert_frac"] = float(_lb[1].max())
+                                moe_payload["moe/dead_experts"] = float(_lb[2].sum())
+                                for _j in range(_lb.shape[1]):
+                                    moe_payload[f"moe/lb_entropy/layer_{_j:02d}"] = float(_lb[0, _j])
+                            if moe_payload:
+                                moe_str = (
+                                    f"moe_z={moe_payload.get('moe/router_z_loss', float('nan')):.3f} "
+                                    f"moe_ent={moe_payload.get('moe/load_entropy_min', float('nan')):.3f} "
+                                    f"moe_maxf={moe_payload.get('moe/max_expert_frac', float('nan')):.3f} "
+                                    f"moe_dead={moe_payload.get('moe/dead_experts', 0):.0f} "
+                                )
                         wall_elapsed = time.perf_counter() - _run_t0
                         epoch_progress = epoch + (
                             micro_step + ((sub_batch_idx + 1) / max(1, total_sub_batches))
@@ -3201,7 +3368,7 @@ def run_pure_pretraining(
                             f"grad_norm={grad_norm_val:.4f} tok/s={tps:,} real_tok/s={real_tps_log:,} "
                             f"real_tok/step={step_tok:,.0f} "
                             f"dt={avg_step_ms:.2f}ms wall={wall_elapsed:.1f}s waste={waste:.1f}% "
-                            f"h100_mfu={mfu:.2%} {vram_log}"
+                            f"h100_mfu={mfu:.2%} {moe_str}{vram_log}"
                         )
                         payload = {
                             "train/global_step": global_step,
@@ -3219,6 +3386,8 @@ def run_pure_pretraining(
                         }
                         if muon_lr is not None:
                             payload["train/muon_lr"] = muon_lr
+                        if moe_payload:
+                            payload.update(moe_payload)
                         if wandb_enabled and wandb.run is not None:
                             try:
                                 if recycling_scheduler is not None and sampled_r is not None:
@@ -3272,6 +3441,35 @@ def run_pure_pretraining(
                     at_terminal = (global_step == total_steps)
                     do_periodic = global_step % save_steps == 0
 
+                    # Wall-clock budget. The clock is armed once, after the
+                    # compile/autotune warmup steps, so the budget measures
+                    # steady-state training. Ranks read their own clocks and can
+                    # straddle the deadline, so the verdict is reduced to a single
+                    # global answer -- a rank-local stop would leave peers waiting
+                    # in the next collective. At total_steps the post-loop save
+                    # already handles the exit, so don't double up.
+                    hit_wallclock = False
+                    if wallclock_limit_sec is not None and wallclock_t0 is None:
+                        if global_step >= start_step + _WALLCLOCK_WARMUP_STEPS:
+                            wallclock_t0 = time.perf_counter()
+                            if is_main:
+                                logger.info(
+                                    "Wall-clock budget clock started at step %d "
+                                    "(%.1fs of setup/compile excluded); stopping at "
+                                    "+%.3fh of training.",
+                                    global_step,
+                                    wallclock_t0 - _run_t0,
+                                    wallclock_limit_sec / 3600.0,
+                                )
+                    elif wallclock_limit_sec is not None and not at_terminal:
+                        hit_wallclock = (time.perf_counter() - wallclock_t0) >= wallclock_limit_sec
+                        if distributed and dist.is_initialized():
+                            _wc = torch.tensor(
+                                [1.0 if hit_wallclock else 0.0], device=device
+                            )
+                            dist.all_reduce(_wc, op=dist.ReduceOp.MAX)
+                            hit_wallclock = bool(_wc.item() > 0)
+
                     if global_step % eval_steps == 0 or at_wsd_stable_end:
                         _raise_on_nonfinite_params(f"before eval at step {global_step}")
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
@@ -3317,11 +3515,12 @@ def run_pure_pretraining(
                                         logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
-                    # In-loop saves: the forced wsd stable-end boundary and the
-                    # periodic save_steps cadence. Skip the periodic save at the
-                    # terminal step -- the post-loop save writes the role-named
-                    # terminal checkpoint there for every schedule.
-                    if at_wsd_stable_end or (do_periodic and not at_terminal):
+                    # In-loop saves: the forced wsd stable-end boundary, the
+                    # wall-clock deadline, and the periodic save_steps cadence.
+                    # Skip the periodic save at the terminal step -- the post-loop
+                    # save writes the role-named terminal checkpoint there for
+                    # every schedule.
+                    if at_wsd_stable_end or hit_wallclock or (do_periodic and not at_terminal):
                         _raise_on_nonfinite_params(f"before checkpoint at step {global_step}")
                         next_data_step = micro_step
                         next_sub_batch_step = sub_batch_idx + 1
@@ -3335,12 +3534,36 @@ def run_pure_pretraining(
                             epoch_sub_batch_step=next_sub_batch_step,
                             batch_split_divisor=next_batch_split_divisor,
                         )
-                        _save("stable-end" if at_wsd_stable_end else "periodic", **_pos)
+                        _phase = "stable-end" if at_wsd_stable_end else "periodic"
+                        _save(_phase, **_pos)
                         # When the wsd stable-end coincides with the periodic
                         # cadence, also write the periodic checkpoint so the
                         # save_steps trail is unbroken.
                         if at_wsd_stable_end and do_periodic:
                             _save("periodic", **_pos)
+
+                    # Leave immediately after the save so the checkpoint on disk
+                    # matches the final in-memory state: later sub-batches in this
+                    # macro-batch would otherwise take further optimizer steps.
+                    if hit_wallclock:
+                        wallclock_stop = True
+                        wallclock_stop_ckpt = _checkpoint_dir_name(global_step, _phase)
+                        if is_main:
+                            logger.info(
+                                "Wall-clock limit of %.3fh reached after %.1fs of training "
+                                "(%.1fs since process start) at step %d/%d (%.1f%% of the "
+                                "token budget); wrote %s, stopping.",
+                                wallclock_limit_sec / 3600.0,
+                                time.perf_counter() - wallclock_t0,
+                                time.perf_counter() - _run_t0,
+                                global_step, total_steps,
+                                100.0 * global_step / max(1, total_steps),
+                                wallclock_stop_ckpt,
+                            )
+                        break
+
+                if wallclock_stop:
+                    break
 
                 if epoch == resume_epoch and micro_step == resume_data_step:
                     resume_data_step = 0
@@ -3387,9 +3610,9 @@ def run_pure_pretraining(
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
 
-            # Stop once the token-budget horizon is met; otherwise replay the
-            # DataLoader for another pass.
-            if global_step >= total_steps:
+            # Stop once the token-budget horizon is met (or the wall-clock budget
+            # ran out); otherwise replay the DataLoader for another pass.
+            if wallclock_stop or global_step >= total_steps:
                 break
             epoch += 1
 
@@ -3411,7 +3634,18 @@ def run_pure_pretraining(
             else "final"
         )
     )
-    _save(_terminal_phase)
+    # A wall-clock stop never reaches the end of the LR schedule, so the run has
+    # no terminal checkpoint to write: naming a mid-decay snapshot "final" would
+    # misrepresent it (and clobber a real final from an earlier run in the same
+    # output dir). The in-loop save at the deadline is the run's output.
+    if wallclock_stop:
+        logger.info(
+            "Stopped on the wall-clock budget at step %d/%d; skipping the terminal "
+            "'%s' checkpoint. Latest state is %s.",
+            global_step, total_steps, _terminal_phase, wallclock_stop_ckpt,
+        )
+    else:
+        _save(_terminal_phase)
 
     if debug_tracker is not None:
         debug_tracker.close()

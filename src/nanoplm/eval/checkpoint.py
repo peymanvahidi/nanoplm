@@ -58,6 +58,12 @@ def _model_config_from_dict(m: dict) -> ProtModernBertMLMConfig:
             + ", ".join(sorted(missing_required))
         )
 
+    # Checkpoints written before use_huginn_looping existed encode "recycling is
+    # on" solely as recycling_loop_count > 1. Infer the flag so those configs
+    # still validate under the now-explicit switch.
+    if "use_huginn_looping" not in m:
+        kwargs["use_huginn_looping"] = int(m.get("recycling_loop_count", 1) or 1) > 1
+
     return ProtModernBertMLMConfig(**kwargs)
 
 
@@ -126,6 +132,32 @@ def _apply_training_mlp_layout(
     )
 
 
+def _cast_sonicmoe_experts_to_bf16(
+    model: PureProtModernBertMLM,
+    config: ProtModernBertMLMConfig,
+) -> None:
+    """Give the sonicmoe expert GEMMs operands their kernel accepts.
+
+    quack's SM90 grouped GEMM only takes 16- or 8-bit operands, and eval holds
+    the model in fp32 and leans on autocast, which never reaches a custom op.
+    Training multiplied these same weights in bf16 under FSDP's bf16 policy, so
+    bf16 is their trained compute dtype; casting only ``Wi``/``Wo`` leaves the
+    rest of the graph at the precision every other checkpoint is evaluated at.
+    """
+    if str(getattr(config, "moe_kernel_backend", "cutlass")).lower() != "sonicmoe":
+        return
+
+    from nanoplm.pretraining.models.modern_bert.moe import MoELayer
+
+    n_cast = 0
+    for module in model.modules():
+        if isinstance(module, MoELayer):
+            module.Wi.data = module.Wi.data.to(torch.bfloat16)
+            module.Wo.data = module.Wo.data.to(torch.bfloat16)
+            n_cast += 1
+    logger.info(f"sonicmoe eval: cast Wi/Wo of {n_cast} MoE layer(s) to bfloat16")
+
+
 def load_checkpoint(
     checkpoint_dir: Union[str, Path],
     config: ProtModernBertMLMConfig,
@@ -147,6 +179,7 @@ def load_checkpoint(
     model.load_state_dict(state_dict, strict=True)
     if device.type == "cuda" and next(model.parameters()).device.type != "cuda":
         model.to(device)
+    _cast_sonicmoe_experts_to_bf16(model, config)
     model.eval()
 
     training_state_path = checkpoint_dir / "training_state.json"

@@ -1,7 +1,7 @@
 # Evaluation configuration for nanoPLM
 #
 # Runs biotrainer's autoeval pipeline on a pure-torch nanoPLM checkpoint.
-# Requires:  pip install nanoplm[eval]
+# Requires:  pip install nanoplm[eval]   (biotrainer 2.0.0)
 #
 # The model config is loaded from <checkpoint_dir>/model_config.yaml.
 # Checkpoints without that file are not supported.
@@ -11,24 +11,29 @@ eval:
   # directory (the latest checkpoint inside the run-* is used).
   checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
 
-  # One or more of: pbc, flip, pgym. 'pgym' is zero-shot ProteinGym.
-  framework: [pbc]
+  # One or more of: pgym, pbc_zeroshot_contact. Both are zero-shot —
+  # 'pgym' scores ProteinGym DMS variants, 'pbc_zeroshot_contact'
+  # predicts contact maps from the categorical Jacobian.
+  framework: [pgym]
 
   output_dir: "autoeval_output"
 
-  batch_size: 16
-  min_seq_length: 0
-  max_seq_length: 2000
-
   # device: cuda                     # auto-detected when omitted
   # embedder_name: my-run            # defaults to checkpoint dir stem
-  parallel_tasks: 0                  # 0 = sequential, >0 = parallel workers
 
-  # Zero-shot scoring method when framework includes 'pgym'.
+  # Zero-shot scoring method for the 'pgym' framework.
   zero_shot_method: masked_marginals  # masked_marginals | wt_marginals | pseudoperplexity
 
-  # Optional whitelist of task names. Parallel mode only.
-  # tasks: [PBC-secondary_structure]
+  # Sequences per forward pass. Masked-marginals masks one position at a time;
+  # this batches that many masked positions into a single forward.
+  zero_shot_batch_size: 60
+
+  # Subsampled task sets (fast) vs the full benchmark (final numbers).
+  development_mode: true
+
+  # Pre-downloaded benchmark datasets, for machines without internet access.
+  # Mutually exclusive with force_download.
+  # dataset_dir: "/path/to/biotrainer-autoeval-data"
 
   # Re-download framework datasets (use when new tasks land upstream).
   force_download: false

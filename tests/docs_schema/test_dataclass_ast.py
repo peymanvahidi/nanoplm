@@ -15,8 +15,8 @@ def test_eval_fields_carry_leading_comments():
     fields = dc.extract_fields(spec.file, spec.classname)
     by = {f.key: f for f in fields}
     assert "framework" in by
-    assert "pbc, flip, pgym" in by["framework"].description
-    assert by["batch_size"].raw_default == "16"
+    assert "pgym, pbc_zeroshot_contact" in by["framework"].description
+    assert by["zero_shot_batch_size"].raw_default == "60"
 
 def test_eval_zero_shot_method_description():
     spec = DATACLASS_SOURCES["eval"]
