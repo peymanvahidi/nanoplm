@@ -155,6 +155,9 @@ def _validate_distributed_mode(
         raise click.ClickException(
             "ddp_bucket_cap_mb applies only when distributed_mode=ddp."
         )
+    cfg.fsdp_reduce_dtype = str(cfg.fsdp_reduce_dtype).lower()
+    if cfg.fsdp_reduce_dtype not in {"fp32", "bf16"}:
+        raise click.ClickException("fsdp_reduce_dtype must be fp32 or bf16.")
 
 
 def _validate_debug_layerwise_metrics_compat(

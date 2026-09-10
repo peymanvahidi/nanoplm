@@ -106,9 +106,6 @@ torch.backends.cudnn.allow_tf32 = True
 # H100 SXM peak BF16 tensor-core throughput (TFLOPS).
 H100_PEAK_TFLOPS = 989.4
 
-# https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html#forward-backward-with-prefetching
-N_PREFETCH_LAYERS_FSDP2 = 1
-
 # How many micro-steps before the synced epoch end the per-step batch
 # exhaustion allreduce kicks in.  synced_len is the all-rank MIN of exact
 # per-rank loader lengths, so ranks can only run dry inside this window;
@@ -2120,7 +2117,12 @@ def run_pure_pretraining(
     if distributed and _is_fsdp(distributed_mode):
         fsdp_kwargs: dict = {}
         if use_bf16:
-            fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+            reduce_dtype = (
+                torch.bfloat16
+                if str(getattr(pretrain_config, "fsdp_reduce_dtype", "fp32")).lower() == "bf16"
+                else torch.float32
+            )
+            fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=reduce_dtype)
         if distributed_mode == "hsdp":
             # 2D mesh: FSDP2 auto-enables HSDP — all-gather/reduce-scatter within
             # the "shard" dim (intra-node), all-reduce grads across "replicate"
@@ -2150,20 +2152,16 @@ def run_pure_pretraining(
                 
         _encoder = base_model.model
         _recycling_active = int(getattr(_encoder.config, "recycling_loop_count", 1) or 1) > 1
-        _loopie_active = bool(getattr(_encoder.config, "use_loopie", False))
-        if _loopie_active:
-            # Under Loopie every layer executes more than once per forward, so
-            # skip per-layer sharding entirely and let all layers fall into the
-            # root FSDP group: one unshard covering the whole forward/backward,
-            # gradients from all repeats accumulating into a single
-            # reduce-scatter. Same reasoning as the recurrent-layer exclusion.
-            _recurrent_ids = {id(l) for l in _encoder.layers}
-        else:
-            _recurrent_ids = (
-                {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
-                if _recycling_active
-                else set()
-            )
+        # Huginn recycling calls each recurrent layer once per iteration, so
+        # per-layer sharding would re-all-gather it every iteration. Leaving
+        # those layers to the root FSDP group buys one unshard for the whole
+        # forward/backward and a single reduce-scatter for the accumulated
+        # gradients.
+        _recurrent_ids = (
+            {id(l) for l in getattr(_encoder, "recurrent_layers", [])}
+            if _recycling_active
+            else set()
+        )
         for layer in _encoder.layers:
             if id(layer) in _recurrent_ids:
                 continue
@@ -2182,15 +2180,6 @@ def run_pure_pretraining(
         )
         fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
         # optimizer_dist was set above (full mesh for fsdp, "shard" sub-mesh for hsdp)
-
-        # Explicit prefetching for FSDP2
-        if N_PREFETCH_LAYERS_FSDP2 > 1:
-            layers = base_model.model.layers
-            for i, layer in enumerate(layers):
-                if i + 1 < len(layers):
-                    layer.set_modules_to_forward_prefetch(layers[i + 1 : i + 1 + N_PREFETCH_LAYERS_FSDP2])
-                if i - 1 >= 0:
-                    layer.set_modules_to_backward_prefetch(list(reversed(layers[max(0, i - N_PREFETCH_LAYERS_FSDP2) : i])))
 
     # Keep base_model for checkpointing/eval (eval changes shapes → recompilation).
     orig_model = base_model
