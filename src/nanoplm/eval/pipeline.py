@@ -44,6 +44,7 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
         from biotrainer.embedding import CustomEmbedder
         from biotrainer_core.data_classes import ZeroShotMethod
         from biotrainer_core.data_classes.autoeval import AutoEvalReport
+        from biotrainer.shared import SequenceTooLongError
         from biotrainer_core.utils.constants import STANDARD_AAS
     except ImportError as e:
         raise ImportError(
@@ -61,6 +62,7 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
         "CustomEmbedder": CustomEmbedder,
         "get_optimal_window": get_optimal_window,
         "ZeroShotMethod": ZeroShotMethod,
+        "SequenceTooLongError": SequenceTooLongError,
         "STANDARD_AAS": STANDARD_AAS,
     }
 

@@ -15,8 +15,10 @@ from nanoplm.utils.logger import logger
 
 # Upper bound on tokens per batched forward pass. The effective batch is
 # ``min(zero_shot_batch_size, TOKEN_BUDGET // window_len)``, so long windows
-# shrink the batch instead of running out of memory.
-TOKEN_BUDGET = 65_536
+# shrink the batch instead of running out of memory. Sized so a full
+# 1024-token window still admits a batch of 256: below that, a configured
+# batch size is silently capped rather than honoured.
+TOKEN_BUDGET = 262_144
 
 
 def special_token_offsets(tokenizer: ProtModernBertTokenizer) -> Tuple[int, int]:
@@ -68,6 +70,7 @@ class NanoPLMBioEngineer:
         ZeroShotMethod = biotrainer["ZeroShotMethod"]
         STANDARD_AAS = biotrainer["STANDARD_AAS"]
         get_optimal_window = biotrainer["get_optimal_window"]
+        SequenceTooLongError = biotrainer["SequenceTooLongError"]
 
         n_leading, n_trailing = special_token_offsets(tokenizer)
 
@@ -229,17 +232,18 @@ class NanoPLMBioEngineer:
             def _compute_categorical_jacobian(
                 self, sequence: str, batch_size: int = 32
             ) -> torch.Tensor:
-                """Categorical Jacobian, corrected for nanoPLM's tokenizer.
+                """Categorical Jacobian at the configured batch size.
 
-                biotrainer's implementation hardcodes a ``[BOS] + residues + [EOS]``
-                layout: it derives ``L = input_ids.shape[1] - 2`` and slices logits
-                ``[1:-1]``. nanoPLM's tokenizer has no BOS and may append register
-                tokens, so that arithmetic is wrong here (it raises on the final
-                reshape). This uses the tokenizer's real offsets instead.
+                biotrainer calls this with a hardcoded ``batch_size=32``; the
+                zero-shot contact pipeline offers no way to configure it, and the
+                Jacobian is 20*L forward rows per protein, so the batch size is
+                the whole wall-clock story. The configured ``zero_shot_batch_size``
+                wins instead, capped by the token budget.
 
-                ``batch_size`` is biotrainer's hardcoded 32 — the zero-shot contact
-                pipeline offers no way to configure it — so the configured
-                ``zero_shot_batch_size`` wins.
+                Offsets come from the tokenizer rather than a ``[BOS] + residues +
+                [EOS]`` assumption: nanoPLM has no BOS and may append register
+                tokens. biotrainer >= PR #192 derives them the same way, so this
+                differs from upstream only in the batching.
                 """
                 aa_token_ids = torch.tensor(
                     list(self.aa_to_idx().values()), device=self._device
@@ -248,6 +252,18 @@ class NanoPLMBioEngineer:
 
                 length = len(sequence)
                 expected_len = n_leading + length + n_trailing
+                # Same guard biotrainer's own Jacobian applies, and it has to be
+                # this exact exception type: the contact evaluator catches it to
+                # skip the protein, and anything else kills the framework run.
+                # Without it this override would score proteins past the context
+                # the reference embedders skip, which is not a comparable number.
+                if expected_len > self.max_context_length():
+                    raise SequenceTooLongError(
+                        f"Sequence of {length} residues tokenizes to {expected_len} "
+                        f"tokens, which exceeds the {self.max_context_length()} token "
+                        "context. The categorical Jacobian has no windowed variant, "
+                        "so it is not computed."
+                    )
                 if input_ids.shape[1] != expected_len:
                     raise ValueError(
                         f"Tokenized length {input_ids.shape[1]} does not match the "
