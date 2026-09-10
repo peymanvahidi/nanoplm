@@ -1056,11 +1056,22 @@
           "x-nanoplm-backend": [
             "pure_torch"
           ],
+          "x-nanoplm-advanced": true
+        },
+        "loopie_loop_count_jitter": {
+          "type": "integer",
+          "default": 0,
+          "x-nanoplm-group": "Loopie stochastic depth (only when model.use_loopie: true)",
+          "minimum": 0,
+          "description": "0 = fixed depth; 1 at count 2 gives R in {1,2,3}",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
-            "field": "recycling_loop_count",
-            "op": ">",
-            "value": 1
+            "field": "use_loopie",
+            "op": "==",
+            "value": true
           }
         },
         "mlm_probability": {
@@ -1113,8 +1124,9 @@
         },
         "logging_steps": {
           "type": "integer",
-          "default": 1,
-          "x-nanoplm-group": "Logging, eval, checkpoints"
+          "default": 25,
+          "x-nanoplm-group": "Logging, eval, checkpoints",
+          "description": "step line reports means over this many steps; should divide eval_steps"
         },
         "eval_steps": {
           "type": "integer",
@@ -1403,6 +1415,7 @@
         "Batch (token-budget surface)": "micro_batch_seqs     = sequences per GPU per forward  (the VRAM knob)\nglobal_batch_tokens  = tokens per optimizer step\nGradient accumulation is inferred from those two + manifest seq_len +\nworld_size. You never set grad_accum yourself.",
         "Duration + LR schedule": "Token budget, not epochs.\n  lr_schedule: wsd\n    set stable_tokens + decay_tokens\n    stable_tokens INCLUDES warmup \u2014 it is the point where decay begins,\n    not a length added after warmup. decay_tokens IS a length after that.\n  lr_schedule: warmup_stable | cosine | linear\n    comment out stable_tokens / decay_tokens; uncomment train_tokens\nwarmup_steps is used by ALL schedules.\nPrefer tokens over steps. Step overrides (below) replace their *_tokens twin \u2014 never set both of a pair.",
         "Optimizer \u2014 shared & Adam side": "adam_* also drives the AdamW side (1D params + embeddings/unembed) when\noptimizer is muon | normuon | nordion2.",
+        "Loopie stochastic depth (only when model.use_loopie: true)": "Draws R uniformly from loopie_loop_count \u00b1 jitter, fresh per micro-batch.",
         "Precision": "Recommended: keep bf16 enabled (~1.5\u20133\u00d7 speedup).\nWhen bf16: true, hardware picks the best path:\n  CUDA Ampere+ (A100, RTX 3090+)  \u2192  bf16 + TF32\n  CUDA Volta/Turing (V100, 2080)  \u2192  fp16 fallback\n  Apple Silicon (M1/M2/M3/\u2026)      \u2192  fp16 (hardware accelerated)\n  CPU                             \u2192  fp32 (no mixed precision)"
       }
     },
