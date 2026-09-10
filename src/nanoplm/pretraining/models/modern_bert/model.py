@@ -161,12 +161,12 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         ):
             raise ValueError(
                 "GQA is not implemented in the HF ModernBERT path. "
-                "Set num_kv_heads equal to num_attention_heads or use --pure-torch / --pure-te."
+                "Set num_kv_heads equal to num_attention_heads or use --pure-torch."
             )
         if str(config.classifier_activation).strip().lower() == "srelu":
             raise ValueError(
-                "classifier_activation='srelu' is implemented only in the pure-torch and "
-                "Transformer Engine paths. Use --pure-torch / --pure-te or choose relu/gelu."
+                "classifier_activation='srelu' is implemented only in the pure-torch "
+                "path. Use --pure-torch or choose relu/gelu."
             )
         if config.use_paired_head_attention:
             raise ValueError(

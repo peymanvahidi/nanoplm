@@ -45,8 +45,6 @@ Checkpoint saved -> output/pretraining_checkpoints/<run>/checkpoint-stable-end
 
 That `checkpoint-stable-end` is the model as it stood immediately before the anneal. Keep it: the last section of this page is built on it.
 
-WSD requires **pure-torch**. `--pure-te` supports only `warmup_stable`, `cosine`, and `linear`; see [Choose a backend](/nanoplm/guides/backends/).
-
 ## Resume a run that died
 
 A node dropped, a job hit its wall-clock limit, the process was killed. You want to finish the run you started, on the schedule you started it with.
@@ -149,15 +147,13 @@ Change `decay_tokens`, `decay_shape`, or `lr_decay_to_fraction` and run it again
 The scaffold's comment calls `decay_shape` and `lr_decay_to_fraction` *"OPTIONAL overrides"*. That is true of `decay_shape` (it falls back to `1-sqrt`). It is **not** true of `lr_decay_to_fraction`: omit it and the run raises `resume decay requires lr_decay_to_fraction`. Always set it.
 :::
 
-Four more rules for decay branches:
+Three more rules for decay branches:
 
-- **Pure-torch only.** `resume mode: decay` on `--pure-te` fails at config load.
 - **Exactly one of `decay_tokens` or `decay_steps`.** Both is `resume decay: set exactly one of decay_tokens or decay_steps, not both.`; neither is `resume.mode=decay requires a budget: set decay_tokens or decay_steps.`
 - **Keep `global_batch_tokens` and `world_size` identical to the trunk's.** They set how many tokens one optimizer step consumes, which is what turns your `decay_tokens` into a step count. Change either and the branch's LR curve stops matching a single-run WSD decay. The run warns you if it notices.
 - **A branch is not bit-for-bit identical to single-run WSD.** The decay restarts the dataloader at the top of a pass rather than continuing mid-pass, so the two match exactly only when the trunk's stable-to-decay boundary happened to be pass-aligned. For comparing recipes against each other this does not matter. For producing one final model, use `lr_schedule: wsd` in a single run.
 
 ## Where to go next
 
-- [Choose a backend](/nanoplm/guides/backends/): `wsd` and `mode: decay` both require pure-torch.
 - [Choose an optimizer](/nanoplm/guides/optimizers/): a Muon run puts two learning rates on this schedule.
 - [pretrain.yaml reference](/nanoplm/reference/pretrain/): every `pretraining:` and `resume:` key, with defaults.

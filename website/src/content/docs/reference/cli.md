@@ -257,7 +257,7 @@ Template written to: <cwd>/pretrain.yaml
 ### pretrain from-yaml
 
 ```
-nanoplm pretrain from-yaml [CONFIG] [--pure-torch | --pure-te]
+nanoplm pretrain from-yaml [CONFIG] [--pure-torch]
 ```
 
 Runs pretraining from a config with `model:`, `pretraining:`, and `resume:` blocks. `CONFIG` defaults to `pretrain.yaml`.
@@ -265,9 +265,8 @@ Runs pretraining from a config with `model:`, `pretraining:`, and `resume:` bloc
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--pure-torch` | Force the pure-torch model and training loop | off (YAML `pure_torch: true` is the template default) |
-| `--pure-te` | Use the Transformer Engine model and training loop | off |
 
-The stock template sets top-level `pure_torch: true`, so a normal `from-yaml` run needs no backend flag. A CLI flag can force a backend on but does not clear the other YAML key: with `pure_torch: true` still set, `--pure-te` alone fails. For Transformer Engine, set `pure_te: true` and `pure_torch: false`. See [Choose a backend](/nanoplm/guides/backends/).
+The stock template sets top-level `pure_torch: true`, so a normal `from-yaml` run needs no flag. Pure-torch is the only pretraining backend; a config with neither the YAML key nor the flag stops with `Pretraining requires pure_torch: true.`
 
 ```bash
 nanoplm pretrain from-yaml
@@ -290,10 +289,10 @@ torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml
 ### pretrain run
 
 ```
-nanoplm pretrain run --dataset-dir DIR [OPTIONS] --pure-torch | --pure-te
+nanoplm pretrain run --dataset-dir DIR [OPTIONS] --pure-torch
 ```
 
-Flag-driven pretraining without a YAML file. `--dataset-dir` is the only required option; a backend flag **is** mandatory here because there is no YAML default to fall back on. Every flag maps to a `pretrain.yaml` key of the same name, so the [pretrain.yaml reference](/nanoplm/reference/pretrain/) is the authoritative source for meanings and defaults.
+Flag-driven pretraining without a YAML file. `--dataset-dir` is the only required option; `--pure-torch` **is** mandatory here because there is no YAML default to fall back on. Every flag maps to a `pretrain.yaml` key of the same name, so the [pretrain.yaml reference](/nanoplm/reference/pretrain/) is the authoritative source for meanings and defaults.
 
 - **Dataset and output**: `--dataset-dir`, `--ckp-dir`.
 - **Batch and duration**: `--micro-batch-seqs`, `--global-batch-tokens`, `--global-batch-warmup-steps`, `--train-tokens`, `--max-steps`, `--stable-tokens`, `--stable-steps`, `--decay-tokens`, `--decay-steps`.

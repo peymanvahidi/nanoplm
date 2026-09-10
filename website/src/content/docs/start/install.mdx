@@ -163,13 +163,13 @@ If all three work, go train something: [Your first PLM](/nanoplm/start/first-plm
 
 ## What you get vs what you still choose
 
-After a successful `nanoplm deps install`, Muon-family optimizers, token packing (FlashAttention-3), FP8 / pure-TE, and the SonicMoE expert backend are **available**. You still turn features on in YAML (`optimizer`, `use_packing`, `fp8`, `moe_kernel_backend`, …); the installer only guarantees the packages are present.
+After a successful `nanoplm deps install`, Muon-family optimizers, token packing (FlashAttention-3), FP8, and the SonicMoE expert backend are **available**. You still turn features on in YAML (`optimizer`, `use_packing`, `fp8`, `moe_kernel_backend`, …); the installer only guarantees the packages are present.
 
 | Feature | Still needs in config / hardware |
 | --- | --- |
-| Pretraining (pure-torch, the default) | Hopper GPU for the supported path |
+| Pretraining (pure-torch, the only backend) | Hopper GPU for the supported path |
 | Token packing (`use_packing: true`, the default) | FA3 is installed; set `use_packing: false` only if you want padding instead |
-| `fp8: true` / `--pure-te` | TE is installed; FP8 tensor cores need Hopper+; `mxfp8` / `nvfp4` need Blackwell+ |
+| `fp8: true` | Transformer Engine is installed; FP8 tensor cores need Hopper+; `mxfp8` / `nvfp4` need Blackwell+ |
 | `optimizer: muon \| normuon \| muonh \| aurora` | Dion is installed; see [Choose an optimizer](/nanoplm/guides/optimizers/) |
 | `moe_kernel_backend: sonicmoe` | QuACK + SonicMoE are installed; still Hopper-only |
 

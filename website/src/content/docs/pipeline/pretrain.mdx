@@ -52,11 +52,11 @@ The pretraining stage reads the shards and `.data_manifest` the [data stage](/na
 
 Read those startup lines. They are the config after nanoPLM has resolved it: the sequence length came from the manifest, the gradient accumulation was inferred, and your token budget became 504 optimizer steps. If any of those numbers surprise you, stop the run now rather than in six hours.
 
-## Pick a backend
+## The pure-torch backend
 
 The stock template ships `pure_torch: true` at the bottom of `pretrain.yaml`, so `nanoplm pretrain from-yaml` already runs the pure-torch backend. You do **not** need `--pure-torch` for a normal YAML run.
 
-Pure-torch is the hand-written training loop, the only backend that supports the default `wsd` schedule, and the only one whose checkpoints the [eval stage](/nanoplm/pipeline/eval/) can load. Switch to Transformer Engine only when you need it: set `pure_te: true` **and** `pure_torch: false` (or pass `--pure-te` after clearing the YAML pure-torch key). The two backends are mutually exclusive. See [Choose a backend](/nanoplm/guides/backends/) for the full comparison.
+Pure-torch is nanoPLM's hand-written model and training loop, and the only pretraining backend. Leave the key set: a config without it stops with `Pretraining requires pure_torch: true.`
 
 ## A config that really runs
 
@@ -84,7 +84,7 @@ pretraining:
   stable_tokens: 60000000       # tokens up to the decay boundary: warmup is INSIDE this
   decay_tokens: 6000000         # extra tokens spent annealing the LR down
 
-pure_torch: true                # template default; omit only if you switch backends
+pure_torch: true                # template default; the run stops without it
 ```
 
 Those four `model:` keys are the only ones you must supply; the rest of the block is optional. The [reference](/nanoplm/reference/pretrain/) lists a value for them, but that is the number the template pre-fills, not a fallback: leave them out of a hand-written config and the run stops. In `pretraining:`, only `dataset_dir` is strictly required: but a `wsd` schedule needs a budget, so `stable_tokens` and `decay_tokens` come with it.
@@ -180,7 +180,7 @@ Four keys decide the size of your model, and they are the four you must always s
 | [`num_hidden_layers`](/nanoplm/reference/pretrain/#pretrain-model-num_hidden_layers) | `12` | `16` | Depth. |
 | [`num_attention_heads`](/nanoplm/reference/pretrain/#pretrain-model-num_attention_heads) | `8` | `16` | `hidden_size` must divide evenly by this. |
 
-The rest of the block is a long tail of `use_*` flags: alternative attention schemes, mixture-of-experts, low-rank branches, weight-tied recurrence. **They all default to off**, and none of them is needed for a good model. Each is documented in the [pretrain.yaml reference](/nanoplm/reference/pretrain/), and which ones can be combined with which backend is in the [compatibility matrix](/nanoplm/reference/compatibility/). Get a baseline trained first; then turn one on and measure.
+The rest of the block is a long tail of `use_*` flags: alternative attention schemes, mixture-of-experts, low-rank branches, weight-tied recurrence. **They all default to off**, and none of them is needed for a good model. Each is documented in the [pretrain.yaml reference](/nanoplm/reference/pretrain/), and which ones can be combined is in the [compatibility matrix](/nanoplm/reference/compatibility/). Get a baseline trained first; then turn one on and measure.
 
 Two keys are conspicuously absent from `model:`, and now you know why: `max_seq_len` and `num_register_tokens` come from `.data_manifest`. The data stage decided them; the model inherits them.
 

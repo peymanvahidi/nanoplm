@@ -225,7 +225,7 @@ def _archive_future_checkpoints(run_dir: Path, resume_step: int) -> None:
 def _read_checkpoint_epoch(checkpoint_dir: Union[str, Path]) -> int:
     """Read the current epoch from a checkpoint directory.
 
-    Tries the pure-torch / TE format (`training_state.json`) first, then falls
+    Tries the pure-torch format (`training_state.json`) first, then falls
     back to the HuggingFace Trainer format (`trainer_state.json`).  HF stores
     `epoch` as a float (e.g. 4.5 mid-epoch); we truncate to the number of
     completed full epochs.
