@@ -511,6 +511,7 @@ class ModernBertAttention(nn.Module):
         self,
         q: torch.Tensor,
         k: torch.Tensor,
+        v: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Post-softmax probabilities for the padded SDPA path, as (B, H, S, S).
@@ -522,12 +523,31 @@ class ModernBertAttention(nn.Module):
         instead of being reconstructed from config (where a one-off in the
         window would not show up in any aggregate statistic).
 
-        fp32 throughout: SDPA accumulates the softmax in fp32 over bf16 inputs,
-        so doing it in bf16 here would return probabilities the model never
-        actually attended with.
+        Precision is matched to SDPA on both ends, which under autocast are not
+        the same: q and k are first rounded to v's dtype, because QK-norm
+        returns fp32 and autocast casts SDPA's inputs down on entry, so the
+        kernel never sees the unrounded values; the product is then accumulated
+        in fp32, because that is what SDPA does internally. Autocast has to be
+        switched off explicitly for that second half, since inside an enabled
+        region `matmul` casts its inputs back down to bf16 whatever `.float()`
+        says, which at QK-norm logit magnitudes moves probabilities by a few
+        percent.
         """
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
         if self.num_q_heads != self.num_kv_heads:
             k = k.repeat_interleave(self.num_q_heads // self.num_kv_heads, dim=1)
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            return self._softmax_scores(q, k, attn_mask)
+
+    def _softmax_scores(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * self.scale
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
@@ -785,7 +805,7 @@ class ModernBertAttention(nn.Module):
             # fp16 on the CPU as it is produced: (32 layers, 16 heads, L, L) is
             # 2 GB of fp32 at L=1000 if the whole stack is held on the device.
             sink.append(
-                self._eager_attention_probs(q, k, attn_mask)
+                self._eager_attention_probs(q, k, v, attn_mask)
                 .to(self._attn_probs_dtype)
                 .cpu()
             )
@@ -846,7 +866,10 @@ def collect_attention_probs(
         yield sink
     finally:
         for m in attentions:
-            m._attn_probs_sink = None
+            # `del`, not `= None`: leaving an instance attribute behind would
+            # contradict the class-attribute default and can cost a Dynamo
+            # recompile on a compiled model.
+            del m._attn_probs_sink
             del m._attn_probs_dtype
 
 

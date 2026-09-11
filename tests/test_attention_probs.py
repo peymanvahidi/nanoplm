@@ -1,5 +1,7 @@
 """The captured attention probabilities must be the ones SDPA actually used."""
 
+import contextlib
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -11,7 +13,7 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 )
 
 
-def _model():
+def _model(**overrides):
     config = ModernBertConfig(
         vocab_size=64,
         hidden_size=64,
@@ -23,6 +25,7 @@ def _model():
         use_qk_norm=True,
         norm_type="rmsnorm",
         mlp_activation="swiglu",
+        **overrides,
     )
     torch.manual_seed(0)
     model = ModernBertModel(config).eval()
@@ -36,6 +39,80 @@ def _padded_batch(config, lengths=(17, 11)):
     for row, length in enumerate(lengths):
         attention_mask[row, :length] = 1
     return input_ids, attention_mask
+
+
+def _spy_compare(model, config, input_ids, attention_mask, autocast, atol):
+    """Run one forward, capturing both the probabilities and SDPA's own output."""
+    captured = []
+    real_sdpa = F.scaled_dot_product_attention
+
+    def _spy(q, k, v, **kwargs):
+        out = real_sdpa(q, k, v, **kwargs)
+        captured.append((v.detach(), out.detach()))
+        return out
+
+    F.scaled_dot_product_attention = _spy
+    try:
+        with torch.no_grad(), autocast, collect_attention_probs(
+            model, dtype=torch.float32
+        ) as probs:
+            model(input_ids=input_ids, attention_mask=attention_mask)
+    finally:
+        F.scaled_dot_product_attention = real_sdpa
+
+    assert len(probs) == config.num_hidden_layers
+    real = attention_mask.bool().cpu()
+    for layer, (p, (v, out)) in enumerate(zip(probs, captured)):
+        # the capture lands on the CPU; bring the kernel's own tensors along
+        p, v, out = p.float(), v.cpu(), out.cpu()
+        if v.shape[1] != p.shape[1]:  # GQA: SDPA broadcasts v across the group
+            v = v.repeat_interleave(p.shape[1] // v.shape[1], dim=1)
+        recomputed = torch.matmul(p, v.float())
+        keep = real[:, None, :, None].expand_as(recomputed)
+        assert torch.allclose(
+            recomputed[keep], out.float()[keep.expand_as(out)], atol=atol
+        ), (
+            f"layer {layer} ({config.layer_types[layer]}) diverges: max abs "
+            f"{(recomputed[keep] - out.float()[keep.expand_as(out)]).abs().max().item()}"
+        )
+
+
+@pytest.mark.parametrize("num_kv_heads", [None, 2])
+def test_probs_reproduce_the_sdpa_output_gqa(num_kv_heads):
+    """The GQA branch repeats k by hand; SDPA does it with enable_gqa."""
+    model, config = _model(num_kv_heads=num_kv_heads)
+    input_ids, attention_mask = _padded_batch(config)
+    _spy_compare(
+        model,
+        config,
+        input_ids,
+        attention_mask,
+        contextlib.nullcontext(),
+        atol=1e-5,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_probs_reproduce_the_sdpa_output_under_autocast():
+    """The real eval runs under bf16 autocast, where fp32 is not free.
+
+    Inside an enabled autocast region a matmul casts its inputs down however
+    they were spelled, so the recompute has to disable autocast to keep SDPA's
+    fp32 accumulation. On CPU, with no autocast, that mistake is invisible.
+    """
+    device = torch.device("cuda")
+    model, config = _model()
+    model = model.to(device)
+    input_ids, attention_mask = _padded_batch(config)
+    _spy_compare(
+        model,
+        config,
+        input_ids.to(device),
+        attention_mask.to(device),
+        torch.amp.autocast("cuda", dtype=torch.bfloat16),
+        # bounded by SDPA's own bf16 output rounding, not by the scores
+        atol=2e-2,
+    )
 
 
 def test_probs_reproduce_the_sdpa_output():
@@ -176,3 +253,38 @@ def test_empty_window_rows_are_zero_not_nan():
         assert torch.isfinite(p.float()).all(), layer
     # the construction is only meaningful if some query really has no keys
     assert 3 + window < 17
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_probs_are_autocast_invariant():
+    """Same q/k in, same probabilities out, inside an autocast region or not.
+
+    This is the invariant that keeps the probe's features equal to what the
+    model attended with: SDPA accumulates its softmax in fp32, but inside an
+    enabled autocast region a matmul silently casts its inputs back to bf16
+    however they were spelled, so the recompute has to switch autocast off.
+    Measured, the omission moves probabilities by up to 3e-3 absolute -- an
+    order of magnitude past the fp16 rounding they are then stored at, and too
+    small for an output-level comparison to resolve, which is why it is checked
+    here rather than through `probs @ v`.
+    """
+    from nanoplm.pretraining.models.modern_bert.modeling import ModernBertAttention
+
+    model, config = _model()
+    attention = next(
+        m for m in model.modules() if isinstance(m, ModernBertAttention)
+    ).cuda()
+
+    torch.manual_seed(0)
+    shape = (1, config.num_attention_heads, 24, config.head_dim)
+    q = torch.randn(shape, device="cuda")
+    k = torch.randn(shape, device="cuda")
+    v = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        outside = attention._eager_attention_probs(q, k, v, None)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            inside = attention._eager_attention_probs(q, k, v, None)
+
+    assert outside.dtype == torch.float32
+    torch.testing.assert_close(inside, outside, atol=0, rtol=0)
