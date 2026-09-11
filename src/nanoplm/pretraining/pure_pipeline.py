@@ -3085,6 +3085,11 @@ def run_pure_pretraining(
     epoch = start_epoch
     wallclock_stop = False
     wallclock_stop_ckpt = ""
+    # Where the next pass would resume, refreshed at every step boundary so the
+    # post-loop terminal save can record it too. Empty until the first step
+    # completes, so a zero-step run falls back to the old position-less save
+    # rather than reading a loop variable that was never bound.
+    latest_data_pos: dict = {}
 
     # Single entry point for every checkpoint write. The common kwargs are
     # captured by reference (resolved at call time); per-call-site differences
@@ -3815,6 +3820,26 @@ def run_pure_pretraining(
                                         logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
+                    # Computed every step, not only when saving, because the
+                    # terminal save happens after both loops have exited and has
+                    # no other way to know where the data stream stood. When the
+                    # pass ends exactly on the terminal step this records
+                    # epoch_data_step == synced_len, which the resume path reads
+                    # as "start the next pass from the top" -- keep that guard.
+                    next_data_step = micro_step
+                    next_sub_batch_step = sub_batch_idx + 1
+                    next_batch_split_divisor = batch_split_divisor
+                    if next_sub_batch_step >= total_sub_batches:
+                        next_data_step = micro_step + 1
+                        next_sub_batch_step = 0
+                        next_batch_split_divisor = mbs_divisor
+                    _pos = dict(
+                        epoch_data_step=next_data_step,
+                        epoch_sub_batch_step=next_sub_batch_step,
+                        batch_split_divisor=next_batch_split_divisor,
+                    )
+                    latest_data_pos = _pos
+
                     # In-loop saves: the forced wsd stable-end boundary, the
                     # wall-clock deadline, and the periodic save_steps cadence.
                     # Skip the periodic save at the terminal step -- the post-loop
@@ -3822,18 +3847,6 @@ def run_pure_pretraining(
                     # every schedule.
                     if at_wsd_stable_end or hit_wallclock or (do_periodic and not at_terminal):
                         _raise_on_nonfinite_params(f"before checkpoint at step {global_step}")
-                        next_data_step = micro_step
-                        next_sub_batch_step = sub_batch_idx + 1
-                        next_batch_split_divisor = batch_split_divisor
-                        if next_sub_batch_step >= total_sub_batches:
-                            next_data_step = micro_step + 1
-                            next_sub_batch_step = 0
-                            next_batch_split_divisor = mbs_divisor
-                        _pos = dict(
-                            epoch_data_step=next_data_step,
-                            epoch_sub_batch_step=next_sub_batch_step,
-                            batch_split_divisor=next_batch_split_divisor,
-                        )
                         _phase = "stable-end" if at_wsd_stable_end else "periodic"
                         _save(_phase, **_pos)
                         # When the wsd stable-end coincides with the periodic
@@ -3956,7 +3969,10 @@ def run_pure_pretraining(
             global_step, total_steps, _terminal_phase, wallclock_stop_ckpt,
         )
     else:
-        _save(_terminal_phase)
+        # Pass the data position through: without it a `resume.mode: continue`
+        # from this checkpoint replays the current pass from the top, which
+        # silently duplicates data the run has already trained on.
+        _save(_terminal_phase, **latest_data_pos)
 
     if debug_tracker is not None:
         debug_tracker.close()
