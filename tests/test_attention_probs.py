@@ -94,11 +94,12 @@ def test_probs_reproduce_the_sdpa_output_gqa(num_kv_heads):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_probs_reproduce_the_sdpa_output_under_autocast():
-    """The real eval runs under bf16 autocast, where fp32 is not free.
+    """The same equivalence, under the autocast the real eval actually runs in.
 
-    Inside an enabled autocast region a matmul casts its inputs down however
-    they were spelled, so the recompute has to disable autocast to keep SDPA's
-    fp32 accumulation. On CPU, with no autocast, that mistake is invisible.
+    The tolerance here is the kernel's own bf16 output rounding, so this case
+    checks the mask, the scale and the dtype alignment under autocast -- not
+    whether the softmax is accumulated in fp32, which it is far too coarse to
+    see. `test_probs_are_autocast_invariant` is what pins that.
     """
     device = torch.device("cuda")
     model, config = _model()
