@@ -25,6 +25,7 @@ FRAMEWORK_REPORT_NAMES = {
     "pgym": "PGYM",
     "pbc_zeroshot_contact": "PBC_ZEROSHOT_CONTACT",
     "pbc_supervised": "PBC_SUPERVISED",
+    "pbc_supervised_contact": "PBC_SUPERVISED_CONTACT",
 }
 
 # Frameworks that existed before the biotrainer 2.0.0 migration. Kept only to
@@ -163,7 +164,8 @@ def run_eval(eval_config: EvalConfig) -> None:
 
     Supports one or more frameworks per invocation: 'pgym' scores ProteinGym DMS
     variants zero-shot, 'pbc_zeroshot_contact' predicts contact maps from the
-    categorical Jacobian, and 'pbc_supervised' trains task heads on the frozen
+    categorical Jacobian, 'pbc_supervised_contact' fits a probe on the model's
+    attention maps, and 'pbc_supervised' trains task heads on the frozen
     encoder's embeddings. The zero-shot pair runs through a ``BioEngineer`` and
     the supervised one through a ``CustomEmbedder``, both wrapping the same
     GPU-resident model, and all accumulate into one ``AutoEvalReport`` at
@@ -295,6 +297,12 @@ def run_eval(eval_config: EvalConfig) -> None:
                 f"{eval_config.zero_shot_batch_size}"
             )
             autoeval.pbc_supervised()
+        elif framework == "pbc_supervised_contact":
+            logger.info(
+                "Adding PBC supervised contact: a logistic probe over "
+                "symmetrized, APC-corrected attention maps"
+            )
+            autoeval.pbc_supervised_contact()
 
     logger.info(
         f"Starting autoeval: frameworks={frameworks}, "

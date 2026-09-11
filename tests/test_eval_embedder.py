@@ -174,13 +174,6 @@ def test_embedding_is_the_final_normed_hidden_state():
     assert (embedding - pre_norm[0, residues]).abs().max() > 1e-4
 
 
-def test_compute_attention_map_is_not_wired_up():
-    embedder, _, _ = _build_embedder()
-
-    with pytest.raises(NotImplementedError, match="pbc_supervised_contact"):
-        embedder.compute_attention_map(SEQUENCES[0])
-
-
 # ---------------------------------------------------------------------------
 # Loopie refinement depth
 # ---------------------------------------------------------------------------
@@ -226,10 +219,93 @@ def test_loop_count_matches_a_model_built_at_that_depth(depth):
 # ---------------------------------------------------------------------------
 
 def test_pbc_supervised_is_an_accepted_framework():
-    _validate_frameworks(["pgym", "pbc_zeroshot_contact", "pbc_supervised"])
+    _validate_frameworks(
+        [
+            "pgym",
+            "pbc_zeroshot_contact",
+            "pbc_supervised",
+            "pbc_supervised_contact",
+        ]
+    )
 
 
 @pytest.mark.parametrize("framework", ["flip", "pbc"])
 def test_removed_frameworks_are_still_rejected(framework):
     with pytest.raises(click.ClickException, match="no longer supported"):
         _validate_frameworks([framework])
+
+
+def test_attention_map_is_residue_aligned():
+    """The probe indexes the map with an [L, L] mask, so L must be exact.
+
+    Register tokens are the trap: they sit after the EOS, so trimming a single
+    trailing token would leave them in the map as extra residues and silently
+    shift every pair the probe trains on.
+    """
+    embedder, model, tokenizer = _build_embedder(num_register_tokens=2)
+    _perturb(model)
+    sequence = SEQUENCES[0]
+
+    attention_map = embedder.compute_attention_map(sequence=sequence)
+
+    layers = model.config.num_hidden_layers
+    heads = model.config.num_attention_heads
+    assert attention_map.shape == (len(sequence), len(sequence), layers * heads)
+    assert torch.isfinite(attention_map.float()).all()
+
+
+def test_attention_map_is_symmetric_across_residues():
+    """Symmetrization is part of the contract; contacts are undirected."""
+    embedder, model, _ = _build_embedder()
+    _perturb(model)
+
+    attention_map = embedder.compute_attention_map(sequence=SEQUENCES[1]).float()
+
+    torch.testing.assert_close(
+        attention_map, attention_map.transpose(0, 1), atol=1e-3, rtol=0
+    )
+
+
+def test_attention_map_matches_the_reference_recipe():
+    """Same numbers as biotrainer's embedder would get from these probabilities.
+
+    Guards against the post-processing drifting: order (strip, symmetrize, then
+    APC) and the APC correction itself both change the features the probe sees.
+    """
+    from biotrainer.embedding.huggingface.huggingface_transformer_embedder import (
+        HuggingfaceTransformerEmbedder as reference,
+    )
+    from nanoplm.pretraining.models.modern_bert.modeling import (
+        collect_attention_probs,
+    )
+
+    embedder, model, tokenizer = _build_embedder(num_register_tokens=1)
+    _perturb(model)
+    sequence = SEQUENCES[2]
+    n_leading, n_trailing = special_token_offsets(tokenizer)
+
+    encoded = tokenizer([sequence], return_tensors="pt")
+    with torch.no_grad(), collect_attention_probs(model.model) as per_layer:
+        model.model(
+            input_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+        )
+    end = encoded["input_ids"].shape[-1] - n_trailing
+    expected = torch.cat([p[0] for p in per_layer], dim=0).float()
+    expected = expected[:, n_leading:end, n_leading:end]
+    expected = reference._apc(reference._symmetrize(expected)).permute(1, 2, 0)
+
+    actual = embedder.compute_attention_map(sequence=sequence).float()
+    torch.testing.assert_close(actual, expected.half().float(), atol=1e-3, rtol=0)
+
+
+def test_attention_map_leaves_no_capture_state_behind():
+    """A leaked sink would make every later training forward allocate an S x S."""
+    embedder, model, _ = _build_embedder()
+    embedder.compute_attention_map(sequence=SEQUENCES[1])
+
+    from nanoplm.pretraining.models.modern_bert.modeling import ModernBertAttention
+
+    for module in model.modules():
+        if isinstance(module, ModernBertAttention):
+            assert module._attn_probs_sink is None

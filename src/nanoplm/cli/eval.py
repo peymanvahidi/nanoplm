@@ -16,7 +16,12 @@ from nanoplm.eval.config import EvalConfig
 from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
 
-_VALID_FRAMEWORKS = {"pgym", "pbc_zeroshot_contact", "pbc_supervised"}
+_VALID_FRAMEWORKS = {
+    "pgym",
+    "pbc_zeroshot_contact",
+    "pbc_supervised",
+    "pbc_supervised_contact",
+}
 _VALID_ZERO_SHOT_METHODS = {"masked_marginals", "wt_marginals", "pseudoperplexity"}
 
 # Frameworks dropped in the biotrainer 2.0.0 migration.

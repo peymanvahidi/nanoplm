@@ -12,10 +12,11 @@ class EvalConfig:
     checkpoint_dir: Union[str, Path]
 
     # Benchmark framework(s) to evaluate on. One or more of: pgym,
-    # pbc_zeroshot_contact, pbc_supervised. 'pgym' scores ProteinGym DMS
-    # variants zero-shot, 'pbc_zeroshot_contact' predicts contact maps from the
-    # categorical Jacobian, 'pbc_supervised' trains task heads on the frozen
-    # encoder's embeddings.
+    # pbc_zeroshot_contact, pbc_supervised, pbc_supervised_contact. 'pgym'
+    # scores ProteinGym DMS variants zero-shot, 'pbc_zeroshot_contact' predicts
+    # contact maps from the categorical Jacobian, 'pbc_supervised_contact' fits
+    # a probe on the attention maps, and 'pbc_supervised' trains task heads on
+    # the frozen encoder's embeddings.
     framework: List[str] = field(default_factory=lambda: ["pgym"])
 
     # Directory where autoeval results and per-framework outputs are written.
