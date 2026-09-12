@@ -309,3 +309,36 @@ def test_attention_map_leaves_no_capture_state_behind():
     for module in model.modules():
         if isinstance(module, ModernBertAttention):
             assert module._attn_probs_sink is None
+
+
+# ---------------------------------------------------------------------------
+# PBC_SUPERVISED dataset filter
+# ---------------------------------------------------------------------------
+
+def test_pbc_supervised_datasets_defaults_to_the_battery():
+    """The battery wants two of the seven heads; the rest cost 13 min and 30 GB."""
+    from nanoplm.eval.config import EvalConfig
+
+    config = EvalConfig(checkpoint_dir="unused")
+    assert config.pbc_supervised_datasets == ["secondary_structure", "scl"]
+
+
+def test_pbc_supervised_filter_selects_only_the_named_datasets():
+    """Mirrors the predicate pipeline.py builds, against biotrainer's own shape.
+
+    `secondary_structure` is what carries newPISCES364, so a filter that drops
+    it silently removes the metric rather than failing loudly.
+    """
+    wanted = {"secondary_structure", "scl"}
+    task_filter = lambda task: task.dataset_name in wanted  # noqa: E731
+
+    class _Task:
+        def __init__(self, dataset_name):
+            self.dataset_name = dataset_name
+
+    every = [
+        "conservation", "disorder_chezod", "frustration-classification",
+        "frustration-regression", "phages", "scl", "secondary_structure",
+    ]
+    kept = [name for name in every if task_filter(_Task(name))]
+    assert kept == ["scl", "secondary_structure"]

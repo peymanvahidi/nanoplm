@@ -291,12 +291,21 @@ def run_eval(eval_config: EvalConfig) -> None:
             )
             autoeval.pbc_zeroshot_contact()
         elif framework == "pbc_supervised":
+            wanted = eval_config.pbc_supervised_datasets
+            # Restricting the datasets also restricts the embedding: biotrainer
+            # only embeds the sequences the selected tasks need, which is the
+            # whole reason to filter rather than run all seven and ignore five.
+            task_filter = None
+            if wanted:
+                wanted_set = set(wanted)
+                task_filter = lambda task: task.dataset_name in wanted_set  # noqa: E731
             logger.info(
                 "Adding PBC supervised: task heads trained on frozen "
-                f"per-residue/per-sequence embeddings, batch_size="
+                f"per-residue/per-sequence embeddings, datasets="
+                f"{sorted(wanted_set) if wanted else 'all'}, batch_size="
                 f"{eval_config.zero_shot_batch_size}"
             )
-            autoeval.pbc_supervised()
+            autoeval.pbc_supervised(task_filter=task_filter)
         elif framework == "pbc_supervised_contact":
             logger.info(
                 "Adding PBC supervised contact: a logistic probe over "

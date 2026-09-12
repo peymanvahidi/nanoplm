@@ -165,6 +165,18 @@ def eval():
     show_default=True,
 )
 @click.option(
+    "--pbc-supervised-dataset",
+    multiple=True,
+    default=("secondary_structure", "scl"),
+    help=(
+        "PBC_SUPERVISED dataset(s) to run when --framework includes "
+        "'pbc_supervised'. Restricting them also restricts the embedding, which "
+        "is the expensive part. 'secondary_structure' carries the newPISCES364 "
+        "test split. Pass 'all' to run every dataset."
+    ),
+    show_default=True,
+)
+@click.option(
     "--zero-shot-method",
     type=click.Choice(sorted(_VALID_ZERO_SHOT_METHODS)),
     default="masked_marginals",
@@ -247,6 +259,7 @@ def eval():
 def run(
     checkpoint_dir: str,
     framework: tuple,
+    pbc_supervised_dataset: tuple,
     zero_shot_method: str,
     output_dir: str,
     zero_shot_batch_size: int,
@@ -280,6 +293,10 @@ def run(
         force_download=force_download,
         loop_count=loop_count,
         torch_compile=torch_compile,
+        pbc_supervised_datasets=(
+            None if "all" in pbc_supervised_dataset
+            else list(pbc_supervised_dataset)
+        ),
     )
 
     from nanoplm.eval.pipeline import run_eval

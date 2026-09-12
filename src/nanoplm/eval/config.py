@@ -19,6 +19,17 @@ class EvalConfig:
     # the frozen encoder's embeddings.
     framework: List[str] = field(default_factory=lambda: ["pgym"])
 
+    # Which PBC_SUPERVISED datasets to run, when 'pbc_supervised' is in
+    # `framework`. The framework holds seven task heads and embeds every
+    # sequence they need, which is ~13 min and ~30 GB of per-residue embeddings
+    # for the full set; the standing battery only wants two of them, so the
+    # default restricts it. None means every dataset.
+    #   secondary_structure -> carries the newPISCES364 test split
+    #   scl                 -> subcellular location
+    pbc_supervised_datasets: Optional[List[str]] = field(
+        default_factory=lambda: ["secondary_structure", "scl"]
+    )
+
     # Directory where autoeval results and per-framework outputs are written.
     output_dir: Union[str, Path] = "autoeval_output"
 
