@@ -272,6 +272,15 @@ def run(
     torch_compile: bool,
 ):
     """Run downstream evaluation directly from CLI flags."""
+    # MoE checkpoints route the MLP through sonicmoe's quack GEMM, whose
+    # autotuner keys on tensor shapes. Eval's variable-length batches make
+    # almost every batch a new key, at ~11 s a search for no measurable
+    # steady-state gain. Must run before the model (and sonicmoe) is imported.
+    from nanoplm.eval._quack_untuned import disable_quack_autotune
+
+    if disable_quack_autotune():
+        logger.info("quack GEMM autotuning disabled for eval "
+                    "(set NANOPLM_EVAL_QUACK_TUNED=1 to restore)")
     frameworks_list = list(framework)
     _validate_frameworks(frameworks_list)
     if force_download and dataset_dir:
