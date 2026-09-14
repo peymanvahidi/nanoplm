@@ -3026,6 +3026,11 @@ def run_pure_pretraining(
             output_dir=output_dir,
             is_main=is_main,
             distributed=bool(distributed and dist.is_initialized()),
+            max_rep=(
+                int(_model_cfg.loopie_loop_count) + _loopie_jitter
+                if _model_cfg.use_loopie
+                else 1
+            ),
         )
     epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)

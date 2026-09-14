@@ -1,6 +1,6 @@
 """Layerwise debug metrics tracker.
 
-Gathers per-layer grad/weight norms, per-block residual-stream RMS, and
+Gathers per-layer grad/weight norms, per-application residual-stream RMS, and
 lm_head logit stats with a single host-sync per logging window.
 
 Design invariants
@@ -106,11 +106,13 @@ class LayerwiseDebugTracker:
         output_dir: str,
         is_main: bool,
         distributed: bool,
+        max_rep: int = 1,
     ) -> None:
         self.log_every = int(log_every)
         self.device = device
         self.is_main = is_main
         self.distributed = distributed
+        self.max_rep = max(1, int(max_rep))
 
         self._hook_handles: list = []
 
@@ -132,11 +134,14 @@ class LayerwiseDebugTracker:
         # ---- residual-stream RMS hooks --------------------------------------
         # FSDP2's composable `fully_shard` swaps `mod.__class__` to a dynamic
         # subclass, so match via MRO rather than immediate class name.
-        def _is_block(mod: nn.Module) -> bool:
+        def _mro_named(mod: nn.Module, names: tuple[str, ...]) -> bool:
             for cls in type(mod).__mro__:
-                if cls.__name__ in _BLOCK_CLASS_NAMES:
+                if cls.__name__ in names:
                     return True
             return False
+
+        def _is_block(mod: nn.Module) -> bool:
+            return _mro_named(mod, _BLOCK_CLASS_NAMES)
 
         self.block_names: list[str] = []
         blocks: list[nn.Module] = []
@@ -145,12 +150,26 @@ class LayerwiseDebugTracker:
                 self.block_names.append(mod_name)
                 blocks.append(mod)
         n_blocks = len(blocks)
-        self.residual_sq_sum = torch.zeros(n_blocks, device=device, dtype=torch.float32)
-        self.residual_count = torch.zeros(n_blocks, device=device, dtype=torch.float32)
+        self.residual_sq_sum = torch.zeros(
+            n_blocks, self.max_rep, device=device, dtype=torch.float32
+        )
+        self.residual_count = torch.zeros(
+            n_blocks, self.max_rep, device=device, dtype=torch.float32
+        )
         for idx, block in enumerate(blocks):
-            self._hook_handles.append(
-                block.register_forward_hook(self._make_residual_hook(idx))
-            )
+            tap = getattr(block, "repeat_tap", None)
+            if isinstance(tap, nn.Module) and _mro_named(tap, ("RepeatTap",)):
+                self._hook_handles.append(
+                    tap.register_forward_hook(
+                        self._make_residual_hook(idx, from_tap=True)
+                    )
+                )
+            else:
+                self._hook_handles.append(
+                    block.register_forward_hook(
+                        self._make_residual_hook(idx, from_tap=False)
+                    )
+                )
 
         # ---- logit stats ----------------------------------------------------
         # [0]=sq_sum over all scored elements, [1]=abs_max, [2]=entropy_sum
@@ -202,9 +221,10 @@ class LayerwiseDebugTracker:
         )
 
     # ------------------------------------------------------------------ hooks
-    def _make_residual_hook(self, idx: int):
+    def _make_residual_hook(self, idx: int, from_tap: bool):
         buf_sq = self.residual_sq_sum
         buf_cnt = self.residual_count
+        max_rep = self.max_rep
 
         # `torch.compiler.disable` keeps the hook body OUT of the compiled
         # graph. The model is wrapped by torch.compile, so without this Dynamo
@@ -216,6 +236,9 @@ class LayerwiseDebugTracker:
         def hook(_module, _inputs, output):
             if not _module.training:
                 return
+            rep = int(_inputs[1]) if from_tap else 0
+            if rep >= max_rep:
+                return
             x = output[0] if isinstance(output, (tuple, list)) else output
             if not torch.is_tensor(x):
                 return
@@ -224,8 +247,8 @@ class LayerwiseDebugTracker:
                 # cast only the scalar to fp32 for the fp32 accumulator.
                 xd = x.detach()
                 sq = (xd * xd).mean()
-                buf_sq[idx].add_(sq.float())
-                buf_cnt[idx].add_(1.0)
+                buf_sq[idx, rep].add_(sq.float())
+                buf_cnt[idx, rep].add_(1.0)
 
         return hook
 
@@ -335,12 +358,13 @@ class LayerwiseDebugTracker:
 
         n_p = len(self._params)
         n_b = len(self.block_names)
+        n_br = n_b * self.max_rep
         sum_buf = torch.cat(
             [
                 self.grad_norm_buf,
                 self.weight_norm_buf,
-                self.residual_sq_sum,
-                self.residual_count,
+                self.residual_sq_sum.reshape(-1),
+                self.residual_count.reshape(-1),
                 self.logit_buf[0:1],
                 self.logit_buf[2:3],
                 self.logit_elem_count,
@@ -369,8 +393,8 @@ class LayerwiseDebugTracker:
         off = 0
         grad_sq_cpu = sum_cpu[off : off + n_p]; off += n_p
         weight_sq_cpu = sum_cpu[off : off + n_p]; off += n_p
-        residual_sq_cpu = sum_cpu[off : off + n_b]; off += n_b
-        residual_cnt_cpu = sum_cpu[off : off + n_b]; off += n_b
+        residual_sq_cpu = sum_cpu[off : off + n_br].view(n_b, self.max_rep); off += n_br
+        residual_cnt_cpu = sum_cpu[off : off + n_br].view(n_b, self.max_rep); off += n_br
         logit_sq_sum = float(sum_cpu[off]); off += 1
         logit_entropy_sum = float(sum_cpu[off]); off += 1
         logit_elem_count = float(sum_cpu[off]); off += 1
@@ -406,10 +430,11 @@ class LayerwiseDebugTracker:
         residual_sq_list = residual_sq_cpu.tolist()
         residual_cnt_list = residual_cnt_cpu.tolist()
         for i, name in enumerate(self.block_names):
-            cnt = residual_cnt_list[i]
-            if cnt > 0:
-                mean_sq = residual_sq_list[i] / cnt
-                payload[f"debug/residual_rms/block_{i:03d}"] = mean_sq ** 0.5
+            for r in range(self.max_rep):
+                cnt = residual_cnt_list[i][r]
+                if cnt > 0:
+                    mean_sq = residual_sq_list[i][r] / cnt
+                    payload[f"debug/residual_rms/block_{i:03d}_rep{r}"] = mean_sq ** 0.5
 
         if logit_elem_count > 0:
             payload["debug/logits/norm"] = (logit_sq_sum) ** 0.5
