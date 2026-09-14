@@ -179,6 +179,38 @@ def test_fixed_path_compiles_exactly_as_an_unlooped_model(make_counting_backend)
     )
 
 
+def test_truncated_bptt_traces_like_full_backprop(make_counting_backend):
+    assert torch.is_grad_enabled(), "the mid-forward no_grad toggle is a no-op without this"
+    torch.manual_seed(0)
+    full = _loopie_model()
+    input_ids, attention_mask = _batch(full.model_config)
+
+    full_backend, n_full = make_counting_backend()
+    torch._dynamo.reset()
+    compiled_full = torch.compile(full, backend=full_backend, dynamic=False)
+    compiled_full(input_ids=input_ids, attention_mask=attention_mask)
+
+    torch.manual_seed(0)
+    truncated = _loopie_model(loopie_bptt=1)
+    trunc_backend, n_trunc = make_counting_backend()
+    torch._dynamo.reset()
+    counters.clear()
+    compiled_trunc = torch.compile(truncated, backend=trunc_backend, dynamic=False)
+    compiled_trunc(input_ids=input_ids, attention_mask=attention_mask)
+    after_warmup = n_trunc[0]
+    compiled_trunc(input_ids=input_ids, attention_mask=attention_mask)
+
+    breaks = [reason for reason in counters["graph_break"] if "_forward_repeats" in reason]
+    assert not breaks, (
+        f"The truncated-BPTT split reached the disabled driver:\n{breaks}"
+    )
+    assert n_trunc[0] == after_warmup, "loopie_bptt=1 recompiled on a repeat call"
+    assert n_trunc[0] == n_full[0], (
+        f"loopie_bptt=1 compiled into {n_trunc[0]} graphs vs {n_full[0]} for the "
+        f"same model with full backprop; the bptt split multiplied traces."
+    )
+
+
 def test_one_layer_call_per_step_regardless_of_depth():
     """FSDP2 all-gathers on __call__, so every repeat must stay inside forward.
 

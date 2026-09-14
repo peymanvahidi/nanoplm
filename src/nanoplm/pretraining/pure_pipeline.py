@@ -1245,11 +1245,11 @@ def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = Non
     """Training FLOPs/token at the TARGET recycling loop count (startup estimate)."""
     components = _recycling_flops_components(config, seq_len)
     if getattr(config, "use_loopie", False):
-        # Loopie has no prelude/coda (P=C=0), so the recycling decomposition
-        # already describes it exactly: forward = R x stack, and bptt=None means
-        # full backprop through every repeat (2 x forward).
+        # Loopie has no prelude or coda, so P=C=0 and the decomposition is exact.
         return _recycling_flops_per_token(
-            components, max(1, int(getattr(config, "loopie_loop_count", 2))), bptt=None
+            components,
+            max(1, int(getattr(config, "loopie_loop_count", 2))),
+            bptt=getattr(config, "loopie_bptt", None),
         )
     loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
     return _recycling_flops_per_token(components, loop_count, bptt=bptt)
@@ -2849,9 +2849,7 @@ def run_pure_pretraining(
     # estimator must know K or it overcounts backward and inflates MFU for r > K.
     _bptt = max(1, int(getattr(pretrain_config, "recycling_bptt", 1)))
     if getattr(_cfg, "use_loopie", False):
-        # Loopie backprops through every repeat; bptt=None keeps the estimator
-        # from truncating the backward cost.
-        _bptt = None
+        _bptt = getattr(_cfg, "loopie_bptt", None)
     _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len, bptt=_bptt)
     # Components for per-step FLOPs at the *actual* loop count (curriculum-accurate
     # MFU). _flops_per_token above is the nominal estimate at the target loop count.

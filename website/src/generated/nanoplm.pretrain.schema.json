@@ -628,6 +628,21 @@
             "op": "==",
             "value": true
           }
+        },
+        "loopie_bptt": {
+          "type": "integer",
+          "default": 1,
+          "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "description": "grad through the last k applications only (~1.33x a plain step at R=2, not 2x); null = full backprop",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-visible-when": {
+            "field": "use_loopie",
+            "op": "==",
+            "value": true
+          }
         }
       },
       "x-nanoplm-group-notes": {

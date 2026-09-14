@@ -116,6 +116,7 @@ class ProtModernBertMLMConfig:
     # Loopie layer-loop (pure-torch path only). See ModernBertConfig.
     use_loopie: bool = False
     loopie_loop_count: int = 2
+    loopie_bptt: Optional[int] = None
 
 
 class ProtModernBertMLM(ModernBertForMaskedLM):

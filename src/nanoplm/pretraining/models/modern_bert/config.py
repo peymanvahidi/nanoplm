@@ -180,6 +180,7 @@ class ModernBertConfig:
     # exclusive with Huginn recycling.
     use_loopie: bool = False
     loopie_loop_count: int = 2                # consecutive applications per stored layer (>= 2 when enabled)
+    loopie_bptt: Optional[int] = None        # grad through the last k applications (None = all)
 
     head_dim: int = field(init=False)
     rope_dim: int = field(init=False)
@@ -251,6 +252,12 @@ class ModernBertConfig:
             if not isinstance(self.loopie_loop_count, int) or self.loopie_loop_count < 2:
                 raise ValueError(
                     f"loopie_loop_count must be int >= 2 when use_loopie=true, got {self.loopie_loop_count!r}"
+                )
+            if self.loopie_bptt is not None and (
+                not isinstance(self.loopie_bptt, int) or self.loopie_bptt < 1
+            ):
+                raise ValueError(
+                    f"loopie_bptt must be None or int >= 1 when use_loopie=true, got {self.loopie_bptt!r}"
                 )
             for _flag in ("use_resid_lambdas", "use_x0_lambdas", "use_mhc_lite"):
                 if getattr(self, _flag, False):

@@ -149,6 +149,7 @@ model:
   # Cannot be used together with Huginn recycling above.
   use_loopie: false                     # master switch
   loopie_loop_count: 2                  # times each layer is applied (>= 2 when enabled)
+  loopie_bptt: 1                        # grad through the last k applications only (~1.33x a plain step at R=2, not 2x); null = full backprop
 
 
 # =============================================================================

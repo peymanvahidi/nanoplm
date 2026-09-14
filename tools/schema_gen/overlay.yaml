@@ -146,6 +146,7 @@ model.recycling_loop_count: { backend: [pure_torch], advanced: true }
 model.use_huginn_looping: { backend: [pure_torch], advanced: true }
 model.use_loopie: { backend: [pure_torch], advanced: true }
 model.loopie_loop_count: { backend: [pure_torch], advanced: true }
+model.loopie_bptt: { backend: [pure_torch], advanced: true }
 
 # --------------------------------------------------------------- distillation
 distillation.optimizer:
