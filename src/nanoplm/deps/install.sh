@@ -144,6 +144,86 @@ quack_ok() {
 
 satisfied_quack() { [ "$FORCE" -eq 0 ] && quack_ok; }
 
+# ---- runtime cuBLAS vs. the toolkit TE is built against ----------------------
+# TransformerEngine compiles against $CUDA_HOME's cuBLAS headers, but at runtime
+# torch loads its OWN pinned cuBLAS wheel (2.12.1+cu130 caps it at 13.1.1.3)
+# through an RPATH into site-packages/nvidia/cu13/lib. Both libraries carry the
+# soname libcublasLt.so.13, so whichever loads first serves the whole process.
+# Build against a toolkit newer than that wheel -- CUDA 13.3 ships cuBLAS 13.6,
+# which added the grouped-GEMM entry points -- and importing torch before TE
+# dies with:
+#     libtransformer_engine.so: undefined symbol:
+#     cublasLtGroupedMatrixLayoutInit_internal, version libcublasLt.so.13
+# (Importing TE first masked it: ldconfig then resolved the toolkit's copy, and
+# the process ended up with TWO cuBLAS libraries mapped.) Upgrading the wheel to
+# the toolkit's own cuBLAS keeps exactly one in the process and makes build and
+# runtime agree. It steps over torch's upper pin, so `pip check` reports a
+# conflict -- expected, and harmless here: CUDA guarantees minor-version
+# compatibility inside a major version, and verify.py exercises the result on
+# the GPU before we call the install good.
+
+# cublas_header: echo the path of $CUDA_HOME's cublas_api.h, else return 1.
+# Toolkits expose it either at include/ (EasyBuild modules, plain installs) or
+# only under targets/<arch>/include -- globbed, not hardcoded to x86_64-linux,
+# because Grace-Hopper nodes are sm90 too and spell that dir sbsa-linux.
+cublas_header() {
+  local dir
+  for dir in "${CUDA_HOME:-}/include" "${CUDA_HOME:-}"/targets/*/include; do
+    if [ -r "$dir/cublas_api.h" ]; then printf '%s\n' "$dir/cublas_api.h"; return 0; fi
+  done
+  return 1
+}
+
+# toolkit_cublas_version: echo the toolkit's cuBLAS version the way PyPI spells
+# it (major.minor.patch.build, e.g. 13.6.0.2). The header is the authority --
+# it is what the TE build actually compiles against, and the CUDA toolkit's own
+# release number (13.3.1) is NOT the cuBLAS one (13.6.0.2).
+toolkit_cublas_version() {
+  local header
+  header="$(cublas_header)" || return 1
+  awk '
+    $2 == "CUBLAS_VER_MAJOR" { maj = $3 }
+    $2 == "CUBLAS_VER_MINOR" { min = $3 }
+    $2 == "CUBLAS_VER_PATCH" { pat = $3 }
+    $2 == "CUBLAS_VER_BUILD" { bld = $3 }
+    END {
+      if (maj == "" || min == "" || pat == "" || bld == "") exit 1
+      print maj "." min "." pat "." bld
+    }
+  ' "$header"
+}
+
+# installed_cublas_dist: echo "<dist-name> <version>" for the cuBLAS wheel in
+# this venv, else nothing. The NAME is discovered, never hardcoded: NVIDIA has
+# shipped this wheel as nvidia-cublas-cu11, then -cu12, and as plain
+# nvidia-cublas for cu13 (while cudnn/cusparselt kept their -cu13 suffix), so a
+# future CUDA major can rename it again and we still upgrade the right dist --
+# and reinstall it under the name that is actually there.
+installed_cublas_dist() {
+  "$PY" - <<'PY' 2>/dev/null
+import re
+from importlib.metadata import distributions
+for dist in distributions():
+    try:
+        name = dist.metadata["Name"] or ""
+    except Exception:
+        continue
+    if re.fullmatch(r"nvidia-cublas(-cu[0-9]+)?", name.lower().replace("_", "-")):
+        print(name, dist.version)
+        break
+PY
+}
+
+# cublas_needs_upgrade <have> <want>: 0 iff <want> is strictly newer than
+# <have>; an absent <have> counts as older. sort -V so 13.10.x beats 13.2.x.
+cublas_needs_upgrade() {
+  local have="$1" want="$2" newest
+  [ -n "$have" ] || return 0
+  if [ "$have" = "$want" ]; then return 1; fi
+  newest="$(printf '%s\n%s\n' "$have" "$want" | sort -V | tail -1)"
+  [ "$newest" = "$want" ]
+}
+
 # ---- preflight: recover what is recoverable, then fail loudly ----------------
 # An unexported toolkit or a missing ninja is a PATH problem, not a platform
 # problem: probe/bootstrap it and print exactly what changed. Anything we cannot
@@ -272,6 +352,53 @@ step_torch() {
   run_cmd "$PY" -m pip install "torch==2.12.1" --index-url "$TORCH_INDEX"
 }
 
+step_cublas() {
+  local want dist have line
+  want="$(toolkit_cublas_version)" || {
+    warn "no cublas_api.h under $CUDA_HOME — leaving torch's cuBLAS wheel alone."
+    warn "If TE then fails to import with 'undefined symbol: cublasLt...', install the"
+    warn "toolkit's own cuBLAS: $PY -m pip install --no-deps nvidia-cublas==<toolkit version>"
+    return 0
+  }
+  line="$(installed_cublas_dist)" || line=""
+  dist="${line%% *}"; have="${line##* }"
+  if [ -z "$dist" ]; then
+    warn "no cuBLAS wheel in this venv — leaving the CUDA stack alone."
+    warn "(torch normally brings one; if TE fails to import with 'undefined symbol:"
+    warn "cublasLt...', install the toolkit's own: nvidia-cublas==$want.)"
+    return 0
+  fi
+  if [ "${have%%.*}" != "${want%%.*}" ]; then
+    # Aligning across a major would swap the soname out from under torch. The
+    # toolkit/torch pairing itself is wrong here; no version bump fixes that.
+    warn "cuBLAS major mismatch: toolkit has $want, the wheel has $have ($dist) — not touching it."
+    warn "Point CUDA_HOME at a toolkit whose major matches torch's CUDA build."
+    return 0
+  fi
+  if cublas_needs_upgrade "$have" "$want"; then
+    log "toolkit cuBLAS $want is newer than $dist $have — aligning them (TE builds against the toolkit)"
+  elif [ "$FORCE" -eq 1 ] && [ "$have" = "$want" ]; then
+    log "$dist already at the toolkit's $want; reinstalling (--force)"
+  else
+    # An older toolkit needs no help: TE just compiles without the newer entry
+    # points. Never downgrade here — that would break torch's own cuBLAS floor.
+    log "$dist $have already covers the toolkit's $want; skipping."
+    return 0
+  fi
+  # NVIDIA does not publish a wheel for every toolkit patch release. Only
+  # ">= want" is required for correctness (a newer cuBLAS still exports the
+  # entry points TE compiled against), so fall back to the newest wheel that
+  # clears it — and if even that is unavailable, warn and let the build proceed
+  # rather than losing a 10-minute install to it. verify.py is the final judge.
+  if ! run_cmd "$PY" -m pip install --no-deps "$dist==$want"; then
+    warn "no $dist==$want wheel on PyPI — trying the newest >=$want."
+    run_cmd "$PY" -m pip install --no-deps "$dist>=$want" || {
+      warn "could not install a cuBLAS >=$want; continuing with $have."
+      warn "If TE then fails to import with 'undefined symbol: cublasLt...', this is why."
+    }
+  fi
+}
+
 step_dion() {
   if satisfied dion "$DION_SHA"; then log "dion @ ${DION_SHA:0:12} present; skipping."; return 0; fi
   log "installing dion @ ${DION_SHA:0:12}"
@@ -362,6 +489,7 @@ main() {
   done
   preflight
   step_torch
+  step_cublas
   step_dion
   step_te
   step_fa3

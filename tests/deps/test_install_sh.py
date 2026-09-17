@@ -353,3 +353,192 @@ def test_fa3_sha_unset_refused_in_real_mode(tmp_path):
                        env={**os.environ, "VIRTUAL_ENV": sys.prefix})
     assert r.returncode == 1
     assert "FA3_SHA256" in r.stderr
+
+
+# ---- cuBLAS wheel / build-toolkit alignment ---------------------------------
+# TE compiles against $CUDA_HOME's cuBLAS headers while torch loads its own
+# pinned cuBLAS wheel; both carry soname libcublasLt.so.13, so a toolkit newer
+# than the wheel yields "undefined symbol: cublasLtGroupedMatrixLayoutInit_
+# internal" at import. step_cublas closes that gap.
+
+def _fake_cublas_header(root, version="13.6.0.2", subdir="include"):
+    """Write a fake cublas_api.h carrying CUBLAS_VER_* for `version`."""
+    maj, minor, patch, build = version.split(".")
+    inc = root / subdir
+    inc.mkdir(parents=True, exist_ok=True)
+    (inc / "cublas_api.h").write_text(
+        f"#define CUBLAS_VER_MAJOR {maj}\n"
+        f"#define CUBLAS_VER_MINOR {minor}\n"
+        f"#define CUBLAS_VER_PATCH {patch}\n"
+        f"#define CUBLAS_VER_BUILD {build}\n"
+        "#define CUBLAS_VERSION (CUBLAS_VER_MAJOR * 10000)\n"
+    )
+    return inc
+
+
+def _source(snippet, extra_env=None):
+    env = {**os.environ, "VIRTUAL_ENV": sys.prefix}
+    env.update(extra_env or {})
+    return subprocess.run(["bash", "-c", f'source "{SCRIPT}"; {snippet}'],
+                          capture_output=True, text=True, env=env)
+
+
+def test_toolkit_cublas_version_parsed_from_header(tmp_path):
+    _fake_cublas_header(tmp_path, "13.6.0.2")
+    r = _source(f'CUDA_HOME="{tmp_path}"; toolkit_cublas_version')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "13.6.0.2"
+
+
+def test_toolkit_cublas_version_found_under_targets_include(tmp_path):
+    # Module-installed toolkits expose the header only under targets/<arch>.
+    _fake_cublas_header(tmp_path, "13.1.1.3", subdir="targets/x86_64-linux/include")
+    r = _source(f'CUDA_HOME="{tmp_path}"; toolkit_cublas_version')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "13.1.1.3"
+
+
+def test_toolkit_cublas_version_fails_without_header(tmp_path):
+    r = _source(f'CUDA_HOME="{tmp_path}"; toolkit_cublas_version')
+    assert r.returncode != 0
+
+
+def test_cublas_needs_upgrade_only_moves_forward():
+    # want > have -> upgrade; equal or older toolkit -> leave the wheel alone.
+    cases = {
+        ("13.1.1.3", "13.6.0.2"): 0,   # the supergpu22 case: CUDA 13.3 toolkit
+        ("13.6.0.2", "13.6.0.2"): 1,
+        ("13.7.0.27", "13.6.0.2"): 1,  # wheel already newer
+        ("13.2.2.2", "13.10.0.1"): 0,  # numeric, not lexicographic
+        ("", "13.6.0.2"): 0,           # nothing installed
+    }
+    for (have, want), expected in cases.items():
+        r = _source(f'cublas_needs_upgrade "{have}" "{want}"')
+        assert r.returncode == expected, f"have={have!r} want={want!r} -> {r.returncode}"
+
+
+def test_cublas_wheel_is_aligned_with_the_build_toolkit(tmp_path):
+    bindir = _fake_bin(tmp_path)
+    _fake_cublas_header(tmp_path, "13.6.0.2")
+    r = _run(["--force"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+    assert r.returncode == 0, r.stderr
+    assert "pip install --no-deps nvidia-cublas==13.6.0.2" in r.stdout
+    # Must run AFTER torch (which installs its own pinned cuBLAS) and BEFORE
+    # the TE build that references the toolkit's newer entry points.
+    assert r.stdout.index("torch==2.12.1") < r.stdout.index("nvidia-cublas==13.6.0.2") \
+        < r.stdout.index("v2.16")
+
+
+def test_older_toolkit_leaves_the_cublas_wheel_alone(tmp_path):
+    # A toolkit at/below torch's pin needs no help: TE simply compiles without
+    # the newer entry points. Forced or not, no cuBLAS install may be emitted.
+    bindir = _fake_bin(tmp_path)
+    _fake_cublas_header(tmp_path, "13.0.0.19")
+    r = _run(["--force"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+    assert r.returncode == 0, r.stderr
+    assert "nvidia-cublas==" not in r.stdout
+
+
+def test_unreadable_cublas_header_warns_and_continues(tmp_path):
+    # No header (unusual toolkit layout) must not abort the install.
+    bindir = _fake_bin(tmp_path)
+    r = _run(["--force"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+    assert r.returncode == 0, r.stderr
+    assert "cuBLAS" in r.stderr
+    assert "--branch v2.16" in r.stdout  # install carried on to the TE build
+
+
+def test_unpublished_toolkit_cublas_falls_back_to_a_range(tmp_path):
+    # NVIDIA does not ship a wheel for every toolkit patch release. An exact pin
+    # that 404s must not abort the install: only ">= toolkit" is required for
+    # correctness, so step_cublas retries with a range. run_cmd is stubbed to
+    # fail the "==" form exactly as pip would, so no network is touched.
+    _fake_cublas_header(tmp_path, "13.9.9.9")
+    snippet = (
+        f'CUDA_HOME="{tmp_path}"; FORCE=0; DRY_RUN=""; '
+        'installed_cublas_dist() { echo "nvidia-cublas 13.1.1.3"; }; '
+        'run_cmd() { case "$*" in *"cublas=="*) echo "PIP_FAIL $*"; return 1 ;; '
+        '*) echo "PIP_OK $*"; return 0 ;; esac; }; '
+        'step_cublas'
+    )
+    r = _source(snippet)
+    assert r.returncode == 0, r.stderr
+    assert "PIP_FAIL" in r.stdout and "nvidia-cublas==13.9.9.9" in r.stdout
+    assert "PIP_OK" in r.stdout and "nvidia-cublas>=13.9.9.9" in r.stdout
+    assert "trying the newest" in r.stderr
+
+
+def test_toolkit_cublas_version_found_on_non_x86_toolkit(tmp_path):
+    # Grace-Hopper nodes are sm90 too and spell the target dir sbsa-linux, so
+    # the header lookup must glob targets/* rather than assume x86_64-linux.
+    _fake_cublas_header(tmp_path, "13.6.0.2", subdir="targets/sbsa-linux/include")
+    r = _source(f'CUDA_HOME="{tmp_path}"; toolkit_cublas_version')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "13.6.0.2"
+
+
+def test_cublas_dist_name_is_discovered_not_hardcoded(tmp_path):
+    # NVIDIA has shipped this wheel as nvidia-cublas-cu11/-cu12 and as plain
+    # nvidia-cublas for cu13. Whatever it is called locally is what we upgrade.
+    _fake_cublas_header(tmp_path, "13.6.0.2")
+    r = _source(
+        f'CUDA_HOME="{tmp_path}"; FORCE=0; DRY_RUN=1; '
+        'installed_cublas_dist() { echo "nvidia-cublas-cu13 13.1.1.3"; }; '
+        'step_cublas'
+    )
+    assert r.returncode == 0, r.stderr
+    assert "nvidia-cublas-cu13==13.6.0.2" in r.stdout
+
+
+def test_real_installed_cublas_dist_shape():
+    # Against the live venv: either nothing (no CUDA wheels) or exactly
+    # "<nvidia-cublas name> <version>".
+    r = _source("installed_cublas_dist")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout.split()
+    if out:
+        assert len(out) == 2, r.stdout
+        assert out[0].lower().replace("_", "-").startswith("nvidia-cublas")
+
+
+def test_cublas_major_mismatch_is_refused(tmp_path):
+    # Swapping cuBLAS across a major would pull the soname out from under torch.
+    _fake_cublas_header(tmp_path, "14.0.0.1")
+    r = _source(
+        f'CUDA_HOME="{tmp_path}"; FORCE=1; DRY_RUN=1; '
+        'installed_cublas_dist() { echo "nvidia-cublas 13.6.0.2"; }; '
+        'step_cublas'
+    )
+    assert r.returncode == 0, r.stderr
+    assert "major mismatch" in r.stderr
+    assert "pip install" not in r.stdout
+
+
+def test_missing_cublas_wheel_is_left_alone(tmp_path):
+    # No cuBLAS wheel at all: warn, never blind-install a stack torch did not ask for.
+    _fake_cublas_header(tmp_path, "13.6.0.2")
+    r = _source(
+        f'CUDA_HOME="{tmp_path}"; FORCE=1; DRY_RUN=1; '
+        'installed_cublas_dist() { :; }; '
+        'step_cublas'
+    )
+    assert r.returncode == 0, r.stderr
+    assert "no cuBLAS wheel in this venv" in r.stderr
+    assert "pip install" not in r.stdout
+
+
+def test_unavailable_cublas_wheel_does_not_abort_the_install(tmp_path):
+    # Neither "==" nor ">=" resolvable: warn and carry on, so a 10-minute TE
+    # build is not lost to a wheel NVIDIA never published. verify.py judges.
+    _fake_cublas_header(tmp_path, "13.9.9.9")
+    r = _source(
+        f'CUDA_HOME="{tmp_path}"; FORCE=0; DRY_RUN=""; '
+        'installed_cublas_dist() { echo "nvidia-cublas 13.1.1.3"; }; '
+        'run_cmd() { return 1; }; '
+        'step_cublas'
+    )
+    assert r.returncode == 0, r.stderr
+    assert "continuing with 13.1.1.3" in r.stderr
