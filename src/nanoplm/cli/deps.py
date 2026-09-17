@@ -47,7 +47,9 @@ def install(arch: str, force: bool):
     """Install the full pinned stack into the active virtualenv, then verify.
 
     On clusters, load the CUDA toolchain first (JURECA:
-    `module load CUDA/13 NCCL cuDNN Ninja`). Run from a login node — the
+    `module load CUDA/13 NCCL cuDNN Ninja`). Elsewhere, a CUDA 13 toolkit that
+    is installed but not exported (/usr/local/cuda*) is found automatically, and
+    a missing ninja is installed into the venv. Run from a login node — the
     TransformerEngine source build needs internet but no GPU (~10 min).
     """
     in_venv = sys.prefix != sys.base_prefix or bool(os.environ.get("VIRTUAL_ENV"))

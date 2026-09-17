@@ -68,6 +68,14 @@ export MAX_JOBS="${MAX_JOBS:-32}"
 FORCE=0
 DRY_RUN="${NANOPLM_DEPS_DRY_RUN:-}"
 JURECA_HINT="module load CUDA/13 NCCL cuDNN Ninja"
+# Where to look for a CUDA 13 toolkit when `nvcc` is NOT already on PATH — the
+# plain-toolkit case (no module system): the toolkit sits under /usr/local but
+# nothing exports its bin/. Note nvidia-smi's "CUDA Version: 13.x" is the DRIVER
+# and says nothing about nvcc, so that row is no substitute for this probe.
+# Colon-separated and globbed; the first root whose bin/nvcc reports release 13
+# wins. NANOPLM_CUDA_SEARCH_ROOTS="" disables the probe (tests set it empty to
+# stay hermetic on hosts that really do have a toolkit installed).
+CUDA_SEARCH_ROOTS="${NANOPLM_CUDA_SEARCH_ROOTS-/usr/local/cuda:/usr/local/cuda-13*:/opt/cuda:/opt/cuda-13*}"
 
 log() { echo ">> $*"; }
 err() { echo "ERROR: $*" >&2; }
@@ -136,7 +144,37 @@ quack_ok() {
 
 satisfied_quack() { [ "$FORCE" -eq 0 ] && quack_ok; }
 
-# ---- preflight: fail loudly, no auto-detect ----------------------------------
+# ---- preflight: recover what is recoverable, then fail loudly ----------------
+# An unexported toolkit or a missing ninja is a PATH problem, not a platform
+# problem: probe/bootstrap it and print exactly what changed. Anything we cannot
+# fix ourselves (no CUDA 13 anywhere, no venv, no git) still refuses up front,
+# before sinking ~10 minutes into the TransformerEngine build.
+
+# nvcc_is_cuda13 <path>: 0 iff <path> is an executable nvcc reporting release 13.
+nvcc_is_cuda13() {
+  [ -n "$1" ] && [ -x "$1" ] || return 1
+  "$1" --version 2>/dev/null | grep -q "release 13"
+}
+
+# find_cuda13_nvcc: echo the path of a CUDA 13 nvcc that is not on PATH, else
+# return 1. A toolkit the environment already points at ($CUDA_HOME, or
+# $EBROOTCUDA on EasyBuild clusters) beats a probe; then $CUDA_SEARCH_ROOTS.
+find_cuda13_nvcc() {
+  local cand root
+  for root in "${CUDA_HOME:-}" "${EBROOTCUDA:-}"; do
+    [ -n "$root" ] || continue
+    if nvcc_is_cuda13 "$root/bin/nvcc"; then printf '%s\n' "$root/bin/nvcc"; return 0; fi
+  done
+  local IFS=:
+  # Unquoted on purpose: splits on ':' AND globs (/usr/local/cuda-13* matches
+  # both the cuda-13 symlink and cuda-13.3). A glob that matches nothing stays
+  # literal and simply fails the -x test below.
+  for cand in $CUDA_SEARCH_ROOTS; do
+    if nvcc_is_cuda13 "$cand/bin/nvcc"; then printf '%s\n' "$cand/bin/nvcc"; return 0; fi
+  done
+  return 1
+}
+
 resolve_cuda_home() {
   if [ -z "${CUDA_HOME:-}" ]; then
     if [ -n "${EBROOTCUDA:-}" ]; then
@@ -177,24 +215,54 @@ preflight() {
     log "pip missing in this venv (created with 'uv venv'?) — bootstrapping via ensurepip"
     run_cmd "$PY" -m ensurepip --upgrade
   fi
-  if ! command -v nvcc >/dev/null 2>&1 || ! nvcc --version 2>/dev/null | grep -q "release 13"; then
-    err "nvcc (CUDA 13.x) not found on PATH."
-    err "On JURECA/EasyBuild clusters run:"
-    err "    $JURECA_HINT        # do NOT module purge"
-    err "then re-run \`nanoplm deps install\`."
-    err "Elsewhere: install the CUDA 13.0 toolkit and put its bin/ on PATH."
-    exit 1
+  if ! nvcc_is_cuda13 "$(command -v nvcc 2>/dev/null)"; then
+    local found root
+    found="$(find_cuda13_nvcc)" || found=""
+    if [ -n "$found" ]; then
+      # Exporting (not just calling it by path) is what the user would have
+      # typed, and it is what hands the same toolkit to TE's cmake/ninja build
+      # and to nvcc-invoking pip builds later in this run.
+      root="$(dirname "$(dirname "$found")")"
+      if [ -n "${CUDA_HOME:-}" ] && [ "$CUDA_HOME" != "$root" ]; then
+        warn "CUDA_HOME was $CUDA_HOME but has no CUDA 13 nvcc — overriding it with $root."
+      fi
+      export PATH="$(dirname "$found"):$PATH" CUDA_HOME="$root"
+      log "nvcc was not on PATH; found CUDA 13 at $root and prepended its bin/ for this run."
+      log "To make that permanent:  export PATH=$root/bin:\$PATH"
+    else
+      err "nvcc (CUDA 13.x) not found on PATH, and no CUDA 13 toolkit under: ${CUDA_SEARCH_ROOTS:-<probe disabled>}"
+      err "(nvidia-smi reporting 'CUDA Version: 13.x' is the DRIVER — nvcc ships in the separate toolkit.)"
+      err "On JURECA/EasyBuild clusters run:"
+      err "    $JURECA_HINT        # do NOT module purge"
+      err "then re-run \`nanoplm deps install\`."
+      err "Elsewhere: install the CUDA 13.0 toolkit, then put its bin/ on PATH, point CUDA_HOME at it,"
+      err "or add its root to NANOPLM_CUDA_SEARCH_ROOTS."
+      exit 1
+    fi
   fi
   if ! command -v ninja >/dev/null 2>&1; then
-    err "ninja not found on PATH (needed to build TransformerEngine)."
-    err "JURECA: $JURECA_HINT    |    Debian/Ubuntu: apt install ninja-build"
-    exit 1
+    # The ninja wheel ships a real ninja binary, so the pip bootstrapped above
+    # can supply it in-venv — no root, no module. step_te installs it again
+    # alongside TE's other build deps; that is idempotent.
+    log "ninja not on PATH — installing the ninja wheel into the venv (TransformerEngine's build needs it)"
+    run_cmd "$PY" -m pip install ninja
+    # A venv that was never `activate`d has $VIRTUAL_ENV set but its bin/ off
+    # PATH, so the binary we just installed would still be invisible to the build.
+    case ":$PATH:" in
+      *":$VIRTUAL_ENV/bin:"*) ;;
+      *) export PATH="$VIRTUAL_ENV/bin:$PATH" ;;
+    esac
+    if [ -z "$DRY_RUN" ] && ! command -v ninja >/dev/null 2>&1; then
+      err "ninja still not on PATH after installing the ninja wheel into $VIRTUAL_ENV."
+      err "JURECA: $JURECA_HINT    |    Debian/Ubuntu: apt install ninja-build"
+      exit 1
+    fi
   fi
   command -v git >/dev/null 2>&1 || { err "git not found on PATH."; exit 1; }
   resolve_cuda_home
   [ -n "${CUDA_HOME:-}" ] || { err "CUDA_HOME could not be determined."; exit 1; }
   hopper_gate
-  log "preflight OK: python=$PY  nvcc=$(command -v nvcc)  CUDA_HOME=$CUDA_HOME  archs=$NVTE_CUDA_ARCHS"
+  log "preflight OK: python=$PY  nvcc=$(command -v nvcc)  CUDA_HOME=$CUDA_HOME  ninja=$(command -v ninja)  archs=$NVTE_CUDA_ARCHS"
 }
 
 # ---- steps (each: skip when satisfied, unless --force) ------------------------
