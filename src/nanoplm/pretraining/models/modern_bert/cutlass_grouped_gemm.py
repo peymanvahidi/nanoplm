@@ -75,10 +75,12 @@ def _load_extension():
         name="nanoplm_cutlass_grouped_gemm",
         sources=sources,
         extra_include_paths=include_paths,
-        extra_cflags=["-O3", "-std=c++17"],
+        # No -std here on purpose: torch supplies the standard its own headers
+        # need (c++20 as of 2.12, and it SKIPS adding one if we pass any -std=),
+        # so hardcoding c++17 broke instantiation inside ATen/core/List_inl.h.
+        extra_cflags=["-O3"],
         extra_cuda_cflags=[
             "-O3",
-            "-std=c++17",
             *(_cuda_arch_flags()),
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
