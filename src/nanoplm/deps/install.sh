@@ -161,6 +161,16 @@ satisfied_quack() { [ "$FORCE" -eq 0 ] && quack_ok; }
 # conflict -- expected, and harmless here: CUDA guarantees minor-version
 # compatibility inside a major version, and verify.py exercises the result on
 # the GPU before we call the install good.
+#
+# ORDERING: step_cublas must run AFTER every step that pip-installs a
+# torch-dependent distribution -- dion, flash-attn-3, quack-kernels and
+# sonic-moe all declare `Requires-Dist: torch`, so installing any of them pulls
+# torch into pip's resolve graph, carries its `nvidia-cublas<=13.1.1.3` pin
+# along, and "repairs" the alignment we just made by downgrading the wheel
+# again. Running it second only looked correct on a machine where those steps
+# were already satisfied and printed "present; skipping"; on a fresh install it
+# left verify.py failing with the very symbol error this step exists to prevent.
+# Keep it last.
 
 # cublas_header: echo the path of $CUDA_HOME's cublas_api.h, else return 1.
 # Toolkits expose it either at include/ (EasyBuild modules, plain installs) or
@@ -489,11 +499,13 @@ main() {
   done
   preflight
   step_torch
-  step_cublas
   step_dion
   step_te
   step_fa3
   step_moe
+  # LAST on purpose -- see the comment above step_cublas. Every step above that
+  # installs a torch-dependent dist re-resolves torch's pins and would undo it.
+  step_cublas
   log "=== hard-dependency install finished (verification runs next) ==="
 }
 

@@ -424,10 +424,9 @@ def test_cublas_wheel_is_aligned_with_the_build_toolkit(tmp_path):
              extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
     assert r.returncode == 0, r.stderr
     assert "pip install --no-deps nvidia-cublas==13.6.0.2" in r.stdout
-    # Must run AFTER torch (which installs its own pinned cuBLAS) and BEFORE
-    # the TE build that references the toolkit's newer entry points.
-    assert r.stdout.index("torch==2.12.1") < r.stdout.index("nvidia-cublas==13.6.0.2") \
-        < r.stdout.index("v2.16")
+    # Must run LAST: every step that installs a torch-dependent dist re-resolves
+    # torch's pins and would downgrade the wheel straight back again.
+    assert r.stdout.index("torch==2.12.1") < r.stdout.index("nvidia-cublas==13.6.0.2")
 
 
 def test_older_toolkit_leaves_the_cublas_wheel_alone(tmp_path):
@@ -542,3 +541,23 @@ def test_unavailable_cublas_wheel_does_not_abort_the_install(tmp_path):
     )
     assert r.returncode == 0, r.stderr
     assert "continuing with 13.1.1.3" in r.stderr
+
+
+
+def test_cublas_alignment_is_the_last_install_step(tmp_path):
+    """Regression: step_cublas ran 2nd, and dion/FA3/quack/sonic-moe each declare
+    `Requires-Dist: torch`, so installing any of them re-resolves torch's
+    `nvidia-cublas<=13.1.1.3` pin and downgrades the wheel again. That left a
+    FRESH install failing verify with the exact symbol error the step prevents
+    (it only passed where those steps printed "present; skipping"). The cuBLAS
+    install must therefore come after every other pip install in the run.
+    """
+    bindir = _fake_bin(tmp_path)
+    _fake_cublas_header(tmp_path, "13.6.0.2")
+    r = _run(["--force"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+    assert r.returncode == 0, r.stderr
+    cublas_at = r.stdout.index("nvidia-cublas==13.6.0.2")
+    for later in ("dion.git", "--branch v2.16", "flash-attention3-wheels",
+                  "quack-kernels[cu13]==0.5.0", "sonic-moe.git"):
+        assert r.stdout.index(later) < cublas_at, f"{later} must install before the cuBLAS alignment"
