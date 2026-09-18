@@ -28,13 +28,20 @@ SCRIPT = Path(__file__).resolve().parents[2] / "src" / "nanoplm" / "deps" / "ins
 SYS_PATH = "/usr/bin:/bin"  # keep bash/git/coreutils reachable next to the fake bins
 
 
-def _write_nvcc(path, release="13.0"):
-    """A fake nvcc whose --version mimics the real release banner."""
+def _write_nvcc(path, release="13.0", finds_headers=True):
+    """A fake nvcc whose --version mimics the real release banner.
+
+    Any other invocation is ensure_te_headers' `#include` probe: exit 0 means
+    "this toolkit already has nccl.h/cudnn.h" (the NGC-container case, and the
+    default so the other tests stay unaffected), non-zero means it does not.
+    """
     path.write_text(
         "#!/bin/bash\n"
         'if [ "$1" = "--version" ]; then\n'
         f'  echo "Cuda compilation tools, release {release}, V{release}.0"\n'
+        "  exit 0\n"
         "fi\n"
+        f"exit {0 if finds_headers else 1}\n"
     )
     path.chmod(0o755)
     return path
@@ -48,12 +55,12 @@ def _fake_toolkit(root, release="13.3"):
 
 
 def _fake_bin(tmp_path, cuda_release="13.0", compute_cap=None, smi_fails=False,
-              with_nvcc=True, with_ninja=True):
+              with_nvcc=True, with_ninja=True, finds_headers=True):
     """Fake nvcc/ninja (+ optional nvidia-smi) ahead of the system PATH."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     if with_nvcc:
-        _write_nvcc(bindir / "nvcc", cuda_release)
+        _write_nvcc(bindir / "nvcc", cuda_release, finds_headers=finds_headers)
     if with_ninja:
         ninja = bindir / "ninja"
         ninja.write_text("#!/bin/bash\necho 1.13.0\n")
@@ -561,3 +568,125 @@ def test_cublas_alignment_is_the_last_install_step(tmp_path):
     for later in ("dion.git", "--branch v2.16", "flash-attention3-wheels",
                   "quack-kernels[cu13]==0.5.0", "sonic-moe.git"):
         assert r.stdout.index(later) < cublas_at, f"{later} must install before the cuBLAS alignment"
+
+
+# TE 2.16 includes two headers a bare CUDA toolkit does not ship: "nccl.h"
+# (common/util/logging.h, unconditional) and <cudnn.h> (pytorch/csrc/common.h,
+# compiled with only $CUDA_HOME/include on the line). On the Spack CUDA 13.0.2
+# toolkit that killed the build a minute in with
+#     util/logging.h:15:10: fatal error: nccl.h: No such file or directory
+# ensure_te_headers puts a directory that HAS each missing header on CPATH --
+# one export that reaches both the cmake half and the pytorch half.
+
+def _fake_header_tree(root, *headers):
+    """<root>/include/<header> for each header, as a module/wheel tree has it."""
+    inc = root / "include"
+    inc.mkdir(parents=True, exist_ok=True)
+    for header in headers:
+        (inc / header).write_text(f"/* fake {header} */\n")
+    return inc
+
+
+def test_header_reachable_asks_the_compiler(tmp_path):
+    # The compiler's own verdict is the authority — no directory guessing.
+    for finds, expected in ((True, 0), (False, 1)):
+        bindir = tmp_path / f"bin-{finds}"
+        bindir.mkdir()
+        _write_nvcc(bindir / "nvcc", finds_headers=finds)
+        r = _source("header_reachable nccl.h",
+                    extra_env={"PATH": f"{bindir}:{SYS_PATH}"})
+        assert r.returncode == expected, f"finds_headers={finds} -> {r.returncode}"
+
+
+def test_missing_headers_come_from_the_torch_wheel_stack(tmp_path):
+    # torch pins nvidia-nccl/nvidia-cudnn, so the headers are in this venv even
+    # when the toolkit has none — and they are the ones the cmake half compiles
+    # cuDNN from and the ones torch loads at runtime, so they beat a loaded
+    # `module load nccl cudnn` carrying a different version.
+    wheel = _fake_header_tree(tmp_path / "nvidia", "nccl.h", "cudnn.h")
+    module = _fake_header_tree(tmp_path / "nccl-module", "nccl.h", "cudnn.h")
+    r = _source(
+        'header_reachable() { return 1; }; '
+        f'nvidia_wheel_include_dirs() {{ echo "{wheel}"; }}; '
+        f'NCCL_HOME="{tmp_path}/nccl-module"; CUDNN_HOME="{tmp_path}/nccl-module"; '
+        'ensure_te_headers; echo "CPATH=$CPATH"',
+        extra_env={"CPATH": ""},
+    )
+    assert r.returncode == 0, r.stderr
+    assert f"CPATH={wheel}" in r.stdout, r.stdout
+    assert str(module) not in r.stdout
+
+
+def test_a_module_tree_covers_what_the_wheels_lack(tmp_path):
+    # Fallback: a venv whose wheel stack has no nccl.h still builds when
+    # `module load nccl` (NCCL_HOME) or EasyBuild's $EBROOTNCCL is there.
+    wheel = _fake_header_tree(tmp_path / "nvidia", "cudnn.h")
+    nccl = _fake_header_tree(tmp_path / "nccl", "nccl.h")
+    r = _source(
+        'header_reachable() { return 1; }; '
+        f'nvidia_wheel_include_dirs() {{ echo "{wheel}"; }}; '
+        f'NCCL_HOME="{tmp_path}/nccl"; '
+        'ensure_te_headers; echo "CPATH=$CPATH"',
+        extra_env={"CPATH": "", "CUDNN_HOME": ""},
+    )
+    assert r.returncode == 0, r.stderr
+    assert f"CPATH={nccl}:{wheel}" in r.stdout, r.stdout   # nccl.h probed first
+    assert f"nccl.h is not on the toolkit's include path -- added {nccl}" in r.stdout
+
+
+def test_an_already_complete_toolkit_is_left_alone(tmp_path):
+    # NGC-style layout (both headers next to the CUDA ones): touch nothing.
+    r = _source(
+        'header_reachable() { return 0; }; '
+        'nvidia_wheel_include_dirs() { echo SHOULD_NOT_BE_CALLED; }; '
+        'ensure_te_headers; echo "CPATH=[${CPATH:-}]"',
+        extra_env={"CPATH": ""},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "CPATH=[]" in r.stdout
+    assert "SHOULD_NOT_BE_CALLED" not in r.stdout
+
+
+def test_unfindable_header_warns_but_does_not_abort(tmp_path):
+    # Nothing we can do from here: name the header and let the build's own
+    # error follow. Refusing would sink hosts whose layout we merely missed.
+    r = _source(
+        'header_reachable() { return 1; }; '
+        'nvidia_wheel_include_dirs() { :; }; '
+        'ensure_te_headers; echo "rc=$?"',
+        extra_env={"CPATH": "", "NCCL_HOME": "", "CUDNN_HOME": "",
+                   "EBROOTNCCL": "", "EBROOTCUDNN": ""},
+    )
+    assert "rc=0" in r.stdout, r.stderr          # never fatal
+    assert "nccl.h is not on the compiler's include path" in r.stderr
+    assert "cudnn.h is not on the compiler's include path" in r.stderr
+    assert "module load CUDA/13 NCCL cuDNN Ninja" in r.stderr
+
+
+def test_real_nvidia_wheel_include_dirs_shape():
+    # Against the live venv: either nothing (no CUDA wheels) or existing
+    # .../nvidia/<component>/include dirs. This is where nccl.h comes from on a
+    # toolkit that has none, so a wheel-layout change must show up here.
+    r = _source("nvidia_wheel_include_dirs")
+    assert r.returncode == 0, r.stderr
+    for line in r.stdout.split():
+        path = Path(line)
+        assert path.name == "include" and path.is_dir(), line
+
+
+def test_step_te_resolves_headers_before_building(tmp_path):
+    # Wiring: a toolkit whose compiler cannot find nccl.h must get a CPATH
+    # entry BEFORE the TE clone/build, not after it fails.
+    # Whichever source wins here (this venv's wheels, else the module trees
+    # below), both headers must be resolved before the clone.
+    bindir = _fake_bin(tmp_path, finds_headers=False)
+    _fake_header_tree(tmp_path / "nccl", "nccl.h")
+    _fake_header_tree(tmp_path / "cudnn", "cudnn.h")
+    r = _run(["--force"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1", "CPATH": "",
+                        "NCCL_HOME": f"{tmp_path}/nccl",
+                        "CUDNN_HOME": f"{tmp_path}/cudnn"})
+    assert r.returncode == 0, r.stderr
+    for header in ("nccl.h", "cudnn.h"):
+        assert f"{header} is not on the toolkit's include path -- added" in r.stdout
+    assert r.stdout.index("to CPATH") < r.stdout.index("--branch v2.16")

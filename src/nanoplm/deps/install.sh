@@ -234,6 +234,111 @@ cublas_needs_upgrade() {
   [ "$newest" = "$want" ]
 }
 
+# ---- headers TE's build expects next to the CUDA toolkit ---------------------
+# TE 2.16 includes two headers a bare CUDA toolkit does not ship, and neither
+# half of its build goes looking for them:
+#   * common/util/logging.h:15  #include "nccl.h"  -- unconditional (it backs
+#     NVTE_CHECK_NCCL), yet the cmake half adds an NCCL include dir only inside
+#     the NVTE_WITH_CUBLASMP / NVTE_WITH_CUSOLVERMP options, which we leave off.
+#   * pytorch/csrc/common.h:23  #include <cudnn.h> -- the cmake half finds cuDNN
+#     through the cudnn-frontend's own site-packages probe, but the pytorch
+#     extension half compiles with just $CUDA_HOME/include (build_tools/
+#     utils.py: get_cuda_include_dirs returns the toolkit and nothing else once
+#     a toolkit exists).
+# Upstream gets away with both because NGC containers ship nccl.h and cudnn.h
+# beside the CUDA headers. Toolkits that do not -- Spack, EasyBuild without
+# `module load NCCL cuDNN`, plain runfile installs -- die a minute into the
+# build with:
+#     util/logging.h:15:10: fatal error: nccl.h: No such file or directory
+# Only the HEADERS are missing: every nccl* CALL sits behind those two options,
+# so nothing here has to link libnccl.
+#
+# The fix is CPATH, not -I: one export reaches BOTH halves (cmake's nvcc/g++ and
+# torch's cpp_extension, which builds its own compile lines and would drop
+# CFLAGS), and nvcc honors it for the host and device passes alike. TE's
+# NVTE_CMAKE_EXTRA_ARGS would reach the cmake half only -- and it splits on
+# whitespace.
+
+# header_reachable <header>: 0 iff nvcc already resolves `#include "<header>"`
+# with the include path it has (its own toolkit, /usr/include, $CPATH). Asking
+# the compiler beats guessing toolkit layouts, and costs ~50 ms. Heredoc, not a
+# pipe: under `set -o pipefail` a compiler that never reads stdin would hand us
+# printf's SIGPIPE instead of its own verdict.
+header_reachable() {
+  nvcc -E -x cu - -o /dev/null >/dev/null 2>&1 <<EOF
+#include "$1"
+EOF
+}
+
+# nvidia_wheel_include_dirs: echo every <site-packages>/nvidia/*/include that
+# exists (torch's own CUDA wheel stack: cu13, cudnn, nccl, ...). Deliberately
+# the same place TE itself falls back to when there is no toolkit
+# (get_cuda_include_dirs under NVTE_BUILD_USE_NVIDIA_WHEELS=1), so we add
+# exactly the headers a pip-only install would have compiled against.
+nvidia_wheel_include_dirs() {
+  "$PY" - <<'PYEOF' 2>/dev/null
+from pathlib import Path
+try:
+    import nvidia
+except ModuleNotFoundError:
+    raise SystemExit(0)
+root = Path(nvidia.__file__).parent if nvidia.__file__ else Path(nvidia.__path__[0])
+for sub in sorted(p for p in root.iterdir() if p.is_dir()):
+    if (sub / "include").is_dir():
+        print(sub / "include")
+PYEOF
+}
+
+# ensure_te_headers: for each header TE includes that the compiler cannot find,
+# append a directory that has it to CPATH. Appended, never prepended: the
+# toolkit's own headers keep priority.
+#
+# torch's WHEELS come before any module tree ($NCCL_HOME / $CUDNN_HOME, set by
+# an `module load nccl cudnn`; $EBROOT* on EasyBuild clusters), even though a
+# loaded module is the more deliberate choice, because the wheels are what the
+# rest of this build and the finished library actually pair with: TE's cmake
+# half already compiles cuDNN from the wheel (the cudnn-frontend probes
+# site-packages), and at runtime torch loads its own libnccl/libcudnn through an
+# RPATH into site-packages. A module's headers are a different version --
+# NHR@FAU ships nccl 2.28.7 against torch's 2.29.7, and its only cudnn modules
+# are cu11/cu12 builds -- which would leave the two halves of one .so compiled
+# against two cuDNNs. Same build-vs-runtime rule as step_cublas. Module trees
+# stay as the fallback for a venv without the NVIDIA wheels.
+#
+# Never fatal -- a named warning plus the build's own error beats refusing on a
+# host whose layout we merely failed to guess.
+ensure_te_headers() {
+  local header dir found missing=() cands=()
+  for header in nccl.h cudnn.h; do
+    header_reachable "$header" || missing+=("$header")
+  done
+  [ "${#missing[@]}" -eq 0 ] && return 0
+  while IFS= read -r dir; do
+    [ -n "$dir" ] && cands+=("$dir")
+  done < <(nvidia_wheel_include_dirs)
+  for dir in "${NCCL_HOME:-}" "${EBROOTNCCL:-}" "${CUDNN_HOME:-}" "${EBROOTCUDNN:-}"; do
+    [ -n "$dir" ] && cands+=("$dir/include")
+  done
+  for header in "${missing[@]}"; do
+    found=""
+    for dir in "${cands[@]:-}"; do
+      if [ -r "$dir/$header" ]; then found="$dir"; break; fi
+    done
+    if [ -z "$found" ]; then
+      warn "$header is not on the compiler's include path and is in none of:"
+      warn "  ${cands[*]:-<no candidate include dirs>}"
+      warn "TransformerEngine 2.16 includes it unconditionally, so its build will fail."
+      warn "On EasyBuild clusters run:  $JURECA_HINT"
+      continue
+    fi
+    case ":${CPATH:-}:" in
+      *":$found:"*) ;;
+      *) export CPATH="${CPATH:+$CPATH:}$found" ;;
+    esac
+    log "$header is not on the toolkit's include path -- added $found to CPATH for the build"
+  done
+}
+
 # ---- preflight: recover what is recoverable, then fail loudly ----------------
 # An unexported toolkit or a missing ninja is a PATH problem, not a platform
 # problem: probe/bootstrap it and print exactly what changed. Anything we cannot
@@ -417,6 +522,9 @@ step_dion() {
 
 step_te() {
   if satisfied transformer_engine "2.16"; then log "TransformerEngine 2.16 present; skipping."; return 0; fi
+  # nccl.h / cudnn.h first: both halves of this build include them and neither
+  # half looks for them outside the toolkit (see ensure_te_headers).
+  ensure_te_headers
   # --no-build-isolation reads the live env and --no-deps installs ONLY
   # transformer_engine (re-resolving torch's CUDA wheel stack against PyPI can
   # pull wheels that clash with the toolchain we build against). So TE's build
