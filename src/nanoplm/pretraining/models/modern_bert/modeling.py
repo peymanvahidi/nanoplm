@@ -385,6 +385,18 @@ class ModernBertSwiGLUMLP(nn.Module):
         return self.Wo(self.drop(hidden))
 
 
+def _repo_inv_freq(theta: float, rope_dim: int) -> torch.Tensor:
+    """RePO's fixed per-channel frequency table (same shape/formula as RoPE's).
+
+    Pulled out as a standalone function so it can be recomputed from just
+    ``(theta, rope_dim)`` wherever the buffer needs rebuilding -- e.g. by
+    `nanoplm.hf`'s `_init_weights`, which re-materializes this non-persistent
+    buffer after a `from_pretrained` load (see that module for why).
+    """
+    channel = torch.arange(0, rope_dim, 2, dtype=torch.float32)
+    return 1.0 / (theta ** (channel / rope_dim))
+
+
 class ModernBertAttention(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int = 0):
         super().__init__()
@@ -494,10 +506,14 @@ class ModernBertAttention(nn.Module):
                 else config.local_rope_theta
             )
             rope_dim = config.rope_dim
-            channel = torch.arange(0, rope_dim, 2, dtype=torch.float32)
+            # Stashed (plain floats/ints, not tensors -- unaffected by meta-device
+            # construction) so `repo_inv_freq` can be recomputed later without a
+            # config/layer_idx on hand -- see `_repo_inv_freq`.
+            self._repo_theta = theta
+            self._repo_rope_dim = rope_dim
             self.register_buffer(
                 "repo_inv_freq",
-                1.0 / (theta ** (channel / rope_dim)),
+                _repo_inv_freq(theta, rope_dim),
                 persistent=False,
             )
 
@@ -2283,6 +2299,35 @@ class MLMOutput:
         return getattr(self, key)
 
 
+def _reset_moe_bookkeeping(
+    root: nn.Module,
+    use_moe: bool,
+    num_valid_tokens: Optional[torch.Tensor] = None,
+) -> None:
+    """Reset the per-layer MoE bookkeeping that `MoELayer.forward` accumulates
+    (aux loss, execution count, expert counts). Doing it once here, before any
+    path branches, is what makes the accumulation safe when a layer runs more
+    than once per forward -- Huginn recycling iterations or Loopie repeats --
+    instead of each execution clobbering the last.
+
+    Shared by the native `ModernBertForMaskedLM.forward` and by `nanoplm.hf`'s
+    forwards, so both reset the same bookkeeping the same way; the latter
+    always pass `num_valid_tokens=None` (HF has no packed-batch valid-token
+    count).
+    """
+    if not use_moe:
+        return
+    from .moe import MoELayer as _MoELayer
+
+    for module in root.modules():
+        if isinstance(module, _MoELayer):
+            module.last_expert_counts = None
+            module.last_aux_loss = None
+            module.last_z_loss = None
+            module.last_aux_count = None
+            module.valid_token_count = num_valid_tokens
+
+
 class ModernBertPredictionHead(nn.Module):
     def __init__(self, config: ModernBertConfig):
         super().__init__()
@@ -2542,20 +2587,7 @@ class ModernBertForMaskedLM(nn.Module):
         recycling_bptt: Optional[int] = None,
         num_valid_tokens: Optional[torch.Tensor] = None,
     ) -> MLMOutput:
-        # Reset the per-layer MoE bookkeeping that MoELayer.forward accumulates
-        # (aux loss, execution count, expert counts). Doing it once here, before
-        # any path branches, is what makes the accumulation safe when a layer
-        # runs more than once per forward -- Huginn recycling iterations or
-        # Loopie repeats -- instead of each execution clobbering the last.
-        if self.config.use_moe:
-            from .moe import MoELayer as _MoELayer
-            for _module in self.modules():
-                if isinstance(_module, _MoELayer):
-                    _module.last_expert_counts = None
-                    _module.last_aux_loss = None
-                    _module.last_z_loss = None
-                    _module.last_aux_count = None
-                    _module.valid_token_count = num_valid_tokens
+        _reset_moe_bookkeeping(self, self.config.use_moe, num_valid_tokens)
 
         # ---- static packed path (pre-flattened by collator) ---------------
         # When both cu_seqlens and position_ids are provided and input_ids is
