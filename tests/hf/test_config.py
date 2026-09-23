@@ -21,7 +21,9 @@ def test_constructible_with_no_arguments():
 
 def test_carries_every_model_config_field():
     cfg = NanoPLMConfig()
-    missing = [f.name for f in fields(ProtModernBertMLMConfig) if not hasattr(cfg, f.name)]
+    missing = [
+        f.name for f in fields(ProtModernBertMLMConfig) if not hasattr(cfg, f.name)
+    ]
     assert missing == []
 
 
@@ -52,8 +54,12 @@ def test_to_model_config_returns_a_dataclass():
 
 def test_from_model_config_preserves_values():
     src = ProtModernBertMLMConfig(
-        hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, use_moe=True, moe_num_experts=3,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        use_moe=True,
+        moe_num_experts=3,
     )
     cfg = NanoPLMConfig.from_model_config(src, repo_active=True, source_global_step=500)
     assert cfg.moe_num_experts == 3

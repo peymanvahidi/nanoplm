@@ -5,6 +5,7 @@ retyped, so a new model flag needs no edit here. The four fields that have no
 dataclass default get explicit ones because transformers instantiates configs
 with no arguments.
 """
+
 from __future__ import annotations
 
 from dataclasses import MISSING, fields
@@ -70,6 +71,8 @@ class NanoPLMConfig(PretrainedConfig):
     def from_model_config(
         cls, config: ProtModernBertMLMConfig, **extra: Any
     ) -> "NanoPLMConfig":
-        payload = {f.name: getattr(config, f.name) for f in fields(ProtModernBertMLMConfig)}
+        payload = {
+            f.name: getattr(config, f.name) for f in fields(ProtModernBertMLMConfig)
+        }
         payload.update(extra)
         return cls(**payload)
