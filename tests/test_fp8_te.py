@@ -260,3 +260,79 @@ def test_te_fp8_recipe_from_config_accepts_current_config_shape():
     recipe = te_fp8_recipe_from_config(_Cfg())
 
     assert recipe is not None
+
+
+# ---------------------------------------------------------------------------
+# geglu routing
+#
+# ModernBertMLP (geglu) and ModernBertSwiGLUMLP are structurally identical, so
+# the conversion used to classify both as "swiglu" purely from shapes and
+# silently retrained gelu-gated layers as silu-gated ones under fp8.
+# ---------------------------------------------------------------------------
+
+def _geglu_layer(hidden=16, inter=32, bias=False):
+    from nanoplm.pretraining.models.modern_bert.config import ModernBertConfig
+    from nanoplm.pretraining.models.modern_bert.modeling import ModernBertMLP
+
+    cfg = ModernBertConfig(
+        hidden_size=hidden, intermediate_size=inter, num_hidden_layers=2,
+        num_attention_heads=4, num_kv_heads=2, vocab_size=32,
+        mlp_activation="geglu", mlp_bias=bias, norm_type="rmsnorm",
+        fused_up_gate=True,
+    )
+    layer = nn.Module()
+    layer.canon_c = None
+    layer.mlp_norm = nn.RMSNorm(hidden, eps=1e-5)
+    layer.mlp = ModernBertMLP(cfg)
+    model = nn.Module()
+    model.layer = layer
+    return model
+
+
+def test_geglu_is_not_classified_as_swiglu():
+    from nanoplm.pretraining.fp8 import _te_layernorm_mlp_activation
+
+    assert _te_layernorm_mlp_activation(_geglu_layer().layer) == "geglu"
+    assert _te_layernorm_mlp_activation(_EncoderLayerWrapper().layer) == "swiglu"
+
+
+def test_convert_mlp_blocks_routes_geglu_to_te_geglu_without_swapping_halves():
+    model = _geglu_layer()
+    old_wi_weight = model.layer.mlp.Wi.weight.detach().clone()
+    old_wo_weight = model.layer.mlp.Wo.weight.detach().clone()
+
+    converted = convert_mlp_blocks_to_te_layernorm_mlp(model)
+
+    assert converted == 1
+    fused = model.layer.mlp.layernorm_mlp
+    assert fused.activation == "geglu"
+    # TE geglu gates on the FIRST half, exactly like ModernBertMLP, so the
+    # halves must carry over in order -- unlike swiglu, which swaps them.
+    assert torch.allclose(fused.fc1_weight.detach().cpu(), old_wi_weight)
+    assert torch.allclose(fused.fc2_weight.detach().cpu(), old_wo_weight)
+
+
+def test_unrecognised_gate_activation_is_left_in_eager():
+    from nanoplm.pretraining.fp8 import _te_layernorm_mlp_activation
+
+    model = _geglu_layer()
+    model.layer.mlp.act = torch.tanh  # not a gate TE can be trusted to match
+    assert _te_layernorm_mlp_activation(model.layer) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="TE LayerNormMLP needs CUDA")
+def test_te_geglu_conversion_matches_eager_math():
+    torch.manual_seed(0)
+    model = _geglu_layer(hidden=64, inter=128).cuda()
+    x = torch.randn(2, 8, 64, device="cuda")
+
+    with torch.no_grad():
+        expected = model.layer.mlp(model.layer.mlp_norm(x))
+
+    convert_mlp_blocks_to_te_layernorm_mlp(model)
+    with torch.no_grad():
+        got = model.layer.mlp(x)
+
+    assert torch.allclose(got, expected, atol=2e-2, rtol=2e-2), (
+        f"max abs diff {(got - expected).abs().max().item():.3e}"
+    )

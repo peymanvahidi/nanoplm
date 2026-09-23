@@ -107,3 +107,37 @@ def test_sample_with_curriculum_uses_current_mean():
     assert statistics.mean(early_samples) < 3
     late_samples = [sched.sample(5000, device=torch.device("cpu"), generator=g) for _ in range(200)]
     assert statistics.mean(late_samples) > 15
+
+
+def _uniform_sched(target, jitter):
+    """Loopie's construction: bounded uniform, no curriculum."""
+    return RecyclingScheduler(
+        _MockPretrainCfg(), target_loop_count=target, total_training_steps=1000,
+        curriculum_complete=True, sampling="uniform", jitter=jitter,
+    )
+
+
+def test_uniform_mode_is_opt_in_and_leaves_huginn_callers_alone():
+    sched = RecyclingScheduler(
+        _MockPretrainCfg(), target_loop_count=8, total_training_steps=1000,
+    )
+    assert sched.sampling == "lognormal_poisson"
+    assert sched.jitter == 0
+
+
+@pytest.mark.parametrize("target,jitter", [(2, 1), (4, 2), (8, 7)])
+def test_uniform_sampling_covers_its_support_with_the_target_as_mean(target, jitter):
+    sched = _uniform_sched(target, jitter)
+    g = torch.Generator().manual_seed(11)
+    samples = [sched.sample(0, device=torch.device("cpu"), generator=g)
+               for _ in range(20000)]
+    assert set(samples) == set(range(target - jitter, target + jitter + 1))
+    assert abs(statistics.mean(samples) - target) < 0.1 * (jitter + 1)
+
+
+@pytest.mark.parametrize("jitter", [0, 4, 5])
+def test_uniform_sampling_rejects_a_support_that_would_clip_at_one(jitter):
+    # jitter <= target - 1 is what makes the mean exactly the target; jitter 0
+    # is fixed depth, which is the "fixed" mode, not this one.
+    with pytest.raises(ValueError, match="jitter"):
+        _uniform_sched(target=4, jitter=jitter)

@@ -36,12 +36,17 @@ def visibility_gates() -> dict:
     gt1 = {"field": "recycling_loop_count", "op": ">", "value": 1}
     eq_true = lambda f: {"field": f, "op": "==", "value": True}
     g: dict[str, dict] = {}
+    # recycling_pretraining_eval_loop_counts is deliberately absent: the in-loop
+    # r sweep it configures is read for loopie runs too, and a gate expresses
+    # one condition, not "either looping mechanism".
     for f in ("recycling_bptt", "recycling_loop_count_sampling", "recycling_loop_count_sigma",
               "recycling_loop_count_curriculum", "recycling_loop_count_curriculum_steps",
-              "recycling_pretraining_eval_loop_counts", "recycling_num_prelude_layers",
-              "recycling_num_coda_layers", "recycling_adapter_bias", "recycling_s0_noise_sigma",
+              "recycling_num_prelude_layers", "recycling_num_coda_layers",
+              "recycling_adapter_bias", "recycling_s0_noise_sigma",
               "recycling_use_takase_init"):
         g[f] = gt1
+    g["loopie_loop_count"] = eq_true("use_loopie")
+    g["loopie_loop_count_jitter"] = eq_true("use_loopie")
     for f in ("canon_layers_mode", "canon_layers_kernel_size"):
         g[f] = eq_true("use_canon_layers")
     for f in ("noble_rank", "noble_alpha", "noble_half_kaiming", "noble_targets",

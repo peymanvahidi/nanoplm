@@ -5,7 +5,7 @@ def test_optimizer_enum_present():
     o = overlay.load()
     entry = o["pretraining.optimizer"]
     # Must match click.Choice in cli/pretrain.py::run --optimizer.
-    assert entry["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "muonh", "aurora"]
+    assert entry["enum"] == ["adamw", "stable_adamw", "muon", "normuon", "nordion2"]
 
 def test_lr_schedule_enum_matches_validator():
     # click.Choice --lr-schedule and _validate_duration_config's `valid` set.
@@ -40,9 +40,9 @@ def test_unknown_key_returns_empty_overlay():
     assert overlay.for_field(o, "pretraining.does_not_exist") == {}
 
 def test_mlp_activation_enum_matches_validator():
-    # Must match the authoritative validator (modeling.py: {swiglu, glu, srelu}),
+    # Must match the authoritative validator (config.py: {swiglu, geglu, srelu}),
     # NOT gelu/relu which are rejected at config-build time.
-    assert overlay.load()["model.mlp_activation"]["enum"] == ["swiglu", "glu", "srelu"]
+    assert overlay.load()["model.mlp_activation"]["enum"] == ["swiglu", "geglu", "srelu"]
 
 def test_for_field_does_not_alias_cached_overlay():
     # Mutating a for_field result must not corrupt the lru_cache'd overlay.

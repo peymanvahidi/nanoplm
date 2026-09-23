@@ -14,8 +14,6 @@ trigger: "recycling_loop_count > 1"
 
 model_flags:
   reject:
-    - flag: use_moe
-      reason: "MoE per-layer state (last_expert_counts, last_aux_loss) is overwritten on every recurrent iteration; only the last iteration's routing decisions would reach the pipeline's expert-bias correction. Disable use_moe or recycling_loop_count > 1."
     - flag: use_x0_lambdas
       reason: "x0 captured once before the loop; per-physical-layer rescaling re-applied every recurrent iteration has unvalidated semantics."
     - flag: use_resid_lambdas
@@ -24,6 +22,9 @@ model_flags:
       reason: "mHC-lite multi-stream residual mixing has its own stability guarantees (doubly-stochastic mixing); interaction with the recycled residual stream is untested."
 
   allow_with_warning:
+    - flag: use_moe
+      condition: "use_moe is True"
+      message: "MoE per-layer state now accumulates across recurrent iterations: aux/z-loss sums and the loss takes the per-execution mean (same scale as an unlooped run), and expert counts sum over iterations (the pipeline's bias update is relative and zero-meaned, so it is invariant to that scale). Aux gradients reach the router gate only through the last recycling_bptt iterations. Cutlass dispatch-workspace reuse is disabled under looping."
     - flag: use_repo
       condition: "repo_after_n_layers falls inside the recurrent block region"
       message: "RePO will re-predict per-head positions every recurrent iteration. This hasn't been ablated; consider setting repo_after_n_layers >= recycling_num_prelude_layers + (num_hidden_layers - recycling_num_prelude_layers - recycling_num_coda_layers) so RePO stays in the coda."
@@ -43,9 +44,6 @@ model_flags:
 
 pipeline_flags:
   reject:
-    - flag: pure_te
-      condition: "pure_te is True"
-      reason: "te_pipeline.py is out of scope for the v1 recycling implementation. Use pure_torch."
     - flag: pure_torch
       condition: "pure_torch is False"
       reason: "Recycling lands only in pure_pipeline.py for v1; the HF path is out of scope."

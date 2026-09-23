@@ -17,12 +17,12 @@
         },
         "compressed_fasta": {
           "type": "string",
-          "default": "output/data/raw/uniref50.fasta.gz",
+          "default": "output/data/raw/sequences.fasta.gz",
           "description": "unused if source is a plain .fasta (URL or local_fasta)"
         },
         "extracted_fasta": {
           "type": "string",
-          "default": "output/data/raw/uniref50.fasta"
+          "default": "output/data/raw/sequences.fasta"
         },
         "validation_dir": {
           "type": "string",
@@ -30,11 +30,11 @@
         },
         "shuffled_fasta": {
           "type": "string",
-          "default": "output/data/raw/uniref50_shuffled.fasta"
+          "default": "output/data/raw/sequences_shuffled.fasta"
         },
         "filtered_fasta": {
           "type": "string",
-          "default": "output/data/filter/uniref50_filtered.fasta"
+          "default": "output/data/filter/sequences_filtered.fasta"
         },
         "splitted_fasta_dir": {
           "type": "string",

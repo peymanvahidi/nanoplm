@@ -56,6 +56,13 @@ def _check_model_flags(model_config, matrix: dict[str, Any]) -> None:
                 _logger.warning(
                     "recycling: %s — %s", entry["condition"], entry["message"]
                 )
+        else:
+            # Unconditional warn: the flag being set is the whole condition.
+            _logger.warning(
+                "recycling: %s — %s",
+                entry.get("condition", flag),
+                entry["message"],
+            )
 
 
 def _check_pipeline_flags(pipeline_config, matrix: dict[str, Any]) -> None:
@@ -66,8 +73,6 @@ def _check_pipeline_flags(pipeline_config, matrix: dict[str, Any]) -> None:
         value = getattr(pipeline_config, flag, None)
         # Explicit per-flag predicate matches the model-side pattern.
         # The yaml `condition:` string stays as human-readable doc only.
-        if flag == "pure_te" and value is True:
-            raise ValueError(f"recycling: incompatible pipeline flag '{flag}'. {entry['reason']}")
         if flag == "pure_torch" and value is False:
             raise ValueError(f"recycling: incompatible pipeline flag '{flag}'. {entry['reason']}")
 

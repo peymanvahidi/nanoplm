@@ -22,6 +22,7 @@ def _model_cfg(**kwargs):
         num_hidden_layers=4,
         num_attention_heads=4,
         vocab_size=32,
+        use_huginn_looping=True,
         recycling_loop_count=2,
         recycling_num_prelude_layers=1,
         recycling_num_coda_layers=1,
@@ -38,6 +39,7 @@ def _pipeline_model_cfg(**kwargs):
     """
     from types import SimpleNamespace
     base = dict(
+        use_huginn_looping=True,
         recycling_loop_count=2,
         recycling_num_prelude_layers=1,
         recycling_num_coda_layers=1,
@@ -56,13 +58,27 @@ def test_matrix_loads_with_expected_top_level_keys():
 
 
 def test_validator_no_op_when_recycling_off():
-    cfg = _model_cfg(recycling_loop_count=1, recycling_num_prelude_layers=0, recycling_num_coda_layers=0)
+    cfg = _model_cfg(use_huginn_looping=False, recycling_loop_count=1,
+                     recycling_num_prelude_layers=0, recycling_num_coda_layers=0)
     validate_recycling_compatibility(cfg)
 
 
-def test_reject_use_moe():
-    with pytest.raises(ValueError, match="use_moe"):
-        _model_cfg(use_moe=True)
+def test_warn_use_moe(monkeypatch):
+    """MoE is allowed under recycling now that per-layer aux/count state
+    accumulates across iterations instead of being overwritten; the matrix
+    downgrades it from reject to allow_with_warning."""
+    warnings_seen = []
+    from nanoplm.utils.logger import logger as _nplm_logger
+    monkeypatch.setattr(_nplm_logger, "warning",
+                        lambda msg, *a, **k: warnings_seen.append(msg % a if a else msg))
+    cfg = _model_cfg(
+        use_moe=True,
+        moe_num_experts=4,
+        moe_top_k=2,
+        mlp_activation="swiglu",
+    )
+    validate_recycling_compatibility(cfg)
+    assert any("MoE" in w for w in warnings_seen), warnings_seen
 
 
 def test_reject_use_x0_lambdas():
@@ -109,18 +125,10 @@ def test_repo_outside_recurrent_block_no_warning(monkeypatch):
     assert not any("RePO" in w for w in warnings_seen)
 
 
-def test_pipeline_flag_rejects_pure_te():
-    cfg = _pipeline_model_cfg()
-    from types import SimpleNamespace
-    pipeline_cfg = SimpleNamespace(pure_te=True, pure_torch=True, fp8=False, use_compile_max_autotune=False)
-    with pytest.raises(ValueError, match="te_pipeline"):
-        validate_recycling_compatibility(cfg, pipeline_cfg)
-
-
 def test_pipeline_flag_rejects_hf_path():
     cfg = _pipeline_model_cfg()
     from types import SimpleNamespace
-    pipeline_cfg = SimpleNamespace(pure_te=False, pure_torch=False, fp8=False, use_compile_max_autotune=False)
+    pipeline_cfg = SimpleNamespace(pure_torch=False, fp8=False, use_compile_max_autotune=False)
     with pytest.raises(ValueError, match="HF path"):
         validate_recycling_compatibility(cfg, pipeline_cfg)
 
@@ -128,7 +136,7 @@ def test_pipeline_flag_rejects_hf_path():
 def test_pipeline_flag_warns_on_fp8(monkeypatch):
     cfg = _pipeline_model_cfg()
     from types import SimpleNamespace
-    pipeline_cfg = SimpleNamespace(pure_te=False, pure_torch=True, fp8=True, use_compile_max_autotune=False)
+    pipeline_cfg = SimpleNamespace(pure_torch=True, fp8=True, use_compile_max_autotune=False)
     # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
     warnings_seen = []
     from nanoplm.utils.logger import logger as _nplm_logger
@@ -136,3 +144,88 @@ def test_pipeline_flag_warns_on_fp8(monkeypatch):
                         lambda msg, *a, **k: warnings_seen.append(msg % a if a else msg))
     validate_recycling_compatibility(cfg, pipeline_cfg)
     assert any("fp8" in w for w in warnings_seen)
+
+
+# ---------------------------------------------------------------------------
+# Explicit looping switches: use_huginn_looping / use_loopie
+# ---------------------------------------------------------------------------
+
+def test_huginn_flag_requires_loop_count():
+    with pytest.raises(ValueError, match="use_huginn_looping"):
+        _model_cfg(use_huginn_looping=True, recycling_loop_count=1,
+                   recycling_num_prelude_layers=0, recycling_num_coda_layers=0)
+
+
+def test_loop_count_requires_huginn_flag():
+    with pytest.raises(ValueError, match="use_huginn_looping"):
+        _model_cfg(use_huginn_looping=False)
+
+
+def test_loopie_and_huginn_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _model_cfg(use_loopie=True)
+
+
+def test_loopie_loop_count_must_be_at_least_two():
+    with pytest.raises(ValueError, match="loopie_loop_count"):
+        _model_cfg(use_huginn_looping=False, recycling_loop_count=1,
+                   recycling_num_prelude_layers=0, recycling_num_coda_layers=0,
+                   use_loopie=True, loopie_loop_count=1)
+
+
+def test_loopie_loop_count_without_flag_is_rejected():
+    with pytest.raises(ValueError, match="no effect"):
+        _model_cfg(use_huginn_looping=False, recycling_loop_count=1,
+                   recycling_num_prelude_layers=0, recycling_num_coda_layers=0,
+                   loopie_loop_count=3)
+
+
+@pytest.mark.parametrize("flag", ["use_resid_lambdas", "use_x0_lambdas", "use_mhc_lite"])
+def test_loopie_rejects_per_layer_state_flags(flag):
+    with pytest.raises(ValueError, match=flag):
+        _model_cfg(use_huginn_looping=False, recycling_loop_count=1,
+                   recycling_num_prelude_layers=0, recycling_num_coda_layers=0,
+                   use_loopie=True, **{flag: True})
+
+
+def test_loopie_valid_config_builds():
+    cfg = _model_cfg(use_huginn_looping=False, recycling_loop_count=1,
+                     recycling_num_prelude_layers=0, recycling_num_coda_layers=0,
+                     use_loopie=True, loopie_loop_count=2)
+    assert cfg.use_loopie and cfg.loopie_loop_count == 2
+
+
+def _prot_cfg(**kwargs):
+    from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
+    base = dict(vocab_size=32, hidden_size=64, intermediate_size=64,
+                num_hidden_layers=4, num_attention_heads=4, num_kv_heads=4)
+    base.update(kwargs)
+    return ProtModernBertMLMConfig(**base)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(use_huginn_looping=True, recycling_loop_count=2,
+         recycling_num_prelude_layers=1, recycling_num_coda_layers=1),
+    dict(use_loopie=True, loopie_loop_count=2),
+])
+def test_hf_path_rejects_looping(kwargs):
+    from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLM
+    with pytest.raises(ValueError, match="pure-torch"):
+        ProtModernBertMLM(_prot_cfg(**kwargs))
+
+
+def test_eval_checkpoint_backfills_huginn_flag():
+    """Checkpoints written before use_huginn_looping existed encode recycling
+    only via recycling_loop_count > 1; the loader must infer the flag."""
+    from nanoplm.eval.checkpoint import _model_config_from_dict
+    cfg = _model_config_from_dict(dict(
+        vocab_size=32, hidden_size=64, intermediate_size=64,
+        num_hidden_layers=4, num_attention_heads=4, num_kv_heads=4,
+        recycling_loop_count=2, recycling_num_prelude_layers=1,
+        recycling_num_coda_layers=1,
+    ))
+    assert cfg.use_huginn_looping is True
+    assert _model_config_from_dict(dict(
+        vocab_size=32, hidden_size=64, intermediate_size=64,
+        num_hidden_layers=4, num_attention_heads=4, num_kv_heads=4,
+    )).use_huginn_looping is False

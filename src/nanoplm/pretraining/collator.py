@@ -367,7 +367,14 @@ class DataCollatorWithFlattening:
         
         packed_batch["cu_seqlens"] = cu_seqlens
         packed_batch["max_seqlen"] = seq_lengths.max().item() if len(seq_lengths) > 0 else 0
-        packed_batch["num_valid_tokens"] = flat_input_ids.numel()
+        # A 0-d TENSOR, not a Python int: _move_batch_to_device only moves
+        # tensors, so an int survives to the forward and gets turned into a
+        # CUDA tensor there -- a blocking H2D copy from pageable memory, i.e.
+        # one cudaStreamSynchronize per micro-step. As a tensor it rides the
+        # pinned non_blocking path with the rest of the batch.
+        packed_batch["num_valid_tokens"] = torch.tensor(
+            flat_input_ids.numel(), dtype=torch.long
+        )
 
         if self.return_position_ids:
              # position_ids [0..len-1] for each sequence, concatenated

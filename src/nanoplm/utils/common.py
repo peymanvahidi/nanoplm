@@ -6,9 +6,10 @@ import sys
 import subprocess
 import time
 import threading
+from datetime import datetime
 from IPython import get_ipython
 from pathlib import Path
-from typing import Dict, Any, Union, Callable, TypeVar
+from typing import Dict, Any, Optional, Union, Callable, TypeVar
 
 from nanoplm.utils.logger import logger
 
@@ -134,6 +135,41 @@ def inside_git_repo(work_dir: Path) -> bool:
     except FileNotFoundError:
         return False
 
+def is_global_main() -> bool:
+    """True on the single rank that owns once-per-job side effects.
+
+    Reads ``RANK`` rather than ``LOCAL_RANK``, which restarts at 0 on every node
+    and so is true once per *node*. Usable before ``dist.init_process_group``,
+    where ``dist.get_rank()`` is not yet available.
+    """
+    return int(os.environ.get("RANK", 0)) == 0
+
+
+def job_stamp() -> str:
+    """Return a token identifying this job that every rank derives identically.
+
+    Run directories are named before ``dist.init_process_group``, so ranks
+    cannot settle on one name by broadcasting it. Each must compute the same
+    name from the environment alone, which rules out both a wall-clock reading
+    and probing the filesystem for an unused name.
+    """
+    for key in ("SLURM_JOB_ID", "TORCHELASTIC_RUN_ID"):
+        stamp = os.environ.get(key)
+        if stamp:
+            return stamp
+
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if world_size > 1:
+        raise RuntimeError(
+            f"WORLD_SIZE={world_size} but neither SLURM_JOB_ID nor "
+            "TORCHELASTIC_RUN_ID is set, so there is no job id the ranks can "
+            "agree on. Each would stamp the run directory with its own clock "
+            "reading and scatter one job across several directories. Launch "
+            "under srun or torchrun, or export a shared TORCHELASTIC_RUN_ID."
+        )
+    return datetime.now().strftime("%d%m%H%M")
+
+
 def resolve_world_size(multi_gpu: bool, world_size: Union[int, str]) -> int:
     """Resolve effective world size from config values and environment."""
     if not multi_gpu:
@@ -142,6 +178,131 @@ def resolve_world_size(multi_gpu: bool, world_size: Union[int, str]) -> int:
         env_ws = os.environ.get("WORLD_SIZE")
         return int(env_ws) if env_ws else max(torch.cuda.device_count(), 1)
     return int(world_size) if world_size else 1
+
+
+def _head_sha_from_git_files(work_dir: Path) -> Optional[str]:
+    """Read HEAD's commit out of the ``.git`` metadata, with no git binary.
+
+    Reading refs cannot see uncommitted changes, so a sha from here says
+    nothing about whether the tree was modified.
+    """
+    hexdigits = "0123456789abcdef"
+
+    def sha_or_none(text: Optional[str]) -> Optional[str]:
+        if not text:
+            return None
+        text = text.strip()
+        if len(text) in (40, 64) and all(char in hexdigits for char in text):
+            return text
+        return None
+
+    def line_of(path: Path) -> Optional[str]:
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    try:
+        start = work_dir.resolve()
+    except OSError:
+        return None
+
+    dot_git = next(
+        (p / ".git" for p in [start, *start.parents] if (p / ".git").exists()), None
+    )
+    if dot_git is None:
+        return None
+
+    if dot_git.is_dir():
+        git_dir = dot_git
+    else:
+        pointer = line_of(dot_git)
+        if not pointer or not pointer.startswith("gitdir:"):
+            return None
+        # Path.__truediv__ keeps an absolute right-hand side, so this covers
+        # both the absolute and the relative spelling of a worktree pointer.
+        git_dir = dot_git.parent / pointer[len("gitdir:") :].strip()
+
+    # A worktree keeps its own HEAD but shares refs/heads and packed-refs.
+    common_dir = git_dir
+    commondir = line_of(git_dir / "commondir")
+    if commondir:
+        common_dir = git_dir / commondir
+
+    head = line_of(git_dir / "HEAD")
+    if not head:
+        return None
+
+    detached = sha_or_none(head)
+    if detached:
+        return detached
+    if not head.startswith("ref: "):
+        return None
+    ref = head[len("ref: ") :].strip()
+    if not ref:
+        return None
+
+    for loose in (git_dir / ref, common_dir / ref):
+        sha = sha_or_none(line_of(loose))
+        if sha:
+            return sha
+
+    for packed in (common_dir / "packed-refs", git_dir / "packed-refs"):
+        try:
+            text = packed.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in text.splitlines():
+            if line.startswith("#") or line.startswith("^"):
+                continue
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == ref:
+                sha = sha_or_none(fields[0])
+                if sha:
+                    return sha
+
+    return None
+
+
+def git_sha(work_dir: Path) -> Optional[str]:
+    """
+    Resolve the HEAD commit of the Git checkout containing work_dir.
+
+    Args:
+        work_dir: Directory path to resolve from
+
+    Returns:
+        Optional[str]: one of four shapes. ``"<sha>"`` when git confirmed the
+        tree clean. ``"<sha>-dirty"`` when git reported uncommitted changes.
+        ``"<sha>-dirty-unknown"`` when the sha is trustworthy but its
+        modification state is not, either because the sha was read out of
+        ``.git`` with no git binary available or because ``git status`` failed.
+        None when no sha could be resolved at all.
+    """
+    def _git(*args: str) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=str(work_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    sha = _git("rev-parse", "HEAD")
+    if not sha:
+        sha = _head_sha_from_git_files(work_dir)
+        return f"{sha}-dirty-unknown" if sha else None
+
+    # An uncommitted edit means the sha does not describe the code that ran, and
+    # a provenance record that can silently lie is worse than none.
+    status = _git("status", "--porcelain")
+    if status is None:
+        return f"{sha}-dirty-unknown"
+    return f"{sha}-dirty" if status else sha
 
 
 def is_git_subdir(work_dir: Path) -> bool:

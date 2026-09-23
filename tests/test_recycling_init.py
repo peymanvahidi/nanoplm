@@ -22,6 +22,7 @@ def _cfg(tokenizer, **overrides):
         hidden_size=128, intermediate_size=256, num_hidden_layers=6,
         num_attention_heads=4, vocab_size=tokenizer.vocab_size,
         recycling_num_prelude_layers=2, recycling_num_coda_layers=2,
+        use_huginn_looping=True,
         recycling_loop_count=4,  # r_bar = 3
         recycling_use_takase_init=True,
         wo_init="zero",

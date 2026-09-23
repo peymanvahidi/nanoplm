@@ -204,7 +204,7 @@ def test_no_unexplained_hardcoded_keywords():
 # exclusive per ModernBertConfig.__post_init__ / recycling_compatibility.yaml
 # (e.g. use_moe and recycling_loop_count > 1 reject each other; use_repo
 # requires no GQA; use_diff_attn_v2 is incompatible with use_repo and with
-# Canon-B). Every one of the 68 forwarded fields (all ProtModernBertMLMConfig
+# Canon-B). Every one of the 71 forwarded fields (all ProtModernBertMLMConfig
 # fields except num_register_tokens) is exercised by exactly one group below —
 # none were skipped as "unsafe to vary".
 
@@ -218,7 +218,7 @@ def test_values_survive_the_mapping_structural_and_attention_group():
         num_kv_heads=2,
         vocab_size=99,
         norm_type="rmsnorm",
-        mlp_activation="glu",
+        mlp_activation="geglu",  # was "glu"; main renamed it
         mlp_dropout=0.15,
         mlp_bias=True,
         no_mlp_on_first_layer=False,
@@ -250,7 +250,7 @@ def test_values_survive_the_mapping_structural_and_attention_group():
     assert mapped.num_kv_heads == 2
     assert mapped.vocab_size == 99
     assert mapped.norm_type == "rmsnorm"
-    assert mapped.mlp_activation == "glu"
+    assert mapped.mlp_activation == "geglu"
     assert mapped.mlp_dropout == 0.15
     assert mapped.mlp_bias is True
     assert mapped.no_mlp_on_first_layer is False
@@ -417,6 +417,7 @@ def test_values_survive_the_mapping_recycling_group():
         num_attention_heads=4,
         recycling_num_prelude_layers=1,
         recycling_num_coda_layers=1,
+        use_huginn_looping=True,  # main now requires this switch explicitly
         recycling_loop_count=2,
         recycling_adapter_bias=True,
         recycling_s0_noise_sigma=0.5,
@@ -426,6 +427,7 @@ def test_values_survive_the_mapping_recycling_group():
     assert mapped.recycling_num_prelude_layers == 1
     assert mapped.recycling_num_coda_layers == 1
     assert mapped.recycling_loop_count == 2
+    assert mapped.use_huginn_looping is True
     assert mapped.recycling_adapter_bias is True
     assert mapped.recycling_s0_noise_sigma == 0.5
     assert mapped.recycling_use_takase_init is False
@@ -442,3 +444,20 @@ def test_pure_model_uses_the_shared_mapping():
         )
     )
     assert model.config.moe_num_experts == 5
+
+
+def test_values_survive_the_mapping_loopie_group():
+    # Loopie needs its own config: ModernBertConfig.__post_init__ rejects
+    # use_loopie together with use_huginn_looping or recycling_loop_count > 1,
+    # so these two fields cannot ride along in the recycling group.
+    src = ProtModernBertMLMConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        use_loopie=True,
+        loopie_loop_count=3,
+    )
+    mapped = modernbert_config_from(src)
+    assert mapped.use_loopie is True
+    assert mapped.loopie_loop_count == 3

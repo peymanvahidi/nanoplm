@@ -7,6 +7,7 @@ import click
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 from nanoplm.config.datasets import DATASET_URLS
@@ -17,26 +18,50 @@ from nanoplm.data.preparation.shuffler import FastaShuffler, ShufflingError
 from nanoplm.data.preparation.filterer import Filterer, FilterError
 from nanoplm.data.preparation.splitor import Splitor, SplitError
 from nanoplm.data.infra.manifest import PretrainManifest, DistillationManifest, write_manifest
+from nanoplm.data.infra.validation import ValidationError
 from nanoplm.data.sharding.distill_shard_writer import SaveKDDataset, shard_h5_file
 from nanoplm.distillation.models.teacher import ProtT5
 from nanoplm.data.sharding.pretrain_shard_writer import ShardWriter
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
-from nanoplm.utils import create_dirs
+from nanoplm.utils import create_dirs, logger
 from nanoplm.utils.common import inside_git_repo, is_git_subdir, read_yaml, is_flash_attention_available
+
+
+# dvc is a declared dependency, so the interpreter running nanoplm always has
+# it importable. A bare "dvc" on PATH does not: the documented cluster launch
+# is "$REPO_ROOT/.venv/bin/nanoplm" with the venv unactivated, where PATH has
+# no dvc at all.
+_DVC = [sys.executable, "-m", "dvc"]
+
+
+# Our own pipeline exceptions. Their messages are written for a user, so they
+# stand alone as a one-line error.
+_PIPELINE_ERRORS = (
+    DownloadError, ExtractionError, ShufflingError, FilterError, SplitError, ValidationError,
+)
+
+# Third-party and builtin types the stages raise for real input problems: h5py
+# and the native backends surface corrupt files as OSError and RuntimeError.
+# These same types are also what a bug in our own code raises, and we cannot
+# tell the two apart from the type alone, so their message carries a pointer to
+# the traceback rather than pretending the cause is understood.
+_OPAQUE_ERRORS = (OSError, EOFError, RuntimeError, ValueError)
+
+_DEBUG_HINT = "Re-run with NANOPLM_DEBUG=1 for the full traceback."
 
 
 class _GroupedDataCommand(click.Group):
     _GROUPS = [
         ("Main commands (most users only need these — they orchestrate the rest "
-         "of the pipeline through DVC under the hood):",
+         "of the pipeline through DVC under the hood)",
          ["get-yaml", "from-yaml"]),
         ("Pipeline stages (invoked by 'from-yaml' via DVC; can also be run "
-         "directly for debugging):",
+         "directly for debugging)",
          ["get-file", "extract", "check", "shuffle", "filter", "split"]),
-        ("Pretraining-specific:",
+        ("Pretraining-specific",
          ["pre-tokenize"]),
-        ("Knowledge-distillation-specific:",
+        ("Knowledge-distillation-specific",
          ["kd-embed", "kd-reshard"]),
     ]
 
@@ -60,6 +85,27 @@ class _GroupedDataCommand(click.Group):
         if leftover:
             with formatter.section("Other"):
                 formatter.write_dl([(n, c.get_short_help_str() or "") for n, c in leftover])
+
+    def invoke(self, ctx):
+        # Centralizes failure presentation for every 'data' subcommand: an
+        # expected domain error becomes one clean line instead of each
+        # subcommand carrying its own try/except (or none at all).
+        try:
+            return super().invoke(ctx)
+        except (click.exceptions.Exit, click.Abort):
+            # Both subclass RuntimeError (Click's own quirk), but are clean
+            # exits (--help, ctx.exit(), Ctrl-C prompts), not domain errors.
+            raise
+        except _PIPELINE_ERRORS as e:
+            if os.environ.get("NANOPLM_DEBUG"):
+                raise
+            raise click.ClickException(str(e)) from e
+        except _OPAQUE_ERRORS as e:
+            if os.environ.get("NANOPLM_DEBUG"):
+                raise
+            raise click.ClickException(
+                f"{type(e).__name__}: {e}\n{_DEBUG_HINT}"
+            ) from e
 
 
 @click.group(name="data", cls=_GroupedDataCommand)
@@ -145,10 +191,7 @@ def get_file(dataset, url, local_fasta, output, force):
         click.echo(f"Linked local file: {local_fasta} -> {output_path}")
         return
     chosen_url = DATASET_URLS[dataset] if dataset else url
-    try:
-        Downloader(url=chosen_url, output_path=output_path).download()
-    except DownloadError as e:
-        raise click.ClickException(f"Download failed: {e}")
+    Downloader(url=chosen_url, output_path=output_path).download()
     click.echo(f"Downloaded to: {output_path}")
 
 
@@ -196,24 +239,9 @@ def extract(input: str, output: str, force: bool):
             return
 
     # Extract dataset
-    try:
-        extractor = Extractor(input_path=input_path, output_path=output_path)
-        extractor.extract()
-        click.echo(f"Extraction completed successfully. Output: {output_path}")
-
-    except (ExtractionError, EOFError, OSError) as e:
-        if isinstance(e, EOFError):
-            raise click.ClickException(
-                "Extraction failed: Corrupted or incomplete gzip file"
-            )
-        elif isinstance(e, OSError):
-            raise click.ClickException(f"Extraction failed: {e}")
-        else:
-            raise click.ClickException(f"Extraction failed: {e}")
-    except Exception as e:
-        raise click.ClickException(
-            f"An unexpected error occurred during extraction: {e}"
-        )
+    extractor = Extractor(input_path=input_path, output_path=output_path)
+    extractor.extract()
+    click.echo(f"Extraction completed successfully. Output: {output_path}")
 
 
 @data.command("shuffle")
@@ -265,20 +293,13 @@ def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str)
 
     do_shuffle = shuffle_flag.lower() == "true"
 
-    try:
-        shuffler = FastaShuffler(
-            input_path=input_path,
-            output_path=output_path,
-            seed=seed,
-            do_shuffle=do_shuffle,
-        )
-        shuffler.shuffle()
-    except ShufflingError as e:
-        raise click.ClickException(f"FASTA shuffling failed: {e}")
-    except Exception as e:
-        raise click.ClickException(
-            f"An unexpected error occurred during shuffling: {e}"
-        )
+    shuffler = FastaShuffler(
+        input_path=input_path,
+        output_path=output_path,
+        seed=seed,
+        do_shuffle=do_shuffle,
+    )
+    shuffler.shuffle()
 
 
 @data.command("filter")
@@ -345,23 +366,16 @@ def filter(
     if output_path.is_dir():
         output_path = output_path / input_path.name.replace(".fasta", "_filtered.fasta")
 
-    try:
-        filterer = Filterer(
-            input_path=input_path,
-            output_path=output_path,
-            min_seq_len=min_seq_len,
-            max_seq_len=max_seq_len,
-            seqs_num=seqs_num,
-            exclude_ids=Path(exclude_ids) if exclude_ids else None,
-        )
-        filterer.filter()
-        click.echo("Filtering completed successfully")
-    except FilterError as e:
-        raise click.ClickException(f"Filtering failed: {e}")
-    except Exception as e:
-        raise click.ClickException(
-            f"An unexpected error occurred during filtering: {e}"
-        )
+    filterer = Filterer(
+        input_path=input_path,
+        output_path=output_path,
+        min_seq_len=min_seq_len,
+        max_seq_len=max_seq_len,
+        seqs_num=seqs_num,
+        exclude_ids=Path(exclude_ids) if exclude_ids else None,
+    )
+    filterer.filter()
+    click.echo("Filtering completed successfully")
 
 
 @data.command("check")
@@ -416,7 +430,7 @@ def check(input: str, output: str, drop_invalid: str):
     "-o",
     required=True,
     type=click.Path(exists=False),
-    help="Output file path / directory for the train split",
+    help="Output directory for the train/val split (train.fasta and val.fasta are written here)",
 )
 @click.option(
     "--val-ratio",
@@ -437,29 +451,21 @@ def split(
     create_dirs(output_path)
 
     if not output_path.is_dir():
-        click.echo("Output must be a directory")
-    else:
-        train_file_path = output_path / "train.fasta"
-        val_file_path = output_path / "val.fasta"
+        raise click.ClickException(f"--output must be a directory, got: {output_path}")
 
-    try:
-        splitor = Splitor(
-            input_file=input_path,
-            train_file=train_file_path,
-            val_file=val_file_path,
-            val_ratio=val_ratio,
-        )
-        train_size, val_size = splitor.split()
-        click.echo(
-            f"Splitting completed successfully.\nTrain file: {train_file_path}\nVal file: {val_file_path}\nTrain size: {train_size}, Val size: {val_size}"
-        )
+    train_file_path = output_path / "train.fasta"
+    val_file_path = output_path / "val.fasta"
 
-    except SplitError as e:
-        raise click.ClickException(f"Splitting failed: {e}")
-    except Exception as e:
-        raise click.ClickException(
-            f"An unexpected error occurred during splitting: {e}"
-        )
+    splitor = Splitor(
+        input_file=input_path,
+        train_file=train_file_path,
+        val_file=val_file_path,
+        val_ratio=val_ratio,
+    )
+    train_size, val_size = splitor.split()
+    click.echo(
+        f"Splitting completed successfully.\nTrain file: {train_file_path}\nVal file: {val_file_path}\nTrain size: {train_size}, Val size: {val_size}"
+    )
 
 
 @data.command("kd-embed")
@@ -849,7 +855,7 @@ def from_yaml(
     regenerates dvc.yaml to match the current settings, then runs dvc repro.
     """
     import yaml as _yaml
-    from nanoplm.utils import set_log_level, logger
+    from nanoplm.utils import set_log_level
     from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
 
     set_log_level(log_level)
@@ -863,11 +869,11 @@ def from_yaml(
         raise click.ClickException(f"Failed to read {config_path}: {e}") from e
 
     data_params = params.get("data_params", {})
+    kind = _detect_kind(data_params, config_path.name)
 
     _reject_legacy_pipeline_mode(data_params)
     _validate_source_fields(params.get("data_dirs", {}))
-
-    kind = _detect_kind(data_params, config_path.name)
+    _validate_pipeline_fields(params.get("data_dirs", {}), data_params, kind, config_path)
 
     if fix:
         _flip_drop_invalid(config_path, True)
@@ -884,17 +890,20 @@ def from_yaml(
         params_filename=config_path.name,
     )
     dvc_yaml_path.write_text(dvc_content, encoding="utf-8")
-    logger.info(f"Regenerated {dvc_yaml_path}")
-    click.echo(f"Regenerated dvc.yaml in {cwd}")
+    # click.echo, not logger.info: this must still print at --log-level error.
+    click.echo(f"Regenerated {dvc_yaml_path}")
 
     dvc_dir = cwd / ".dvc"
-    if not dvc_dir.exists():
+    # --dry-run is a read-only preview and must not mutate the directory by
+    # running 'dvc init' on its own; if that turns out to be required, the
+    # 'dvc repro' call below fails with an explanation instead.
+    if not dvc_dir.exists() and not dry_run:
         if no_auto_init:
             raise click.ClickException(
                 f"DVC is not initialized in {cwd}. Run 'dvc init' first or omit --no-auto-init."
             )
         try:
-            init_cmd = ["dvc", "init", "-q"]
+            init_cmd = _DVC + ["init", "-q"]
             if not inside_git_repo(cwd):
                 init_cmd.append("--no-scm")
             elif is_git_subdir(cwd):
@@ -903,7 +912,7 @@ def from_yaml(
             click.echo(f"Initialized DVC repository in: {cwd}")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             raise click.ClickException(
-                f"Failed to initialize DVC in {cwd}. Ensure DVC is installed. Details: {e}"
+                f"Failed to initialize DVC in {cwd}. Details: {e}"
             )
 
     # Build environment for repro
@@ -915,11 +924,20 @@ def from_yaml(
     if device is not None:
         repro_env["NANOPLM_DEVICE"] = str(device)
 
+    # dvc repro --dry needs an initialized repo, and --dry-run will not create
+    # one, so say that here rather than letting dvc say it less helpfully first.
+    if dry_run and not dvc_dir.exists():
+        raise click.ClickException(
+            f"--dry-run needs an initialized DVC repo and will not create one. "
+            f"{cwd} has no .dvc/. Run 'nanoplm data from-yaml' once without "
+            f"--dry-run, or 'dvc init', then retry."
+        )
+
     # Build repro command
     if dry_run:
-        cmd: list[str] = ["dvc", "repro", "--dry", "--allow-missing"]
+        cmd: list[str] = _DVC + ["repro", "--dry", "--allow-missing"]
     else:
-        cmd = ["dvc", "repro"]
+        cmd = _DVC + ["repro"]
     if verbose:
         cmd.append("-v")
     if force_repro:
@@ -939,7 +957,7 @@ def from_yaml(
         )
 
     if not dry_run:
-        _print_summary(cwd, params, kind)
+        _print_summary(cwd, params, kind, config_path)
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +1009,6 @@ def _validate_source_fields(data_dirs: dict) -> None:
       In plain-.fasta mode it is optional; warn if it's set anyway.
     """
     from nanoplm.cli._dvc_yaml_gen import _source_is_compressed
-    from nanoplm.utils.logger import logger
 
     url = data_dirs.get("url") or None
     local_fasta = data_dirs.get("local_fasta") or None
@@ -1030,6 +1047,89 @@ def _validate_source_fields(data_dirs: dict) -> None:
         )
 
 
+# data_dirs path keys that generate_dvc_yaml (_dvc_yaml_gen.py) substitutes as
+# ${data_dirs.X} into every pipeline stage, for both kinds. url/local_fasta,
+# extracted_fasta and compressed_fasta are covered by _validate_source_fields.
+_DATA_DIRS_REQUIRED = [
+    "validation_dir", "shuffled_fasta", "filtered_fasta", "splitted_fasta_dir", "output_dir",
+]
+
+
+def _int_at_least(lo: int):
+    return lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= lo
+
+
+def _int_in_range(lo: int, hi: int):
+    return lambda v: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+
+
+def _shard_count(v) -> bool:
+    """-1 (no sharding) or a positive shard size, matching kd-embed's own check."""
+    return isinstance(v, int) and not isinstance(v, bool) and (v == -1 or v > 0)
+
+
+def _unit_float(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 1
+
+
+def _optional_int(v) -> bool:
+    return v is None or (isinstance(v, int) and not isinstance(v, bool))
+
+
+def _is_bool(v) -> bool:
+    return isinstance(v, bool)
+
+
+def _nonempty_str(v) -> bool:
+    return isinstance(v, str) and bool(v)
+
+
+_PRETRAIN = frozenset({"pretrain"})
+_DISTILLATION = frozenset({"distillation"})
+_BOTH = _PRETRAIN | _DISTILLATION
+
+# data_params keys generate_dvc_yaml substitutes as ${data_params.X}, one row
+# per (field, kinds-that-need-it, validator). A field needed by both kinds with
+# a kind-specific rule (samples_per_shard) gets one row per kind.
+_DATA_PARAMS_TABLE = [
+    ("drop_invalid_sequences", _BOTH, _is_bool),
+    ("shuffle", _BOTH, _is_bool),
+    ("shuffle_seed", _BOTH, _optional_int),
+    ("min_seq_len", _BOTH, _int_at_least(0)),
+    ("max_seq_len", _BOTH, _int_at_least(0)),
+    ("seqs_num", _BOTH, _int_at_least(-1)),
+    ("val_ratio", _BOTH, _unit_float),
+    ("samples_per_shard", _PRETRAIN, _int_at_least(1)),
+    ("samples_per_shard", _DISTILLATION, _shard_count),
+    ("register_tokens", _PRETRAIN, _int_in_range(0, 2)),
+    ("teacher_model", _DISTILLATION, _nonempty_str),
+    ("embed_calc_batch_size", _DISTILLATION, _int_at_least(1)),
+]
+
+
+def _validate_pipeline_fields(data_dirs: dict, data_params: dict, kind: str, config_path: Path) -> None:
+    """Check every data_dirs/data_params key generate_dvc_yaml substitutes for *kind*.
+
+    A missing or mistyped key here reaches DVC only as an unresolved
+    ${...} template, so a typo would otherwise surface mid-`dvc repro`
+    instead of before it runs.
+    """
+    for key in _DATA_DIRS_REQUIRED:
+        if not data_dirs.get(key):
+            raise click.ClickException(f"{config_path.name}: data_dirs.{key} is required.")
+
+    for field, kinds, is_valid in _DATA_PARAMS_TABLE:
+        if kind not in kinds:
+            continue
+        if field not in data_params:
+            raise click.ClickException(f"{config_path.name}: data_params.{field} is required.")
+        value = data_params[field]
+        if not is_valid(value):
+            raise click.ClickException(
+                f"{config_path.name}: data_params.{field} has an invalid value: {value!r}"
+            )
+
+
 def _detect_kind(data_params: dict, filename: str) -> str:
     """Detect pipeline kind from the config filename or data_params keys."""
     if "distillation" in filename:
@@ -1053,18 +1153,27 @@ def _flip_drop_invalid(config_path: Path, value: bool) -> None:
     config_path.write_text(new_text)
 
 
-def _print_summary(cwd: Path, params: dict, kind: str) -> None:
+def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path) -> None:
     """Print a human-readable summary using .data_manifest if present."""
     import yaml as _yaml
-    output_dir = Path(params["data_dirs"]["output_dir"])
+    data_dirs = params.get("data_dirs") or {}
+    output_dir_value = data_dirs.get("output_dir")
+    if not output_dir_value:
+        raise click.ClickException(
+            f"{config_path.name}: data_dirs.output_dir is missing; cannot locate the pipeline output."
+        )
+    output_dir = Path(output_dir_value)
     manifest_path = (cwd / output_dir / ".data_manifest") if not output_dir.is_absolute() \
         else (output_dir / ".data_manifest")
     if not manifest_path.exists():
         click.echo("Pipeline completed (no manifest found).")
         return
-    m = _yaml.safe_load(manifest_path.read_text())
+    try:
+        m = _yaml.safe_load(manifest_path.read_text()) or {}
+    except _yaml.YAMLError as e:
+        raise click.ClickException(f"{manifest_path}: failed to parse manifest: {e}")
     title = "Pretraining" if kind == "pretrain" else "Distillation"
-    src = params["data_dirs"].get("url") or params["data_dirs"].get("local_fasta")
+    src = data_dirs.get("url") or data_dirs.get("local_fasta")
     click.echo(
         f"\n{title} data pipeline complete.\n\n"
         f"  Source:          {src}\n"

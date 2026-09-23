@@ -81,23 +81,26 @@ class PretrainingConfig:
     adam_weight_decay: float = 0.0
     # Gradient clipping threshold (L2 norm). Set float("inf") to disable clipping.
     max_grad_norm: float = float("inf")
-    # Muon-family hyperparameters (used when optimizer is muon/normuon/muonh/aurora).
+    # Matrix-optimizer hyperparameters (used when optimizer is muon/normuon/nordion2).
     # adam_* fields are used for the AdamW sub-optimizer.
     muon_learning_rate: float = 1e-3
     muon_weight_decay: float = 0.01
-    muon_cautious_weight_decay: bool = True
+    muon_cautious_weight_decay: bool = True  # Muon/NorMuon only (NorDion2 has no cautious_wd)
     muon_use_polar_express: bool = True
     muon_momentum: float = 0.95
-    muon_nesterov: bool = True
+    muon_nesterov: bool = True  # Muon/NorMuon only (NorDion2 has no nesterov)
     muon_eps: float = 1e-7
-    # MuonH-specific. Only used when optimizer == "muonh".
-    # 'neuron' normalizes along the last axis; 'short_axis' along the shorter
-    # matrix axis. Set to "none" to disable update normalization in MuonH.
-    muonh_normalization: str = "neuron"
-    # Hyperball optimizer scope for experiments: "all" applies MuonH/Aurora to
-    # all eligible matrix params; "mlp" applies MuonH/Aurora only to MLP
-    # matrices and keeps other matrices on NorMuon.
-    muonh_scope: str = "all"
+    # Shared matrix-optimizer knobs (passed to each Dion optimizer only where its
+    # signature accepts it). muon_adjust_lr default 'rms_norm' preserves the prior
+    # hardcoded muon/normuon behavior; dion's native default is 'spectral_norm'.
+    muon_adjust_lr: str = "rms_norm"  # rms_norm | spectral_norm | none
+    muon_beta2: float = 0.95  # NorMuon/NorDion2 second-moment beta (ignored by plain Muon)
+    muon_use_gram_newton_schulz: bool = False
+    muon_triton_post_ortho: bool = False  # NorDion2 only in the current dion build
+    muon_flatten: bool = False
+    # NorDion2-specific. Only used when optimizer == "nordion2".
+    nordion2_fraction: float = 0.25  # low-rank fraction of the Dion2 update
+    nordion2_selection_scope: str = "local"  # local | global (FSDP2 row-shard selection)
     # Target effective batch size in tokens per optimizer step.
     # gradient_accumulation_steps is inferred from this value at runtime.
     global_batch_tokens: int = 256000
@@ -148,10 +151,29 @@ class PretrainingConfig:
     mlm_standard_amino_acids_only: bool = True
 
     # Logging/checkpointing
-    logging_steps: int = 1
+    # At 1, the step line is 94% of a run log and every step pays a
+    # cuda.synchronize(), a D2H copy and an all_reduce. 25 divides the
+    # default eval_steps (250), which the VRAM/peak-reset line depends on.
+    logging_steps: int = 25
     eval_steps: int = 250
     save_steps: int = 5000
+    # Wall-clock budget for training, in hours. When set, the run checkpoints
+    # and exits at the first optimizer step past the deadline, before the
+    # token-budget horizon is reached. Intended for wall-clock-matched
+    # ablations. The clock starts a couple of optimizer steps in, so compile,
+    # autotune and warmup are excluded and the budget measures steady-state
+    # training: expect total job time to exceed it. It also restarts from zero
+    # on resume, measuring this run rather than cumulative time across resumes.
+    # Left unset, the deadline instead defaults to SLURM's projected job end
+    # minus a margin for the final checkpoint write, so a job that runs out of
+    # time stops and checkpoints itself rather than being killed mid-step. This
+    # value overrides that, which is why an ablation should set it explicitly.
+    max_wallclock_hours: Optional[float] = None
     seed: int = 42
+    # Device peak BF16 tensor-core TFLOP/s used as the MFU denominator.
+    # None = the H100 SXM figure (989.4).  Set it per cluster: the GH200
+    # booster caps at 630, against which 989.4 understates MFU by 1.57x.
+    peak_tflops: Optional[float] = None
     debug_non_finite_params: bool = True
     debug_layerwise_metrics: bool = False
     debug_layerwise_log_every: int = 20
@@ -182,7 +204,7 @@ class PretrainingConfig:
     # legacy reduction codegen while keeping torch.compile enabled.
     compile_triton_mix_order_reduction: bool = False
 
-    # Profiling (pure_torch / pure_te pipelines). When enabled on rank 0:
+    # Profiling (pure_torch pipeline). When enabled on rank 0:
     # - If running under nsys: uses CUDA Profiler API (start/stop at steps) for .nsys-rep traces.
     # - Otherwise: uses PyTorch profiler and exports a Chrome trace (chrome://tracing) to ckp_dir.
     profiler_enabled: bool = False
@@ -208,6 +230,10 @@ class PretrainingConfig:
     # finer-grained comm/compute overlap — better for slow interconnects like PCIe).
     fsdp_shard_granularity: str = "layer"
     fsdp_reshard_after_forward: bool = False
+    # FSDP2 MixedPrecisionPolicy.reduce_dtype for the gradient reduce-scatter:
+    # "fp32" (exact) or "bf16" (half the bytes of the largest collective on the
+    # wire; the sum across ranks then rounds to bf16).
+    fsdp_reduce_dtype: str = "fp32"
     ddp_bucket_cap_mb: int = 25
     project_name: str = "nanoplm-pretraining"
     run_name: str = "run"
@@ -227,6 +253,12 @@ class PretrainingConfig:
     recycling_loop_count_curriculum: str = "1_sqrt"           # "none" | "linear" | "1_sqrt"
     recycling_loop_count_curriculum_steps: int = -1           # -1 = auto (25% of total training steps)
     recycling_pretraining_eval_loop_counts: Optional[list[int]] = None  # None = single r at target mean
+
+    # Loopie stochastic depth. Inactive when model.use_loopie is false.
+    # 0 = fixed depth; j >= 1 draws R uniformly from
+    # {loopie_loop_count - j, ..., loopie_loop_count + j} once per micro-batch,
+    # shared by every stored layer and locked-step across DP ranks.
+    loopie_loop_count_jitter: int = 0
     def __post_init__(self) -> None:
         for name in (
             "mlm_probability",
@@ -359,11 +391,18 @@ class PretrainingConfig:
 
         self.fp8_target = _normalize_fp8_targets(self.fp8_target)
 
-        self.muonh_scope = str(self.muonh_scope).strip().lower()
-        if self.muonh_scope not in {"all", "mlp"}:
+        self.muon_adjust_lr = str(self.muon_adjust_lr).strip().lower()
+        if self.muon_adjust_lr not in {"rms_norm", "spectral_norm", "none"}:
             raise ValueError(
-                "muonh_scope must be one of: all, mlp "
-                f"(got {self.muonh_scope!r})"
+                "muon_adjust_lr must be one of: rms_norm, spectral_norm, none "
+                f"(got {self.muon_adjust_lr!r})"
+            )
+
+        self.nordion2_selection_scope = str(self.nordion2_selection_scope).strip().lower()
+        if self.nordion2_selection_scope not in {"local", "global"}:
+            raise ValueError(
+                "nordion2_selection_scope must be one of: local, global "
+                f"(got {self.nordion2_selection_scope!r})"
             )
 
 

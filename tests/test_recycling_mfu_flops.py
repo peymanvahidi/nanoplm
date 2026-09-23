@@ -38,6 +38,7 @@ def _cfg(**overrides):
         vocab_size=32,
         recycling_num_prelude_layers=2,
         recycling_num_coda_layers=2,
+        use_huginn_looping=True,
         recycling_loop_count=4,
         recycling_use_takase_init=False,
         wo_init="kaiming",
@@ -80,7 +81,8 @@ def test_target_loop_overstates_flops_when_curriculum_runs_r1():
 
 def test_no_recycling_collapses_to_dense_cost():
     """loop_count == 1 (recycling off) must equal the dense n_layers cost."""
-    cfg = _cfg(recycling_loop_count=1,
+    cfg = _cfg(use_huginn_looping=False,
+               recycling_loop_count=1,
                recycling_num_prelude_layers=0,
                recycling_num_coda_layers=0)
     comp = _recycling_flops_components(cfg, SEQ)

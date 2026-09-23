@@ -53,10 +53,10 @@
           "x-nanoplm-group": "Norms & MLP",
           "enum": [
             "swiglu",
-            "glu",
+            "geglu",
             "srelu"
           ],
-          "description": "swiglu | glu | srelu"
+          "description": "swiglu | geglu | srelu  (geglu = stock ModernBERT)"
         },
         "mlp_dropout": {
           "type": "number",
@@ -92,7 +92,7 @@
             "gelu",
             "srelu"
           ],
-          "description": "relu | gelu | srelu  (srelu: pure_torch / pure_te)"
+          "description": "relu | gelu | srelu"
         },
         "tie_word_embeddings": {
           "type": "boolean",
@@ -168,7 +168,7 @@
             "kaiming",
             "zero"
           ],
-          "description": "residual out-proj init: kaiming | zero (muonh forbids zero)"
+          "description": "residual out-proj init: kaiming | zero"
         },
         "use_canon_layers": {
           "type": "boolean",
@@ -258,8 +258,7 @@
           "default": false,
           "x-nanoplm-group": "mHC-lite (pure_torch only)",
           "x-nanoplm-backend": [
-            "pure_torch",
-            "pure_te"
+            "pure_torch"
           ],
           "x-nanoplm-advanced": true
         },
@@ -530,10 +529,20 @@
           "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
           "description": "cutlass | sonicmoe  (SonicMoE/quack fused path)"
         },
+        "use_huginn_looping": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "description": "master switch; needs recycling_loop_count >= 2",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true
+        },
         "recycling_num_prelude_layers": {
           "type": "integer",
           "default": 0,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "P",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -544,7 +553,7 @@
         "recycling_num_coda_layers": {
           "type": "integer",
           "default": 0,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "C",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -555,7 +564,7 @@
         "recycling_loop_count": {
           "type": "integer",
           "default": 1,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "target mean loop count (1 = off)",
           "x-nanoplm-backend": [
             "pure_torch"
@@ -565,7 +574,7 @@
         "recycling_adapter_bias": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "bias on 2h\u2192h adapter (Huginn: no bias)",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -576,7 +585,7 @@
         "recycling_s0_noise_sigma": {
           "type": "number",
           "default": 0.6324555320336759,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "sqrt(2/5) \u2014 Huginn s\u2080 noise scale",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -587,21 +596,47 @@
         "recycling_use_takase_init": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Recycling / Huginn architecture (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
           "description": "Takase spike init on recurrent block + adapter",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
             "op": ">",
             "value": 1
           }
+        },
+        "use_loopie": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "description": "master switch",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true
+        },
+        "loopie_loop_count": {
+          "type": "integer",
+          "default": 2,
+          "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "description": "times each layer is applied (>= 2 when enabled)",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-visible-when": {
+            "field": "use_loopie",
+            "op": "==",
+            "value": true
+          }
         }
       },
       "x-nanoplm-group-notes": {
-        "QK-norm & residual scales": "Available on pure_torch and pure_te unless a feature banner says otherwise.",
+        "QK-norm & residual scales": "Available on pure_torch unless a feature banner says otherwise.",
         "mHC-lite (pure_torch only)": "Multi-stream residual with doubly stochastic mixing.\nIncompatible with use_resid_lambdas.",
         "NOBLE (pure_torch only)": "Nonlinear low-rank branches on linear layers.\nTraining LR scaling lives under pretraining.noble_* (active when use_noble).",
         "MoE \u2014 Mixture-of-Experts (pure_torch only)": "Requires: pretraining.use_packing: true  and  use_static_inp_size: true\nAlways-on: one shared expert; routing is always sigmoid.",
-        "Recycling / Huginn architecture (pure_torch only)": "recycling_loop_count: 1  \u2192  recycling OFF (default).\nSplits the L-layer stack into:\n  prelude  P  \u2014 first P layers, run once\n  recurrent   \u2014 layers P .. L-C-1, weight-tied and looped\n  coda     C  \u2014 last C layers, run once\nA learned 2h\u2192h adapter consumes [s, e] at each recycling iteration.\nTraining-time knobs live under pretraining.recycling_* (when recycling_loop_count > 1)."
+        "Recycling / Huginn looping (pure_torch only)": "Runs a block of middle layers in a loop, reusing the same weights.\nTraining knobs: pretraining.recycling_*",
+        "Loopie layer looping (pure_torch only)": "Runs each layer N times in a row, reusing the same weights.\nCannot be used together with Huginn recycling above."
       }
     },
     "pretraining": {
@@ -626,7 +661,7 @@
           "type": "string",
           "default": "run",
           "x-nanoplm-group": "Paths & run identity",
-          "description": "on-disk name: DDMMHHMM-<run_name>"
+          "description": "The run writes to <ckp_dir>/<run_name>-<stamp>. <stamp> is SLURM_JOB_ID, or TORCHELASTIC_RUN_ID when that is unset, or DDMMHHMM from the clock when neither is set."
         },
         "micro_batch_seqs": {
           "type": "integer",
@@ -725,10 +760,9 @@
             "stable_adamw",
             "muon",
             "normuon",
-            "muonh",
-            "aurora"
+            "nordion2"
           ],
-          "description": "adamw | stable_adamw | muon | normuon | muonh | aurora"
+          "description": "adamw | stable_adamw | muon | normuon | nordion2"
         },
         "adam_beta1": {
           "type": "number",
@@ -763,58 +797,88 @@
         "muon_learning_rate": {
           "type": "number",
           "default": 0.001,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
         "muon_weight_decay": {
           "type": "number",
           "default": 0.01,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
         "muon_cautious_weight_decay": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "Muon/NorMuon only (NorDion2 ignores)"
         },
         "muon_use_polar_express": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
         "muon_momentum": {
           "type": "number",
           "default": 0.95,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
         "muon_nesterov": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "Muon/NorMuon only (NorDion2 ignores)"
         },
         "muon_eps": {
           "type": "number",
           "default": 1e-07,
-          "x-nanoplm-group": "Optimizer \u2014 Muon family"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
         },
-        "muonh_normalization": {
+        "muon_adjust_lr": {
           "type": "string",
-          "default": "neuron",
-          "x-nanoplm-group": "Optimizer \u2014 Muon family",
+          "default": "rms_norm",
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
           "enum": [
-            "neuron",
-            "short_axis",
+            "rms_norm",
+            "spectral_norm",
             "none"
           ],
-          "description": "muonh only: neuron | short_axis | none"
+          "description": "Shared matrix-optimizer knobs (applied per-optimizer where supported): rms_norm | spectral_norm | none"
         },
-        "muonh_scope": {
+        "muon_beta2": {
+          "type": "number",
+          "default": 0.95,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "NorMuon/NorDion2 second-moment beta"
+        },
+        "muon_use_gram_newton_schulz": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
+        },
+        "muon_triton_post_ortho": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "NorDion2 only in the current dion build"
+        },
+        "muon_flatten": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
+        },
+        "nordion2_fraction": {
+          "type": "number",
+          "default": 0.25,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "NorDion2-specific (used only when optimizer: nordion2): low-rank fraction of the Dion2 update"
+        },
+        "nordion2_selection_scope": {
           "type": "string",
-          "default": "all",
-          "x-nanoplm-group": "Optimizer \u2014 Muon family",
+          "default": "local",
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
           "enum": [
-            "all",
-            "mlp"
+            "local",
+            "global"
           ],
-          "description": "muonh|aurora: all = all matrices; mlp = MLP only (rest on NorMuon)"
+          "description": "local | global"
         },
         "repo_rope_warmup_steps": {
           "type": "integer",
@@ -992,11 +1056,22 @@
           "x-nanoplm-backend": [
             "pure_torch"
           ],
+          "x-nanoplm-advanced": true
+        },
+        "loopie_loop_count_jitter": {
+          "type": "integer",
+          "default": 0,
+          "x-nanoplm-group": "Loopie stochastic depth (only when model.use_loopie: true)",
+          "minimum": 0,
+          "description": "0 = fixed depth; 1 at count 2 gives R in {1,2,3}",
+          "x-nanoplm-backend": [
+            "pure_torch"
+          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
-            "field": "recycling_loop_count",
-            "op": ">",
-            "value": 1
+            "field": "use_loopie",
+            "op": "==",
+            "value": true
           }
         },
         "mlm_probability": {
@@ -1049,8 +1124,9 @@
         },
         "logging_steps": {
           "type": "integer",
-          "default": 1,
-          "x-nanoplm-group": "Logging, eval, checkpoints"
+          "default": 25,
+          "x-nanoplm-group": "Logging, eval, checkpoints",
+          "description": "step line reports means over this many steps; should divide eval_steps"
         },
         "eval_steps": {
           "type": "integer",
@@ -1067,6 +1143,20 @@
           "default": 42,
           "x-nanoplm-group": "Logging, eval, checkpoints"
         },
+        "max_wallclock_hours": {
+          "type": "number",
+          "default": null,
+          "description": "Wall-clock budget for training, in hours. The run writes a checkpoint and stops at the first optimizer step past the deadline, even if the token budget is not spent, which is how wall-clock-matched ablations are run. The clock starts a couple of optimizer steps in so that torch.compile, autotuning and warmup are excluded, meaning total job time is longer than the budget; it also restarts on resume rather than accumulating across resumes. Unset (the default) runs the full token budget.",
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-group": "Logging, eval, checkpoints"
+        },
+        "peak_tflops": {
+          "type": "number",
+          "default": null,
+          "description": "Device peak BF16 tensor-core throughput in TFLOP/s, used as the denominator of the reported MFU. Unset (the default) uses the H100 SXM figure of 989.4, which is wrong for any other accelerator: on a GH200 booster capped at 630 it understates MFU by 1.57x. Set it per cluster so the logged MFU means what it says. Affects reporting only, never the computation.",
+          "x-nanoplm-advanced": true,
+          "x-nanoplm-group": "Logging, eval, checkpoints"
+        },
         "debug_non_finite_params": {
           "type": "boolean",
           "default": false,
@@ -1077,7 +1167,7 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Debug",
-          "description": "per-layer grad/weight norms, residual RMS, logits; overhead; breaks compile; not pure_te",
+          "description": "per-layer grad/weight norms, residual RMS, logits; overhead; breaks compile",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
@@ -1158,13 +1248,13 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Precision",
-          "description": "FP8 \u2014 pure_torch targets vs TE recipe knobs (see field comments)"
+          "description": "FP8 \u2014 target selection and recipe knobs (see field comments)"
         },
         "fp8_target": {
           "type": "string",
           "default": "mlp",
           "x-nanoplm-group": "Precision",
-          "description": "pure_torch: mlp | attn_wqkv | attn_wo; combine as \"attn_wqkv,mlp\" or YAML list",
+          "description": "mlp | attn_wqkv | attn_wo; combine as \"attn_wqkv,mlp\" or YAML list",
           "x-nanoplm-backend": [
             "pure_torch"
           ]
@@ -1173,7 +1263,7 @@
           "type": "integer",
           "default": 0,
           "x-nanoplm-group": "Precision",
-          "description": "pure_torch FP8: keep final N layers in bf16",
+          "description": "FP8: keep final N layers in bf16",
           "x-nanoplm-backend": [
             "pure_torch"
           ]
@@ -1189,9 +1279,9 @@
             "mxfp8",
             "nvfp4"
           ],
-          "description": "TE only: delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)",
+          "description": "delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)",
           "x-nanoplm-backend": [
-            "pure_te"
+            "pure_torch"
           ]
         },
         "fp8_format": {
@@ -1202,18 +1292,18 @@
             "hybrid",
             "e4m3"
           ],
-          "description": "TE only: hybrid | e4m3; ignored by nvfp4",
+          "description": "hybrid | e4m3; ignored by nvfp4",
           "x-nanoplm-backend": [
-            "pure_te"
+            "pure_torch"
           ]
         },
         "fp8_amax_history_len": {
           "type": "integer",
           "default": 64,
           "x-nanoplm-group": "Precision",
-          "description": "TE DelayedScaling only: amax history window",
+          "description": "DelayedScaling only: amax history window",
           "x-nanoplm-backend": [
-            "pure_te"
+            "pure_torch"
           ],
           "x-nanoplm-advanced": true
         },
@@ -1221,9 +1311,9 @@
           "type": "boolean",
           "default": true,
           "x-nanoplm-group": "Precision",
-          "description": "TE DelayedScaling: sync amax across FP8 group",
+          "description": "DelayedScaling: sync amax across FP8 group",
           "x-nanoplm-backend": [
-            "pure_te"
+            "pure_torch"
           ],
           "x-nanoplm-advanced": true
         },
@@ -1231,7 +1321,7 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Precision",
-          "description": "pure_torch FP8: TE CPU activation offload hooks",
+          "description": "FP8: TE CPU activation offload hooks",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
@@ -1271,7 +1361,7 @@
             "hsdp",
             "ddp"
           ],
-          "description": "fsdp | hsdp | ddp (pure_torch/pure_te honor this; HF path ignores it)"
+          "description": "fsdp | hsdp | ddp (pure_torch honors this; HF path ignores it)"
         },
         "hsdp_shard_size": {
           "type": "string",
@@ -1293,7 +1383,13 @@
           "type": "boolean",
           "default": false,
           "x-nanoplm-group": "Distributed",
-          "description": "FSDP2 reshard_after_forward (pure_torch / pure_te)"
+          "description": "FSDP2 reshard_after_forward"
+        },
+        "fsdp_reduce_dtype": {
+          "type": "string",
+          "default": "fp32",
+          "x-nanoplm-group": "Distributed",
+          "description": "fp32 (exact) | bf16 (halves reduce-scatter bytes; cross-rank sum rounds to bf16)"
         },
         "world_size": {
           "type": "string",
@@ -1325,7 +1421,8 @@
       "x-nanoplm-group-notes": {
         "Batch (token-budget surface)": "micro_batch_seqs     = sequences per GPU per forward  (the VRAM knob)\nglobal_batch_tokens  = tokens per optimizer step\nGradient accumulation is inferred from those two + manifest seq_len +\nworld_size. You never set grad_accum yourself.",
         "Duration + LR schedule": "Token budget, not epochs.\n  lr_schedule: wsd\n    set stable_tokens + decay_tokens\n    stable_tokens INCLUDES warmup \u2014 it is the point where decay begins,\n    not a length added after warmup. decay_tokens IS a length after that.\n  lr_schedule: warmup_stable | cosine | linear\n    comment out stable_tokens / decay_tokens; uncomment train_tokens\nwarmup_steps is used by ALL schedules.\nPrefer tokens over steps. Step overrides (below) replace their *_tokens twin \u2014 never set both of a pair.",
-        "Optimizer \u2014 shared & Adam side": "adam_* also drives the AdamW side (1D params + embeddings/unembed) when\noptimizer is muon | normuon | muonh | aurora.",
+        "Optimizer \u2014 shared & Adam side": "adam_* also drives the AdamW side (1D params + embeddings/unembed) when\noptimizer is muon | normuon | nordion2.",
+        "Loopie stochastic depth (only when model.use_loopie: true)": "Draws R uniformly from loopie_loop_count \u00b1 jitter, fresh per micro-batch.",
         "Precision": "Recommended: keep bf16 enabled (~1.5\u20133\u00d7 speedup).\nWhen bf16: true, hardware picks the best path:\n  CUDA Ampere+ (A100, RTX 3090+)  \u2192  bf16 + TF32\n  CUDA Volta/Turing (V100, 2080)  \u2192  fp16 fallback\n  Apple Silicon (M1/M2/M3/\u2026)      \u2192  fp16 (hardware accelerated)\n  CPU                             \u2192  fp32 (no mixed precision)"
       }
     },
@@ -1392,11 +1489,6 @@
     "feature": "huggin_style_recycling",
     "model_reject": [
       {
-        "flag": "use_moe",
-        "reason": "MoE per-layer state (last_expert_counts, last_aux_loss) is overwritten on every recurrent iteration; only the last iteration's routing decisions would reach the pipeline's expert-bias correction. Disable use_moe or recycling_loop_count > 1.",
-        "condition": ""
-      },
-      {
         "flag": "use_x0_lambdas",
         "reason": "x0 captured once before the loop; per-physical-layer rescaling re-applied every recurrent iteration has unvalidated semantics.",
         "condition": ""
@@ -1413,6 +1505,11 @@
       }
     ],
     "model_warn": [
+      {
+        "flag": "use_moe",
+        "message": "MoE per-layer state now accumulates across recurrent iterations: aux/z-loss sums and the loss takes the per-execution mean (same scale as an unlooped run), and expert counts sum over iterations (the pipeline's bias update is relative and zero-meaned, so it is invariant to that scale). Aux gradients reach the router gate only through the last recycling_bptt iterations. Cutlass dispatch-workspace reuse is disabled under looping.",
+        "condition": "use_moe is True"
+      },
       {
         "flag": "use_repo",
         "message": "RePO will re-predict per-head positions every recurrent iteration. This hasn't been ablated; consider setting repo_after_n_layers >= recycling_num_prelude_layers + (num_hidden_layers - recycling_num_prelude_layers - recycling_num_coda_layers) so RePO stays in the coda.",
@@ -1433,11 +1530,6 @@
       "attn_layer_pattern"
     ],
     "pipeline_reject": [
-      {
-        "flag": "pure_te",
-        "reason": "te_pipeline.py is out of scope for the v1 recycling implementation. Use pure_torch.",
-        "condition": "pure_te is True"
-      },
       {
         "flag": "pure_torch",
         "reason": "Recycling lands only in pure_pipeline.py for v1; the HF path is out of scope.",

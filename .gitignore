@@ -74,6 +74,8 @@ agent_space/
 CLAUDE.md
 CLAUDE.local.md
 AGENTS.md
+# ...except the checked-in template style guide
+!src/nanoplm/cli/templates/CLAUDE.md
 
 # Docs site (Astro/Starlight)
 node_modules/

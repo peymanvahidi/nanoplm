@@ -1176,11 +1176,20 @@ torch.library.register_autograd(
 # ════════════════════════════════════════════════════════════════════════
 
 
-def is_compatible(x: torch.Tensor, radius: int) -> bool:
-    """True when the CuTeDSL backend can handle this call."""
+def is_compatible(x: torch.Tensor, radius: int, *weights: torch.Tensor) -> bool:
+    """True when the CuTeDSL backend can handle this call.
+
+    ``weights`` are the conv weight/bias, plus the norm gain for the fused-RMS
+    entry point. The kernels load them as bf16 without checking, so an fp32
+    caller gets NaN back with no error — training holds bf16 params under
+    FSDP's policy, but eval loads a checkpoint in fp32. Refuse those here and
+    let the Triton path serve them.
+    """
     if radius != R:
         return False
     if not x.is_cuda or x.dtype != torch.bfloat16 or x.dim() != 2:
+        return False
+    if any(w is not None and w.dtype != torch.bfloat16 for w in weights):
         return False
     T, C = x.shape
     if C not in _CFG:

@@ -92,24 +92,3 @@ class TestMHCLiteWrappingLevel:
                 mhc_lite_wrapping_level="bogus",
                 use_canon_layers=False,
             )
-
-
-class TestTEMHCLiteWrappingLevel:
-    def test_te_construction_layer(self):
-        pytest.importorskip("transformer_engine")
-
-        from nanoplm.pretraining.models.modern_bert.modeling import MHCLiteBlock
-        from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
-
-        cfg = _tiny_config(use_mhc_lite=True, wrapping_level="layer")
-        model = TEProtModernBertMLM(cfg)
-        assert isinstance(model.model.layers[0], MHCLiteBlock)
-
-    def test_te_rejects_sublayers(self):
-        pytest.importorskip("transformer_engine")
-
-        from nanoplm.pretraining.models.modern_bert.pure_model import TEProtModernBertMLM
-
-        cfg = _tiny_config(use_mhc_lite=True, wrapping_level="sublayers")
-        with pytest.raises(ValueError, match="only layer-level mHC-lite"):
-            TEProtModernBertMLM(cfg)

@@ -51,11 +51,13 @@ nanoplm deps install
 
 ### Benchmarking extra
 
-`nanoplm eval` runs on [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline, so the `eval` extra pulls in **biotrainer 1.4.0**:
+`nanoplm eval` runs on [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline, so the `eval` extra pulls in **biotrainer 2.0.0** (plus `biotrainer-core`):
 
 ```bash
 uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"   # or: uv pip install -e ".[eval]"
 ```
+
+The `pbc_zeroshot_contact` framework needs fixes not yet in biotrainer 2.0.0. Run `tools/install_biotrainer_pr.sh` after the extra installs to layer PR #192 on top, with `--no-deps` so it doesn't touch nanoPLM's pinned MoE kernels.
 
 To take biotrainer straight from source instead, use the command below:
 
@@ -112,7 +114,7 @@ nanoplm distill get-yaml
 nanoplm pretrain from-yaml
 ```
 
-The stock `pretrain.yaml` sets `pure_torch: true`, so no backend flag is needed. For Transformer Engine, set `pure_te: true` and turn off pure-torch — see [Choose a backend](https://peymanvahidi.github.io/nanoplm/guides/backends/).
+The stock `pretrain.yaml` sets `pure_torch: true`, so no backend flag is needed.
 
 ---
 
@@ -134,13 +136,17 @@ README section can.
 · [Your first PLM](https://peymanvahidi.github.io/nanoplm/start/first-plm/)
 · [Troubleshooting](https://peymanvahidi.github.io/nanoplm/troubleshooting/)
 
-Paths inside a config are resolved relative to the config file's directory.
+`nanoplm data from-yaml` resolves a relative path in its config against the directory that
+holds the config file. `nanoplm pretrain from-yaml` and `nanoplm eval from-yaml` resolve a
+relative path against the working directory you run them from, not against the config file.
+Run those two from the directory their relative paths belong to. In an sbatch script, set
+`#SBATCH --chdir` to that directory. An absolute path in a config is used as written.
 
 ---
 
 ## Requirements
 
-- Python 3.11+, which backs `nanoplm eval` (it also caps below 3.14, so 3.11–3.13). Developed and tested on 3.12.
+- Python 3.12+, which backs `nanoplm eval` (biotrainer 2.0.0 caps below 3.14, so 3.12–3.13). Developed and tested on 3.12.
 - Linux x86_64 with an NVIDIA Hopper GPU; see the supported-platform note under [Install](#️-install).
 
 ---

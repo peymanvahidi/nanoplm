@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Make your own protein language model, faster than ever."
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     {name = "Peyman Vahidi", email = "peyman.vahidi@helmholtz-munich.de"},
 ]
@@ -23,9 +23,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 keywords = ["bioinformatics", "protein-language-model", "large-language-models"]
 dependencies = [
@@ -57,7 +56,7 @@ nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
 nanoplm-eval = "nanoplm.cli.eval:eval"
 
 [project.optional-dependencies]
-eval = ["biotrainer==1.4.0"]
+eval = ["biotrainer==2.0.0", "biotrainer-core>=2.0.0"]
 docs = ["pyyaml>=6"]
 
 [project.urls]

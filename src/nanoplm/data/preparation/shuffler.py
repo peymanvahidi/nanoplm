@@ -4,8 +4,10 @@ from pathlib import Path
 from nanoplm.data.infra.atomic import atomic_write_path
 from nanoplm.data.preparation._native_ops import shuffle_fasta_native
 from nanoplm.utils import logger
+from nanoplm.utils.common import run_with_heartbeat
 
 _DEFAULT_THREADS = min(os.cpu_count() or 1, 16)
+_SHUFFLE_PHASE_NAMES = {1: "scanning records", 3: "shuffling records"}
 
 
 class ShufflingError(RuntimeError):
@@ -32,12 +34,44 @@ class FastaShuffler:
                 self._symlink_through()
                 return
             effective_seed = self.seed if self.seed is not None else random.randint(1, 2**31 - 1)
+            last_progress: dict[int, int] = {}
+
+            def progress_cb(phase: int, progress: float, completed: int, total: int, aux: int) -> None:
+                percent = int(progress * 100.0)
+                if percent < 100 and percent % 5 != 0:
+                    return
+                if last_progress.get(phase) == percent:
+                    return
+                last_progress[phase] = percent
+                phase_name = _SHUFFLE_PHASE_NAMES.get(phase, f"phase {phase}")
+                if phase == 1:
+                    logger.info(
+                        "Shuffle progress: %s %d%% (%d/%d bytes, %d records found)",
+                        phase_name,
+                        percent,
+                        completed,
+                        total,
+                        aux,
+                    )
+                else:
+                    logger.info(
+                        "Shuffle progress: %s %d%% (%d/%d records)",
+                        phase_name,
+                        percent,
+                        completed,
+                        total,
+                    )
+
             with atomic_write_path(self.output_path) as tmp:
-                shuffle_fasta_native(
-                    input_path=self.input_path,
-                    output_path=tmp,
-                    seed=effective_seed,
-                    num_threads=_DEFAULT_THREADS,
+                run_with_heartbeat(
+                    "Shuffling FASTA (native backend)",
+                    lambda: shuffle_fasta_native(
+                        input_path=self.input_path,
+                        output_path=tmp,
+                        seed=effective_seed,
+                        num_threads=_DEFAULT_THREADS,
+                        progress_cb=progress_cb,
+                    ),
                 )
         except ShufflingError:
             raise

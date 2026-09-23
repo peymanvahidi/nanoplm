@@ -11,38 +11,51 @@ class EvalConfig:
     # (the latest checkpoint inside the run-* is used).
     checkpoint_dir: Union[str, Path]
 
-    # Benchmark framework(s) to evaluate on. One or more of: pbc, flip, pgym.
-    framework: List[str] = field(default_factory=lambda: ["pbc"])
+    # Benchmark framework(s) to evaluate on. One or more of: pgym,
+    # pbc_zeroshot_contact, pbc_supervised. 'pgym' scores ProteinGym DMS
+    # variants zero-shot, 'pbc_zeroshot_contact' predicts contact maps from the
+    # categorical Jacobian, 'pbc_supervised' trains task heads on the frozen
+    # encoder's embeddings.
+    framework: List[str] = field(default_factory=lambda: ["pgym"])
 
-    # Directory where autoeval results, H5 embeddings, and per-task outputs are written.
+    # Directory where autoeval results and per-framework outputs are written.
     output_dir: Union[str, Path] = "autoeval_output"
-
-    # Batch size for embedding computation.
-    batch_size: int = 16
-
-    # Sequence length filters applied to benchmark datasets.
-    min_seq_length: int = 0
-    max_seq_length: int = 2000
 
     # Device override. When None, picks 'cuda' if available else 'cpu'.
     device: Optional[str] = None
 
-    # Embedder name shown in the autoeval report. When None, defaults to the
-    # checkpoint directory stem.
+    # Embedder name shown in the autoeval report and in its filename. When
+    # None, defaults to '<run-dir>-ckpt<step>' resolved from the checkpoint, so
+    # two runs evaluated into one output_dir do not overwrite each other's
+    # report; a role-named checkpoint takes its step from training_state.json.
     embedder_name: Optional[str] = None
 
-    # Number of parallel workers for downstream task training.
-    # 0 = sequential (runs through biotrainer.autoeval_pipeline).
-    # >0 = parallel mode (GPU embedding first, then CPU task training in a ThreadPoolExecutor).
-    parallel_tasks: int = 0
-
-    # Zero-shot scoring method when framework includes 'pgym'.
-    # One of: masked_marginals, wt_marginals, pseudoperplexity.
+    # Zero-shot scoring method for the 'pgym' framework. One of:
+    # masked_marginals, wt_marginals, pseudoperplexity. Ignored by
+    # pbc_zeroshot_contact, which always uses the categorical Jacobian, and by
+    # pbc_supervised, which trains on embeddings.
     zero_shot_method: str = "masked_marginals"
 
-    # Optional whitelist of task names (e.g. PBC-secondary_structure).
-    # Parallel mode only — sequential mode warns and ignores.
-    tasks: Optional[List[str]] = None
+    # Sequences scored per forward pass. Masked-marginals masks one position at
+    # a time, so this batches that many masked positions into a single forward
+    # (biotrainer scores them one-by-one); it also sizes the Jacobian batches
+    # and the pbc_supervised embedding batches.
+    zero_shot_batch_size: int = 60
+
+    # Evaluate on subsampled task sets instead of the full benchmark. Much
+    # faster; use false for final numbers.
+    development_mode: bool = True
+
+    # Pre-downloaded benchmark dataset directory, passed to biotrainer as
+    # custom_storage_path. Set this on machines without internet access.
+    # Mutually exclusive with force_download.
+    dataset_dir: Optional[str] = None
 
     # Force re-download of framework datasets (use when new tasks land upstream).
     force_download: bool = False
+
+    # Refinement depth to run this checkpoint at, overriding the depth it was
+    # trained with. None = the depth in the checkpoint's model_config.yaml.
+    # Works for both loopie and huginn checkpoints; a checkpoint with no
+    # looping rejects it.
+    loop_count: Optional[int] = None

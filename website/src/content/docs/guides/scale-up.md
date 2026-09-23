@@ -149,8 +149,8 @@ The run warns that `the token budget is approximate under batch-size warmup`. St
 ```yaml title="pretrain.yaml"
 pretraining:
   fp8: true
-  fp8_target: "mlp"            # pure-torch: mlp | attn_wqkv | attn_wo (combine: "attn_wqkv,mlp")
-  fp8_skip_last_n_layers: 2    # pure-torch: keep the final layers in bf16 for stability
+  fp8_target: "mlp"            # mlp | attn_wqkv | attn_wo (combine: "attn_wqkv,mlp")
+  fp8_skip_last_n_layers: 2    # keep the final layers in bf16 for stability
 ```
 
 ```
@@ -159,14 +159,14 @@ FP8 enabled (Transformer Engine conversion): target=mlp, recipe=delayed, skip_la
 
 Which keys apply where:
 
-| Key | Default | Honored by | Notes |
-| --- | --- | --- | --- |
-| [`fp8_target`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_target) | `mlp` | pure-torch | `mlp`, `attn_wqkv`, `attn_wo`. Comma-separated or a YAML list. Start at `mlp`; it is the largest and most forgiving. |
-| [`fp8_skip_last_n_layers`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_skip_last_n_layers) | `0` | pure-torch | Keeps the final N transformer layers in bf16. The first thing to try if FP8 loss diverges. |
-| [`fp8_recipe`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_recipe) | `delayed` | both | `delayed \| current \| block \| mxfp8 \| nvfp4`. `mxfp8` and `nvfp4` need **Blackwell or newer**; the other three run on Hopper+. |
-| [`fp8_format`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_format) | `hybrid` | both | `hybrid \| e4m3`. Ignored by `nvfp4`. |
-| [`fp8_amax_history_len`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_amax_history_len) | `64` | both | Scaling-factor history window. Used **only** with `fp8_recipe: delayed`. |
-| [`fp8_reduce_amax`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_reduce_amax) | `true` | both | Synchronizes the scaling factors across ranks. `delayed` only. |
+| Key | Default | Notes |
+| --- | --- | --- |
+| [`fp8_target`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_target) | `mlp` | `mlp`, `attn_wqkv`, `attn_wo`. Comma-separated or a YAML list. Start at `mlp`; it is the largest and most forgiving. |
+| [`fp8_skip_last_n_layers`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_skip_last_n_layers) | `0` | Keeps the final N transformer layers in bf16. The first thing to try if FP8 loss diverges. |
+| [`fp8_recipe`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_recipe) | `delayed` | `delayed \| current \| block \| mxfp8 \| nvfp4`. `mxfp8` and `nvfp4` need **Blackwell or newer**; the other three run on Hopper+. |
+| [`fp8_format`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_format) | `hybrid` | `hybrid \| e4m3`. Ignored by `nvfp4`. |
+| [`fp8_amax_history_len`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_amax_history_len) | `64` | Scaling-factor history window. Used **only** with `fp8_recipe: delayed`. |
+| [`fp8_reduce_amax`](/nanoplm/reference/pretrain/#pretrain-pretraining-fp8_reduce_amax) | `true` | Synchronizes the scaling factors across ranks. `delayed` only. |
 
 `fp8_cpu_activation_offload` also exists: it pushes FP8 activations to host memory through saved-tensor hooks. It was hand-tuned for a 4×GH200 machine, performance elsewhere is not guaranteed, and it is incompatible with `activation_checkpointing: true` and with [recycling](/nanoplm/guides/recycling/). Leave it off unless you are on that hardware.
 
@@ -184,6 +184,5 @@ The `tok/s` and `h100_mfu` fields in the step log are how you tell whether any o
 
 ## Where to go next
 
-- [Choose a backend](/nanoplm/guides/backends/): why pure-torch is the default.
 - [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/): WSD, and picking a long run back up.
 - [pretrain.yaml reference](/nanoplm/reference/pretrain/): every key, with defaults.

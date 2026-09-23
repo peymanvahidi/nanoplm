@@ -48,25 +48,17 @@ On current nanoPLM, `pure_torch` is a **top-level boolean**, and the loader eval
 
 ## Pretraining won't start
 
-**`Pretraining requires pure_torch: true or pure_te: true. The HF Trainer pretraining path is no longer supported.`**
+**`Pretraining requires pure_torch: true. The HF Trainer pretraining path is no longer supported.`**
 
-Some backend must be selected: either in the YAML or on the CLI. The stock template already sets `pure_torch: true`, so this usually means a hand-written config is missing the key, both backends are false, or you used `pretrain run` without a flag. There is no HF-Trainer path.
+Pure-torch must be selected: either in the YAML or on the CLI. The stock template already sets `pure_torch: true`, so this usually means a hand-written config is missing the key, has it set to false, or you used `pretrain run` without the flag. There is no HF-Trainer path.
 
 ```bash
 # YAML path (template default is pure_torch: true)
 nanoplm pretrain from-yaml
 
-# Flag-driven path still needs an explicit backend
+# Flag-driven path still needs the explicit flag
 nanoplm pretrain run --dataset-dir output/data/pretrain_data --pure-torch
 ```
-
-**`lr_schedule: wsd and resume mode: decay require pure_torch: true (TE supports warmup_stable/cosine/linear + continue only).`**
-
-You asked for WSD or a decay resume on the Transformer Engine backend. Either switch back to pure-torch (`pure_torch: true` or `--pure-torch`), or pick an `lr_schedule` TE supports.
-
-**`--pure-torch and --pure-te are mutually exclusive.`** (or `pure_torch and pure_te cannot both be true.`)
-
-Pass one flag, not both. Also check the YAML: a `pure_te: true` key plus a `--pure-torch` flag is fine (the flag wins), but two `true` keys are not.
 
 ### Duration and schedule disagree
 
@@ -216,7 +208,7 @@ If one replica would span the whole world there is nothing to replicate: that is
 
 ## FP8 errors
 
-FP8 goes through Transformer Engine on **both** backends: including pure-torch, which swaps eligible blocks for TE modules. "TE only" in the template comments means "these are TE recipe knobs", not "pure-TE backend only".
+FP8 goes through Transformer Engine: pure-torch swaps eligible blocks for TE modules and runs them under a TE autocast. Transformer Engine is therefore required for `fp8: true`, even though nanoPLM has no separate TE backend.
 
 **`fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`**
 
@@ -245,14 +237,14 @@ CPU activation offload is the fussiest FP8 feature. All four of these are hard e
 
 Several architecture features are mutually exclusive, and several are pure-torch only.
 
-**`model.use_canon_layers=true requires pure_torch: true (or --pure-torch). Canon layers are not implemented in HF/TE paths.`**
+**`model.use_canon_layers=true requires pure_torch: true (or --pure-torch). Canon layers are not implemented in the HF path.`**
 
 The same message shape appears for `use_noble`, `use_diff_attn_v2`, and `use_paired_head_attention`. MoE and recycling have their own wording:
 
 - **`MoE is currently implemented only in the pure-torch path. Disable use_moe or use --pure-torch.`**
 - **`Huginn-style recycling (recycling_loop_count > 1) is implemented only in the pure-torch path. Use --pure-torch with recycling_loop_count>1.`**
 
-Keep pure-torch (the template default). Do not switch to `--pure-te` while these features are on.
+Keep pure-torch (the template default).
 
 ### Incompatible pairs
 
@@ -265,8 +257,6 @@ Keep pure-torch (the template default). Do not switch to `--pure-te` while these
 | `GQA (num_kv_heads != num_attention_heads) is not compatible with use_repo.` | |
 | `model.use_mhc_lite=true is not compatible with model.use_resid_lambdas=true.` | `resid_lambdas` rescales the hidden state before each layer, which breaks mHC-lite's doubly-stochastic stability guarantee. |
 | `Paired head attention requires an even head_dim. Got head_dim=65.` | |
-
-**`Transformer Engine currently supports only layer-level mHC-lite. Set model.mhc_lite_wrapping_level: layer or use pure_torch: true.`**
 
 ### MoE
 
@@ -282,15 +272,13 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 
 **`rope_dim_fraction must be in (0.0, 1.0], got 1.5`**
 
-**`Unsupported mlp_activation: gelu. Supported: ['swiglu', 'glu', 'srelu']`**: note `glu` is pure-torch only; Transformer Engine does not implement it.
+**`Unsupported mlp_activation: gelu. Supported: ['swiglu', 'geglu', 'srelu']`**: `geglu` is the gated gelu MLP used by stock ModernBERT (`gelu(up) * gate`). It was called `glu` before, which was inaccurate.
 
 **`norm_bias=True is not compatible with norm_type='rmsnorm'. RMSNorm does not support bias. Set norm_bias=False.`**
 
 **`use_canon_layers=True requires non-empty canon_layers_mode (for example: 'abcd' or 'ac').`**
 
 **`Invalid character 'X' in attn_layer_pattern. Use 'F' for full attention and 'S' for sliding attention.`**
-
-**`debug_layerwise_metrics is not supported with --pure-te / pure_te: true.`**: use pure-torch, or set `debug_layerwise_metrics: false` (the default).
 
 ## Data pipeline
 

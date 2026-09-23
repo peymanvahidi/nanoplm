@@ -17,7 +17,7 @@
 # ---------------------------------------------------------------- pretraining
 # click.Choice --optimizer
 pretraining.optimizer:
-  enum: [adamw, stable_adamw, muon, normuon, muonh, aurora]
+  enum: [adamw, stable_adamw, muon, normuon, nordion2]
 # click.Choice --lr-schedule + _validate_duration_config's `valid` set
 pretraining.lr_schedule:
   enum: [wsd, warmup_stable, cosine, linear]
@@ -29,26 +29,27 @@ pretraining.fsdp_shard_granularity:
 # click.Choice --decay-shape
 pretraining.decay_shape:
   enum: ["1-sqrt", linear]
-# click.Choice --muonh-normalization
-pretraining.muonh_normalization:
-  enum: [neuron, short_axis, "none"]
-# PretrainingConfig.__post_init__ -> {all, mlp}
-pretraining.muonh_scope:
-  enum: [all, mlp]
+# click.Choice --muon-adjust-lr + __post_init__ -> {rms_norm, spectral_norm, none}
+pretraining.muon_adjust_lr:
+  enum: [rms_norm, spectral_norm, "none"]
+# click.Choice --nordion2-selection-scope + __post_init__ -> {local, global}
+pretraining.nordion2_selection_scope:
+  enum: [local, global]
 # click.Choice --mlm-masking-strategy + __post_init__ -> {token, span}
 pretraining.mlm_masking_strategy:
   enum: [token, span]
 
-# FP8, Transformer-Engine-only knobs (recipe/format/amax are TE constructs).
+# FP8 recipe knobs (recipe/format/amax are Transformer-Engine constructs, read
+# by fp8.py's te_fp8_recipe_from_config on the pure-torch path).
 pretraining.fp8_recipe:
   enum: [delayed, current, block, mxfp8, nvfp4]
-  backend: [pure_te]
+  backend: [pure_torch]
 pretraining.fp8_format:
   enum: [hybrid, e4m3]
-  backend: [pure_te]
-pretraining.fp8_amax_history_len: { backend: [pure_te], advanced: true }
-pretraining.fp8_reduce_amax: { backend: [pure_te], advanced: true }
-# FP8, pure-torch-only knobs. fp8_target gets NO enum on purpose: any
+  backend: [pure_torch]
+pretraining.fp8_amax_history_len: { backend: [pure_torch], advanced: true }
+pretraining.fp8_reduce_amax: { backend: [pure_torch], advanced: true }
+# More FP8 knobs. fp8_target gets NO enum on purpose: any
 # COMBINATION of mlp / attn_wqkv / attn_wo is legal (_normalize_fp8_targets),
 # so a closed value list would be a lie.
 pretraining.fp8_target: { backend: [pure_torch] }
@@ -62,16 +63,15 @@ pretraining.use_compile_max_autotune: { backend: [pure_torch], advanced: true }
 pretraining.compile_triton_persistent_reductions: { backend: [pure_torch], advanced: true }
 pretraining.compile_triton_mix_order_reduction: { backend: [pure_torch], advanced: true }
 
-# Layerwise debug hooks are explicitly rejected under pure_te
-# (_validate_debug_layerwise_metrics_compat).
+# Layerwise debug hooks exist only on the pure-torch path.
 pretraining.debug_layerwise_metrics: { backend: [pure_torch], advanced: true }
 pretraining.debug_layerwise_log_every: { backend: [pure_torch], advanced: true }
 
 # RePO exists only on the pure-torch path.
 pretraining.repo_rope_warmup_steps: { backend: [pure_torch], advanced: true }
 
-# Huginn-style recycling: pure-torch only (both ProtModernBertMLM and
-# TEProtModernBertMLM reject recycling_loop_count > 1). Enums come from
+# Huginn-style recycling: pure-torch only (ProtModernBertMLM rejects
+# recycling_loop_count > 1). Enums come from
 # pretraining/recycling/scheduler.py's validators.
 pretraining.recycling_bptt: { backend: [pure_torch], advanced: true }
 pretraining.recycling_loop_count_sampling:
@@ -85,6 +85,9 @@ pretraining.recycling_loop_count_curriculum:
   advanced: true
 pretraining.recycling_loop_count_curriculum_steps: { backend: [pure_torch], advanced: true }
 pretraining.recycling_pretraining_eval_loop_counts: { backend: [pure_torch], advanced: true }
+
+# Loopie stochastic depth: only meaningful with model.use_loopie, pure-torch only.
+pretraining.loopie_loop_count_jitter: { backend: [pure_torch], advanced: true, minimum: 0 }
 
 # NOBLE LR scaling: only meaningful with model.use_noble, which is pure-torch only.
 pretraining.noble_base_lr: { backend: [pure_torch], advanced: true }
@@ -110,7 +113,7 @@ model.norm_type:
 model.classifier_activation:
   enum: [relu, gelu, srelu]
 model.mlp_activation:
-  enum: [swiglu, glu, srelu]
+  enum: [swiglu, geglu, srelu]
 # ModernBertConfig.__post_init__ / click.Choice --wo-init
 model.wo_init:
   enum: [kaiming, zero]
@@ -125,9 +128,7 @@ model.canon_layers_kernel_size:
 model.canon_layers_mode: { backend: [pure_torch], advanced: true }
 model.use_canon_layers: { backend: [pure_torch], advanced: true }
 model.use_repo: { backend: [pure_torch], advanced: true }
-# mHC-lite itself runs on pure_torch AND pure_te; only pure_torch honors a
-# wrapping level other than "layer" (TEProtModernBertMLM rejects 'sublayers').
-model.use_mhc_lite: { backend: [pure_torch, pure_te], advanced: true }
+model.use_mhc_lite: { backend: [pure_torch], advanced: true }
 model.mhc_lite_wrapping_level:
   enum: [layer, sublayers]
   backend: [pure_torch]
@@ -142,6 +143,9 @@ model.noble_targets:
   advanced: true
 model.use_moe: { backend: [pure_torch], advanced: true }
 model.recycling_loop_count: { backend: [pure_torch], advanced: true }
+model.use_huginn_looping: { backend: [pure_torch], advanced: true }
+model.use_loopie: { backend: [pure_torch], advanced: true }
+model.loopie_loop_count: { backend: [pure_torch], advanced: true }
 
 # --------------------------------------------------------------- distillation
 distillation.optimizer:
@@ -152,6 +156,7 @@ distillation.lr_scheduler:
 # ----------------------------------------------------------------------- eval
 eval.zero_shot_method:
   enum: [masked_marginals, wt_marginals, pseudoperplexity]
+eval.loop_count: { backend: [pure_torch], advanced: true, minimum: 1 }
 
 # =============================================================================
 # x-extra-fields: RESERVED KEY (not a "<section>.<field>" annotation).
@@ -202,6 +207,32 @@ x-extra-fields:
           cosine | linear): train for this many optimizer steps instead of for a
           token budget. Set exactly one of train_tokens or max_steps, never
           both; neither is valid with lr_schedule: wsd.
+      max_wallclock_hours:
+        type: number
+        default: null
+        advanced: true
+        group: Logging, eval, checkpoints
+        description: >-
+          Wall-clock budget for training, in hours. The run writes a checkpoint
+          and stops at the first optimizer step past the deadline, even if the
+          token budget is not spent, which is how wall-clock-matched ablations
+          are run. The clock starts a couple of optimizer steps in so that
+          torch.compile, autotuning and warmup are excluded, meaning total job
+          time is longer than the budget; it also restarts on resume rather than
+          accumulating across resumes. Unset (the default) runs the full token
+          budget.
+      peak_tflops:
+        type: number
+        default: null
+        advanced: true
+        group: Logging, eval, checkpoints
+        description: >-
+          Device peak BF16 tensor-core throughput in TFLOP/s, used as the
+          denominator of the reported MFU. Unset (the default) uses the H100 SXM
+          figure of 989.4, which is wrong for any other accelerator: on a GH200
+          booster capped at 630 it understates MFU by 1.57x. Set it per cluster
+          so the logged MFU means what it says. Affects reporting only, never
+          the computation.
       stable_steps:
         type: integer
         default: null

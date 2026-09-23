@@ -38,7 +38,12 @@ def test_installer_script_ships_as_package_data():
 
 
 def test_eval_extra_unchanged():
-    assert _load()["project"]["optional-dependencies"]["eval"] == ["biotrainer==1.4.0"]
+    # biotrainer-core is declared explicitly: nanoplm.eval imports from it directly
+    # (ZeroShotMethod, STANDARD_AAS, AutoEvalReport), not only through biotrainer.
+    assert _load()["project"]["optional-dependencies"]["eval"] == [
+        "biotrainer==2.0.0",
+        "biotrainer-core>=2.0.0",
+    ]
 
 
 def test_readme_documents_the_install_path_and_the_platform():
@@ -108,6 +113,13 @@ def _iter_shipped_non_py_files():
         if path.suffix == ".py":
             continue
         if path.name == ".gitkeep":
+            continue
+        # Agent / editor instruction files are documentation for humans and
+        # tools working IN the tree, never runtime assets, so they are not
+        # expected to ship in a wheel. Excluded by exact name rather than by
+        # suffix: a package that genuinely ships a .md asset should still be
+        # caught by this gate.
+        if path.name in {"CLAUDE.md", "AGENTS.md", "GEMINI.md", "README.md"}:
             continue
         yield path
 

@@ -22,7 +22,7 @@ The matrix is generated from `recycling_compatibility.yaml` (the same rules file
 
 ## Recycling is pure-torch only
 
-That is one instance of a broader rule: **Transformer Engine supports a strictly smaller surface than pure-torch.** Canon layers, RePO, differential attention, paired-head attention, NOBLE, MoE, `mlp_activation: glu`, unfused QKV, `lr_schedule: wsd`, and `resume.mode: decay` are pure-torch only as well, and none of them appear in this matrix because it scopes to recycling alone. See [Choose a backend](/nanoplm/guides/backends/) for the full split, and [Recycling](/nanoplm/guides/recycling/) for what the feature does and when it pays off.
+Pure-torch is the only pretraining backend, so the `pure_torch is False` entry is really about the Hugging Face `Trainer` path, which is no longer supported: a config that does not select pure-torch never reaches the trainer at all. See [Recycling](/nanoplm/guides/recycling/) for what the feature does and when it pays off.
 
 If one of these combinations fails your run, [Troubleshooting](/nanoplm/troubleshooting/) has the exact error text and the fix.
 

@@ -13,7 +13,7 @@ nanoPLM's supported training environment is fixed:
 | --- | --- |
 | OS / CPU | Linux **x86_64** or **aarch64** (GH200 / JUPITER) |
 | GPU | NVIDIA **Hopper** (H100 / H200 / GH200, sm90) |
-| CUDA driver / toolkit | **CUDA ≥ 13.0** (`nvcc` release 13.x on `PATH` for the deps build) |
+| CUDA driver / toolkit | **CUDA ≥ 13.0** — `nvcc` release 13.x for the deps build (auto-detected under `/usr/local/cuda*` when it is not on `PATH`) |
 | Python | **3.11–3.13** (developed and tested on **3.12**) |
 
 Every full install carries the same hard-dependency stack: **torch 2.12.1+cu130**, **TransformerEngine 2.16** (FP8), **FlashAttention-3**, **SonicMoE / QuACK**, and **Dion**. Other GPUs or OSes may partially work; they are unsupported.
@@ -82,7 +82,12 @@ module load CUDA/13 NCCL cuDNN Ninja    # do NOT module purge
 nanoplm deps install
 ```
 
-`nvcc` must report CUDA 13.x and `ninja` must be on `PATH` (TE's source build needs both). On EasyBuild clusters, `CUDA_HOME` is taken from `EBROOTCUDA` automatically.
+The deps build needs `nvcc` (CUDA 13.x) and `ninja`, but neither has to be on `PATH` before you start — preflight recovers both where it can:
+
+- **`nvcc` not on `PATH`**: preflight probes `$CUDA_HOME`, `$EBROOTCUDA`, then `/usr/local/cuda`, `/usr/local/cuda-13*`, `/opt/cuda`, `/opt/cuda-13*`, and prepends the first root whose `bin/nvcc` reports release 13.x — also setting `CUDA_HOME` — for that run. Set `NANOPLM_CUDA_SEARCH_ROOTS` to a colon-separated root list if your toolkit lives elsewhere, or to `""` to disable the probe.
+- **`ninja` missing**: preflight installs the `ninja` wheel into the active venv (it ships a real `ninja` binary, so no module or root access is needed).
+
+Only a host with no CUDA 13 toolkit *anywhere* is refused. Watch out for one red herring there: the `CUDA Version:` row in `nvidia-smi` reports the **driver**, so a machine can advertise CUDA 13.x and still have no `nvcc` installed. On EasyBuild clusters, `CUDA_HOME` is taken from `EBROOTCUDA` automatically.
 
 ### Flags
 
@@ -95,7 +100,7 @@ If the build host has no outbound internet for the FlashAttention-3 wheel, downl
 
 ## Benchmarking extra
 
-`nanoplm eval` runs [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline. That dependency is **not** part of `nanoplm deps install`; pull it with the `eval` extra:
+`nanoplm eval` runs [biotrainer](https://github.com/sacdallago/biotrainer) 2.0.0's autoeval pipeline. That dependency is **not** part of `nanoplm deps install`; pull it with the `eval` extra (it requires Python 3.12–3.13):
 
 <Tabs>
 <TabItem label="From GitHub (recommended)">
@@ -115,6 +120,10 @@ uv pip install -e ".[eval]"
 </Tabs>
 
 Without it, `nanoplm eval from-yaml` fails at import time.
+
+The extra also pulls `biotrainer-core`, which `nanoplm.eval` imports directly. Installing biotrainer
+can move shared pins (notably `quack-kernels` and `nvidia-cutlass-dsl`); re-run `nanoplm deps install`
+afterwards to restore the MoE kernel versions.
 
 ## Verify your install
 
@@ -157,15 +166,40 @@ Without it, `nanoplm eval from-yaml` fails at import time.
 
 If all three work, go train something: [Your first PLM](/nanoplm/start/first-plm/).
 
+### If `transformer_engine.pytorch` fails to import
+
+```
+✗ transformer_engine.pytorch  libtransformer_engine.so: undefined symbol:
+  cublasLtGroupedMatrixLayoutInit_internal, version libcublasLt.so.13
+```
+
+TransformerEngine is built from source against your CUDA toolkit's cuBLAS, while
+torch loads its own pinned cuBLAS wheel — and both use the same library soname, so
+the first one loaded serves the whole process. A toolkit newer than torch's pin
+(CUDA 13.3 ships cuBLAS 13.6; torch 2.12.1+cu130 pins 13.1) therefore builds calls
+the wheel cannot resolve. `nanoplm deps install` closes that gap for you by
+upgrading the cuBLAS wheel to the toolkit's own version, so the fix is to re-run:
+
+```bash
+nanoplm deps install
+```
+
+`pip check` will report that the cuBLAS wheel now exceeds torch's upper pin. That
+is expected: CUDA guarantees minor-version compatibility within a major version,
+and `nanoplm deps verify` exercises the result on the GPU. Anything that
+re-resolves the dependency tree afterwards (`uv sync`, `pip install -e .`) can
+pull the wheel back down to torch's pin and bring the error back — re-run
+`nanoplm deps install` if it does; the step is idempotent.
+
 ## What you get vs what you still choose
 
-After a successful `nanoplm deps install`, Muon-family optimizers, token packing (FlashAttention-3), FP8 / pure-TE, and the SonicMoE expert backend are **available**. You still turn features on in YAML (`optimizer`, `use_packing`, `fp8`, `moe_kernel_backend`, …); the installer only guarantees the packages are present.
+After a successful `nanoplm deps install`, Muon-family optimizers, token packing (FlashAttention-3), FP8, and the SonicMoE expert backend are **available**. You still turn features on in YAML (`optimizer`, `use_packing`, `fp8`, `moe_kernel_backend`, …); the installer only guarantees the packages are present.
 
 | Feature | Still needs in config / hardware |
 | --- | --- |
-| Pretraining (pure-torch, the default) | Hopper GPU for the supported path |
+| Pretraining (pure-torch, the only backend) | Hopper GPU for the supported path |
 | Token packing (`use_packing: true`, the default) | FA3 is installed; set `use_packing: false` only if you want padding instead |
-| `fp8: true` / `--pure-te` | TE is installed; FP8 tensor cores need Hopper+; `mxfp8` / `nvfp4` need Blackwell+ |
+| `fp8: true` | Transformer Engine is installed; FP8 tensor cores need Hopper+; `mxfp8` / `nvfp4` need Blackwell+ |
 | `optimizer: muon \| normuon \| muonh \| aurora` | Dion is installed; see [Choose an optimizer](/nanoplm/guides/optimizers/) |
 | `moe_kernel_backend: sonicmoe` | QuACK + SonicMoE are installed; still Hopper-only |
 

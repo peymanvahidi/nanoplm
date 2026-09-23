@@ -30,6 +30,7 @@ def _recycling_cfg(tokenizer, **overrides):
         vocab_size=tokenizer.vocab_size,
         recycling_num_prelude_layers=1,
         recycling_num_coda_layers=1,
+        use_huginn_looping=True,
         recycling_loop_count=4,
         recycling_use_takase_init=False,
         wo_init="kaiming",
@@ -38,18 +39,7 @@ def _recycling_cfg(tokenizer, **overrides):
     return ProtModernBertMLMConfig(**kwargs)
 
 
-def _make_counting_backend():
-    """Return (backend, counter_list) where counter_list[0] is the compile count."""
-    n = [0]
-
-    def backend(gm, example_inputs):
-        n[0] += 1
-        return gm.forward
-
-    return backend, n
-
-
-def test_compile_bounded_for_varying_loop_count(tokenizer):
+def test_compile_bounded_for_varying_loop_count(tokenizer, make_counting_backend):
     """Five distinct r values must NOT each trigger a fresh Dynamo trace.
 
     On the broken code (Python-int loop bounds inside the compiled graph), each
@@ -62,7 +52,7 @@ def test_compile_bounded_for_varying_loop_count(tokenizer):
     model = PureProtModernBertMLM(cfg)
     model.eval()  # dropout off; deterministic forward
 
-    backend, n_compiles = _make_counting_backend()
+    backend, n_compiles = make_counting_backend()
     torch._dynamo.reset()
     compiled = torch.compile(model, backend=backend, dynamic=False)
 
@@ -77,7 +67,7 @@ def test_compile_bounded_for_varying_loop_count(tokenizer):
         compiled(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            recycling_loop_count=torch.tensor(2, dtype=torch.int64),
+            loop_count=torch.tensor(2, dtype=torch.int64),
             recycling_bptt=K_t,
         )
     warmup_compiles = n_compiles[0]
@@ -93,7 +83,7 @@ def test_compile_bounded_for_varying_loop_count(tokenizer):
             compiled(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                recycling_loop_count=torch.tensor(r, dtype=torch.int64),
+                loop_count=torch.tensor(r, dtype=torch.int64),
                 recycling_bptt=K_t,
             )
 
@@ -106,7 +96,7 @@ def test_compile_bounded_for_varying_loop_count(tokenizer):
     )
 
 
-def test_no_layer_idx_cache_thrash_at_production_R(tokenizer):
+def test_no_layer_idx_cache_thrash_at_production_R(tokenizer, make_counting_backend):
     """Regression: with R recurrent layers > cache_size_limit, the per-layer
     dispatch in the recurrent step must NOT specialize per-layer-index.
 
@@ -131,6 +121,7 @@ def test_no_layer_idx_cache_thrash_at_production_R(tokenizer):
         vocab_size=tokenizer.vocab_size,
         recycling_num_prelude_layers=1,
         recycling_num_coda_layers=1,
+        use_huginn_looping=True,
         recycling_loop_count=4,
         recycling_use_takase_init=False,
         wo_init="kaiming",
@@ -143,7 +134,7 @@ def test_no_layer_idx_cache_thrash_at_production_R(tokenizer):
 
     model = PureProtModernBertMLM(cfg)
     model.eval()
-    backend, n_compiles = _make_counting_backend()
+    backend, n_compiles = make_counting_backend()
     torch._dynamo.reset()
     compiled = torch.compile(model, backend=backend, dynamic=False)
 
@@ -160,7 +151,7 @@ def test_no_layer_idx_cache_thrash_at_production_R(tokenizer):
                 compiled(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    recycling_loop_count=torch.tensor(r, dtype=torch.int64),
+                    loop_count=torch.tensor(r, dtype=torch.int64),
                     recycling_bptt=K_t,
                 )
 

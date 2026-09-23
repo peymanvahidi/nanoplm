@@ -1,6 +1,6 @@
 ---
 title: 3. Evaluate
-description: Score a checkpoint on PBC, FLIP, and zero-shot ProteinGym benchmarks with eval.yaml.
+description: Score a checkpoint on zero-shot ProteinGym and contact-prediction benchmarks with eval.yaml.
 ---
 
 import { FileTree, Steps } from '@astrojs/starlight/components';
@@ -11,7 +11,7 @@ This is where the checkpoint format pays off. `eval.yaml` needs **a path and a l
 
 ## Before you start
 
-Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer), which is an optional
+Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer) 2.0.0, which is an optional
 dependency (not part of `nanoplm deps install`; see [Install](/nanoplm/start/install/)):
 
 ```sh
@@ -20,7 +20,17 @@ uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
 uv pip install -e ".[eval]"
 ```
 
+:::note[pbc_zeroshot_contact needs a PR build]
+`pbc_zeroshot_contact` needs fixes not yet in the biotrainer 2.0.0 release; without them it fails with `TypeError: Got unsupported ScalarType BFloat16`. Run `tools/install_biotrainer_pr.sh` after the extra above to install biotrainer and biotrainer-core from [PR #192](https://github.com/sacdallago/biotrainer/pull/192) on top. The script needs outbound network to clone the PR branch, so run it on a machine that has one. See [Offline machines](#offline-machines) below for staging the benchmark data itself with `dataset_dir` on a compute node that doesn't.
+:::
+
 Evaluation loads **pure-torch checkpoints only**. That is one more reason to keep the stock `pure_torch: true` default when you pretrain, as [2. Pretrain](/nanoplm/pipeline/pretrain/) recommends.
+
+:::note[Zero-shot only]
+`nanoplm eval` covers biotrainer's **zero-shot** frameworks. The supervised probe
+benchmarks (`pbc`, `flip`) were dropped in the move to biotrainer 2.0.0; a config
+that still lists them fails with a message naming the replacement.
+:::
 
 ## Run it
 
@@ -49,12 +59,13 @@ Evaluation loads **pure-torch checkpoints only**. That is one more reason to kee
    Using device: cuda
    Loaded model config from checkpoint: .../checkpoint-final/model_config.yaml
    Embedder name: checkpoint-final
-   Starting autoeval pipeline (sequential): framework=pbc
+   Adding PGYM zero-shot: method=masked_marginals, batch_size=60
+   Starting autoeval: frameworks=['pgym'], development_mode=True
    ============================================================
-   [1/8] PBC: PBC-secondary_structure
    # ...
    ============================================================
-   AUTOEVAL COMPLETE: Final Report Summary
+   AUTOEVAL COMPLETE in 812.4s — Final Report Summary
+   Frameworks in report: ['PGYM']
    ============================================================
    ```
 
@@ -69,21 +80,20 @@ eval:
   # A checkpoint-* directory, or a run-* directory (the newest checkpoint inside it is used).
   checkpoint_dir: "output/pretraining_checkpoints/run-14071932/checkpoint-final"
 
-  framework: [pbc]                    # one or more of: pbc, flip, pgym
+  framework: [pgym]                   # one or more of: pgym, pbc_zeroshot_contact
 
   output_dir: "autoeval_output"
 
-  batch_size: 16                      # embedding batch size: the only VRAM knob here
-  min_seq_length: 0                   # filters applied to the BENCHMARK data, not yours
-  max_seq_length: 2000
-
   # device: cuda                      # auto-detected when omitted
   # embedder_name: my-run             # defaults to the checkpoint directory's name
-  parallel_tasks: 0                   # 0 = sequential, >0 = that many parallel workers
 
   zero_shot_method: masked_marginals  # masked_marginals | wt_marginals | pseudoperplexity
 
-  # tasks: [PBC-secondary_structure]  # optional whitelist: parallel mode only
+  zero_shot_batch_size: 60            # sequences per forward pass: the VRAM knob here
+
+  development_mode: true              # subsampled tasks; false for final numbers
+
+  # dataset_dir: "/path/to/data"      # pre-downloaded benchmarks, for offline machines
 
   force_download: false               # re-download benchmark datasets
 ```
@@ -103,11 +113,10 @@ So during a long run you can leave `checkpoint_dir` pointed at the run directory
 
 | Value | What it measures |
 | --- | --- |
-| `pbc` | Protein Benchmark Collection: supervised probes on frozen embeddings (secondary structure, localisation, and similar). |
-| `flip` | FLIP: supervised probes on fitness-landscape splits. |
 | `pgym` | ProteinGym, **zero-shot**: the model scores mutants directly, with no probe trained on top. |
+| `pbc_zeroshot_contact` | Contact maps derived from the model's **categorical Jacobian**, scored against experimental structures. |
 
-`pbc` and `flip` train a small supervised head on your model's frozen embeddings, so they measure representation quality. `pgym` uses the MLM head itself, so it measures how well the model models proteins. They can disagree, and the disagreement is informative.
+Both use the MLM head itself rather than a trained probe, so they measure how well the model models proteins — `pgym` through mutational effects, `pbc_zeroshot_contact` through the pairwise couplings the model has internalised.
 
 Zero-shot scoring has three methods, set by [`zero_shot_method`](/nanoplm/reference/eval/#eval-zero_shot_method) and used only when `pgym` is in `framework`:
 
@@ -115,31 +124,41 @@ Zero-shot scoring has three methods, set by [`zero_shot_method`](/nanoplm/refere
 - `wt_marginals`: a single forward pass over the wild-type sequence.
 - `pseudoperplexity`: the full pseudo-log-likelihood of the mutant.
 
-## Sequential or parallel
+`pbc_zeroshot_contact` ignores `zero_shot_method`; it always uses the categorical Jacobian.
 
-[`parallel_tasks`](/nanoplm/reference/eval/#eval-parallel_tasks) defaults to `0`, which runs each benchmark task one after another through biotrainer's own pipeline. Set it above `0` and nanoPLM instead computes every embedding on the GPU first, then trains the supervised probes on CPU across that many workers. On a machine with spare cores this is substantially faster, and it is the only mode in which the [`tasks`](/nanoplm/reference/eval/#eval-tasks) whitelist works. In sequential mode a `tasks:` list is ignored with a warning.
+## Batch size
 
-The two modes write to **differently named output directories**. Switching `parallel_tasks` between runs therefore hides your earlier results from the resume cache: already-completed tasks are recomputed, and the scores land in a new tree. Pick a mode per project and keep it.
+[`zero_shot_batch_size`](/nanoplm/reference/eval/#eval-zero_shot_batch_size) is the one VRAM knob. biotrainer scores masked-marginals **one masked position per forward pass**; nanoPLM batches positions that share a scoring window into a single forward instead, which is where nearly all the wall-clock goes. The same setting sizes the Jacobian batches for `pbc_zeroshot_contact`.
 
-:::caution[`force_download` clears every framework's cache]
-[`force_download: true`](/nanoplm/reference/eval/#eval-force_download) does not re-download only the framework you are running: it wipes **all** benchmark caches under the autoeval root. Every other framework you evaluate afterwards re-downloads its data too. Use it when new tasks land upstream, then set it back to `false`.
+Positions are grouped by window length so every row in a batch has identical length — no padding is introduced, and each row sees exactly the token slice the per-position path would have passed. A token budget caps the batch for very long windows, so raising this value cannot silently blow up memory on long sequences.
+
+:::caution[Mixture-of-experts checkpoints]
+An MoE forward pass is not batch-composition invariant: what else shares the batch can shift a sequence's logits slightly. Scores for MoE checkpoints will therefore differ marginally from an unbatched run. Set `zero_shot_batch_size: 1` if you need to reproduce older unbatched numbers exactly.
 :::
+
+## Development mode
+
+[`development_mode`](/nanoplm/reference/eval/#eval-development_mode) defaults to `true`, which evaluates a subsampled slice of each benchmark. That is the right setting while iterating. Set it to `false` for numbers you intend to report.
+
+## Offline machines
+
+Benchmark datasets are downloaded on first use into `~/.cache/biotrainer/autoeval/`. On a cluster whose compute nodes have no outbound network, download once somewhere with internet and point [`dataset_dir`](/nanoplm/reference/eval/#eval-dataset_dir) at the resulting tree. `dataset_dir` and `force_download` are mutually exclusive: a pre-populated directory does not use the download cache that `force_download` clears.
 
 ## What you get
 
 <FileTree>
 
 - autoeval_output/
+  - autoeval_report_checkpoint-final.json the combined report
   - checkpoint-final/ the embedder name: defaults to the checkpoint directory's name
-    - pbc_0_2000/ parallel mode: framework, min\_seq\_length, max\_seq\_length
-      - PBC-secondary_structure/
-        - …
+    - PGYM/
+      - … per-task outputs and the zero-shot result cache
+    - PBC_ZEROSHOT_CONTACT/
       - …
-    - … per-task outputs, embeddings, and the combined report
 
 </FileTree>
 
-The combined report is written at the embedder level, so a second framework added to `framework:` later merges into the same report rather than starting a new one. Re-running an evaluation reuses any task result already on disk, so an interrupted benchmark run resumes rather than restarting.
+A second framework added to `framework:` later merges into the same report rather than starting a new one. That also means a framework already present in the report is **reused, not recomputed** — the run logs a warning naming which ones were served from disk. Delete the report, or use a fresh `output_dir`, to force a re-run.
 
 ## Next
 

@@ -135,7 +135,7 @@ class ModernBertCanonLayer(nn.Module):
         bias = self.conv.bias
         # CuTeDSL backend (sm90, bf16, C in 512-3072, K=7); returns x + conv(x).
         if _canon_cute_ops is not None and _canon_cute_ops.is_compatible(
-            x, self.radius
+            x, self.radius, weight, bias
         ):
             return _canon_cute_ops.varlen_canon_conv_residual(
                 x, seq_id, weight, bias, self.radius
@@ -250,7 +250,7 @@ class ModernBertCanonLayer(nn.Module):
         bias = self.conv.bias
         # CuTeDSL backend (sm90, bf16, C in 512-3072, K=7) — ~2-4x the Triton kernels.
         if _canon_cute_ops is not None and _canon_cute_ops.is_compatible(
-            x, self.radius
+            x, self.radius, weight, bias, rms_weight
         ):
             return _canon_cute_ops.varlen_rms_canon_conv(
                 x, seq_id, rms_weight, rms_eps, weight, bias, self.radius

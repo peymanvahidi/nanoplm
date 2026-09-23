@@ -35,7 +35,7 @@ Every field is listed, including the ones a normal run never touches. Those are 
 - The FP8, `torch.compile`, and layerwise-debug knobs.
 - The step-based duration overrides (`train_tokens`, `stable_steps`, `decay_steps`, `max_steps`).
 
-Most of them are pure-torch only, but not all: a few FP8 fields are Transformer Engine recipe knobs. The backend marker next to a field name is the authoritative per-field answer; a field with no marker works on both backends. Pure-TE supports a strictly smaller surface than pure-torch; see [Choose a backend](/nanoplm/guides/backends/) and the [compatibility matrix](/nanoplm/reference/compatibility/).
+Most of them are pure-torch specific; the backend marker next to a field name says so explicitly. Which of them can be combined with recycling is in the [compatibility matrix](/nanoplm/reference/compatibility/).
 
 ## The fields
 
@@ -50,4 +50,4 @@ Most of them are pure-torch only, but not all: a few FP8 fields are Transformer 
 
 The `resume:` block's template comment calls `lr_decay_to_fraction` an optional override for `mode: decay`. That comment is wrong: decay mode **requires** it, and the run raises `resume decay requires lr_decay_to_fraction` without it. `decay_shape` genuinely is optional and falls back to `1-sqrt`.
 
-Backend selection lives outside all three blocks, as the top-level `pure_torch:` / `pure_te:` booleans at the bottom of the template. The scaffold ships `pure_torch: true`; leave it alone for a normal run. A CLI flag can force a backend on but does not clear the other YAML key, so switch by editing those booleans (only one may be true). When a config fails to load, [Troubleshooting](/nanoplm/troubleshooting/) lists every validation error with its fix.
+Backend selection lives outside all three blocks, as the top-level `pure_torch:` boolean at the bottom of the template. The scaffold ships `pure_torch: true`; leave it alone. Pure-torch is the only pretraining backend, and a config that does not select it stops at load. When a config fails to load, [Troubleshooting](/nanoplm/troubleshooting/) lists every validation error with its fix.

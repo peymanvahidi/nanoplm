@@ -28,15 +28,22 @@ class RecyclingScheduler:
         `current_mean` pins the loop-count mean at `target` from step 0.
         Used by `decay` resumes that anneal a trunk which already ran the
         full curriculum.
+    sampling :
+        Overrides `recycling_loop_count_sampling`. Loopie stochastic depth
+        passes "uniform"; Huginn callers pass nothing and read the config.
+    jitter :
+        Half-width of the "uniform" support, {target - jitter, ..., target + jitter}.
     """
 
     def __init__(self, pretraining_config, target_loop_count: int,
-                 total_training_steps: int, *, curriculum_complete: bool = False):
-        self.sampling = pretraining_config.recycling_loop_count_sampling
+                 total_training_steps: int, *, curriculum_complete: bool = False,
+                 sampling: Optional[str] = None, jitter: int = 0):
+        self.sampling = sampling or pretraining_config.recycling_loop_count_sampling
         self.sigma = pretraining_config.recycling_loop_count_sigma
         self.curriculum = pretraining_config.recycling_loop_count_curriculum
         self.target = max(1, int(target_loop_count))
         self.curriculum_complete = bool(curriculum_complete)
+        self.jitter = int(jitter)
 
         cs = pretraining_config.recycling_loop_count_curriculum_steps
         if cs == -1:
@@ -44,10 +51,17 @@ class RecyclingScheduler:
         else:
             self.curriculum_steps = max(1, int(cs))
 
-        if self.sampling not in {"fixed", "lognormal_poisson"}:
+        if self.sampling not in {"fixed", "lognormal_poisson", "uniform"}:
             raise ValueError(
-                f"recycling_loop_count_sampling must be 'fixed' or 'lognormal_poisson', "
-                f"got {self.sampling!r}"
+                f"loop count sampling must be 'fixed', 'lognormal_poisson' or "
+                f"'uniform', got {self.sampling!r}"
+            )
+        # jitter <= target - 1 keeps the support inside [1, ...], so it never
+        # clips at 1 and drags the mean above the target.
+        if self.sampling == "uniform" and not 1 <= self.jitter <= self.target - 1:
+            raise ValueError(
+                f"uniform sampling needs 1 <= jitter <= target - 1 "
+                f"(target={self.target}), got jitter={self.jitter}"
             )
         if self.curriculum not in {"none", "linear", "1_sqrt"}:
             raise ValueError(
@@ -69,10 +83,15 @@ class RecyclingScheduler:
         return max(1, int(k))
 
     def sample(self, step: int, device: torch.device, generator: torch.Generator) -> int:
-        """Sample r ~ Poisson(exp(N(log(r_bar) - 0.5 σ², σ))) + 1."""
+        """Sample r ~ Poisson(exp(N(log(r_bar) - 0.5 σ², σ))) + 1, or r ~ U{k ± jitter}."""
         k_t = self.current_mean(step)
         if self.sampling == "fixed":
             return k_t
+        if self.sampling == "uniform":
+            return int(torch.randint(
+                k_t - self.jitter, k_t + self.jitter + 1, (1,),
+                device=device, generator=generator,
+            ).item())
         r_bar = max(1, k_t - 1)
         sigma = self.sigma
         log_lambda = (

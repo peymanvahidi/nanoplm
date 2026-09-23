@@ -25,37 +25,28 @@ import torch
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 
-_TE_IMPORT_ERROR = None
-try:
-    from nanoplm.pretraining.te_pipeline import run_te_pretraining
-except Exception as exc:  # pragma: no cover - depends on TE/FA availability
-    _TE_IMPORT_ERROR = exc
-
-    def run_te_pretraining(*_args, **_kwargs):
-        raise ImportError(
-            "Transformer Engine pretraining requested but unavailable in this environment."
-        ) from _TE_IMPORT_ERROR
-
-
 from nanoplm.pretraining.models.modern_bert.model import (
     ProtModernBertMLM,
     ProtModernBertMLMConfig,
 )
-from nanoplm.pretraining.models.modern_bert.pure_model import (
-    PureProtModernBertMLM,
-    TEProtModernBertMLM,
-)
+from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.data.infra.validation import validate_pretrain_dataset
 from nanoplm.data.infra.manifest import read_manifest, validate_manifest_for_pipeline, DataManifest
 from nanoplm.utils.common import read_yaml, create_dirs, is_flash_attention_available
 from nanoplm.cli.templates import load_template
+from nanoplm.cli._common import (
+    YAML_FIRST_SECTIONS,
+    ConfigErrorGroup,
+    log_level_option,
+    unknown_keys_message,
+)
 from nanoplm.utils.logger import logger
 
 
 def _check_muon_available(optimizer: str) -> None:
     """Abort early when a Muon variant is requested but ``dion`` is not installed."""
     optimizer_name = optimizer.lower()
-    if optimizer_name in {"muon", "normuon", "muonh", "aurora"}:
+    if optimizer_name in {"muon", "normuon", "nordion2"}:
         try:
             import dion
         except ImportError:
@@ -63,7 +54,7 @@ def _check_muon_available(optimizer: str) -> None:
                 f"Optimizer '{optimizer}' requires the 'dion' package which is not installed.\n"
                 "Install it with:  pip install nanoplm[cuda]"
             )
-        required_class = {"muon": "Muon", "normuon": "NorMuon", "muonh": "MuonH", "aurora": "Aurora"}[optimizer_name]
+        required_class = {"muon": "Muon", "normuon": "NorMuon", "nordion2": "NorDion2"}[optimizer_name]
         if not hasattr(dion, required_class):
             raise click.ClickException(
                 f"Optimizer '{optimizer}' requires dion.{required_class}, but this Dion build does not expose it."
@@ -135,13 +126,12 @@ def _validate_distributed_mode(
     cfg: PretrainingConfig,
     *,
     pure_torch: bool,
-    pure_te: bool,
 ) -> None:
     cfg.distributed_mode = _normalize_distributed_mode(cfg.distributed_mode)
     cfg.ddp_bucket_cap_mb = int(cfg.ddp_bucket_cap_mb)
     if cfg.ddp_bucket_cap_mb <= 0:
         raise click.ClickException("ddp_bucket_cap_mb must be > 0.")
-    if not (pure_torch or pure_te):
+    if not pure_torch:
         return
     if cfg.distributed_mode in {"ddp", "hsdp"} and not cfg.multi_gpu:
         raise click.ClickException(
@@ -155,53 +145,21 @@ def _validate_distributed_mode(
         raise click.ClickException(
             "ddp_bucket_cap_mb applies only when distributed_mode=ddp."
         )
+    cfg.fsdp_reduce_dtype = str(cfg.fsdp_reduce_dtype).lower()
+    if cfg.fsdp_reduce_dtype not in {"fp32", "bf16"}:
+        raise click.ClickException("fsdp_reduce_dtype must be fp32 or bf16.")
 
 
-def _validate_muonh_wo_init_compat(
-    pretrain_cfg: PretrainingConfig,
-    model_cfg: ProtModernBertMLMConfig,
-) -> None:
-    optimizer = str(pretrain_cfg.optimizer).strip().lower()
-    wo_init = str(getattr(model_cfg, "wo_init", "zero")).strip().lower()
-    if optimizer == "muonh" and wo_init == "zero":
-        raise click.ClickException(
-            "optimizer=muonh is incompatible with model.wo_init='zero'. "
-            "MuonH initializes each matrix hyperball radius from ||W_init||_F, "
-            "so zero-initialized Wo matrices are locked at zero. "
-            "Set model.wo_init='kaiming' (or --wo-init kaiming)."
-        )
-
-
-def _validate_debug_layerwise_metrics_compat(
-    cfg: PretrainingConfig,
-    *,
-    pure_te: bool,
-) -> None:
-    if pure_te and cfg.debug_layerwise_metrics:
-        raise click.ClickException(
-            "debug_layerwise_metrics is not supported with --pure-te / pure_te: true. "
-            "Use the pure-torch path for layerwise debug hooks, or disable debug_layerwise_metrics."
-        )
-
-
-def _check_pipeline_supported(pure_torch: bool, pure_te: bool,
-                              lr_schedule: str, resume_mode) -> None:
-    """Pretraining requires pure_torch or pure_te; wsd/decay require pure_torch (spec section 14)."""
-    if not (pure_torch or pure_te):
+def _check_pipeline_supported(pure_torch: bool) -> None:
+    """Pretraining requires pure_torch (spec section 14)."""
+    if not pure_torch:
         raise ValueError(
-            "Pretraining requires pure_torch: true or pure_te: true. "
+            "Pretraining requires pure_torch: true. "
             "The HF Trainer pretraining path is no longer supported."
         )
-    sched = (lr_schedule or "").lower()
-    mode = (resume_mode or "").lower() if resume_mode else None
-    if not pure_torch and (sched == "wsd" or mode == "decay"):
-        raise ValueError(
-            "lr_schedule: wsd and resume mode: decay require pure_torch: true "
-            "(TE supports warmup_stable/cosine/linear + continue only)."
-        )
 
 
-@click.group(name="pretrain")
+@click.group(name="pretrain", cls=ConfigErrorGroup, sections=YAML_FIRST_SECTIONS)
 @click.help_option("--help", "-h")
 def pretrain():
     """Group of commands for model pretraining."""
@@ -209,6 +167,7 @@ def pretrain():
 
 
 @pretrain.command("run")
+@log_level_option
 @click.help_option("--help", "-h")
 # Dataset and output
 @click.option(
@@ -340,7 +299,7 @@ def pretrain():
 @click.option(
     "--optimizer",
     type=click.Choice(
-        ["adamw", "stable_adamw", "muon", "normuon", "muonh", "aurora"], case_sensitive=False
+        ["adamw", "stable_adamw", "muon", "normuon", "nordion2"], case_sensitive=False
     ),
     default="normuon",
     help="Optimizer to use",
@@ -352,13 +311,13 @@ def pretrain():
     "--muon-learning-rate",
     type=float,
     default=1e-3,
-    help="Muon-family LR (used when optimizer=muon, normuon, muonh, or aurora; learning-rate remains AdamW LR)",
+    help="Matrix-optimizer LR (used when optimizer=muon, normuon, or nordion2; learning-rate remains AdamW LR)",
 )
 @click.option(
     "--muon-weight-decay",
     type=float,
     default=0.01,
-    help="Muon-family matrix weight decay (used when optimizer=muon, normuon, muonh, or aurora)",
+    help="Matrix-optimizer weight decay (used when optimizer=muon, normuon, or nordion2)",
 )
 @click.option(
     "--muon-cautious-weight-decay/--no-muon-cautious-weight-decay",
@@ -388,11 +347,43 @@ def pretrain():
     help="Muon-family epsilon",
 )
 @click.option(
-    "--muonh-normalization",
-    type=click.Choice(["neuron", "short_axis", "none"], case_sensitive=False),
-    default="neuron",
-    help="MuonH update normalization (used only when optimizer=muonh): "
-    "'neuron' = per-row, 'short_axis' = along the shorter matrix axis, 'none' = disabled.",
+    "--muon-adjust-lr",
+    type=click.Choice(["rms_norm", "spectral_norm", "none"], case_sensitive=False),
+    default="rms_norm",
+    help="Update LR adjustment for the matrix optimizer (muon/normuon/nordion2).",
+)
+@click.option(
+    "--muon-beta2",
+    type=float,
+    default=0.95,
+    help="Second-moment beta for NorMuon/NorDion2 (ignored by plain Muon)",
+)
+@click.option(
+    "--muon-use-gram-newton-schulz/--no-muon-use-gram-newton-schulz",
+    default=False,
+    help="Use the Gram-Newton-Schulz orthogonalization kernels where supported",
+)
+@click.option(
+    "--muon-triton-post-ortho/--no-muon-triton-post-ortho",
+    default=False,
+    help="NorDion2: run the post-orthogonalization step in Triton",
+)
+@click.option(
+    "--muon-flatten/--no-muon-flatten",
+    default=False,
+    help="Flatten >2D matrix params before orthogonalization where supported",
+)
+@click.option(
+    "--nordion2-fraction",
+    type=float,
+    default=0.25,
+    help="NorDion2 low-rank fraction (used only when optimizer=nordion2)",
+)
+@click.option(
+    "--nordion2-selection-scope",
+    type=click.Choice(["local", "global"], case_sensitive=False),
+    default="local",
+    help="NorDion2 FSDP2 row-shard selection scope (used only when optimizer=nordion2)",
 )
 @click.option("--mlm-probability", type=float, default=0.3, help="MLM probability")
 @click.option(
@@ -438,6 +429,16 @@ def pretrain():
     default=2500,
     help="Number of steps between checkpoint saves",
 )
+@click.option(
+    "--max-wallclock-hours",
+    type=float,
+    default=None,
+    help="Stop training after this many hours, checkpointing at the first "
+    "optimizer step past the deadline, even if the token budget is unspent. "
+    "For wall-clock-matched ablations. The clock starts a couple of optimizer "
+    "steps in, so compile/warmup is excluded and total job time is longer; it "
+    "also restarts on resume rather than accumulating.",
+)
 @click.option("--seed", type=int, default=42, help="Random seed")
 @click.option(
     "--debug-non-finite-params/--no-debug-non-finite-params",
@@ -448,8 +449,7 @@ def pretrain():
     "--debug-layerwise-metrics/--no-debug-layerwise-metrics",
     default=False,
     help="Log per-layer grad/weight norms, residual-stream RMS, and logit stats. "
-    "Has non-trivial overhead; installs forward hooks that may break torch.compile graphs. "
-    "Not supported with --pure-te.",
+    "Has non-trivial overhead; installs forward hooks that may break torch.compile graphs.",
 )
 @click.option(
     "--debug-layerwise-log-every",
@@ -512,7 +512,7 @@ def pretrain():
 @click.option(
     "--fp8/--no-fp8",
     default=False,
-    help="Enable FP8 Linear matmuls in pure-torch/TE paths (CUDA only, best on H100+)",
+    help="Enable FP8 Linear matmuls in the pure-torch path (CUDA only, best on H100+)",
 )
 @click.option(
     "--fp8-target",
@@ -566,7 +566,7 @@ def pretrain():
     type=click.Choice(["fsdp", "ddp"], case_sensitive=False),
     default="fsdp",
     show_default=True,
-    help="Distributed wrapper for multi-GPU runs. DDP is supported only in pure-torch / pure-te.",
+    help="Distributed wrapper for multi-GPU runs.",
 )
 @click.option(
     "--fsdp-shard-granularity",
@@ -580,7 +580,7 @@ def pretrain():
     "--fsdp-reshard-after-forward/--no-fsdp-reshard-after-forward",
     default=False,
     show_default=True,
-    help="Universal FSDP2 reshard_after_forward setting for all fully_shard groups in pure-torch / pure-te.",
+    help="Universal FSDP2 reshard_after_forward setting for all fully_shard groups.",
 )
 @click.option(
     "--world-size",
@@ -712,7 +712,7 @@ def pretrain():
 )
 @click.option(
     "--mlp-activation",
-    type=click.Choice(["swiglu", "glu", "srelu"], case_sensitive=False),
+    type=click.Choice(["swiglu", "geglu", "srelu"], case_sensitive=False),
     default="swiglu",
     help="MLP activation",
 )
@@ -729,7 +729,7 @@ def pretrain():
     "--classifier-activation",
     type=click.Choice(["relu", "gelu", "srelu"], case_sensitive=False),
     default="gelu",
-    help="Classifier activation (srelu is supported only in pure-torch and pure-te paths)",
+    help="Classifier activation (srelu is supported only in the pure-torch path)",
 )
 @click.option(
     "--use-resid-lambdas/--no-use-resid-lambdas",
@@ -908,12 +908,6 @@ def pretrain():
     default=False,
     help="Use custom pure-torch model and training loop instead of HF Trainer",
 )
-@click.option(
-    "--pure-te",
-    is_flag=True,
-    default=False,
-    help="Use Transformer Engine model and training loop instead of HF Trainer",
-)
 def run(
     # dataset/output
     dataset_dir: str,
@@ -947,7 +941,13 @@ def run(
     muon_momentum: float,
     muon_nesterov: bool,
     muon_eps: float,
-    muonh_normalization: str,
+    muon_adjust_lr: str,
+    muon_beta2: float,
+    muon_use_gram_newton_schulz: bool,
+    muon_triton_post_ortho: bool,
+    muon_flatten: bool,
+    nordion2_fraction: float,
+    nordion2_selection_scope: str,
     mlm_probability: float,
     mlm_masking_strategy: str,
     mlm_span_mean_length: float,
@@ -956,6 +956,7 @@ def run(
     logging_steps: int,
     eval_steps: int,
     save_steps: int,
+    max_wallclock_hours: Optional[float],
     seed: int,
     debug_non_finite_params: bool,
     debug_layerwise_metrics: bool,
@@ -1039,7 +1040,6 @@ def run(
     mhc_n_streams: int,
     mhc_lite_wrapping_level: str,
     pure_torch: bool,
-    pure_te: bool,
 ):
     """Run MLM pretraining with ModernBERT backbone."""
 
@@ -1077,7 +1077,13 @@ def run(
         muon_momentum=muon_momentum,
         muon_nesterov=muon_nesterov,
         muon_eps=muon_eps,
-        muonh_normalization=muonh_normalization,
+        muon_adjust_lr=muon_adjust_lr,
+        muon_beta2=muon_beta2,
+        muon_use_gram_newton_schulz=muon_use_gram_newton_schulz,
+        muon_triton_post_ortho=muon_triton_post_ortho,
+        muon_flatten=muon_flatten,
+        nordion2_fraction=nordion2_fraction,
+        nordion2_selection_scope=nordion2_selection_scope,
         mlm_probability=mlm_probability,
         mlm_masking_strategy=mlm_masking_strategy,
         mlm_span_mean_length=mlm_span_mean_length,
@@ -1089,6 +1095,7 @@ def run(
         logging_steps=logging_steps,
         eval_steps=eval_steps,
         save_steps=save_steps,
+        max_wallclock_hours=max_wallclock_hours,
         seed=seed,
         debug_non_finite_params=debug_non_finite_params,
         debug_layerwise_metrics=debug_layerwise_metrics,
@@ -1122,38 +1129,29 @@ def run(
         profiler_end_step=profiler_end_step,
     )
 
-    if pure_torch and pure_te:
-        raise click.ClickException("--pure-torch and --pure-te are mutually exclusive.")
     if use_canon_layers and not pure_torch:
         raise click.ClickException(
             "use_canon_layers requires --pure-torch. "
-            "Canon layers are not implemented in HF/TE paths."
+            "Canon layers are not implemented in the HF path."
         )
-    if classifier_activation.lower() == "srelu" and not (pure_torch or pure_te):
+    if classifier_activation.lower() == "srelu" and not pure_torch:
         raise click.ClickException(
-            "classifier_activation=srelu requires --pure-torch or --pure-te. "
+            "classifier_activation=srelu requires --pure-torch. "
             "The default HF path supports only relu/gelu."
         )
     if (
         num_kv_heads is not None
         and num_kv_heads != num_attention_heads
-        and not (pure_torch or pure_te)
+        and not pure_torch
     ):
         raise click.ClickException(
-            "GQA requires --pure-torch or --pure-te. "
+            "GQA requires --pure-torch. "
             "The default HF path does not implement num_kv_heads != num_attention_heads."
         )
-    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not (
-        pure_torch or pure_te
-    ):
+    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not pure_torch:
         raise click.ClickException(
-            "mHC-lite requires --pure-torch or --pure-te. "
-            "Set one of those modes (or disable mHC-lite settings)."
-        )
-    if pure_te and mhc_lite_wrapping_level.lower() != "layer":
-        raise click.ClickException(
-            "Transformer Engine currently supports only layer-level mHC-lite. "
-            "Set --mhc-lite-wrapping-level layer or use --pure-torch."
+            "mHC-lite requires --pure-torch. "
+            "Set that mode (or disable mHC-lite settings)."
         )
     if use_mhc_lite and use_resid_lambdas:
         raise click.ClickException(
@@ -1161,8 +1159,7 @@ def run(
             "resid_lambdas scales the hidden state before each layer, which breaks "
             "mHC-lite's doubly-stochastic stability guarantees."
         )
-    _validate_debug_layerwise_metrics_compat(cfg, pure_te=pure_te)
-    _validate_distributed_mode(cfg, pure_torch=pure_torch, pure_te=pure_te)
+    _validate_distributed_mode(cfg, pure_torch=pure_torch)
 
     _populate_batch_setup(cfg)
 
@@ -1208,31 +1205,26 @@ def run(
         moe_kernel_backend=moe_kernel_backend.lower(),
     )
 
-    _validate_muonh_wo_init_compat(cfg, model_cfg)
-
     _set_seed_for_init(seed)
     if use_diff_attn_v2 and not pure_torch:
         raise click.ClickException(
             "use_diff_attn_v2 requires --pure-torch. "
-            "Differential Attention V2 is not implemented in HF/TE paths."
+            "Differential Attention V2 is not implemented in the HF path."
         )
     if use_paired_head_attention and not pure_torch:
         raise click.ClickException(
             "use_paired_head_attention requires --pure-torch. "
-            "Paired head attention is not implemented in HF/TE paths."
+            "Paired head attention is not implemented in the HF path."
         )
     if use_paired_head_attention and use_diff_attn_v2:
         raise click.ClickException(
             "use_paired_head_attention and use_diff_attn_v2 are mutually exclusive."
         )
-    # Fail fast before any heavy manifest/model instantiation: only
-    # pure_torch/pure_te pipelines are supported, and wsd/decay require
-    # pure_torch. The HF Trainer pretraining path is no longer supported.
+    # Fail fast before any heavy manifest/model instantiation: only the
+    # pure_torch pipeline is supported. The HF Trainer pretraining path is
+    # no longer supported.
     try:
-        _check_pipeline_supported(
-            pure_torch, pure_te, cfg.lr_schedule,
-            resume_mode if resume else None,
-        )
+        _check_pipeline_supported(pure_torch)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -1242,10 +1234,7 @@ def run(
         raise click.ClickException(str(exc)) from exc
 
     manifest = _load_manifest_and_inject(cfg, model_cfg)
-    if pure_te:
-        logger.info("Using Transformer Engine model and training loop")
-        model = TEProtModernBertMLM(model_cfg)
-    elif pure_torch:
+    if pure_torch:
         logger.info("Using pure-torch model and training loop")
         model = PureProtModernBertMLM(model_cfg)
     else:
@@ -1277,14 +1266,7 @@ def run(
         raise click.ClickException("--resume requires --resume-checkpoint-dir")
     _validate_resume_config_modes(resume_cfg)
 
-    if pure_te:
-        run_te_pretraining(
-            model=model,
-            pretrain_config=cfg,
-            manifest=manifest,
-            resume_config=resume_cfg if resume_cfg.is_resume else None,
-        )
-    elif pure_torch:
+    if pure_torch:
         run_pure_pretraining(
             model=model,
             pretrain_config=cfg,
@@ -1294,6 +1276,7 @@ def run(
 
 
 @pretrain.command("from-yaml")
+@log_level_option
 @click.help_option("--help", "-h")
 @click.argument(
     "config",
@@ -1306,13 +1289,7 @@ def run(
     default=False,
     help="Use custom pure-torch model and training loop instead of HF Trainer",
 )
-@click.option(
-    "--pure-te",
-    is_flag=True,
-    default=False,
-    help="Use Transformer Engine model and training loop instead of HF Trainer",
-)
-def from_yaml(config: str, pure_torch: bool, pure_te: bool):
+def from_yaml(config: str, pure_torch: bool):
     """Run pretraining from a YAML file with training and model parameters.
 
         model: {...}
@@ -1322,14 +1299,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     If resume.is_resume is True, training will resume from the given
     checkpoint using the hyperparameters in the 'pretraining' block.
     """
-    config = Path(config)
-
-    if config.is_absolute():
-        cwd = config.parent
-        pretrain_yaml = config
-    else:
-        cwd = Path.cwd()
-        pretrain_yaml = cwd / config
+    pretrain_yaml = Path(config).resolve()
 
     raw = read_yaml(pretrain_yaml)
 
@@ -1341,48 +1311,39 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
     if not pure_torch:
         pure_torch = bool(raw.get("pure_torch", False))
-    if not pure_te:
-        pure_te = bool(raw.get("pure_te", False))
-
-    if pure_torch and pure_te:
-        raise click.ClickException("pure_torch and pure_te cannot both be true.")
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
+    # A relative dataset_dir or ckp_dir resolves against the process working
+    # directory, not against the config file. Resolving here is what makes the
+    # downstream "Validating pretraining dataset: ..." log name a path a reader
+    # can still find weeks later.
+    pretrain_config.dataset_dir = str(Path(pretrain_config.dataset_dir).resolve())
+    pretrain_config.ckp_dir = str(Path(pretrain_config.ckp_dir).resolve())
     _check_muon_available(pretrain_config.optimizer)
 
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
     _validate_resume_config_modes(resume_config)
-    _validate_muonh_wo_init_compat(pretrain_config, model_config)
     if getattr(model_config, "use_noble", False) and not pure_torch:
         raise click.ClickException(
             "model.use_noble=true requires pure_torch: true (or --pure-torch). "
-            "NOBLE is not implemented in HF/TE paths."
+            "NOBLE is not implemented in the HF path."
         )
     if model_config.use_canon_layers and not pure_torch:
         raise click.ClickException(
             "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
-            "Canon layers are not implemented in HF/TE paths."
+            "Canon layers are not implemented in the HF path."
         )
     if (
         model_config.use_mhc_lite
         or str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower()
         != "layer"
-    ) and not (pure_torch or pure_te):
+    ) and not pure_torch:
         raise click.ClickException(
             "model.use_mhc_lite=true (or model.mhc_lite_wrapping_level != 'layer') "
-            "requires pure_torch: true / --pure-torch or pure_te: true / --pure-te. "
+            "requires pure_torch: true / --pure-torch. "
             "mHC-lite is not implemented in the HF path."
-        )
-    if (
-        pure_te
-        and str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower()
-        != "layer"
-    ):
-        raise click.ClickException(
-            "Transformer Engine currently supports only layer-level mHC-lite. "
-            "Set model.mhc_lite_wrapping_level: layer or use pure_torch: true."
         )
     if model_config.use_mhc_lite and model_config.use_resid_lambdas:
         raise click.ClickException(
@@ -1393,12 +1354,12 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
     if getattr(model_config, "use_diff_attn_v2", False) and not pure_torch:
         raise click.ClickException(
             "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
-            "Differential Attention V2 is not implemented in HF/TE paths."
+            "Differential Attention V2 is not implemented in the HF path."
         )
     if getattr(model_config, "use_paired_head_attention", False) and not pure_torch:
         raise click.ClickException(
             "model.use_paired_head_attention=true requires pure_torch: true (or --pure-torch). "
-            "Paired head attention is not implemented in HF/TE paths."
+            "Paired head attention is not implemented in the HF path."
         )
     if getattr(model_config, "use_paired_head_attention", False) and getattr(
         model_config, "use_diff_attn_v2", False
@@ -1408,41 +1369,30 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         )
     if str(
         getattr(model_config, "classifier_activation", "gelu")
-    ).lower() == "srelu" and not (pure_torch or pure_te):
+    ).lower() == "srelu" and not pure_torch:
         raise click.ClickException(
-            "model.classifier_activation=srelu requires pure_torch: true / --pure-torch or "
-            "pure_te: true / --pure-te. The HF path supports only relu/gelu."
+            "model.classifier_activation=srelu requires pure_torch: true / --pure-torch. "
+            "The HF path supports only relu/gelu."
         )
     if (
         getattr(model_config, "num_kv_heads", None) is not None
         and model_config.num_kv_heads != model_config.num_attention_heads
-        and not (pure_torch or pure_te)
+        and not pure_torch
     ):
         raise click.ClickException(
-            "model.num_kv_heads != model.num_attention_heads requires pure_torch: true / --pure-torch "
-            "or pure_te: true / --pure-te. The HF path does not implement GQA."
+            "model.num_kv_heads != model.num_attention_heads requires "
+            "pure_torch: true / --pure-torch. The HF path does not implement GQA."
         )
-    _validate_debug_layerwise_metrics_compat(pretrain_config, pure_te=pure_te)
-    _validate_distributed_mode(
-        pretrain_config,
-        pure_torch=pure_torch,
-        pure_te=pure_te,
-    )
+    _validate_distributed_mode(pretrain_config, pure_torch=pure_torch)
     _populate_batch_setup(pretrain_config)
 
-    # Fail fast before any heavy model instantiation: only pure_torch/pure_te
-    # pipelines are supported, and wsd/decay require pure_torch.
-    _check_pipeline_supported(
-        pure_torch, pure_te, pretrain_config.lr_schedule,
-        resume_config.mode if resume_config.is_resume else None,
-    )
+    # Fail fast before any heavy model instantiation: only the pure_torch
+    # pipeline is supported.
+    _check_pipeline_supported(pure_torch)
 
     manifest = _load_manifest_and_inject(pretrain_config, model_config)
     _set_seed_for_init(pretrain_config.seed)
-    if pure_te:
-        logger.info("Using Transformer Engine model and training loop")
-        model = TEProtModernBertMLM(config=model_config)
-    elif pure_torch:
+    if pure_torch:
         logger.info("Using pure-torch model and training loop")
         model = PureProtModernBertMLM(config=model_config)
 
@@ -1459,14 +1409,7 @@ def from_yaml(config: str, pure_torch: bool, pure_te: bool):
         logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    if pure_te:
-        run_te_pretraining(
-            model=model,
-            pretrain_config=pretrain_config,
-            manifest=manifest,
-            resume_config=resume_config if resume_config.is_resume else None,
-        )
-    elif pure_torch:
+    if pure_torch:
         run_pure_pretraining(
             model=model,
             pretrain_config=pretrain_config,
@@ -1572,9 +1515,7 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
             kwargs[key] = value
 
     if extra:
-        raise ValueError(
-            f"Unexpected training configuration keys: {', '.join(sorted(extra))}"
-        )
+        raise ValueError(unknown_keys_message("training", extra, expected_keys))
 
     # Explicitly convert float-like fields if they are strings (handles scientific notation).
     float_fields = [
@@ -1588,6 +1529,9 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_weight_decay",
         "muon_momentum",
         "muon_eps",
+        "muon_beta2",
+        "nordion2_fraction",
+        "max_wallclock_hours",
         "min_lr",
         "noble_base_lr",
         "noble_lr_gamma",
@@ -1664,6 +1608,9 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "muon_nesterov",
         "muon_cautious_weight_decay",
         "muon_use_polar_express",
+        "muon_use_gram_newton_schulz",
+        "muon_triton_post_ortho",
+        "muon_flatten",
         "use_packing",
         "use_static_inp_size",
         "use_compile_max_autotune",
