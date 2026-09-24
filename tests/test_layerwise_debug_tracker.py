@@ -150,3 +150,35 @@ def test_repeat_tap_adds_no_state_dict_keys():
     for cfg in (_cfg(), _cfg(use_loopie=True, loopie_loop_count=2)):
         model = PureProtModernBertMLM(cfg)
         assert not [k for k in model.state_dict() if "repeat_tap" in k]
+
+
+def test_taps_add_no_state_dict_keys_or_buffers(tmp_path):
+    """The tracker's accumulators are plain attributes, not params/buffers.
+
+    A registered buffer would land in the checkpoint (and, under FSDP2, in the
+    sharding plan), so the taps must stay invisible to `state_dict`,
+    `named_buffers` and `named_parameters` even while they are accumulating.
+    """
+    model = PureProtModernBertMLM(_cfg(use_loopie=True, loopie_loop_count=2))
+    model.train()
+    keys_before = set(model.state_dict())
+    bufs_before = {n for n, _ in model.named_buffers()}
+    params_before = {n for n, _ in model.named_parameters()}
+    assert not [k for k in keys_before if "tap" in k]
+    assert not [n for n in bufs_before if "tap" in n]
+
+    tracker = _tracker(model, tmp_path, max_rep=2)
+    try:
+        _run(model, 1)
+        assert float(tracker.residual_count.sum()) > 0.0, "taps did not accumulate"
+        assert set(model.state_dict()) == keys_before
+        assert {n for n, _ in model.named_buffers()} == bufs_before
+        assert {n for n, _ in model.named_parameters()} == params_before
+    finally:
+        tracker.close()
+
+    # close() puts every tap back to plain-identity.
+    assert set(model.state_dict()) == keys_before
+    assert model.logit_tap.stats is None
+    assert model.model.final_norm_tap.stats is None
+    assert all(layer.repeat_tap.stats is None for layer in model.model.layers)

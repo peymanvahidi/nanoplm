@@ -61,6 +61,10 @@ from .canon_layer import (
     _varlen_canon_inner,
 )
 
+# Debug-stat taps. They live in their own module because `canon_layer` needs
+# them too and this module imports `canon_layer`.
+from .taps import RepeatTap, StatsTap
+
 from nanoplm.pretraining.cpu_offload import run_flush
 
 
@@ -792,15 +796,6 @@ def _residual_add(
     return x + alpha * branch_out
 
 
-class RepeatTap(nn.Module):
-    """Identity; exists only as a forward-hook anchor so that debug metrics can
-    attribute a residual-stream sample to one loop application (see
-    ``nanoplm.pretraining.debug_metrics``)."""
-
-    def forward(self, x: torch.Tensor, rep: int) -> torch.Tensor:
-        return x
-
-
 class ModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
@@ -821,6 +816,11 @@ class ModernBertEncoderLayer(nn.Module):
             .strip()
             .lower()
         )
+        # Layer-mode AC is applied by `forward` itself (see
+        # `_use_internal_layer_ac`). A parent block that already checkpoints
+        # this layer clears the flag so the two never nest
+        # (`MHCLiteBlock.__init__`).
+        self._layer_ac_internal: bool = True
         self.attn_norm = (
             nn.Identity()
             if layer_idx == 0
@@ -867,6 +867,36 @@ class ModernBertEncoderLayer(nn.Module):
             self.canon_c = None
             self.mlp = None
 
+    def _use_internal_layer_ac(self) -> bool:
+        """Whether ``forward`` checkpoints its own unrolled loop.
+
+        Placement matters more than the checkpoint itself. FSDP2 installs its
+        pre/post-forward hooks on ``__call__`` (``register_forward_pre_hook``),
+        so a checkpoint opened *here* has no hook inside its body: the nesting
+        is FSDP(AC(layer)), the call becomes one ``tag_activation_checkpoint``
+        HOP, the min-cut partitioner picks what to save, and recompute is
+        bounded to this one layer. Checkpointing the layer from the encoder loop
+        instead — AC(FSDP(layer)) — puts those ``torch._dynamo.disable``d hooks
+        in the body, where the HOP cannot be traced through them: Dynamo reports
+        "Attempted to call function marked as skipped / Higher Order Operator:
+        torch.utils.checkpoint.checkpoint", cannot resume, and drops the layer
+        to eager, so the backward re-materialised ~15 layers at once (77 GB at
+        micro-batch 128, R=3; experiments/loop-imp-v4/NOTES.md, Step 3 / R1).
+
+        ``attn``/``attn+mlp`` modes are unaffected: they checkpoint branches
+        inside ``_forward_once`` and are already inside the unit. Intended side
+        effect of checkpointing from here: the Huginn recycling path
+        (prelude/recurrent/coda), which calls layers outside the encoder loop
+        that held the old wrapper, now honours layer mode too — it silently
+        ignored it before.
+        """
+        return (
+            self._layer_ac_internal
+            and self.activation_checkpointing
+            and self.training
+            and self.activation_checkpointing_mode == "layer"
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -881,7 +911,13 @@ class ModernBertEncoderLayer(nn.Module):
         prores_alpha: "torch.Tensor | float" = 1.0,
         loop_count: "torch.Tensor | int | None" = None,
     ) -> torch.Tensor:
-        if loop_count is None:
+        if not isinstance(loop_count, torch.Tensor):
+            # Fixed depth (None -> self.repeats) or a Python int R. Both are
+            # trace-time constants, so the loop unrolls inside the compiled
+            # graph and Dynamo specializes one whole-model graph per distinct R
+            # (three for R ~ U{1,2,3}); R=2 traces the same graph as a fixed
+            # loopie_loop_count=2 model. A tensor R takes the eager driver below.
+            r = self.repeats if loop_count is None else int(loop_count)
             once_kwargs = dict(
                 attn_mask=attn_mask,
                 cos_sin=cos_sin,
@@ -893,18 +929,31 @@ class ModernBertEncoderLayer(nn.Module):
                 repo_active=repo_active,
                 prores_alpha=prores_alpha,
             )
-            no_grad_reps = 0 if self.bptt is None else max(0, self.repeats - self.bptt)
-            for rep in range(self.repeats):
-                if rep < no_grad_reps:
-                    with torch.no_grad():
-                        h = self._forward_once(x, **once_kwargs)
-                    # Not a no-op: forward is exactly h, backward is the identity,
-                    # so the layers below keep their only path to the loss.
-                    x = h + (x - x.detach())
-                else:
-                    x = self._forward_once(x, **once_kwargs)
-                x = self.repeat_tap(x, rep)
-            return x
+            no_grad_reps = 0 if self.bptt is None else max(0, r - self.bptt)
+
+            def _unrolled(x_in: torch.Tensor) -> torch.Tensor:
+                # `r` and `no_grad_reps` are Python ints, i.e. trace-time
+                # constants, so this unrolls inside the graph (or inside the
+                # checkpoint HOP) exactly as it did inline.
+                for rep in range(r):
+                    if rep < no_grad_reps:
+                        with torch.no_grad():
+                            h = self._forward_once(x_in, **once_kwargs)
+                        # Not a no-op: forward is exactly h, backward is the
+                        # identity, so the layers below keep their only path to
+                        # the loss. Recompute re-runs both deterministically.
+                        x_in = h + (x_in - x_in.detach())
+                    else:
+                        x_in = self._forward_once(x_in, **once_kwargs)
+                    x_in = self.repeat_tap(x_in, rep)
+                return x_in
+
+            if self._use_internal_layer_ac():
+                # Only the non-reentrant API is traceable as a HOP, and it needs
+                # no tensor arguments for gradients to reach the closed-over
+                # tensors (cos_sin, prores_alpha, the parameters).
+                return _checkpoint(_unrolled, x, use_reentrant=False)
+            return _unrolled(x)
         return self._forward_repeats(
             x,
             loop_count,
@@ -928,23 +977,20 @@ class ModernBertEncoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Apply this layer ``loop_count`` times, driven from eager Python.
 
-        Same contract and same reason as ``ModernBertModel._drive_recurrence``:
-        a variable trip count inside a traced graph makes Dynamo specialize on
-        the Python int, so every distinct count costs a guard miss + fresh
-        trace + autotune pass. Compiled callers pass a 0-d int64 tensor, which
-        installs no equality guard at this disable boundary, and
-        ``recursive=False`` lets each ``_forward_once`` re-enter Dynamo and
-        compile as its own cached graph.
-
-        ``forward`` keeps its own unrolled ``range(self.repeats)`` branch
-        instead of delegating here, so a fixed-depth run traces exactly the
-        graph it traced before this method existed.
+        Tensor-R fallback, same contract as ``ModernBertModel._drive_recurrence``:
+        a 0-d int64 tensor installs no equality guard at this disable boundary,
+        and ``recursive=False`` lets each ``_forward_once`` re-enter Dynamo and
+        compile as its own cached graph. The price is a graph break at every
+        stored layer, so the loopie training path no longer uses it: it passes
+        a Python int, and ``forward`` unrolls it (one whole-model graph per
+        distinct R, which for a support of three values is cheaper than
+        L graph breaks per step). Keep this for callers whose R support is wide
+        enough to thrash the Dynamo cache.
 
         Grad mode is a Dynamo guard, so with ``bptt`` set the ``no_grad``
-        applications compile their own ``_forward_once`` entries: the frame
+        applications compile their own ``_forward_once`` entries: this frame
         needs (distinct layers) x (input shapes) x 2 cache slots, which can
-        exceed Dynamo's default 8. ``pure_pipeline._dynamo_recompile_limit``
-        sizes the limit.
+        exceed Dynamo's default 8.
         """
         r = int(loop_count.item()) if isinstance(loop_count, torch.Tensor) else int(loop_count)
         no_grad_reps = 0 if self.bptt is None else max(0, r - self.bptt)
@@ -1275,6 +1321,11 @@ class MHCLiteBlock(nn.Module):
         self.C = hidden_size
         self.nC = n_streams * hidden_size
         self.layer = layer
+        # This block is what the encoder loop checkpoints in layer mode, so the
+        # wrapped layer must not checkpoint itself as well: nested checkpoints
+        # would recompute the layer body twice in the backward.
+        if isinstance(layer, ModernBertEncoderLayer):
+            layer._layer_ac_internal = False
         n_fact = math.factorial(n_streams)
         self.n_fact = n_fact
         self.triton_fused = triton_fused
@@ -1289,6 +1340,9 @@ class MHCLiteBlock(nn.Module):
 
         perm_flat, self._identity_idx = _build_permutation_matrices(n_streams)
         self.register_buffer("perm_mat", perm_flat)  # (n!, n*n)
+        # Parity with ModernBertEncoderLayer: debug_metrics enumerates this
+        # class as a block, so it needs a tap to sample its output stream.
+        self.repeat_tap = RepeatTap()
 
     @property
     def attention_type(self):
@@ -1489,8 +1543,10 @@ class MHCLiteBlock(nn.Module):
         )
 
         if use_triton:
-            return self._forward_triton(x_streams, **kwargs)
-        return self._forward_pytorch(x_streams, **kwargs)
+            out = self._forward_triton(x_streams, **kwargs)
+        else:
+            out = self._forward_pytorch(x_streams, **kwargs)
+        return self.repeat_tap(out, 0)
 
 
 class MHCLiteSublayersLayer(nn.Module):
@@ -1515,6 +1571,8 @@ class MHCLiteSublayersLayer(nn.Module):
             if self.enc.mlp is not None
             else None
         )
+        # Parity with ModernBertEncoderLayer: see MHCLiteBlock.__init__.
+        self.repeat_tap = RepeatTap()
 
     @property
     def attention_type(self):
@@ -1524,7 +1582,27 @@ class MHCLiteSublayersLayer(nn.Module):
         x_streams = self.mhc_attn(x_streams, **kwargs)
         if self.mhc_mlp is not None:
             x_streams = self.mhc_mlp(x_streams, **kwargs)
-        return x_streams
+        return self.repeat_tap(x_streams, 0)
+
+
+def _block_owns_layer_checkpoint(block: nn.Module, loop_count=None) -> bool:
+    """True when *block* already applies layer-mode AC inside its own forward.
+
+    ``ModernBertEncoderLayer`` does (see
+    ``ModernBertEncoderLayer._use_internal_layer_ac``), so that the checkpoint
+    lands inside the FSDP2 unit; checkpointing it again from the encoder loop
+    would both nest two checkpoints and put FSDP's dynamo-disabled hooks back
+    inside the HOP body. Every other block type (``MHCLiteBlock``,
+    ``MHCLiteSublayersLayer``) keeps the encoder-level wrapper below.
+
+    A tensor ``loop_count`` also keeps it: that path leaves ``forward`` for the
+    dynamo-disabled ``_forward_repeats`` driver, which does not checkpoint, so
+    the encoder-level wrapper is the only thing holding activations down there.
+    """
+    if isinstance(loop_count, torch.Tensor):
+        return False
+    fn = getattr(block, "_use_internal_layer_ac", None)
+    return bool(fn()) if callable(fn) else False
 
 
 class ModernBertModel(nn.Module):
@@ -1594,6 +1672,9 @@ class ModernBertModel(nn.Module):
         self.final_norm = _create_norm(
             config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
         )
+        # Identity unless debug_metrics installs an accumulator (no state_dict
+        # keys); samples the encoder output handed to the head/decoder.
+        self.final_norm_tap = StatsTap()
         # Set by cpu_offload.install() to flush the final activation offload.
         self._cpu_offload_flush = None
         self.rotary_emb = ModernBertRotaryEmbedding(config)
@@ -2049,6 +2130,9 @@ class ModernBertModel(nn.Module):
                         and self.training
                         and str(self.config.activation_checkpointing_mode).strip().lower()
                         == "layer"
+                        # ModernBertEncoderLayer checkpoints itself, inside its
+                        # FSDP unit; see _block_owns_layer_checkpoint.
+                        and not _block_owns_layer_checkpoint(layer, loop_count)
                     ):
                         cos_sin = rope[lt]
                         cu_seqlens = _cu_seqlens
@@ -2100,7 +2184,9 @@ class ModernBertModel(nn.Module):
 
             if self.config.use_mhc_lite:
                 x = x[..., 0, :]  # compress: take stream 0
-            return run_flush(self._cpu_offload_flush, self.final_norm(x))
+            return run_flush(
+                self._cpu_offload_flush, self.final_norm_tap(self.final_norm(x))
+            )
 
         # ---- SDPA (fallback) path -----------------------------------------
         _, seq_len = input_ids.shape
@@ -2259,6 +2345,9 @@ class ModernBertModel(nn.Module):
                     and self.training
                     and str(self.config.activation_checkpointing_mode).strip().lower()
                     == "layer"
+                    # ModernBertEncoderLayer checkpoints itself, inside its
+                    # FSDP unit; see _block_owns_layer_checkpoint.
+                    and not _block_owns_layer_checkpoint(layer, loop_count)
                 ):
                     attn_mask = attn_masks[layer_type]
                     cos_sin = rope[layer_type]
@@ -2304,7 +2393,9 @@ class ModernBertModel(nn.Module):
 
         if self.config.use_mhc_lite:
             x = x[..., 0, :]  # compress: take stream 0
-        return run_flush(self._cpu_offload_flush, self.final_norm(x))
+        return run_flush(
+            self._cpu_offload_flush, self.final_norm_tap(self.final_norm(x))
+        )
 
 
 @dataclass
@@ -2345,6 +2436,9 @@ class ModernBertForMaskedLM(nn.Module):
         self.decoder = nn.Linear(
             config.hidden_size, config.vocab_size, bias=config.decoder_bias
         )
+        # Identity unless debug_metrics installs an accumulator (no state_dict
+        # keys); samples the logits on every scoring path via `_lm_logits`.
+        self.logit_tap = StatsTap(with_entropy=True, with_sum=False)
 
         self.sparse_prediction = config.sparse_prediction
         self.sparse_pred_ignore_index = config.sparse_pred_ignore_index
@@ -2563,6 +2657,15 @@ class ModernBertForMaskedLM(nn.Module):
     def get_output_embeddings(self) -> nn.Linear:
         return self.decoder
 
+    def _lm_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """head -> decoder -> logit tap.  The single scoring path.
+
+        Every branch in ``forward`` goes through here so the debug logit stats
+        see exactly the elements that are scored (the sparse path passes
+        ``x[keep]``).
+        """
+        return self.logit_tap(self.decoder(self.head(x)))
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -2611,7 +2714,7 @@ class ModernBertForMaskedLM(nn.Module):
             # x: (F, hidden) where F is fixed flat length
 
             if labels is not None:
-                logits = self.decoder(self.head(x))
+                logits = self._lm_logits(x)
                 loss = F.cross_entropy(
                     logits.float(),
                     labels,
@@ -2632,7 +2735,7 @@ class ModernBertForMaskedLM(nn.Module):
                     if aux_losses:
                         loss = loss + sum(aux_losses) / len(aux_losses)
             else:
-                logits = self.decoder(self.head(x))
+                logits = self._lm_logits(x)
                 loss = None
 
             return MLMOutput(loss=loss, logits=logits)
@@ -2676,18 +2779,18 @@ class ModernBertForMaskedLM(nn.Module):
             if self.sparse_prediction and labels is not None:
                 flat_labels = labels.view(-1)[indices]
                 keep = flat_labels != self.sparse_pred_ignore_index
-                logits = self.decoder(self.head(x[keep]))
+                logits = self._lm_logits(x[keep])
                 loss = F.cross_entropy(logits.float(), flat_labels[keep])
             elif labels is not None:
                 flat_labels = labels.view(-1)[indices]
-                logits = self.decoder(self.head(x))
+                logits = self._lm_logits(x)
                 loss = F.cross_entropy(
                     logits.float(),
                     flat_labels,
                     ignore_index=self.sparse_pred_ignore_index,
                 )
             else:
-                logits = self.decoder(self.head(x))
+                logits = self._lm_logits(x)
                 logits = _pad_output(logits, indices, batch, seq_len)
                 loss = None
 
@@ -2710,7 +2813,7 @@ class ModernBertForMaskedLM(nn.Module):
         else:
             flat_labels = labels
 
-        logits = self.decoder(self.head(x))
+        logits = self._lm_logits(x)
 
         loss = None
         if labels is not None:

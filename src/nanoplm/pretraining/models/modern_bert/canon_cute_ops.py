@@ -816,18 +816,21 @@ def _pi32(t):
 # returns stale (and possibly smaller) tensors -> garbage masks / OOB.
 
 
-_dummy_f32 = {}
-
-
 def _dummy(device, C):
     # C fp32 zeros; stands in for unused gamma/inv/partial pointers on the
     # plain (HAS_NORM=False) path. All reads of these are gated on HAS_NORM
     # in-kernel; the buffer is a safety placeholder, >= C in every dtype view.
-    buf = _dummy_f32.get((device, C))
-    if buf is None:
-        buf = torch.zeros(C, dtype=torch.float32, device=device)
-        _dummy_f32[(device, C)] = buf
-    return buf
+    #
+    # Deliberately NOT memoized in a module-level dict. Under
+    # compile_mode="reduce-overhead" the first call happens inside Inductor's
+    # CUDA-graph warmup, so a cached buffer is allocated from the private
+    # cudagraph pool and then kept alive there forever by the cache: cudagraph
+    # trees reject that outright ("Detected 1 tensor(s) in the cudagraph pool
+    # not tracked as outputs", R2a jobs 1858565/1858566, allocation traced here
+    # by cudagraph_trees_history_recording), and even without the check the
+    # buffer would alias memory the graph replays into. 4 KB of zeros is one
+    # allocation from the caching allocator plus a memset the graph captures.
+    return torch.zeros(C, dtype=torch.float32, device=device)
 
 
 def _pick_niter(T, bt, pref):

@@ -177,6 +177,19 @@ class PretrainingConfig:
     debug_non_finite_params: bool = True
     debug_layerwise_metrics: bool = False
     debug_layerwise_log_every: int = 20
+    # CUDA allocator history capture, for attributing a peak (or an OOM) to
+    # allocations rather than guessing from the reserved/allocated totals.
+    # Pickles land in <run root>/memory_snapshots/ (the run directory under
+    # ckp_dir), for https://docs.pytorch.org/memory_viz. Every rank records;
+    # LOCAL_RANK 0 takes the scheduled dump, and an OOM dumps on whichever rank
+    # hit it. Recording costs a Python stack capture per allocation, so keep it
+    # off for throughput measurements.
+    debug_memory_snapshot: bool = False
+    # Also dump a snapshot right after this optimizer step (>= 0). -1 dumps
+    # only when a torch.OutOfMemoryError escapes the training loop.
+    debug_memory_snapshot_step: int = -1
+    # Size of the allocator-history ring buffer (events, oldest dropped).
+    debug_memory_snapshot_max_entries: int = 100000
 
     # Data loading
     num_workers: Union[int, str] = "auto"
@@ -193,6 +206,11 @@ class PretrainingConfig:
     # This may improve steady-state performance, but increases compile/autotune time
     # noticeably at the start of a run.
     use_compile_max_autotune: bool = False
+    # Explicit torch.compile(mode=...) for the pure-torch training graph:
+    # "default" | "reduce-overhead" (CUDA graphs) | "max-autotune" |
+    # "max-autotune-no-cudagraphs". None (the default) keeps the derivation from
+    # use_compile_max_autotune; set it and it wins over that flag.
+    compile_mode: Optional[str] = None
     # TorchInductor Triton setting. Persistent reductions can exceed per-block shared
     # memory limits for some fused kernels (e.g. LayerNorm backward at hidden >= 1536),
     # causing "No valid triton configs / out of resource". Set to False to force
@@ -210,6 +228,11 @@ class PretrainingConfig:
     profiler_enabled: bool = False
     profiler_start_step: int = 10
     profiler_end_step: int = 15
+    # torch.profiler record_shapes. Shape recording adds per-op bookkeeping on
+    # the dispatch path, which is exactly the path a CPU-bound step is limited
+    # by, so a trace taken with it on is not a steady-state wall-clock
+    # reference. Turn it on only to attribute kernels to tensor shapes.
+    profiler_record_shapes: bool = False
 
     # Distributed training
     multi_gpu: bool = True
@@ -403,6 +426,34 @@ class PretrainingConfig:
             raise ValueError(
                 "nordion2_selection_scope must be one of: local, global "
                 f"(got {self.nordion2_selection_scope!r})"
+            )
+
+        if self.compile_mode is not None:
+            compile_mode = str(self.compile_mode).strip().lower()
+            if compile_mode not in {
+                "default",
+                "reduce-overhead",
+                "max-autotune",
+                "max-autotune-no-cudagraphs",
+            }:
+                raise ValueError(
+                    "compile_mode must be one of: default, reduce-overhead, "
+                    "max-autotune, max-autotune-no-cudagraphs "
+                    f"(got {self.compile_mode!r})"
+                )
+            self.compile_mode = compile_mode
+
+        for name in ("debug_memory_snapshot_step", "debug_memory_snapshot_max_entries"):
+            try:
+                setattr(self, name, int(getattr(self, name)))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{name} must be an integer, got {getattr(self, name)!r}"
+                ) from exc
+        if self.debug_memory_snapshot_max_entries < 1:
+            raise ValueError(
+                "debug_memory_snapshot_max_entries must be >= 1, "
+                f"got {self.debug_memory_snapshot_max_entries}"
             )
 
 

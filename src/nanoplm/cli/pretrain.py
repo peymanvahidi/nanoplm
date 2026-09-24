@@ -458,6 +458,31 @@ def pretrain():
     help="Log layerwise debug metrics every N optimizer steps.",
 )
 @click.option(
+    "--debug-memory-snapshot/--no-debug-memory-snapshot",
+    default=False,
+    show_default=True,
+    help="Pure-torch only: record CUDA allocator history and dump a memory_viz pickle to "
+    "<run root>/memory_snapshots/ on OOM (and at --debug-memory-snapshot-step). "
+    "All ranks record; LOCAL_RANK 0 takes the scheduled dump, an OOM dumps on the rank "
+    "that hit it.",
+)
+@click.option(
+    "--debug-memory-snapshot-step",
+    type=int,
+    default=-1,
+    show_default=True,
+    help="Also dump a memory snapshot right after this optimizer step; -1 dumps only on OOM "
+    "(only when --debug-memory-snapshot).",
+)
+@click.option(
+    "--debug-memory-snapshot-max-entries",
+    type=int,
+    default=100000,
+    show_default=True,
+    help="Allocator events kept in the memory-history ring buffer "
+    "(only when --debug-memory-snapshot).",
+)
+@click.option(
     "--mask-replace-prob",
     type=float,
     default=0.8,
@@ -625,7 +650,15 @@ def pretrain():
     type=int,
     default=22,
     show_default=True,
-    help="Last optimizer step captured by the profiler (only when --profiler-enabled).",
+    help="Last optimizer step captured by the profiler (only when --profiler-enabled). "
+    "At most 2 steps are actually captured.",
+)
+@click.option(
+    "--profiler-record-shapes/--no-profiler-record-shapes",
+    default=False,
+    show_default=True,
+    help="Record per-op input shapes in the PyTorch profiler trace. Adds dispatch-path "
+    "bookkeeping, so such a trace is not a steady-state wall-clock reference.",
 )
 # Resume options
 @click.option(
@@ -889,6 +922,17 @@ def pretrain():
     "May improve throughput, but increases compile time significantly at run start.",
 )
 @click.option(
+    "--compile-mode",
+    type=click.Choice(
+        ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        case_sensitive=False,
+    ),
+    default=None,
+    help="Pure-torch only: explicit torch.compile(mode=...). Unset uses Inductor's default "
+    "mode (or max-autotune-no-cudagraphs when --use-compile-max-autotune); set it and it "
+    "overrides that flag. 'reduce-overhead' enables CUDA graphs.",
+)
+@click.option(
     "--compile-triton-persistent-reductions/--no-compile-triton-persistent-reductions",
     default=False,
     help="Pure-torch only: TorchInductor Triton setting. Disable to avoid shared-memory "
@@ -961,6 +1005,9 @@ def run(
     debug_non_finite_params: bool,
     debug_layerwise_metrics: bool,
     debug_layerwise_log_every: int,
+    debug_memory_snapshot: bool,
+    debug_memory_snapshot_step: int,
+    debug_memory_snapshot_max_entries: int,
     mask_replace_prob: float,
     random_token_prob: float,
     keep_probability: float,
@@ -970,6 +1017,7 @@ def run(
     use_packing: bool,
     use_static_inp_size: bool,
     use_compile_max_autotune: bool,
+    compile_mode: Optional[str],
     compile_triton_persistent_reductions: bool,
     compile_triton_mix_order_reduction: bool,
     bf16: bool,
@@ -992,6 +1040,7 @@ def run(
     profiler_enabled: bool,
     profiler_start_step: int,
     profiler_end_step: int,
+    profiler_record_shapes: bool,
     resume: bool,
     resume_checkpoint_dir: str,
     resume_mode: str,
@@ -1100,11 +1149,15 @@ def run(
         debug_non_finite_params=debug_non_finite_params,
         debug_layerwise_metrics=debug_layerwise_metrics,
         debug_layerwise_log_every=debug_layerwise_log_every,
+        debug_memory_snapshot=debug_memory_snapshot,
+        debug_memory_snapshot_step=debug_memory_snapshot_step,
+        debug_memory_snapshot_max_entries=debug_memory_snapshot_max_entries,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         use_packing=use_packing,
         use_static_inp_size=use_static_inp_size,
         use_compile_max_autotune=use_compile_max_autotune,
+        compile_mode=compile_mode,
         compile_triton_persistent_reductions=compile_triton_persistent_reductions,
         compile_triton_mix_order_reduction=compile_triton_mix_order_reduction,
         bf16=bf16,
@@ -1127,6 +1180,7 @@ def run(
         profiler_enabled=profiler_enabled,
         profiler_start_step=profiler_start_step,
         profiler_end_step=profiler_end_step,
+        profiler_record_shapes=profiler_record_shapes,
     )
 
     if use_canon_layers and not pure_torch:
@@ -1587,6 +1641,8 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "fp8_amax_history_len",
         "fp8_skip_last_n_layers",
         "mlm_span_max_length",
+        "debug_memory_snapshot_step",
+        "debug_memory_snapshot_max_entries",
     ):
         if int_key in kwargs and kwargs[int_key] is not None:
             try:
@@ -1617,8 +1673,10 @@ def _load_pretrain_config(config: Dict[str, Any]) -> PretrainingConfig:
         "compile_triton_persistent_reductions",
         "compile_triton_mix_order_reduction",
         "profiler_enabled",
+        "profiler_record_shapes",
         "debug_non_finite_params",
         "debug_layerwise_metrics",
+        "debug_memory_snapshot",
         "mlm_standard_amino_acids_only",
     ]:
         if bool_key in kwargs:

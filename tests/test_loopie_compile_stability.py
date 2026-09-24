@@ -1,11 +1,13 @@
 """Compile-stability and FSDP2 invariants for Loopie stochastic depth.
 
-Two constraints pull against each other here. The trip count must stay out of
-every traced graph, or Dynamo specializes on it and each distinct R costs a
-fresh trace (the failure ``ModernBertModel._drive_recurrence`` documents). And
-the repeats must stay inside ``ModernBertEncoderLayer.forward``, or FSDP2 —
-which shards per encoder layer — all-gathers once per repeat instead of once
-per layer. Both live in this file because a fix for either can break the other.
+Two constraints pull against each other here. The trip count must not thrash
+the Dynamo cache: a tensor R stays out of every traced graph (the
+``_forward_repeats`` driver), while a Python int R is allowed to specialize,
+once per distinct value, because the training support is three values and the
+unrolled graph is the one a fixed-depth model traces. And the repeats must stay
+inside ``ModernBertEncoderLayer.forward``, or FSDP2 — which shards per encoder
+layer — all-gathers once per repeat instead of once per layer. Both live in
+this file because a fix for either can break the other.
 
 ``dynamic=False`` matches production: ``use_packing`` + ``use_static_inp_size``
 resolve ``compile_dynamic`` to False in ``pure_pipeline``.
@@ -130,6 +132,85 @@ def test_no_per_layer_cache_thrash_at_production_depth(make_counting_backend):
     )
 
 
+def test_int_loop_count_specializes_once_per_value(make_counting_backend):
+    """A Python int R compiles once per distinct value and never again.
+
+    This is the loopie training path (``_loop_count_fwd_kwargs`` passes an
+    int). Each of R=1,2,3 pays one trace on first sight; repeats of any of them
+    must hit the cache, and none may reach the Dynamo-disabled driver.
+    """
+    torch.manual_seed(0)
+    model = _loopie_model()
+    input_ids, attention_mask = _batch(model.model_config)
+
+    backend, n_compiles = make_counting_backend()
+    torch._dynamo.reset()
+    counters.clear()
+    compiled = torch.compile(model, backend=backend, dynamic=False)
+
+    seen = []
+    for r in (2, 1, 3):
+        before = n_compiles[0]
+        with torch.no_grad():
+            compiled(input_ids=input_ids, attention_mask=attention_mask, loop_count=r)
+        seen.append(n_compiles[0] - before)
+    assert all(n > 0 for n in seen), f"each new R must trace at least once; got {seen}"
+    after_warmup = n_compiles[0]
+
+    for r in (1, 2, 3, 3, 1, 2):
+        with torch.no_grad():
+            compiled(input_ids=input_ids, attention_mask=attention_mask, loop_count=r)
+    assert n_compiles[0] == after_warmup, (
+        f"int R recompiled on values already seen: {n_compiles[0] - after_warmup} "
+        "extra graphs after warmup"
+    )
+
+    breaks = [reason for reason in counters["graph_break"] if "_forward_repeats" in reason]
+    assert not breaks, f"int R reached the eager driver:\n{breaks}"
+
+
+def test_int_loop_count_traces_the_fixed_depth_graph(make_counting_backend):
+    """``loop_count=2`` as an int must compile into the same graphs as fixed R=2.
+
+    That equality is what makes a stochastic-depth 20xR arm's R=2 steps run
+    the same kernels as a fixed 20x2 arm.
+    """
+    torch.manual_seed(0)
+    model = _loopie_model()
+    input_ids, attention_mask = _batch(model.model_config)
+
+    fixed_backend, n_fixed = make_counting_backend()
+    torch._dynamo.reset()
+    compiled_fixed = torch.compile(model, backend=fixed_backend, dynamic=False)
+    with torch.no_grad():
+        compiled_fixed(input_ids=input_ids, attention_mask=attention_mask)
+
+    int_backend, n_int = make_counting_backend()
+    torch._dynamo.reset()
+    compiled_int = torch.compile(model, backend=int_backend, dynamic=False)
+    with torch.no_grad():
+        compiled_int(input_ids=input_ids, attention_mask=attention_mask, loop_count=2)
+
+    assert n_int[0] == n_fixed[0], (
+        f"int R=2 compiled into {n_int[0]} graphs vs {n_fixed[0]} for the fixed-depth "
+        "path; the int branch added a graph break or a split trace."
+    )
+
+
+def test_int_and_tensor_loop_count_agree_numerically():
+    torch.manual_seed(0)
+    model = _loopie_model()
+    input_ids, attention_mask = _batch(model.model_config)
+    with torch.no_grad():
+        for r in (1, 3):
+            via_int = model(input_ids=input_ids, attention_mask=attention_mask, loop_count=r)
+            via_tensor = model(
+                input_ids=input_ids, attention_mask=attention_mask,
+                loop_count=torch.tensor(r, dtype=torch.int64),
+            )
+            torch.testing.assert_close(via_int.logits, via_tensor.logits)
+
+
 def test_fixed_path_compiles_exactly_as_an_unlooped_model(make_counting_backend):
     """Without the kwarg, loopie must trace to the graph it traced before.
 
@@ -208,11 +289,13 @@ def test_truncated_bptt_traces_like_full_backprop(make_counting_backend):
     )
 
 
-def test_one_layer_call_per_step_regardless_of_depth():
+@pytest.mark.parametrize("as_tensor", [False, True], ids=["int", "tensor"])
+def test_one_layer_call_per_step_regardless_of_depth(as_tensor):
     """FSDP2 all-gathers on __call__, so every repeat must stay inside forward.
 
     Counting forward pre-hooks against ``_forward_once`` executions is exactly
-    the invariant fully_shard keys on, and it needs no GPUs to check.
+    the invariant fully_shard keys on, and it needs no GPUs to check. Both the
+    unrolled int path and the eager tensor driver must hold it.
     """
     torch.manual_seed(0)
     model = _loopie_model()
@@ -236,7 +319,7 @@ def test_one_layer_call_per_step_regardless_of_depth():
         model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            loop_count=torch.tensor(4, dtype=torch.int64),
+            loop_count=torch.tensor(4, dtype=torch.int64) if as_tensor else 4,
         )
 
     assert calls == {i: 1 for i in range(_NUM_LAYERS)}, (

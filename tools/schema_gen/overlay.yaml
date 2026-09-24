@@ -265,6 +265,83 @@ x-extra-fields:
           Step-based override for decay_tokens (lr_schedule: wsd only): number
           of additional anneal optimizer steps after the stable phase. Set
           exactly one of decay_tokens or decay_steps, never both.
+      compile_mode:
+        type: string
+        default: null
+        advanced: true
+        backend: [pure_torch]
+        group: torch.compile knobs (pure_torch only)
+        enum: [default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs]
+        description: >-
+          Explicit mode passed to torch.compile for the training graph. Unset
+          (the default) compiles in Inductor's default mode, or in
+          max-autotune-no-cudagraphs when use_compile_max_autotune is true;
+          setting this field overrides that flag. reduce-overhead enables CUDA
+          graphs, which cuts per-step launch overhead on a CPU-dispatch-bound
+          step but costs extra VRAM for the graph pools and re-records when
+          input addresses or shapes change. max-autotune adds CUDA graphs on top
+          of kernel autotuning; max-autotune-no-cudagraphs autotunes only.
+          Shipped commented out by `nanoplm pretrain get-yaml` because the
+          default mode is the right choice for an ordinary run.
+      debug_memory_snapshot:
+        type: boolean
+        default: false
+        advanced: true
+        backend: [pure_torch]
+        group: Debug
+        description: >-
+          Record the CUDA caching allocator's history (allocation stacks and
+          compile context) for the whole run and write it as a pickle that
+          https://docs.pytorch.org/memory_viz renders, which is how a VRAM peak
+          gets attributed to saved activations, all-gather buffers, optimizer
+          state or fragmentation instead of guessed at. A pickle is written when
+          a torch.OutOfMemoryError escapes the training loop (the error then
+          propagates unchanged) and after debug_memory_snapshot_step. Every rank
+          records. The scheduled dump is written by LOCAL_RANK 0; an OOM dump is
+          written by whichever rank hit it, because an OOM is rank-local. Files
+          land in <run root>/memory_snapshots/rank<RANK>_<tag>.pickle, that is,
+          in the run directory the job creates under ckp_dir. Recording
+          captures a Python stack per allocation, so leave it off for throughput
+          measurements. Shipped commented out by `nanoplm pretrain get-yaml`.
+      debug_memory_snapshot_step:
+        type: integer
+        default: -1
+        advanced: true
+        backend: [pure_torch]
+        group: Debug
+        description: >-
+          Also dump a memory snapshot right after this optimizer step, giving a
+          reference picture of a step that fits to compare against the OOM dump.
+          -1 (the default) dumps only on an out-of-memory error. Ignored unless
+          debug_memory_snapshot is true. Shipped commented out by `nanoplm
+          pretrain get-yaml`.
+      debug_memory_snapshot_max_entries:
+        type: integer
+        default: 100000
+        minimum: 1
+        advanced: true
+        backend: [pure_torch]
+        group: Debug
+        description: >-
+          Number of allocator events kept in the memory-history ring buffer;
+          older events are dropped. Lower it if the pickles get unwieldy, raise
+          it if the OOM dump no longer reaches back to the allocations that
+          built the peak. Ignored unless debug_memory_snapshot is true. Shipped
+          commented out by `nanoplm pretrain get-yaml`.
+      profiler_record_shapes:
+        type: boolean
+        default: false
+        advanced: true
+        backend: [pure_torch]
+        group: Profiler
+        description: >-
+          Record per-operator input shapes in the PyTorch profiler trace. Shape
+          recording adds bookkeeping on the dispatch path, which is the path a
+          CPU-bound step is limited by, so a trace taken with it on overstates
+          step time and must not be read as a steady-state wall-clock reference.
+          Turn it on only to attribute kernels to tensor shapes. Ignored unless
+          profiler_enabled is true. Shipped commented out by `nanoplm pretrain
+          get-yaml`.
     resume:
       decay_steps:
         type: integer
