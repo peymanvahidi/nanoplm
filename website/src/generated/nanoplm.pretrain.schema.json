@@ -630,10 +630,10 @@
           }
         },
         "loopie_bptt": {
-          "type": "integer",
-          "default": 1,
+          "type": "null",
+          "default": null,
           "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
-          "description": "grad through the last k applications only (~1.33x a plain step at R=2, not 2x); null = full backprop",
+          "description": "null = full backprop; k = grad through the last k applications only (~1.33x a plain step at R=2 with k=1, not 2x)",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
