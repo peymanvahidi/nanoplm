@@ -272,6 +272,62 @@ def _cast_sonicmoe_experts_to_bf16(
     logger.info(f"sonicmoe eval: cast Wi/Wo of {n_cast} MoE layer(s) to bfloat16")
 
 
+@dataclass(frozen=True)
+class CheckpointRuntimeState:
+    """Step-dependent runtime state that lives outside the model weights.
+
+    ``load_checkpoint`` (the native eval path) and the Hugging Face exporter
+    both need to reconstruct this from the same on-disk facts, so it is
+    resolved once here rather than re-typed in each caller.
+
+    ``global_step`` is ``training_state.json``'s ``global_step`` (0 if the
+    file is missing) -- this is the step ProRes's alphas are recomputed for.
+    ``repo_warmup_steps`` and ``repo_active`` are only meaningful when the
+    config turns RePO on; resolved with this exact precedence: if
+    ``pretrain_config.yaml`` exists, its ``repo_rope_warmup_steps``, else its
+    ``warmup_steps``, else 0; if it does NOT exist but ``training_state.json``
+    does, that file's own ``warmup_steps`` (default 0). ``use_repo=False``
+    resolves ``repo_warmup_steps=0`` and ``repo_active=False`` without reading
+    either file.
+    """
+
+    global_step: int
+    repo_warmup_steps: int
+    repo_active: bool
+
+
+def resolve_checkpoint_runtime_state(
+    checkpoint_dir: Path, config: ProtModernBertMLMConfig
+) -> CheckpointRuntimeState:
+    checkpoint_dir = Path(checkpoint_dir)
+    training_state_path = checkpoint_dir / "training_state.json"
+    checkpoint_state: dict[str, Any] = {}
+    if training_state_path.exists():
+        checkpoint_state = json.loads(training_state_path.read_text(encoding="utf-8"))
+    global_step = int(checkpoint_state.get("global_step", 0))
+
+    repo_warmup_steps = 0
+    if config.use_repo:
+        pretrain_cfg_path = checkpoint_dir / "pretrain_config.yaml"
+        if pretrain_cfg_path.exists():
+            pretrain_cfg = _safe_load_checkpoint_yaml(pretrain_cfg_path) or {}
+            repo_warmup_steps = int(
+                pretrain_cfg.get(
+                    "repo_rope_warmup_steps",
+                    pretrain_cfg.get("warmup_steps", 0),
+                )
+            )
+        elif training_state_path.exists():
+            repo_warmup_steps = int(checkpoint_state.get("warmup_steps", 0))
+
+    repo_active = bool(config.use_repo) and global_step >= repo_warmup_steps
+    return CheckpointRuntimeState(
+        global_step=global_step,
+        repo_warmup_steps=repo_warmup_steps,
+        repo_active=repo_active,
+    )
+
+
 def load_checkpoint(
     checkpoint_dir: Union[str, Path],
     config: ProtModernBertMLMConfig,
@@ -296,12 +352,8 @@ def load_checkpoint(
     _cast_sonicmoe_experts_to_bf16(model, config)
     model.eval()
 
-    training_state_path = checkpoint_dir / "training_state.json"
-    checkpoint_step = 0
-    checkpoint_state: dict[str, Any] = {}
-    if training_state_path.exists():
-        checkpoint_state = json.loads(training_state_path.read_text(encoding="utf-8"))
-        checkpoint_step = int(checkpoint_state.get("global_step", 0))
+    runtime_state = resolve_checkpoint_runtime_state(checkpoint_dir, config)
+    checkpoint_step = runtime_state.global_step
 
     # Restore step-dependent runtime state that is intentionally not persisted
     # in the model weights.
@@ -310,24 +362,11 @@ def load_checkpoint(
         logger.info(f"  ProRes restored for global_step={checkpoint_step}")
 
     if config.use_repo:
-        repo_warmup_steps = 0
-        pretrain_cfg_path = checkpoint_dir / "pretrain_config.yaml"
-        if pretrain_cfg_path.exists():
-            pretrain_cfg = _safe_load_checkpoint_yaml(pretrain_cfg_path) or {}
-            repo_warmup_steps = int(
-                pretrain_cfg.get(
-                    "repo_rope_warmup_steps",
-                    pretrain_cfg.get("warmup_steps", 0),
-                )
-            )
-        elif training_state_path.exists():
-            repo_warmup_steps = int(checkpoint_state.get("warmup_steps", 0))
-
-        model.model.repo_active = checkpoint_step >= repo_warmup_steps
+        model.model.repo_active = runtime_state.repo_active
         state = "activated" if model.model.repo_active else "inactive"
         logger.info(
             "  RePO "
-            f"{state} (step={checkpoint_step}, repo_rope_warmup_steps={repo_warmup_steps})"
+            f"{state} (step={checkpoint_step}, repo_rope_warmup_steps={runtime_state.repo_warmup_steps})"
         )
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
