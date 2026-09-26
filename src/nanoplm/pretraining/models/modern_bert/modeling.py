@@ -385,6 +385,31 @@ class ModernBertSwiGLUMLP(nn.Module):
         return self.Wo(self.drop(hidden))
 
 
+def _create_dense_mlp(config: ModernBertConfig) -> nn.Module:
+    """Build a dense (non-MoE) MLP branch, choosing the class by ``mlp_activation``.
+
+    Shared by ``ModernBertEncoderLayer`` (for both a genuinely dense model and
+    the dense layers inside an MoE stack) and by ``fp8.py``'s
+    ``restore_dense_from_te``, which rebuilds this same module when undoing an
+    FP8/TE conversion.
+    """
+    # For dense layers in MoE mode, use the full active intermediate
+    # size so per-token capacity matches the MoE layers.
+    mlp_config = config
+    if config.use_moe:
+        import copy
+        mlp_config = copy.copy(config)
+        mlp_config.intermediate_size = config.moe_dense_intermediate_size
+    if mlp_config.mlp_activation == "srelu":
+        return ModernBertSReluMLP(mlp_config)
+    elif mlp_config.mlp_activation == "swiglu":
+        return ModernBertSwiGLUMLP(mlp_config)
+    else:
+        # geglu: ModernBertMLP gates on `hidden_activation`, which is
+        # gelu and is not settable from the run config.
+        return ModernBertMLP(mlp_config)
+
+
 def _repo_inv_freq(theta: float, rope_dim: int) -> torch.Tensor:
     """RePO's fixed per-channel frequency table (same shape/formula as RoPE's).
 
@@ -852,21 +877,7 @@ class ModernBertEncoderLayer(nn.Module):
                 from .moe import MoELayer
                 self.mlp = MoELayer(config)
             else:
-                # For dense layers in MoE mode, use the full active intermediate
-                # size so per-token capacity matches the MoE layers.
-                mlp_config = config
-                if config.use_moe and not config.moe_layer_flags[layer_idx]:
-                    import copy
-                    mlp_config = copy.copy(config)
-                    mlp_config.intermediate_size = config.moe_dense_intermediate_size
-                if mlp_config.mlp_activation == "srelu":
-                    self.mlp = ModernBertSReluMLP(mlp_config)
-                elif mlp_config.mlp_activation == "swiglu":
-                    self.mlp = ModernBertSwiGLUMLP(mlp_config)
-                else:
-                    # geglu: ModernBertMLP gates on `hidden_activation`, which is
-                    # gelu and is not settable from the run config.
-                    self.mlp = ModernBertMLP(mlp_config)
+                self.mlp = _create_dense_mlp(config)
         else:
             self.mlp_norm = nn.Identity()
             self.canon_c = None

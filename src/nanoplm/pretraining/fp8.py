@@ -549,6 +549,169 @@ def convert_fp8_targets(
     return converted
 
 
+def _has_te_bias(bias: torch.Tensor) -> bool:
+    """TE linear/MLP bias tensors are never ``None`` -- a disabled bias is an
+    empty tensor, not a missing attribute. ``is not None`` would always be
+    true and silently give every restored linear a spurious zero bias.
+    """
+    return bias.numel() > 0
+
+
+def _restore_mlp_branch(layer: nn.Module, config) -> None:
+    """Rebuild native ``mlp_norm`` + ``mlp`` from a ``_TELayerNormMLPWrapper``."""
+    from nanoplm.pretraining.models.modern_bert.modeling import (
+        _create_dense_mlp,
+        _create_norm,
+    )
+
+    te_mlp = layer.mlp.layernorm_mlp
+    old_norm_training = layer.mlp_norm.training
+    old_mlp_training = layer.mlp.training
+    device = te_mlp.fc1_weight.device
+    dtype = te_mlp.fc1_weight.dtype
+
+    norm = _create_norm(
+        config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
+    ).to(device=device, dtype=dtype)
+    mlp = _create_dense_mlp(config).to(device=device, dtype=dtype)
+    norm.train(old_norm_training)
+    mlp.train(old_mlp_training)
+
+    layer.mlp_norm = norm
+    layer.mlp = mlp
+
+    activation = _te_layernorm_mlp_activation(layer)
+    if activation != te_mlp.activation:
+        raise ValueError(
+            "MLP activation mismatch during restore: the config implies "
+            f"{activation!r}, but the converted checkpoint was built with "
+            f"{te_mlp.activation!r}."
+        )
+    gated = activation in {"swiglu", "geglu"}
+
+    with torch.no_grad():
+        norm.weight.copy_(te_mlp.layer_norm_weight)
+        if getattr(norm, "bias", None) is not None:
+            norm.bias.copy_(te_mlp.layer_norm_bias)
+
+        mlp.Wi.weight.copy_(te_fc1_to_native_wi(te_mlp.fc1_weight, activation))
+        if mlp.Wi.bias is not None:
+            mlp.Wi.bias.copy_(te_fc1_to_native_wi(te_mlp.fc1_bias, activation))
+
+        if gated:
+            mlp.Wo.weight.copy_(te_fc2_to_native_wo(te_mlp.fc2_weight, activation))
+            if mlp.Wo.bias is not None:
+                mlp.Wo.bias.copy_(te_mlp.fc2_bias)
+        else:
+            mlp.Wo_weight.copy_(te_fc2_to_native_wo(te_mlp.fc2_weight, activation))
+            if mlp.Wo_bias is not None:
+                mlp.Wo_bias.copy_(te_mlp.fc2_bias)
+
+
+def _restore_attn_wo(layer: nn.Module) -> None:
+    """Replace ``attn.Wo`` (a ``te.Linear``) with a copy in ``nn.Linear``."""
+    wo = layer.attn.Wo
+    dense_wo = nn.Linear(
+        wo.in_features, wo.out_features, bias=_has_te_bias(wo.bias)
+    ).to(device=wo.weight.device, dtype=wo.weight.dtype)
+    with torch.no_grad():
+        dense_wo.weight.copy_(wo.weight)
+        if dense_wo.bias is not None:
+            dense_wo.bias.copy_(wo.bias)
+    dense_wo.train(wo.training)
+    layer.attn.Wo = dense_wo
+
+
+def _attn_has_te_qkv(layer: nn.Module) -> bool:
+    attn = getattr(layer, "attn", None)
+    if attn is None:
+        return False
+    return any(
+        isinstance(getattr(attn, name, None), _TELayerNormLinearWrapper)
+        for name in ("Wqkv", "Wq", "Wq2", "Wk", "Wv")
+    )
+
+
+def _restore_attn_qkv_branch(layer: nn.Module, config) -> None:
+    """Rebuild native ``attn_norm`` + Q/K/V linears from TE ``LayerNormLinear``.
+
+    Every converted part shares one tied norm (``_tie_norm_to_te_layernorm_module``
+    shares the Parameter), so it is read off the first wrapper and restored once.
+    """
+    from nanoplm.pretraining.models.modern_bert.modeling import _create_norm
+
+    attn = layer.attn
+    wrapped_names = [
+        name
+        for name in ("Wqkv", "Wq", "Wq2", "Wk", "Wv")
+        if isinstance(getattr(attn, name, None), _TELayerNormLinearWrapper)
+    ]
+    first = getattr(attn, wrapped_names[0]).layernorm_linear
+    device = first.weight.device
+    dtype = first.weight.dtype
+
+    old_norm_training = layer.attn_norm.training
+    norm = _create_norm(
+        config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
+    ).to(device=device, dtype=dtype)
+    norm.train(old_norm_training)
+    with torch.no_grad():
+        norm.weight.copy_(first.layer_norm_weight)
+        if getattr(norm, "bias", None) is not None:
+            norm.bias.copy_(first.layer_norm_bias)
+
+    for name in wrapped_names:
+        wrapped = getattr(attn, name)
+        te_linear = wrapped.layernorm_linear
+        dense = nn.Linear(
+            te_linear.in_features,
+            te_linear.out_features,
+            bias=_has_te_bias(te_linear.bias),
+        ).to(device=te_linear.weight.device, dtype=te_linear.weight.dtype)
+        with torch.no_grad():
+            dense.weight.copy_(te_linear.weight)
+            if dense.bias is not None:
+                dense.bias.copy_(te_linear.bias)
+        dense.train(wrapped.training)
+        setattr(attn, name, dense)
+
+    layer.attn_norm = norm
+
+
+def restore_dense_from_te(model: nn.Module, config) -> int:
+    """Invert ``convert_fp8_targets``, in place. Returns the block count restored.
+
+    Export writes a portable, dense model; TE modules would demand
+    Transformer Engine on every consumer machine. Walks the tree, finds every
+    TE wrapper ``convert_fp8_targets`` installed, and rebuilds the native
+    modules it replaced, using the transforms above. Counts one restored
+    block per converted LAYER, matching ``convert_fp8_targets``'s own count --
+    an unfused QKV layer touches three or four linears but is still one block.
+    """
+    _require_te()
+
+    mlp_layers = [
+        layer
+        for layer in model.modules()
+        if isinstance(getattr(layer, "mlp", None), _TELayerNormMLPWrapper)
+    ]
+    wo_layers = [
+        layer
+        for layer in model.modules()
+        if isinstance(getattr(getattr(layer, "attn", None), "Wo", None), te.Linear)
+    ]
+    qkv_layers = [layer for layer in model.modules() if _attn_has_te_qkv(layer)]
+
+    for layer in mlp_layers:
+        _restore_mlp_branch(layer, config)
+    for layer in wo_layers:
+        _restore_attn_wo(layer)
+    for layer in qkv_layers:
+        _restore_attn_qkv_branch(layer, config)
+
+    return len(mlp_layers) + len(wo_layers) + len(qkv_layers)
+
+
 def te_fp8_format_from_config(cfg) -> Format:
     _require_te()
     fp8_format = str(getattr(cfg, "fp8_format", "hybrid")).strip().lower()
@@ -605,6 +768,7 @@ __all__ = [
     "convert_fp8_targets",
     "convert_mlp_blocks_to_te_layernorm_mlp",
     "iter_te_cpu_offload_target_wrappers",
+    "restore_dense_from_te",
     "te_fp8_autocast_context",
     "te_fp8_format_from_config",
     "te_fp8_recipe_from_config",
