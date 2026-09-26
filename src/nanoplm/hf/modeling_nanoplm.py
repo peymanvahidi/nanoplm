@@ -8,6 +8,7 @@ model and this one, so export copies weights with no renaming table.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -26,6 +27,62 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     _reset_moe_bookkeeping,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import modernbert_config_from
+
+
+@contextmanager
+def _collect_hidden_states(encoder: ModernBertModel, enabled: bool):
+    """Capture per-layer outputs without touching the compiled forward.
+
+    Threading an `output_hidden_states` flag through ModernBertModel.forward
+    would add a branch to a torch.compile-guarded hot path for zero training
+    benefit. Hooks are registered only when asked for and removed on exit
+    (`finally`, so they come off even if the wrapped forward raises).
+
+    Captured tensors are NOT detached: HF `hidden_states` are part of the
+    autograd graph, and detaching would silently break gradients from any
+    loss computed on an intermediate layer.
+
+    Under recycling (`encoder.adapter is not None`) the recurrent block's
+    layers fire once per iteration rather than once total, so entries would
+    otherwise balloon with `recycling_loop_count`. Per the design spec, one
+    entry is reported per recurrent ITERATION instead of per layer firing:
+    the embeddings output, each prelude layer's output, the output of the
+    recurrent block's LAST layer (`recurrent_layers[-1]`, which -- because
+    each iteration inlines the recurrent layers in one call -- already fires
+    exactly once per iteration) once per iteration, and each coda layer's
+    output. Outside recycling, every layer in `encoder.layers` is hooked once.
+
+    Under mHC-lite (`use_mhc_lite=True`) the embeddings entry is (B, S, C)
+    but every layer entry is (B, S, n, C) with n = `config.mhc_n_streams`:
+    mHC-lite carries multiple residual streams per layer, and that shape is
+    reported as-is rather than reshaped/compressed away.
+    """
+    captured: list[torch.Tensor] = []
+    if not enabled:
+        yield captured
+        return
+
+    handles = []
+
+    def _hook(_module, _args, output):
+        tensor = output[0] if isinstance(output, tuple) else output
+        captured.append(tensor)
+
+    handles.append(encoder.embeddings.register_forward_hook(_hook))
+    if encoder.adapter is not None:
+        for layer in encoder.prelude_layers:
+            handles.append(layer.register_forward_hook(_hook))
+        handles.append(encoder.recurrent_layers[-1].register_forward_hook(_hook))
+        for layer in encoder.coda_layers:
+            handles.append(layer.register_forward_hook(_hook))
+    else:
+        for layer in encoder.layers:
+            handles.append(layer.register_forward_hook(_hook))
+    try:
+        yield captured
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 class NanoPLMPreTrainedModel(PreTrainedModel):
@@ -116,8 +173,17 @@ class NanoPLMModel(NanoPLMPreTrainedModel):
         return_dict: Optional[bool] = None,
     ) -> BaseModelOutput:
         _reset_moe_bookkeeping(self.model, self._inner_config.use_moe)
-        hidden = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        return BaseModelOutput(last_hidden_state=hidden, hidden_states=None)
+        want_hidden = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        with _collect_hidden_states(self.model, want_hidden) as captured:
+            hidden = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        return BaseModelOutput(
+            last_hidden_state=hidden,
+            hidden_states=tuple(captured) if want_hidden else None,
+        )
 
 
 class NanoPLMForMaskedLM(NanoPLMPreTrainedModel):
@@ -159,7 +225,13 @@ class NanoPLMForMaskedLM(NanoPLMPreTrainedModel):
         return_dict: Optional[bool] = None,
     ) -> MaskedLMOutput:
         _reset_moe_bookkeeping(self.model, self._inner_config.use_moe)
-        hidden = self.model(input_ids=input_ids, attention_mask=attention_mask)
+        want_hidden = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        with _collect_hidden_states(self.model, want_hidden) as captured:
+            hidden = self.model(input_ids=input_ids, attention_mask=attention_mask)
         logits = self.decoder(self.head(hidden))
         loss = None
         if labels is not None:
@@ -168,4 +240,8 @@ class NanoPLMForMaskedLM(NanoPLMPreTrainedModel):
                 labels.view(-1),
                 ignore_index=self._inner_config.sparse_pred_ignore_index,
             )
-        return MaskedLMOutput(loss=loss, logits=logits, hidden_states=None)
+        return MaskedLMOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=tuple(captured) if want_hidden else None,
+        )
