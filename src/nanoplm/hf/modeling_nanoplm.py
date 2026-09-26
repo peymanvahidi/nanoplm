@@ -23,6 +23,7 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertModel,
     ModernBertPredictionHead,
     ModernBertRotaryEmbedding,
+    _init_modernbert_weights,
     _repo_inv_freq,
     _reset_moe_bookkeeping,
 )
@@ -91,17 +92,42 @@ class NanoPLMPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = False
 
     def _init_weights(self, module: nn.Module) -> None:
-        """Materialize the non-persistent runtime-state buffers.
+        """Initialize parameters with nanoPLM's native scheme, and
+        materialize the non-persistent runtime-state buffers.
 
-        transformers 5.x's `from_pretrained` builds the model on the meta
-        device, loads the checkpoint, then recreates every *non-persistent*
-        buffer with `torch.empty_like` (uninitialized memory) and calls this
-        hook to fill them back in (`_move_missing_keys_from_meta_to_device` /
-        `_initialize_missing_keys` in transformers' modeling_utils.py). This
-        hook also runs once after a direct (non-`from_pretrained`)
+        transformers 5.x's `initialize_weights()` walks the module tree
+        children-first and calls this hook once per module not already
+        flagged `_is_hf_initialized`, root last. For *custom* model code
+        (anything outside the `transformers` package -- true here), it also
+        SKIPS the call entirely for a module whose own direct parameters and
+        buffers (`recurse=False`) are all already flagged, which is
+        vacuously true for a module with none of either. `self` (this class)
+        is exactly such a module: `NanoPLMModel` / `NanoPLMForMaskedLM` own
+        no parameter or buffer directly -- everything lives under
+        `.model` / `.head` / `.decoder` -- so hooking `module is self` would
+        never actually fire. `root.model` (`ModernBertModel`) always carries
+        the non-persistent `_prores_alphas` buffer directly (see below), so
+        its visit is guaranteed and used as the trigger instead; `self`
+        (bound to this method regardless of which `module` is being
+        visited) gives it the outer shell to initialize.
+
+        On direct construction nothing is flagged, so every parameter gets a
+        fresh native-scheme draw. On `from_pretrained`, loaded params/buffers
+        (and tied weights) are flagged *before* this runs, and transformers
+        swaps in guarded `nn.init.*` functions that silently skip any
+        flagged tensor -- so only the keys the checkpoint didn't supply
+        (e.g. a missing MoE expert) actually get (re)initialized; every
+        loaded key is left untouched. `_init_modernbert_weights`
+        (modeling.py) is the one function both this hook and the native
+        `ModernBertForMaskedLM.init_weights` call, and it additionally
+        guards its few direct tensor writes (`.fill_`, slice assignment)
+        that bypass that automatic guard.
+
+        This hook also runs once after a direct (non-`from_pretrained`)
         construction, via `post_init()` -> `init_weights()`.
 
-        Three buffer sites are affected: `ModernBertModel._prores_alphas`
+        Separately from parameter init, three buffer sites always need
+        recomputing here: `ModernBertModel._prores_alphas`
         (every model), `ModernBertRotaryEmbedding.inv_freq_full` /
         `.inv_freq_sliding` (every model -- the standard RoPE tables), and
         `ModernBertAttention.repo_inv_freq` (RePO layers only). All three need
@@ -115,13 +141,9 @@ class NanoPLMPreTrainedModel(PreTrainedModel):
         any read (see `moe.py`'s `_ensure_dispatch_buffers`), so garbage after
         reload is exactly as harmless as garbage after a fresh `torch.empty`
         call in a directly constructed model.
-
-        Everything else -- every `nn.Linear` / `nn.Embedding` weight, every
-        norm -- is either loaded from the checkpoint or already has a fine
-        default init from construction; this function never writes to a
-        `Parameter`.
         """
         if isinstance(module, ModernBertModel):
+            _init_modernbert_weights(self, self._inner_config)
             if self.config.use_prores:
                 module.update_prores_alphas(int(self.config.prores_step))
             else:

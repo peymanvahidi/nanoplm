@@ -2357,6 +2357,257 @@ class ModernBertPredictionHead(nn.Module):
         return self.norm(self.act(self.dense(x)))
 
 
+def _hf_initialized(tensor: torch.Tensor) -> bool:
+    """True when transformers' `from_pretrained` flagged `tensor`
+    `_is_hf_initialized` (loaded from the checkpoint, or tied to a loaded
+    tensor). `nn.init.*` calls are skipped automatically for such tensors by
+    the guard transformers installs while `initialize_weights()` runs, but
+    plain tensor writes -- `.fill_()`, slice/index assignment -- bypass that
+    guard, so `_init_modernbert_weights` checks this explicitly before each
+    one. Never set on the native construction path, so native behaviour is
+    unchanged.
+    """
+    return getattr(tensor, "_is_hf_initialized", False)
+
+
+@torch.no_grad()
+def _init_modernbert_weights(root: nn.Module, config: ModernBertConfig) -> None:
+    """Native `ModernBertForMaskedLM`'s parameter-init scheme, shared with
+    the `nanoplm.hf` shells built around the same submodules.
+
+    `root` is initialized in place: the native `ModernBertForMaskedLM`
+    itself, or one of the HF shells -- `NanoPLMModel` (`.model` only) or
+    `NanoPLMForMaskedLM` (`.model`, `.head`, `.decoder`). The head/decoder
+    section below only runs when `root` has both. Order matches the
+    previous `init_weights` body exactly, so RNG draws land the same way on
+    the native path.
+
+    Every direct tensor write (`.fill_`, slice/index assignment) is guarded
+    with `_hf_initialized` so it never clobbers a tensor `from_pretrained`
+    already loaded; the `nn.init.*` calls need no such guard, since
+    transformers swaps in a version that already skips those tensors while
+    this runs.
+    """
+    has_head = hasattr(root, "head") and hasattr(root, "decoder")
+
+    width = config.hidden_size
+    bound = math.sqrt(3.0 / width)
+    # Residual-branch out-projections (attn.Wo, mlp.Wo) are configurable:
+    # 'zero' for zero-init residual branches, 'kaiming' otherwise.
+    wo_init = config.wo_init
+    mlp_out_bound = math.sqrt(3.0 / config.intermediate_size)
+    # NOBLE half-Kaiming: halve init scale for layers that use Kaiming
+    # (Wqkv, Wi).
+    noble_kaiming = config.use_noble and config.noble_half_kaiming
+    kaiming_bound = bound / 2 if noble_kaiming else bound
+
+    def _noble_bound(mod: nn.Module) -> float:
+        return kaiming_bound if isinstance(mod, NOBLELinear) else bound
+
+    def _init_wo(tensor: torch.Tensor, init_bound: float) -> None:
+        if wo_init == "zero":
+            nn.init.zeros_(tensor)
+        else:
+            nn.init.uniform_(tensor, -init_bound, init_bound)
+
+    embedding_std = 0.02 if config.tie_word_embeddings else 1.0
+
+    nn.init.normal_(
+        root.model.embeddings.tok_embeddings.weight,
+        mean=0.0,
+        std=embedding_std,
+    )
+
+    for module in root.modules():
+        if isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
+            if module.weight is not None:
+                nn.init.ones_(module.weight)
+            if hasattr(module, "bias") and module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    for layer_idx, layer in enumerate(root.model.layers):
+        if isinstance(layer, MHCLiteBlock):
+            enc = layer.layer
+            mhc_blocks = [layer]
+        elif isinstance(layer, MHCLiteSublayersLayer):
+            enc = layer.enc
+            mhc_blocks = [b for b in (layer.mhc_attn, layer.mhc_mlp) if b is not None]
+        else:
+            enc = layer
+            mhc_blocks = []
+        # QKV weight init (NOBLE modules get half-Kaiming bound)
+        if enc.attn.Wqkv is not None:
+            b = _noble_bound(enc.attn.Wqkv)
+            nn.init.uniform_(enc.attn.Wqkv.weight, -b, b)
+        else:
+            bq = _noble_bound(enc.attn.Wq)
+            nn.init.uniform_(enc.attn.Wq.weight, -bq, bq)
+            if enc.attn.Wq2 is not None:
+                bq2 = _noble_bound(enc.attn.Wq2)
+                nn.init.uniform_(enc.attn.Wq2.weight, -bq2, bq2)
+            bk = _noble_bound(enc.attn.Wk)
+            nn.init.uniform_(enc.attn.Wk.weight, -bk, bk)
+            bv = _noble_bound(enc.attn.Wv)
+            nn.init.uniform_(enc.attn.Wv.weight, -bv, bv)
+        _init_wo(enc.attn.Wo.weight, bound)
+
+        # MLP weight init (NOBLE modules get half-Kaiming bound)
+        if enc.mlp is not None:
+            is_moe_mlp = False
+            if getattr(config, "use_moe", False):
+                from .moe import MoELayer as _MoELayer
+
+                is_moe_mlp = isinstance(enc.mlp, _MoELayer)
+
+            if is_moe_mlp:
+                # Routed expert stacked weights (nn.Parameter, not nn.Linear).
+                nn.init.uniform_(enc.mlp.Wi, -bound, bound)
+                _init_wo(enc.mlp.Wo, mlp_out_bound)
+                nn.init.uniform_(enc.mlp.router.gate.weight, -bound, bound)
+                shared = enc.mlp.shared_expert
+                if shared.Wi is not None:
+                    bi = _noble_bound(shared.Wi)
+                    nn.init.uniform_(shared.Wi.weight, -bi, bi)
+                elif hasattr(shared, "W_up") and shared.W_up is not None:
+                    bu = _noble_bound(shared.W_up)
+                    nn.init.uniform_(shared.W_up.weight, -bu, bu)
+                    bg = _noble_bound(shared.W_gate)
+                    nn.init.uniform_(shared.W_gate.weight, -bg, bg)
+                # SwiGLU shared expert has a Wo Linear; sReLU has a Wo_weight param.
+                if hasattr(shared, "Wo"):
+                    _init_wo(shared.Wo.weight, mlp_out_bound)
+                else:
+                    _init_wo(shared.Wo_weight, mlp_out_bound)
+            elif enc.mlp.Wi is not None:
+                bi = _noble_bound(enc.mlp.Wi)
+                nn.init.uniform_(enc.mlp.Wi.weight, -bi, bi)
+            elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
+                bu = _noble_bound(enc.mlp.W_up)
+                nn.init.uniform_(enc.mlp.W_up.weight, -bu, bu)
+                bg = _noble_bound(enc.mlp.W_gate)
+                nn.init.uniform_(enc.mlp.W_gate.weight, -bg, bg)
+            if not is_moe_mlp:
+                if hasattr(enc.mlp, "Wo"):
+                    _init_wo(enc.mlp.Wo.weight, mlp_out_bound)
+                else:
+                    _init_wo(enc.mlp.Wo_weight, mlp_out_bound)
+
+        # QKV bias init
+        if enc.attn.Wqkv is not None:
+            if enc.attn.Wqkv.bias is not None:
+                nn.init.zeros_(enc.attn.Wqkv.bias)
+        else:
+            if enc.attn.Wq.bias is not None:
+                nn.init.zeros_(enc.attn.Wq.bias)
+            if enc.attn.Wq2 is not None and enc.attn.Wq2.bias is not None:
+                nn.init.zeros_(enc.attn.Wq2.bias)
+            if enc.attn.Wk.bias is not None:
+                nn.init.zeros_(enc.attn.Wk.bias)
+            if enc.attn.Wv.bias is not None:
+                nn.init.zeros_(enc.attn.Wv.bias)
+        if enc.attn.Wo.bias is not None:
+            nn.init.zeros_(enc.attn.Wo.bias)
+
+        # MLP bias init
+        if enc.mlp is not None:
+            is_moe_mlp = False
+            if getattr(config, "use_moe", False):
+                from .moe import MoELayer as _MoELayer
+
+                is_moe_mlp = isinstance(enc.mlp, _MoELayer)
+
+            if is_moe_mlp:
+                shared = enc.mlp.shared_expert
+                if shared.Wi is not None:
+                    if shared.Wi.bias is not None:
+                        nn.init.zeros_(shared.Wi.bias)
+                elif hasattr(shared, "W_up") and shared.W_up is not None:
+                    if shared.W_up.bias is not None:
+                        nn.init.zeros_(shared.W_up.bias)
+                    if shared.W_gate.bias is not None:
+                        nn.init.zeros_(shared.W_gate.bias)
+                wo_bias = shared.Wo.bias if hasattr(shared, "Wo") else shared.Wo_bias
+                if wo_bias is not None:
+                    nn.init.zeros_(wo_bias)
+            elif enc.mlp.Wi is not None:
+                if enc.mlp.Wi.bias is not None:
+                    nn.init.zeros_(enc.mlp.Wi.bias)
+            elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
+                if enc.mlp.W_up.bias is not None:
+                    nn.init.zeros_(enc.mlp.W_up.bias)
+                if enc.mlp.W_gate.bias is not None:
+                    nn.init.zeros_(enc.mlp.W_gate.bias)
+            if not is_moe_mlp:
+                if hasattr(enc.mlp, "Wo"):
+                    if enc.mlp.Wo.bias is not None:
+                        nn.init.zeros_(enc.mlp.Wo.bias)
+                elif enc.mlp.Wo_bias is not None:
+                    nn.init.zeros_(enc.mlp.Wo_bias)
+
+        # DiffV2: zero-init lambda_proj so sigmoid(0)=0.5 at start.
+        if enc.attn.lambda_proj is not None:
+            nn.init.zeros_(enc.attn.lambda_proj.weight)
+
+        # RePO: zero-init W_z so positions start at zero (NoPE-like).
+        # W_g and W_c keep default Kaiming uniform init.
+        if enc.attn.repo is not None:
+            nn.init.zeros_(enc.attn.repo.W_z.weight)
+
+        # mHC-lite: zero-init fused projection, set biases for identity behavior
+        def _init_mhc_block(block: MHCLiteBlock) -> None:
+            nn.init.zeros_(block.W_all.weight)
+            n_s = block.n
+            # These bias-slice writes bypass the `nn.init.*` guard, so check
+            # the flag on the bias Parameter itself, not on the `.data`
+            # slices below (which don't carry it).
+            if not _hf_initialized(block.W_all.bias):
+                bias = block.W_all.bias.data
+                # pre bias: first n values
+                bias[:n_s].fill_(-1.0)
+                bias[0] = 1.0
+                # post bias: next n values
+                bias[n_s : 2 * n_s].fill_(-1.0)
+                bias[n_s] = 1.0
+                # res bias: last n! values
+                bias[2 * n_s :].fill_(-8.0)
+                bias[2 * n_s + block._identity_idx] = 0.0
+            if not _hf_initialized(block.alpha_pre):
+                block.alpha_pre.fill_(0.01)
+            if not _hf_initialized(block.alpha_post):
+                block.alpha_post.fill_(0.01)
+            if not _hf_initialized(block.alpha_res):
+                block.alpha_res.fill_(0.01)
+
+        for block in mhc_blocks:
+            _init_mhc_block(block)
+
+    if has_head:
+        nn.init.uniform_(root.head.dense.weight, -bound, bound)
+        if root.head.dense.bias is not None:
+            nn.init.zeros_(root.head.dense.bias)
+
+        decoder_std = embedding_std if config.tie_word_embeddings else 0.001
+        # The HF shells tie `decoder.weight` to the token embedding in
+        # `__init__`, BEFORE `post_init()` reaches this function, so by here
+        # they're already the same Parameter. Natively the tie (if any)
+        # happens AFTER `init_weights()`, so this is never true on the
+        # native path and its draw is unchanged. Without the skip, this
+        # would redraw the tensor the embedding `normal_` call above already
+        # wrote.
+        if root.decoder.weight is not root.model.embeddings.tok_embeddings.weight:
+            nn.init.normal_(root.decoder.weight, mean=0.0, std=decoder_std)
+        if root.decoder.bias is not None:
+            nn.init.zeros_(root.decoder.bias)
+
+    if root.model.resid_lambdas is not None and not _hf_initialized(
+        root.model.resid_lambdas
+    ):
+        root.model.resid_lambdas.fill_(config.resid_lambda_init)
+    if root.model.x0_lambdas is not None and not _hf_initialized(root.model.x0_lambdas):
+        root.model.x0_lambdas.fill_(config.x0_lambda_init)
+    root.model._apply_takase_init()
+
+
 class ModernBertForMaskedLM(nn.Module):
     _tied_weights_keys = {"decoder.weight": "model.embeddings.tok_embeddings.weight"}
 
@@ -2380,206 +2631,7 @@ class ModernBertForMaskedLM(nn.Module):
 
     @torch.no_grad()
     def init_weights(self) -> None:
-
-        width = self.config.hidden_size
-        bound = math.sqrt(3.0 / width)
-        # Residual-branch out-projections (attn.Wo, mlp.Wo) are configurable:
-        # 'zero' for zero-init residual branches, 'kaiming' otherwise.
-        wo_init = self.config.wo_init
-        mlp_out_bound = math.sqrt(3.0 / self.config.intermediate_size)
-        # NOBLE half-Kaiming: halve init scale for layers that use Kaiming
-        # (Wqkv, Wi).
-        noble_kaiming = (
-            self.config.use_noble and self.config.noble_half_kaiming
-        )
-        kaiming_bound = bound / 2 if noble_kaiming else bound
-
-        def _noble_bound(mod: nn.Module) -> float:
-            return kaiming_bound if isinstance(mod, NOBLELinear) else bound
-
-        def _init_wo(tensor: torch.Tensor, init_bound: float) -> None:
-            if wo_init == "zero":
-                nn.init.zeros_(tensor)
-            else:
-                nn.init.uniform_(tensor, -init_bound, init_bound)
-
-        embedding_std = 0.02 if self.config.tie_word_embeddings else 1.0
-
-        nn.init.normal_(
-            self.model.embeddings.tok_embeddings.weight,
-            mean=0.0,
-            std=embedding_std,
-        )
-
-        for module in self.modules():
-            if isinstance(module, (nn.LayerNorm, nn.RMSNorm)):
-                if module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if hasattr(module, "bias") and module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-        for layer_idx, layer in enumerate(self.model.layers):
-            if isinstance(layer, MHCLiteBlock):
-                enc = layer.layer
-                mhc_blocks = [layer]
-            elif isinstance(layer, MHCLiteSublayersLayer):
-                enc = layer.enc
-                mhc_blocks = [
-                    b for b in (layer.mhc_attn, layer.mhc_mlp) if b is not None
-                ]
-            else:
-                enc = layer
-                mhc_blocks = []
-            # QKV weight init (NOBLE modules get half-Kaiming bound)
-            if enc.attn.Wqkv is not None:
-                b = _noble_bound(enc.attn.Wqkv)
-                nn.init.uniform_(enc.attn.Wqkv.weight, -b, b)
-            else:
-                bq = _noble_bound(enc.attn.Wq)
-                nn.init.uniform_(enc.attn.Wq.weight, -bq, bq)
-                if enc.attn.Wq2 is not None:
-                    bq2 = _noble_bound(enc.attn.Wq2)
-                    nn.init.uniform_(enc.attn.Wq2.weight, -bq2, bq2)
-                bk = _noble_bound(enc.attn.Wk)
-                nn.init.uniform_(enc.attn.Wk.weight, -bk, bk)
-                bv = _noble_bound(enc.attn.Wv)
-                nn.init.uniform_(enc.attn.Wv.weight, -bv, bv)
-            _init_wo(enc.attn.Wo.weight, bound)
-
-            # MLP weight init (NOBLE modules get half-Kaiming bound)
-            if enc.mlp is not None:
-                is_moe_mlp = False
-                if getattr(self.config, "use_moe", False):
-                    from .moe import MoELayer as _MoELayer
-                    is_moe_mlp = isinstance(enc.mlp, _MoELayer)
-
-                if is_moe_mlp:
-                    # Routed expert stacked weights (nn.Parameter, not nn.Linear).
-                    nn.init.uniform_(enc.mlp.Wi, -bound, bound)
-                    _init_wo(enc.mlp.Wo, mlp_out_bound)
-                    nn.init.uniform_(enc.mlp.router.gate.weight, -bound, bound)
-                    shared = enc.mlp.shared_expert
-                    if shared.Wi is not None:
-                        bi = _noble_bound(shared.Wi)
-                        nn.init.uniform_(shared.Wi.weight, -bi, bi)
-                    elif hasattr(shared, "W_up") and shared.W_up is not None:
-                        bu = _noble_bound(shared.W_up)
-                        nn.init.uniform_(shared.W_up.weight, -bu, bu)
-                        bg = _noble_bound(shared.W_gate)
-                        nn.init.uniform_(shared.W_gate.weight, -bg, bg)
-                    # SwiGLU shared expert has a Wo Linear; sReLU has a Wo_weight param.
-                    if hasattr(shared, "Wo"):
-                        _init_wo(shared.Wo.weight, mlp_out_bound)
-                    else:
-                        _init_wo(shared.Wo_weight, mlp_out_bound)
-                elif enc.mlp.Wi is not None:
-                    bi = _noble_bound(enc.mlp.Wi)
-                    nn.init.uniform_(enc.mlp.Wi.weight, -bi, bi)
-                elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
-                    bu = _noble_bound(enc.mlp.W_up)
-                    nn.init.uniform_(enc.mlp.W_up.weight, -bu, bu)
-                    bg = _noble_bound(enc.mlp.W_gate)
-                    nn.init.uniform_(enc.mlp.W_gate.weight, -bg, bg)
-                if not is_moe_mlp:
-                    if hasattr(enc.mlp, "Wo"):
-                        _init_wo(enc.mlp.Wo.weight, mlp_out_bound)
-                    else:
-                        _init_wo(enc.mlp.Wo_weight, mlp_out_bound)
-
-            # QKV bias init
-            if enc.attn.Wqkv is not None:
-                if enc.attn.Wqkv.bias is not None:
-                    nn.init.zeros_(enc.attn.Wqkv.bias)
-            else:
-                if enc.attn.Wq.bias is not None:
-                    nn.init.zeros_(enc.attn.Wq.bias)
-                if enc.attn.Wq2 is not None and enc.attn.Wq2.bias is not None:
-                    nn.init.zeros_(enc.attn.Wq2.bias)
-                if enc.attn.Wk.bias is not None:
-                    nn.init.zeros_(enc.attn.Wk.bias)
-                if enc.attn.Wv.bias is not None:
-                    nn.init.zeros_(enc.attn.Wv.bias)
-            if enc.attn.Wo.bias is not None:
-                nn.init.zeros_(enc.attn.Wo.bias)
-
-            # MLP bias init
-            if enc.mlp is not None:
-                is_moe_mlp = False
-                if getattr(self.config, "use_moe", False):
-                    from .moe import MoELayer as _MoELayer
-                    is_moe_mlp = isinstance(enc.mlp, _MoELayer)
-
-                if is_moe_mlp:
-                    shared = enc.mlp.shared_expert
-                    if shared.Wi is not None:
-                        if shared.Wi.bias is not None:
-                            nn.init.zeros_(shared.Wi.bias)
-                    elif hasattr(shared, "W_up") and shared.W_up is not None:
-                        if shared.W_up.bias is not None:
-                            nn.init.zeros_(shared.W_up.bias)
-                        if shared.W_gate.bias is not None:
-                            nn.init.zeros_(shared.W_gate.bias)
-                    wo_bias = shared.Wo.bias if hasattr(shared, "Wo") else shared.Wo_bias
-                    if wo_bias is not None:
-                        nn.init.zeros_(wo_bias)
-                elif enc.mlp.Wi is not None:
-                    if enc.mlp.Wi.bias is not None:
-                        nn.init.zeros_(enc.mlp.Wi.bias)
-                elif hasattr(enc.mlp, "W_up") and enc.mlp.W_up is not None:
-                    if enc.mlp.W_up.bias is not None:
-                        nn.init.zeros_(enc.mlp.W_up.bias)
-                    if enc.mlp.W_gate.bias is not None:
-                        nn.init.zeros_(enc.mlp.W_gate.bias)
-                if not is_moe_mlp:
-                    if hasattr(enc.mlp, "Wo"):
-                        if enc.mlp.Wo.bias is not None:
-                            nn.init.zeros_(enc.mlp.Wo.bias)
-                    elif enc.mlp.Wo_bias is not None:
-                        nn.init.zeros_(enc.mlp.Wo_bias)
-
-            # DiffV2: zero-init lambda_proj so sigmoid(0)=0.5 at start.
-            if enc.attn.lambda_proj is not None:
-                nn.init.zeros_(enc.attn.lambda_proj.weight)
-
-            # RePO: zero-init W_z so positions start at zero (NoPE-like).
-            # W_g and W_c keep default Kaiming uniform init.
-            if enc.attn.repo is not None:
-                nn.init.zeros_(enc.attn.repo.W_z.weight)
-
-            # mHC-lite: zero-init fused projection, set biases for identity behavior
-            def _init_mhc_block(block: MHCLiteBlock) -> None:
-                nn.init.zeros_(block.W_all.weight)
-                n_s = block.n
-                bias = block.W_all.bias.data
-                # pre bias: first n values
-                bias[:n_s].fill_(-1.0)
-                bias[0] = 1.0
-                # post bias: next n values
-                bias[n_s : 2 * n_s].fill_(-1.0)
-                bias[n_s] = 1.0
-                # res bias: last n! values
-                bias[2 * n_s :].fill_(-8.0)
-                bias[2 * n_s + block._identity_idx] = 0.0
-                block.alpha_pre.fill_(0.01)
-                block.alpha_post.fill_(0.01)
-                block.alpha_res.fill_(0.01)
-
-            for block in mhc_blocks:
-                _init_mhc_block(block)
-
-        nn.init.uniform_(self.head.dense.weight, -bound, bound)
-        if self.head.dense.bias is not None:
-            nn.init.zeros_(self.head.dense.bias)
-
-        decoder_std = embedding_std if self.config.tie_word_embeddings else 0.001
-        nn.init.normal_(self.decoder.weight, mean=0.0, std=decoder_std)
-        if self.decoder.bias is not None:
-            nn.init.zeros_(self.decoder.bias)
-        if self.model.resid_lambdas is not None:
-            self.model.resid_lambdas.fill_(self.config.resid_lambda_init)
-        if self.model.x0_lambdas is not None:
-            self.model.x0_lambdas.fill_(self.config.x0_lambda_init)
-        self.model._apply_takase_init()
+        _init_modernbert_weights(self, self.config)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embeddings.tok_embeddings
