@@ -398,6 +398,7 @@ def _create_dense_mlp(config: ModernBertConfig) -> nn.Module:
     mlp_config = config
     if config.use_moe:
         import copy
+
         mlp_config = copy.copy(config)
         mlp_config.intermediate_size = config.moe_dense_intermediate_size
     if mlp_config.mlp_activation == "srelu":

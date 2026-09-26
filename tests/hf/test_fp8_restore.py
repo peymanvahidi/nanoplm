@@ -29,20 +29,27 @@ TINY = dict(
     vocab_size=32,
 )
 
-IDS = torch.tensor([[4, 5, 6, 7, 1, 0]], device="cuda")
-MASK = torch.tensor([[1, 1, 1, 1, 1, 0]], device="cuda")
-
 
 def _build(**kwargs):
     cfg = ProtModernBertMLMConfig(**kwargs)
     return PureProtModernBertMLM(cfg).eval().to("cuda", torch.bfloat16)
 
 
+def _ids_and_mask():
+    # Built lazily (not at module scope): a CUDA tensor at import time would
+    # raise "No CUDA GPUs are available" before the `pytestmark` skipif above
+    # ever gets a chance to run, aborting collection instead of skipping.
+    ids = torch.tensor([[4, 5, 6, 7, 1, 0]], device="cuda")
+    mask = torch.tensor([[1, 1, 1, 1, 1, 0]], device="cuda")
+    return ids, mask
+
+
 def _assert_round_trips(dense, target: str) -> int:
     """convert -> restore and check: shape parity, exact weights, close logits."""
+    ids, mask = _ids_and_mask()
     reference = {k: v.clone() for k, v in dense.state_dict().items()}
     with torch.no_grad():
-        want = dense(input_ids=IDS, attention_mask=MASK).logits.float()
+        want = dense(input_ids=ids, attention_mask=mask).logits.float()
 
     n = convert_fp8_targets(dense, target=target)
     assert n > 0
@@ -53,9 +60,12 @@ def _assert_round_trips(dense, target: str) -> int:
     assert set(got_state) == set(reference), "restore changed the module tree shape"
     for key, expected in reference.items():
         assert torch.equal(got_state[key], expected), f"weight mismatch at {key!r}"
+    assert not any(
+        m.training for m in dense.modules()
+    ), "restore left a rebuilt module in training mode"
 
     with torch.no_grad():
-        got = dense(input_ids=IDS, attention_mask=MASK).logits.float()
+        got = dense(input_ids=ids, attention_mask=mask).logits.float()
     torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-3)
     return n
 
@@ -142,6 +152,9 @@ def test_restore_rebuilds_moe_dense_layer_at_moe_dense_intermediate_size():
     assert torch.equal(dense_layer.mlp.Wi.weight, reference_wi)
     assert torch.equal(dense_layer.mlp.Wo.weight, reference_wo)
     assert isinstance(dense.model.layers[2].mlp, MoELayer)
+    assert not any(
+        m.training for m in dense.modules()
+    ), "restore left a rebuilt module in training mode"
 
 
 def test_restore_rejects_a_config_whose_activation_disagrees_with_the_checkpoint():

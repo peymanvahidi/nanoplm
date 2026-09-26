@@ -565,8 +565,11 @@ def _restore_mlp_branch(layer: nn.Module, config) -> None:
     )
 
     te_mlp = layer.mlp.layernorm_mlp
-    old_norm_training = layer.mlp_norm.training
-    old_mlp_training = layer.mlp.training
+    # Not `layer.mlp_norm`/`layer.mlp` -- convert leaves those as freshly
+    # constructed `nn.Identity()`/wrapper instances (always training=True);
+    # only the inner TE module carries the real flag, set by convert's own
+    # `new_mlp.train(mlp.training)`.
+    old_training = te_mlp.training
     device = te_mlp.fc1_weight.device
     dtype = te_mlp.fc1_weight.dtype
 
@@ -574,8 +577,8 @@ def _restore_mlp_branch(layer: nn.Module, config) -> None:
         config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
     ).to(device=device, dtype=dtype)
     mlp = _create_dense_mlp(config).to(device=device, dtype=dtype)
-    norm.train(old_norm_training)
-    mlp.train(old_mlp_training)
+    norm.train(old_training)
+    mlp.train(old_training)
 
     layer.mlp_norm = norm
     layer.mlp = mlp
@@ -650,11 +653,13 @@ def _restore_attn_qkv_branch(layer: nn.Module, config) -> None:
     device = first.weight.device
     dtype = first.weight.dtype
 
-    old_norm_training = layer.attn_norm.training
+    # Not `layer.attn_norm` -- convert leaves that as a freshly constructed
+    # `nn.Identity()` (always training=True); `first` is the inner TE module,
+    # which carries the real flag from convert's own `new_linear.train(...)`.
     norm = _create_norm(
         config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
     ).to(device=device, dtype=dtype)
-    norm.train(old_norm_training)
+    norm.train(first.training)
     with torch.no_grad():
         norm.weight.copy_(first.layer_norm_weight)
         if getattr(norm, "bias", None) is not None:
@@ -672,7 +677,10 @@ def _restore_attn_qkv_branch(layer: nn.Module, config) -> None:
             dense.weight.copy_(te_linear.weight)
             if dense.bias is not None:
                 dense.bias.copy_(te_linear.bias)
-        dense.train(wrapped.training)
+        # Not `wrapped.training` -- `wrapped` is the freshly constructed
+        # `_TELayerNormLinearWrapper` (always training=True); `te_linear` is
+        # the inner TE module that actually carries the flag.
+        dense.train(te_linear.training)
         setattr(attn, name, dense)
 
     layer.attn_norm = norm
