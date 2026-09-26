@@ -219,7 +219,6 @@ def _copy_mlp_branch_to_te_layernorm_mlp(layer: nn.Module, *, name: str | None =
     if activation is None:
         raise ValueError("Layer is not eligible for Transformer Engine LayerNormMLP conversion.")
     gated_activation = activation in {"swiglu", "geglu"}
-    swap_gate_halves = activation == "swiglu"
     ffn_hidden_size = mlp.Wo.in_features if gated_activation else mlp.Wo_weight.shape[0]
     normalization = "RMSNorm" if isinstance(mlp_norm, nn.RMSNorm) else "LayerNorm"
     new_mlp = te_mod.LayerNormMLP(
@@ -238,32 +237,109 @@ def _copy_mlp_branch_to_te_layernorm_mlp(layer: nn.Module, *, name: str | None =
         if normalization == "LayerNorm" and getattr(mlp_norm, "bias", None) is not None:
             new_mlp.layer_norm_bias.copy_(mlp_norm.bias)
         if gated_activation:
-            # TE applies the nonlinearity to the FIRST half of fc1 for both
-            # gated forms. ModernBertMLP (geglu) already does that, so its
-            # halves carry over as-is; ModernBertSwiGLUMLP applies silu to the
-            # SECOND half, so its halves have to swap on the way in.
-            if swap_gate_halves:
-                up_weight, gate_weight = wi.weight.chunk(2, dim=0)
-                new_mlp.fc1_weight.copy_(torch.cat([gate_weight, up_weight], dim=0))
-            else:
-                new_mlp.fc1_weight.copy_(wi.weight)
-            new_mlp.fc2_weight.copy_(mlp.Wo.weight)
+            new_mlp.fc1_weight.copy_(native_wi_to_te_fc1(wi.weight, activation))
+            new_mlp.fc2_weight.copy_(native_wo_to_te_fc2(mlp.Wo.weight, activation))
         else:
-            new_mlp.fc1_weight.copy_(wi.weight)
-            new_mlp.fc2_weight.copy_(mlp.Wo_weight.T)
+            new_mlp.fc1_weight.copy_(native_wi_to_te_fc1(wi.weight, activation))
+            new_mlp.fc2_weight.copy_(native_wo_to_te_fc2(mlp.Wo_weight, activation))
         if wi.bias is not None:
+            new_mlp.fc1_bias.copy_(native_wi_to_te_fc1(wi.bias, activation))
             if gated_activation:
-                if swap_gate_halves:
-                    up_bias, gate_bias = wi.bias.chunk(2, dim=0)
-                    new_mlp.fc1_bias.copy_(torch.cat([gate_bias, up_bias], dim=0))
-                else:
-                    new_mlp.fc1_bias.copy_(wi.bias)
                 new_mlp.fc2_bias.copy_(mlp.Wo.bias)
             else:
-                new_mlp.fc1_bias.copy_(wi.bias)
                 new_mlp.fc2_bias.copy_(mlp.Wo_bias)
     new_mlp.train(mlp.training)
     return _TELayerNormMLPWrapper(new_mlp)
+
+
+# ---------------------------------------------------------------------------
+# Dense restore (FP8/TE layout -> native modules). Used by `nanoplm export`.
+#
+# The forward conversion above has three fc1/fc2 layouts, keyed by the same
+# activation strings `_te_layernorm_mlp_activation` returns:
+#   - "swiglu" (ModernBertSwiGLUMLP): fc1 = [gate, up] from native Wi =
+#     [up, gate] -- halves swap, for weight and bias alike. TE applies the
+#     nonlinearity to the FIRST half of fc1; ModernBertSwiGLUMLP applies silu
+#     to the SECOND half of Wi, so the halves have to swap on the way in.
+#   - "geglu" (ModernBertMLP, act=F.gelu): fc1 = Wi unchanged -- ModernBertMLP
+#     already gates on the first half, exactly like TE.
+#   - "srelu" (ModernBertSReluMLP): fc1 = Wi unchanged; fc2 = Wo_weight.T
+#     (sRelu keeps Wo as (intermediate, hidden) to match its Triton kernel).
+# fc2 is unchanged for both gated forms; fc2 biases carry over unchanged in
+# all three layouts.
+#
+# These are pure tensor functions so they can be unit-tested on CPU without
+# Transformer Engine installed. The module-level walk that uses them for the
+# restore direction is a separate function that needs TE.
+# ---------------------------------------------------------------------------
+
+
+def native_wi_to_te_fc1(t: torch.Tensor, activation: str) -> torch.Tensor:
+    """Native fused ``Wi`` (weight or bias) -> TE ``fc1``. Mirrors the forward path.
+
+    Only "swiglu" swaps the dim-0 halves; "geglu" and "srelu" pass through.
+    Swapping a non-swiglu tensor would silently compute silu(up) * gate
+    instead of the model's actual activation.
+    """
+    if activation == "swiglu":
+        if t.shape[0] % 2 != 0:
+            raise ValueError(
+                f"swiglu Wi must have an even first dimension, got {tuple(t.shape)}"
+            )
+        up, gate = t.chunk(2, dim=0)
+        return torch.cat([gate, up], dim=0)
+    if activation in {"geglu", "srelu"}:
+        return t
+    raise ValueError(f"Unsupported activation for fc1 conversion: {activation!r}")
+
+
+def te_fc1_to_native_wi(t: torch.Tensor, activation: str) -> torch.Tensor:
+    """TE ``fc1`` (weight or bias) -> native fused ``Wi``. Inverse of ``native_wi_to_te_fc1``.
+
+    TE stores [gate, up] for swiglu; native stores [up, gate]. Swapping these
+    backwards silently computes silu(up) * gate instead of silu(gate) * x_proj
+    -- a model that loads, embeds plausibly, and is wrong.
+    """
+    if activation == "swiglu":
+        if t.shape[0] % 2 != 0:
+            raise ValueError(
+                f"swiglu fc1 must have an even first dimension, got {tuple(t.shape)}"
+            )
+        gate, up = t.chunk(2, dim=0)
+        return torch.cat([up, gate], dim=0)
+    if activation in {"geglu", "srelu"}:
+        return t
+    raise ValueError(f"Unsupported activation for fc1 conversion: {activation!r}")
+
+
+def native_wo_to_te_fc2(w: torch.Tensor, activation: str) -> torch.Tensor:
+    """Native ``Wo`` weight -> TE ``fc2`` weight. Mirrors the forward path.
+
+    Only "srelu" transposes; "swiglu"/"geglu" pass through. Weights only --
+    fc2 biases carry over unchanged in every layout.
+    """
+    if activation == "srelu":
+        if w.ndim != 2:
+            raise ValueError(f"srelu Wo must be 2-D, got {tuple(w.shape)}")
+        return w.T.contiguous()
+    if activation in {"swiglu", "geglu"}:
+        return w
+    raise ValueError(f"Unsupported activation for fc2 conversion: {activation!r}")
+
+
+def te_fc2_to_native_wo(w: torch.Tensor, activation: str) -> torch.Tensor:
+    """TE ``fc2`` weight -> native ``Wo`` weight. Inverse of ``native_wo_to_te_fc2``.
+
+    sReLU keeps Wo as (intermediate, hidden) to match its Triton kernel layout,
+    while TE's fc2 is (hidden, intermediate); the gated forms need no change.
+    """
+    if activation == "srelu":
+        if w.ndim != 2:
+            raise ValueError(f"srelu fc2 must be 2-D, got {tuple(w.shape)}")
+        return w.T.contiguous()
+    if activation in {"swiglu", "geglu"}:
+        return w
+    raise ValueError(f"Unsupported activation for fc2 conversion: {activation!r}")
 
 
 def convert_mlp_blocks_to_te_layernorm_mlp(
