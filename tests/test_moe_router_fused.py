@@ -265,6 +265,11 @@ def test_current_layout_round_trips():
     from nanoplm.pretraining.models.modern_bert.moe import MoELayer
 
     src, dst = MoELayer(_moe_cfg()), MoELayer(_moe_cfg())
+    # A bare MoELayer leaves Wi as torch.empty (init_weights lives on the full
+    # model), and uninitialized memory can hold NaN, which never compares equal.
+    torch.manual_seed(0)
+    with torch.no_grad():
+        src.Wi.copy_(torch.randn_like(src.Wi))
     dst.load_state_dict(src.state_dict())
     assert torch.equal(dst.Wi, src.Wi)
 
