@@ -31,11 +31,11 @@ KERNEL_MODULES = (
 WITH_CUDA = torch.cuda.is_available()
 
 _CHILD = r"""
-import importlib.abc
-import importlib.util
 import json
 import sys
 import traceback
+
+from import_blocker import block_imports
 
 BLOCKED = (
     "triton", "flash_attn", "flash_attn_interface", "kernels",
@@ -43,35 +43,7 @@ BLOCKED = (
 )
 MODERN_BERT_DIR, KERNEL_MODULES = sys.argv[1], sys.argv[2].split(",")
 WITH_CUDA = sys.argv[3] == "1"
-attempts = []  # (blocked name, file of the frame that imported it)
-
-
-class _BlockKernels(importlib.abc.MetaPathFinder):
-    def find_spec(self, name, path=None, target=None):
-        if name.split(".")[0] not in BLOCKED:
-            return None
-        frame = sys._getframe(1)
-        while frame is not None and frame.f_code.co_filename.startswith("<frozen"):
-            frame = frame.f_back
-        attempts.append((name, frame.f_code.co_filename if frame else "?"))
-        raise ModuleNotFoundError(f"blocked by test_portable_mode: {name}", name=name)
-
-
-sys.meta_path.insert(0, _BlockKernels())
-
-# transformers probes optional packages with importlib.util.find_spec, which
-# would propagate the finder's error and abort `import transformers`. Answer
-# those probes the way a machine without the package does.
-_real_find_spec = importlib.util.find_spec
-
-
-def _find_spec(name, package=None):
-    if name.split(".")[0] in BLOCKED:
-        return None
-    return _real_find_spec(name, package)
-
-
-importlib.util.find_spec = _find_spec
+attempts = block_imports(BLOCKED)  # (blocked name, file of the frame that imported it)
 
 import torch  # noqa: E402
 
@@ -243,7 +215,10 @@ def child():
     env["NANOPLM_PORTABLE"] = "1"
     env["NANOPLM_CUTLASS_ROOT"] = str(MODERN_BERT_DIR / "no-cutlass-here")
     src = str(Path(nanoplm.__file__).resolve().parents[1])
-    env["PYTHONPATH"] = os.pathsep.join(filter(None, [src, env.get("PYTHONPATH")]))
+    helpers = str(Path(__file__).resolve().parent)  # import_blocker
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, [src, helpers, env.get("PYTHONPATH")])
+    )
     return subprocess.run(
         [
             sys.executable,

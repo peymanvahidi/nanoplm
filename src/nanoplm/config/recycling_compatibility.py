@@ -29,8 +29,14 @@ _MATRIX_PATH = Path(__file__).parent / "recycling_compatibility.yaml"
 @lru_cache(maxsize=1)
 def load_compatibility_matrix() -> dict[str, Any]:
     """Load the YAML matrix once and cache it."""
-    with open(_MATRIX_PATH) as f:
-        return yaml.safe_load(f)
+    if _MATRIX_PATH.exists():
+        with open(_MATRIX_PATH) as f:
+            return yaml.safe_load(f)
+    # An exported Hugging Face bundle has no YAML: the remote-code loader copies
+    # only .py files, so nanoplm.hf.vendor embeds the text in _recycling_matrix.py.
+    from ._recycling_matrix import MATRIX_YAML
+
+    return yaml.safe_load(MATRIX_YAML)
 
 
 def _check_model_flags(model_config, matrix: dict[str, Any]) -> None:
