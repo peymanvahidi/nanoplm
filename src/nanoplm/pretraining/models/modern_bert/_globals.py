@@ -6,18 +6,32 @@ model files don't need to repeat them.
 
 from __future__ import annotations
 
+import os as _os_portable
+
 import torch
+
+# -- Portable mode -------------------------------------------------------------
+
+# Portable mode imports no custom kernel (Triton, CuTeDSL, flash-attn) and leaves
+# every flag below at its CPU value, so the model runs its eager/SDPA paths on
+# any device, CUDA included; the MoE op files read it too. Exported Hugging Face
+# bundles run in it: their consumers are only guaranteed torch and transformers.
+PORTABLE: bool = _os_portable.environ.get("NANOPLM_PORTABLE", "0") == "1"  # vendor: rewritten to True in exported bundles
 
 # -- Canon / mHC Triton op registration (side-effect imports) ----------------
 
-if torch.cuda.is_available():
+# Kernel modules are imported as `from . import x as _x`, never `from .x import y`:
+# transformers' remote-code loader copies every sibling named in the second form
+# and then requires everything that sibling imports (canon_ops imports Triton).
+if not PORTABLE and torch.cuda.is_available():
     # Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
     from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
     # Registers torch.ops.nanoplm_canon::* — Triton varlen depthwise conv.
     from . import canon_ops as _canon_ops
-    from .canon_ops import varlen_canon_conv as _varlen_canon_conv
-    from .canon_ops import varlen_ln_canon_conv as _varlen_ln_canon_conv
-    from .canon_ops import varlen_rms_canon_conv as _varlen_rms_canon_conv
+
+    _varlen_canon_conv = _canon_ops.varlen_canon_conv
+    _varlen_ln_canon_conv = _canon_ops.varlen_ln_canon_conv
+    _varlen_rms_canon_conv = _canon_ops.varlen_rms_canon_conv
 
     # CuTeDSL backend for the RMS+Canon and plain canon paths (sm90, bf16,
     # C in 512-3072 with C%256==0, K=7).
@@ -51,9 +65,13 @@ _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
 _OFFLINE_MODE = True
 
-if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
+if (
+    not PORTABLE
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability() == (9, 0)
+):
     try:
-        
+
         # FA3 (H100 / sm90)
         if _OFFLINE_MODE:
             import flash_attn_interface as _fa3
@@ -61,14 +79,14 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
             from kernels import get_kernel
             _fa3 = get_kernel("varunneal/flash-attention-3")
             _fa3 = getattr(_fa3, "flash_attn_interface", _fa3)
-        
+
         _flash_varlen_fn = _fa3.flash_attn_varlen_func
         _HAS_FLASH_VARLEN = True
         _FLASH_HAS_DROPOUT = False  # FA3 removed dropout_p
     except ImportError:
         pass
 
-if not _HAS_FLASH_VARLEN:
+if not PORTABLE and not _HAS_FLASH_VARLEN:
     try:
         # FA2 (Ampere+, RTX 30xx/40xx/50xx)
         from flash_attn import flash_attn_varlen_func as _flash_varlen_fn
@@ -84,9 +102,13 @@ import os as _os_srelu  # noqa: E402
 
 USE_TRITON_SRELU = False
 
-if torch.cuda.is_available() and (
-    torch.cuda.get_device_capability() == (9, 0)
-    or torch.cuda.get_device_capability() == (12, 0)
+if (
+    not PORTABLE
+    and torch.cuda.is_available()
+    and (
+        torch.cuda.get_device_capability() == (9, 0)
+        or torch.cuda.get_device_capability() == (12, 0)
+    )
 ):
     USE_TRITON_SRELU = True
 

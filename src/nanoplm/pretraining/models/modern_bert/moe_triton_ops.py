@@ -22,6 +22,7 @@ from typing import Any
 import torch
 import torch.library
 
+from ._globals import PORTABLE as _PORTABLE
 
 _lib = torch.library.Library("nanoplm_moe", "DEF")
 
@@ -145,7 +146,10 @@ def _moe_autotune_status_end(
         )
 
 
-# ── Eager fallbacks (CPU and MPS) ────────────────────────────────────────────
+# ── Eager fallbacks (CPU, MPS, and CUDA in portable mode) ────────────────────
+#
+# In portable mode each CUDA impl below returns its CPU impl before touching
+# ``moe_triton_kernels``, so no Triton import ever happens.
 
 
 def _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale):
@@ -216,6 +220,8 @@ def _scatter_dispatch_fake(x, token_idx):
 
 @torch.library.impl(_lib, "scatter_dispatch", "CUDA")
 def _scatter_dispatch_cuda(x, token_idx):
+    if _PORTABLE:
+        return _scatter_dispatch_cpu(x, token_idx)
     from . import moe_triton_kernels as k
 
     x = x.contiguous()
@@ -256,6 +262,8 @@ def _scatter_add_bwd_fake(grad_sorted, token_idx, T):
 
 @torch.library.impl(_lib, "scatter_add_bwd", "CUDA")
 def _scatter_add_bwd_cuda(grad_sorted, token_idx, T):
+    if _PORTABLE:
+        return _scatter_add_bwd_cpu(grad_sorted, token_idx, T)
     from . import moe_triton_kernels as k
 
     grad_sorted = grad_sorted.contiguous()
@@ -372,6 +380,8 @@ def _launch_gather_combine_triton(expert_out_sorted, inv_map, weights, scale):
 
 @torch.library.impl(_lib, "gather_combine", "CUDA")
 def _gather_combine_cuda(expert_out_sorted, inv_map, weights, scale):
+    if _PORTABLE:
+        return _gather_combine_cpu(expert_out_sorted, inv_map, weights, scale)
     return _launch_gather_combine_triton(expert_out_sorted, inv_map, weights, scale)
 
 
@@ -409,6 +419,10 @@ def _gather_combine_bwd_fake(
 def _gather_combine_bwd_cuda(
     grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype,
 ):
+    if _PORTABLE:
+        return _gather_combine_bwd_cpu(
+            grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype
+        )
     from . import moe_triton_kernels as k
 
     T, top_k = inv_map.shape

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.library
 
+from ._globals import PORTABLE as _PORTABLE
 from .cutlass_grouped_gemm import grouped_gemm as cutlass_grouped_gemm
 
 
@@ -112,7 +113,9 @@ def _grouped_gemm_cuda(
     trans_b: bool = False,
 ):
     _validate_inputs(a, b, batch_sizes, trans_a, trans_b)
-    if a.dtype not in {torch.float16, torch.bfloat16}:
+    # Portable mode never builds the CUTLASS extension (a consumer of an
+    # exported model has no third_party/cutlass tree).
+    if _PORTABLE or a.dtype not in {torch.float16, torch.bfloat16}:
         return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
     return cutlass_grouped_gemm(a, b, batch_sizes, trans_a=trans_a, trans_b=trans_b)
 

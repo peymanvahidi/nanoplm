@@ -304,11 +304,11 @@ class ModernBertSReluMLP(nn.Module):
         # Crossover measured in practice, not theoretical. x.shape[-1] == h is
         # static under dynamic=False, so this branch resolves at compile time.
         if USE_TRITON_SRELU and isinstance(self.Wi, nn.Linear) and x.shape[-1] < 1700:
-            from nanoplm.pretraining.models.modern_bert.triton_kernels import (
-                fused_linear_relu_square,
-            )
+            from . import triton_kernels as _triton_kernels
 
-            out = fused_linear_relu_square(x, self.Wi.weight, self.Wo_weight)
+            out = _triton_kernels.fused_linear_relu_square(
+                x, self.Wi.weight, self.Wo_weight
+            )
         else:
             h = F.relu(self.Wi(x))
             h = h * h
@@ -1475,9 +1475,11 @@ class MHCLiteBlock(nn.Module):
 
     def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
         """x_streams: (..., n, C).  Returns (..., n, C)."""
-        # Use Triton path when: triton_fused=True, CUDA, bf16, 2D token dim
+        # Use Triton path when: triton_fused=True, the ops are registered (not
+        # portable mode), CUDA, bf16, 2D token dim
         use_triton = (
             self.triton_fused
+            and _mhc_triton_ops is not None
             and x_streams.is_cuda
             and x_streams.dtype == torch.bfloat16
             and x_streams.dim() == 3  # (T, n, C) — no batch dim

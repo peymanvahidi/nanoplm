@@ -25,6 +25,7 @@ import torch.library
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._globals import PORTABLE as _PORTABLE
 from .moe_grouped_gemm_ops import moe_grouped_gemm
 from .moe_triton_ops import (
     build_inverse_map,
@@ -149,13 +150,18 @@ def convert_wi_state_dict_v1_to_v2(
 # The kernel returns *indices only*; the caller gathers the values from the
 # source tensor, which is bit-identical to ``torch.topk``'s values and keeps
 # the differentiable path in plain ATen ops.
-try:  # pragma: no cover - exercised on GPU builds
-    import triton
-    import triton.language as tl
-
-    _HAVE_TRITON = True
-except ImportError:  # pragma: no cover
+#
+# Portable mode skips the Triton import; CUDA then takes the ``torch.topk`` path.
+if _PORTABLE:
     _HAVE_TRITON = False
+else:
+    try:  # pragma: no cover - exercised on GPU builds
+        import triton
+        import triton.language as tl
+
+        _HAVE_TRITON = True
+    except ImportError:  # pragma: no cover
+        _HAVE_TRITON = False
 
 
 if _HAVE_TRITON:
