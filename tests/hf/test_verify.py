@@ -1,5 +1,12 @@
 """Export verification. Runs on CPU with a dense tiny model; GPU-gated tests
-(marked below) additionally cover the CUDA and FP8 paths on real hardware.
+(marked below) additionally cover the CUDA, FP8, and sReLU paths on real
+hardware.
+
+Every forward-comparison config here uses `wo_init="kaiming"` (R12-9): the
+default `wo_init="zero"` zeroes every attention/MLP output projection at
+init, which makes every residual branch a no-op and every native-vs-export
+comparison trivially agree regardless of whether the branch under test is
+correct -- see `nanoplm.hf.verify`'s module docstring for the full story.
 """
 
 import copy
@@ -39,6 +46,7 @@ TINY = dict(
     num_attention_heads=4,
     num_kv_heads=2,
     vocab_size=32,
+    wo_init="kaiming",
 )
 MOE = dict(use_moe=True, moe_num_experts=4, moe_top_k=2, moe_kernel_backend="cutlass")
 RECYCLING = dict(
@@ -96,6 +104,8 @@ def test_matching_export_passes(tmp_path):
     )
     assert result.passed
     assert result.max_logit_diff == pytest.approx(0.0, abs=1e-6)
+    assert result.rel_logit_diff == pytest.approx(0.0, abs=1e-6)
+    assert result.rel_hidden_diff == pytest.approx(0.0, abs=1e-6)
 
 
 def test_perturbed_export_is_rejected(tmp_path):
@@ -104,7 +114,7 @@ def test_perturbed_export_is_rejected(tmp_path):
     # shifting: the encoder's final norm output is close to zero-mean per
     # feature, so adding a constant to every weight entry nearly cancels out
     # (measured ~1e-6, under tolerance) -- scaling does not have that problem.
-    reloaded = NanoPLMForMaskedLM.from_pretrained(out)
+    reloaded = NanoPLMForMaskedLM.from_pretrained(out, local_files_only=True)
     with torch.no_grad():
         reloaded.head.dense.weight.mul_(2.0)
     reloaded.save_pretrained(out, safe_serialization=True)
@@ -221,6 +231,108 @@ def test_fp8_source_on_cuda_passes_and_leaves_native_in_te_layout(tmp_path):
     assert isinstance(native.model.layers[-1].mlp.layernorm_mlp, te.LayerNormMLP)
 
 
+# --- (d-neg) a swapped FP8 export is caught (R12-9 negative control) -----------
+
+
+@pytest.mark.skipif(
+    not (WITH_CUDA and WITH_TE), reason="needs CUDA + Transformer Engine"
+)
+def test_fp8_source_with_swapped_gate_up_is_rejected(tmp_path):
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    native = PureProtModernBertMLM(ProtModernBertMLMConfig(**TINY)).to(device).eval()
+    convert_fp8_targets(native, target="mlp,attn_wqkv,attn_wo")
+    restored = copy.deepcopy(native)
+    restore_dense_from_te(restored, restored.config)
+
+    # Simulate a wrong te_fc1_to_native_wi: swap the [up, gate] halves the
+    # restore should have produced, in the EXPORT only -- native stays correct.
+    with torch.no_grad():
+        for layer in restored.model.layers:
+            if layer.mlp is not None:
+                up, gate = layer.mlp.Wi.weight.chunk(2, dim=0)
+                layer.mlp.Wi.weight.copy_(torch.cat([gate, up], dim=0))
+
+    hf = NanoPLMForMaskedLM(NanoPLMConfig(**TINY)).eval()
+    hf.load_state_dict(restored.state_dict(), strict=True)
+    hf.config.auto_map = AUTO_MAP
+    hf.save_pretrained(tmp_path, safe_serialization=True)
+    ProtModernBertTokenizer(num_register_tokens=0).save_pretrained(tmp_path)
+    vendor_modeling_code(tmp_path)
+    assert_no_unguarded_optional_imports(tmp_path)
+
+    with pytest.raises(ExportVerificationError):
+        verify_exported(
+            native,
+            tmp_path,
+            tokenizer=_native_tokenizer(),
+            device=device,
+            fp8_source=True,
+        )
+
+
+# --- (srelu) a correct sReLU export passes in its APPROX class -----------------
+
+
+@pytest.mark.skipif(not WITH_CUDA, reason="needs CUDA")
+def test_srelu_export_passes_on_cuda_bf16(tmp_path):
+    cfg = {**TINY, "mlp_activation": "srelu"}
+    torch.manual_seed(0)
+    native = PureProtModernBertMLM(ProtModernBertMLMConfig(**cfg)).eval()
+    hf = NanoPLMForMaskedLM(NanoPLMConfig(**cfg)).eval()
+    hf.load_state_dict(native.state_dict(), strict=True)
+    native = native.to(torch.device("cuda"), torch.bfloat16)
+    hf = hf.to(torch.bfloat16)
+    hf.config.auto_map = AUTO_MAP
+    hf.save_pretrained(tmp_path, safe_serialization=True)
+    ProtModernBertTokenizer(num_register_tokens=0).save_pretrained(tmp_path)
+    vendor_modeling_code(tmp_path)
+    assert_no_unguarded_optional_imports(tmp_path)
+
+    result = verify_exported(
+        native,
+        tmp_path,
+        tokenizer=_native_tokenizer(),
+        device=torch.device("cuda"),
+        fp8_source=False,
+    )
+    assert result.passed
+    # Native compute dtype is bf16 -> the APPROX class, looser than EXACT.
+    assert result.tolerance > 1e-4
+
+
+# --- (srelu-neg) a wrong Wo transpose is caught (R12-9 negative control) -------
+
+
+@pytest.mark.skipif(not WITH_CUDA, reason="needs CUDA")
+def test_srelu_export_with_wrong_wo_transpose_is_rejected(tmp_path):
+    cfg = {**TINY, "mlp_activation": "srelu"}
+    torch.manual_seed(0)
+    native = PureProtModernBertMLM(ProtModernBertMLMConfig(**cfg)).eval()
+    state = {k: v.clone() for k, v in native.state_dict().items()}
+    for key in list(state):
+        if key.endswith("mlp.Wo_weight"):
+            state[key] = state[key].flip(0)  # wrong row order, same shape
+
+    native = native.to(torch.device("cuda"), torch.bfloat16)
+    hf = NanoPLMForMaskedLM(NanoPLMConfig(**cfg)).eval().to(torch.bfloat16)
+    hf.load_state_dict(state, strict=True)
+    hf.config.auto_map = AUTO_MAP
+    hf.save_pretrained(tmp_path, safe_serialization=True)
+    ProtModernBertTokenizer(num_register_tokens=0).save_pretrained(tmp_path)
+    vendor_modeling_code(tmp_path)
+    assert_no_unguarded_optional_imports(tmp_path)
+
+    with pytest.raises(ExportVerificationError):
+        verify_exported(
+            native,
+            tmp_path,
+            tokenizer=_native_tokenizer(),
+            device=torch.device("cuda"),
+            fp8_source=False,
+        )
+
+
 # --- (e) tokenizer mismatch --------------------------------------------------------
 
 
@@ -243,7 +355,7 @@ def test_tokenizer_mismatch_is_rejected(tmp_path):
 
 def test_perturbing_the_head_names_logits_only(tmp_path):
     native, out = _export_tiny(tmp_path)
-    reloaded = NanoPLMForMaskedLM.from_pretrained(out)
+    reloaded = NanoPLMForMaskedLM.from_pretrained(out, local_files_only=True)
     with torch.no_grad():
         reloaded.head.dense.weight.mul_(2.0)
     reloaded.save_pretrained(out, safe_serialization=True)
@@ -261,14 +373,12 @@ def test_perturbing_the_head_names_logits_only(tmp_path):
 
 def test_perturbing_an_encoder_layer_names_last_hidden_state(tmp_path):
     native, out = _export_tiny(tmp_path)
-    reloaded = NanoPLMForMaskedLM.from_pretrained(out)
+    reloaded = NanoPLMForMaskedLM.from_pretrained(out, local_files_only=True)
     with torch.no_grad():
-        # attn.Wo is zero-initialized (wo_init="zero", a zero-init-residual
-        # scheme), so scaling it is a no-op and adding a constant to every
-        # entry nearly cancels for the same reason as head.dense above
-        # (measured ~1.5e-6, under tolerance). A single large entry sidesteps
-        # both: it cannot be zeroed by scaling and cannot cancel in a sum.
-        reloaded.model.layers[0].attn.Wo.weight[0, 0] += 10.0
+        # TINY uses wo_init="kaiming", so attn.Wo already carries live weight
+        # -- doubling it is a real, detectable perturbation (unlike the
+        # zero-init default; see nanoplm.hf.verify's module docstring).
+        reloaded.model.layers[0].attn.Wo.weight.mul_(2.0)
     reloaded.save_pretrained(out, safe_serialization=True)
     with pytest.raises(ExportVerificationError, match="last_hidden_state"):
         verify_exported(
@@ -318,7 +428,7 @@ def test_rng_state_and_tf32_flags_are_restored_after_success(tmp_path):
 
 def test_rng_state_and_tf32_flags_are_restored_after_failure(tmp_path):
     native, out = _export_tiny(tmp_path)
-    reloaded = NanoPLMForMaskedLM.from_pretrained(out)
+    reloaded = NanoPLMForMaskedLM.from_pretrained(out, local_files_only=True)
     with torch.no_grad():
         reloaded.head.dense.weight.mul_(2.0)
     reloaded.save_pretrained(out, safe_serialization=True)
@@ -349,6 +459,25 @@ def test_export_without_auto_map_is_rejected(tmp_path):
         verify_exported(
             native,
             tmp_path,
+            tokenizer=_native_tokenizer(),
+            device=torch.device("cpu"),
+            fp8_source=False,
+        )
+
+
+# --- (i) a non-finite export is rejected (R12-8) --------------------------------
+
+
+def test_nan_export_is_rejected_as_non_finite(tmp_path):
+    native, out = _export_tiny(tmp_path)
+    reloaded = NanoPLMForMaskedLM.from_pretrained(out, local_files_only=True)
+    with torch.no_grad():
+        reloaded.model.final_norm.weight[0] = float("nan")
+    reloaded.save_pretrained(out, safe_serialization=True)
+    with pytest.raises(ExportVerificationError, match="non-finite"):
+        verify_exported(
+            native,
+            out,
             tokenizer=_native_tokenizer(),
             device=torch.device("cpu"),
             fp8_source=False,
