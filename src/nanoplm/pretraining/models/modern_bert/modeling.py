@@ -939,6 +939,12 @@ class ModernBertEncoderLayer(nn.Module):
         ``forward`` keeps its own unrolled ``range(self.repeats)`` branch
         instead of delegating here, so a fixed-depth run traces exactly the
         graph it traced before this method existed.
+
+        Grad mode is a Dynamo guard, so with ``bptt`` set the ``no_grad``
+        applications compile their own ``_forward_once`` entries: the frame
+        needs (distinct layers) x (input shapes) x 2 cache slots, which can
+        exceed Dynamo's default 8. ``pure_pipeline._dynamo_recompile_limit``
+        sizes the limit.
         """
         r = int(loop_count.item()) if isinstance(loop_count, torch.Tensor) else int(loop_count)
         no_grad_reps = 0 if self.bptt is None else max(0, r - self.bptt)

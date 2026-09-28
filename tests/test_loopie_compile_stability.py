@@ -11,14 +11,19 @@ per layer. Both live in this file because a fix for either can break the other.
 resolve ``compile_dynamic`` to False in ``pure_pipeline``.
 """
 
-import warnings
+import types
 
+import pytest
 import torch
 import torch._dynamo
+from torch._C._dynamo.eval_frame import _debug_get_cache_entry_list
 from torch._dynamo.utils import counters
 
+import nanoplm.pretraining.models.modern_bert.modeling as modeling
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
+from nanoplm.pretraining.models.modern_bert.modeling import ModernBertEncoderLayer
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
+from nanoplm.pretraining.pure_pipeline import _count_layer_variants, _dynamo_recompile_limit
 
 # 10 stored layers is the production loop-imp geometry and exceeds Dynamo's
 # recompile_limit, so per-layer frame specialization would show up as an eager
@@ -109,8 +114,8 @@ def test_no_per_layer_cache_thrash_at_production_depth(make_counting_backend):
     torch._dynamo.reset()
     compiled = torch.compile(model, backend=backend, dynamic=False)
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    # torch 2.12 logs the limit hit instead of warning; this makes it raise.
+    with torch._dynamo.config.patch(fail_on_recompile_limit_hit=True):
         for r in (2, 3, 4):
             with torch.no_grad():
                 compiled(
@@ -119,14 +124,6 @@ def test_no_per_layer_cache_thrash_at_production_depth(make_counting_backend):
                     loop_count=torch.tensor(r, dtype=torch.int64),
                 )
 
-    cache_warnings = [
-        str(w.message) for w in caught
-        if "cache_size_limit" in str(w.message) or "recompile_limit" in str(w.message)
-    ]
-    assert not cache_warnings, (
-        "Dynamo hit its recompile limit (eager fallback). Warnings:\n"
-        + "\n".join(cache_warnings)
-    )
     assert n_compiles[0] <= 4 * _NUM_LAYERS, (
         f"Expected the graph count to track distinct layer shapes; got "
         f"{n_compiles[0]} for {_NUM_LAYERS} layers."
@@ -249,3 +246,112 @@ def test_one_layer_call_per_step_regardless_of_depth():
     assert bodies == {i: 4 for i in range(_NUM_LAYERS)}, (
         f"Each stored layer must run its body loop_count times; got {bodies}."
     )
+
+
+def _stub_flash_varlen(q, k, v, *, window_size, **kwargs):
+    """Shape-preserving CPU stand-in for the flash varlen kernel.
+
+    Reads ``window_size`` like the real kernel's int argument does, so full
+    and sliding layers keep their distinct guards.
+    """
+    return v * (1.0 + 0 * window_size[0])
+
+
+# Flat token count per micro-batch; the three max_seqlen buckets below stand in
+# for the packed collator's power-of-two buckets, the shapes that coexist in
+# one compile epoch (batch-size warmup stages are separated by a reset).
+_PACKED_TOKENS = 128
+_MAX_SEQLENS = (32, 64, 128)
+_JITTER_RS = (1, 2, 3)
+
+
+@pytest.mark.parametrize(
+    "pattern, num_layers, variants",
+    # "F": layer 0 (Identity attn_norm) + the rest. "FS": that, plus the
+    # sliding layers, whose window_size is an extra guard.
+    [("F", 3, 2), ("FS", 4, 3)],
+)
+@pytest.mark.parametrize("bptt", [None, 1])
+def test_jitter_training_fits_the_computed_recompile_limit(
+    monkeypatch, make_counting_backend, pattern, num_layers, variants, bptt
+):
+    """Jitter + truncated BPTT in training must not overflow _forward_once's cache.
+
+    The no_grad applications are a separate grad-mode guard, so the shared
+    per-layer frame needs V x S x G entries. With the limit from
+    ``_dynamo_recompile_limit`` and ``fail_on_recompile_limit_hit`` on, an
+    undersized limit raises instead of silently running that shape eager.
+    """
+    monkeypatch.setattr(modeling, "_flash_varlen_fn", _stub_flash_varlen)
+    monkeypatch.setattr(modeling, "_HAS_FLASH_VARLEN", True)
+    torch.manual_seed(0)
+    model = PureProtModernBertMLM(
+        _cfg(
+            num_hidden_layers=num_layers,
+            attn_layer_pattern=pattern,
+            use_loopie=True,
+            loopie_loop_count=2,
+            loopie_bptt=bptt,
+        )
+    ).train()
+    assert _count_layer_variants(model.model.layers) == variants
+
+    grad_modes = 2 if bptt is not None and max(_JITTER_RS) > bptt else 1
+    limit = _dynamo_recompile_limit(
+        model.model_config,
+        layers=model.model.layers,
+        loopie_jitter=1,
+        global_batch_warmup_steps=0,
+        n_input_shapes=len(_MAX_SEQLENS),
+    )
+
+    backend, _ = make_counting_backend()
+    torch._dynamo.reset()
+    compiled = torch.compile(model, backend=backend, dynamic=False)
+    with torch._dynamo.config.patch(recompile_limit=limit, fail_on_recompile_limit_hit=True):
+        for max_seqlen in _MAX_SEQLENS:
+            for r in _JITTER_RS:
+                input_ids = torch.randint(0, model.model_config.vocab_size, (_PACKED_TOKENS,))
+                cu_seqlens = torch.arange(0, _PACKED_TOKENS + 1, max_seqlen, dtype=torch.int32)
+                torch._dynamo.mark_dynamic(cu_seqlens, 0)
+                out = compiled(
+                    input_ids=input_ids,
+                    labels=input_ids.clone(),
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    position_ids=torch.arange(_PACKED_TOKENS) % max_seqlen,
+                    loop_count=torch.tensor(r, dtype=torch.int64),
+                )
+                out.loss.backward()
+
+    entries = len(_debug_get_cache_entry_list(ModernBertEncoderLayer._forward_once.__code__))
+    assert entries == variants * len(_MAX_SEQLENS) * grad_modes, (
+        f"_forward_once has {entries} cache entries; expected V={variants} x "
+        f"S={len(_MAX_SEQLENS)} x G={grad_modes}."
+    )
+    torch._dynamo.reset()
+
+
+def test_recompile_limit_arithmetic():
+    loopie = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=1)
+    full_bptt = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=None)
+    plain = types.SimpleNamespace(use_loopie=False)
+
+    def limit(cfg, jitter=1, warmup=0, shapes=6, variants=3):
+        return _dynamo_recompile_limit(
+            cfg,
+            layers=[torch.nn.Linear(k + 1, 1) for k in range(variants)],
+            loopie_jitter=jitter,
+            global_batch_warmup_steps=warmup,
+            n_input_shapes=shapes,
+        )
+
+    assert _count_layer_variants([torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)]) == 1
+    assert limit(plain) == 8
+    assert limit(plain, warmup=10) == 16
+    assert limit(loopie, jitter=0) == 8
+    assert limit(loopie) == 3 * 6 * 2  # max R = 3 > bptt = 1
+    assert limit(full_bptt) == 3 * 6
+    assert limit(loopie, shapes=1, variants=2, warmup=10) == 16  # warmup floor wins
+    bptt_covers_r = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=3)
+    assert limit(bptt_covers_r) == 3 * 6  # every R <= bptt: no no_grad applications

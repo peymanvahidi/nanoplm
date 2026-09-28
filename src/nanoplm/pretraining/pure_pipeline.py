@@ -329,23 +329,68 @@ def _split_batch(
     return _split_standard_batch(batch, n_splits=n_splits)
 
 
-def _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps: int) -> None:
-    """Increase Dynamo cache room when warmup introduces a few extra static shapes."""
-    if int(global_batch_warmup_steps) <= 0:
-        return
+def _count_layer_variants(layers) -> int:
+    """Number of structurally distinct encoder layers, i.e. how many Dynamo
+    cache entries one shape of a shared per-layer frame (``_forward_once``)
+    needs. Layer 0's Identity attn_norm, MoE vs dense MLPs and full vs sliding
+    attention each split the guards."""
+    return len({
+        (
+            getattr(layer, "attention_type", None),
+            tuple((name, type(m).__name__) for name, m in layer.named_modules()),
+            tuple((name, tuple(p.shape)) for name, p in layer.named_parameters()),
+        )
+        for layer in layers
+    })
+
+
+def _dynamo_recompile_limit(
+    model_config,
+    *,
+    layers,
+    loopie_jitter: int,
+    global_batch_warmup_steps: int,
+    n_input_shapes: int,
+) -> int:
+    """Dynamo recompile_limit this run needs so no compiled frame falls back to eager.
+
+    Batch-size warmup keeps the 16 it always had. Its stages do not share a
+    cache (each stage boundary calls ``torch.compiler.reset()``), but split
+    micro-batches carry unbucketed ``max_seqlen`` values.
+
+    Loopie jitter drives each layer from eager Python, so ``_forward_once``
+    becomes one frame shared by every layer. It needs V x S x G entries per
+    compile epoch: V structurally distinct layers, S input shapes (the
+    ``max_seqlen`` buckets on the static packed path), and G = 2 when some
+    sampled R exceeds ``loopie_bptt``. Grad mode is a guard, so the no_grad
+    applications get their own entries.
+    """
+    limit = 16 if int(global_batch_warmup_steps) > 0 else 8
+    if getattr(model_config, "use_loopie", False) and int(loopie_jitter) > 0:
+        bptt = getattr(model_config, "loopie_bptt", None)
+        # RecyclingScheduler(sampling="uniform") draws R from {R0 - j, ..., R0 + j}.
+        max_r = int(model_config.loopie_loop_count) + int(loopie_jitter)
+        grad_modes = 2 if bptt is not None and max_r > int(bptt) else 1
+        limit = max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * grad_modes)
+    return limit
+
+
+def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
+    """Raise Dynamo's recompile_limit to ``needed``; never lower a higher setting."""
     try:
         import torch._dynamo.config as dynamo_config
 
-        current_limit = int(getattr(dynamo_config, "cache_size_limit", 8))
-        if current_limit < 16:
-            dynamo_config.cache_size_limit = 16
+        current_limit = int(getattr(dynamo_config, "recompile_limit", 8))
+        if current_limit < needed:
+            dynamo_config.recompile_limit = needed
             logger.info(
-                "torch._dynamo.config.cache_size_limit raised from %d to %d for batch-size warmup.",
+                "torch._dynamo.config.recompile_limit raised from %d to %d "
+                "(batch-size warmup / loopie jitter shapes).",
                 current_limit,
-                dynamo_config.cache_size_limit,
+                dynamo_config.recompile_limit,
             )
     except Exception:
-        logger.exception("Failed to raise Dynamo cache_size_limit for batch-size warmup; continuing.")
+        logger.exception("Failed to raise Dynamo recompile_limit; continuing.")
 
 
 def _build_compiled_training_model(
@@ -2424,7 +2469,33 @@ def run_pure_pretraining(
         if getattr(pretrain_config, "use_compile_max_autotune", False)
         else None
     )
-    _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps)
+    _loopie_jitter_cfg = int(getattr(pretrain_config, "loopie_loop_count_jitter", 0))
+    _maybe_raise_dynamo_recompile_limit(
+        _dynamo_recompile_limit(
+            _model_config,
+            layers=base_model.model.layers,
+            loopie_jitter=_loopie_jitter_cfg,
+            global_batch_warmup_steps=global_batch_warmup_steps,
+            n_input_shapes=(
+                1 if compile_dynamic
+                else len(build_power_of_two_buckets(int(manifest.max_seq_len), min_power_of_two=32))
+            ),
+        )
+    )
+    if (
+        getattr(_model_config, "use_loopie", False)
+        and _loopie_jitter_cfg > 0
+        and getattr(_model_config, "activation_checkpointing", False)
+        and str(getattr(_model_config, "activation_checkpointing_mode", "layer")).strip().lower() == "layer"
+    ):
+        # The layer-level checkpoint wrapper cannot trace the dynamo-disabled
+        # _forward_repeats, so Dynamo never re-enters _forward_once.
+        logger.warning(
+            "activation_checkpointing_mode='layer' with loopie_loop_count_jitter=%d: "
+            "the encoder layers run uncompiled (eager). Use "
+            "activation_checkpointing_mode='attn' to keep them compiled.",
+            _loopie_jitter_cfg,
+        )
 
     # ---- TorchInductor knobs (must be set before torch.compile) ----
     if device.type == "cuda":
