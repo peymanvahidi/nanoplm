@@ -1040,8 +1040,9 @@ def _loop_count_fwd_kwargs(model_config, sampled_r: int, recycling_bptt: int,
 
     Loopie's tensor stays on CPU because its driver reads ``.item()`` once per
     stored layer per forward — on a device tensor that is L host syncs a step.
-    Huginn reads it once per forward and keeps the device tensor. Truncated
-    BPTT is Huginn-only; Loopie backprops through every repeat.
+    Huginn reads it once per forward and keeps the device tensor, and gets
+    its truncation depth here too. Loopie gets no bptt kwarg: each layer
+    reads ``loopie_bptt`` from the config at construction.
     """
     if getattr(model_config, "use_loopie", False):
         return {"loop_count": torch.tensor(sampled_r, dtype=torch.int64)}

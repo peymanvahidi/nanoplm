@@ -97,15 +97,30 @@ def _max_diff(a, b):
     return max((a[n] - b[n]).abs().max().item() for n in a)
 
 
+def _reference_grads(layer, x, kw, frozen):
+    """Gradients of the last application alone, stated without the re-attach.
+
+    The ``frozen`` applications before it run once to produce its input and
+    are then cut off: they contribute no parameter gradient, and in backward
+    they are the identity, so dL/dx is dL/d(input of the last application).
+    """
+    h = x.detach()
+    with torch.no_grad():
+        for _ in range(frozen):
+            h = layer._forward_once(h, **kw)
+    h = h.detach().requires_grad_(True)
+    loss = layer._forward_once(h, **kw).pow(2).sum()
+    names, params = zip(*layer.named_parameters())
+    grads = torch.autograd.grad(loss, [*params, h], allow_unused=True)
+    want = {n: g for n, g in zip(names, grads[:-1]) if g is not None}
+    want["<input>"] = grads[-1]
+    return want
+
+
 def test_bptt_1_matches_the_frozen_reattached_reference():
     layer, x, kw = _layer_and_inputs(loop_count=2, bptt=1)
-    out = layer(x, **kw)
-    got = _grads_and_reset(layer, x, out)
-
-    with torch.no_grad():
-        h = layer._forward_once(x, **kw)
-    x2 = h + (x - x.detach())
-    want = _grads_and_reset(layer, x, layer._forward_once(x2, **kw))
+    got = _grads_and_reset(layer, x, layer(x, **kw))
+    want = _reference_grads(layer, x, kw, frozen=1)
 
     assert _max_diff(got, want) < 1e-6
 
@@ -141,14 +156,7 @@ def test_bptt_none_still_backprops_through_every_application():
 def test_bptt_1_on_the_variable_depth_path():
     layer, x, kw = _layer_and_inputs(loop_count=2, bptt=1)
     got = _grads_and_reset(layer, x, layer(x, loop_count=3, **kw))
-
-    with torch.no_grad():
-        h1 = layer._forward_once(x, **kw)
-    x2 = h1 + (x - x.detach())
-    with torch.no_grad():
-        h2 = layer._forward_once(x2, **kw)
-    x3 = h2 + (x2 - x2.detach())
-    want = _grads_and_reset(layer, x, layer._forward_once(x3, **kw))
+    want = _reference_grads(layer, x, kw, frozen=2)
 
     assert _max_diff(got, want) < 1e-6
 
@@ -195,11 +203,35 @@ def test_bptt_shrinks_the_flops_estimate():
 
 
 def test_config_validates_bptt():
-    with pytest.raises(ValueError, match="loopie_bptt"):
-        _mb_cfg(loopie_bptt=0)
+    for bad in (0, -5, True, False, "abc", 1.0):
+        with pytest.raises(ValueError, match="loopie_bptt"):
+            _mb_cfg(loopie_bptt=bad)
     assert _mb_cfg(loopie_bptt=None).loopie_bptt is None
     assert _mb_cfg(loopie_bptt=1).loopie_bptt == 1
     assert _mb_cfg(loopie_bptt=3).loopie_bptt == 3
+
+
+@pytest.mark.parametrize("bad", [-5, True, "abc"])
+def test_config_validates_bptt_without_loopie(bad):
+    with pytest.raises(ValueError, match="loopie_bptt"):
+        ModernBertConfig(
+            hidden_size=64, intermediate_size=128, num_hidden_layers=4,
+            num_attention_heads=4, vocab_size=32, loopie_bptt=bad,
+        )
+
+
+def test_yaml_true_is_rejected_not_read_as_1():
+    import yaml
+
+    from nanoplm.cli.pretrain import _load_model_config
+
+    model_cfg = _load_model_config(yaml.safe_load(
+        "vocab_size: 32\nhidden_size: 64\nintermediate_size: 64\n"
+        "num_hidden_layers: 2\nnum_attention_heads: 4\n"
+        "use_loopie: true\nloopie_bptt: true\n"
+    ))
+    with pytest.raises(ValueError, match="loopie_bptt"):
+        PureProtModernBertMLM(model_cfg)
 
 
 def test_bptt_is_inert_without_loopie():
