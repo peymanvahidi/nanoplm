@@ -11,7 +11,10 @@
           "default": "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
         },
         "local_fasta": {
-          "type": "null",
+          "type": [
+            "string",
+            "null"
+          ],
           "default": null,
           "description": "optional local .fasta or .fasta.gz file (skips network download)"
         },

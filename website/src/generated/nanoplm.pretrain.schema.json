@@ -27,9 +27,13 @@
           "x-nanoplm-group": "Architecture (edit these first)"
         },
         "num_kv_heads": {
-          "type": "integer",
+          "type": [
+            "integer",
+            "null"
+          ],
           "default": 8,
           "x-nanoplm-group": "Architecture (edit these first)",
+          "minimum": 1,
           "description": "GQA; equal to num_attention_heads = MHA"
         },
         "vocab_size": {
@@ -630,9 +634,13 @@
           }
         },
         "loopie_bptt": {
-          "type": "null",
+          "type": [
+            "integer",
+            "null"
+          ],
           "default": null,
           "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "minimum": 1,
           "description": "null = full backprop; k = grad through the last k applications only (~1.33x a plain step at R=2 with k=1, not 2x)",
           "x-nanoplm-backend": [
             "pure_torch"
@@ -1064,9 +1072,15 @@
           }
         },
         "recycling_pretraining_eval_loop_counts": {
-          "type": "null",
+          "type": [
+            "array",
+            "null"
+          ],
           "default": null,
           "x-nanoplm-group": "Recycling training (only when model.recycling_loop_count > 1)",
+          "items": {
+            "type": "integer"
+          },
           "description": "null = single r at target mean; e.g. [1, 4] for eval sweep",
           "x-nanoplm-backend": [
             "pure_torch"
