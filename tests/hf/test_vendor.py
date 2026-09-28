@@ -10,6 +10,7 @@ package.
 
 import ast
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -320,6 +321,9 @@ CASES = {
 # Two masked positions (<mask> = 3) and one padding position (<pad> = 0).
 IDS = torch.tensor([[4, 5, 3, 7, 8, 1], [9, 3, 11, 12, 1, 0]])
 MASK = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 0]])
+LABELS = torch.tensor(
+    [[-100, -100, 6, -100, -100, -100], [-100, 10, -100, -100, -100, -100]]
+)
 BLOCKED = (
     "nanoplm",
     "triton",
@@ -332,68 +336,106 @@ BLOCKED = (
 )
 
 _CHILD = r"""
+import json
 import sys
 
 from import_blocker import block_imports
 
-export_dir, batch_path, out_path, with_cuda, blocked = sys.argv[1:6]
-blocked = blocked.split(",")
-block_imports(blocked)
+spec = json.loads(sys.argv[1])
+block_imports(spec["blocked"])
 
 import torch  # noqa: E402
 from transformers import AutoModelForMaskedLM  # noqa: E402
 
+batch = torch.load(spec["batch"])
+labels = batch.pop("labels")
+
+
+def run(model, cuda):
+    model.eval()
+    module = type(model).__module__
+    flags = sys.modules.get(module.rpartition(".")[0] + "._globals")
+    result = {"module": module, "portable": getattr(flags, "PORTABLE", None)}
+    out = model(**batch, labels=labels)
+    out.loss.backward()
+    result["cpu"] = out.logits.detach()
+    result["grads"] = {  # cloned: model.to() below moves each .grad too
+        name: p.grad.clone()
+        for name, p in model.named_parameters()
+        if p.grad is not None
+    }
+    if cuda:
+        model.to("cuda")
+        with torch.no_grad():
+            cuda_batch = {k: v.cuda() for k, v in batch.items()}
+            result["cuda"] = model(**cuda_batch).logits.cpu()
+    return result
+
+
+results = {}
+if spec["native"] is not None:
+    # nanoplm's own model first, so its torch.library ops are registered.
+    from nanoplm.hf import NanoPLMConfig, NanoPLMForMaskedLM
+
+    torch.manual_seed(spec["native"]["seed"])
+    native = NanoPLMForMaskedLM(NanoPLMConfig(**spec["native"]["config"]))
+    results["native"] = run(native, cuda=False)
+# After any nanoplm import: nanoplm.pretraining.pure_pipeline switches TF32 on
+# at import, and its 10-bit mantissa would swamp the fp32 CUDA comparison.
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
-
-model = AutoModelForMaskedLM.from_pretrained(export_dir, trust_remote_code=True)
-model.eval()
-module = type(model).__module__
-out = {
-    "module": module,
-    "portable": sys.modules[module.rpartition(".")[0] + "._globals"].PORTABLE,
-}
-batch = torch.load(batch_path)
-with torch.no_grad():
-    out["cpu"] = model(**batch).logits
-    if with_cuda == "1":
-        model.to("cuda")
-        cuda_batch = {k: v.cuda() for k, v in batch.items()}
-        out["cuda"] = model(**cuda_batch).logits.cpu()
-out["leaked"] = sorted(m for m in sys.modules if m.split(".")[0] in blocked)
-torch.save(out, out_path)
+ops_before = set(torch._C._dispatch_get_all_op_names())
+for export in spec["exports"]:
+    model = AutoModelForMaskedLM.from_pretrained(export, trust_remote_code=True)
+    results[export] = run(model, spec["cuda"])
+results["new_ops"] = sorted(
+    op
+    for op in set(torch._C._dispatch_get_all_op_names()) - ops_before
+    if not op.startswith("transformers::")  # transformers' own, registered lazily
+)
+results["leaked"] = sorted(m for m in sys.modules if m.split(".")[0] in spec["blocked"])
+torch.save(results, spec["out"])
 """
 
 
-@pytest.mark.parametrize("case", list(CASES))
-def test_export_loads_and_matches_without_nanoplm(tmp_path, case):
-    export = tmp_path / "export"
-    torch.manual_seed(0)
+def _export(path, case, seed=0):
+    """Save a seeded tiny model as a vendored, gated export.
+
+    Returns its CPU fp32 logits and gradients on the masked batch.
+    """
+    torch.manual_seed(seed)
     model = NanoPLMForMaskedLM(NanoPLMConfig(**{**TINY, **CASES[case]})).eval()
     model.config.auto_map = AUTO_MAP
-    model.save_pretrained(export)
-    vendor_modeling_code(export)
-    assert_no_unguarded_optional_imports(export)
-    with torch.no_grad():
-        expected = model(input_ids=IDS, attention_mask=MASK).logits
-    torch.save({"input_ids": IDS, "attention_mask": MASK}, tmp_path / "batch.pt")
+    model.save_pretrained(path)
+    vendor_modeling_code(path)
+    assert_no_unguarded_optional_imports(path)
+    out = model(input_ids=IDS, attention_mask=MASK, labels=LABELS)
+    out.loss.backward()
+    grads = {name: p.grad for name, p in model.named_parameters() if p.grad is not None}
+    return out.logits.detach(), grads
 
+
+def _run_child(tmp_path, exports, *, blocked=BLOCKED, native=None):
+    """Load `exports` with trust_remote_code in one fresh interpreter."""
+    batch = {"input_ids": IDS, "attention_mask": MASK, "labels": LABELS}
+    torch.save(batch, tmp_path / "batch.pt")
+    spec = {
+        "batch": str(tmp_path / "batch.pt"),
+        "out": str(tmp_path / "out.pt"),
+        "cuda": WITH_CUDA,
+        "blocked": list(blocked),
+        "exports": [str(export) for export in exports],
+        "native": native,
+    }
     env = dict(os.environ)
     env.pop("NANOPLM_PORTABLE", None)  # the bundle must be portable by itself
-    env["PYTHONPATH"] = str(HERE)  # import_blocker, and nothing from src/
+    # import_blocker, plus src/ only for a child that builds a native model.
+    paths = [str(HERE)] + ([str(PACKAGE_ROOT.parent)] if native else [])
+    env["PYTHONPATH"] = os.pathsep.join(paths)
     env["HF_MODULES_CACHE"] = str(tmp_path / "hf_modules")
     env["NANOPLM_CUTLASS_ROOT"] = str(tmp_path / "no-cutlass-here")
     child = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            _CHILD,
-            str(export),
-            str(tmp_path / "batch.pt"),
-            str(tmp_path / "out.pt"),
-            "1" if WITH_CUDA else "0",
-            ",".join(BLOCKED),
-        ],
+        [sys.executable, "-c", _CHILD, json.dumps(spec)],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -401,11 +443,58 @@ def test_export_loads_and_matches_without_nanoplm(tmp_path, case):
         timeout=1800,
     )
     assert child.returncode == 0, child.stderr[-6000:]
+    return torch.load(tmp_path / "out.pt")
 
-    out = torch.load(tmp_path / "out.pt")
-    assert out["module"].startswith("transformers_modules.")
-    assert out["portable"] is True
-    assert out["leaked"] == []
-    torch.testing.assert_close(out["cpu"], expected, rtol=0, atol=1e-5)
-    if WITH_CUDA:
-        torch.testing.assert_close(out["cuda"], expected, rtol=0, atol=1e-4)
+
+def _assert_matches(result, expected, *, bundle=True):
+    logits, grads = expected
+    if bundle:
+        assert result["module"].startswith("transformers_modules.")
+        assert result["portable"] is True
+    torch.testing.assert_close(result["cpu"], logits, rtol=0, atol=1e-5)
+    assert result["grads"].keys() == grads.keys()
+    for name, grad in grads.items():
+        torch.testing.assert_close(
+            result["grads"][name], grad, rtol=0, atol=1e-5, msg=lambda m: f"{name}: {m}"
+        )
+    if bundle and WITH_CUDA:
+        torch.testing.assert_close(result["cuda"], logits, rtol=0, atol=1e-4)
+
+
+@pytest.mark.parametrize("case", list(CASES))
+def test_export_loads_and_matches_without_nanoplm(tmp_path, case):
+    expected = _export(tmp_path / "export", case)
+    results = _run_child(tmp_path, [tmp_path / "export"])
+    assert results["leaked"] == []
+    assert results["new_ops"] == []
+    _assert_matches(results[str(tmp_path / "export")], expected)
+
+
+# --- (h), (i) torch.library registrations are process-global -------------------
+
+
+def test_two_moe_exports_load_in_one_process(tmp_path):
+    # Each export is imported as its own transformers_modules package, so a
+    # torch.library registration in the bundle would run once per export.
+    expected = {
+        name: _export(tmp_path / name, "moe", seed)
+        for name, seed in (("ckpt_a", 0), ("ckpt_b", 1))
+    }
+    results = _run_child(tmp_path, [tmp_path / name for name in expected])
+    first, second = (results[str(tmp_path / name)] for name in expected)
+    assert first["module"] != second["module"]
+    assert results["leaked"] == []
+    assert results["new_ops"] == []
+    for name in expected:
+        _assert_matches(results[str(tmp_path / name)], expected[name])
+
+
+def test_moe_export_loads_next_to_native_nanoplm(tmp_path):
+    # An in-process parity check: nanoplm's MoE ops are already registered
+    # when the export is imported.
+    expected = _export(tmp_path / "export", "moe")
+    native = {"seed": 0, "config": {**TINY, **CASES["moe"]}}
+    results = _run_child(tmp_path, [tmp_path / "export"], blocked=(), native=native)
+    _assert_matches(results["native"], expected, bundle=False)
+    _assert_matches(results[str(tmp_path / "export")], expected)
+    assert results["new_ops"] == []

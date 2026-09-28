@@ -146,7 +146,7 @@ def _grouped_gemm_bf16():
     a = torch.randn(8, 16, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(2, 16, 32, device="cuda", dtype=torch.bfloat16)
     counts = torch.tensor([3, 5], device="cuda")
-    got = torch.ops.nanoplm_moe.grouped_gemm(a, b, counts)
+    got = moe_grouped_gemm_ops.moe_grouped_gemm(a, b, counts)
     ref = moe_grouped_gemm_ops._reference_grouped_gemm(a, b, counts, False, False)
     return {
         "equal": bool(torch.equal(got, ref)),
@@ -202,6 +202,10 @@ report["loaded"] = sorted(
     if m.split(".")[0] in BLOCKED
     or m in {f"nanoplm.pretraining.models.modern_bert.{k}" for k in KERNEL_MODULES}
 )
+# torch.library ops are process-global; portable mode must register none.
+report["nanoplm_ops"] = sorted(
+    op for op in torch._C._dispatch_get_all_op_names() if op.startswith("nanoplm")
+)
 report["modeling_tree_attempts"] = sorted(
     {f"{name} <- {path}" for name, path in attempts if path.startswith(MODERN_BERT_DIR)}
 )
@@ -251,6 +255,7 @@ def test_portable_child_imports_no_kernel(child):
     assert flags["PORTABLE"] == "True"
     assert report["loaded"] == []
     assert report["modeling_tree_attempts"] == []
+    assert report["nanoplm_ops"] == []
     assert flags["_HAS_FLASH_VARLEN"] == "False"
     assert flags["_FLASH_HAS_DROPOUT"] == "False"
     assert flags["USE_TRITON_SRELU"] == "False"

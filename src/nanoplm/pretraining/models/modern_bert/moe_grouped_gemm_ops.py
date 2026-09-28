@@ -7,12 +7,6 @@ from ._globals import PORTABLE as _PORTABLE
 from .cutlass_grouped_gemm import grouped_gemm as cutlass_grouped_gemm
 
 
-_lib = torch.library.Library("nanoplm_moe", "FRAGMENT")
-_lib.define(
-    "grouped_gemm(Tensor a, Tensor b, Tensor batch_sizes, bool trans_a=False, bool trans_b=False) -> Tensor"
-)
-
-
 def _validate_inputs(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -89,7 +83,6 @@ def _reference_grouped_gemm(
     return out
 
 
-@torch.library.register_fake("nanoplm_moe::grouped_gemm")
 def _grouped_gemm_fake(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -104,7 +97,6 @@ def _grouped_gemm_fake(
     )
 
 
-@torch.library.impl(_lib, "grouped_gemm", "CUDA")
 def _grouped_gemm_cuda(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -113,14 +105,11 @@ def _grouped_gemm_cuda(
     trans_b: bool = False,
 ):
     _validate_inputs(a, b, batch_sizes, trans_a, trans_b)
-    # Portable mode never builds the CUTLASS extension (a consumer of an
-    # exported model has no third_party/cutlass tree).
-    if _PORTABLE or a.dtype not in {torch.float16, torch.bfloat16}:
+    if a.dtype not in {torch.float16, torch.bfloat16}:
         return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
     return cutlass_grouped_gemm(a, b, batch_sizes, trans_a=trans_a, trans_b=trans_b)
 
 
-@torch.library.impl(_lib, "grouped_gemm", "CPU")
 def _grouped_gemm_cpu(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -131,7 +120,6 @@ def _grouped_gemm_cpu(
     return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
 
 
-@torch.library.impl(_lib, "grouped_gemm", "MPS")
 def _grouped_gemm_mps(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -201,11 +189,24 @@ def _backward(ctx, grad_out: torch.Tensor):
     return grad_a, grad_b, None, None, None
 
 
-torch.library.register_autograd(
-    "nanoplm_moe::grouped_gemm",
-    _backward,
-    setup_context=_setup_context,
-)
+# Registered only outside portable mode: torch.library ops are process-global,
+# and each exported Hugging Face bundle is imported as its own package, so a
+# second bundle, or nanoplm itself, in the same process would register them
+# again and raise. In portable mode moe_grouped_gemm calls the reference loop.
+if not _PORTABLE:
+    _lib = torch.library.Library("nanoplm_moe", "FRAGMENT")
+    _lib.define(
+        "grouped_gemm(Tensor a, Tensor b, Tensor batch_sizes, bool trans_a=False, bool trans_b=False) -> Tensor"
+    )
+    torch.library.register_fake("nanoplm_moe::grouped_gemm")(_grouped_gemm_fake)
+    torch.library.impl(_lib, "grouped_gemm", "CUDA")(_grouped_gemm_cuda)
+    torch.library.impl(_lib, "grouped_gemm", "CPU")(_grouped_gemm_cpu)
+    torch.library.impl(_lib, "grouped_gemm", "MPS")(_grouped_gemm_mps)
+    torch.library.register_autograd(
+        "nanoplm_moe::grouped_gemm",
+        _backward,
+        setup_context=_setup_context,
+    )
 
 
 def moe_grouped_gemm(
@@ -216,4 +217,8 @@ def moe_grouped_gemm(
     trans_a: bool = False,
     trans_b: bool = False,
 ) -> torch.Tensor:
+    if _PORTABLE:
+        # Plain torch ops, so autograd needs no custom backward. It never
+        # builds CUTLASS: an export's consumer has no third_party/cutlass tree.
+        return _reference_grouped_gemm(a, b, batch_sizes, trans_a, trans_b)
     return torch.ops.nanoplm_moe.grouped_gemm(a, b, batch_sizes, trans_a, trans_b)

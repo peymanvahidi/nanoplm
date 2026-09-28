@@ -9,7 +9,8 @@ Provides custom ops registered via ``torch.library``:
     and grad_weights in a single pass (loads grad_out once)
 
 All backward ops are registered as separate custom ops (not direct Triton
-launches) so that ``torch.compile`` can trace through FakeTensors.
+launches) so that ``torch.compile`` can trace through FakeTensors. Portable
+mode registers none of them (see "Registration" at the end of the file).
 """
 
 from __future__ import annotations
@@ -23,20 +24,6 @@ import torch
 import torch.library
 
 from ._globals import PORTABLE as _PORTABLE
-
-_lib = torch.library.Library("nanoplm_moe", "DEF")
-
-_lib.define("scatter_dispatch(Tensor x, Tensor token_idx) -> Tensor")
-_lib.define("scatter_add_bwd(Tensor grad_sorted, Tensor token_idx, int T) -> Tensor")
-_lib.define(
-    "gather_combine(Tensor expert_out_sorted, Tensor inv_map, "
-    "Tensor weights, float scale) -> Tensor"
-)
-_lib.define(
-    "gather_combine_bwd(Tensor grad_out, Tensor expert_out_sorted, "
-    "Tensor inv_map, Tensor weights, float scale, int M, int eo_dtype) "
-    "-> (Tensor, Tensor)"
-)
 
 # Encode dtype as int so it can pass through the op schema.
 _DTYPE_TO_INT = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2, torch.float64: 3}
@@ -146,10 +133,11 @@ def _moe_autotune_status_end(
         )
 
 
-# ── Eager fallbacks (CPU, MPS, and CUDA in portable mode) ────────────────────
+# ── Eager fallbacks (CPU, MPS, and every device in portable mode) ────────────
 #
-# In portable mode each CUDA impl below returns its CPU impl before touching
-# ``moe_triton_kernels``, so no Triton import ever happens.
+# Portable mode registers no op (see "Registration" at the end of the file);
+# the public wrappers call these directly, so ``moe_triton_kernels`` is never
+# imported.
 
 
 def _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale):
@@ -211,17 +199,13 @@ def build_inverse_map(
 # ── scatter_dispatch: fuses repeat_interleave + permute ──────────────────────
 
 
-@torch.library.register_fake("nanoplm_moe::scatter_dispatch")
 def _scatter_dispatch_fake(x, token_idx):
     return torch.empty(
         token_idx.shape[0], x.shape[1], dtype=x.dtype, device=x.device,
     )
 
 
-@torch.library.impl(_lib, "scatter_dispatch", "CUDA")
 def _scatter_dispatch_cuda(x, token_idx):
-    if _PORTABLE:
-        return _scatter_dispatch_cpu(x, token_idx)
     from . import moe_triton_kernels as k
 
     x = x.contiguous()
@@ -238,12 +222,10 @@ def _scatter_dispatch_cuda(x, token_idx):
     return y
 
 
-@torch.library.impl(_lib, "scatter_dispatch", "CPU")
 def _scatter_dispatch_cpu(x, token_idx):
     return x[token_idx.long()]
 
 
-@torch.library.impl(_lib, "scatter_dispatch", "MPS")
 def _scatter_dispatch_mps(x, token_idx):
     # No fused MPS kernel exists; this is a plain index_select, which Metal
     # handles natively. MPS is an inference target, never a training one, so
@@ -255,15 +237,11 @@ def _scatter_dispatch_mps(x, token_idx):
 # ── scatter_add_bwd ──────────────────────────────────────────────────────────
 
 
-@torch.library.register_fake("nanoplm_moe::scatter_add_bwd")
 def _scatter_add_bwd_fake(grad_sorted, token_idx, T):
     return torch.empty(T, grad_sorted.shape[1], dtype=grad_sorted.dtype, device=grad_sorted.device)
 
 
-@torch.library.impl(_lib, "scatter_add_bwd", "CUDA")
 def _scatter_add_bwd_cuda(grad_sorted, token_idx, T):
-    if _PORTABLE:
-        return _scatter_add_bwd_cpu(grad_sorted, token_idx, T)
     from . import moe_triton_kernels as k
 
     grad_sorted = grad_sorted.contiguous()
@@ -282,7 +260,6 @@ def _scatter_add_bwd_cuda(grad_sorted, token_idx, T):
     return grad_x
 
 
-@torch.library.impl(_lib, "scatter_add_bwd", "CPU")
 def _scatter_add_bwd_cpu(grad_sorted, token_idx, T):
     D = grad_sorted.shape[1]
     grad_x = torch.zeros(T, D, dtype=grad_sorted.dtype, device=grad_sorted.device)
@@ -303,21 +280,15 @@ def _scatter_dispatch_backward(ctx, grad_sorted):
     ), None
 
 
-torch.library.register_autograd(
-    "nanoplm_moe::scatter_dispatch",
-    _scatter_dispatch_backward,
-    setup_context=_scatter_dispatch_setup_context,
-)
-
-
 def moe_scatter_dispatch(x: torch.Tensor, token_idx: torch.Tensor) -> torch.Tensor:
+    if _PORTABLE:
+        return _scatter_dispatch_cpu(x, token_idx)
     return torch.ops.nanoplm_moe.scatter_dispatch(x, token_idx)
 
 
 # ── gather_combine: fuses unpermute + mul(weights) + sum(top_k) ──────────────
 
 
-@torch.library.register_fake("nanoplm_moe::gather_combine")
 def _gather_combine_fake(expert_out_sorted, inv_map, weights, scale):
     T = inv_map.shape[0]
     C = expert_out_sorted.shape[1]
@@ -378,19 +349,14 @@ def _launch_gather_combine_triton(expert_out_sorted, inv_map, weights, scale):
     return output
 
 
-@torch.library.impl(_lib, "gather_combine", "CUDA")
 def _gather_combine_cuda(expert_out_sorted, inv_map, weights, scale):
-    if _PORTABLE:
-        return _gather_combine_cpu(expert_out_sorted, inv_map, weights, scale)
     return _launch_gather_combine_triton(expert_out_sorted, inv_map, weights, scale)
 
 
-@torch.library.impl(_lib, "gather_combine", "CPU")
 def _gather_combine_cpu(expert_out_sorted, inv_map, weights, scale):
     return _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale)
 
 
-@torch.library.impl(_lib, "gather_combine", "MPS")
 def _gather_combine_mps(expert_out_sorted, inv_map, weights, scale):
     # Same reasoning as scatter_dispatch's MPS impl above: the eager
     # (gather + weighted sum) path is plain torch ops with no Triton
@@ -403,7 +369,6 @@ def _gather_combine_mps(expert_out_sorted, inv_map, weights, scale):
 # ── gather_combine fused backward ────────────────────────────────────────────
 
 
-@torch.library.register_fake("nanoplm_moe::gather_combine_bwd")
 def _gather_combine_bwd_fake(
     grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype,
 ):
@@ -415,14 +380,9 @@ def _gather_combine_bwd_fake(
     )
 
 
-@torch.library.impl(_lib, "gather_combine_bwd", "CUDA")
 def _gather_combine_bwd_cuda(
     grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype,
 ):
-    if _PORTABLE:
-        return _gather_combine_bwd_cpu(
-            grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype
-        )
     from . import moe_triton_kernels as k
 
     T, top_k = inv_map.shape
@@ -477,7 +437,6 @@ def _gather_combine_bwd_cuda(
     return grad_eo, grad_w
 
 
-@torch.library.impl(_lib, "gather_combine_bwd", "CPU")
 def _gather_combine_bwd_cpu(
     grad_out, expert_out_sorted, inv_map, weights, scale, M, eo_dtype,
 ):
@@ -510,19 +469,67 @@ def _gather_combine_backward(ctx, grad_out):
     return grad_eo, None, grad_w, None
 
 
-torch.library.register_autograd(
-    "nanoplm_moe::gather_combine",
-    _gather_combine_backward,
-    setup_context=_gather_combine_setup_context,
-)
-
-
 def moe_gather_combine(
     expert_out_sorted: torch.Tensor,
     inv_map: torch.Tensor,
     weights: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
+    if _PORTABLE:
+        return _gather_combine_fwd_eager(expert_out_sorted, inv_map, weights, scale)
     return torch.ops.nanoplm_moe.gather_combine(
         expert_out_sorted, inv_map, weights, scale,
+    )
+
+
+# ── Registration ─────────────────────────────────────────────────────────────
+#
+# Only outside portable mode: torch.library ops are process-global, and each
+# exported Hugging Face bundle is imported as its own package, so a second
+# bundle, or nanoplm itself, in the same process would register them again and
+# raise. Portable mode's wrappers above run plain torch ops, which autograd
+# differentiates without the custom backward ops.
+
+if not _PORTABLE:
+    _lib = torch.library.Library("nanoplm_moe", "DEF")
+
+    _lib.define("scatter_dispatch(Tensor x, Tensor token_idx) -> Tensor")
+    _lib.define(
+        "scatter_add_bwd(Tensor grad_sorted, Tensor token_idx, int T) -> Tensor"
+    )
+    _lib.define(
+        "gather_combine(Tensor expert_out_sorted, Tensor inv_map, "
+        "Tensor weights, float scale) -> Tensor"
+    )
+    _lib.define(
+        "gather_combine_bwd(Tensor grad_out, Tensor expert_out_sorted, "
+        "Tensor inv_map, Tensor weights, float scale, int M, int eo_dtype) "
+        "-> (Tensor, Tensor)"
+    )
+
+    torch.library.register_fake("nanoplm_moe::scatter_dispatch")(_scatter_dispatch_fake)
+    torch.library.impl(_lib, "scatter_dispatch", "CUDA")(_scatter_dispatch_cuda)
+    torch.library.impl(_lib, "scatter_dispatch", "CPU")(_scatter_dispatch_cpu)
+    torch.library.impl(_lib, "scatter_dispatch", "MPS")(_scatter_dispatch_mps)
+    torch.library.register_fake("nanoplm_moe::scatter_add_bwd")(_scatter_add_bwd_fake)
+    torch.library.impl(_lib, "scatter_add_bwd", "CUDA")(_scatter_add_bwd_cuda)
+    torch.library.impl(_lib, "scatter_add_bwd", "CPU")(_scatter_add_bwd_cpu)
+    torch.library.register_autograd(
+        "nanoplm_moe::scatter_dispatch",
+        _scatter_dispatch_backward,
+        setup_context=_scatter_dispatch_setup_context,
+    )
+    torch.library.register_fake("nanoplm_moe::gather_combine")(_gather_combine_fake)
+    torch.library.impl(_lib, "gather_combine", "CUDA")(_gather_combine_cuda)
+    torch.library.impl(_lib, "gather_combine", "CPU")(_gather_combine_cpu)
+    torch.library.impl(_lib, "gather_combine", "MPS")(_gather_combine_mps)
+    torch.library.register_fake("nanoplm_moe::gather_combine_bwd")(
+        _gather_combine_bwd_fake
+    )
+    torch.library.impl(_lib, "gather_combine_bwd", "CUDA")(_gather_combine_bwd_cuda)
+    torch.library.impl(_lib, "gather_combine_bwd", "CPU")(_gather_combine_bwd_cpu)
+    torch.library.register_autograd(
+        "nanoplm_moe::gather_combine",
+        _gather_combine_backward,
+        setup_context=_gather_combine_setup_context,
     )

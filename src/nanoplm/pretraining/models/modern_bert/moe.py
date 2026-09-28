@@ -207,11 +207,6 @@ if _HAVE_TRITON:
             tl.atomic_add(CNT + cols, acc, mask=cmask)
 
 
-_lib = torch.library.Library("nanoplm_router", "DEF")
-_lib.define("topk_counts(Tensor scores, int k, bool want_counts) -> (Tensor, Tensor)")
-
-
-@torch.library.register_fake("nanoplm_router::topk_counts")
 def _topk_counts_fake(scores, k, want_counts):
     m, e = scores.shape
     return (
@@ -220,7 +215,6 @@ def _topk_counts_fake(scores, k, want_counts):
     )
 
 
-@torch.library.impl(_lib, "topk_counts", "CUDA")
 def _topk_counts_cuda(scores, k, want_counts):
     scores = scores.contiguous()
     m, e = scores.shape
@@ -239,7 +233,6 @@ def _topk_counts_cuda(scores, k, want_counts):
     return idx, cnt32.to(torch.int64)
 
 
-@torch.library.impl(_lib, "topk_counts", "CPU")
 def _topk_counts_fallback(scores, k, want_counts):
     """Reference path (CPU). Mirrors the kernel, including its tie-break.
 
@@ -264,13 +257,27 @@ def _topk_counts_fallback(scores, k, want_counts):
     return idx, cnt
 
 
-@torch.library.impl(_lib, "topk_counts", "MPS")
 def _topk_counts_mps(scores, k, want_counts):
     # No Metal kernel exists, and the CPU reference above is pure torch keyed on
     # scores.device, so it runs on MPS unchanged. Registered for the same reason
     # the MoE dispatch/combine ops are: an exported model must run on Apple
     # Silicon, and an unregistered op raises NotImplementedError at dispatch.
     return _topk_counts_fallback(scores, k, want_counts)
+
+
+# Registered only outside portable mode: torch.library ops are process-global,
+# and each exported Hugging Face bundle is imported as its own package, so a
+# second bundle, or nanoplm itself, in the same process would register them
+# again and raise. In portable mode _router_topk_indices calls the reference.
+if not _PORTABLE:
+    _lib = torch.library.Library("nanoplm_router", "DEF")
+    _lib.define(
+        "topk_counts(Tensor scores, int k, bool want_counts) -> (Tensor, Tensor)"
+    )
+    torch.library.register_fake("nanoplm_router::topk_counts")(_topk_counts_fake)
+    torch.library.impl(_lib, "topk_counts", "CUDA")(_topk_counts_cuda)
+    torch.library.impl(_lib, "topk_counts", "CPU")(_topk_counts_fallback)
+    torch.library.impl(_lib, "topk_counts", "MPS")(_topk_counts_mps)
 
 
 def _router_topk_indices(
@@ -288,7 +295,10 @@ def _router_topk_indices(
     )
     use_fused = supported and (_HAVE_TRITON if scores.is_cuda else True)
     if use_fused:
-        idx, cnt = torch.ops.nanoplm_router.topk_counts(scores, k, want_counts)
+        if _PORTABLE:  # the op is not registered; same reference math
+            idx, cnt = _topk_counts_fallback(scores, k, want_counts)
+        else:
+            idx, cnt = torch.ops.nanoplm_router.topk_counts(scores, k, want_counts)
         return idx, (cnt if want_counts else None)
     idx = torch.topk(scores, k, dim=-1).indices
     if not want_counts:
