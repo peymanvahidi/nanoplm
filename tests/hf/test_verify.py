@@ -312,6 +312,10 @@ def test_srelu_export_with_wrong_wo_transpose_is_rejected(tmp_path):
     state = {k: v.clone() for k, v in native.state_dict().items()}
     for key in list(state):
         if key.endswith("mlp.Wo_weight"):
+            # A row flip, not a true transpose (.t()): Wo_weight is
+            # (intermediate, hidden), and hidden != intermediate here, so a
+            # transpose would be shape-incompatible. .flip(0) reorders the
+            # rows -- still the wrong Wo, still shape-compatible.
             state[key] = state[key].flip(0)  # wrong row order, same shape
 
     native = native.to(torch.device("cuda"), torch.bfloat16)

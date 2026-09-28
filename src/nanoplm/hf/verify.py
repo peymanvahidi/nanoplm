@@ -44,67 +44,90 @@ VERIFY_SEQUENCES: tuple[str, ...] = (
     "MAIGTXBOUZAIGTMKALC",
 )
 
-# Measured (R12-7) with `wo_init="kaiming"` -- i.e. with every residual
-# branch actually contributing something, unlike the zero-init default (see
-# the module docstring) -- on this node's H100 plus CPU, 2026-09-28, torch
-# 2.12.1+cu130, Transformer Engine 2.16.0+4220403. Full table, negative
-# controls, and the exact commands are in the probe script and its log:
+# Measured (R12-7, revised in a round-2 re-review of this comment -- see
+# below) with `wo_init="kaiming"` -- i.e. with every residual branch actually
+# contributing something, unlike the zero-init default (see the module
+# docstring) -- on this node's H100 plus CPU, 2026-09-28, torch 2.12.1+cu130,
+# Transformer Engine 2.16.0+4220403. EVERY number in this comment appears in
+# one saved log; none is hand-derived or extrapolated between shapes or
+# dtypes. Probe script and log:
 # .superpowers/sdd/2026-09-09-huggingface-export/task12_scratch/
-# probe_live_weights.py[.log]. Relative L2 error over valid
-# (attention_mask==1) positions:
+# probe_live_weights.py, probe_live_weights_round2.log. Relative L2 error
+# over valid (attention_mask==1) positions:
 #
-#   class  | case                       | shape    | device | rel(logits) | rel(hidden)
-#   -------|----------------------------|----------|--------|-------------|------------
-#   EXACT  | dense fp32                 | 64/2     | cpu    | 0.0         | 0.0
-#   EXACT  | dense fp32                 | 64/2     | cuda   | 0.0         | 0.0
-#   EXACT  | dense fp32                 | 768/4    | cpu    | 0.0         | 0.0
-#   EXACT  | dense fp32                 | 768/4    | cuda   | 0.0         | 0.0
-#   EXACT  | dense fp32                 | 1024/16  | cpu    | 0.0         | 0.0
-#   EXACT  | dense fp32                 | 1024/16  | cuda   | 0.0         | 0.0
-#   EXACT  | MoE (cutlass) fp32         | 64/2     | cpu    | 0.0         | 0.0
-#   EXACT  | MoE (cutlass) fp32         | 64/2     | cuda   | 1.36e-7     | 3.39e-8
-#   EXACT  | MoE (cutlass) fp32         | 768/4    | cpu    | 0.0         | 0.0
-#   EXACT  | MoE (cutlass) fp32         | 768/4    | cuda   | 5.93e-7     | 3.99e-7
-#   EXACT  | recycling fp32 (noise s0)  | 64/3     | cpu    | 0.0         | 0.0
-#   EXACT  | recycling fp32 (noise s0)  | 64/3     | cuda   | 0.0         | 0.0
-#   APPROX | srelu bf16 (Triton)        | 64/2     | cuda   | 8.65e-3     | 5.84e-3
-#   APPROX | srelu bf16 (Triton)        | 768/4    | cuda   | 1.23e-2     | 9.18e-3
-#   APPROX | FP8-source fp32            | 64/2     | cuda   | 3.62e-4     | 3.13e-4
-#   APPROX | FP8-source fp32            | 768/4    | cuda   | 6.13e-4     | 5.03e-4
-#   APPROX | FP8-source fp32            | 1024/16  | cuda   | 1.04e-3     | 8.62e-4
-#   APPROX | FP8-source bf16            | 64/2     | cuda   | 7.16e-3     | 4.93e-3
-#   APPROX | FP8-source bf16            | 768/4    | cuda   | 1.17e-2     | 8.38e-3
-#   APPROX | FP8-source bf16            | 1024/16  | cuda   | 1.77e-2     | 1.50e-2  <- worst correct
+#   class  | case                       | shape    | device/dtype | rel(logits) | rel(hidden)
+#   -------|----------------------------|----------|---------------|-------------|------------
+#   EXACT  | dense fp32                 | 64/2     | cpu, cuda     | 0.0         | 0.0
+#   EXACT  | dense fp32                 | 768/4    | cpu, cuda     | 0.0         | 0.0
+#   EXACT  | dense fp32                 | 1024/16  | cpu, cuda     | 0.0         | 0.0
+#   EXACT  | MoE (cutlass) fp32         | 64/2     | cpu           | 0.0         | 0.0
+#   EXACT  | MoE (cutlass) fp32         | 64/2     | cuda          | 1.36e-7     | 3.39e-8
+#   EXACT  | MoE (cutlass) fp32         | 768/4    | cpu           | 0.0         | 0.0
+#   EXACT  | MoE (cutlass) fp32         | 768/4    | cuda          | 5.93e-7     | 3.99e-7
+#   EXACT  | recycling fp32 (noise s0)  | 64/3     | cpu, cuda     | 0.0         | 0.0
+#   APPROX | srelu (Triton kernel)      | 64/2     | cuda, bf16    | 8.65e-3     | 5.84e-3
+#   APPROX | srelu (Triton kernel)      | 768/4    | cuda, bf16    | 1.23e-2     | 9.18e-3
+#   APPROX | srelu (Triton kernel)      | 1024/16  | cuda, bf16    | 1.75e-2     | 1.53e-2
+#   APPROX | FP8-source                 | 64/2     | cuda, fp32    | 3.62e-4     | 3.13e-4
+#   APPROX | FP8-source                 | 64/2     | cuda, bf16    | 7.16e-3     | 4.93e-3
+#   APPROX | FP8-source                 | 768/4    | cuda, fp32    | 6.13e-4     | 5.03e-4
+#   APPROX | FP8-source                 | 768/4    | cuda, bf16    | 1.17e-2     | 8.38e-3
+#   APPROX | FP8-source                 | 1024/16  | cuda, fp32    | 1.04e-3     | 8.62e-4
+#   APPROX | FP8-source                 | 1024/16  | cuda, bf16    | 1.77e-2     | 1.50e-2  <- worst correct
 #
-# Negative controls (each must FAIL its class's threshold):
-#   NEG head.dense x2                          | 64/2 | cpu  | EXACT  | rel(logits)=8.34e-2, rel(hidden)=0.0
-#   NEG FP8 Wi gate/up halves swapped, fp32     | 64/2 | cuda | APPROX | rel(logits)=3.19e-1, rel(hidden)=2.91e-1
-#   NEG FP8 Wi gate/up halves swapped, bf16     | 768/4| cuda | APPROX | rel(logits)=7.17e-1, rel(hidden)=5.63e-1
-#   NEG FP8 Wi gate/up halves swapped, bf16     |1024/16|cuda | APPROX | rel(logits)=8.46e-1, rel(hidden)=8.04e-1
-#   NEG srelu Wo transpose flipped, bf16        | 64/2 | cuda | APPROX | rel(logits)=9.86e-1, rel(hidden)=9.37e-1
-#   NEG srelu Wo transpose flipped, bf16        | 768/4| cuda | APPROX | rel(logits)=1.22e0,  rel(hidden)=1.10e0
-#   NEG one NaN weight                          | 64/2 | cpu  | n/a    | caught by the finiteness check (R12-8)
+# Negative controls, run at EVERY shape/dtype above (round 1 only ran these
+# at one or two shapes and the comment cited numbers for shapes it never
+# actually measured -- a round-2 finding; every number below is now real):
+#
+#   NEG head.dense x2                      | 64/2    | cpu        | EXACT  | rel(logits)=8.34e-2, rel(hidden)=0.0
+#   NEG FP8 Wi gate/up swapped              | 64/2    | cuda, fp32 | APPROX | rel(logits)=3.19e-1, rel(hidden)=2.91e-1  <- weakest negative
+#   NEG FP8 Wi gate/up swapped              | 64/2    | cuda, bf16 | APPROX | rel(logits)=3.19e-1, rel(hidden)=2.91e-1
+#   NEG FP8 Wi gate/up swapped              | 768/4   | cuda, fp32 | APPROX | rel(logits)=7.17e-1, rel(hidden)=5.63e-1
+#   NEG FP8 Wi gate/up swapped              | 768/4   | cuda, bf16 | APPROX | rel(logits)=7.17e-1, rel(hidden)=5.63e-1
+#   NEG FP8 Wi gate/up swapped              | 1024/16 | cuda, fp32 | APPROX | rel(logits)=8.45e-1, rel(hidden)=8.04e-1
+#   NEG FP8 Wi gate/up swapped              | 1024/16 | cuda, bf16 | APPROX | rel(logits)=8.46e-1, rel(hidden)=8.04e-1
+#   NEG srelu Wo row-flipped                | 64/2    | cuda, bf16 | APPROX | rel(logits)=9.86e-1, rel(hidden)=9.37e-1
+#   NEG srelu Wo row-flipped                | 768/4   | cuda, bf16 | APPROX | rel(logits)=1.22e0,  rel(hidden)=1.10e0
+#   NEG srelu Wo row-flipped                | 1024/16 | cuda, bf16 | APPROX | rel(logits)=1.24e0,  rel(hidden)=1.18e0
+#   NEG one NaN weight                      | 64/2    | cpu        | n/a    | caught by the finiteness check (R12-8)
 #     before any tolerance is applied, independent of class.
 #
-# A structural bug's relative error grows with depth (a 2-layer toy model is
-# not a stand-in for a real, many-layer checkpoint -- the swap at 64/2 is
-# only 0.32/0.29, while the SAME bug at 768/4 is 0.72/0.56 and at 1024/16 is
-# 0.85/0.80: an untrained model's gate and up branches are drawn from the
+# A structural bug's relative error grows with depth: the SAME FP8 swap
+# measures 0.29-0.32 at 64/2 (2 layers) but 0.56-0.72 at 768/4 and 0.80-0.85
+# at 1024/16 -- an untrained model's gate and up branches are drawn from the
 # same random distribution, so a swap at 2 layers is a much weaker signal
-# than it would be in a real trained model of any realistic depth). The
-# thresholds below are chosen against the worst CORRECT case at any shape
-# (APPROX: FP8-source bf16 1024/16, 1.77e-2) and the worst NEGATIVE control
-# at 768/4+ (APPROX: FP8 swap bf16, 5.63e-1) -- not against the weak 64/2
-# swap signal, which is not representative of what this check exists to
-# catch. EXACT's only observed nonzero source is MoE's GPU grouped-gemm
-# (<6e-7, presumably nondeterministic reduction order, not an export bug).
+# than the same bug would be in a real trained model of realistic depth.
+# EXACT's only observed nonzero source is MoE's GPU grouped-gemm (<6e-7,
+# presumably nondeterministic reduction order, not an export bug).
 #
-#   EXACT:  worst correct 1.36e-7 * 3  = 4.08e-7  <=  tol  <=  8.34e-2 / 10 = 8.34e-3
-#   APPROX: worst correct 1.77e-2 * 3  = 5.31e-2  <=  tol  <=  5.63e-1 / 10 = 5.63e-2
+# R12-7's criterion, applied PER SHAPE/DTYPE with one constant threshold
+# across all of them (the controller's round-2 restatement -- this replaces
+# round 1's use of a single "representative" shape for the negative
+# controls, which was not a valid basis for the claim it was used for):
 #
-# Both ranges are real but narrow (APPROX especially: width 0.0032). Chosen
-# values sit inside each range with margin verified below, not derived from
-# it algebraically -- see the probe log for the full margin table.
+#   EXACT:  tol >= 3 * worst_correct (1.36e-7)      = 4.08e-7
+#           tol <= weakest_negative (8.34e-2) / 10  = 8.34e-3
+#           -> feasible range [4.08e-7, 8.34e-3]. Chosen: 1e-4 (correct
+#              margin 735x, negative margin 834x -- comfortable, unaffected
+#              by this round's finding).
+#
+#   APPROX: tol >= 3 * worst_correct (1.77e-2)         = 5.3046e-2
+#           tol <= weakest_negative (2.9096e-1) / 10   = 2.9096e-2
+#           -> INFEASIBLE: 5.3046e-2 > 2.9096e-2. No single constant clears
+#              both bounds. The weakest negative is the 64/2 FP8 swap (both
+#              dtypes, ~0.291-0.319); every other negative control clears
+#              10x margin over the CURRENT threshold comfortably (>=10.2x;
+#              see the log for the full per-case margin table).
+#
+# Per the controller's ruling, an infeasible range is not loosened to fit:
+# _REL_TOL["approx"] is left AT ITS PRIOR VALUE (5.5e-2, chosen in round 1
+# under a since-invalidated argument) rather than picked fresh, pending a
+# controller decision on how to resolve this -- e.g. a different negative
+# control, a per-config threshold instead of one global constant, or
+# accepting a smaller correct-side margin. At the current value, the
+# correct-side margin is fine (3.11x, satisfies >=3x) but the negative-side
+# margin at 64/2 is only ~5.3-5.8x, NOT the required >=10x. See
+# task-12-report.md's "Fix round 2" section for the full writeup.
 _REL_TOL = {"exact": 1e-4, "approx": 5.5e-2}
 
 # Shared by both forwards below so a recycling model's `torch.randn_like`
