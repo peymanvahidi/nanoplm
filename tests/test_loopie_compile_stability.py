@@ -340,28 +340,60 @@ def _stub_flash_varlen(q, k, v, *, window_size, **kwargs):
     return v * (1.0 + 0 * window_size[0])
 
 
-# Flat token count per micro-batch; the three max_seqlen buckets below stand in
-# for the packed collator's power-of-two buckets, the shapes that coexist in
-# one compile epoch (batch-size warmup stages are separated by a reset).
-_PACKED_TOKENS = 128
-_MAX_SEQLENS = (32, 64, 128)
-_JITTER_RS = (1, 2, 3)
+# Flat token count per micro-batch; the max_seqlen buckets below stand in for
+# the packed collator's power-of-two buckets, the shapes that coexist in one
+# compile epoch (batch-size warmup stages are separated by a reset).
+_PACKED_TOKENS = 64
+_MAX_SEQLENS = (32, 64)
+_JITTER_RS = (1, 2, 3)  # R0 = 2, jitter 1
+
+
+@pytest.fixture
+def single_rank_fsdp():
+    """A one-rank gloo group, so ``fully_shard`` runs on CPU."""
+    import socket
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        dist.init_process_group(
+            "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=0, world_size=1
+        )
+    mesh = init_device_mesh("cpu", (1,))
+
+    def _shard(model):
+        # Per-layer units, then the root, as pure_pipeline shards them.
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=mesh, reshard_after_forward=False)
+        fully_shard(model, mesh=mesh, reshard_after_forward=False)
+        return model
+
+    yield _shard
+    if owns_group:
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
-    "pattern, num_layers, variants",
+    "pattern, num_layers, variants, bptt",
     # "F": layer 0 (Identity attn_norm) + the rest. "FS": that, plus the
-    # sliding layers, whose window_size is an extra guard.
-    [("F", 3, 2), ("FS", 4, 3)],
+    # sliding layers, whose window_size is an extra guard. bptt=1 shows the
+    # no_grad applications add no entries on the unrolled path.
+    [("F", 3, 2, None), ("FS", 4, 3, 1)],
 )
-@pytest.mark.parametrize("bptt", [None, 1])
 def test_jitter_training_fits_the_computed_recompile_limit(
-    monkeypatch, make_counting_backend, pattern, num_layers, variants, bptt
+    monkeypatch, make_counting_backend, single_rank_fsdp, pattern, num_layers, variants, bptt
 ):
-    """Jitter + truncated BPTT in training must not overflow _forward_once's cache.
+    """Int-R jitter training under FSDP2 must fit the limit the pipeline sets.
 
-    The no_grad applications are a separate grad-mode guard, so the shared
-    per-layer frame needs V x S x G entries. With the limit from
+    FSDP2's dynamo-disabled hooks break the graph at every layer call, so
+    ``ModernBertEncoderLayer.forward`` is one frame shared by all layers, and
+    the int R specializes it: V x S x N entries. With the limit from
     ``_dynamo_recompile_limit`` and ``fail_on_recompile_limit_hit`` on, an
     undersized limit raises instead of silently running that shape eager.
     """
@@ -378,8 +410,6 @@ def test_jitter_training_fits_the_computed_recompile_limit(
         )
     ).train()
     assert _count_layer_variants(model.model.layers) == variants
-
-    grad_modes = 2 if bptt is not None and max(_JITTER_RS) > bptt else 1
     limit = _dynamo_recompile_limit(
         model.model_config,
         layers=model.model.layers,
@@ -387,9 +417,13 @@ def test_jitter_training_fits_the_computed_recompile_limit(
         global_batch_warmup_steps=0,
         n_input_shapes=len(_MAX_SEQLENS),
     )
+    expected = variants * len(_MAX_SEQLENS) * len(_JITTER_RS)
+    assert expected > 8, "test precondition: the default limit must be too small"
+    single_rank_fsdp(model)
 
     backend, _ = make_counting_backend()
     torch._dynamo.reset()
+    counters.clear()
     compiled = torch.compile(model, backend=backend, dynamic=False)
     with torch._dynamo.config.patch(recompile_limit=limit, fail_on_recompile_limit_hit=True):
         for max_seqlen in _MAX_SEQLENS:
@@ -403,20 +437,22 @@ def test_jitter_training_fits_the_computed_recompile_limit(
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     position_ids=torch.arange(_PACKED_TOKENS) % max_seqlen,
-                    loop_count=torch.tensor(r, dtype=torch.int64),
+                    loop_count=r,
                 )
                 out.loss.backward()
 
-    entries = len(_debug_get_cache_entry_list(ModernBertEncoderLayer._forward_once.__code__))
-    assert entries == variants * len(_MAX_SEQLENS) * grad_modes, (
-        f"_forward_once has {entries} cache entries; expected V={variants} x "
-        f"S={len(_MAX_SEQLENS)} x G={grad_modes}."
+    breaks = [reason for reason in counters["graph_break"] if "_forward_repeats" in reason]
+    assert not breaks, f"int R reached the eager driver:\n{breaks}"
+    entries = len(_debug_get_cache_entry_list(ModernBertEncoderLayer.forward.__code__))
+    assert entries == expected, (
+        f"ModernBertEncoderLayer.forward has {entries} cache entries; expected "
+        f"V={variants} x S={len(_MAX_SEQLENS)} x N={len(_JITTER_RS)}."
     )
     torch._dynamo.reset()
 
 
 def test_recompile_limit_arithmetic():
-    loopie = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=1)
+    truncated = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=1)
     full_bptt = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=None)
     plain = types.SimpleNamespace(use_loopie=False)
 
@@ -432,9 +468,8 @@ def test_recompile_limit_arithmetic():
     assert _count_layer_variants([torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)]) == 1
     assert limit(plain) == 8
     assert limit(plain, warmup=10) == 16
-    assert limit(loopie, jitter=0) == 8
-    assert limit(loopie) == 3 * 6 * 2  # max R = 3 > bptt = 1
-    assert limit(full_bptt) == 3 * 6
-    assert limit(loopie, shapes=1, variants=2, warmup=10) == 16  # warmup floor wins
-    bptt_covers_r = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=3)
-    assert limit(bptt_covers_r) == 3 * 6  # every R <= bptt: no no_grad applications
+    assert limit(full_bptt, jitter=0) == 8
+    assert limit(full_bptt) == 3 * 6 * 3  # V x S x (2j + 1)
+    assert limit(full_bptt, jitter=2) == 3 * 6 * 5
+    assert limit(truncated) == limit(full_bptt)  # bptt adds no entries
+    assert limit(full_bptt, shapes=1, variants=1, warmup=10) == 16  # warmup floor wins

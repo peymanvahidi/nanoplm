@@ -331,9 +331,9 @@ def _split_batch(
 
 def _count_layer_variants(layers) -> int:
     """Number of structurally distinct encoder layers, i.e. how many Dynamo
-    cache entries one shape of a shared per-layer frame (``_forward_once``)
-    needs. Layer 0's Identity attn_norm, MoE vs dense MLPs and full vs sliding
-    attention each split the guards."""
+    cache entries one input signature of the shared ``ModernBertEncoderLayer``
+    frame needs. Layer 0's Identity attn_norm, MoE vs dense MLPs and full vs
+    sliding attention each split the guards."""
     return len({
         (
             getattr(layer, "attention_type", None),
@@ -358,20 +358,23 @@ def _dynamo_recompile_limit(
     cache (each stage boundary calls ``torch.compiler.reset()``), but split
     micro-batches carry unbucketed ``max_seqlen`` values.
 
-    Loopie jitter drives each layer from eager Python, so ``_forward_once``
-    becomes one frame shared by every layer. It needs V x S x G entries per
-    compile epoch: V structurally distinct layers, S input shapes (the
-    ``max_seqlen`` buckets on the static packed path), and G = 2 when some
-    sampled R exceeds ``loopie_bptt``. Grad mode is a guard, so the no_grad
-    applications get their own entries.
+    Loopie jitter passes R as a Python int (``_loop_count_fwd_kwargs``), and
+    every frame that sees it specializes once per value in the
+    {R0 - j, ..., R0 + j} support. Under FSDP2 the dynamo-disabled per-layer
+    hooks split the model at each encoder layer, so
+    ``ModernBertEncoderLayer.forward`` becomes one frame shared by every layer
+    and needs V x S x N entries: V structurally distinct layers, S input shapes
+    (the ``max_seqlen`` buckets on the static packed path) and N = 2j + 1
+    values of R. Without FSDP the whole model is one frame and needs S x N,
+    which the same bound covers. ``loopie_bptt`` adds nothing: its ``no_grad``
+    applications are traced inside the unrolled graph. The tensor-R fallback
+    (``_forward_repeats``, off the training path) needs V x S x 2 entries on
+    ``_forward_once``, which this bound covers for any j >= 1.
     """
     limit = 16 if int(global_batch_warmup_steps) > 0 else 8
     if getattr(model_config, "use_loopie", False) and int(loopie_jitter) > 0:
-        bptt = getattr(model_config, "loopie_bptt", None)
-        # RecyclingScheduler(sampling="uniform") draws R from {R0 - j, ..., R0 + j}.
-        max_r = int(model_config.loopie_loop_count) + int(loopie_jitter)
-        grad_modes = 2 if bptt is not None and max_r > int(bptt) else 1
-        limit = max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * grad_modes)
+        n_r = 2 * int(loopie_jitter) + 1
+        limit = max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * n_r)
     return limit
 
 
@@ -1331,7 +1334,9 @@ def _loop_count_fwd_kwargs(model_config, sampled_r: int, recycling_bptt: int,
     Loopie gets a Python int. ``ModernBertEncoderLayer.forward`` unrolls it at
     trace time, so Dynamo specializes one whole-model graph per distinct R
     (three for R ~ U{1,2,3}, compiled once each) and the R=2 graph is the
-    fixed-depth 20x2 graph. The earlier 0-d CPU tensor avoided that
+    fixed-depth 20x2 graph. Under FSDP2 the specialization lands on the
+    per-layer frame instead; ``_dynamo_recompile_limit`` sizes the cache for
+    both. The earlier 0-d CPU tensor avoided that
     specialization by routing through the Dynamo-disabled ``_forward_repeats``,
     which cost a graph break at every stored layer on every step.
 
