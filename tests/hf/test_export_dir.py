@@ -14,6 +14,8 @@ correct -- see `nanoplm.hf.verify`'s module docstring.
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -238,6 +240,45 @@ def test_empty_out_dir_is_accepted(checkpoint, tmp_path):
     assert (out / "config.json").exists()
 
 
+# --- (I1) the published dir respects the umask and inherits setgid ----------
+#
+# Regression: the staging dir used to be created with tempfile.mkdtemp (mode
+# 0o700, always) and then chmod'd to 0o777 & ~umask. chmod cannot preserve a
+# setgid bit the directory inherited from its (setgid) parent -- it clears it
+# -- so every file written into the export afterwards (weights, tokenizer,
+# bundle, README) got the exporting user's primary group instead of the
+# project's shared group. Fixed by creating the staging dir with plain
+# os.mkdir, which applies the umask and inherits setgid from the parent
+# natively, with no chmod at all.
+
+
+def test_published_dir_permissions_and_setgid_inheritance(checkpoint, tmp_path):
+    out = tmp_path / "hf"
+    result = export_checkpoint(checkpoint, out)
+
+    # Read the umask without permanently changing it (briefly toggled here in
+    # the TEST only -- export.py itself no longer does this at all).
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    expected_rwx = 0o777 & ~current_umask
+    # Mask off the setgid/setuid/sticky bits before comparing: on a setgid
+    # parent, the kernel ORs setgid into a freshly `mkdir`ed subdirectory's
+    # mode independently of the umask, which is the whole point of this test
+    # -- it must not be mistaken for a umask mismatch.
+    actual_mode = stat.S_IMODE(result.stat().st_mode)
+    assert actual_mode & 0o777 == expected_rwx
+
+    parent_mode = tmp_path.stat().st_mode
+    if not (parent_mode & stat.S_ISGID):
+        pytest.skip(f"{tmp_path} is not setgid on this filesystem")
+
+    assert actual_mode & stat.S_ISGID, "published dir lost setgid"
+    config_json = result / "config.json"
+    assert (
+        config_json.stat().st_gid == tmp_path.stat().st_gid
+    ), "a file inside the published dir did not inherit the parent's group"
+
+
 # --- (c) a verify failure leaves nothing written -----------------------------
 
 
@@ -453,13 +494,16 @@ def test_push_to_hub_calls_the_fake_api_with_the_published_dir(
     calls = {"create_repo": [], "upload_folder": []}
 
     class _FakeHfApi:
+        # No defaults on create_repo's kwargs (I2): the real HfApi.create_repo
+        # defaults `exist_ok` to False, so a fake that supplies its own
+        # default here would pass even if export.py stopped passing
+        # `exist_ok` explicitly -- silently letting a real export 409 on an
+        # existing repo.
         def __init__(self, *a, **k):
             pass
 
-        def create_repo(self, repo_id, private=False, exist_ok=True, **kw):
-            calls["create_repo"].append(
-                {"repo_id": repo_id, "private": private, "exist_ok": exist_ok}
-            )
+        def create_repo(self, repo_id, **kwargs):
+            calls["create_repo"].append({"repo_id": repo_id, "kwargs": kwargs})
 
         def upload_folder(self, folder_path, repo_id, **kw):
             calls["upload_folder"].append(
@@ -474,9 +518,12 @@ def test_push_to_hub_calls_the_fake_api_with_the_published_dir(
         checkpoint, tmp_path / "hf", push_to_hub="someuser/some-repo", private=True
     )
 
-    assert calls["create_repo"] == [
-        {"repo_id": "someuser/some-repo", "private": True, "exist_ok": True}
-    ]
+    assert len(calls["create_repo"]) == 1
+    create_call = calls["create_repo"][0]
+    assert create_call["repo_id"] == "someuser/some-repo"
+    assert create_call["kwargs"]["exist_ok"] is True
+    assert create_call["kwargs"]["private"] is True
+
     assert calls["upload_folder"] == [
         {"folder_path": str(out), "repo_id": "someuser/some-repo"}
     ]

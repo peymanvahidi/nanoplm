@@ -36,8 +36,8 @@ import copy
 import importlib.util
 import json
 import os
+import secrets
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Optional, Union
 
@@ -173,14 +173,25 @@ def _build_export_state_dict(
     return export_state_dict
 
 
-def _respect_umask(path: Path) -> None:
-    """`tempfile.mkdtemp` creates its directory at mode 0o700; give the
-    published directory normal permissions instead, since this is a shared
-    cluster. Reads the umask without permanently changing it."""
-    current_umask = os.umask(0)
-    os.umask(current_umask)
-    mode = 0o777 & ~current_umask
-    os.chmod(path, mode)
+def _mkstagingdir(parent: Path) -> Path:
+    """A fresh staging directory under `parent`, made with plain `os.mkdir`.
+
+    Not `tempfile.mkdtemp`: it hardcodes mode 0o700, so a later `os.chmod`
+    would be needed to fix permissions -- and `os.chmod` cannot restore a
+    parent's setgid bit once cleared (I1: this project's directories on the
+    cluster are setgid, so `chmod(0o777 & ~umask)` silently reparents every
+    file later written into staging to the exporting user's primary group
+    instead of the project group). `os.mkdir` lets the kernel apply the
+    umask and inherit setgid from `parent` natively, with no chmod at all.
+    """
+    for _ in range(10):
+        candidate = parent / f"{_STAGING_PREFIX}{secrets.token_hex(8)}"
+        try:
+            os.mkdir(candidate)
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError(f"could not create a unique staging directory under {parent}")
 
 
 def export_checkpoint(
@@ -241,10 +252,8 @@ def export_checkpoint(
     exported = exported.to(dtype=DTYPES[dtype])
 
     out_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(dir=out_dir.parent, prefix=_STAGING_PREFIX))
+    staging = _mkstagingdir(out_dir.parent)
     try:
-        _respect_umask(staging)
-
         hf_config.auto_map = dict(AUTO_MAP)
         exported.config.auto_map = dict(AUTO_MAP)
         exported.save_pretrained(staging, safe_serialization=True)
