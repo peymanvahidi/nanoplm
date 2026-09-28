@@ -75,6 +75,41 @@ VERIFY_SEQUENCES: tuple[str, ...] = (
 #   APPROX | FP8-source                 | 1024/16  | cuda, fp32    | 1.04e-3     | 8.62e-4
 #   APPROX | FP8-source                 | 1024/16  | cuda, bf16    | 1.77e-2     | 1.50e-2  <- worst correct
 #
+# R14-5 (2026-09-28, same node/torch/TE as above): `_tolerance_class` was
+# fixed to also return "approx" when EITHER side carries a non-fp32
+# parameter, not just native's first one -- a bf16/fp16 EXPORT of an
+# all-fp32 native model used to be misclassified "exact" (tol=1e-4), and a
+# sonicmoe/srelu native compared against a differently-precisioned export
+# was only ever checked with native's own dtype driving the decision. These
+# are the newly-covered APPROX cases; all correct (no new negative controls
+# needed -- this is a classification fix, not a new detector, and APPROX's
+# existing negatives above already cover a structural bug at this
+# tolerance). Probe script and log:
+# .superpowers/sdd/2026-09-09-huggingface-export/task14_scratch/
+# probe_r14_5.py, probe_r14_5.log.
+#
+#   class  | case                                    | shape    | device | rel(logits) | rel(hidden)
+#   -------|-----------------------------------------|----------|--------|-------------|------------
+#   APPROX | bf16 export of fp32 dense native         | 768/4    | cpu    | 1.11e-2     | 8.33e-3
+#   APPROX | bf16 export of fp32 dense native         | 768/4    | cuda   | 1.14e-2     | 8.27e-3
+#   APPROX | bf16 export of fp32 dense native         | 1024/16  | cpu    | 1.63e-2     | 1.38e-2
+#   APPROX | bf16 export of fp32 dense native         | 1024/16  | cuda   | 1.64e-2     | 1.39e-2  <- worst
+#   APPROX | fp16 export of fp32 dense native         | 768/4    | cpu    | 1.44e-3     | 1.04e-3
+#   APPROX | fp16 export of fp32 dense native         | 768/4    | cuda   | 1.40e-3     | 1.04e-3
+#   APPROX | fp16 export of fp32 dense native         | 1024/16  | cpu    | 1.98e-3     | 1.72e-3
+#   APPROX | fp16 export of fp32 dense native         | 1024/16  | cuda   | 2.00e-3     | 1.71e-3
+#   APPROX | sonicmoe native (bf16 experts) vs        | 64/2     | cuda   | 1.70e-3     | 1.53e-3
+#          | cutlass fp32 export                      |          |        |             |
+#   APPROX | sonicmoe native (bf16 experts) vs        | 768/4    | cuda   | 2.64e-3     | 2.38e-3
+#          | cutlass fp32 export                      |          |        |             |
+#   APPROX | srelu native (bf16, R14-6) vs fp32 export| 768/4    | cuda   | 1.15e-2     | 8.88e-3
+#   APPROX | srelu native (bf16, R14-6) vs fp32 export| 1024/16  | cuda   | 1.63e-2     | 1.35e-2
+#
+# Worst measured across every R14-5 case: 1.64e-2 (bf16 export, 1024/16,
+# cuda) -- >=3x under _REL_TOL["approx"] (5.5e-2 / 1.64e-2 = 3.35x) and
+# inside the controller's 1.83e-2 acceptance ceiling for this task. No
+# tolerance change was needed.
+#
 # Negative controls, run at EVERY shape/dtype above (round 1 only ran these
 # at one or two shapes and the comment cited numbers for shapes it never
 # actually measured -- a round-2 finding; every number below is now real):
@@ -197,22 +232,41 @@ def _check_tokenizer(native_tokenizer, exported_tokenizer) -> dict:
     return encoded_native
 
 
+def _any_non_fp32(model: torch.nn.Module) -> bool:
+    return any(p.dtype != torch.float32 for p in model.parameters())
+
+
 def _tolerance_class(
-    native_model: torch.nn.Module, device: torch.device, fp8_source: bool
+    native_model: torch.nn.Module,
+    exported_model: torch.nn.Module,
+    device: torch.device,
+    fp8_source: bool,
 ) -> str:
-    """ "exact" when native computes the same eager fp32 math as the export;
-    "approx" whenever native additionally exercises a kernel path the export
-    cannot reproduce bit-for-bit: FP8/TE (fp8_source), a non-fp32 compute
-    dtype, or the CUDA-only Triton sReLU kernel (native only, gated on device
+    """ "exact" when native and export both compute the same eager fp32 math;
+    "approx" whenever EITHER side exercises something that keeps the two from
+    matching bit-for-bit: FP8/TE (fp8_source), a non-fp32 parameter anywhere
+    in native (e.g. sonicmoe's bf16 experts) or in the loaded export (a
+    bf16/fp16 export -- transformers 5.17 `from_pretrained` defaults to
+    `dtype="auto"`, `modeling_utils.py:4099-4100`, so it loads at the saved
+    dtype), or the CUDA-only Triton sReLU kernel (native only, gated on device
     + activation; the export always runs sReLU in eager).
+
+    R14-5: the earlier version of this function read only the dtype of
+    native's FIRST parameter and never looked at the export at all, so a
+    bf16/fp16 export of an all-fp32 native model was wrongly classified
+    "exact" (tol=1e-4) -- a bf16-rounded weight comparison routinely exceeds
+    that by orders of magnitude, so this only ever failed loudly, but the
+    class was still the wrong reason to fail, and a case that happened to be
+    close enough would have been accepted at the wrong tolerance.
     """
-    try:
-        dtype = next(native_model.parameters()).dtype
-    except StopIteration:  # pragma: no cover - no model has zero parameters
-        dtype = torch.float32
     mlp_activation = str(getattr(native_model.config, "mlp_activation", "")).lower()
     triton_srelu = mlp_activation == "srelu" and device.type == "cuda"
-    if fp8_source or dtype != torch.float32 or triton_srelu:
+    if (
+        fp8_source
+        or triton_srelu
+        or _any_non_fp32(native_model)
+        or _any_non_fp32(exported_model)
+    ):
         return "approx"
     return "exact"
 
@@ -270,7 +324,7 @@ def verify_exported(
 
     encoded = _check_tokenizer(tokenizer, exported_tokenizer)
 
-    tol_class = _tolerance_class(native_model, device, fp8_source)
+    tol_class = _tolerance_class(native_model, exported, device, fp8_source)
     rel_tol = _REL_TOL[tol_class]
 
     native_model = native_model.to(device).eval()
