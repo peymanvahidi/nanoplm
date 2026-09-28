@@ -100,34 +100,33 @@ VERIFY_SEQUENCES: tuple[str, ...] = (
 # EXACT's only observed nonzero source is MoE's GPU grouped-gemm (<6e-7,
 # presumably nondeterministic reduction order, not an export bug).
 #
-# R12-7's criterion, applied PER SHAPE/DTYPE with one constant threshold
-# across all of them (the controller's round-2 restatement -- this replaces
-# round 1's use of a single "representative" shape for the negative
-# controls, which was not a valid basis for the claim it was used for):
+# R12-7's criterion, applied per shape/dtype with one constant threshold
+# across all of them. For EXACT this is straightforward:
 #
 #   EXACT:  tol >= 3 * worst_correct (1.36e-7)      = 4.08e-7
 #           tol <= weakest_negative (8.34e-2) / 10  = 8.34e-3
 #           -> feasible range [4.08e-7, 8.34e-3]. Chosen: 1e-4 (correct
-#              margin 735x, negative margin 834x -- comfortable, unaffected
-#              by this round's finding).
+#              margin 735x, negative margin 834x).
 #
-#   APPROX: tol >= 3 * worst_correct (1.77e-2)         = 5.3046e-2
-#           tol <= weakest_negative (2.9096e-1) / 10   = 2.9096e-2
-#           -> INFEASIBLE: 5.3046e-2 > 2.9096e-2. No single constant clears
-#              both bounds. The weakest negative is the 64/2 FP8 swap (both
-#              dtypes, ~0.291-0.319); every other negative control clears
-#              10x margin over the CURRENT threshold comfortably (>=10.2x;
-#              see the log for the full per-case margin table).
+# For APPROX, the >=10x negative-control margin is required at REALISTIC
+# DEPTH (>=768/4) -- ruling R12-12, made after reading the round-2 measured
+# table above in full: no real export is a 2-layer toy, and the bug signal
+# above grows with depth, so 768/4 and 1024/16 are the shapes that matter.
+# At tol = 5.5e-2:
 #
-# Per the controller's ruling, an infeasible range is not loosened to fit:
-# _REL_TOL["approx"] is left AT ITS PRIOR VALUE (5.5e-2, chosen in round 1
-# under a since-invalidated argument) rather than picked fresh, pending a
-# controller decision on how to resolve this -- e.g. a different negative
-# control, a per-config threshold instead of one global constant, or
-# accepting a smaller correct-side margin. At the current value, the
-# correct-side margin is fine (3.11x, satisfies >=3x) but the negative-side
-# margin at 64/2 is only ~5.3-5.8x, NOT the required >=10x. See
-# task-12-report.md's "Fix round 2" section for the full writeup.
+#   shape    | worst correct margin | weakest negative margin
+#   ---------|-----------------------|-------------------------
+#   64/2     | 6.4x  (>=3x)          | 5.3x  (still rejected, below 10x)
+#   768/4    | 4.5x  (>=3x)          | 10.2x (>=10x)
+#   1024/16  | 3.1x  (>=3x)          | 14.6x (>=10x)
+#
+# The correct-side margin clears >=3x at every shape (6.4x/4.5x/3.1x). The
+# negative-side margin clears the required >=10x at every REALISTIC shape
+# (10.2x at 768/4, 14.6x at 1024/16); at the toy 64/2 shape every negative
+# control is still correctly rejected, just with a smaller margin (>=5.3x)
+# that the ruling accepts as an artifact of testing structural bugs on
+# untrained 2-layer weights rather than a gap in real detection power.
+# _REL_TOL["approx"] = 5.5e-2 is therefore accepted as-is.
 _REL_TOL = {"exact": 1e-4, "approx": 5.5e-2}
 
 # Shared by both forwards below so a recycling model's `torch.randn_like`
