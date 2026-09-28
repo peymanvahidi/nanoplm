@@ -72,6 +72,46 @@ def _table(rows: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _token_budget(pretrain_cfg: dict) -> str:
+    """The training duration pretrain_config.yaml actually specifies, in
+    whichever unit it names -- never converted between tokens and steps.
+
+    PretrainingConfig (pretraining/config.py): WSD's budget is
+    stable_tokens/decay_tokens, with stable_steps/decay_steps as a step
+    override; every other schedule (warmup_stable | cosine | linear) uses a
+    single train_tokens budget, with max_steps as its step override. "unknown"
+    when the schedule's own budget field(s) are absent (a step override for a
+    schedule that isn't set is not read as that schedule's budget).
+    """
+    if pretrain_cfg.get("lr_schedule") == "wsd":
+        stable_tokens = pretrain_cfg.get("stable_tokens")
+        decay_tokens = pretrain_cfg.get("decay_tokens")
+        if stable_tokens is not None or decay_tokens is not None:
+            parts = [
+                f"{_fmt(v)} {name}"
+                for name, v in (("stable", stable_tokens), ("decay", decay_tokens))
+                if v is not None
+            ]
+            return " + ".join(parts) + " tokens"
+        stable_steps = pretrain_cfg.get("stable_steps")
+        decay_steps = pretrain_cfg.get("decay_steps")
+        if stable_steps is not None or decay_steps is not None:
+            parts = [
+                f"{_fmt(v)} {name}"
+                for name, v in (("stable", stable_steps), ("decay", decay_steps))
+                if v is not None
+            ]
+            return " + ".join(parts) + " steps"
+        return _UNKNOWN
+    train_tokens = pretrain_cfg.get("train_tokens")
+    if train_tokens is not None:
+        return f"{_fmt(train_tokens)} tokens"
+    max_steps = pretrain_cfg.get("max_steps")
+    if max_steps is not None:
+        return f"{_fmt(max_steps)} steps"
+    return _UNKNOWN
+
+
 def _tokenizer_section(config: NanoPLMConfig) -> str:
     tokenizer = ProtModernBertTokenizer(num_register_tokens=config.num_register_tokens)
     rows = [
@@ -180,13 +220,25 @@ def render_model_card(
     # unless checkpoint_config.nanoplm_config_from_checkpoint set it, so 0 is
     # treated as absent (R13-5).
     steps = _fmt(config.source_global_step) if config.source_global_step else _UNKNOWN
+    # "Token budget (config)" is pretrain_config.yaml's planned duration;
+    # "Train tokens (dataset)" is the manifest's actual tokenized-corpus size
+    # -- a different quantity the spec's Training table keeps distinct.
     training = _table(
         [
             ("Optimizer", pretrain_cfg.get("optimizer", _UNKNOWN)),
             ("LR schedule", pretrain_cfg.get("lr_schedule", _UNKNOWN)),
+            ("Token budget (config)", _token_budget(pretrain_cfg)),
+            (
+                "Global batch (tokens)",
+                _fmt(pretrain_cfg.get("global_batch_tokens")),
+            ),
+            (
+                "Micro-batch (sequences)",
+                _fmt(pretrain_cfg.get("micro_batch_seqs")),
+            ),
             ("Max sequence length", _fmt(manifest.get("max_seq_len"))),
             ("Training sequences", _fmt(manifest.get("train_sequences"))),
-            ("Total train tokens", _fmt(manifest.get("total_train_tokens"))),
+            ("Train tokens (dataset)", _fmt(manifest.get("total_train_tokens"))),
             ("Training steps", steps),
             ("nanoPLM version", config.nanoplm_version or _UNKNOWN),
         ]

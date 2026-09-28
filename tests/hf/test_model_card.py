@@ -283,3 +283,85 @@ def test_training_steps_and_version_are_unknown_when_absent():
     card = _card(config=CFG)
     assert "unknown" in card.lower()
     assert "12,345" not in card
+
+
+# --- (e) token budget and batch size, from pretrain_config.yaml (fix round 1) ---
+#
+# Task 13 review finding: the Training table read only pretrain_cfg's
+# "optimizer" and "lr_schedule", never the token budget (spec Section 5.8)
+# or any batch-size field. PretrainingConfig (pretraining/config.py): WSD's
+# budget is stable_tokens/decay_tokens (or, as an override, stable_steps/
+# decay_steps); every other schedule (warmup_stable | cosine | linear) uses
+# a single train_tokens budget, or max_steps as its step override.
+
+
+def test_reports_token_budget_and_batch_for_a_single_phase_schedule():
+    pretrain_cfg = {
+        "optimizer": "normuon",
+        "lr_schedule": "cosine",
+        "train_tokens": 20_000_000,
+        "global_batch_tokens": 256_000,
+        "micro_batch_seqs": 64,
+    }
+    card = _card(pretrain_cfg=pretrain_cfg)
+    assert "| Token budget (config) | 20,000,000 tokens |" in card
+    assert "| Global batch (tokens) | 256,000 |" in card
+    assert "| Micro-batch (sequences) | 64 |" in card
+
+
+def test_token_budget_reads_a_wsd_schedules_stable_and_decay_tokens():
+    pretrain_cfg = {
+        "optimizer": "normuon",
+        "lr_schedule": "wsd",
+        "stable_tokens": 8_000_000,
+        "decay_tokens": 2_000_000,
+    }
+    card = _card(pretrain_cfg=pretrain_cfg)
+    assert "8,000,000 stable" in card
+    assert "2,000,000 decay" in card
+    assert "tokens" in card
+
+
+def test_token_budget_reads_a_wsd_schedules_step_override():
+    # WSD's step override (stable_steps/decay_steps) is a DIFFERENT pair of
+    # fields from its token budget -- the step count must not be relabeled
+    # as a token count.
+    pretrain_cfg = {"lr_schedule": "wsd", "stable_steps": 5_000, "decay_steps": 500}
+    card = _card(pretrain_cfg=pretrain_cfg)
+    assert "5,000 stable" in card
+    assert "500 decay" in card
+    assert "steps" in card
+    assert "5,000 stable + 500 decay tokens" not in card
+
+
+def test_token_budget_reads_max_steps_for_single_phase_schedules():
+    pretrain_cfg = {"lr_schedule": "linear", "max_steps": 12_000}
+    card = _card(pretrain_cfg=pretrain_cfg)
+    assert "| Token budget (config) | 12,000 steps |" in card
+
+
+def test_token_budget_does_not_borrow_train_tokens_for_wsd():
+    # train_tokens is warmup_stable | cosine | linear's field, not WSD's --
+    # a WSD config that (incorrectly) also carries train_tokens must not have
+    # it silently adopted as the budget.
+    pretrain_cfg = {"lr_schedule": "wsd", "train_tokens": 10_000_000}
+    card = _card(pretrain_cfg=pretrain_cfg)
+    assert "| Token budget (config) | unknown |" in card
+
+
+def test_token_budget_and_batch_are_unknown_when_absent():
+    card = _card(pretrain_cfg={}, manifest={})
+    assert "| Token budget (config) | unknown |" in card
+    assert "| Global batch (tokens) | unknown |" in card
+    assert "| Micro-batch (sequences) | unknown |" in card
+
+
+def test_train_tokens_dataset_and_token_budget_config_are_labeled_distinctly():
+    # The manifest's actual tokenized-corpus size and pretrain_config.yaml's
+    # planned budget are different quantities and must not share a label.
+    pretrain_cfg = {"lr_schedule": "cosine", "train_tokens": 20_000_000}
+    card = _card(pretrain_cfg=pretrain_cfg)
+    assert "Token budget (config)" in card
+    assert "Train tokens (dataset)" in card
+    assert "| Train tokens (dataset) | 4,823,117 |" in card
+    assert "| Token budget (config) | 20,000,000 tokens |" in card
