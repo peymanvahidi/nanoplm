@@ -54,6 +54,34 @@ def _untagged_code_cells() -> list[dict]:
     ]
 
 
+def _network_code_cells() -> list[dict]:
+    return [
+        c for c in _code_cells() if "network" in c.get("metadata", {}).get("tags", [])
+    ]
+
+
+def _cell_source_containing(needle: str) -> str:
+    """The source of the one code cell containing `needle` (fails loudly if not
+    exactly one) -- for checks that must look at a SPECIFIC cell, not the
+    whole notebook: the immutable QUICKSTART cell already contains many
+    strings (`special_tokens_mask`, `attention_mask`, ...) that would make a
+    whole-notebook grep pass even if the cell actually under test were wrong.
+    """
+    matches = [c for c in _code_cells() if needle in _source_of(c)]
+    assert (
+        len(matches) == 1
+    ), f"expected exactly one code cell containing {needle!r}, found {len(matches)}"
+    return _source_of(matches[0])
+
+
+def _dataset_cell_source() -> str:
+    matches = [c for c in _network_code_cells() if "load_dataset(" in _source_of(c)]
+    assert (
+        len(matches) == 1
+    ), "expected exactly one network cell calling load_dataset(...)"
+    return _source_of(matches[0])
+
+
 # --- the plan's structural tests (adapted per R16-1..R16-6) ------------------
 
 
@@ -119,7 +147,10 @@ def test_no_cell_slices_residues_by_raw_length():
 
 
 def test_embed_helper_uses_the_special_tokens_mask():
-    src = _source()
+    # Scoped to the embed cell itself (I3 fix-round-1 finding): the immutable
+    # QUICKSTART cell already contains every one of these strings, so a
+    # whole-notebook grep here would pass even if `embed()` were broken.
+    src = _cell_source_containing("def embed(")
     assert "return_special_tokens_mask=True" in src
     assert "special_tokens_mask" in src
     assert "attention_mask" in src and "~special" in src.replace(" ", "")
@@ -167,6 +198,52 @@ def test_network_cells_cover_dataset_download_and_umap():
     assert "umap" in joined.lower()
 
 
+# --- (e) labels come from the dataset's own class, not a naive location split
+# (fix round 1, I1): "Cytoplasm,Nucleus,U" rows carry the dataset's own
+# label 0, the same id as every plain "Nucleus,*" row -- so `location`'s
+# comma-separated compartments must not be resolved by just taking the first
+# one, which silently misfiles every dual-localization row.
+
+
+def test_labels_come_from_the_datasets_own_label_column():
+    src = _dataset_cell_source()
+    assert '["label"]' in src
+    # the buggy fix-round-0 derivation (first comma-separated compartment,
+    # wrong for dual-localization rows) must not reappear.
+    assert '.split(",")[0]' not in src
+
+
+def test_label_to_name_mapping_is_verified_unambiguous_before_use():
+    src = _dataset_cell_source()
+    assert "assert" in src
+    assert "len(c) == 1" in src or "len(names) == 1" in src
+
+
+def test_markdown_explains_multi_compartment_handling():
+    src = _source().lower()
+    assert "dual-localiz" in src or "multi-compartment" in src
+
+
+# --- (f) the residue-length filter agrees with the tokenizer's truncation
+# (fix round 1, I2): `MAX_SEQ_LEN` bounds TOKEN count (residues + EOS/BOS/
+# register overhead), so filtering the dataset by raw residue count against
+# the same number silently lets boundary-length sequences get truncated by
+# `embed()` -- contradicting the "untruncated" claim in the markdown.
+
+
+def test_length_filter_does_not_compare_raw_residues_to_the_token_cap():
+    src = _source()
+    assert 'len(ex["aa_seq"]) <= MAX_SEQ_LEN' not in src
+
+
+def test_residue_cap_is_derived_once_and_reused_by_the_dataset_filter():
+    src = _source()
+    assert (
+        src.count("RESIDUE_CAP =") == 1
+    ), "RESIDUE_CAP must be derived in exactly one place"
+    assert "RESIDUE_CAP" in _dataset_cell_source()
+
+
 # --- the hermetic run: every untagged code cell actually executes ------------
 
 
@@ -202,3 +279,44 @@ def test_untagged_cells_run_end_to_end_with_registers(tmp_path):
     # embed-helper demo print: (n, hidden) shape for 2 literal sequences.
     demo_sequences = ["MKALCLLLLPVLG", "MVLSPADKTNVKAAWGKV"]
     assert f"torch.Size([{len(demo_sequences)}, {cfg.hidden_size}])" in result.stdout
+
+
+# --- (g) embed() is checked numerically, not just by output shape (fix round
+# 1, I3): a wrong mask (a dropped `~`, pooling over padding, ...) keeps
+# `embed()`'s output shape correct while silently changing its VALUES, so the
+# shape-only checks above cannot catch it. This runs `embed()` on sequences of
+# DIFFERENT lengths (so the batched call actually pads) and compares each row,
+# within a tight tolerance, against an independent reference: a single
+# unpadded forward per sequence, pooled over exactly the positions the
+# tokenizer's own special-tokens mask marks as real residues.
+
+_MASK_CHECK_SNIPPET = """
+# --- appended by tests/hf/test_notebook.py, not part of the notebook itself:
+# an independent numeric check of embed()'s masking (I3) ---
+_verify_sequences = ["MKALCLLLLPVLG", "MVLSPADKTNVKAAWGKV", "MSTNPKPQRKIQFAVLLLWMV"]
+_batched = embed(_verify_sequences)
+
+_reference_rows = []
+for _seq in _verify_sequences:
+    _single = tokenizer(
+        [_seq], return_tensors="pt", return_special_tokens_mask=True
+    ).to(device)
+    _special = _single.pop("special_tokens_mask").bool()
+    _residue_mask = _single["attention_mask"].bool() & ~_special
+    with torch.no_grad():
+        _hidden = model(**_single).last_hidden_state
+    _reference_rows.append(_hidden[0][_residue_mask[0]].mean(dim=0).float().cpu())
+_reference = torch.stack(_reference_rows)
+
+_max_diff = (_batched - _reference).abs().max().item()
+print("MASK_CHECK_MAX_DIFF:", _max_diff)
+assert _max_diff < 1e-4, f"embed() disagrees with an independent unpadded reference: {_max_diff}"
+"""
+
+
+def test_embed_matches_an_independent_unpadded_reference(tmp_path):
+    _build_export(tmp_path, num_register_tokens=2)
+    script = _script_for(tmp_path) + "\n\n" + _MASK_CHECK_SNIPPET
+    result = _run_quickstart(tmp_path, script)
+    assert result.returncode == 0, result.stderr[-6000:]
+    assert "MASK_CHECK_MAX_DIFF:" in result.stdout
