@@ -45,6 +45,8 @@ Two source types are refused outright off-CUDA:
 
 So "export on the training machine" is a hard requirement for FP8 and sonicmoe sources, and a recommendation (for a fully-exercised `--verify`) everywhere else.
 
+One FP8 case is refused even on the training machine: a checkpoint trained with `norm_type: layernorm` in which Transformer Engine learned nonzero LayerNorm biases. The exported model's LayerNorm has no bias, so exporting would silently change the model; the error names the affected blocks. RMSNorm checkpoints, and FP8 checkpoints whose biases were never trained, export normally.
+
 ## Device support for the exported model
 
 The exported model runs a portable, pure-PyTorch path with no custom kernels — no CUTLASS grouped GEMM, no Transformer Engine, no Triton. This project has verified:

@@ -557,6 +557,73 @@ def _has_te_bias(bias: torch.Tensor) -> bool:
     return bias.numel() > 0
 
 
+_QKV_NAMES = ("Wqkv", "Wq", "Wq2", "Wk", "Wv")
+
+
+def _te_norm_bias_max_abs(te_module: nn.Module) -> float:
+    """Max |``layer_norm_bias``| of a TE LayerNorm* module; 0.0 when it has none.
+
+    TE's RMSNorm modules set ``layer_norm_bias = None``; its LayerNorm modules
+    always own one (zero-initialised, trainable), whether or not the native
+    norm they replaced had a bias.
+    """
+    bias = getattr(te_module, "layer_norm_bias", None)
+    if bias is None or bias.numel() == 0:
+        return 0.0
+    return float(bias.detach().abs().max())
+
+
+def _refuse_unrepresentable_te_norm_biases(model: nn.Module, config) -> None:
+    """Raise before any module is touched if a TE norm bias would be dropped.
+
+    ``norm_type: layernorm`` builds a bias-free native norm
+    (``norm_bias=False``, not user-settable), but the TE modules that replace
+    it under FP8 own a trainable ``layer_norm_bias``, and FP8 training moves it
+    away from zero. The dense architecture has nowhere to put those values, so
+    restoring would silently change the model. An exactly-zero bias (converted,
+    never trained) carries no information and is fine. Unfused Q/K/V parts
+    each own a separate, untied bias, so every wrapped linear is checked.
+    """
+    from nanoplm.pretraining.models.modern_bert.modeling import _create_norm
+
+    native_norm = _create_norm(
+        config.hidden_size, config.norm_eps, config.norm_bias, config.norm_type
+    )
+    if getattr(native_norm, "bias", None) is not None:
+        return  # the native norm has a bias slot; the restore copies into it
+
+    offenders: list[tuple[str, float]] = []
+    for fqn, layer in model.named_modules():
+        prefix = f"{fqn}." if fqn else ""
+        mlp = getattr(layer, "mlp", None)
+        if isinstance(mlp, _TELayerNormMLPWrapper):
+            max_abs = _te_norm_bias_max_abs(mlp.layernorm_mlp)
+            if max_abs != 0.0:
+                offenders.append((f"{prefix}mlp", max_abs))
+        attn = getattr(layer, "attn", None)
+        if attn is None:
+            continue
+        for name in _QKV_NAMES:
+            wrapped = getattr(attn, name, None)
+            if isinstance(wrapped, _TELayerNormLinearWrapper):
+                max_abs = _te_norm_bias_max_abs(wrapped.layernorm_linear)
+                if max_abs != 0.0:
+                    offenders.append((f"{prefix}attn.{name}", max_abs))
+
+    if not offenders:
+        return
+    where = ", ".join(f"{path} (max |bias| = {m:.4g})" for path, m in offenders)
+    raise ValueError(
+        "Cannot export this checkpoint without changing the model. It was "
+        "trained with FP8 and LayerNorm, and Transformer Engine learned "
+        f"LayerNorm biases in {len(offenders)} block(s): {where}. nanoPLM's "
+        "dense architecture uses a bias-free LayerNorm, so it has nowhere to "
+        "put these biases; exporting would silently drop them and change the "
+        "model's outputs. Checkpoints trained with RMSNorm, or without FP8, "
+        "are not affected."
+    )
+
+
 def _restore_mlp_branch(layer: nn.Module, config) -> None:
     """Rebuild native ``mlp_norm`` + ``mlp`` from a ``_TELayerNormMLPWrapper``."""
     from nanoplm.pretraining.models.modern_bert.modeling import (
@@ -594,6 +661,8 @@ def _restore_mlp_branch(layer: nn.Module, config) -> None:
 
     with torch.no_grad():
         norm.weight.copy_(te_mlp.layer_norm_weight)
+        # A bias-free native norm skips this; restore_dense_from_te has already
+        # refused if the TE bias it leaves behind is nonzero.
         if getattr(norm, "bias", None) is not None:
             norm.bias.copy_(te_mlp.layer_norm_bias)
 
@@ -631,7 +700,7 @@ def _attn_has_te_qkv(layer: nn.Module) -> bool:
         return False
     return any(
         isinstance(getattr(attn, name, None), _TELayerNormLinearWrapper)
-        for name in ("Wqkv", "Wq", "Wq2", "Wk", "Wv")
+        for name in _QKV_NAMES
     )
 
 
@@ -646,7 +715,7 @@ def _restore_attn_qkv_branch(layer: nn.Module, config) -> None:
     attn = layer.attn
     wrapped_names = [
         name
-        for name in ("Wqkv", "Wq", "Wq2", "Wk", "Wv")
+        for name in _QKV_NAMES
         if isinstance(getattr(attn, name, None), _TELayerNormLinearWrapper)
     ]
     first = getattr(attn, wrapped_names[0]).layernorm_linear
@@ -662,6 +731,8 @@ def _restore_attn_qkv_branch(layer: nn.Module, config) -> None:
     norm.train(first.training)
     with torch.no_grad():
         norm.weight.copy_(first.layer_norm_weight)
+        # As in _restore_mlp_branch: a nonzero TE bias with no native slot was
+        # already refused by restore_dense_from_te, for every wrapped part.
         if getattr(norm, "bias", None) is not None:
             norm.bias.copy_(first.layer_norm_bias)
 
@@ -695,8 +766,13 @@ def restore_dense_from_te(model: nn.Module, config) -> int:
     modules it replaced, using the transforms above. Counts one restored
     block per converted LAYER, matching ``convert_fp8_targets``'s own count --
     an unfused QKV layer touches three or four linears but is still one block.
+
+    Raises ``ValueError``, before modifying anything, if a TE module carries a
+    nonzero LayerNorm bias the native (bias-free) norm cannot hold -- see
+    ``_refuse_unrepresentable_te_norm_biases``.
     """
     _require_te()
+    _refuse_unrepresentable_te_norm_biases(model, config)
 
     mlp_layers = [
         layer

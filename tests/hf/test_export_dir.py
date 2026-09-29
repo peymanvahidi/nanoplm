@@ -365,6 +365,35 @@ def test_fp8_export_with_broken_gate_up_restore_is_rejected_and_writes_nothing(
     assert set(tmp_path.iterdir()) == before, "a staging dir was left behind"
 
 
+@pytest.mark.skipif(
+    not (WITH_CUDA and WITH_TE), reason="needs CUDA + Transformer Engine"
+)
+def test_fp8_layernorm_checkpoint_with_a_trained_te_norm_bias_is_refused(tmp_path):
+    """The native LayerNorm is bias-free, but TE's LayerNormMLP owns a trainable
+    `layer_norm_bias` that FP8 training moves off zero. The export used to drop
+    it and still pass verify (the drift stayed under the loose FP8 tolerance);
+    the restore now refuses, and nothing is written."""
+    cfg = {**TINY, "norm_type": "layernorm"}
+    torch.manual_seed(0)
+    model = PureProtModernBertMLM(ProtModernBertMLMConfig(**cfg)).to("cuda").eval()
+    convert_fp8_targets(model, target="mlp,attn_wqkv,attn_wo")
+    with torch.no_grad():  # what a few FP8 training steps do to it
+        model.model.layers[1].mlp.layernorm_mlp.layer_norm_bias.fill_(0.05)
+    ckpt = _write_checkpoint(
+        tmp_path,
+        model,
+        cfg,
+        pretrain_cfg={"fp8": True, "fp8_target": "mlp,attn_wqkv,attn_wo"},
+    )
+
+    out = tmp_path / "hf"
+    before = set(tmp_path.iterdir())
+    with pytest.raises(ValueError, match=r"model\.layers\.1\.mlp"):
+        export_checkpoint(ckpt, out)
+    assert not out.exists()
+    assert set(tmp_path.iterdir()) == before, "a staging dir was left behind"
+
+
 # --- (e) sonicmoe end-to-end on CUDA -----------------------------------------
 
 

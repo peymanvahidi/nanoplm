@@ -8,6 +8,9 @@ copy_-in/copy_-out through the transforms in fp8.py never rounds, whatever
 the dtype.
 """
 
+import copy
+import re
+
 import pytest
 import torch
 
@@ -171,3 +174,93 @@ def test_restore_rejects_a_config_whose_activation_disagrees_with_the_checkpoint
 def test_restore_is_a_noop_on_a_dense_model():
     dense = _build(**TINY)
     assert restore_dense_from_te(dense, dense.config) == 0
+
+
+# --- a trained TE LayerNorm bias has no dense slot: refuse ---------------------
+#
+# With norm_type="layernorm" the native norm is bias-free (norm_bias=False, not
+# user-settable), but TE's LayerNormMLP / LayerNormLinear still own a trainable
+# `layer_norm_bias`, and FP8 training moves it off zero. The restore used to copy
+# it only when the native norm had a bias, silently dropping the trained values.
+# It must refuse instead -- and still accept an exactly-zero bias (converted but
+# never trained). Three layers, so layer 1 is converted and clean while the
+# offender sits in layer 2: the refusal must come before layer 1 is restored.
+
+LAYERNORM = dict(TINY, num_hidden_layers=3, norm_type="layernorm")
+ALL_TARGETS = "mlp,attn_wqkv,attn_wo"
+
+
+def _te_layernorm_module(wrapper):
+    if hasattr(wrapper, "layernorm_mlp"):
+        return wrapper.layernorm_mlp
+    return wrapper.layernorm_linear
+
+
+def _te_norm_biases(model) -> dict:
+    return {
+        name: param
+        for name, param in model.named_parameters()
+        if name.endswith("layer_norm_bias")
+    }
+
+
+@pytest.mark.parametrize(
+    ("fused_qkv", "module_path"),
+    [
+        (True, "model.layers.2.mlp"),
+        (True, "model.layers.2.attn.Wqkv"),
+        (False, "model.layers.2.mlp"),
+        (False, "model.layers.2.attn.Wq"),
+        (False, "model.layers.2.attn.Wk"),
+        (False, "model.layers.2.attn.Wv"),
+    ],
+)
+def test_restore_refuses_a_nonzero_te_layernorm_bias(fused_qkv, module_path):
+    dense = _build(mlp_activation="swiglu", fused_qkv=fused_qkv, **LAYERNORM)
+    convert_fp8_targets(dense, target=ALL_TARGETS)
+    te_module = _te_layernorm_module(dense.get_submodule(module_path))
+    with torch.no_grad():
+        te_module.layer_norm_bias[5] = -0.25
+    before = {k: v.clone() for k, v in dense.state_dict().items()}
+
+    with pytest.raises(ValueError) as excinfo:
+        restore_dense_from_te(dense, dense.config)
+
+    message = str(excinfo.value)
+    assert module_path in message
+    assert "0.25" in message  # the max |bias|
+    assert "FP8" in message and "LayerNorm" in message
+    # Nothing was restored, not even the clean layer 1: the refusal comes first.
+    after = dense.state_dict()
+    assert set(after) == set(before)
+    for key, expected in before.items():
+        assert torch.equal(after[key], expected), key
+
+
+def test_restore_refusal_lists_every_offending_block():
+    dense = _build(mlp_activation="swiglu", fused_qkv=False, **LAYERNORM)
+    convert_fp8_targets(dense, target=ALL_TARGETS)
+    with torch.no_grad():
+        for path in ("model.layers.1.attn.Wk", "model.layers.2.mlp"):
+            _te_layernorm_module(dense.get_submodule(path)).layer_norm_bias[0] = 0.5
+    with pytest.raises(ValueError) as excinfo:
+        restore_dense_from_te(dense, dense.config)
+    named = set(re.findall(r"model\.layers\.\d+(?:\.\w+)+", str(excinfo.value)))
+    # Exactly the two offenders; the clean Wq/Wv beside Wk are not named.
+    assert named == {"model.layers.1.attn.Wk", "model.layers.2.mlp"}
+
+
+@pytest.mark.parametrize("fused_qkv", [True, False], ids=["fused", "unfused"])
+def test_restore_accepts_an_exactly_zero_te_layernorm_bias(fused_qkv):
+    dense = _build(mlp_activation="swiglu", fused_qkv=fused_qkv, **LAYERNORM)
+
+    # A converted-but-never-trained model: TE creates layer_norm_bias (zeros)
+    # for every LayerNorm module, even though the native norm has no bias.
+    converted = copy.deepcopy(dense)
+    convert_fp8_targets(converted, target=ALL_TARGETS)
+    biases = _te_norm_biases(converted)
+    # 2 converted layers x (MLP + fused Wqkv, or MLP + Wq/Wk/Wv).
+    assert len(biases) == (4 if fused_qkv else 8), sorted(biases)
+    assert all(torch.count_nonzero(b) == 0 for b in biases.values())
+
+    _assert_round_trips(dense, ALL_TARGETS)
