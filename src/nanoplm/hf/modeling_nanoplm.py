@@ -175,6 +175,13 @@ class NanoPLMPreTrainedModel(PreTrainedModel):
 class NanoPLMModel(NanoPLMPreTrainedModel):
     """Bare encoder. `AutoModel` resolves here."""
 
+    # Every export is a NanoPLMForMaskedLM checkpoint, so loading it as the bare
+    # encoder (as the model card's quickstart does) always leaves the MLM head's
+    # weights over. That is expected; without this, transformers prints a LOAD
+    # REPORT flagging each of them UNEXPECTED. Anchored, so an unexpected key
+    # anywhere else is still reported.
+    _keys_to_ignore_on_load_unexpected = [r"^head\.", r"^decoder\."]
+
     def __init__(self, config: NanoPLMConfig):
         super().__init__(config)
         self._inner_config = modernbert_config_from(config.to_model_config())

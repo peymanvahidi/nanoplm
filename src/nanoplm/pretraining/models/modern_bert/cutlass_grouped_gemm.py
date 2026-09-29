@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from torch.utils.cpp_extension import load
-
+# `torch.utils.cpp_extension` is imported inside `_load_extension`, not here:
+# importing it imports setuptools, which an exported bundle's consumer is not
+# guaranteed to have, and nothing needs it until the extension is built.
 
 _EXTENSION = None
 
@@ -51,6 +52,8 @@ def _load_extension():
     global _EXTENSION
     if _EXTENSION is not None:
         return _EXTENSION
+
+    from torch.utils.cpp_extension import load
 
     repo_root = _repo_root()
     cutlass_root = _cutlass_root(repo_root)

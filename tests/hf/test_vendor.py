@@ -394,6 +394,12 @@ results["new_ops"] = sorted(
     if not op.startswith("transformers::")  # transformers' own, registered lazily
 )
 results["leaked"] = sorted(m for m in sys.modules if m.split(".")[0] in spec["blocked"])
+# Extension-build tooling: importing torch.utils.cpp_extension imports
+# setuptools, which a consumer is not guaranteed to have.
+results["build_tooling"] = sorted(
+    m for m in ("setuptools", "distutils", "torch.utils.cpp_extension")
+    if m in sys.modules
+)
 torch.save(results, spec["out"])
 """
 
@@ -467,7 +473,115 @@ def test_export_loads_and_matches_without_nanoplm(tmp_path, case):
     results = _run_child(tmp_path, [tmp_path / "export"])
     assert results["leaked"] == []
     assert results["new_ops"] == []
+    # The MoE bundle carries cutlass_grouped_gemm.py; loading and running it
+    # must not import the extension builder (or, through it, setuptools).
+    assert results["build_tooling"] == []
     _assert_matches(results[str(tmp_path / "export")], expected)
+
+
+def test_cutlass_grouped_gemm_import_does_not_load_the_extension_builder():
+    """Natively too: the module imports `torch.utils.cpp_extension` only when
+    it actually builds. (Native nanoplm can still pull in setuptools on its
+    own -- `nanoplm.pretraining` imports wandb, which imports distutils -- so
+    only the module this file controls is asserted here; the bundle check
+    above asserts setuptools as well.)"""
+    code = (
+        "import sys\n"
+        "import nanoplm.pretraining.models.modern_bert.cutlass_grouped_gemm\n"
+        "print('torch.utils.cpp_extension' in sys.modules)\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(PACKAGE_ROOT.parent)
+    child = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert child.returncode == 0, child.stderr[-6000:]
+    assert child.stdout.strip().splitlines()[-1] == "False"
+
+
+# --- AutoModel on a ForMaskedLM export: no alarming load report ----------------
+
+_LOAD_REPORT_CHILD = r"""
+import json
+import logging
+import sys
+
+from import_blocker import block_imports
+
+block_imports(json.loads(sys.argv[1]))
+
+from transformers import AutoModel  # noqa: E402
+
+records = []
+
+
+class _Capture(logging.Handler):
+    def emit(self, record):
+        records.append(record.getMessage())
+
+
+logging.getLogger("transformers").addHandler(_Capture(logging.WARNING))
+reports = {}
+for export in sys.argv[2:]:
+    records.clear()
+    AutoModel.from_pretrained(export, trust_remote_code=True, local_files_only=True)
+    reports[export] = "\n".join(records)
+print("LOAD_REPORTS " + json.dumps(reports))
+"""
+
+
+def test_automodel_on_a_masked_lm_export_does_not_flag_the_head(tmp_path):
+    """The quickstart loads a ForMaskedLM export with AutoModel, the bare
+    encoder, which has no slot for the MLM head's `head.*` / `decoder.*`
+    weights. That is expected, so transformers' LOAD REPORT must not list them
+    as UNEXPECTED -- while a genuinely unexpected key is still reported, even
+    one with `head.` in it that is not at the start."""
+    from safetensors.torch import load_file, save_file
+
+    clean, doctored = tmp_path / "clean", tmp_path / "doctored"
+    _export(clean, "dense")
+    _export(doctored, "dense")
+    head_keys = [
+        k for k in load_file(clean / "model.safetensors") if not k.startswith("model.")
+    ]
+    assert head_keys and all(k.startswith(("head.", "decoder.")) for k in head_keys)
+    weights = load_file(doctored / "model.safetensors")
+    weights["extra.head.weight"] = torch.zeros(3)
+    save_file(weights, doctored / "model.safetensors", metadata={"format": "pt"})
+
+    env = dict(os.environ)
+    env.pop("NANOPLM_PORTABLE", None)
+    env["PYTHONPATH"] = str(HERE)
+    env["HF_MODULES_CACHE"] = str(tmp_path / "hf_modules")
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _LOAD_REPORT_CHILD,
+            json.dumps(list(BLOCKED)),
+            str(clean),
+            str(doctored),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    assert child.returncode == 0, child.stderr[-6000:]
+    (line,) = [l for l in child.stdout.splitlines() if l.startswith("LOAD_REPORTS ")]
+    reports = json.loads(line.removeprefix("LOAD_REPORTS "))
+
+    assert reports[str(clean)] == "", reports[str(clean)]
+    doctored_report = reports[str(doctored)]
+    assert "extra.head.weight" in doctored_report
+    assert "UNEXPECTED" in doctored_report
+    for key in head_keys:
+        assert key not in doctored_report.replace("extra.head.weight", ""), key
 
 
 # --- (h), (i) torch.library registrations are process-global -------------------
