@@ -36,7 +36,7 @@ Remove the previous `hf_export` directory first (or use a different `--out`) —
 
 ## Where to run it
 
-A dense checkpoint — including a cutlass-MoE or a recycling model — exports on any machine; without CUDA it just logs a warning that kernel-backed paths (Triton sReLU, sonicmoe) cannot be exercised, so `--verify` proves less than it would on the training machine.
+A dense checkpoint — including a cutlass-MoE or a recycling model — exports on any machine; without CUDA it just logs a warning that kernel-backed paths (e.g. the Triton sReLU kernel) cannot be exercised, so `--verify` proves less than it would on the training machine.
 
 Two source types are refused outright off-CUDA:
 
