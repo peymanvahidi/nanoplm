@@ -67,6 +67,7 @@ export default defineConfig({
             { label: 'Choose an optimizer', link: '/guides/optimizers/' },
             { label: 'Cooldown and resuming', link: '/guides/cooldown-and-resume/' },
             { label: 'Recycling', link: '/guides/recycling/' },
+            { label: 'Publish to Hugging Face', link: '/guides/export-to-huggingface/' },
           ],
         },
         {

@@ -1,9 +1,9 @@
 ---
 title: CLI
-description: "Every nanoplm command, argument, and option, grouped by data, pretrain, eval, deps, and the unmaintained distill."
+description: "Every nanoplm command, argument, and option: the data, pretrain, eval, deps, and unmaintained distill command groups, plus the export command."
 ---
 
-`nanoplm` has five command groups: `data`, `pretrain`, `eval`, `deps`, and `distill`. The pipeline groups share the same shape:
+`nanoplm` has five command groups — `data`, `pretrain`, `eval`, `deps`, and `distill` — plus the `export` command, which is flag-driven and not a group. The pipeline groups share the same shape:
 
 ```
 nanoplm <group> get-yaml | from-yaml | run
@@ -361,6 +361,34 @@ nanoplm eval run --checkpoint-dir DIR [OPTIONS]
 | `--development-mode / --full-eval` | Subsampled task sets, or the full benchmark | `--development-mode` |
 | `--dataset-dir TEXT` | Pre-downloaded benchmark datasets, for offline machines. Mutually exclusive with `--force-download` | none |
 | `--force-download` | Re-download benchmark datasets | off |
+
+---
+
+## export
+
+```
+nanoplm export [OPTIONS] CHECKPOINT
+```
+
+Converts a nanoPLM checkpoint into a Hugging Face model repo: config, weights, tokenizer, a generated model card, and the vendored modeling code, verified against the native checkpoint before anything is published. `CHECKPOINT` is a `checkpoint-*` directory, or a `run-*` directory (the newest checkpoint inside is used) — same rule as `eval run --checkpoint-dir`. See the [Publish to Hugging Face](/nanoplm/guides/export-to-huggingface/) guide for where to run it, what `--verify` checks, and `--dtype` trade-offs.
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--out PATH` | Output directory. Must not exist, or must be empty | `<checkpoint>/hf_export` |
+| `--push-to-hub TEXT` | Repo id to upload to after a successful export, e.g. `acme/nanoplm-base` | none |
+| `--private` | Create the Hub repo as private (only applies when the repo is created) | off |
+| `--dtype [fp32\|bf16\|fp16]` | Exported weight dtype | `fp32` |
+| `--verify / --no-verify` | Compare exported vs. native outputs and refuse to write on mismatch | `--verify` |
+
+```bash
+nanoplm export output/pretraining_checkpoints/<run>/checkpoint-15000
+```
+
+```
+Wrote output/pretraining_checkpoints/<run>/checkpoint-15000/hf_export
+```
+
+A refusal (an existing non-empty output directory, an off-CUDA FP8/sonicmoe source, a failed `--verify`, ...) prints one line and exits `1`.
 
 ---
 
