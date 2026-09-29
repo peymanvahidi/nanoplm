@@ -33,6 +33,7 @@ dependencies = [
     "click>=8.1.8",
     "dvc>=3.59.1",
     "h5py>=3.13.0",
+    "huggingface-hub>=0.34",
     "isal>=1.6,<2",
     "pyyaml>=6.0.2",
     "safetensors>=0.4.0",
