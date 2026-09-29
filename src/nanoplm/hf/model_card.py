@@ -270,7 +270,10 @@ def render_model_card(
         "A protein language model trained with [nanoPLM]"
         "(https://github.com/peymanvahidi/nanoplm), a ModernBERT-style "
         "masked-language-model encoder for protein sequences.",
-        f"## Quickstart\n\n```python\n{quickstart}```",
+        "## Quickstart\n\n"
+        "Requires `torch` and `transformers>=5` (transformers 4.x cannot load "
+        "this model); no `nanoplm` install is needed.\n\n"
+        f"```python\n{quickstart}```",
         f"## Architecture\n\n{architecture}",
         _tokenizer_section(config),
         f"## Training\n\n{training}",

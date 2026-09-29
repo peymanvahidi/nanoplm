@@ -79,6 +79,17 @@ def test_quickstart_uses_trust_remote_code():
     assert "acme/nanoplm-base" in card
 
 
+def test_quickstart_states_the_transformers_version_it_needs():
+    # transformers 4.x fails to load an export with errors that never mention
+    # the version, so the card says so up front -- in the prose before the
+    # code block, since the snippet itself must stay QUICKSTART verbatim.
+    card = _card()
+    quickstart = card.split("## Quickstart", 1)[1]
+    prose, code = quickstart.split("```python", 1)
+    assert "transformers>=5" in prose
+    assert "transformers>=5" not in code
+
+
 def test_documents_the_device_matrix():
     card = _card().lower()
     for token in ("cpu", "mps", "cuda"):

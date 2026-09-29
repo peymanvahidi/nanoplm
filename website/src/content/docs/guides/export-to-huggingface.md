@@ -102,7 +102,13 @@ When you load an export straight from a local directory, `transformers` copies t
 
 ## Consumers
 
-Loading the export needs nothing from this project:
+Loading the export needs nothing from this project, only `torch` and `transformers>=5`:
+
+```bash
+pip install "transformers>=5" torch
+```
+
+transformers 4.x can't load an export: it fails with errors that don't point at the version.
 
 ```python
 from transformers import AutoModel, AutoTokenizer
