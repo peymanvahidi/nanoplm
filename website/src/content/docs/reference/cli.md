@@ -377,7 +377,7 @@ Converts a nanoPLM checkpoint into a Hugging Face model repo: config, weights, t
 | `--out PATH` | Output directory. Must not exist, or must be empty | `<checkpoint>/hf_export` |
 | `--push-to-hub TEXT` | Repo id to upload to after a successful export, e.g. `acme/nanoplm-base` | none |
 | `--private` | Create the Hub repo as private (only applies when the repo is created) | off |
-| `--dtype [fp32\|bf16\|fp16]` | Exported weight dtype | `fp32` |
+| `--dtype [bf16\|fp16\|fp32]` | Exported weight dtype | `fp32` |
 | `--verify / --no-verify` | Compare exported vs. native outputs and refuse to write on mismatch | `--verify` |
 
 ```bash

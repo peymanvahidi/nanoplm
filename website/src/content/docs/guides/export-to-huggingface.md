@@ -32,7 +32,7 @@ Wrote output/pretraining_checkpoints/<run>/checkpoint-15000/hf_export
 Pushed to https://huggingface.co/you/nanoplm-base
 ```
 
-This exports and verifies again (the output directory has to be removed or fresh, per above) and then uploads. See [Push to the Hub](#push-to-the-hub) for authentication.
+Remove the previous `hf_export` directory first (or use a different `--out`) — this exports and verifies again, then uploads the freshly published directory. See [Push to the Hub](#push-to-the-hub) for authentication.
 
 ## Where to run it
 
@@ -64,7 +64,7 @@ Every export writes a `README.md` with:
 
 - **Architecture** and parameter count.
 - **Training provenance**, read from `pretrain_config.yaml` and the data manifest: optimizer, LR schedule, token budget (in whichever unit the schedule specifies — tokens or steps, never converted between them), global batch, micro-batch, max sequence length, training sequences and tokens, training steps, and the nanoPLM version that produced the checkpoint. Anything absent from those files prints as `unknown` rather than being guessed.
-- **Config-driven notes**, added only when the relevant flag is set: recycling's `output_hidden_states` semantics (one entry per recurrent iteration, not per physical layer, with a note about the seeded noise draw when `recycling_s0_noise_sigma > 0`), mHC-lite's extra hidden-state dimension, and a warning that MoE runs the portable reference kernels and will be slower than the native CUTLASS path.
+- **Config-driven notes**, added only when the relevant flag is set: recycling's `output_hidden_states` semantics (one entry per recurrent iteration, not per physical layer, with a note about the seeded noise draw when `recycling_s0_noise_sigma > 0`), mHC-lite's extra hidden-state dimension, and a warning that MoE runs the portable reference kernels (no CUTLASS grouped GEMM) and will be slower than the native training path.
 - The **device support** table above.
 - A **Quickstart** Python snippet, embedded verbatim, that loads the model, tokenizes a couple of sequences, and mean-pools per-residue embeddings excluding special tokens.
 
@@ -91,12 +91,12 @@ If verification fails, the error names which tensor diverged along with its numb
 | Value | Notes |
 | --- | --- |
 | `fp32` *(default)* | Portable, and checked at the exact `1e-4` tolerance when the rest of the comparison is also exact. |
-| `bf16` | Halves the download size. Checked at the looser `5.5e-2` tolerance. Poorly supported on sm70 (V100), and only partially supported on MPS — prefer `fp32` or `fp16` there. |
-| `fp16` | Halves the download size. Checked at the looser tolerance. Values outside fp16's range overflow to non-finite, which `--verify` catches and refuses — if `--verify` fails specifically on non-finite output, try `fp32` or `bf16` instead. |
+| `bf16` | Halves the download size. Checked at the looser `5.5e-2` tolerance. Poorly supported on sm70 (V100), and only partially supported on MPS. |
+| `fp16` | Halves the download size. Checked at the looser tolerance. Values outside fp16's range overflow to non-finite, which `--verify` catches and refuses. |
 
 ## A quirk when loading from a local directory
 
-When you load an export straight from a local directory, `transformers` copies the config class and the model class into two separate dynamic-module folders, so `isinstance(model.config, model.config_class)` comes back `False` even though the model loaded and runs correctly. It's cosmetic: nothing about loading or running the model depends on it. Loading from the Hub goes through one resolved repo instead, but that path hasn't been checked here, so don't assume it behaves identically.
+When you load an export straight from a local directory, `transformers` copies the config class and the model class into two separate dynamic-module folders, so `isinstance(model.config, model.config_class)` comes back `False` even though the model loaded and runs correctly. It's cosmetic: nothing about loading or running the model depends on it.
 
 ## Consumers
 
