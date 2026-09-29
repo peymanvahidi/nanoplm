@@ -560,6 +560,73 @@ def test_push_to_hub_calls_the_fake_api_with_the_published_dir(
     assert "someuser/some-repo" in readme
 
 
+class _HubAuthError(OSError):
+    """Stands in for huggingface_hub's HTTP errors (OSError subclasses)."""
+
+
+@pytest.mark.parametrize("failing_call", ["create_repo", "upload_folder"])
+def test_push_failure_keeps_the_published_export_and_says_how_to_push(
+    checkpoint, tmp_path, monkeypatch, failing_call
+):
+    class _FailingHfApi:
+        def __init__(self, *a, **k):
+            pass
+
+        def create_repo(self, *a, **k):
+            if failing_call == "create_repo":
+                raise _HubAuthError("401 Unauthorized: not logged in")
+
+        def upload_folder(self, *a, **k):
+            raise _HubAuthError("401 Unauthorized: not logged in")
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FailingHfApi)
+
+    out = tmp_path / "hf"
+    with pytest.raises(RuntimeError) as excinfo:
+        export_checkpoint(checkpoint, out, push_to_hub="someuser/some-repo")
+
+    message = str(excinfo.value)
+    assert str(out) in message
+    assert "someuser/some-repo" in message
+    assert "written and verified" in message
+    assert "401 Unauthorized: not logged in" in message  # the Hub's own error
+    assert f"hf upload someuser/some-repo {out}" in message
+    assert isinstance(excinfo.value.__cause__, _HubAuthError)
+    # Published, not rolled back: the export is intact where the message says.
+    assert (out / "config.json").exists()
+    assert (out / "model.safetensors").exists()
+
+
+def test_push_failure_message_carries_private_into_the_manual_command(
+    checkpoint, tmp_path, monkeypatch
+):
+    class _FailingHfApi:
+        def __init__(self, *a, **k):
+            pass
+
+        def create_repo(self, *a, **k):
+            raise _HubAuthError("not logged in")
+
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FailingHfApi)
+
+    out = tmp_path / "hf"
+    with pytest.raises(RuntimeError) as excinfo:
+        export_checkpoint(
+            checkpoint,
+            out,
+            push_to_hub="someuser/some-repo",
+            private=True,
+            verify=False,
+        )
+    message = str(excinfo.value)
+    assert "written (not verified)" in message
+    assert f"hf upload someuser/some-repo {out} --private" in message
+
+
 # --- (j) off-CUDA refusals -----------------------------------------------------
 
 

@@ -121,6 +121,8 @@ The [quickstart notebook](https://github.com/peymanvahidi/nanoplm/blob/master/ex
 
 You need to be authenticated first: `hf auth login` (the current `huggingface_hub` CLI command — older installs use `huggingface-cli login`), or set the `HF_TOKEN` environment variable.
 
+If the push fails (not logged in, no network, no write access to the repo), the export is already written (and verified, unless `--no-verify`) at the output directory, and stays there. The error says so and prints the command that uploads it without exporting again, e.g. `hf upload you/nanoplm-base <out_dir>`.
+
 ## Where to go next
 
 - [CLI reference](/nanoplm/reference/cli/#export): the full flag table with defaults.

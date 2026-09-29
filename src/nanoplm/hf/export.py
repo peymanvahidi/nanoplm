@@ -27,7 +27,8 @@ The flow (spec Section 5.2, narrowed by the Task 14 controller amendments):
    between staging and publish removes the staging directory and re-raises
    unchanged; nothing is ever left partially written at `out_dir`.
 6. Push to the Hub only after a successful publish, and only the published
-   directory.
+   directory. A failed push leaves the published export in place and raises
+   a `RuntimeError` that says where it is and how to push it by hand.
 """
 
 from __future__ import annotations
@@ -293,9 +294,24 @@ def export_checkpoint(
     if push_to_hub:
         from huggingface_hub import HfApi
 
-        api = HfApi()
-        api.create_repo(push_to_hub, private=private, exist_ok=True)
-        api.upload_folder(folder_path=str(out_dir), repo_id=push_to_hub)
+        try:
+            api = HfApi()
+            api.create_repo(push_to_hub, private=private, exist_ok=True)
+            api.upload_folder(folder_path=str(out_dir), repo_id=push_to_hub)
+        except Exception as exc:
+            # The export itself is finished and published at this point. Say
+            # so: the Hub's own error (most often "not logged in") alone hides
+            # it, and a re-run would then refuse the now non-empty out_dir.
+            written = "written and verified" if verify else "written (not verified)"
+            manual = f"hf upload {push_to_hub} {out_dir}"
+            if private:
+                manual += " --private"
+            raise RuntimeError(
+                f"The export was {written} at {out_dir}, but the push to "
+                f"{push_to_hub} failed: {exc}. No need to export again: fix the "
+                "cause (for authentication, run `hf auth login`), then push "
+                f"the existing export with: {manual}"
+            ) from exc
         logger.info("export: pushed to https://huggingface.co/%s", push_to_hub)
 
     logger.info("export: wrote %s", out_dir)

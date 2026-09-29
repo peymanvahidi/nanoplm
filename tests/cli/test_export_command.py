@@ -155,3 +155,29 @@ def test_real_export_then_refuses_on_nonempty_out_dir(tmp_path):
     assert result.exit_code == 1
     assert "exists" in result.output
     assert "Traceback" not in result.output
+
+
+def test_push_failure_is_a_clean_error_that_points_at_the_written_export(
+    tmp_path, monkeypatch
+):
+    import huggingface_hub
+
+    class _FailingHfApi:
+        def __init__(self, *a, **k):
+            pass
+
+        def create_repo(self, *a, **k):
+            raise OSError("401 Unauthorized: not logged in")
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", _FailingHfApi)
+    ckpt = _write_checkpoint(tmp_path)
+    out = tmp_path / "hf"
+
+    result = CliRunner().invoke(
+        cli, ["export", str(ckpt), "--out", str(out), "--push-to-hub", "acme/x"]
+    )
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "401 Unauthorized: not logged in" in result.output
+    assert f"hf upload acme/x {out}" in result.output
+    assert (out / "config.json").exists()
