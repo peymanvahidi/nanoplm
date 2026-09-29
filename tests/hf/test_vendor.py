@@ -292,6 +292,9 @@ def test_matrix_falls_back_to_the_embedded_copy(tmp_path, monkeypatch):
 
 # --- (g) end to end: load the export without nanoplm ---------------------------
 
+# wo_init="kaiming": the default "zero" zeroes every residual output
+# projection, which would make the logits comparisons below vacuous for the
+# residual branches (MoE experts, the recycling loop, ...).
 TINY = dict(
     hidden_size=64,
     intermediate_size=128,
@@ -299,6 +302,7 @@ TINY = dict(
     num_attention_heads=4,
     num_kv_heads=2,
     vocab_size=32,
+    wo_init="kaiming",
 )
 CASES = {
     "dense": {},

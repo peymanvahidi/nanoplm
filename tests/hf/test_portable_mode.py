@@ -65,6 +65,9 @@ from nanoplm.pretraining.models.modern_bert.pure_model import (  # noqa: E402
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
+# wo_init="kaiming": the default "zero" zeroes every residual output
+# projection, which would make the CPU-vs-CUDA logits comparison vacuous for
+# the residual branches (canon, mHC-lite, MoE experts, ...).
 TINY = dict(
     hidden_size=64,
     intermediate_size=128,
@@ -72,6 +75,7 @@ TINY = dict(
     num_attention_heads=4,
     num_kv_heads=2,
     vocab_size=32,
+    wo_init="kaiming",
 )
 CASES = {
     "dense": {},

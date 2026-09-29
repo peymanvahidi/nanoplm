@@ -253,6 +253,11 @@ def test_empty_out_dir_is_accepted(checkpoint, tmp_path):
 
 
 def test_published_dir_permissions_and_setgid_inheritance(checkpoint, tmp_path):
+    # Make the parent setgid ourselves (allowed on a directory we own), so the
+    # inheritance check below runs under a plain /tmp too, not only on the
+    # cluster's setgid project directories.
+    os.chmod(tmp_path, tmp_path.stat().st_mode | stat.S_ISGID)
+
     out = tmp_path / "hf"
     result = export_checkpoint(checkpoint, out)
 
@@ -270,7 +275,9 @@ def test_published_dir_permissions_and_setgid_inheritance(checkpoint, tmp_path):
 
     parent_mode = tmp_path.stat().st_mode
     if not (parent_mode & stat.S_ISGID):
-        pytest.skip(f"{tmp_path} is not setgid on this filesystem")
+        # Only if the kernel refused the chmod above (e.g. a filesystem that
+        # ignores setgid on directories).
+        pytest.skip(f"could not make {tmp_path} setgid on this filesystem")
 
     assert actual_mode & stat.S_ISGID, "published dir lost setgid"
     config_json = result / "config.json"
