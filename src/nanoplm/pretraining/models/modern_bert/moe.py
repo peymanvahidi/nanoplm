@@ -151,7 +151,9 @@ def convert_wi_state_dict_v1_to_v2(
 # source tensor, which is bit-identical to ``torch.topk``'s values and keeps
 # the differentiable path in plain ATen ops.
 #
-# Portable mode skips the Triton import; CUDA then takes the ``torch.topk`` path.
+# Portable mode skips the Triton import, and ``_router_topk_indices`` then runs
+# the pure-torch reference on every device (never ``torch.topk``, whose tie
+# order differs between CPU and CUDA).
 if _PORTABLE:
     _HAVE_TRITON = False
 else:
@@ -287,7 +289,16 @@ def _router_topk_indices(
 
     Falls back to ``torch.topk`` for shapes the fused kernel cannot hold in
     registers, keeping the exact same tie-break and output layout.
+
+    Portable mode (exported bundles) always runs ``_topk_counts_fallback``, on
+    every device and for every shape: its lowest-index tie-break is the native
+    kernel's, whereas ``torch.topk`` promises no tie order and on CUDA does not
+    follow that one, so a CPU and a CUDA consumer of the same export could
+    otherwise route tied tokens to different experts.
     """
+    if _PORTABLE:  # the op is not registered and Triton is not loaded
+        idx, cnt = _topk_counts_fallback(scores, k, want_counts)
+        return idx, (cnt if want_counts else None)
     e = scores.shape[-1]
     supported = (
         0 < k <= e <= 1024
@@ -295,10 +306,7 @@ def _router_topk_indices(
     )
     use_fused = supported and (_HAVE_TRITON if scores.is_cuda else True)
     if use_fused:
-        if _PORTABLE:  # the op is not registered; same reference math
-            idx, cnt = _topk_counts_fallback(scores, k, want_counts)
-        else:
-            idx, cnt = torch.ops.nanoplm_router.topk_counts(scores, k, want_counts)
+        idx, cnt = torch.ops.nanoplm_router.topk_counts(scores, k, want_counts)
         return idx, (cnt if want_counts else None)
     idx = torch.topk(scores, k, dim=-1).indices
     if not want_counts:

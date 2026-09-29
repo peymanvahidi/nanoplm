@@ -173,6 +173,30 @@ def _mhc_block_bf16():
     return {"finite": bool(torch.isfinite(out).all()), "shape": list(out.shape)}
 
 
+def _router_ties():
+    # Only three distinct scores over eight experts, so nearly every row has
+    # exact ties. The native Triton kernel (and the CPU reference) pick the
+    # LOWEST index among tied experts; torch.topk promises no tie order, and on
+    # CUDA it does not follow that rule. Portable mode must route identically
+    # on every device, or CPU and CUDA consumers of one export would disagree.
+    from nanoplm.pretraining.models.modern_bert import moe
+
+    k = 3
+    gen = torch.Generator().manual_seed(0)
+    scores = torch.randint(0, 3, (256, 8), generator=gen).float() / 4
+    rule = [
+        sorted(range(len(row)), key=lambda j: (-row[j], j))[:k]
+        for row in scores.tolist()
+    ]
+    cpu_idx, cpu_cnt = moe._router_topk_indices(scores, k, True)
+    out = {"cpu_matches_rule": cpu_idx.tolist() == rule}
+    if WITH_CUDA:
+        cuda_idx, cuda_cnt = moe._router_topk_indices(scores.cuda(), k, True)
+        out["cuda_matches_rule"] = cuda_idx.cpu().tolist() == rule
+        out["counts_equal"] = bool(torch.equal(cuda_cnt.cpu(), cpu_cnt))
+    return out
+
+
 def _guarded(fn, *args):
     try:
         return fn(*args)
@@ -182,6 +206,7 @@ def _guarded(fn, *args):
 
 report = {
     "cases": {name: _guarded(_forward_case, o) for name, o in CASES.items()},
+    "router_ties": _guarded(_router_ties),
 }
 if WITH_CUDA:
     report["moe_backward"] = _guarded(_moe_backward)
@@ -281,6 +306,16 @@ def test_portable_forward_matches_between_cpu_and_cuda(child, case):
         pytest.skip("CUDA half needs a GPU")
     assert result["cuda_finite"]
     assert result["mismatch"] is None, result["mismatch"]
+
+
+def test_portable_router_breaks_ties_by_lowest_index_on_every_device(child):
+    result = _report(child)["router_ties"]
+    assert "error" not in result, result.get("error")
+    assert result["cpu_matches_rule"]
+    if not WITH_CUDA:
+        pytest.skip("CUDA half needs a GPU")
+    assert result["cuda_matches_rule"], "CUDA routing differs from CPU on ties"
+    assert result["counts_equal"]
 
 
 @pytest.mark.skipif(not WITH_CUDA, reason="needs CUDA")
