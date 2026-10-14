@@ -3605,7 +3605,9 @@ def run_pure_pretraining(
                         # the all-gather (bf16 copy of the full model per GPU);
                         # reshard only after the final backward, ahead of the
                         # optimizer step. With grad_accum 1 this is a no-op.
-                        model.set_reshard_after_backward(sync)
+                        # fsdp_reshard_after_forward opts out: that run chose
+                        # to never hold the full unsharded model at once.
+                        model.set_reshard_after_backward(sync or fsdp_reshard_after_forward)
 
                     if "num_valid_tokens" in batch:
                         microstep_tokens = batch["num_valid_tokens"]
