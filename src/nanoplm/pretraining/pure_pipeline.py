@@ -369,7 +369,8 @@ def _dynamo_recompile_limit(
     which the same bound covers. ``loopie_bptt`` adds nothing: its ``no_grad``
     applications are traced inside the unrolled graph. The tensor-R fallback
     (``_forward_repeats``, off the training path) needs V x S x 2 entries on
-    ``_forward_once``, which this bound covers for any j >= 1.
+    ``_forward_once``, which this bound covers for any j >= 1 (MoE layers add
+    a None/tensor ``last_aux_loss`` split there).
     """
     limit = 16 if int(global_batch_warmup_steps) > 0 else 8
     if getattr(model_config, "use_loopie", False) and int(loopie_jitter) > 0:

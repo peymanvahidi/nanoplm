@@ -65,7 +65,7 @@ pretraining.use_compile_max_autotune: { backend: [pure_torch], advanced: true }
 pretraining.compile_triton_persistent_reductions: { backend: [pure_torch], advanced: true }
 pretraining.compile_triton_mix_order_reduction: { backend: [pure_torch], advanced: true }
 
-# Layerwise debug hooks exist only on the pure-torch path.
+# Layerwise debug metrics (in-graph taps) exist only on the pure-torch path.
 pretraining.debug_layerwise_metrics: { backend: [pure_torch], advanced: true }
 pretraining.debug_layerwise_log_every: { backend: [pure_torch], advanced: true }
 

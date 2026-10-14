@@ -449,7 +449,7 @@ def pretrain():
     "--debug-layerwise-metrics/--no-debug-layerwise-metrics",
     default=False,
     help="Log per-layer grad/weight norms, residual-stream RMS, and logit stats. "
-    "Has non-trivial overhead; installs forward hooks that may break torch.compile graphs.",
+    "Activation stats are computed inside the compiled graph; small overhead.",
 )
 @click.option(
     "--debug-layerwise-log-every",
