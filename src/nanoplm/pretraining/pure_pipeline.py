@@ -3609,8 +3609,13 @@ def run_pure_pretraining(
                     # FSDP2 its unsynced gradients sit on the unsharded params,
                     # where optimizer.zero_grad() can't reach them, and leak
                     # into the next pass's first step. effective_grad_accum and
-                    # mbs_divisor only change at an optimizer step, so the
-                    # count is exact and identical on every rank.
+                    # mbs_divisor only change at an optimizer step. `remaining`
+                    # is an upper bound on the sub-batches left in this pass:
+                    # exact unless a later macro-batch splits into fewer than
+                    # mbs_divisor pieces, and rank-equal whenever split counts
+                    # are, which the accumulation logic already requires. When
+                    # it overestimates, the window runs and the epoch-end
+                    # zero_grad below is the fallback.
                     if accum_micro_count == 0 and not skip_pass_tail:
                         remaining = (total_sub_batches - sub_batch_idx) + (
                             synced_len - micro_step - 1
