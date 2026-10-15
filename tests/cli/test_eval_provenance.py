@@ -418,14 +418,21 @@ def test_eval_modules_import_without_biotrainer():
                 raise ImportError(f"blocked for this test: {fullname}")
             return None
 
+    def _purged(name):
+        root = name.split(".")[0]
+        return root in blocked or name == nanoplm_eval or name.startswith(
+            nanoplm_eval + "."
+        )
+
     def _purge():
         for name in list(sys.modules):
-            root = name.split(".")[0]
-            if root in blocked or name == nanoplm_eval or name.startswith(
-                nanoplm_eval + "."
-            ):
+            if _purged(name):
                 sys.modules.pop(name, None)
 
+    # Put the original modules back afterwards, and rebind them on their parent
+    # packages, so modules imported before this test keep seeing the same
+    # objects as later imports.
+    saved = {name: mod for name, mod in sys.modules.items() if _purged(name)}
     blocker = _Blocker()
     saved_meta_path = list(sys.meta_path)
     sys.meta_path.insert(0, blocker)
@@ -438,5 +445,10 @@ def test_eval_modules_import_without_biotrainer():
     finally:
         sys.meta_path[:] = saved_meta_path
         _purge()
+        sys.modules.update(saved)
+        for name, mod in saved.items():
+            parent, _, child = name.rpartition(".")
+            if parent in sys.modules:
+                setattr(sys.modules[parent], child, mod)
         importlib.import_module("nanoplm.eval.checkpoint")
         importlib.import_module("nanoplm.eval.pipeline")

@@ -119,8 +119,6 @@ def test_from_yaml_reaches_the_quack_patch(stubbed_pipeline, monkeypatch, tmp_pa
         lambda: calls.append(1) or True,
     )
     monkeypatch.setattr(cli_eval, "_check_biotrainer_available", lambda: None)
-    # Other tests reload nanoplm.eval.pipeline; make the CLI import the stubbed one.
-    monkeypatch.setitem(sys.modules, "nanoplm.eval.pipeline", pipeline)
     config = tmp_path / "eval.yaml"
     config.write_text(
         "eval:\n"
