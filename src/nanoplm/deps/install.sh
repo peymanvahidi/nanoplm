@@ -68,6 +68,14 @@ export MAX_JOBS="${MAX_JOBS:-32}"
 FORCE=0
 DRY_RUN="${NANOPLM_DEPS_DRY_RUN:-}"
 JURECA_HINT="module load CUDA/13 NCCL cuDNN Ninja"
+# Where to look for a CUDA 13 toolkit when `nvcc` is NOT already on PATH — the
+# plain-toolkit case (no module system): the toolkit sits under /usr/local but
+# nothing exports its bin/. Note nvidia-smi's "CUDA Version: 13.x" is the DRIVER
+# and says nothing about nvcc, so that row is no substitute for this probe.
+# Colon-separated and globbed; the first root whose bin/nvcc reports release 13
+# wins. NANOPLM_CUDA_SEARCH_ROOTS="" disables the probe (tests set it empty to
+# stay hermetic on hosts that really do have a toolkit installed).
+CUDA_SEARCH_ROOTS="${NANOPLM_CUDA_SEARCH_ROOTS-/usr/local/cuda:/usr/local/cuda-13*:/opt/cuda:/opt/cuda-13*}"
 
 log() { echo ">> $*"; }
 err() { echo "ERROR: $*" >&2; }
@@ -136,7 +144,232 @@ quack_ok() {
 
 satisfied_quack() { [ "$FORCE" -eq 0 ] && quack_ok; }
 
-# ---- preflight: fail loudly, no auto-detect ----------------------------------
+# ---- runtime cuBLAS vs. the toolkit TE is built against ----------------------
+# TransformerEngine compiles against $CUDA_HOME's cuBLAS headers, but at runtime
+# torch loads its OWN pinned cuBLAS wheel (2.12.1+cu130 caps it at 13.1.1.3)
+# through an RPATH into site-packages/nvidia/cu13/lib. Both libraries carry the
+# soname libcublasLt.so.13, so whichever loads first serves the whole process.
+# Build against a toolkit newer than that wheel -- CUDA 13.3 ships cuBLAS 13.6,
+# which added the grouped-GEMM entry points -- and importing torch before TE
+# dies with:
+#     libtransformer_engine.so: undefined symbol:
+#     cublasLtGroupedMatrixLayoutInit_internal, version libcublasLt.so.13
+# (Importing TE first masked it: ldconfig then resolved the toolkit's copy, and
+# the process ended up with TWO cuBLAS libraries mapped.) Upgrading the wheel to
+# the toolkit's own cuBLAS keeps exactly one in the process and makes build and
+# runtime agree. It steps over torch's upper pin, so `pip check` reports a
+# conflict -- expected, and harmless here: CUDA guarantees minor-version
+# compatibility inside a major version, and verify.py exercises the result on
+# the GPU before we call the install good.
+#
+# ORDERING: step_cublas must run AFTER every step that pip-installs a
+# torch-dependent distribution -- dion, flash-attn-3, quack-kernels and
+# sonic-moe all declare `Requires-Dist: torch`, so installing any of them pulls
+# torch into pip's resolve graph, carries its `nvidia-cublas<=13.1.1.3` pin
+# along, and "repairs" the alignment we just made by downgrading the wheel
+# again. Running it second only looked correct on a machine where those steps
+# were already satisfied and printed "present; skipping"; on a fresh install it
+# left verify.py failing with the very symbol error this step exists to prevent.
+# Keep it last.
+
+# cublas_header: echo the path of $CUDA_HOME's cublas_api.h, else return 1.
+# Toolkits expose it either at include/ (EasyBuild modules, plain installs) or
+# only under targets/<arch>/include -- globbed, not hardcoded to x86_64-linux,
+# because Grace-Hopper nodes are sm90 too and spell that dir sbsa-linux.
+cublas_header() {
+  local dir
+  for dir in "${CUDA_HOME:-}/include" "${CUDA_HOME:-}"/targets/*/include; do
+    if [ -r "$dir/cublas_api.h" ]; then printf '%s\n' "$dir/cublas_api.h"; return 0; fi
+  done
+  return 1
+}
+
+# toolkit_cublas_version: echo the toolkit's cuBLAS version the way PyPI spells
+# it (major.minor.patch.build, e.g. 13.6.0.2). The header is the authority --
+# it is what the TE build actually compiles against, and the CUDA toolkit's own
+# release number (13.3.1) is NOT the cuBLAS one (13.6.0.2).
+toolkit_cublas_version() {
+  local header
+  header="$(cublas_header)" || return 1
+  awk '
+    $2 == "CUBLAS_VER_MAJOR" { maj = $3 }
+    $2 == "CUBLAS_VER_MINOR" { min = $3 }
+    $2 == "CUBLAS_VER_PATCH" { pat = $3 }
+    $2 == "CUBLAS_VER_BUILD" { bld = $3 }
+    END {
+      if (maj == "" || min == "" || pat == "" || bld == "") exit 1
+      print maj "." min "." pat "." bld
+    }
+  ' "$header"
+}
+
+# installed_cublas_dist: echo "<dist-name> <version>" for the cuBLAS wheel in
+# this venv, else nothing. The NAME is discovered, never hardcoded: NVIDIA has
+# shipped this wheel as nvidia-cublas-cu11, then -cu12, and as plain
+# nvidia-cublas for cu13 (while cudnn/cusparselt kept their -cu13 suffix), so a
+# future CUDA major can rename it again and we still upgrade the right dist --
+# and reinstall it under the name that is actually there.
+installed_cublas_dist() {
+  "$PY" - <<'PY' 2>/dev/null
+import re
+from importlib.metadata import distributions
+for dist in distributions():
+    try:
+        name = dist.metadata["Name"] or ""
+    except Exception:
+        continue
+    if re.fullmatch(r"nvidia-cublas(-cu[0-9]+)?", name.lower().replace("_", "-")):
+        print(name, dist.version)
+        break
+PY
+}
+
+# cublas_needs_upgrade <have> <want>: 0 iff <want> is strictly newer than
+# <have>; an absent <have> counts as older. sort -V so 13.10.x beats 13.2.x.
+cublas_needs_upgrade() {
+  local have="$1" want="$2" newest
+  [ -n "$have" ] || return 0
+  if [ "$have" = "$want" ]; then return 1; fi
+  newest="$(printf '%s\n%s\n' "$have" "$want" | sort -V | tail -1)"
+  [ "$newest" = "$want" ]
+}
+
+# ---- headers TE's build expects next to the CUDA toolkit ---------------------
+# TE 2.16 includes two headers a bare CUDA toolkit does not ship, and neither
+# half of its build goes looking for them:
+#   * common/util/logging.h:15  #include "nccl.h"  -- unconditional (it backs
+#     NVTE_CHECK_NCCL), yet the cmake half adds an NCCL include dir only inside
+#     the NVTE_WITH_CUBLASMP / NVTE_WITH_CUSOLVERMP options, which we leave off.
+#   * pytorch/csrc/common.h:23  #include <cudnn.h> -- the cmake half finds cuDNN
+#     through the cudnn-frontend's own site-packages probe, but the pytorch
+#     extension half compiles with just $CUDA_HOME/include (build_tools/
+#     utils.py: get_cuda_include_dirs returns the toolkit and nothing else once
+#     a toolkit exists).
+# Upstream gets away with both because NGC containers ship nccl.h and cudnn.h
+# beside the CUDA headers. Toolkits that do not -- Spack, EasyBuild without
+# `module load NCCL cuDNN`, plain runfile installs -- die a minute into the
+# build with:
+#     util/logging.h:15:10: fatal error: nccl.h: No such file or directory
+# Only the HEADERS are missing: every nccl* CALL sits behind those two options,
+# so nothing here has to link libnccl.
+#
+# The fix is CPATH, not -I: one export reaches BOTH halves (cmake's nvcc/g++ and
+# torch's cpp_extension, which builds its own compile lines and would drop
+# CFLAGS), and nvcc honors it for the host and device passes alike. TE's
+# NVTE_CMAKE_EXTRA_ARGS would reach the cmake half only -- and it splits on
+# whitespace.
+
+# header_reachable <header>: 0 iff nvcc already resolves `#include "<header>"`
+# with the include path it has (its own toolkit, /usr/include, $CPATH). Asking
+# the compiler beats guessing toolkit layouts, and costs ~50 ms. Heredoc, not a
+# pipe: under `set -o pipefail` a compiler that never reads stdin would hand us
+# printf's SIGPIPE instead of its own verdict.
+header_reachable() {
+  nvcc -E -x cu - -o /dev/null >/dev/null 2>&1 <<EOF
+#include "$1"
+EOF
+}
+
+# nvidia_wheel_include_dirs: echo every <site-packages>/nvidia/*/include that
+# exists (torch's own CUDA wheel stack: cu13, cudnn, nccl, ...). Deliberately
+# the same place TE itself falls back to when there is no toolkit
+# (get_cuda_include_dirs under NVTE_BUILD_USE_NVIDIA_WHEELS=1), so we add
+# exactly the headers a pip-only install would have compiled against.
+nvidia_wheel_include_dirs() {
+  "$PY" - <<'PYEOF' 2>/dev/null
+from pathlib import Path
+try:
+    import nvidia
+except ModuleNotFoundError:
+    raise SystemExit(0)
+root = Path(nvidia.__file__).parent if nvidia.__file__ else Path(nvidia.__path__[0])
+for sub in sorted(p for p in root.iterdir() if p.is_dir()):
+    if (sub / "include").is_dir():
+        print(sub / "include")
+PYEOF
+}
+
+# ensure_te_headers: for each header TE includes that the compiler cannot find,
+# append a directory that has it to CPATH. Appended, never prepended: the
+# toolkit's own headers keep priority.
+#
+# torch's WHEELS come before any module tree ($NCCL_HOME / $CUDNN_HOME, set by
+# an `module load nccl cudnn`; $EBROOT* on EasyBuild clusters), even though a
+# loaded module is the more deliberate choice, because the wheels are what the
+# rest of this build and the finished library actually pair with: TE's cmake
+# half already compiles cuDNN from the wheel (the cudnn-frontend probes
+# site-packages), and at runtime torch loads its own libnccl/libcudnn through an
+# RPATH into site-packages. A module's headers are a different version --
+# NHR@FAU ships nccl 2.28.7 against torch's 2.29.7, and its only cudnn modules
+# are cu11/cu12 builds -- which would leave the two halves of one .so compiled
+# against two cuDNNs. Same build-vs-runtime rule as step_cublas. Module trees
+# stay as the fallback for a venv without the NVIDIA wheels.
+#
+# Never fatal -- a named warning plus the build's own error beats refusing on a
+# host whose layout we merely failed to guess.
+ensure_te_headers() {
+  local header dir found missing=() cands=()
+  for header in nccl.h cudnn.h; do
+    header_reachable "$header" || missing+=("$header")
+  done
+  [ "${#missing[@]}" -eq 0 ] && return 0
+  while IFS= read -r dir; do
+    [ -n "$dir" ] && cands+=("$dir")
+  done < <(nvidia_wheel_include_dirs)
+  for dir in "${NCCL_HOME:-}" "${EBROOTNCCL:-}" "${CUDNN_HOME:-}" "${EBROOTCUDNN:-}"; do
+    [ -n "$dir" ] && cands+=("$dir/include")
+  done
+  for header in "${missing[@]}"; do
+    found=""
+    for dir in "${cands[@]:-}"; do
+      if [ -r "$dir/$header" ]; then found="$dir"; break; fi
+    done
+    if [ -z "$found" ]; then
+      warn "$header is not on the compiler's include path and is in none of:"
+      warn "  ${cands[*]:-<no candidate include dirs>}"
+      warn "TransformerEngine 2.16 includes it unconditionally, so its build will fail."
+      warn "On EasyBuild clusters run:  $JURECA_HINT"
+      continue
+    fi
+    case ":${CPATH:-}:" in
+      *":$found:"*) ;;
+      *) export CPATH="${CPATH:+$CPATH:}$found" ;;
+    esac
+    log "$header is not on the toolkit's include path -- added $found to CPATH for the build"
+  done
+}
+
+# ---- preflight: recover what is recoverable, then fail loudly ----------------
+# An unexported toolkit or a missing ninja is a PATH problem, not a platform
+# problem: probe/bootstrap it and print exactly what changed. Anything we cannot
+# fix ourselves (no CUDA 13 anywhere, no venv, no git) still refuses up front,
+# before sinking ~10 minutes into the TransformerEngine build.
+
+# nvcc_is_cuda13 <path>: 0 iff <path> is an executable nvcc reporting release 13.
+nvcc_is_cuda13() {
+  [ -n "$1" ] && [ -x "$1" ] || return 1
+  "$1" --version 2>/dev/null | grep -q "release 13"
+}
+
+# find_cuda13_nvcc: echo the path of a CUDA 13 nvcc that is not on PATH, else
+# return 1. A toolkit the environment already points at ($CUDA_HOME, or
+# $EBROOTCUDA on EasyBuild clusters) beats a probe; then $CUDA_SEARCH_ROOTS.
+find_cuda13_nvcc() {
+  local cand root
+  for root in "${CUDA_HOME:-}" "${EBROOTCUDA:-}"; do
+    [ -n "$root" ] || continue
+    if nvcc_is_cuda13 "$root/bin/nvcc"; then printf '%s\n' "$root/bin/nvcc"; return 0; fi
+  done
+  local IFS=:
+  # Unquoted on purpose: splits on ':' AND globs (/usr/local/cuda-13* matches
+  # both the cuda-13 symlink and cuda-13.3). A glob that matches nothing stays
+  # literal and simply fails the -x test below.
+  for cand in $CUDA_SEARCH_ROOTS; do
+    if nvcc_is_cuda13 "$cand/bin/nvcc"; then printf '%s\n' "$cand/bin/nvcc"; return 0; fi
+  done
+  return 1
+}
+
 resolve_cuda_home() {
   if [ -z "${CUDA_HOME:-}" ]; then
     if [ -n "${EBROOTCUDA:-}" ]; then
@@ -177,24 +410,54 @@ preflight() {
     log "pip missing in this venv (created with 'uv venv'?) — bootstrapping via ensurepip"
     run_cmd "$PY" -m ensurepip --upgrade
   fi
-  if ! command -v nvcc >/dev/null 2>&1 || ! nvcc --version 2>/dev/null | grep -q "release 13"; then
-    err "nvcc (CUDA 13.x) not found on PATH."
-    err "On JURECA/EasyBuild clusters run:"
-    err "    $JURECA_HINT        # do NOT module purge"
-    err "then re-run \`nanoplm deps install\`."
-    err "Elsewhere: install the CUDA 13.0 toolkit and put its bin/ on PATH."
-    exit 1
+  if ! nvcc_is_cuda13 "$(command -v nvcc 2>/dev/null)"; then
+    local found root
+    found="$(find_cuda13_nvcc)" || found=""
+    if [ -n "$found" ]; then
+      # Exporting (not just calling it by path) is what the user would have
+      # typed, and it is what hands the same toolkit to TE's cmake/ninja build
+      # and to nvcc-invoking pip builds later in this run.
+      root="$(dirname "$(dirname "$found")")"
+      if [ -n "${CUDA_HOME:-}" ] && [ "$CUDA_HOME" != "$root" ]; then
+        warn "CUDA_HOME was $CUDA_HOME but has no CUDA 13 nvcc — overriding it with $root."
+      fi
+      export PATH="$(dirname "$found"):$PATH" CUDA_HOME="$root"
+      log "nvcc was not on PATH; found CUDA 13 at $root and prepended its bin/ for this run."
+      log "To make that permanent:  export PATH=$root/bin:\$PATH"
+    else
+      err "nvcc (CUDA 13.x) not found on PATH, and no CUDA 13 toolkit under: ${CUDA_SEARCH_ROOTS:-<probe disabled>}"
+      err "(nvidia-smi reporting 'CUDA Version: 13.x' is the DRIVER — nvcc ships in the separate toolkit.)"
+      err "On JURECA/EasyBuild clusters run:"
+      err "    $JURECA_HINT        # do NOT module purge"
+      err "then re-run \`nanoplm deps install\`."
+      err "Elsewhere: install the CUDA 13.0 toolkit, then put its bin/ on PATH, point CUDA_HOME at it,"
+      err "or add its root to NANOPLM_CUDA_SEARCH_ROOTS."
+      exit 1
+    fi
   fi
   if ! command -v ninja >/dev/null 2>&1; then
-    err "ninja not found on PATH (needed to build TransformerEngine)."
-    err "JURECA: $JURECA_HINT    |    Debian/Ubuntu: apt install ninja-build"
-    exit 1
+    # The ninja wheel ships a real ninja binary, so the pip bootstrapped above
+    # can supply it in-venv — no root, no module. step_te installs it again
+    # alongside TE's other build deps; that is idempotent.
+    log "ninja not on PATH — installing the ninja wheel into the venv (TransformerEngine's build needs it)"
+    run_cmd "$PY" -m pip install ninja
+    # A venv that was never `activate`d has $VIRTUAL_ENV set but its bin/ off
+    # PATH, so the binary we just installed would still be invisible to the build.
+    case ":$PATH:" in
+      *":$VIRTUAL_ENV/bin:"*) ;;
+      *) export PATH="$VIRTUAL_ENV/bin:$PATH" ;;
+    esac
+    if [ -z "$DRY_RUN" ] && ! command -v ninja >/dev/null 2>&1; then
+      err "ninja still not on PATH after installing the ninja wheel into $VIRTUAL_ENV."
+      err "JURECA: $JURECA_HINT    |    Debian/Ubuntu: apt install ninja-build"
+      exit 1
+    fi
   fi
   command -v git >/dev/null 2>&1 || { err "git not found on PATH."; exit 1; }
   resolve_cuda_home
   [ -n "${CUDA_HOME:-}" ] || { err "CUDA_HOME could not be determined."; exit 1; }
   hopper_gate
-  log "preflight OK: python=$PY  nvcc=$(command -v nvcc)  CUDA_HOME=$CUDA_HOME  archs=$NVTE_CUDA_ARCHS"
+  log "preflight OK: python=$PY  nvcc=$(command -v nvcc)  CUDA_HOME=$CUDA_HOME  ninja=$(command -v ninja)  archs=$NVTE_CUDA_ARCHS"
 }
 
 # ---- steps (each: skip when satisfied, unless --force) ------------------------
@@ -202,6 +465,53 @@ step_torch() {
   if satisfied_torch; then log "torch $TORCH_PIN present; skipping."; return 0; fi
   log "installing torch $TORCH_PIN from $TORCH_INDEX"
   run_cmd "$PY" -m pip install "torch==2.12.1" --index-url "$TORCH_INDEX"
+}
+
+step_cublas() {
+  local want dist have line
+  want="$(toolkit_cublas_version)" || {
+    warn "no cublas_api.h under $CUDA_HOME — leaving torch's cuBLAS wheel alone."
+    warn "If TE then fails to import with 'undefined symbol: cublasLt...', install the"
+    warn "toolkit's own cuBLAS: $PY -m pip install --no-deps nvidia-cublas==<toolkit version>"
+    return 0
+  }
+  line="$(installed_cublas_dist)" || line=""
+  dist="${line%% *}"; have="${line##* }"
+  if [ -z "$dist" ]; then
+    warn "no cuBLAS wheel in this venv — leaving the CUDA stack alone."
+    warn "(torch normally brings one; if TE fails to import with 'undefined symbol:"
+    warn "cublasLt...', install the toolkit's own: nvidia-cublas==$want.)"
+    return 0
+  fi
+  if [ "${have%%.*}" != "${want%%.*}" ]; then
+    # Aligning across a major would swap the soname out from under torch. The
+    # toolkit/torch pairing itself is wrong here; no version bump fixes that.
+    warn "cuBLAS major mismatch: toolkit has $want, the wheel has $have ($dist) — not touching it."
+    warn "Point CUDA_HOME at a toolkit whose major matches torch's CUDA build."
+    return 0
+  fi
+  if cublas_needs_upgrade "$have" "$want"; then
+    log "toolkit cuBLAS $want is newer than $dist $have — aligning them (TE builds against the toolkit)"
+  elif [ "$FORCE" -eq 1 ] && [ "$have" = "$want" ]; then
+    log "$dist already at the toolkit's $want; reinstalling (--force)"
+  else
+    # An older toolkit needs no help: TE just compiles without the newer entry
+    # points. Never downgrade here — that would break torch's own cuBLAS floor.
+    log "$dist $have already covers the toolkit's $want; skipping."
+    return 0
+  fi
+  # NVIDIA does not publish a wheel for every toolkit patch release. Only
+  # ">= want" is required for correctness (a newer cuBLAS still exports the
+  # entry points TE compiled against), so fall back to the newest wheel that
+  # clears it — and if even that is unavailable, warn and let the build proceed
+  # rather than losing a 10-minute install to it. verify.py is the final judge.
+  if ! run_cmd "$PY" -m pip install --no-deps "$dist==$want"; then
+    warn "no $dist==$want wheel on PyPI — trying the newest >=$want."
+    run_cmd "$PY" -m pip install --no-deps "$dist>=$want" || {
+      warn "could not install a cuBLAS >=$want; continuing with $have."
+      warn "If TE then fails to import with 'undefined symbol: cublasLt...', this is why."
+    }
+  fi
 }
 
 step_dion() {
@@ -212,6 +522,9 @@ step_dion() {
 
 step_te() {
   if satisfied transformer_engine "2.16"; then log "TransformerEngine 2.16 present; skipping."; return 0; fi
+  # nccl.h / cudnn.h first: both halves of this build include them and neither
+  # half looks for them outside the toolkit (see ensure_te_headers).
+  ensure_te_headers
   # --no-build-isolation reads the live env and --no-deps installs ONLY
   # transformer_engine (re-resolving torch's CUDA wheel stack against PyPI can
   # pull wheels that clash with the toolchain we build against). So TE's build
@@ -298,6 +611,9 @@ main() {
   step_te
   step_fa3
   step_moe
+  # LAST on purpose -- see the comment above step_cublas. Every step above that
+  # installs a torch-dependent dist re-resolves torch's pins and would undo it.
+  step_cublas
   log "=== hard-dependency install finished (verification runs next) ==="
 }
 

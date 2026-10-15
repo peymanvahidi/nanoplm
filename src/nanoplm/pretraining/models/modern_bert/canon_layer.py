@@ -25,6 +25,7 @@ from ._globals import (
     _varlen_rms_canon_conv,
 )
 from .config import ModernBertConfig
+from .taps import RepeatTap
 
 
 def _make_canon_layer(channels: int, config: ModernBertConfig) -> nn.Module:
@@ -104,6 +105,11 @@ class ModernBertCanonLayer(nn.Module):
             groups=channels,
             bias=True,
         )
+        # debug_metrics enumerates Canon layers as blocks (they are in
+        # `_BLOCK_CLASS_NAMES`), so this one needs a tap for its output too,
+        # exactly like ModernBertEncoderLayer. Identity until a tracker
+        # installs an accumulator; adds no state_dict keys.
+        self.repeat_tap = RepeatTap()
 
     def _forward_varlen(self, x, cu_seqlens, position_ids=None):
         T, C = x.shape
@@ -286,7 +292,7 @@ class ModernBertCanonLayer(nn.Module):
         )
 
         with autotune_ctx:
-            return self._forward_dispatch(
+            out = self._forward_dispatch(
                 x,
                 position_ids=position_ids,
                 cu_seqlens=cu_seqlens,
@@ -296,6 +302,9 @@ class ModernBertCanonLayer(nn.Module):
                 fuse_norm_type=fuse_norm_type,
                 use_ckpt=use_ckpt,
             )
+        # Outside the checkpoint, like the forward hook this replaced: one
+        # sample per call, all in slot 0 (a Canon layer has no loop index).
+        return self.repeat_tap(out, 0)
 
     def _forward_dispatch(
         self,

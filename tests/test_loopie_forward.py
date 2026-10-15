@@ -1,7 +1,8 @@
 """Tests for Loopie layer-loop recurrence (arXiv 2607.16051).
 
 Each stored layer is applied ``loopie_loop_count`` times consecutively
-(L1,L1,L2,L2,...), weight-tied, with full backprop through every repeat.
+(L1,L1,L2,L2,...), weight-tied. These tests cover the default full backprop;
+``loopie_bptt`` truncation is tested in ``test_loopie_bptt.py``.
 """
 
 import pytest

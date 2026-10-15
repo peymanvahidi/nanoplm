@@ -1,17 +1,25 @@
 """Layerwise debug metrics tracker.
 
-Gathers per-layer grad/weight norms, per-block residual-stream RMS, and
+Gathers per-layer grad/weight norms, per-application residual-stream RMS, and
 lm_head logit stats with a single host-sync per logging window.
 
 Design invariants
 -----------------
+* Activation stats are computed by the model's own tap modules
+  (``modern_bert.taps.RepeatTap`` / ``StatsTap``), not by forward hooks: this
+  tracker only allocates the fp32 accumulators and installs them on the taps
+  with ``enable_stats``. Hooks used to be ``@torch.compiler.disable``d, which
+  made Dynamo skip the whole compiled frame and ran the model largely eager;
+  the taps mutate a lifted graph input instead, so nothing breaks the graph.
 * All accumulation uses in-place ops on preallocated GPU tensors. No `.item()`,
   `.cpu()`, or `.tolist()` outside `flush()`.
 * `flush()` is the only host sync point: one `all_reduce` per reduction op, one
   `.cpu()`, one Python fan-out into a payload dict.
-* Forward hooks remain registered for the lifetime of the tracker. On non-log
-  steps they still fire and accumulate — the cost is one fused scalar add per
-  hook, which is negligible compared to a transformer block.
+* The taps accumulate on every training step, not only on log steps — the cost
+  is a handful of fused reductions per block, negligible against the block
+  itself, and `flush()` divides by the counts it collected.
+* One tensor per tap (never views into one big buffer), so AOTAutograd never
+  sees several mutated inputs aliasing the same storage.
 """
 
 from __future__ import annotations
@@ -22,9 +30,9 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 
+from nanoplm.pretraining.models.modern_bert.taps import RepeatTap, StatsTap
 from nanoplm.utils.logger import logger
 
 
@@ -98,6 +106,22 @@ def _role_from_name(name: str) -> str:
 
 
 class LayerwiseDebugTracker:
+    """Owns the debug accumulators and the single per-window reduction.
+
+    Construction installs fp32 accumulators on the model's taps: one
+    ``[2, max_rep]`` tensor per enumerated block (``RepeatTap``), one
+    6-element tensor for the logits and one for the final-norm output
+    (``StatsTap``). Install after ``model.to(device)``, ``fully_shard`` and
+    ``torch.compile`` but before the first forward — the tensors are plain
+    module attributes, so they are lifted as graph inputs on the first trace
+    and must already live on the training device.
+
+    ``record_step_boundary`` fills the grad/weight slots once per optimizer
+    step; ``flush`` reduces everything, resets the accumulators in place and
+    returns the payload on rank 0. ``close`` removes the accumulators again,
+    which turns every tap back into a plain identity.
+    """
+
     def __init__(
         self,
         model: nn.Module,
@@ -106,13 +130,16 @@ class LayerwiseDebugTracker:
         output_dir: str,
         is_main: bool,
         distributed: bool,
+        max_rep: int = 1,
     ) -> None:
         self.log_every = int(log_every)
         self.device = device
         self.is_main = is_main
         self.distributed = distributed
+        self.max_rep = max(1, int(max_rep))
 
-        self._hook_handles: list = []
+        # Taps whose accumulators this tracker installed; cleared by `close`.
+        self._taps: list[nn.Module] = []
 
         # ---- param list (grad + weight norms) -------------------------------
         params: list[tuple[str, nn.Parameter]] = [
@@ -129,14 +156,17 @@ class LayerwiseDebugTracker:
         self.weight_norm_buf = torch.zeros(n_params, device=device, dtype=torch.float32)
         self._step_recorded = False  # set when record_step_boundary ran this window
 
-        # ---- residual-stream RMS hooks --------------------------------------
+        # ---- residual-stream RMS taps ---------------------------------------
         # FSDP2's composable `fully_shard` swaps `mod.__class__` to a dynamic
         # subclass, so match via MRO rather than immediate class name.
-        def _is_block(mod: nn.Module) -> bool:
+        def _mro_named(mod: nn.Module, names: tuple[str, ...]) -> bool:
             for cls in type(mod).__mro__:
-                if cls.__name__ in _BLOCK_CLASS_NAMES:
+                if cls.__name__ in names:
                     return True
             return False
+
+        def _is_block(mod: nn.Module) -> bool:
+            return _mro_named(mod, _BLOCK_CLASS_NAMES)
 
         self.block_names: list[str] = []
         blocks: list[nn.Module] = []
@@ -145,46 +175,58 @@ class LayerwiseDebugTracker:
                 self.block_names.append(mod_name)
                 blocks.append(mod)
         n_blocks = len(blocks)
-        self.residual_sq_sum = torch.zeros(n_blocks, device=device, dtype=torch.float32)
-        self.residual_count = torch.zeros(n_blocks, device=device, dtype=torch.float32)
-        for idx, block in enumerate(blocks):
-            self._hook_handles.append(
-                block.register_forward_hook(self._make_residual_hook(idx))
+        # One `[2, max_rep]` tensor per block: [0]=Σ mean(x*x) per application,
+        # [1]=application count. Owned by the block's RepeatTap from here on.
+        self._res_stats: list[torch.Tensor] = []
+        n_missing_taps = 0
+        for block in blocks:
+            tap = getattr(block, "repeat_tap", None)
+            # isinstance, not hasattr: the two taps take different arguments, so
+            # a misplaced module should warn here rather than raise on install.
+            if isinstance(tap, RepeatTap):
+                self._res_stats.append(tap.enable_stats(self.max_rep, device))
+                self._taps.append(tap)
+            else:
+                # Placeholder so the packing layout in flush() is unconditional;
+                # it stays zero, so no key is emitted for this block.
+                n_missing_taps += 1
+                self._res_stats.append(
+                    torch.zeros(2, self.max_rep, device=device, dtype=torch.float32)
+                )
+        if n_missing_taps:
+            logger.warning(
+                "LayerwiseDebugTracker: %d of %d blocks have no `repeat_tap` "
+                "(modern_bert.taps.RepeatTap); their residual RMS stays unreported.",
+                n_missing_taps,
+                n_blocks,
             )
 
         # ---- logit stats ----------------------------------------------------
-        # [0]=sq_sum over all scored elements, [1]=abs_max, [2]=entropy_sum
-        self.logit_buf = torch.zeros(3, device=device, dtype=torch.float32)
-        self.logit_elem_count = torch.zeros(1, device=device, dtype=torch.float32)
-        self.logit_token_count = torch.zeros(1, device=device, dtype=torch.float32)
-        decoder = getattr(model, "decoder", None)
-        if isinstance(decoder, nn.Linear):
-            self._hook_handles.append(decoder.register_forward_hook(self._logit_hook))
-        else:
-            logger.warning(
-                "LayerwiseDebugTracker: model has no nn.Linear `decoder` attribute; "
-                "logit stats disabled."
-            )
+        # StatsTap layout: [sq_sum, sum, abs_max, numel, entropy_sum, tokens].
+        # `sum` stays zero for logits (StatsTap(with_sum=False)); nothing reads
+        # it — `debug/logits/norm` is the raw window sum of squares, not a mean.
+        self._logit_stats = self._enable_scalar_tap(
+            getattr(model, "logit_tap", None),
+            device,
+            "`logit_tap` (modeling.ModernBertForMaskedLM tags every scoring "
+            "path with it); logit stats disabled.",
+        )
 
         # ---- final_norm output stats (the "embedding" fed into head/decoder)
-        # [0]=sq_sum, [1]=sum (for mean), [2]=abs_max
-        self.final_norm_buf = torch.zeros(3, device=device, dtype=torch.float32)
-        self.final_norm_elem_count = torch.zeros(1, device=device, dtype=torch.float32)
-        # `final_norm` lives on `model.model` (the encoder) in ModernBert; also
-        # accept it directly on `model` for robustness.
-        final_norm = getattr(model, "final_norm", None)
-        if final_norm is None:
+        # `final_norm_tap` lives on `model.model` (the encoder) in ModernBert;
+        # also accept it directly on `model` for robustness.
+        final_norm_tap = getattr(model, "final_norm_tap", None)
+        if final_norm_tap is None:
             inner = getattr(model, "model", None)
-            final_norm = getattr(inner, "final_norm", None) if inner is not None else None
-        if isinstance(final_norm, nn.Module):
-            self._hook_handles.append(
-                final_norm.register_forward_hook(self._final_norm_hook)
+            final_norm_tap = (
+                getattr(inner, "final_norm_tap", None) if inner is not None else None
             )
-        else:
-            logger.warning(
-                "LayerwiseDebugTracker: model has no `final_norm` module; "
-                "final-norm output stats disabled."
-            )
+        self._final_stats = self._enable_scalar_tap(
+            final_norm_tap,
+            device,
+            "`final_norm_tap` (modeling.ModernBertModel); final-norm output "
+            "stats disabled.",
+        )
 
         # ---- JSONL sink -----------------------------------------------------
         self._jsonl_fh = None
@@ -201,78 +243,38 @@ class LayerwiseDebugTracker:
             self.log_every,
         )
 
-    # ------------------------------------------------------------------ hooks
-    def _make_residual_hook(self, idx: int):
-        buf_sq = self.residual_sq_sum
-        buf_cnt = self.residual_count
+    # -------------------------------------------------------------------- taps
+    def _enable_scalar_tap(
+        self, tap: Optional[object], device: torch.device, missing: str
+    ) -> torch.Tensor:
+        """Install a 6-element accumulator on ``tap``; zeros if it is absent."""
+        if isinstance(tap, StatsTap):
+            self._taps.append(tap)
+            return tap.enable_stats(device)
+        logger.warning("LayerwiseDebugTracker: model has no %s", missing)
+        return torch.zeros(6, device=device, dtype=torch.float32)
 
-        # `torch.compiler.disable` keeps the hook body OUT of the compiled
-        # graph. The model is wrapped by torch.compile, so without this Dynamo
-        # would inline the hook's data-dependent control flow and in-place
-        # mutation of these external tracker tensors, churning guards and
-        # forcing repeated recompiles. Running it eager trades a graph break at
-        # each block boundary for compile stability.
-        @torch.compiler.disable
-        def hook(_module, _inputs, output):
-            if not _module.training:
-                return
-            x = output[0] if isinstance(output, (tuple, list)) else output
-            if not torch.is_tensor(x):
-                return
-            with torch.no_grad():
-                # Compute in native dtype (residual std is O(1), bf16 safe),
-                # cast only the scalar to fp32 for the fp32 accumulator.
-                xd = x.detach()
-                sq = (xd * xd).mean()
-                buf_sq[idx].add_(sq.float())
-                buf_cnt[idx].add_(1.0)
+    def _stacked_res(self) -> torch.Tensor:
+        """The per-block residual accumulators as one `[n_blocks, 2, max_rep]`.
 
-        return hook
-
-    # See `_make_residual_hook` for why these hooks are compile-disabled.
-    @torch.compiler.disable
-    def _final_norm_hook(self, _module, _inputs, output):
-        if not _module.training:
-            return
-        x = output[0] if isinstance(output, (tuple, list)) else output
-        if not torch.is_tensor(x):
-            return
-        with torch.no_grad():
-            xd = x.detach()
-            sq_sum = (xd * xd).sum()
-            sum_ = xd.sum()
-            abs_max = xd.abs().amax()
-            self.final_norm_buf[0].add_(sq_sum.float())
-            self.final_norm_buf[1].add_(sum_.float())
-            self.final_norm_buf[2].copy_(
-                torch.maximum(self.final_norm_buf[2], abs_max.float())
+        A stack (a copy) rather than a preallocated buffer the taps write into:
+        separate storages keep AOTAutograd from seeing aliased mutated inputs.
+        """
+        if not self._res_stats:
+            return torch.zeros(
+                0, 2, self.max_rep, device=self.device, dtype=torch.float32
             )
-            self.final_norm_elem_count.add_(float(xd.numel()))
+        return torch.stack(self._res_stats)
 
-    @torch.compiler.disable
-    def _logit_hook(self, _module, _inputs, output):
-        if not _module.training:
-            return
-        if not torch.is_tensor(output):
-            return
-        logits = output.detach()
-        with torch.no_grad():
-            # Scalars cast to fp32 at the end; avoids a full [B,T,V] fp32 alloc.
-            sq_sum = (logits * logits).sum()
-            abs_max = logits.abs().amax()
-            # Entropy via logsumexp identity: H = lse - Σ p * logits.
-            # logsumexp and softmax run in logits' dtype (bf16 is fine for this
-            # range since lse is stable); only two [B, T] tensors allocated.
-            lse = torch.logsumexp(logits, dim=-1)
-            probs = F.softmax(logits, dim=-1)
-            entropy_per_token = lse - (probs * logits).sum(dim=-1)
-            self.logit_buf[0].add_(sq_sum.float())
-            self.logit_buf[1].copy_(torch.maximum(self.logit_buf[1], abs_max.float()))
-            self.logit_buf[2].add_(entropy_per_token.sum().float())
-            n_elem = logits.numel()
-            n_tokens = n_elem // logits.shape[-1]
-            self.logit_elem_count.add_(float(n_elem))
-            self.logit_token_count.add_(float(n_tokens))
+    @property
+    def residual_sq_sum(self) -> torch.Tensor:
+        """`[n_blocks, max_rep]` sum of per-application `mean(x*x)`."""
+        return self._stacked_res()[:, 0, :]
+
+    @property
+    def residual_count(self) -> torch.Tensor:
+        """`[n_blocks, max_rep]` application counts in this window."""
+        return self._stacked_res()[:, 1, :]
 
     # --------------------------------------------------------- step boundary
     def record_step_boundary(self) -> None:
@@ -323,7 +325,14 @@ class LayerwiseDebugTracker:
         return global_step > 0 and (global_step % self.log_every == 0)
 
     def flush(self, global_step: int) -> Optional[dict]:
-        """Single host-sync point.  Returns payload dict on rank 0, else None."""
+        """Single host-sync point.  Returns payload dict on rank 0, else None.
+
+        Key semantics are unchanged from the forward-hook era, including
+        ``debug/logits/norm``: it is the raw sqrt of the squares summed over the
+        whole window (not per token and not per step), so it scales with the
+        window length and the batch, while ``debug/logits/entropy`` and the
+        residual/final-norm keys are means.
+        """
         # Pack everything into two contiguous tensors: one SUM-reduced, one MAX-reduced.
         # Layout (SUM): [grad_norm_sq... weight_norm_sq... residual_sq... residual_cnt...
         #                logit_sq_sum, logit_entropy_sum, logit_elem_count, logit_token_count]
@@ -335,22 +344,24 @@ class LayerwiseDebugTracker:
 
         n_p = len(self._params)
         n_b = len(self.block_names)
+        n_br = n_b * self.max_rep
+        res = self._stacked_res()  # [n_b, 2, max_rep]
         sum_buf = torch.cat(
             [
                 self.grad_norm_buf,
                 self.weight_norm_buf,
-                self.residual_sq_sum,
-                self.residual_count,
-                self.logit_buf[0:1],
-                self.logit_buf[2:3],
-                self.logit_elem_count,
-                self.logit_token_count,
-                self.final_norm_buf[0:1],   # sq_sum
-                self.final_norm_buf[1:2],   # sum
-                self.final_norm_elem_count,
+                res[:, 0, :].reshape(-1),   # residual Σ mean(x*x)
+                res[:, 1, :].reshape(-1),   # residual application counts
+                self._logit_stats[0:1],     # sq_sum
+                self._logit_stats[4:5],     # entropy_sum
+                self._logit_stats[3:4],     # elem count
+                self._logit_stats[5:6],     # token count
+                self._final_stats[0:1],     # sq_sum
+                self._final_stats[1:2],     # sum
+                self._final_stats[3:4],     # elem count
             ]
         )
-        max_buf = torch.stack([self.logit_buf[1], self.final_norm_buf[2]])
+        max_buf = torch.stack([self._logit_stats[2], self._final_stats[2]])
 
         # Boundary between "summed-squared-norm" slots and "averaged-stat" slots.
         gw_end = 2 * n_p
@@ -369,8 +380,8 @@ class LayerwiseDebugTracker:
         off = 0
         grad_sq_cpu = sum_cpu[off : off + n_p]; off += n_p
         weight_sq_cpu = sum_cpu[off : off + n_p]; off += n_p
-        residual_sq_cpu = sum_cpu[off : off + n_b]; off += n_b
-        residual_cnt_cpu = sum_cpu[off : off + n_b]; off += n_b
+        residual_sq_cpu = sum_cpu[off : off + n_br].view(n_b, self.max_rep); off += n_br
+        residual_cnt_cpu = sum_cpu[off : off + n_br].view(n_b, self.max_rep); off += n_br
         logit_sq_sum = float(sum_cpu[off]); off += 1
         logit_entropy_sum = float(sum_cpu[off]); off += 1
         logit_elem_count = float(sum_cpu[off]); off += 1
@@ -381,15 +392,14 @@ class LayerwiseDebugTracker:
         logit_abs_max = float(max_cpu[0])
         final_norm_abs_max = float(max_cpu[1])
 
-        # Reset GPU state in-place for next window.
+        # Reset GPU state in-place for next window. In place and never
+        # reassigned: the taps (and, after the first trace, the compiled graph)
+        # hold references to exactly these tensors.
         with torch.no_grad():
-            self.residual_sq_sum.zero_()
-            self.residual_count.zero_()
-            self.logit_buf.zero_()
-            self.logit_elem_count.zero_()
-            self.logit_token_count.zero_()
-            self.final_norm_buf.zero_()
-            self.final_norm_elem_count.zero_()
+            for buf in self._res_stats:
+                buf.zero_()
+            self._logit_stats.zero_()
+            self._final_stats.zero_()
         self._step_recorded = False
 
         if not self.is_main:
@@ -406,10 +416,11 @@ class LayerwiseDebugTracker:
         residual_sq_list = residual_sq_cpu.tolist()
         residual_cnt_list = residual_cnt_cpu.tolist()
         for i, name in enumerate(self.block_names):
-            cnt = residual_cnt_list[i]
-            if cnt > 0:
-                mean_sq = residual_sq_list[i] / cnt
-                payload[f"debug/residual_rms/block_{i:03d}"] = mean_sq ** 0.5
+            for r in range(self.max_rep):
+                cnt = residual_cnt_list[i][r]
+                if cnt > 0:
+                    mean_sq = residual_sq_list[i][r] / cnt
+                    payload[f"debug/residual_rms/block_{i:03d}_rep{r}"] = mean_sq ** 0.5
 
         if logit_elem_count > 0:
             payload["debug/logits/norm"] = (logit_sq_sum) ** 0.5
@@ -433,12 +444,13 @@ class LayerwiseDebugTracker:
 
     # ---------------------------------------------------------------- close
     def close(self) -> None:
-        for h in self._hook_handles:
+        # Drops the accumulators, so every tap is a plain identity again.
+        for tap in self._taps:
             try:
-                h.remove()
+                tap.disable_stats()
             except Exception:
                 pass
-        self._hook_handles.clear()
+        self._taps.clear()
         if self._jsonl_fh is not None:
             try:
                 self._jsonl_fh.close()

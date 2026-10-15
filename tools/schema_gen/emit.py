@@ -17,11 +17,18 @@ _DRAFT = "https://json-schema.org/draft/2020-12/schema"
 
 
 # Annotation keys an overlay entry (or an x-extra-fields declaration) may carry.
-_ANNOTATION_KEYS = ("enum", "minimum", "maximum", "backend", "advanced", "group")
+_ANNOTATION_KEYS = ("type", "items", "enum", "minimum", "maximum", "backend", "advanced", "group")
 
 
 def _apply(frag: dict, key: str, description: str, ov: dict, vis: dict) -> dict:
     """Fold one annotation dict, the description, and the visibility gate onto a fragment."""
+    # An overlay `type` replaces the one inferred from the default literal. It is
+    # how a field whose template default is `null` says what else it accepts,
+    # e.g. `type: [integer, "null"]`.
+    if "type" in ov:
+        frag["type"] = ov["type"]
+    if "items" in ov:
+        frag["items"] = ov["items"]
     if "enum" in ov:
         frag["enum"] = ov["enum"]
     for bound in ("minimum", "maximum"):
@@ -54,7 +61,16 @@ def _field_schema(section: str, key: str, raw_default: str, description: str,
     frag = _types.infer(raw_default)
     if group:
         frag["x-nanoplm-group"] = group
-    return _fold(frag, section, key, description, o, vis)
+    frag = _fold(frag, section, key, description, o, vis)
+    # A `null` default says nothing about the field's real type, and `"type":
+    # "null"` would tell the docs the field can only ever be null.
+    types = frag["type"] if isinstance(frag["type"], list) else [frag["type"]]
+    if types == ["null"] or (frag["default"] is None and "null" not in types):
+        raise ValueError(
+            f"{section}.{key} defaults to null: give it a nullable type in "
+            f'overlay.yaml, e.g. `type: [integer, "null"]` (got {frag["type"]!r})'
+        )
+    return frag
 
 
 def _extra_field_schema(section: str, key: str, spec: dict, o: dict, vis: dict) -> dict:

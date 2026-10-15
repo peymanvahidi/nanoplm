@@ -330,23 +330,117 @@ def _split_batch(
     return _split_standard_batch(batch, n_splits=n_splits)
 
 
-def _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps: int) -> None:
-    """Increase Dynamo cache room when warmup introduces a few extra static shapes."""
-    if int(global_batch_warmup_steps) <= 0:
+def _count_layer_variants(layers) -> int:
+    """Number of structurally distinct encoder layers, i.e. how many Dynamo
+    cache entries one input signature of the shared ``ModernBertEncoderLayer``
+    frame needs. Layer 0's Identity attn_norm, MoE vs dense MLPs and full vs
+    sliding attention each split the guards."""
+    return len({
+        (
+            getattr(layer, "attention_type", None),
+            tuple((name, type(m).__name__) for name, m in layer.named_modules()),
+            tuple((name, tuple(p.shape)) for name, p in layer.named_parameters()),
+        )
+        for layer in layers
+    })
+
+
+def _dynamo_recompile_limit(
+    model_config,
+    *,
+    layers,
+    loopie_jitter: int,
+    global_batch_warmup_steps: int,
+    n_input_shapes: int,
+) -> int:
+    """Dynamo recompile_limit this run needs so no compiled frame falls back to eager.
+
+    Batch-size warmup keeps the 16 it always had. Its stages do not share a
+    cache (each stage boundary calls ``torch.compiler.reset()``), but split
+    micro-batches carry unbucketed ``max_seqlen`` values.
+
+    Loopie jitter passes R as a Python int (``_loop_count_fwd_kwargs``), and
+    every frame that sees it specializes once per value in the
+    {R0 - j, ..., R0 + j} support. Under FSDP2 the dynamo-disabled per-layer
+    hooks split the model at each encoder layer, so
+    ``ModernBertEncoderLayer.forward`` becomes one frame shared by every layer
+    and needs V x S x N entries: V structurally distinct layers, S input shapes
+    (the ``max_seqlen`` buckets on the static packed path) and N = 2j + 1
+    values of R. Without FSDP the whole model is one frame and needs S x N,
+    which the same bound covers. ``loopie_bptt`` adds nothing: its ``no_grad``
+    applications are traced inside the unrolled graph. The tensor-R fallback
+    (``_forward_repeats``, off the training path) needs V x S x 2 entries on
+    ``_forward_once``, which this bound covers for any j >= 1 (MoE layers add
+    a None/tensor ``last_aux_loss`` split there).
+    """
+    limit = 16 if int(global_batch_warmup_steps) > 0 else 8
+    if getattr(model_config, "use_loopie", False) and int(loopie_jitter) > 0:
+        n_r = 2 * int(loopie_jitter) + 1
+        limit = max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * n_r)
+    return limit
+
+
+def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
+    """Raise Dynamo's recompile_limit to ``needed``; never lower a higher setting."""
+    try:
+        import torch._dynamo.config as dynamo_config
+
+        current_limit = int(getattr(dynamo_config, "recompile_limit", 8))
+        if current_limit < needed:
+            dynamo_config.recompile_limit = needed
+            logger.info(
+                "torch._dynamo.config.recompile_limit raised from %d to %d "
+                "(batch-size warmup / loopie jitter shapes).",
+                current_limit,
+                dynamo_config.recompile_limit,
+            )
+    except Exception:
+        logger.exception("Failed to raise Dynamo recompile_limit; continuing.")
+
+
+def _layer_mode_activation_checkpointing(model_config) -> bool:
+    """True when the encoder layers checkpoint themselves (FSDP(AC(layer)))."""
+    return bool(getattr(model_config, "activation_checkpointing", False)) and (
+        str(getattr(model_config, "activation_checkpointing_mode", "layer"))
+        .strip()
+        .lower()
+        == "layer"
+    )
+
+
+def _maybe_allow_side_effects_under_checkpoint(model_config) -> None:
+    """Let the layer-mode checkpoint HOP tolerate the MoE telemetry rebinds.
+
+    ``ModernBertEncoderLayer.forward`` runs its whole unrolled loop through
+    ``torch.utils.checkpoint`` in layer mode, so ``MoELayer.forward`` executes
+    inside the HOP — and it rebinds ``last_expert_counts`` / ``last_aux_loss`` /
+    ``last_z_loss`` / ``last_aux_count`` on itself. Dynamo rejects that by
+    default ("HOP: Unsafe side effect: Mutating a variable from outside the
+    scope of this HOP"), cannot resume from it, and drops the whole layer to
+    eager, which brings back the 77 GB one-shot recompute this ordering fixes
+    (experiments/loop-imp-v4/NOTES.md, Step 3 / R1).
+
+    Skipping the *backward* replay of those side effects is also the semantics
+    we want: the aux loss is consumed in the same forward, the expert counts are
+    read after the backward, so replaying them during recompute would double
+    every MoE bias nudge.
+    """
+    if not _layer_mode_activation_checkpointing(model_config):
         return
     try:
         import torch._dynamo.config as dynamo_config
 
-        current_limit = int(getattr(dynamo_config, "cache_size_limit", 8))
-        if current_limit < 16:
-            dynamo_config.cache_size_limit = 16
-            logger.info(
-                "torch._dynamo.config.cache_size_limit raised from %d to %d for batch-size warmup.",
-                current_limit,
-                dynamo_config.cache_size_limit,
-            )
+        dynamo_config.skip_fwd_side_effects_in_bwd_under_checkpoint = True
+        logger.info(
+            "torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint=True "
+            "for layer-mode activation checkpointing (keeps MoE telemetry rebinds "
+            "from breaking the checkpoint HOP)."
+        )
     except Exception:
-        logger.exception("Failed to raise Dynamo cache_size_limit for batch-size warmup; continuing.")
+        logger.exception(
+            "Failed to set skip_fwd_side_effects_in_bwd_under_checkpoint; "
+            "layer-mode activation checkpointing may fall back to eager."
+        )
 
 
 def _build_compiled_training_model(
@@ -952,6 +1046,15 @@ def _make_pure_profiler(
     - Otherwise: uses PyTorch profiler with a schedule and exports a Chrome trace
       to output_dir/profiler_traces/chrome_trace.json (view in chrome://tracing).
 
+    The PyTorch-profiler window defaults to ``record_shapes=False`` and at most two
+    active steps. Shape recording adds per-op bookkeeping on the dispatch path, so on
+    a CPU-dispatch-bound step it inflates the very wall-clock the trace is read for;
+    turn it back on with ``profiler_record_shapes: true`` when kernels have to be
+    attributed to tensor shapes, and read such a trace for structure only. Two active
+    steps are enough for a steady-state picture and keep the trace small enough to
+    load, so a wide profiler_start_step..profiler_end_step range no longer blows the
+    window up.
+
     Returns:
         (context_manager, step_callback): use as ``with context: ...; step_callback(global_step)``
         after each optimizer step.
@@ -1007,7 +1110,8 @@ def _make_pure_profiler(
         activities.append(torch.profiler.ProfilerActivity.CUDA)
     wait = max(0, start_step)
     warmup = 1
-    active = max(1, end_step - start_step - 1)
+    active = max(1, min(2, end_step - start_step - 1))
+    record_shapes = bool(getattr(pretrain_config, "profiler_record_shapes", False))
 
     def on_trace_ready(prof: torch.profiler.profile) -> None:
         prof.export_chrome_trace(str(trace_path))
@@ -1018,34 +1122,234 @@ def _make_pure_profiler(
         # Single profiling window; avoid repeating the cycle throughout training.
         schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
         on_trace_ready=on_trace_ready,
-        record_shapes=True,
+        record_shapes=record_shapes,
     )
     logger.info(
-        "Profiling enabled (PyTorch): trace will be written to %s (steps %s..%s). "
-        "Open in chrome://tracing",
+        "Profiling enabled (PyTorch): trace will be written to %s (steps %s..%s, "
+        "active=%s, record_shapes=%s). Open in chrome://tracing",
         trace_path,
         start_step,
         end_step,
+        active,
+        record_shapes,
     )
     return prof, lambda _: prof.step()
+
+
+def _enable_memory_snapshot_provenance(pretrain_config: PretrainingConfig, inductor_config) -> None:
+    """Turn on Inductor provenance tracking for ``debug_memory_snapshot``.
+
+    ``_dump_snapshot(augment_with_fx_traces=True)`` labels allocations made inside
+    compiled regions with the FX node that produced them, which is the only way to
+    tell a saved activation from a workspace in the memory_viz view. Inductor emits
+    that mapping only when provenance tracking was enabled *before* the graph was
+    compiled, hence this lives with the other pre-compile Inductor knobs.
+    """
+    if not bool(getattr(pretrain_config, "debug_memory_snapshot", False)):
+        return
+    try:
+        inductor_config.trace.provenance_tracking_level = 1
+    except Exception:
+        logger.exception(
+            "Failed to set inductor trace.provenance_tracking_level; memory snapshots "
+            "will lack FX provenance."
+        )
+
+
+def _is_oom_exception(exc_type, exc_val) -> bool:
+    """True when this exception is (or wraps) a CUDA out-of-memory failure.
+
+    ``torch.OutOfMemoryError`` covers the allocator's own raise, but the same
+    condition also arrives as a plain ``RuntimeError("CUDA error: out of memory")``
+    from a kernel launch or NCCL, and as ``torch._dynamo.exc.BackendCompilerFailed``
+    when Inductor OOMs while compiling. Those must still produce a snapshot, so fall
+    back to the message, and look one link down the ``__cause__``/``__context__``
+    chain for the wrapped cases.
+    """
+    if exc_type is None:
+        return False
+    try:
+        if issubclass(exc_type, torch.OutOfMemoryError):
+            return True
+    except TypeError:
+        pass
+    for candidate in (
+        exc_val,
+        getattr(exc_val, "__cause__", None),
+        getattr(exc_val, "__context__", None),
+    ):
+        if candidate is None:
+            continue
+        try:
+            if "out of memory" in str(candidate).lower():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+class _MemorySnapshotRecorder:
+    """CUDA allocator-history recorder for peak/OOM attribution.
+
+    Every rank records. The scheduled (``debug_memory_snapshot_step``) dump is taken
+    on one rank per node, because at that point every rank holds the same story and a
+    16-rank job would write 16 copies of it. An OOM is different: it is rank-local and
+    the rank that dies is rarely local rank 0, so *any* rank that catches one dumps —
+    the ``rank{RANK}`` in the filename keeps those apart. Used as a context manager
+    around the training loop; the error propagates unchanged after the dump, so the
+    failure mode of the run is exactly what it was without the flag.
+
+    Load the pickles at https://docs.pytorch.org/memory_viz.
+    """
+
+    def __init__(
+        self,
+        snapshot_dir: Path,
+        *,
+        rank: int,
+        max_entries: int,
+        dump_step: int,
+        is_dumper: bool,
+    ) -> None:
+        self._dir = snapshot_dir
+        self._rank = rank
+        self._max_entries = max_entries
+        self._dump_step = dump_step
+        self._is_dumper = is_dumper
+        self._recording = False
+
+    def __enter__(self) -> "_MemorySnapshotRecorder":
+        kwargs = dict(
+            max_entries=self._max_entries,
+            context="alloc",
+            stacks="python",
+            compile_context=True,
+        )
+        try:
+            torch.cuda.memory._record_memory_history(**kwargs)
+        except TypeError:
+            # compile_context landed in torch 2.9; older builds reject the kwarg.
+            kwargs.pop("compile_context", None)
+            try:
+                torch.cuda.memory._record_memory_history(**kwargs)
+            except Exception:
+                logger.exception("Failed to start CUDA memory history recording; continuing.")
+                return self
+        except Exception:
+            logger.exception("Failed to start CUDA memory history recording; continuing.")
+            return self
+        self._recording = True
+        logger.info(
+            "debug_memory_snapshot: recording CUDA allocator history (max_entries=%d); "
+            "dumps go to %s (dump_step=%d, scheduled dump on this rank=%s; an OOM "
+            "dumps on any rank)",
+            self._max_entries,
+            self._dir,
+            self._dump_step,
+            self._is_dumper,
+        )
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if _is_oom_exception(exc_type, exc):
+            # Ungated by _is_dumper on purpose: whichever rank ran out of memory is
+            # the only one whose history explains the failure.
+            self.dump("oom", any_rank=True)
+        try:
+            # Stop capturing a Python stack per allocation; the final eval,
+            # checkpoint write and teardown do not belong in the history, and on a
+            # clean exit there is nobody left to read it.
+            torch.cuda.memory._record_memory_history(enabled=None)
+        except Exception:
+            logger.exception("Failed to stop CUDA memory history recording; continuing.")
+        # Never swallow: the OOM must keep propagating.
+        return False
+
+    def maybe_dump_step(self, global_step: int) -> None:
+        if self._dump_step >= 0 and global_step == self._dump_step:
+            self.dump(f"step{global_step}")
+
+    def dump(self, tag: str, *, any_rank: bool = False) -> None:
+        if not self._recording or not (self._is_dumper or any_rank):
+            return
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            path = self._dir / f"rank{self._rank}_{tag}.pickle"
+            try:
+                torch.cuda.memory._dump_snapshot(str(path), augment_with_fx_traces=True)
+            except TypeError:
+                # augment_with_fx_traces landed in torch 2.9.
+                torch.cuda.memory._dump_snapshot(str(path))
+            logger.info("debug_memory_snapshot: wrote %s", path)
+        except Exception:
+            logger.exception("Failed to dump CUDA memory snapshot (tag=%s); continuing.", tag)
+
+
+def _make_memory_snapshot_recorder(
+    pretrain_config: PretrainingConfig,
+    output_dir: str,
+    local_rank: int,
+    device: torch.device,
+    is_main: bool = True,
+):
+    """Build the allocator-history context + per-step dump callback.
+
+    Mirrors :func:`_make_pure_profiler`: disabled (the default) costs a
+    ``nullcontext`` and a no-op callback, so the training loop is unchanged.
+    """
+    enabled = bool(getattr(pretrain_config, "debug_memory_snapshot", False))
+    dump_step = int(getattr(pretrain_config, "debug_memory_snapshot_step", -1))
+    if not enabled:
+        if dump_step >= 0 and is_main:
+            logger.warning(
+                "debug_memory_snapshot_step=%d is set but debug_memory_snapshot is false: "
+                "no allocator history is recorded and no snapshot will be written.",
+                dump_step,
+            )
+        return nullcontext(), lambda _: None
+    if device.type != "cuda":
+        if is_main:
+            logger.warning(
+                "debug_memory_snapshot=True on a %s device: the allocator history is a "
+                "CUDA-only facility, so nothing will be recorded or written.",
+                device.type,
+            )
+        return nullcontext(), lambda _: None
+
+    rank = int(os.environ.get("RANK", 0))
+    recorder = _MemorySnapshotRecorder(
+        Path(output_dir) / "memory_snapshots",
+        rank=rank,
+        max_entries=int(getattr(pretrain_config, "debug_memory_snapshot_max_entries", 100000)),
+        dump_step=dump_step,
+        # All ranks record; one rank per node takes the scheduled dump. An OOM
+        # dump ignores this and is taken by whichever rank hit it.
+        is_dumper=local_rank == 0,
+    )
+    return recorder, recorder.maybe_dump_step
 
 
 def _loop_count_fwd_kwargs(model_config, sampled_r: int, recycling_bptt: int,
                            device: torch.device) -> dict:
     """Forward kwargs carrying this micro-step's loop count to the model.
 
-    The count is a 0-d tensor, never a Python int: at the Dynamo-disable
-    boundary (``_drive_recurrence`` for Huginn, ``_forward_repeats`` for
-    Loopie) an int installs an equality guard, so the compiled segment that
-    calls the driver recompiles for every distinct r and thrashes the cache.
+    Loopie gets a Python int. ``ModernBertEncoderLayer.forward`` unrolls it at
+    trace time, so Dynamo specializes one whole-model graph per distinct R
+    (three for R ~ U{1,2,3}, compiled once each) and the R=2 graph is the
+    fixed-depth 20x2 graph. Under FSDP2 the specialization lands on the
+    per-layer frame instead; ``_dynamo_recompile_limit`` sizes the cache for
+    both. The earlier 0-d CPU tensor avoided that
+    specialization by routing through the Dynamo-disabled ``_forward_repeats``,
+    which cost a graph break at every stored layer on every step.
 
-    Loopie's tensor stays on CPU because its driver reads ``.item()`` once per
-    stored layer per forward — on a device tensor that is L host syncs a step.
-    Huginn reads it once per forward and keeps the device tensor. Truncated
-    BPTT is Huginn-only; Loopie backprops through every repeat.
+    Huginn keeps the device tensor: its lognormal-Poisson R support is wide
+    enough that per-value specialization would thrash the cache, and
+    ``_drive_recurrence`` reads it once per forward. Huginn also gets its
+    truncation depth here. Loopie gets no bptt kwarg: each layer reads
+    ``loopie_bptt`` from the config at construction.
     """
     if getattr(model_config, "use_loopie", False):
-        return {"loop_count": torch.tensor(sampled_r, dtype=torch.int64)}
+        return {"loop_count": int(sampled_r)}
     return {
         "loop_count": torch.tensor(sampled_r, dtype=torch.int64, device=device),
         "recycling_bptt": torch.tensor(recycling_bptt, dtype=torch.int64, device=device),
@@ -1246,11 +1550,11 @@ def _estimate_model_flops_per_token(config, seq_len: int, bptt: int | None = Non
     """Training FLOPs/token at the TARGET recycling loop count (startup estimate)."""
     components = _recycling_flops_components(config, seq_len)
     if getattr(config, "use_loopie", False):
-        # Loopie has no prelude/coda (P=C=0), so the recycling decomposition
-        # already describes it exactly: forward = R x stack, and bptt=None means
-        # full backprop through every repeat (2 x forward).
+        # Loopie has no prelude or coda, so P=C=0 and the decomposition is exact.
         return _recycling_flops_per_token(
-            components, max(1, int(getattr(config, "loopie_loop_count", 2))), bptt=None
+            components,
+            max(1, int(getattr(config, "loopie_loop_count", 2))),
+            bptt=getattr(config, "loopie_bptt", None),
         )
     loop_count = max(1, int(getattr(config, "recycling_loop_count", 1)))
     return _recycling_flops_per_token(components, loop_count, bptt=bptt)
@@ -2384,6 +2688,19 @@ def run_pure_pretraining(
             fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
             optimizer_dist = fsdp_mesh
         fsdp_sublayer = getattr(pretrain_config, "fsdp_shard_granularity", "layer") == "sublayer"
+        if fsdp_sublayer and _layer_mode_activation_checkpointing(model.model_config):
+            # Sublayer units put attn/mlp inside the layer's own checkpoint body,
+            # and their dynamo-disabled FSDP hooks re-create the un-resumable
+            # checkpoint-HOP break that layer-mode AC exists to avoid (the layer
+            # would fall back to eager and recompute ~15 layers at once).
+            if is_main:
+                logger.warning(
+                    "fsdp_shard_granularity='sublayer' is incompatible with "
+                    "activation_checkpointing_mode='layer' (the attn/mlp FSDP "
+                    "hooks would sit inside the checkpoint HOP and break it); "
+                    "forcing per-layer sharding for this run."
+                )
+            fsdp_sublayer = False
         fsdp_reshard_after_forward = bool(getattr(pretrain_config, "fsdp_reshard_after_forward", False))
                 
         _encoder = base_model.model
@@ -2424,7 +2741,32 @@ def run_pure_pretraining(
         if getattr(pretrain_config, "use_compile_max_autotune", False)
         else None
     )
-    _maybe_expand_dynamo_cache_for_batch_warmup(global_batch_warmup_steps)
+    # An explicit compile_mode wins over the use_compile_max_autotune shorthand,
+    # so "reduce-overhead" (CUDA graphs) is reachable without a second flag.
+    _explicit_compile_mode = getattr(pretrain_config, "compile_mode", None)
+    if _explicit_compile_mode:
+        compile_mode = str(_explicit_compile_mode)
+    if is_main:
+        logger.info(
+            "torch.compile mode: %s (compile_mode=%s, use_compile_max_autotune=%s)",
+            compile_mode if compile_mode is not None else "<inductor default>",
+            _explicit_compile_mode,
+            bool(getattr(pretrain_config, "use_compile_max_autotune", False)),
+        )
+    _maybe_raise_dynamo_recompile_limit(
+        _dynamo_recompile_limit(
+            _model_config,
+            layers=base_model.model.layers,
+            loopie_jitter=int(getattr(pretrain_config, "loopie_loop_count_jitter", 0)),
+            global_batch_warmup_steps=global_batch_warmup_steps,
+            n_input_shapes=(
+                1 if compile_dynamic
+                else len(build_power_of_two_buckets(int(manifest.max_seq_len), min_power_of_two=32))
+            ),
+        )
+    )
+    # Must precede every torch.compile call below.
+    _maybe_allow_side_effects_under_checkpoint(model.model_config)
 
     # ---- TorchInductor knobs (must be set before torch.compile) ----
     if device.type == "cuda":
@@ -2461,6 +2803,7 @@ def run_pure_pretraining(
                 os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_PRUNE_CHOICES_BASED_ON_SHARED_MEM"] = "1"
                 inductor_config.max_autotune_gemm_backends = "ATEN"
                 inductor_config.max_autotune_prune_choices_based_on_shared_mem = True
+            _enable_memory_snapshot_provenance(pretrain_config, inductor_config)
             logger.info(
                 "TorchInductor: triton.persistent_reductions=%s (env TORCHINDUCTOR_PERSISTENT_REDUCTIONS=%s); "
                 "triton.mix_order_reduction=%s (env TORCHINDUCTOR_MIX_ORDER_REDUCTION=%s); "
@@ -2850,9 +3193,7 @@ def run_pure_pretraining(
     # estimator must know K or it overcounts backward and inflates MFU for r > K.
     _bptt = max(1, int(getattr(pretrain_config, "recycling_bptt", 1)))
     if getattr(_cfg, "use_loopie", False):
-        # Loopie backprops through every repeat; bptt=None keeps the estimator
-        # from truncating the backward cost.
-        _bptt = None
+        _bptt = getattr(_cfg, "loopie_bptt", None)
     _flops_per_token = _estimate_model_flops_per_token(_cfg, manifest.max_seq_len, bptt=_bptt)
     # Components for per-step FLOPs at the *actual* loop count (curriculum-accurate
     # MFU). _flops_per_token above is the nominal estimate at the target loop count.
@@ -3015,10 +3356,10 @@ def run_pure_pretraining(
     if debug_layerwise_enabled:
         if is_main:
             logger.warning(
-                "debug_layerwise_metrics=True: forward hooks will be installed on "
-                "every transformer block and the lm_head. If torch.compile is "
-                "enabled, expect graph breaks at those boundaries (5-20%% throughput "
-                "regression typical)."
+                "debug_layerwise_metrics=True: activation stats are accumulated "
+                "in-graph by the model's taps (no forward hooks, no graph "
+                "breaks); expect a few extra reductions per block and one host "
+                "sync per debug_layerwise_log_every window."
             )
         debug_tracker = LayerwiseDebugTracker(
             model=orig_model,
@@ -3027,11 +3368,19 @@ def run_pure_pretraining(
             output_dir=output_dir,
             is_main=is_main,
             distributed=bool(distributed and dist.is_initialized()),
+            max_rep=(
+                int(_model_cfg.loopie_loop_count) + _loopie_jitter
+                if _model_cfg.use_loopie
+                else 1
+            ),
         )
     epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
     profiler_ctx, profiler_step_cb = _make_pure_profiler(pretrain_config, output_dir, is_main)
+    memory_snapshot_ctx, memory_snapshot_step_cb = _make_memory_snapshot_recorder(
+        pretrain_config, output_dir, local_rank, device, is_main
+    )
     if global_batch_warmup_steps > 0 and is_main:
         logger.info(
             "Batch-size warmup active: steps=%d, initial_grad_accum=%d, initial_micro_batch=%d, split_divisor=%d",
@@ -3086,6 +3435,11 @@ def run_pure_pretraining(
     epoch = start_epoch
     wallclock_stop = False
     wallclock_stop_ckpt = ""
+    # Where the next pass would resume, refreshed at every step boundary so the
+    # post-loop terminal save can record it too. Empty until the first step
+    # completes, so a zero-step run falls back to the old position-less save
+    # rather than reading a loop variable that was never bound.
+    latest_data_pos: dict = {}
 
     # Single entry point for every checkpoint write. The common kwargs are
     # captured by reference (resolved at call time); per-call-site differences
@@ -3106,7 +3460,7 @@ def run_pure_pretraining(
         )
         run_progress.last_checkpoint = _checkpoint_dir_name(global_step, phase)
 
-    with profiler_ctx:
+    with profiler_ctx, memory_snapshot_ctx:
         while global_step < total_steps:
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
                 epoch_setter.set_epoch(epoch)
@@ -3253,6 +3607,14 @@ def run_pure_pretraining(
                     sync = at_accum_boundary
                     if distributed and _is_fsdp(distributed_mode):
                         model.set_requires_gradient_sync(sync)
+                        # Gradient accumulation: keep the unsharded parameters
+                        # resident across micro-steps so the next forward skips
+                        # the all-gather (bf16 copy of the full model per GPU);
+                        # reshard only after the final backward, ahead of the
+                        # optimizer step. With grad_accum 1 this is a no-op.
+                        # fsdp_reshard_after_forward opts out: that run chose
+                        # to never hold the full unsharded model at once.
+                        model.set_reshard_after_backward(sync or fsdp_reshard_after_forward)
 
                     if "num_valid_tokens" in batch:
                         microstep_tokens = batch["num_valid_tokens"]
@@ -3512,6 +3874,7 @@ def run_pure_pretraining(
                     global_step += 1
                     tokens_seen += int(achieved_global_batch_tokens)
                     profiler_step_cb(global_step)
+                    memory_snapshot_step_cb(global_step)
 
                     if _prores_model is not None:
                         _prores_model.update_prores_alphas(global_step)
@@ -3816,6 +4179,26 @@ def run_pure_pretraining(
                                         logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
+                    # Computed every step, not only when saving, because the
+                    # terminal save happens after both loops have exited and has
+                    # no other way to know where the data stream stood. When the
+                    # pass ends exactly on the terminal step this records
+                    # epoch_data_step == synced_len, which the resume path reads
+                    # as "start the next pass from the top" -- keep that guard.
+                    next_data_step = micro_step
+                    next_sub_batch_step = sub_batch_idx + 1
+                    next_batch_split_divisor = batch_split_divisor
+                    if next_sub_batch_step >= total_sub_batches:
+                        next_data_step = micro_step + 1
+                        next_sub_batch_step = 0
+                        next_batch_split_divisor = mbs_divisor
+                    _pos = dict(
+                        epoch_data_step=next_data_step,
+                        epoch_sub_batch_step=next_sub_batch_step,
+                        batch_split_divisor=next_batch_split_divisor,
+                    )
+                    latest_data_pos = _pos
+
                     # In-loop saves: the forced wsd stable-end boundary, the
                     # wall-clock deadline, and the periodic save_steps cadence.
                     # Skip the periodic save at the terminal step -- the post-loop
@@ -3823,18 +4206,6 @@ def run_pure_pretraining(
                     # every schedule.
                     if at_wsd_stable_end or hit_wallclock or (do_periodic and not at_terminal):
                         _raise_on_nonfinite_params(f"before checkpoint at step {global_step}")
-                        next_data_step = micro_step
-                        next_sub_batch_step = sub_batch_idx + 1
-                        next_batch_split_divisor = batch_split_divisor
-                        if next_sub_batch_step >= total_sub_batches:
-                            next_data_step = micro_step + 1
-                            next_sub_batch_step = 0
-                            next_batch_split_divisor = mbs_divisor
-                        _pos = dict(
-                            epoch_data_step=next_data_step,
-                            epoch_sub_batch_step=next_sub_batch_step,
-                            batch_split_divisor=next_batch_split_divisor,
-                        )
                         _phase = "stable-end" if at_wsd_stable_end else "periodic"
                         _save(_phase, **_pos)
                         # When the wsd stable-end coincides with the periodic
@@ -3957,7 +4328,10 @@ def run_pure_pretraining(
             global_step, total_steps, _terminal_phase, wallclock_stop_ckpt,
         )
     else:
-        _save(_terminal_phase)
+        # Pass the data position through: without it a `resume.mode: continue`
+        # from this checkpoint replays the current pass from the top, which
+        # silently duplicates data the run has already trained on.
+        _save(_terminal_phase, **latest_data_pos)
 
     if debug_tracker is not None:
         debug_tracker.close()

@@ -4,7 +4,9 @@
 # Two namespaces live in this file:
 #
 #  1. Flat field annotations, keyed "<section>.<field>". Any of:
-#     enum, minimum, maximum, backend, advanced, auto_computed, type.
+#     enum, minimum, maximum, backend, advanced, auto_computed, type, items.
+#     A field whose template default is `null` MUST set `type` to a nullable
+#     union (e.g. `type: [integer, "null"]`); emit.py refuses to guess one.
 #     Every enum below is transcribed from the authoritative validator: the
 #     `click.Choice(...)` in src/nanoplm/cli/*.py and/or the dataclass
 #     `__post_init__` check. Never from prose.
@@ -63,7 +65,7 @@ pretraining.use_compile_max_autotune: { backend: [pure_torch], advanced: true }
 pretraining.compile_triton_persistent_reductions: { backend: [pure_torch], advanced: true }
 pretraining.compile_triton_mix_order_reduction: { backend: [pure_torch], advanced: true }
 
-# Layerwise debug hooks exist only on the pure-torch path.
+# Layerwise debug metrics (in-graph taps) exist only on the pure-torch path.
 pretraining.debug_layerwise_metrics: { backend: [pure_torch], advanced: true }
 pretraining.debug_layerwise_log_every: { backend: [pure_torch], advanced: true }
 
@@ -84,7 +86,11 @@ pretraining.recycling_loop_count_curriculum:
   backend: [pure_torch]
   advanced: true
 pretraining.recycling_loop_count_curriculum_steps: { backend: [pure_torch], advanced: true }
-pretraining.recycling_pretraining_eval_loop_counts: { backend: [pure_torch], advanced: true }
+pretraining.recycling_pretraining_eval_loop_counts:
+  type: [array, "null"]
+  items: { type: integer }
+  backend: [pure_torch]
+  advanced: true
 
 # Loopie stochastic depth: only meaningful with model.use_loopie, pure-torch only.
 pretraining.loopie_loop_count_jitter: { backend: [pure_torch], advanced: true, minimum: 0 }
@@ -146,8 +152,16 @@ model.recycling_loop_count: { backend: [pure_torch], advanced: true }
 model.use_huginn_looping: { backend: [pure_torch], advanced: true }
 model.use_loopie: { backend: [pure_torch], advanced: true }
 model.loopie_loop_count: { backend: [pure_torch], advanced: true }
+# ModernBertConfig.__post_init__: None (full BPTT) or int >= 1.
+model.loopie_bptt: { type: [integer, "null"], minimum: 1, backend: [pure_torch], advanced: true }
+
+# ----------------------------------------------------------------------- data
+data_dirs.local_fasta: { type: [string, "null"] }
 
 # --------------------------------------------------------------- distillation
+# Optional[int]; null = MHA. The flat key also matches the pretrain template's
+# model.num_kv_heads (default 8), which takes null the same way.
+model.num_kv_heads: { type: [integer, "null"], minimum: 1 }
 distillation.optimizer:
   enum: [adamw, muon, normuon]
 distillation.lr_scheduler:
@@ -318,6 +332,83 @@ x-extra-fields:
           Step-based override for decay_tokens (lr_schedule: wsd only): number
           of additional anneal optimizer steps after the stable phase. Set
           exactly one of decay_tokens or decay_steps, never both.
+      compile_mode:
+        type: string
+        default: null
+        advanced: true
+        backend: [pure_torch]
+        group: torch.compile knobs (pure_torch only)
+        enum: [default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs]
+        description: >-
+          Explicit mode passed to torch.compile for the training graph. Unset
+          (the default) compiles in Inductor's default mode, or in
+          max-autotune-no-cudagraphs when use_compile_max_autotune is true;
+          setting this field overrides that flag. reduce-overhead enables CUDA
+          graphs, which cuts per-step launch overhead on a CPU-dispatch-bound
+          step but costs extra VRAM for the graph pools and re-records when
+          input addresses or shapes change. max-autotune adds CUDA graphs on top
+          of kernel autotuning; max-autotune-no-cudagraphs autotunes only.
+          Shipped commented out by `nanoplm pretrain get-yaml` because the
+          default mode is the right choice for an ordinary run.
+      debug_memory_snapshot:
+        type: boolean
+        default: false
+        advanced: true
+        backend: [pure_torch]
+        group: Debug
+        description: >-
+          Record the CUDA caching allocator's history (allocation stacks and
+          compile context) for the whole run and write it as a pickle that
+          https://docs.pytorch.org/memory_viz renders, which is how a VRAM peak
+          gets attributed to saved activations, all-gather buffers, optimizer
+          state or fragmentation instead of guessed at. A pickle is written when
+          a torch.OutOfMemoryError escapes the training loop (the error then
+          propagates unchanged) and after debug_memory_snapshot_step. Every rank
+          records. The scheduled dump is written by LOCAL_RANK 0; an OOM dump is
+          written by whichever rank hit it, because an OOM is rank-local. Files
+          land in <run root>/memory_snapshots/rank<RANK>_<tag>.pickle, that is,
+          in the run directory the job creates under ckp_dir. Recording
+          captures a Python stack per allocation, so leave it off for throughput
+          measurements. Shipped commented out by `nanoplm pretrain get-yaml`.
+      debug_memory_snapshot_step:
+        type: integer
+        default: -1
+        advanced: true
+        backend: [pure_torch]
+        group: Debug
+        description: >-
+          Also dump a memory snapshot right after this optimizer step, giving a
+          reference picture of a step that fits to compare against the OOM dump.
+          -1 (the default) dumps only on an out-of-memory error. Ignored unless
+          debug_memory_snapshot is true. Shipped commented out by `nanoplm
+          pretrain get-yaml`.
+      debug_memory_snapshot_max_entries:
+        type: integer
+        default: 100000
+        minimum: 1
+        advanced: true
+        backend: [pure_torch]
+        group: Debug
+        description: >-
+          Number of allocator events kept in the memory-history ring buffer;
+          older events are dropped. Lower it if the pickles get unwieldy, raise
+          it if the OOM dump no longer reaches back to the allocations that
+          built the peak. Ignored unless debug_memory_snapshot is true. Shipped
+          commented out by `nanoplm pretrain get-yaml`.
+      profiler_record_shapes:
+        type: boolean
+        default: false
+        advanced: true
+        backend: [pure_torch]
+        group: Profiler
+        description: >-
+          Record per-operator input shapes in the PyTorch profiler trace. Shape
+          recording adds bookkeeping on the dispatch path, which is the path a
+          CPU-bound step is limited by, so a trace taken with it on overstates
+          step time and must not be read as a steady-state wall-clock reference.
+          Turn it on only to attribute kernels to tensor shapes. Ignored unless
+          profiler_enabled is true. Shipped commented out by `nanoplm pretrain
+          get-yaml`.
     resume:
       decay_steps:
         type: integer

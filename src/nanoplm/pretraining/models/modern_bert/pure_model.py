@@ -112,6 +112,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             recycling_use_takase_init=config.recycling_use_takase_init,
             use_loopie=config.use_loopie,
             loopie_loop_count=config.loopie_loop_count,
+            loopie_bptt=config.loopie_bptt,
         )
 
         super().__init__(mb_config)

@@ -1,4 +1,6 @@
 # tests/docs_schema/test_emit.py
+import pytest
+
 from tools.schema_gen import emit
 
 def test_pretrain_schema_shape():
@@ -105,3 +107,43 @@ def test_data_and_distill_surfaces_build():
         assert s["x-nanoplm-surface"] == surf and s["properties"]
     assert "x-nanoplm-compat" in emit.build_surface("distill")
     assert "x-nanoplm-compat" not in emit.build_surface("data")
+
+
+def _leaf_fields(schema: dict):
+    for key, frag in schema["properties"].items():
+        if frag.get("type") == "object" and "properties" in frag:
+            for sub, sub_frag in frag["properties"].items():
+                yield f"{key}.{sub}", sub_frag
+        else:
+            yield key, frag
+
+
+def test_no_field_is_typed_null_only():
+    # `"type": "null"` is what type inference yields for a `null` default, and it
+    # tells the docs the field can only ever be null.
+    for surface in ("data", "pretrain", "distill", "eval"):
+        for name, frag in _leaf_fields(emit.build_surface(surface)):
+            assert frag.get("type") not in ("null", ["null"]), f"{surface}:{name}"
+
+
+def test_null_default_fields_get_their_overlay_type():
+    pre = emit.build_surface("pretrain")["properties"]
+    bptt = pre["model"]["properties"]["loopie_bptt"]
+    assert bptt["type"] == ["integer", "null"]
+    assert bptt["default"] is None and bptt["minimum"] == 1
+    counts = pre["pretraining"]["properties"]["recycling_pretraining_eval_loop_counts"]
+    assert counts["type"] == ["array", "null"]
+    assert counts["items"] == {"type": "integer"}
+    fasta = emit.build_surface("data")["properties"]["data_dirs"]["properties"]["local_fasta"]
+    assert fasta["type"] == ["string", "null"]
+    kv = emit.build_surface("distill")["properties"]["model"]["properties"]["num_kv_heads"]
+    assert kv["type"] == ["integer", "null"] and kv["default"] is None
+
+
+def test_null_default_without_overlay_type_fails_loudly():
+    with pytest.raises(ValueError, match="sec.f defaults to null"):
+        emit._field_schema("sec", "f", "null", "", {}, {})
+    with pytest.raises(ValueError, match="nullable type"):
+        emit._field_schema("sec", "f", "null", "", {"sec.f": {"type": "integer"}}, {})
+    frag = emit._field_schema("sec", "f", "null", "", {"sec.f": {"type": ["integer", "null"]}}, {})
+    assert frag["type"] == ["integer", "null"] and frag["default"] is None
