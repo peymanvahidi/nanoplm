@@ -704,7 +704,20 @@ class MoELayer(nn.Module):
             counts.scatter_add_(0, expert_flat, count_ones)
         else:
             sorted_idx = expert_flat.argsort(stable=True)
-            counts = expert_flat.bincount(minlength=self.num_experts).to(torch.int64)
+            # zeros + scatter_add_, not `bincount`: bincount's output shape
+            # depends on its data, which Dynamo can only handle with a graph
+            # break, and under layer-mode activation checkpointing a break
+            # inside the checkpoint HOP is fatal — Dynamo cannot resume from it
+            # and the whole layer falls back to eager, which is what the
+            # FSDP(AC(layer)) reorder is there to prevent. Same histogram as the
+            # workspace-reuse branch above, with a static [num_experts] shape.
+            # The src is an expanded scalar, so the ones cost no memory (the
+            # reuse branch keeps a persistent `count_ones` buffer for the same
+            # reason).
+            _ones = torch.ones((), device=expert_flat.device, dtype=torch.int64)
+            counts = torch.zeros(
+                self.num_experts, device=expert_flat.device, dtype=torch.int64
+            ).scatter_add_(0, expert_flat, _ones.expand_as(expert_flat))
 
         # Store for external bias-update logic. The pure-torch loop accumulates
         # this every micro-step (pure_pipeline.py `_moe_count_accum`), so it

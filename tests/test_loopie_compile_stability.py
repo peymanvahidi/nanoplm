@@ -1,11 +1,13 @@
 """Compile-stability and FSDP2 invariants for Loopie stochastic depth.
 
-Two constraints pull against each other here. The trip count must stay out of
-every traced graph, or Dynamo specializes on it and each distinct R costs a
-fresh trace (the failure ``ModernBertModel._drive_recurrence`` documents). And
-the repeats must stay inside ``ModernBertEncoderLayer.forward``, or FSDP2 —
-which shards per encoder layer — all-gathers once per repeat instead of once
-per layer. Both live in this file because a fix for either can break the other.
+Two constraints pull against each other here. The trip count must not thrash
+the Dynamo cache: a tensor R stays out of every traced graph (the
+``_forward_repeats`` driver), while a Python int R is allowed to specialize,
+once per distinct value, because the training support is three values and the
+unrolled graph is the one a fixed-depth model traces. And the repeats must stay
+inside ``ModernBertEncoderLayer.forward``, or FSDP2 — which shards per encoder
+layer — all-gathers once per repeat instead of once per layer. Both live in
+this file because a fix for either can break the other.
 
 ``dynamic=False`` matches production: ``use_packing`` + ``use_static_inp_size``
 resolve ``compile_dynamic`` to False in ``pure_pipeline``.
@@ -130,6 +132,85 @@ def test_no_per_layer_cache_thrash_at_production_depth(make_counting_backend):
     )
 
 
+def test_int_loop_count_specializes_once_per_value(make_counting_backend):
+    """A Python int R compiles once per distinct value and never again.
+
+    This is the loopie training path (``_loop_count_fwd_kwargs`` passes an
+    int). Each of R=1,2,3 pays one trace on first sight; repeats of any of them
+    must hit the cache, and none may reach the Dynamo-disabled driver.
+    """
+    torch.manual_seed(0)
+    model = _loopie_model()
+    input_ids, attention_mask = _batch(model.model_config)
+
+    backend, n_compiles = make_counting_backend()
+    torch._dynamo.reset()
+    counters.clear()
+    compiled = torch.compile(model, backend=backend, dynamic=False)
+
+    seen = []
+    for r in (2, 1, 3):
+        before = n_compiles[0]
+        with torch.no_grad():
+            compiled(input_ids=input_ids, attention_mask=attention_mask, loop_count=r)
+        seen.append(n_compiles[0] - before)
+    assert all(n > 0 for n in seen), f"each new R must trace at least once; got {seen}"
+    after_warmup = n_compiles[0]
+
+    for r in (1, 2, 3, 3, 1, 2):
+        with torch.no_grad():
+            compiled(input_ids=input_ids, attention_mask=attention_mask, loop_count=r)
+    assert n_compiles[0] == after_warmup, (
+        f"int R recompiled on values already seen: {n_compiles[0] - after_warmup} "
+        "extra graphs after warmup"
+    )
+
+    breaks = [reason for reason in counters["graph_break"] if "_forward_repeats" in reason]
+    assert not breaks, f"int R reached the eager driver:\n{breaks}"
+
+
+def test_int_loop_count_traces_the_fixed_depth_graph(make_counting_backend):
+    """``loop_count=2`` as an int must compile into the same graphs as fixed R=2.
+
+    That equality is what makes a stochastic-depth 20xR arm's R=2 steps run
+    the same kernels as a fixed 20x2 arm.
+    """
+    torch.manual_seed(0)
+    model = _loopie_model()
+    input_ids, attention_mask = _batch(model.model_config)
+
+    fixed_backend, n_fixed = make_counting_backend()
+    torch._dynamo.reset()
+    compiled_fixed = torch.compile(model, backend=fixed_backend, dynamic=False)
+    with torch.no_grad():
+        compiled_fixed(input_ids=input_ids, attention_mask=attention_mask)
+
+    int_backend, n_int = make_counting_backend()
+    torch._dynamo.reset()
+    compiled_int = torch.compile(model, backend=int_backend, dynamic=False)
+    with torch.no_grad():
+        compiled_int(input_ids=input_ids, attention_mask=attention_mask, loop_count=2)
+
+    assert n_int[0] == n_fixed[0], (
+        f"int R=2 compiled into {n_int[0]} graphs vs {n_fixed[0]} for the fixed-depth "
+        "path; the int branch added a graph break or a split trace."
+    )
+
+
+def test_int_and_tensor_loop_count_agree_numerically():
+    torch.manual_seed(0)
+    model = _loopie_model()
+    input_ids, attention_mask = _batch(model.model_config)
+    with torch.no_grad():
+        for r in (1, 3):
+            via_int = model(input_ids=input_ids, attention_mask=attention_mask, loop_count=r)
+            via_tensor = model(
+                input_ids=input_ids, attention_mask=attention_mask,
+                loop_count=torch.tensor(r, dtype=torch.int64),
+            )
+            torch.testing.assert_close(via_int.logits, via_tensor.logits)
+
+
 def test_fixed_path_compiles_exactly_as_an_unlooped_model(make_counting_backend):
     """Without the kwarg, loopie must trace to the graph it traced before.
 
@@ -208,11 +289,13 @@ def test_truncated_bptt_traces_like_full_backprop(make_counting_backend):
     )
 
 
-def test_one_layer_call_per_step_regardless_of_depth():
+@pytest.mark.parametrize("as_tensor", [False, True], ids=["int", "tensor"])
+def test_one_layer_call_per_step_regardless_of_depth(as_tensor):
     """FSDP2 all-gathers on __call__, so every repeat must stay inside forward.
 
     Counting forward pre-hooks against ``_forward_once`` executions is exactly
-    the invariant fully_shard keys on, and it needs no GPUs to check.
+    the invariant fully_shard keys on, and it needs no GPUs to check. Both the
+    unrolled int path and the eager tensor driver must hold it.
     """
     torch.manual_seed(0)
     model = _loopie_model()
@@ -236,7 +319,7 @@ def test_one_layer_call_per_step_regardless_of_depth():
         model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            loop_count=torch.tensor(4, dtype=torch.int64),
+            loop_count=torch.tensor(4, dtype=torch.int64) if as_tensor else 4,
         )
 
     assert calls == {i: 1 for i in range(_NUM_LAYERS)}, (
@@ -257,28 +340,60 @@ def _stub_flash_varlen(q, k, v, *, window_size, **kwargs):
     return v * (1.0 + 0 * window_size[0])
 
 
-# Flat token count per micro-batch; the three max_seqlen buckets below stand in
-# for the packed collator's power-of-two buckets, the shapes that coexist in
-# one compile epoch (batch-size warmup stages are separated by a reset).
-_PACKED_TOKENS = 128
-_MAX_SEQLENS = (32, 64, 128)
-_JITTER_RS = (1, 2, 3)
+# Flat token count per micro-batch; the max_seqlen buckets below stand in for
+# the packed collator's power-of-two buckets, the shapes that coexist in one
+# compile epoch (batch-size warmup stages are separated by a reset).
+_PACKED_TOKENS = 64
+_MAX_SEQLENS = (32, 64)
+_JITTER_RS = (1, 2, 3)  # R0 = 2, jitter 1
+
+
+@pytest.fixture
+def single_rank_fsdp():
+    """A one-rank gloo group, so ``fully_shard`` runs on CPU."""
+    import socket
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    owns_group = not dist.is_initialized()
+    if owns_group:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        dist.init_process_group(
+            "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=0, world_size=1
+        )
+    mesh = init_device_mesh("cpu", (1,))
+
+    def _shard(model):
+        # Per-layer units, then the root, as pure_pipeline shards them.
+        for layer in model.model.layers:
+            fully_shard(layer, mesh=mesh, reshard_after_forward=False)
+        fully_shard(model, mesh=mesh, reshard_after_forward=False)
+        return model
+
+    yield _shard
+    if owns_group:
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
-    "pattern, num_layers, variants",
+    "pattern, num_layers, variants, bptt",
     # "F": layer 0 (Identity attn_norm) + the rest. "FS": that, plus the
-    # sliding layers, whose window_size is an extra guard.
-    [("F", 3, 2), ("FS", 4, 3)],
+    # sliding layers, whose window_size is an extra guard. bptt=1 shows the
+    # no_grad applications add no entries on the unrolled path.
+    [("F", 3, 2, None), ("FS", 4, 3, 1)],
 )
-@pytest.mark.parametrize("bptt", [None, 1])
 def test_jitter_training_fits_the_computed_recompile_limit(
-    monkeypatch, make_counting_backend, pattern, num_layers, variants, bptt
+    monkeypatch, make_counting_backend, single_rank_fsdp, pattern, num_layers, variants, bptt
 ):
-    """Jitter + truncated BPTT in training must not overflow _forward_once's cache.
+    """Int-R jitter training under FSDP2 must fit the limit the pipeline sets.
 
-    The no_grad applications are a separate grad-mode guard, so the shared
-    per-layer frame needs V x S x G entries. With the limit from
+    FSDP2's dynamo-disabled hooks break the graph at every layer call, so
+    ``ModernBertEncoderLayer.forward`` is one frame shared by all layers, and
+    the int R specializes it: V x S x N entries. With the limit from
     ``_dynamo_recompile_limit`` and ``fail_on_recompile_limit_hit`` on, an
     undersized limit raises instead of silently running that shape eager.
     """
@@ -295,8 +410,6 @@ def test_jitter_training_fits_the_computed_recompile_limit(
         )
     ).train()
     assert _count_layer_variants(model.model.layers) == variants
-
-    grad_modes = 2 if bptt is not None and max(_JITTER_RS) > bptt else 1
     limit = _dynamo_recompile_limit(
         model.model_config,
         layers=model.model.layers,
@@ -304,9 +417,13 @@ def test_jitter_training_fits_the_computed_recompile_limit(
         global_batch_warmup_steps=0,
         n_input_shapes=len(_MAX_SEQLENS),
     )
+    expected = variants * len(_MAX_SEQLENS) * len(_JITTER_RS)
+    assert expected > 8, "test precondition: the default limit must be too small"
+    single_rank_fsdp(model)
 
     backend, _ = make_counting_backend()
     torch._dynamo.reset()
+    counters.clear()
     compiled = torch.compile(model, backend=backend, dynamic=False)
     with torch._dynamo.config.patch(recompile_limit=limit, fail_on_recompile_limit_hit=True):
         for max_seqlen in _MAX_SEQLENS:
@@ -320,20 +437,22 @@ def test_jitter_training_fits_the_computed_recompile_limit(
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     position_ids=torch.arange(_PACKED_TOKENS) % max_seqlen,
-                    loop_count=torch.tensor(r, dtype=torch.int64),
+                    loop_count=r,
                 )
                 out.loss.backward()
 
-    entries = len(_debug_get_cache_entry_list(ModernBertEncoderLayer._forward_once.__code__))
-    assert entries == variants * len(_MAX_SEQLENS) * grad_modes, (
-        f"_forward_once has {entries} cache entries; expected V={variants} x "
-        f"S={len(_MAX_SEQLENS)} x G={grad_modes}."
+    breaks = [reason for reason in counters["graph_break"] if "_forward_repeats" in reason]
+    assert not breaks, f"int R reached the eager driver:\n{breaks}"
+    entries = len(_debug_get_cache_entry_list(ModernBertEncoderLayer.forward.__code__))
+    assert entries == expected, (
+        f"ModernBertEncoderLayer.forward has {entries} cache entries; expected "
+        f"V={variants} x S={len(_MAX_SEQLENS)} x N={len(_JITTER_RS)}."
     )
     torch._dynamo.reset()
 
 
 def test_recompile_limit_arithmetic():
-    loopie = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=1)
+    truncated = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=1)
     full_bptt = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=None)
     plain = types.SimpleNamespace(use_loopie=False)
 
@@ -349,9 +468,8 @@ def test_recompile_limit_arithmetic():
     assert _count_layer_variants([torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)]) == 1
     assert limit(plain) == 8
     assert limit(plain, warmup=10) == 16
-    assert limit(loopie, jitter=0) == 8
-    assert limit(loopie) == 3 * 6 * 2  # max R = 3 > bptt = 1
-    assert limit(full_bptt) == 3 * 6
-    assert limit(loopie, shapes=1, variants=2, warmup=10) == 16  # warmup floor wins
-    bptt_covers_r = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=3)
-    assert limit(bptt_covers_r) == 3 * 6  # every R <= bptt: no no_grad applications
+    assert limit(full_bptt, jitter=0) == 8
+    assert limit(full_bptt) == 3 * 6 * 3  # V x S x (2j + 1)
+    assert limit(full_bptt, jitter=2) == 3 * 6 * 5
+    assert limit(truncated) == limit(full_bptt)  # bptt adds no entries
+    assert limit(full_bptt, shapes=1, variants=1, warmup=10) == 16  # warmup floor wins
