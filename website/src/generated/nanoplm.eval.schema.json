@@ -20,7 +20,7 @@
         "secondary_structure",
         "scl"
       ],
-      "description": "Which PBC_SUPERVISED datasets to run, when 'pbc_supervised' is in `framework`. The framework holds seven task heads and embeds every sequence they need, which is ~13 min and ~30 GB of per-residue embeddings for the full set; the standing battery only wants two of them, so the default restricts it. None means every dataset. secondary_structure -> carries the newPISCES364 test split scl                 -> subcellular location"
+      "description": "Which PBC_SUPERVISED datasets to run, when 'pbc_supervised' is in `framework`. The framework holds seven task heads and embeds every sequence they need, which is ~13 min and ~30 GB of per-residue embeddings for the full set; the standing battery only wants two of them, so the default restricts it. 'all' or [] runs every dataset; a single name may be given as a bare string. (null in YAML keeps this default.) secondary_structure -> carries the newPISCES364 test split scl                 -> subcellular location"
     },
     "output_dir": {
       "type": "string",

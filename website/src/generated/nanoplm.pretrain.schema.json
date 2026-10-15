@@ -1546,7 +1546,7 @@
         "eval_mask_seed": {
           "type": "integer",
           "default": null,
-          "description": "Seed for eval masking. When set, an eval batch's mask is a pure function of its own token ids, so it is identical across arms, runs, dataloader worker counts and batch order. Leave null to draw fresh masks from global RNG on every eval, which adds mask noise to every reported eval loss.",
+          "description": "Seed for eval masking. When set, an eval batch's mask is seeded from the batch's token ids, so it is stable across runs and dataloader worker counts for the same eval loader and world size; it depends on batch composition. Leave null to draw fresh masks from global RNG on every eval, which adds mask noise to every reported eval loss.",
           "x-nanoplm-advanced": true,
           "x-nanoplm-group": "MLM"
         }
