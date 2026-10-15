@@ -44,7 +44,22 @@ _SCENARIOS = {
     # Batch-size warmup: steps 0-2 split each micro-batch 4 ways with ga=1
     # (3-5: 2 ways). N=2 lands at sub_batch 2/4 of the first micro-batch.
     "split_divisor": dict(n=32, micro=8, ga=2, bwarm=9, N=2, M=6),
+    # 2 micro-batches/pass, bwarm=3: steps 0-2 take one sub-batch each from
+    # micro-batch 0 (split 4 ways), then ga=2. N=3 resumes at sub_batch 3/4,
+    # inside a split macro-batch whose next window spans into micro-batch 1.
+    "split_tail": dict(n=16, micro=8, ga=2, bwarm=3, N=3, M=3),
 }
+
+# Launcher/scheduler state that would leak into the children: SLURM_JOB_END_TIME
+# sets a wall-clock deadline, and RANK/WORLD_SIZE/MASTER_* would make a plain
+# python child think it is part of a process group.
+_SCRUB = {"RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"}
+
+
+def _child_env(**over) -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("SLURM_") and k not in _SCRUB}
+    return dict(env, PYTHONPATH=SRC, CUDA_VISIBLE_DEVICES="", **over)
 
 
 def _run(tmp: Path, name: str, spec: dict, nproc: int) -> list[dict]:
@@ -55,8 +70,7 @@ def _run(tmp: Path, name: str, spec: dict, nproc: int) -> list[dict]:
         cmd = [TORCHRUN, "--standalone", f"--nproc_per_node={nproc}", str(HARNESS), str(spec_path)]
     else:
         cmd = [PY, str(HARNESS), str(spec_path)]
-    env = dict(os.environ, PYTHONPATH=SRC, CUDA_VISIBLE_DEVICES="", WANDB_MODE="disabled",
-               OMP_NUM_THREADS="1")
+    env = _child_env(WANDB_MODE="disabled", OMP_NUM_THREADS="1")
     r = subprocess.run(cmd, cwd=tmp, env=env, capture_output=True, text=True, timeout=900)
     (tmp / f"{name}.log").write_text(r.stdout + r.stderr)
     assert r.returncode == 0, f"{name} failed:\n{(r.stdout + r.stderr)[-4000:]}"
@@ -67,8 +81,7 @@ def _dataset(tmp: Path, n: int) -> Path:
     d = tmp / "ds"
     code = ("import sys; sys.path.insert(0, %r); import resume_harness as h; "
             "from pathlib import Path; h.build_dataset(Path(%r), %d)") % (str(HERE), str(d), n)
-    env = dict(os.environ, PYTHONPATH=SRC, CUDA_VISIBLE_DEVICES="")
-    subprocess.run([PY, "-c", code], cwd=tmp, env=env, check=True, capture_output=True)
+    subprocess.run([PY, "-c", code], cwd=tmp, env=_child_env(), check=True, capture_output=True)
     return d
 
 
@@ -187,3 +200,4 @@ def test_zero_step_resume_keeps_data_position(tmp_path, scenario):
     second = _run(tmp_path, "noop2", noop, 1)
     assert first[0]["resume_lines"] == second[0]["resume_lines"]
     assert first[0]["log"] == second[0]["log"] == []
+

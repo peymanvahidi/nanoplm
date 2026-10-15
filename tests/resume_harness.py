@@ -4,7 +4,9 @@
     torchrun --nproc_per_node=K resume_harness.py SPEC.json   # gloo DDP, K ranks
 
 SPEC keys: dataset_dir, ckp_dir, out (per-rank JSON path prefix), micro, ga,
-steps, bwarm, mode ("single" | "dist"), resume (checkpoint dir or null).
+steps, bwarm, mode ("single" | "dist"), resume (checkpoint dir or null),
+dist_mode (pipeline distributed_mode; default "ddp" for "dist" and "fsdp" for
+"single", since the pipeline rejects ddp without multi_gpu).
 
 Forces CPU and makes torch.compile the identity. Records, for every training
 sub-batch the loop moves to the device, (global_step, epoch, micro_step,
@@ -94,7 +96,7 @@ def run_phase(spec: dict) -> None:
         bf16=False, tf32=False, fp8=False, use_packing=False, use_static_inp_size=False,
         multi_gpu=dist_mode, world_size=world, num_workers=0,
         eval_steps=10_000_000, save_steps=10_000_000, logging_steps=10_000_000,
-        seed=SEED, optimizer="adamw", distributed_mode=spec.get("dist_mode", "ddp"),
+        seed=SEED, optimizer="adamw", distributed_mode=spec.get("dist_mode", "ddp" if dist_mode else "fsdp"),
     )
     _populate_batch_setup(cfg)
     if dist_mode:
