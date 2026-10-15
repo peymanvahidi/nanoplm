@@ -38,7 +38,7 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
     try:
         from biotrainer.autoeval import AutoEval
         from biotrainer.bioengineer import BioEngineer, CustomBioEngineerModel
-        from biotrainer.bioengineer.bioengineer_custom_model import (
+        from biotrainer.bioengineer.models import (
             CustomBioEngineerModelWrapper,
         )
         from biotrainer.bioengineer.bioengineer_utils import get_optimal_window

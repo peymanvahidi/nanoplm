@@ -90,7 +90,7 @@ def test_strip_special_tokens_keeps_only_residue_positions():
 
 def _sequential_masked_log_probs(wrapper, sequence: str) -> torch.Tensor:
     """biotrainer's unbatched reference implementation, one forward per position."""
-    from biotrainer.bioengineer.bioengineer_custom_model import (
+    from biotrainer.bioengineer.models import (
         CustomBioEngineerModelWrapper,
     )
 
