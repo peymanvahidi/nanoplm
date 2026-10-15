@@ -59,10 +59,10 @@ uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"   #
 
 If `~/.cache/biotrainer/autoeval` holds datasets from an older biotrainer, `nanoplm eval` refuses to start until you set `dataset_dir` to a fresh directory or delete that cache.
 
-To take biotrainer straight from source instead, use the command below:
+To install only biotrainer at the pinned version, without the extra:
 
 ```bash
-uv pip install biotrainer
+uv pip install "biotrainer==2.1.1" "biotrainer-core==2.1.1"
 ```
 
 ---

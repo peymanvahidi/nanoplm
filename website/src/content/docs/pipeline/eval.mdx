@@ -1,6 +1,6 @@
 ---
 title: 3. Evaluate
-description: Score a checkpoint on zero-shot ProteinGym and contact-prediction benchmarks with eval.yaml.
+description: Score a checkpoint on ProteinGym, contact-prediction and supervised probe benchmarks with eval.yaml.
 ---
 
 import { FileTree, Steps } from '@astrojs/starlight/components';
@@ -22,10 +22,11 @@ uv pip install -e ".[eval]"
 
 Evaluation loads **pure-torch checkpoints only**. That is one more reason to keep the stock `pure_torch: true` default when you pretrain, as [2. Pretrain](/nanoplm/pipeline/pretrain/) recommends.
 
-:::note[Zero-shot only]
-`nanoplm eval` covers biotrainer's **zero-shot** frameworks. The supervised probe
-benchmarks (`pbc`, `flip`) were dropped in the move to biotrainer 2.0.0; a config
-that still lists them fails with a message naming the replacement.
+:::note[Removed frameworks]
+The old `pbc` and `flip` probe suites were dropped in the move to biotrainer
+2.0.0; a config that still lists them fails with a message naming the supported
+frameworks. Supervised probes now run through `pbc_supervised` and
+`pbc_supervised_contact`.
 :::
 
 ## Run it
@@ -111,8 +112,10 @@ So during a long run you can leave `checkpoint_dir` pointed at the run directory
 | --- | --- |
 | `pgym` | ProteinGym, **zero-shot**: the model scores mutants directly, with no probe trained on top. |
 | `pbc_zeroshot_contact` | Contact maps derived from the model's **categorical Jacobian**, scored against experimental structures. |
+| `pbc_supervised` | Task heads trained on the frozen encoder's embeddings. [`pbc_supervised_datasets`](/nanoplm/reference/eval/#eval-pbc_supervised_datasets) picks the datasets; the default is `secondary_structure` and `scl`, and `all` runs all seven. |
+| `pbc_supervised_contact` | A logistic probe over the model's symmetrized, APC-corrected attention maps. |
 
-Both use the MLM head itself rather than a trained probe, so they measure how well the model models proteins — `pgym` through mutational effects, `pbc_zeroshot_contact` through the pairwise couplings the model has internalised.
+The first two use the MLM head itself rather than a trained probe, so they measure how well the model models proteins — `pgym` through mutational effects, `pbc_zeroshot_contact` through the pairwise couplings the model has internalised. The `pbc_supervised*` frameworks train a probe on top of the frozen model.
 
 Zero-shot scoring has three methods, set by [`zero_shot_method`](/nanoplm/reference/eval/#eval-zero_shot_method) and used only when `pgym` is in `framework`:
 
