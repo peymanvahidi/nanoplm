@@ -177,10 +177,12 @@ class ProtDataCollatorForLM(DataCollatorForLanguageModeling):
         Returns None unless deterministic_seed is set, in which case callers
         keep using global RNG exactly as before.
 
-        The seed is a hash of the token ids, NOT a call counter, so the mask a
-        sequence gets depends only on the sequence itself. That makes it stable
-        across arms, across runs, across dataloader worker counts and batch
-        order, and independent of how much global RNG training has consumed.
+        The seed is a hash of the whole padded batch's token ids, NOT a call
+        counter, so the masks are stable across runs and dataloader worker
+        counts for the same eval loader and world size, and independent of how
+        much global RNG training has consumed. They depend on batch
+        composition: the same sequence batched with different neighbours, in a
+        different row, or padded to another length gets a different mask.
         Without it every eval draws fresh masks, so eval loss carries mask
         noise on top of the model differences we are trying to measure.
 

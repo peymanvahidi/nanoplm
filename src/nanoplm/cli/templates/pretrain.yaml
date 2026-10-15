@@ -285,10 +285,11 @@ pretraining:
   # eval_random_token_prob: 0.1
   # eval_keep_probability: 0.1
   #
-  # Seed for eval masking. Set it and an eval batch's mask becomes a pure
-  # function of its own token ids: identical across runs, across dataloader
-  # worker counts, and across batch order. Unset, every eval draws fresh masks
-  # from global RNG, so eval loss carries mask noise on top of real change.
+  # Seed for eval masking. Set it and an eval batch's mask is seeded from the
+  # batch's token ids: stable across runs and dataloader worker counts for the
+  # same eval loader and world size, though it depends on batch composition.
+  # Unset, every eval draws fresh masks from global RNG, so eval loss carries
+  # mask noise on top of real change.
   # eval_mask_seed: 1234
 
   # ── Logging, eval, checkpoints ────────────────────────────────────────────

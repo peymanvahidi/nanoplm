@@ -163,9 +163,10 @@ class PretrainingConfig:
     eval_random_token_prob: Optional[float] = None
     eval_keep_probability: Optional[float] = None
     eval_mlm_masking_strategy: Optional[str] = None
-    # Seed for eval masking. When set, an eval batch's mask is a pure function
-    # of its own token ids, so it is identical across arms, runs, worker counts
-    # and batch order. Leave None to keep drawing fresh masks from global RNG.
+    # Seed for eval masking. When set, an eval batch's mask is seeded from the
+    # batch's token ids, so it is stable across runs and worker counts for the
+    # same eval loader and world size; it depends on batch composition. Leave
+    # None to keep drawing fresh masks from global RNG.
     eval_mask_seed: Optional[int] = None
 
     # Logging/checkpointing
