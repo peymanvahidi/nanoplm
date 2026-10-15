@@ -199,16 +199,6 @@ eval.loop_count: { backend: [pure_torch], advanced: true, minimum: 1 }
 x-extra-fields:
   pretrain:
     pretraining:
-      peak_tflops:
-        type: number
-        default: null
-        advanced: true
-        group: Logging + metrics
-        description: >-
-          Peak dense bf16 TFLOP/s of one accelerator, used as the denominator
-          for the reported MFU. Defaults to the H100 figure. Set it to the real
-          number for the hardware in use (GH200 is 630) or the MFU column is
-          scaled wrong and not comparable across machines.
       eval_mlm_probability:
         type: number
         default: null
