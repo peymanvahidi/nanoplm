@@ -49,19 +49,12 @@ else:
 _HAS_FLASH_VARLEN = False
 _flash_varlen_fn = None
 _FLASH_HAS_DROPOUT = False
-_OFFLINE_MODE = True
 
 if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
     try:
-        
         # FA3 (H100 / sm90)
-        if _OFFLINE_MODE:
-            import flash_attn_interface as _fa3
-        else: 
-            from kernels import get_kernel
-            _fa3 = get_kernel("varunneal/flash-attention-3")
-            _fa3 = getattr(_fa3, "flash_attn_interface", _fa3)
-        
+        import flash_attn_interface as _fa3
+
         _flash_varlen_fn = _fa3.flash_attn_varlen_func
         _HAS_FLASH_VARLEN = True
         _FLASH_HAS_DROPOUT = False  # FA3 removed dropout_p

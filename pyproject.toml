@@ -44,7 +44,6 @@ dependencies = [
     "wandb>=0.19.11,<0.20.0",
     "certifi>=2024.7.4",
     "ipython>=8.3.0",
-    "kernels>=0.17,<0.18",
     "pytest",
 ]
 
