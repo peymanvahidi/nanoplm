@@ -43,6 +43,22 @@ def test_null_keeps_the_default(tmp_path):
     assert config.pbc_supervised_datasets == ["secondary_structure", "scl"]
 
 
+def test_names_are_matched_case_insensitively(tmp_path):
+    config = _from_yaml(tmp_path, "[SCL, Secondary_Structure]")
+    assert config.pbc_supervised_datasets == ["scl", "secondary_structure"]
+
+
+def test_all_mixed_with_names_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="mixes 'all' with dataset names"):
+        _from_yaml(tmp_path, "[scl, all]")
+
+
+@pytest.mark.parametrize("value", ["5", "true", "{scl: 1}"])
+def test_a_scalar_that_is_not_a_name_is_a_value_error(tmp_path, value):
+    with pytest.raises(ValueError, match="must be 'all', a dataset name or a list"):
+        _from_yaml(tmp_path, value)
+
+
 def test_unknown_name_is_refused(tmp_path):
     with pytest.raises(ValueError, match="Unknown pbc_supervised_datasets.*'ssp'"):
         _from_yaml(tmp_path, "[scl, ssp]")

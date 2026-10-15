@@ -36,7 +36,9 @@ class EvalConfig:
     # sequence they need, which is ~13 min and ~30 GB of per-residue embeddings
     # for the full set; the standing battery only wants two of them, so the
     # default restricts it. 'all' or [] runs every dataset; a single name may
-    # be given as a bare string. (null in YAML keeps this default.)
+    # be given as a bare string, and names are matched case-insensitively.
+    # None here also means every dataset, but null in YAML keeps this default:
+    # the YAML loader drops null values for every eval key.
     #   secondary_structure -> carries the newPISCES364 test split
     #   scl                 -> subcellular location
     pbc_supervised_datasets: Optional[List[str]] = field(
@@ -101,14 +103,26 @@ class EvalConfig:
             return
         if isinstance(wanted, str):
             wanted = [wanted]
+        if not isinstance(wanted, (list, tuple)):
+            raise ValueError(
+                "pbc_supervised_datasets must be 'all', a dataset name or a list "
+                f"of names; got {wanted!r}."
+            )
         wanted = [str(name) for name in wanted]
-        if not wanted or any(name.lower() == "all" for name in wanted):
+        names = [name for name in wanted if name.lower() != "all"]
+        if not names:
             self.pbc_supervised_datasets = None
             return
-        unknown = [name for name in wanted if name not in PBC_SUPERVISED_DATASETS]
+        if len(names) < len(wanted):
+            raise ValueError(
+                f"pbc_supervised_datasets {wanted} mixes 'all' with dataset "
+                "names. Pass 'all' alone, or only names."
+            )
+        canonical = {name.lower(): name for name in PBC_SUPERVISED_DATASETS}
+        unknown = [name for name in names if name.lower() not in canonical]
         if unknown:
             raise ValueError(
                 f"Unknown pbc_supervised_datasets {unknown}. Expected 'all' or "
                 f"names from: {list(PBC_SUPERVISED_DATASETS)}."
             )
-        self.pbc_supervised_datasets = wanted
+        self.pbc_supervised_datasets = [canonical[name.lower()] for name in names]
