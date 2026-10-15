@@ -2922,7 +2922,8 @@ def run_pure_pretraining(
     recycling_scheduler = None
     recycling_rng = None
     recycling_metrics_buffer = None
-    _model_cfg = model.model_config
+    # `model` may be DDP-wrapped here, which hides model_config.
+    _model_cfg = orig_model.model_config
     _loopie_jitter = int(getattr(pretrain_config, "loopie_loop_count_jitter", 0))
     if _model_cfg.use_loopie and _loopie_jitter > 0:
         # curriculum_complete pins current_mean at the target from step 0: there
@@ -2937,7 +2938,7 @@ def run_pure_pretraining(
         )
         recycling_rng = torch.Generator(device=device).manual_seed(int(pretrain_config.seed) + 999)
         recycling_metrics_buffer = RecyclingMetricsBuffer(window=100)
-    elif model.model_config.recycling_loop_count > 1:
+    elif _model_cfg.recycling_loop_count > 1:
         # Resume semantics for the loop-count curriculum (spec §17):
         #   - `continue` keeps the curriculum on the ORIGINAL horizon, read from
         #     the checkpoint's training_state.json (not the locally recomputed
@@ -2955,7 +2956,7 @@ def run_pure_pretraining(
             _recycling_total_steps = total_steps
         recycling_scheduler = RecyclingScheduler(
             pretrain_config,
-            target_loop_count=model.model_config.recycling_loop_count,
+            target_loop_count=_model_cfg.recycling_loop_count,
             total_training_steps=_recycling_total_steps,
             curriculum_complete=_curriculum_complete,
         )
@@ -3145,7 +3146,7 @@ def run_pure_pretraining(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 mode="offline",
-                config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
