@@ -3323,7 +3323,6 @@ def run_pure_pretraining(
     _moe_lb_stats: Optional[torch.Tensor] = None
     window_loss = torch.zeros((), device=device)
     window_steps = 0
-    discard_accumulation = False
     # Set by the (sync-free) per-micro-step finite poll; consumed once
     # per accumulation window, at the boundary.
     local_nonfinite = False
@@ -3482,6 +3481,10 @@ def run_pure_pretraining(
 
             epoch_ended_early = False
             epoch_sub_batch_count = 0
+            # Set once the micro-batches left in this pass cannot fill the
+            # next grad-accum window; the rest of the pass is skipped.
+            skip_pass_tail = False
+            skipped_tail_count = 0
             for micro_step in range(synced_len):
                 if pending_compile_rebuild:
                     if distributed and dist.is_initialized():
@@ -3591,21 +3594,25 @@ def run_pure_pretraining(
                     if sub_batch_idx < resume_sub_batch_start:
                         continue
 
+                    # A window that cannot complete before the pass ends would
+                    # be discarded at the epoch boundary. Don't run it: under
+                    # FSDP2 its unsynced gradients sit on the unsharded params,
+                    # where optimizer.zero_grad() can't reach them, and leak
+                    # into the next pass's first step. effective_grad_accum and
+                    # mbs_divisor only change at an optimizer step, so the
+                    # count is exact and identical on every rank.
+                    if accum_micro_count == 0 and not skip_pass_tail:
+                        remaining = (total_sub_batches - sub_batch_idx) + (
+                            synced_len - micro_step - 1
+                        ) * mbs_divisor
+                        skip_pass_tail = remaining < effective_grad_accum
+                    if skip_pass_tail:
+                        skipped_tail_count += 1
+                        continue
+
                     accum_micro_count += 1
                     epoch_sub_batch_count += 1
                     at_accum_boundary = accum_micro_count >= effective_grad_accum
-                    if discard_accumulation:
-                        if at_accum_boundary:
-                            discard_accumulation = False
-                            local_nonfinite = False
-                            accum_micro_count = 0
-                            effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
-                                global_step,
-                                inferred_grad_accum_steps,
-                                pretrain_config.micro_batch_seqs,
-                                global_batch_warmup_steps,
-                            )
-                        continue
 
                     batch = _move_batch_to_device(batch, device)
                     upcoming_step = global_step + 1
@@ -3772,10 +3779,7 @@ def run_pure_pretraining(
                         accum_loss.zero_()
                         if _moe_layers:
                             _moe_count_accum.zero_()
-                        if at_accum_boundary:
-                            accum_micro_count = 0
-                        else:
-                            discard_accumulation = True
+                        accum_micro_count = 0
                         continue
 
                     accum_loss = accum_loss + loss.detach()
@@ -4268,17 +4272,16 @@ def run_pure_pretraining(
                     break
 
             # ---- Epoch boundary cleanup ----
-            # When the inner loop ends (either by exhausting synced_len or
-            # breaking early via the all_reduce exhaustion check), there may
-            # be partial gradient-accumulation state left over from micro-steps
-            # that ran forward+backward but never reached an optimizer step.
-            # Flush everything to prevent gradient leak (stale .grad tensors
-            # carrying into next epoch), loss contamination, FSDP gradient
-            # desync (partial micro-steps had sync=False), and token/loss
-            # counter bleed across the boundary.  Timing window is reset at
-            # the top of the next epoch iteration, after iter(train_loader).
+            # A trailing window that cannot complete is skipped above, but a
+            # loader that runs dry before synced_len (the all_reduce exhaustion
+            # check) can still leave micro-steps that ran forward+backward
+            # without reaching an optimizer step. Flush everything to prevent
+            # gradient leak (stale .grad tensors carrying into next epoch),
+            # loss contamination, and token/loss counter bleed across the
+            # boundary.  Timing window is reset at the top of the next epoch
+            # iteration, after iter(train_loader).
             epoch_fwd_count = epoch_sub_batch_count
-            partial_discarded = accum_micro_count
+            partial_discarded = accum_micro_count + skipped_tail_count
             if is_main:
                 logger.info(
                     "Data pass %d complete (global_step %d/%d): %d effective micro-steps, %d optimizer steps%s",
@@ -4290,7 +4293,6 @@ def run_pure_pretraining(
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
             accum_micro_count = 0
-            discard_accumulation = False
             token_count.zero_()
             raw_token_count.zero_()
             window_flops.zero_()
