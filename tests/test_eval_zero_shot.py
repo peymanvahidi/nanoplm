@@ -1,11 +1,11 @@
 """Tests for the biotrainer zero-shot BioEngineer wrapper in ``nanoplm.eval``.
 
-These cover the two things nanoPLM overrides on top of biotrainer 2.0.0:
+These cover what nanoPLM adds on top of biotrainer 2.1:
 
-* batched masked-marginals (biotrainer scores one masked position per forward),
-* a categorical Jacobian aligned to nanoPLM's tokenizer, which has no BOS token
-  and may append register tokens — biotrainer's implementation hardcodes a
-  ``[BOS] + residues + [EOS]`` layout.
+* batched masked-marginals, sized by the token budget rather than biotrainer's
+  fixed batch,
+* the categorical Jacobian through nanoPLM's tokenizer, which has no BOS token
+  and may append register tokens, at the configured batch size.
 
 They are skipped unless the ``eval`` extra (biotrainer 2.x) is installed.
 """
@@ -144,7 +144,7 @@ def test_chunk_size_shrinks_for_long_windows():
 
 @pytest.mark.parametrize("registers", [0, 2])
 def test_categorical_jacobian_has_residue_aligned_shape(registers):
-    """biotrainer's own implementation raises here: it assumes a BOS token."""
+    """No BOS and trailing register tokens must still give an L x 20 x L x 20 map."""
     engineer, _, _, _ = _build_engineer(num_register_tokens=registers, batch_size=64)
     wrapper = engineer.model_wrapper
 
@@ -157,8 +157,8 @@ def test_categorical_jacobian_has_residue_aligned_shape(registers):
 def test_categorical_jacobian_is_aligned_to_the_right_residue():
     """Mutating residue p must be the row the Jacobian attributes to p.
 
-    This is the arithmetic biotrainer gets wrong for a tokenizer without BOS:
-    it writes mutations at column ``n+1`` and slices logits ``[1:-1]``.
+    biotrainer releases before PR #192 got this wrong for a tokenizer without
+    BOS: they wrote mutations at column ``n+1`` and sliced logits ``[1:-1]``.
     """
     engineer, _, tokenizer, biotrainer = _build_engineer(batch_size=64)
     wrapper = engineer.model_wrapper
@@ -209,7 +209,7 @@ def test_jacobian_rejects_a_tokenization_it_cannot_align():
         original_tokenize(batch, preprocess)[1][:, :-1],
     )
     try:
-        with pytest.raises(ValueError, match="does not match the expected"):
+        with pytest.raises(ValueError, match="disagree about which tokens are special"):
             wrapper._compute_categorical_jacobian(SEQUENCE[:8])
     finally:
         wrapper._tokenize = original_tokenize

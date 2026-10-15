@@ -70,7 +70,6 @@ class NanoPLMBioEngineer:
         ZeroShotMethod = biotrainer["ZeroShotMethod"]
         STANDARD_AAS = biotrainer["STANDARD_AAS"]
         get_optimal_window = biotrainer["get_optimal_window"]
-        SequenceTooLongError = biotrainer["SequenceTooLongError"]
 
         n_leading, n_trailing = special_token_offsets(tokenizer)
 
@@ -136,7 +135,7 @@ class NanoPLMBioEngineer:
                 return tensor[n_leading : tensor.shape[0] - n_trailing]
 
         class _Wrapper(CustomBioEngineerModelWrapper):
-            """Adds batched masked-marginals and a tokenizer-correct Jacobian."""
+            """Adds batched masked-marginals and a configurable Jacobian batch size."""
 
             def __init__(self, custom_bioengineer, device: torch.device, batch_size: int):
                 super().__init__(custom_bioengineer=custom_bioengineer, device=device)
@@ -241,80 +240,21 @@ class NanoPLMBioEngineer:
             ) -> torch.Tensor:
                 """Categorical Jacobian at the configured batch size.
 
-                biotrainer calls this with a hardcoded ``batch_size=32``; the
-                zero-shot contact pipeline offers no way to configure it, and the
-                Jacobian is 20*L forward rows per protein, so the batch size is
-                the whole wall-clock story. The configured ``zero_shot_batch_size``
-                wins instead, capped by the token budget.
-
-                Offsets come from the tokenizer rather than a ``[BOS] + residues +
-                [EOS]`` assumption: nanoPLM has no BOS and may append register
-                tokens. biotrainer >= PR #192 derives them the same way, so this
-                differs from upstream only in the batching.
+                biotrainer's implementation already derives residue positions
+                from ``strip_special_tokens`` and raises ``SequenceTooLongError``
+                past ``max_context_length()``; only the batching differs. The
+                Jacobian is 20*L forward rows per protein, so the configured
+                ``zero_shot_batch_size``, capped by the token budget, replaces
+                whatever biotrainer passes.
                 """
-                aa_token_ids = torch.tensor(
-                    list(self.aa_to_idx().values()), device=self._device
-                )
-                input_ids, attention_mask = self._tokenize([sequence], preprocess=True)
-
-                length = len(sequence)
-                expected_len = n_leading + length + n_trailing
-                # Same guard biotrainer's own Jacobian applies, and it has to be
-                # this exact exception type: the contact evaluator catches it to
-                # skip the protein, and anything else kills the framework run.
-                # Without it this override would score proteins past the context
-                # the reference embedders skip, which is not a comparable number.
-                if expected_len > self.max_context_length():
-                    raise SequenceTooLongError(
-                        f"Sequence of {length} residues tokenizes to {expected_len} "
-                        f"tokens, which exceeds the {self.max_context_length()} token "
-                        "context. The categorical Jacobian has no windowed variant, "
-                        "so it is not computed."
-                    )
-                if input_ids.shape[1] != expected_len:
-                    raise ValueError(
-                        f"Tokenized length {input_ids.shape[1]} does not match the "
-                        f"expected {expected_len} = {n_leading} leading + {length} "
-                        f"residues + {n_trailing} trailing special tokens. The "
-                        f"categorical Jacobian cannot be aligned to residues."
-                    )
-
-                n_rows = length * 20
-                chunk = self._chunk_size(expected_len)
+                n_tokens = n_leading + len(sequence) + n_trailing
+                chunk = self._chunk_size(n_tokens)
+                n_rows = len(sequence) * 20
                 logger.info(
-                    f"Categorical Jacobian: L={length} -> {n_rows} mutated sequences "
-                    f"in {-(-n_rows // chunk)} forward passes (batch {chunk})."
+                    f"Categorical Jacobian: L={len(sequence)} -> {n_rows} mutated "
+                    f"sequences in {-(-n_rows // chunk)} forward passes (batch {chunk})."
                 )
-
-                mutated_ids = torch.tile(input_ids, (n_rows, 1))
-                mutated_mask = torch.tile(attention_mask, (n_rows, 1))
-                for position in range(length):
-                    # Order of aa_token_ids matters: it defines the AA axes.
-                    mutated_ids[
-                        position * 20 : (position + 1) * 20, n_leading + position
-                    ] = aa_token_ids
-
-                ref_logits = self._model_forward_fn(input_ids, attention_mask)
-                ref_logits = ref_logits[n_leading : n_leading + length][
-                    :, aa_token_ids
-                ].cpu()
-
-                mutated_logits = []
-                for batch_ids, batch_mask in zip(
-                    torch.split(mutated_ids, chunk), torch.split(mutated_mask, chunk)
-                ):
-                    logits = self._model_batched_forward_fn(batch_ids, batch_mask)
-                    mutated_logits.append(
-                        logits[:, n_leading : n_leading + length, :][
-                            :, :, aa_token_ids
-                        ].cpu()
-                    )
-
-                # [L*20, L, 20] -> [L, 20, L, 20] in order of aa_token_ids/STANDARD_AAS
-                mutated_logits = torch.cat(mutated_logits, dim=0).reshape(
-                    length, 20, length, 20
-                )
-                return mutated_logits - ref_logits
+                return super()._compute_categorical_jacobian(sequence, chunk)
 
         return BioEngineer.from_custom_model(
             _Wrapper(custom_bioengineer=_Impl(), device=device, batch_size=batch_size),
