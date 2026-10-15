@@ -2,6 +2,7 @@
 biotrainer symbol and the checkpoint loading are stubbed.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -160,3 +161,45 @@ def test_run_eval_refuses_results_from_another_biotrainer(stubbed_pipeline, tmp_
     with pytest.raises(RuntimeError, match="fresh output_dir"):
         pipeline.run_eval(config)
     assert stubbed_pipeline.instances == []
+
+
+def test_run_eval_records_the_version_and_reuses_its_own_results(
+    stubbed_pipeline, monkeypatch, tmp_path
+):
+    from nanoplm.eval.checkpoint import write_eval_provenance
+
+    monkeypatch.setattr(pipeline, "write_eval_provenance", write_eval_provenance)
+    monkeypatch.setattr(
+        pipeline.EvalProvenance,
+        "resolve",
+        classmethod(
+            lambda cls, **kw: cls(
+                embedder_name="stub",
+                checkpoint_dir=tmp_path / "ckpt",
+                checkpoint_step=None,
+                run_name="run",
+                loop_count=None,
+                eval_git_sha=None,
+                eval_started_at="2026-10-15T00:00:00+00:00",
+                training_run=None,
+                biotrainer_version=kw["biotrainer_version"],
+            )
+        ),
+    )
+    out = tmp_path / "out"
+    config = EvalConfig(
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        framework=["pbc_zeroshot_contact"],
+        output_dir=str(out),
+        dataset_dir=str(tmp_path / "data"),
+        device="cpu",
+        torch_compile=False,
+    )
+
+    pipeline.run_eval(config)
+    sidecar = out / "autoeval_report_stub.provenance.json"
+    assert json.loads(sidecar.read_text())["biotrainer_version"] == "2.1.1"
+
+    (out / "autoeval_report_stub.json").write_text("{}")
+    pipeline.run_eval(config)
+    assert len(stubbed_pipeline.instances) == 2
