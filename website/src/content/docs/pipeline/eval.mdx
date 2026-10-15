@@ -158,7 +158,7 @@ biotrainer 2.1 changed the dataset layout. If `~/.cache/biotrainer/autoeval` sti
 
 </FileTree>
 
-A second framework added to `framework:` later merges into the same report rather than starting a new one. That also means a framework already present in the report is **reused, not recomputed** — the run logs a warning naming which ones were served from disk. Delete the report, or use a fresh `output_dir`, to force a re-run.
+A second framework added to `framework:` later merges into the same report rather than starting a new one. That also means a framework already present in the report is **reused, not recomputed** — the run logs a warning naming which ones were served from disk. Delete the report, or use a fresh `output_dir`, to force a re-run. Results that another biotrainer version wrote are never reused: the run stops before loading the model and asks for a fresh `output_dir`.
 
 ## Next
 
