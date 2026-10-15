@@ -72,3 +72,69 @@ def test_zero_shot_contact_gets_the_configured_batch_size(stubbed_pipeline, tmp_
 
     (autoeval,) = stubbed_pipeline.instances
     assert autoeval.calls == [("pbc_zeroshot_contact", {"batch_size": 123})]
+
+
+# ---------------------------------------------------------------------------
+# Stale pre-2.1 dataset cache
+# ---------------------------------------------------------------------------
+
+def _make(root, *relpaths):
+    for rel in relpaths:
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        ["CONTACT/contacts/casp14/x.fasta"],
+        ["PBC/supervised/scl/scl.fasta"],
+    ],
+    ids=["old-contact-dir", "pbc-without-contacts"],
+)
+def test_pre_2_1_cache_layout_is_refused(tmp_path, files):
+    _make(tmp_path, *files)
+    with pytest.raises(RuntimeError, match="dataset_dir"):
+        pipeline._refuse_stale_dataset_cache(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        [],
+        ["PBC/contacts/zeroshot/casp14/x.fasta", "PBC/supervised/scl/scl.fasta"],
+    ],
+    ids=["empty", "2.1-layout"],
+)
+def test_empty_or_current_cache_is_accepted(tmp_path, files):
+    _make(tmp_path, *files)
+    (tmp_path / "PBC").mkdir(exist_ok=True)
+    pipeline._refuse_stale_dataset_cache(tmp_path)
+    pipeline._refuse_stale_dataset_cache(tmp_path / "missing")
+
+
+@pytest.mark.parametrize("force_download", [False, True])
+def test_run_eval_checks_the_default_cache_only_without_force_download(
+    stubbed_pipeline, monkeypatch, tmp_path, force_download
+):
+    handler = pytest.importorskip("biotrainer.autoeval.core.autoeval_data_handler")
+    cache = tmp_path / "cache"
+    _make(cache, "CONTACT/contacts/casp14/x.fasta")
+    monkeypatch.setattr(handler, "get_autoeval_path", lambda: cache)
+    config = EvalConfig(
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        framework=["pbc_zeroshot_contact"],
+        output_dir=str(tmp_path / "out"),
+        device="cpu",
+        torch_compile=False,
+        force_download=force_download,
+    )
+
+    if force_download:
+        pipeline.run_eval(config)
+        assert stubbed_pipeline.instances[0].init_kwargs["force_download"] is True
+    else:
+        with pytest.raises(RuntimeError, match="layout of biotrainer < 2.1"):
+            pipeline.run_eval(config)
+        assert stubbed_pipeline.instances == []

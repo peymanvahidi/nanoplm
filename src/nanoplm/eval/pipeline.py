@@ -141,6 +141,31 @@ def _reused_frameworks(
     return reused
 
 
+def _refuse_stale_dataset_cache(root: Path) -> None:
+    """Raise if ``root`` holds the dataset layout of biotrainer < 2.1.
+
+    Without ``dataset_dir``, biotrainer 2.1 reads ``<root>/PBC`` and
+    ``<root>/PGYM`` and downloads only into empty directories. A cache left by
+    the PR #192 / 2.0 stack is therefore never refreshed: supervised PBC would
+    silently score the old files, and the contact frameworks and PGYM fail
+    later with unrelated-looking errors.
+    """
+    stale = []
+    if (root / "CONTACT").is_dir():
+        stale.append(root / "CONTACT")
+    pbc = root / "PBC"
+    if pbc.is_dir() and any(pbc.iterdir()) and not (pbc / "contacts").is_dir():
+        stale.append(pbc)
+    if stale:
+        raise RuntimeError(
+            f"The biotrainer dataset cache {root} has the layout of biotrainer "
+            f"< 2.1 ({', '.join(str(p) for p in stale)}), which 2.1 would reuse "
+            "without downloading the current bundle. Set dataset_dir to a "
+            "directory for the 2.1 datasets, or delete the cache so 2.1 downloads "
+            "the current bundle."
+        )
+
+
 def _completion_message(
     *, computed: list[str], reused: list[str], elapsed_s: float
 ) -> str:
@@ -198,6 +223,11 @@ def run_eval(eval_config: EvalConfig) -> None:
             "only clears the download cache, which a pre-populated dataset_dir "
             "does not use."
         )
+    if not eval_config.dataset_dir and not eval_config.force_download:
+        # force_download clears the whole cache, stale layout included.
+        from biotrainer.autoeval.core.autoeval_data_handler import get_autoeval_path
+
+        _refuse_stale_dataset_cache(get_autoeval_path())
 
     checkpoint_dir = resolve_checkpoint_dir(eval_config.checkpoint_dir)
     logger.info(f"Resolved checkpoint: {checkpoint_dir}")
