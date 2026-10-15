@@ -4,6 +4,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Union
 
+# PBC_SUPERVISED dataset names in biotrainer 2.1.1
+# (biotrainer_core's all_pbc_supervised_datasets()), as task.dataset_name
+# spells them. Kept here so this module imports without biotrainer.
+PBC_SUPERVISED_DATASETS = (
+    "conservation",
+    "disorder_chezod",
+    "frustration-classification",
+    "frustration-regression",
+    "phages",
+    "scl",
+    "secondary_structure",
+)
 
 @dataclass
 class EvalConfig:
@@ -23,7 +35,8 @@ class EvalConfig:
     # `framework`. The framework holds seven task heads and embeds every
     # sequence they need, which is ~13 min and ~30 GB of per-residue embeddings
     # for the full set; the standing battery only wants two of them, so the
-    # default restricts it. None means every dataset.
+    # default restricts it. 'all' or [] runs every dataset; a single name may
+    # be given as a bare string. (null in YAML keeps this default.)
     #   secondary_structure -> carries the newPISCES364 test split
     #   scl                 -> subcellular location
     pbc_supervised_datasets: Optional[List[str]] = field(
@@ -81,3 +94,21 @@ class EvalConfig:
     # Compiled with dynamic shapes, because every protein is a different
     # length; warmup is a few seconds and does not recur per shape.
     torch_compile: bool = True
+
+    def __post_init__(self):
+        wanted = self.pbc_supervised_datasets
+        if wanted is None:
+            return
+        if isinstance(wanted, str):
+            wanted = [wanted]
+        wanted = [str(name) for name in wanted]
+        if not wanted or any(name.lower() == "all" for name in wanted):
+            self.pbc_supervised_datasets = None
+            return
+        unknown = [name for name in wanted if name not in PBC_SUPERVISED_DATASETS]
+        if unknown:
+            raise ValueError(
+                f"Unknown pbc_supervised_datasets {unknown}. Expected 'all' or "
+                f"names from: {list(PBC_SUPERVISED_DATASETS)}."
+            )
+        self.pbc_supervised_datasets = wanted

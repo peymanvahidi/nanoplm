@@ -302,10 +302,7 @@ def run(
         force_download=force_download,
         loop_count=loop_count,
         torch_compile=torch_compile,
-        pbc_supervised_datasets=(
-            None if "all" in pbc_supervised_dataset
-            else list(pbc_supervised_dataset)
-        ),
+        pbc_supervised_datasets=list(pbc_supervised_dataset),
     )
 
     from nanoplm.eval.pipeline import run_eval
