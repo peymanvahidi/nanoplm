@@ -289,7 +289,9 @@ def run_eval(eval_config: EvalConfig) -> None:
                 "Adding PBC zero-shot contact (categorical Jacobian), "
                 f"batch_size={eval_config.zero_shot_batch_size}"
             )
-            autoeval.pbc_zeroshot_contact()
+            autoeval.pbc_zeroshot_contact(
+                batch_size=eval_config.zero_shot_batch_size
+            )
         elif framework == "pbc_supervised":
             wanted = eval_config.pbc_supervised_datasets
             # Restricting the datasets also restricts the embedding: biotrainer
