@@ -3104,18 +3104,19 @@ def run_pure_pretraining(
                 and "epoch_data_step" in _ckp_state
             ):
                 # Restore the exact within-pass position saved at checkpoint time.
-                # (Boundary/periodic saves persist epoch_data_step/sub_batch/
-                # divisor; the dataloader fast-forwards to this point.)
+                # (Every save, terminal included, persists epoch_data_step/
+                # sub_batch/divisor; the dataloader fast-forwards to this point.)
                 resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
                 resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
                 resume_batch_split_divisor = max(
                     1, int(_ckp_state.get("batch_split_divisor", 1))
                 )
             else:
-                # Dataset changed, pre-upgrade checkpoint, or a terminal/role
-                # checkpoint without a saved within-pass position: replay the
-                # DataLoader from the top of the current pass (spec §11 honest
-                # fallback). The LR schedule still fast-forwards via global_step.
+                # Dataset changed, or a checkpoint written before the position
+                # was saved (terminal/role checkpoints only carry it since
+                # #154): replay the DataLoader from the top of the current pass
+                # (spec §11 honest fallback). The LR schedule still fast-forwards
+                # via global_step.
                 resume_data_step = 0
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
@@ -3435,10 +3436,14 @@ def run_pure_pretraining(
     wallclock_stop = False
     wallclock_stop_ckpt = ""
     # Where the next pass would resume, refreshed at every step boundary so the
-    # post-loop terminal save can record it too. Empty until the first step
-    # completes, so a zero-step run falls back to the old position-less save
-    # rather than reading a loop variable that was never bound.
-    latest_data_pos: dict = {}
+    # post-loop terminal save can record it too. Seeded with the resume position
+    # so a run that takes zero steps (resumed at or past total_steps) rewrites
+    # its terminal checkpoint with the position it loaded instead of dropping it.
+    latest_data_pos = dict(
+        epoch_data_step=resume_data_step,
+        epoch_sub_batch_step=resume_sub_batch_step,
+        batch_split_divisor=resume_batch_split_divisor,
+    )
 
     # Single entry point for every checkpoint write. The common kwargs are
     # captured by reference (resolved at call time); per-call-site differences
