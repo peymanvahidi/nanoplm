@@ -44,7 +44,7 @@ dependencies = [
     "wandb>=0.19.11,<0.20.0",
     "certifi>=2024.7.4",
     "ipython>=8.3.0",
-    "kernels>=0.12.0,<0.13",
+    "kernels>=0.17,<0.18",
     "pytest",
 ]
 
@@ -56,7 +56,7 @@ nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
 nanoplm-eval = "nanoplm.cli.eval:eval"
 
 [project.optional-dependencies]
-eval = ["biotrainer==2.0.0", "biotrainer-core>=2.0.0"]
+eval = ["biotrainer==2.1.1", "biotrainer-core==2.1.1"]
 docs = ["pyyaml>=6"]
 
 [project.urls]
