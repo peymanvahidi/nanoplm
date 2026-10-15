@@ -241,6 +241,15 @@ def run_eval(eval_config: EvalConfig) -> None:
     ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``. Results for this embedder
     left by another biotrainer version stop the run before the model loads.
     """
+    # MoE checkpoints route the MLP through sonicmoe's quack GEMM, whose
+    # autotuner keys on tensor shapes. Eval's variable-length batches make
+    # almost every batch a new key, at ~11 s a search for no measurable
+    # steady-state gain. Must run before the model is loaded.
+    from nanoplm.eval._quack_untuned import disable_quack_autotune
+
+    if disable_quack_autotune():
+        logger.info("quack GEMM autotuning disabled for eval "
+                    "(set NANOPLM_EVAL_QUACK_TUNED=1 to restore)")
     _disable_h100_triton_srelu()
 
     biotrainer = _load_biotrainer_symbols()

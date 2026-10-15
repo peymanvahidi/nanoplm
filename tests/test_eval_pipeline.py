@@ -41,6 +41,9 @@ def stubbed_pipeline(monkeypatch):
         "version": "2.1.1",
     }
     monkeypatch.setattr(pipeline, "_load_biotrainer_symbols", lambda: symbols)
+    monkeypatch.setattr(
+        "nanoplm.eval._quack_untuned.disable_quack_autotune", lambda: False
+    )
     monkeypatch.setattr(pipeline, "resolve_checkpoint_dir", lambda d: d)
     monkeypatch.setattr(pipeline, "load_model_config_from_checkpoint", lambda d: {})
     monkeypatch.setattr(
@@ -74,6 +77,91 @@ def test_zero_shot_contact_gets_the_configured_batch_size(stubbed_pipeline, tmp_
 
     (autoeval,) = stubbed_pipeline.instances
     assert autoeval.calls == [("pbc_zeroshot_contact", {"batch_size": 123})]
+
+
+def test_run_eval_disables_quack_autotune_before_loading_the_model(
+    stubbed_pipeline, monkeypatch, tmp_path
+):
+    """from-yaml and programmatic callers reach run_eval without the CLI's
+    `run` command, so the patch has to live in run_eval itself."""
+    order = []
+    monkeypatch.setattr(
+        "nanoplm.eval._quack_untuned.disable_quack_autotune",
+        lambda: order.append("quack") or True,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "load_checkpoint",
+        lambda d, cfg, device: order.append("load") or SimpleNamespace(tokenizer=None),
+    )
+    pipeline.run_eval(
+        EvalConfig(
+            checkpoint_dir=str(tmp_path / "ckpt"),
+            framework=["pbc_zeroshot_contact"],
+            output_dir=str(tmp_path / "out"),
+            dataset_dir=str(tmp_path / "data"),
+            device="cpu",
+            torch_compile=False,
+        )
+    )
+    assert order == ["quack", "load"]
+
+
+def test_from_yaml_reaches_the_quack_patch(stubbed_pipeline, monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    import nanoplm.cli.eval as cli_eval
+
+    calls = []
+    monkeypatch.setattr(
+        "nanoplm.eval._quack_untuned.disable_quack_autotune",
+        lambda: calls.append(1) or True,
+    )
+    monkeypatch.setattr(cli_eval, "_check_biotrainer_available", lambda: None)
+    config = tmp_path / "eval.yaml"
+    config.write_text(
+        "eval:\n"
+        f"  checkpoint_dir: {tmp_path / 'ckpt'}\n"
+        "  framework: [pbc_zeroshot_contact]\n"
+        f"  output_dir: {tmp_path / 'out'}\n"
+        f"  dataset_dir: {tmp_path / 'data'}\n"
+        "  device: cpu\n"
+        "  torch_compile: false\n"
+    )
+    result = CliRunner().invoke(cli_eval.eval, ["from-yaml", str(config)])
+    assert result.exit_code == 0, result.output
+    assert calls == [1]
+
+
+def test_quack_patch_is_idempotent(monkeypatch):
+    """Fake quack modules: the real ones would be mutated for the whole session."""
+    import sys
+    import types
+
+    import nanoplm.eval._quack_untuned as untuned
+
+    quack = types.ModuleType("quack")
+    gi = types.ModuleType("quack.gemm_interface")
+    for name in untuned._NAMES:
+        setattr(gi, name, lambda *a, **k: k)
+    quack.gemm_interface = gi
+    monkeypatch.setitem(sys.modules, "quack", quack)
+    monkeypatch.setitem(sys.modules, "quack.gemm_interface", gi)
+    monkeypatch.setitem(sys.modules, "sonicmoe", None)
+    monkeypatch.setitem(sys.modules, "sonicmoe.functional", None)
+    monkeypatch.delenv("NANOPLM_EVAL_QUACK_TUNED", raising=False)
+    monkeypatch.setattr(untuned, "_applied", False)
+
+    assert untuned.disable_quack_autotune() is True
+    patched = gi.gemm
+    assert untuned.disable_quack_autotune() is False
+    assert gi.gemm is patched
+    assert gi.gemm(tuned=True) == {"tuned": False}
+    # Even with the flag reset, an already-wrapped entry point is not rewrapped.
+    monkeypatch.setattr(untuned, "_applied", False)
+    untuned.disable_quack_autotune()
+    assert gi.gemm is patched
+    assert not hasattr(patched.__wrapped__, "__wrapped__")
 
 
 # ---------------------------------------------------------------------------
