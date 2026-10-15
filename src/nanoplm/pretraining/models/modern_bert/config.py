@@ -275,6 +275,11 @@ class ModernBertConfig:
                 f"loopie_loop_count={self.loopie_loop_count} has no effect when use_loopie=false; "
                 "set use_loopie: true or leave loopie_loop_count at its default of 2."
             )
+        elif self.loopie_bptt is not None:
+            raise ValueError(
+                f"loopie_bptt={self.loopie_bptt} has no effect when use_loopie=false; "
+                "set use_loopie: true or leave loopie_bptt unset."
+            )
         # GQA: resolve num_kv_heads (None = MHA, i.e. same as num_attention_heads).
         if self.num_kv_heads is None:
             self.num_kv_heads = self.num_attention_heads
