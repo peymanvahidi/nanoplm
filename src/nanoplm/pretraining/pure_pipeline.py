@@ -390,6 +390,9 @@ def _dynamo_recompile_limit(
     MoE mlp frame sees neither ``max_seqlen`` nor R and stays at <= 4 entries
     (None/tensor ``last_aux_loss`` x grad mode). The tensor-R fallback
     (``_forward_repeats``) is off the training path and not sized here.
+    Huginn recycling runs the core layers under both grad modes once
+    ``recycling_bptt`` truncates the recurrence: x 2 on either frame, set for
+    every Huginn run since ``recycling_bptt`` lives in the pretrain config.
 
     Batch-size warmup keeps a floor of 16 (8 otherwise). Its stages do not
     share a cache (each stage boundary calls ``torch.compiler.reset()``), and
@@ -401,6 +404,8 @@ def _dynamo_recompile_limit(
         n_r = 2 * max(0, int(loopie_jitter)) + 1
         grad_modes = 2 if getattr(model_config, "loopie_bptt", None) is not None else 1
         per_shape = max(n_r, grad_modes)
+    elif getattr(model_config, "use_huginn_looping", False):
+        per_shape = 2  # truncated recurrence runs the core layers under no_grad too
     return max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * per_shape)
 
 
@@ -414,9 +419,17 @@ def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
             dynamo_config.recompile_limit = needed
             logger.info(
                 "torch._dynamo.config.recompile_limit raised from %d to %d "
-                "(layer variants x input shapes x loopie R / grad modes).",
+                "(layer variants x input shapes x recurrence R / grad modes).",
                 current_limit,
                 dynamo_config.recompile_limit,
+            )
+        accumulated_limit = int(getattr(dynamo_config, "accumulated_recompile_limit", 256))
+        if needed >= accumulated_limit * 3 // 4:
+            logger.warning(
+                "Dynamo recompile_limit %d is close to accumulated_recompile_limit %d, "
+                "the per-frame cap on all entries; a frame past it runs eager.",
+                dynamo_config.recompile_limit,
+                accumulated_limit,
             )
     except Exception:
         logger.exception("Failed to raise Dynamo recompile_limit; continuing.")
