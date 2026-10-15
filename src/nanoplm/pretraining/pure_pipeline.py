@@ -4249,6 +4249,10 @@ def run_pure_pretraining(
                                 wallclock_stop_ckpt,
                             )
                         break
+                    # A split macro-batch (batch warmup) can hold more optimizer
+                    # steps than remain; stop at the horizon, not the batch end.
+                    if global_step >= total_steps:
+                        break
 
                 if wallclock_stop:
                     break
