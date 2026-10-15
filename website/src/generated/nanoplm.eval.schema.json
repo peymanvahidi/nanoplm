@@ -8,18 +8,31 @@
       "description": "Checkpoint path. Accepts a checkpoint-* directory or a run-* directory (the latest checkpoint inside the run-* is used)."
     },
     "framework": {
-      "type": "array",
+      "type": [
+        "array",
+        "string"
+      ],
       "default": [
         "pgym"
       ],
+      "items": {
+        "type": "string"
+      },
       "description": "Benchmark framework(s) to evaluate on. One or more of: pgym, pbc_zeroshot_contact, pbc_supervised, pbc_supervised_contact. 'pgym' scores ProteinGym DMS variants zero-shot, 'pbc_zeroshot_contact' predicts contact maps from the categorical Jacobian, 'pbc_supervised_contact' fits a probe on the attention maps, and 'pbc_supervised' trains task heads on the frozen encoder's embeddings."
     },
     "pbc_supervised_datasets": {
-      "type": "array",
+      "type": [
+        "array",
+        "string",
+        "null"
+      ],
       "default": [
         "secondary_structure",
         "scl"
       ],
+      "items": {
+        "type": "string"
+      },
       "description": "Which PBC_SUPERVISED datasets to run, when 'pbc_supervised' is in `framework`. The framework holds seven task heads and embeds every sequence they need, which is ~13 min and ~30 GB of per-residue embeddings for the full set; the standing battery only wants two of them, so the default restricts it. 'all' or [] runs every dataset; a single name may be given as a bare string. (null in YAML keeps this default.) secondary_structure -> carries the newPISCES364 test split scl                 -> subcellular location"
     },
     "output_dir": {

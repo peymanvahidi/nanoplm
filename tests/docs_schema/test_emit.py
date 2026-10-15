@@ -78,7 +78,8 @@ def test_eval_required_field_has_no_fabricated_default():
 def test_eval_factory_default_is_resolved():
     props = emit.build_surface("eval")["properties"]
     fr = props["framework"]
-    assert fr["type"] == "array"
+    assert emit._json_type_from_annotation("List[str]") == "array"
+    assert fr["type"] == ["array", "string"]  # overlay: a bare string is accepted too
     assert fr["default"] == ["pgym"]      # the resolved value, not the lambda source string
 
 def test_eval_none_default_is_json_null():

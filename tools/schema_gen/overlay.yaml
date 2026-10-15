@@ -171,6 +171,9 @@ distillation.lr_scheduler:
 eval.zero_shot_method:
   enum: [masked_marginals, wt_marginals, pseudoperplexity]
 eval.loop_count: { backend: [pure_torch], advanced: true, minimum: 1 }
+# Both also take a bare string; null keeps the datasets default.
+eval.framework: { type: [array, string], items: { type: string } }
+eval.pbc_supervised_datasets: { type: [array, string, "null"], items: { type: string } }
 
 # =============================================================================
 # x-extra-fields: RESERVED KEY (not a "<section>.<field>" annotation).
