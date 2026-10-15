@@ -367,9 +367,14 @@ def single_rank_fsdp():
         )
     mesh = init_device_mesh("cpu", (1,))
 
-    def _shard(model):
-        # Per-layer units, then the root, as pure_pipeline shards them.
+    def _shard(model, sublayer=False):
+        # Per-layer units (attn and mlp first with sublayer granularity), then
+        # the root, as pure_pipeline shards them.
         for layer in model.model.layers:
+            if sublayer:
+                fully_shard(layer.attn, mesh=mesh, reshard_after_forward=False)
+                if layer.mlp is not None:
+                    fully_shard(layer.mlp, mesh=mesh, reshard_after_forward=False)
             fully_shard(layer, mesh=mesh, reshard_after_forward=False)
         fully_shard(model, mesh=mesh, reshard_after_forward=False)
         return model
@@ -379,23 +384,46 @@ def single_rank_fsdp():
         dist.destroy_process_group()
 
 
+_MOE = dict(
+    use_moe=True, moe_num_experts=4, moe_top_k=2, moe_leading_dense_layers=2,
+    mlp_activation="swiglu",
+)
+
+
 @pytest.mark.parametrize(
-    "pattern, num_layers, variants, bptt",
+    "pattern, num_layers, variants, bptt, jitter, moe, sublayer, seqlens, frame, expected",
     # "F": layer 0 (Identity attn_norm) + the rest. "FS": that, plus the
-    # sliding layers, whose window_size is an extra guard. bptt=1 shows the
-    # no_grad applications add no entries on the unrolled path.
-    [("F", 3, 2, None), ("FS", 4, 3, 1)],
+    # sliding layers, whose window_size is an extra guard. MoE with two
+    # leading dense layers: layer 0, dense, MoE. Per-layer units: the layer
+    # frame needs V x S x N, and bptt=1 adds nothing on the unrolled path.
+    # Sublayer units: the frame is _forward_once, which splits on grad mode
+    # under bptt (x 2) but not on R, and no longer sees the attention type or
+    # MLP kind (those moved into their own frames), so only layer 0 differs:
+    # 2 x S x 2, with a third max_seqlen to clear the default limit. The MoE
+    # mlp frame stays at <= 4 entries.
+    [
+        ("F", 3, 2, None, 1, False, False, _MAX_SEQLENS, "forward", 2 * 2 * 3),
+        ("FS", 4, 3, 1, 1, False, False, _MAX_SEQLENS, "forward", 3 * 2 * 3),
+        ("F", 4, 3, None, 1, True, False, _MAX_SEQLENS, "forward", 3 * 2 * 3),
+        ("FS", 4, 3, 1, 1, False, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
+        ("FS", 4, 3, 1, 0, False, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
+        ("F", 4, 3, 1, 1, True, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
+    ],
+    ids=["F", "FS-bptt", "moe-jitter", "FS-sublayer-bptt", "FS-sublayer-bptt-j0",
+         "moe-sublayer-bptt"],
 )
 def test_jitter_training_fits_the_computed_recompile_limit(
-    monkeypatch, make_counting_backend, single_rank_fsdp, pattern, num_layers, variants, bptt
+    monkeypatch, make_counting_backend, single_rank_fsdp,
+    pattern, num_layers, variants, bptt, jitter, moe, sublayer, seqlens, frame, expected,
 ):
-    """Int-R jitter training under FSDP2 must fit the limit the pipeline sets.
+    """Loopie training under FSDP2 must fit the limit the pipeline sets.
 
-    FSDP2's dynamo-disabled hooks break the graph at every layer call, so
-    ``ModernBertEncoderLayer.forward`` is one frame shared by all layers, and
-    the int R specializes it: V x S x N entries. With the limit from
-    ``_dynamo_recompile_limit`` and ``fail_on_recompile_limit_hit`` on, an
-    undersized limit raises instead of silently running that shape eager.
+    FSDP2's dynamo-disabled hooks break the graph at every FSDP unit, so
+    ``ModernBertEncoderLayer.forward`` (or ``_forward_once`` with sublayer
+    units) is one frame shared by all layers, and the int R and the input
+    shapes specialize it. With the limit from ``_dynamo_recompile_limit`` and
+    ``fail_on_recompile_limit_hit`` on, an undersized limit raises instead of
+    silently running that shape eager.
     """
     monkeypatch.setattr(modeling, "_flash_varlen_fn", _stub_flash_varlen)
     monkeypatch.setattr(modeling, "_HAS_FLASH_VARLEN", True)
@@ -407,27 +435,28 @@ def test_jitter_training_fits_the_computed_recompile_limit(
             use_loopie=True,
             loopie_loop_count=2,
             loopie_bptt=bptt,
+            **(_MOE if moe else {}),
         )
     ).train()
     assert _count_layer_variants(model.model.layers) == variants
     limit = _dynamo_recompile_limit(
         model.model_config,
         layers=model.model.layers,
-        loopie_jitter=1,
+        loopie_jitter=jitter,
         global_batch_warmup_steps=0,
-        n_input_shapes=len(_MAX_SEQLENS),
+        n_input_shapes=len(seqlens),
     )
-    expected = variants * len(_MAX_SEQLENS) * len(_JITTER_RS)
     assert expected > 8, "test precondition: the default limit must be too small"
-    single_rank_fsdp(model)
+    single_rank_fsdp(model, sublayer=sublayer)
 
     backend, _ = make_counting_backend()
     torch._dynamo.reset()
     counters.clear()
     compiled = torch.compile(model, backend=backend, dynamic=False)
+    rs = range(2 - jitter, 2 + jitter + 1)
     with torch._dynamo.config.patch(recompile_limit=limit, fail_on_recompile_limit_hit=True):
-        for max_seqlen in _MAX_SEQLENS:
-            for r in _JITTER_RS:
+        for max_seqlen in seqlens:
+            for r in rs:
                 input_ids = torch.randint(0, model.model_config.vocab_size, (_PACKED_TOKENS,))
                 cu_seqlens = torch.arange(0, _PACKED_TOKENS + 1, max_seqlen, dtype=torch.int32)
                 torch._dynamo.mark_dynamic(cu_seqlens, 0)
@@ -443,11 +472,15 @@ def test_jitter_training_fits_the_computed_recompile_limit(
 
     breaks = [reason for reason in counters["graph_break"] if "_forward_repeats" in reason]
     assert not breaks, f"int R reached the eager driver:\n{breaks}"
-    entries = len(_debug_get_cache_entry_list(ModernBertEncoderLayer.forward.__code__))
+    code = getattr(ModernBertEncoderLayer, frame).__code__
+    entries = len(_debug_get_cache_entry_list(code))
     assert entries == expected, (
-        f"ModernBertEncoderLayer.forward has {entries} cache entries; expected "
-        f"V={variants} x S={len(_MAX_SEQLENS)} x N={len(_JITTER_RS)}."
+        f"ModernBertEncoderLayer.{frame} has {entries} cache entries; expected {expected}."
     )
+    if moe:
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer
+
+        assert len(_debug_get_cache_entry_list(MoELayer.forward.__code__)) <= 4
     torch._dynamo.reset()
 
 
@@ -466,10 +499,12 @@ def test_recompile_limit_arithmetic():
         )
 
     assert _count_layer_variants([torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)]) == 1
-    assert limit(plain) == 8
-    assert limit(plain, warmup=10) == 16
-    assert limit(full_bptt, jitter=0) == 8
+    assert limit(plain) == 3 * 6  # V x S
+    assert limit(plain, shapes=2, variants=2) == 8  # floor wins
+    assert limit(plain, shapes=2, variants=2, warmup=10) == 16
+    assert limit(full_bptt, jitter=0) == 3 * 6
+    assert limit(truncated, jitter=0) == 3 * 6 * 2  # sublayer _forward_once splits on grad mode
     assert limit(full_bptt) == 3 * 6 * 3  # V x S x (2j + 1)
     assert limit(full_bptt, jitter=2) == 3 * 6 * 5
-    assert limit(truncated) == limit(full_bptt)  # bptt adds no entries
+    assert limit(truncated) == limit(full_bptt)  # grad modes do not multiply R
     assert limit(full_bptt, shapes=1, variants=1, warmup=10) == 16  # warmup floor wins

@@ -354,29 +354,34 @@ def _dynamo_recompile_limit(
 ) -> int:
     """Dynamo recompile_limit this run needs so no compiled frame falls back to eager.
 
-    Batch-size warmup keeps the 16 it always had. Its stages do not share a
-    cache (each stage boundary calls ``torch.compiler.reset()``), but split
-    micro-batches carry unbucketed ``max_seqlen`` values.
+    Under FSDP2 the dynamo-disabled per-layer hooks split the model at each
+    encoder layer, so ``ModernBertEncoderLayer.forward`` becomes one frame
+    shared by every layer and needs V x S entries: V structurally distinct
+    layers and S input shapes (the ``max_seqlen`` buckets on the static packed
+    path). Without FSDP the whole model is one frame and needs only S.
 
-    Loopie jitter passes R as a Python int (``_loop_count_fwd_kwargs``), and
-    every frame that sees it specializes once per value in the
-    {R0 - j, ..., R0 + j} support. Under FSDP2 the dynamo-disabled per-layer
-    hooks split the model at each encoder layer, so
-    ``ModernBertEncoderLayer.forward`` becomes one frame shared by every layer
-    and needs V x S x N entries: V structurally distinct layers, S input shapes
-    (the ``max_seqlen`` buckets on the static packed path) and N = 2j + 1
-    values of R. Without FSDP the whole model is one frame and needs S x N,
-    which the same bound covers. ``loopie_bptt`` adds nothing: its ``no_grad``
-    applications are traced inside the unrolled graph. The tensor-R fallback
-    (``_forward_repeats``, off the training path) needs V x S x 2 entries on
-    ``_forward_once``, which this bound covers for any j >= 1 (MoE layers add
-    a None/tensor ``last_aux_loss`` split there).
+    Loopie jitter passes R as a Python int (``_loop_count_fwd_kwargs``), which
+    the layer frame specializes on: x N, with N = 2j + 1 values in the
+    {R0 - j, ..., R0 + j} support. ``loopie_bptt`` adds nothing to that frame,
+    since its ``no_grad`` applications are traced inside the unrolled graph.
+    With ``fsdp_shard_granularity: sublayer`` the frame is ``_forward_once``
+    instead, entered once per application, and it splits on grad mode: x 2
+    under ``loopie_bptt``, not multiplied by N. MoE needs no extra factor: the
+    MoE mlp frame sees neither ``max_seqlen`` nor R and stays at <= 4 entries
+    (None/tensor ``last_aux_loss`` x grad mode). The tensor-R fallback
+    (``_forward_repeats``) is off the training path and not sized here.
+
+    Batch-size warmup keeps a floor of 16 (8 otherwise). Its stages do not
+    share a cache (each stage boundary calls ``torch.compiler.reset()``), but
+    split micro-batches carry unbucketed ``max_seqlen`` values.
     """
     limit = 16 if int(global_batch_warmup_steps) > 0 else 8
-    if getattr(model_config, "use_loopie", False) and int(loopie_jitter) > 0:
-        n_r = 2 * int(loopie_jitter) + 1
-        limit = max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * n_r)
-    return limit
+    per_shape = 1
+    if getattr(model_config, "use_loopie", False):
+        n_r = 2 * max(0, int(loopie_jitter)) + 1
+        grad_modes = 2 if getattr(model_config, "loopie_bptt", None) is not None else 1
+        per_shape = max(n_r, grad_modes)
+    return max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * per_shape)
 
 
 def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
@@ -389,7 +394,7 @@ def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
             dynamo_config.recompile_limit = needed
             logger.info(
                 "torch._dynamo.config.recompile_limit raised from %d to %d "
-                "(batch-size warmup / loopie jitter shapes).",
+                "(layer variants x input shapes x loopie R / grad modes).",
                 current_limit,
                 dynamo_config.recompile_limit,
             )
