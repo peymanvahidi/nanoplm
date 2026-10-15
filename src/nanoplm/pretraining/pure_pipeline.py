@@ -63,6 +63,7 @@ from nanoplm.data.infra.manifest import validate_manifest_for_pipeline, DataMani
 from nanoplm.pretraining.collator import (
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
+    _bucket_ceiling,
     build_power_of_two_buckets,
     mlm_masking_kwargs_from_config,
 )
@@ -225,8 +226,15 @@ def _split_packed_batch(
     batch: dict[str, Any],
     n_splits: int,
     effective_tokens_per_split: int,
+    max_seqlen_buckets: Optional[list[int]] = None,
 ) -> list[dict[str, Any]]:
-    """Split a packed flat-token batch at sequence boundaries and re-pad each split."""
+    """Split a packed flat-token batch at sequence boundaries and re-pad each split.
+
+    With ``max_seqlen_buckets`` (the static packed path), each split's
+    ``max_seqlen`` is rounded up to the collator's buckets, and the trailing
+    pad is cut into dummy segments no longer than the top bucket, so splits
+    add no compiled shapes.
+    """
     if n_splits <= 1:
         return [batch]
 
@@ -265,12 +273,19 @@ def _split_packed_batch(
         pad_tokens = effective_tokens_per_split - actual_tokens
         sub_cu = cu[start_seq : end_seq + 1] - cu[start_seq]
         actual_max_seqlen = int((sub_cu[1:] - sub_cu[:-1]).max().item())
+        pad_cap = max_seqlen_buckets[-1] if max_seqlen_buckets else max(1, pad_tokens)
+        pad_lens = [pad_cap] * (pad_tokens // pad_cap)
+        if pad_tokens % pad_cap:
+            pad_lens.append(pad_tokens % pad_cap)
+        max_seqlen = max([actual_max_seqlen, *pad_lens])
+        if max_seqlen_buckets:
+            max_seqlen = _bucket_ceiling(max_seqlen, max_seqlen_buckets, name="max_seqlen")
 
         sub = {
             "input_ids": batch["input_ids"].new_zeros(effective_tokens_per_split),
             "labels": batch["labels"].new_full((effective_tokens_per_split,), -100),
             "cu_seqlens": sub_cu,
-            "max_seqlen": max(actual_max_seqlen, pad_tokens),
+            "max_seqlen": max_seqlen,
             "num_valid_tokens": torch.tensor(actual_tokens, dtype=torch.long),
         }
         if actual_tokens > effective_tokens_per_split:
@@ -280,23 +295,26 @@ def _split_packed_batch(
             )
         sub["input_ids"][:actual_tokens] = batch["input_ids"][s:e]
         sub["labels"][:actual_tokens] = batch["labels"][s:e]
-        if pad_tokens > 0:
+        if pad_lens:
             sub["cu_seqlens"] = torch.cat(
                 [
                     sub["cu_seqlens"],
-                    sub["cu_seqlens"][-1:] + pad_tokens,
+                    sub["cu_seqlens"][-1:] + sub_cu.new_tensor(pad_lens).cumsum(0, dtype=sub_cu.dtype),
                 ]
             )
 
         if "position_ids" in batch:
             sub_pos = batch["position_ids"].new_zeros(effective_tokens_per_split)
             sub_pos[:actual_tokens] = batch["position_ids"][s:e]
-            if pad_tokens > 0:
-                sub_pos[actual_tokens:] = torch.arange(
-                    pad_tokens,
-                    dtype=batch["position_ids"].dtype,
-                    device=batch["position_ids"].device,
-                )
+            if pad_lens:
+                sub_pos[actual_tokens:] = torch.cat([
+                    torch.arange(
+                        n,
+                        dtype=batch["position_ids"].dtype,
+                        device=batch["position_ids"].device,
+                    )
+                    for n in pad_lens
+                ])
             sub["position_ids"] = sub_pos
 
         for key, value in batch.items():
@@ -315,6 +333,7 @@ def _split_batch(
     *,
     n_splits: int,
     effective_tokens_per_split: Optional[int] = None,
+    max_seqlen_buckets: Optional[list[int]] = None,
 ) -> list[dict[str, Any]]:
     if n_splits <= 1:
         return [batch]
@@ -325,6 +344,7 @@ def _split_batch(
             batch,
             n_splits=n_splits,
             effective_tokens_per_split=effective_tokens_per_split,
+            max_seqlen_buckets=max_seqlen_buckets,
         )
     return _split_standard_batch(batch, n_splits=n_splits)
 
@@ -372,8 +392,8 @@ def _dynamo_recompile_limit(
     (``_forward_repeats``) is off the training path and not sized here.
 
     Batch-size warmup keeps a floor of 16 (8 otherwise). Its stages do not
-    share a cache (each stage boundary calls ``torch.compiler.reset()``), but
-    split micro-batches carry unbucketed ``max_seqlen`` values.
+    share a cache (each stage boundary calls ``torch.compiler.reset()``), and
+    split micro-batches keep the collator's ``max_seqlen`` buckets.
     """
     limit = 16 if int(global_batch_warmup_steps) > 0 else 8
     per_shape = 1
@@ -2543,6 +2563,7 @@ def run_pure_pretraining(
 
     # ---- Collator / Sampler / Packing ----
     train_sampler = None
+    max_seqlen_buckets = None
 
     if use_packing:
         inner_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
@@ -3576,6 +3597,7 @@ def run_pure_pretraining(
                     full_batch,
                     n_splits=batch_split_divisor,
                     effective_tokens_per_split=effective_tokens_per_split if "cu_seqlens" in full_batch else None,
+                    max_seqlen_buckets=max_seqlen_buckets,
                 )
                 total_sub_batches = len(sub_batches)
                 if resume_sub_batch_start > 0 and is_main:
