@@ -20,10 +20,6 @@ uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
 uv pip install -e ".[eval]"
 ```
 
-:::note[pbc_zeroshot_contact needs a PR build]
-`pbc_zeroshot_contact` needs fixes not yet in the biotrainer 2.0.0 release; without them it fails with `TypeError: Got unsupported ScalarType BFloat16`. Run `tools/install_biotrainer_pr.sh` after the extra above to install biotrainer and biotrainer-core from [PR #192](https://github.com/sacdallago/biotrainer/pull/192) on top. The script needs outbound network to clone the PR branch, so run it on a machine that has one. See [Offline machines](#offline-machines) below for staging the benchmark data itself with `dataset_dir` on a compute node that doesn't.
-:::
-
 Evaluation loads **pure-torch checkpoints only**. That is one more reason to keep the stock `pure_torch: true` default when you pretrain, as [2. Pretrain](/nanoplm/pipeline/pretrain/) recommends.
 
 :::note[Zero-shot only]
