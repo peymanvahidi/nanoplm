@@ -3,6 +3,7 @@ biotrainer symbol and the checkpoint loading are stubbed.
 """
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -118,6 +119,8 @@ def test_from_yaml_reaches_the_quack_patch(stubbed_pipeline, monkeypatch, tmp_pa
         lambda: calls.append(1) or True,
     )
     monkeypatch.setattr(cli_eval, "_check_biotrainer_available", lambda: None)
+    # Other tests reload nanoplm.eval.pipeline; make the CLI import the stubbed one.
+    monkeypatch.setitem(sys.modules, "nanoplm.eval.pipeline", pipeline)
     config = tmp_path / "eval.yaml"
     config.write_text(
         "eval:\n"
@@ -135,7 +138,6 @@ def test_from_yaml_reaches_the_quack_patch(stubbed_pipeline, monkeypatch, tmp_pa
 
 def test_quack_patch_is_idempotent(monkeypatch):
     """Fake quack modules: the real ones would be mutated for the whole session."""
-    import sys
     import types
 
     import nanoplm.eval._quack_untuned as untuned
