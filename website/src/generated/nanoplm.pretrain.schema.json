@@ -641,7 +641,7 @@
           "default": null,
           "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
           "minimum": 1,
-          "description": "null = full backprop; k = grad through the last k applications only (~1.33x a plain step at R=2 with k=1, not 2x). With truncation, only k of the R applications send MoE aux-loss gradient to the router, each weighted 1/R.",
+          "description": "null = full backprop; k = grad through the last k applications only (~1.33x a plain step at R=2 with k=1, not 2x). With truncation, only k of the R applications send MoE aux- and z-loss gradient to the router, each weighted 1/R.",
           "x-nanoplm-backend": [
             "pure_torch"
           ],
