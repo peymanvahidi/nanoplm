@@ -201,3 +201,16 @@ def test_zero_step_resume_keeps_data_position(tmp_path, scenario):
     assert first[0]["resume_lines"] == second[0]["resume_lines"]
     assert first[0]["log"] == second[0]["log"] == []
 
+
+def test_pass_shorter_than_one_window_is_rejected(tmp_path):
+    """A pass of 1 micro-batch can't fill grad_accum=3, so no pass can ever
+    step. Setup must raise instead of replaying the loader forever."""
+    ds = _dataset(tmp_path, 2)
+    spec = dict(dataset_dir=str(ds), micro=2, ga=3, bwarm=0, mode="single",
+                ckp_dir=str(tmp_path / "ck"), steps=1, out=str(tmp_path / "o"))
+    (tmp_path / "s.json").write_text(json.dumps(spec))
+    r = subprocess.run([PY, str(HARNESS), str(tmp_path / "s.json")], cwd=tmp_path,
+                       env=_child_env(WANDB_MODE="disabled", OMP_NUM_THREADS="1"),
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode != 0
+    assert "fewer than grad_accum=3" in r.stderr, r.stderr[-4000:]

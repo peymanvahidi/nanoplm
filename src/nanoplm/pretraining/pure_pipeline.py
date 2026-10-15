@@ -2862,6 +2862,16 @@ def run_pure_pretraining(
             "train_loader is empty (synced_len=0); cannot satisfy the token budget. "
             "Check the dataset/manifest and per-rank sharding."
         )
+    # Batch warmup only lowers grad_accum, so a pass that fits one full window
+    # fits every warmup window too. Otherwise no pass can step and the replay
+    # loop below would spin forever.
+    if synced_len < inferred_grad_accum_steps:
+        raise RuntimeError(
+            f"train_loader yields {synced_len} micro-batches per rank per pass, fewer than "
+            f"grad_accum={inferred_grad_accum_steps}: one optimizer step "
+            f"(global_batch_tokens={pretrain_config.global_batch_tokens}) is larger than a "
+            "pass over the train set. Lower global_batch_tokens or use a larger dataset."
+        )
 
     # ---- Training horizon (token budget -> optimizer steps) ----
     # total_steps comes from the configured token/step budget, NOT from epochs.
