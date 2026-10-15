@@ -94,11 +94,14 @@ def run_phase(spec: dict) -> None:
         bf16=False, tf32=False, fp8=False, use_packing=False, use_static_inp_size=False,
         multi_gpu=dist_mode, world_size=world, num_workers=0,
         eval_steps=10_000_000, save_steps=10_000_000, logging_steps=10_000_000,
-        seed=SEED, optimizer="adamw", distributed_mode="ddp",
+        seed=SEED, optimizer="adamw", distributed_mode=spec.get("dist_mode", "ddp"),
     )
     _populate_batch_setup(cfg)
     if dist_mode:
         pp._bootstrap_single_process_env()
+    # The FSDP2 path builds its mesh on "cuda"; on CPU/gloo it must be "cpu".
+    _mesh = pp.init_device_mesh
+    pp.init_device_mesh = lambda _t, *a, **k: _mesh("cpu", *a, **k)
 
     log, msgs = [], []
     orig_move = pp._move_batch_to_device
