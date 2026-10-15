@@ -59,11 +59,13 @@ class EvalConfig:
     development_mode: bool = True
 
     # Pre-downloaded benchmark dataset directory, passed to biotrainer as
-    # custom_storage_path. Set this on machines without internet access.
+    # custom_storage_path. Set this on machines without internet access, and
+    # while ~/.cache/biotrainer/autoeval holds datasets from biotrainer < 2.1.
     # Mutually exclusive with force_download.
     dataset_dir: Optional[str] = None
 
-    # Force re-download of framework datasets (use when new tasks land upstream).
+    # Delete the whole ~/.cache/biotrainer/autoeval directory and download the
+    # datasets again. For a fresh copy elsewhere, use an empty dataset_dir.
     force_download: bool = False
 
     # Refinement depth to run this checkpoint at, overriding the depth it was

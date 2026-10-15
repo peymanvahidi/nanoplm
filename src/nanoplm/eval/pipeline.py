@@ -34,7 +34,7 @@ REMOVED_FRAMEWORKS = {"pbc", "flip"}
 
 
 def _load_biotrainer_symbols() -> dict[str, Any]:
-    """Import the biotrainer 2.0.0 symbols the eval pipeline depends on."""
+    """Import the biotrainer 2.1.1 symbols the eval pipeline depends on."""
     try:
         from biotrainer.autoeval import AutoEval
         from biotrainer.bioengineer import BioEngineer, CustomBioEngineerModel
@@ -49,7 +49,7 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
         from biotrainer_core.utils.constants import STANDARD_AAS
     except ImportError as e:
         raise ImportError(
-            "biotrainer 2.0.x is required for nanoplm eval but is not installed "
+            "biotrainer 2.1.1 is required for nanoplm eval but is not installed "
             f"or has an incompatible API. Install with: pip install nanoplm[eval]. "
             f"Original error: {e}"
         ) from e
@@ -207,8 +207,8 @@ def run_eval(eval_config: EvalConfig) -> None:
     removed = [f for f in frameworks if f in REMOVED_FRAMEWORKS]
     if removed:
         raise ValueError(
-            f"Framework(s) {removed} are no longer supported. nanoplm eval moved "
-            "to biotrainer 2.0.0 and now covers: "
+            f"Framework(s) {removed} are no longer supported. nanoplm eval runs "
+            "on biotrainer 2.1.1 and covers: "
             f"{sorted(FRAMEWORK_REPORT_NAMES)}."
         )
     unknown = [f for f in frameworks if f not in FRAMEWORK_REPORT_NAMES]

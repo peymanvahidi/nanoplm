@@ -51,11 +51,13 @@ nanoplm deps install
 
 ### Benchmarking extra
 
-`nanoplm eval` runs on [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline, so the `eval` extra pulls in **biotrainer 2.0.0** (plus `biotrainer-core`):
+`nanoplm eval` runs on [biotrainer](https://github.com/sacdallago/biotrainer)'s autoeval pipeline, so the `eval` extra pulls in **biotrainer 2.1.1** (plus `biotrainer-core`):
 
 ```bash
 uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"   # or: uv pip install -e ".[eval]"
 ```
+
+If `~/.cache/biotrainer/autoeval` holds datasets from an older biotrainer, `nanoplm eval` refuses to start until you set `dataset_dir` to a fresh directory or delete that cache.
 
 To take biotrainer straight from source instead, use the command below:
 
@@ -144,7 +146,7 @@ Run those two from the directory their relative paths belong to. In an sbatch sc
 
 ## Requirements
 
-- Python 3.12+, which backs `nanoplm eval` (biotrainer 2.0.0 caps below 3.14, so 3.12–3.13). Developed and tested on 3.12.
+- Python 3.12+, which backs `nanoplm eval` (biotrainer 2.1.1 caps below 3.14, so 3.12–3.13). Developed and tested on 3.12.
 - Linux x86_64 with an NVIDIA Hopper GPU; see the supported-platform note under [Install](#️-install).
 
 ---

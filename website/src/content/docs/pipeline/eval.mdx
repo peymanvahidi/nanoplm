@@ -11,7 +11,7 @@ This is where the checkpoint format pays off. `eval.yaml` needs **a path and a l
 
 ## Before you start
 
-Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer) 2.0.0, which is an optional
+Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer) 2.1.1, which is an optional
 dependency (not part of `nanoplm deps install`; see [Install](/nanoplm/start/install/)):
 
 ```sh
@@ -139,6 +139,10 @@ An MoE forward pass is not batch-composition invariant: what else shares the bat
 ## Offline machines
 
 Benchmark datasets are downloaded on first use into `~/.cache/biotrainer/autoeval/`. On a cluster whose compute nodes have no outbound network, download once somewhere with internet and point [`dataset_dir`](/nanoplm/reference/eval/#eval-dataset_dir) at the resulting tree. `dataset_dir` and `force_download` are mutually exclusive: a pre-populated directory does not use the download cache that `force_download` clears.
+
+biotrainer 2.1 changed the dataset layout. If `~/.cache/biotrainer/autoeval` still holds datasets from an older biotrainer, `nanoplm eval` refuses to start without `dataset_dir`, because 2.1 would reuse the old files instead of downloading the current ones. Point `dataset_dir` at a fresh directory, or delete the cache.
+
+`force_download` deletes the whole `~/.cache/biotrainer/autoeval` directory before downloading, including datasets another biotrainer install may still use. To get a fresh copy without touching that cache, set `dataset_dir` to an empty directory instead.
 
 ## What you get
 

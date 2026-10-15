@@ -35,7 +35,7 @@ def _check_biotrainer_available() -> None:
         import biotrainer_core.data_classes  # noqa: F401
     except ImportError:
         raise click.ClickException(
-            "biotrainer 2.0.x is required for nanoplm eval but is not installed.\n"
+            "biotrainer 2.1.1 is required for nanoplm eval but is not installed.\n"
             "Install it with:  pip install nanoplm[eval]"
         )
 
@@ -46,8 +46,8 @@ def _validate_frameworks(frameworks: List[str]) -> None:
     for fw in frameworks:
         if fw in _REMOVED_FRAMEWORKS:
             raise click.ClickException(
-                f"Framework {fw!r} is no longer supported. nanoplm eval moved to "
-                "biotrainer 2.0.0 and now covers: "
+                f"Framework {fw!r} is no longer supported. nanoplm eval runs on "
+                "biotrainer 2.1.1 and covers: "
                 f"{sorted(_VALID_FRAMEWORKS)}."
             )
         if fw not in _VALID_FRAMEWORKS:
