@@ -77,7 +77,9 @@ eval:
   # A checkpoint-* directory, or a run-* directory (the newest checkpoint inside it is used).
   checkpoint_dir: "output/pretraining_checkpoints/run-14071932/checkpoint-final"
 
-  framework: [pgym]                   # one or more of: pgym, pbc_zeroshot_contact
+  framework: [pgym]                   # one or more of: pgym, pbc_zeroshot_contact, pbc_supervised, pbc_supervised_contact
+
+  # pbc_supervised_datasets: [secondary_structure, scl]   # or one name, or all
 
   output_dir: "autoeval_output"
 

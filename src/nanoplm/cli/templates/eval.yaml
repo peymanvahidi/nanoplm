@@ -12,8 +12,13 @@ eval:
   checkpoint_dir: "output/pretraining_checkpoints/run-1/checkpoint-1"
 
   # pgym and pbc_zeroshot_contact score the model as-is; pbc_supervised
-  # trains task heads on its frozen embeddings.
-  framework: [pgym]     # pgym | pbc_zeroshot_contact | pbc_supervised
+  # trains task heads on its frozen embeddings, and pbc_supervised_contact
+  # fits a probe on its attention maps.
+  framework: [pgym]     # pgym | pbc_zeroshot_contact | pbc_supervised | pbc_supervised_contact
+
+  # Datasets for pbc_supervised. A list, a single name, or 'all' (or []) for
+  # all seven; null keeps the default below.
+  # pbc_supervised_datasets: [secondary_structure, scl]
 
   output_dir: "autoeval_output"
 

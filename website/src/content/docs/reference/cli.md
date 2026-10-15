@@ -362,6 +362,8 @@ nanoplm eval run --checkpoint-dir DIR [OPTIONS]
 | `--development-mode / --full-eval` | Subsampled task sets, or the full benchmark | `--development-mode` |
 | `--dataset-dir TEXT` | Pre-downloaded benchmark datasets, for offline machines. Mutually exclusive with `--force-download` | none |
 | `--force-download` | Re-download benchmark datasets | off |
+| `--loop-count INTEGER` | Refinement depth to run a looped (loopie or huginn) checkpoint at, overriding the depth it was trained with | the trained depth |
+| `--torch-compile / --no-torch-compile` | Run the model through `torch.compile` with dynamic shapes (roughly 2x faster than eager) | `--torch-compile` |
 
 ---
 
