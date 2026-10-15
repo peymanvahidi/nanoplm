@@ -225,6 +225,31 @@ def test_contact_map_collapses_to_l_by_l():
     assert contacts.shape == (len(short), len(short))
 
 
+def test_jacobian_batches_by_the_chunk_size_not_biotrainers_batch_size():
+    """zero_shot_contact_map passes its own batch_size; the shim must ignore it
+    and use ``_chunk_size``, which caps the configured size by the token budget."""
+    engineer, _, tokenizer, biotrainer = _build_engineer(batch_size=7)
+    wrapper = engineer.model_wrapper
+    short = SEQUENCE[:12]
+    n_leading, n_trailing = special_token_offsets(tokenizer)
+
+    rows = []
+    original = wrapper._model_batched_forward_fn
+
+    def recording(*args, **kwargs):
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        rows.append(input_ids.shape[0])
+        return original(*args, **kwargs)
+
+    wrapper._model_batched_forward_fn = recording
+    engineer.zero_shot_contact_map(
+        biotrainer["ZeroShotMethod"].JACOBIAN_CONTACT, short, 999
+    )
+
+    assert wrapper._chunk_size(n_leading + len(short) + n_trailing) == 7
+    assert rows == [7] * 34 + [2]  # 12 residues x 20 = 240 rows
+
+
 def test_jacobian_rejects_a_tokenization_it_cannot_align():
     engineer, _, _, _ = _build_engineer()
     wrapper = engineer.model_wrapper
