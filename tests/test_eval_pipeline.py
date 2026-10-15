@@ -37,6 +37,7 @@ def stubbed_pipeline(monkeypatch):
         "AutoEvalReport": SimpleNamespace(
             get_file_name=lambda name: f"autoeval_report_{name}.json"
         ),
+        "version": "2.1.1",
     }
     monkeypatch.setattr(pipeline, "_load_biotrainer_symbols", lambda: symbols)
     monkeypatch.setattr(pipeline, "resolve_checkpoint_dir", lambda d: d)
@@ -138,3 +139,24 @@ def test_run_eval_checks_the_default_cache_only_without_force_download(
         with pytest.raises(RuntimeError, match="layout of biotrainer < 2.1"):
             pipeline.run_eval(config)
         assert stubbed_pipeline.instances == []
+
+
+def test_run_eval_refuses_results_from_another_biotrainer(stubbed_pipeline, tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "autoeval_report_stub.json").write_text("{}")
+    (out / "autoeval_report_stub.provenance.json").write_text(
+        '{"biotrainer_version": "2.0.0"}'
+    )
+    config = EvalConfig(
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        framework=["pgym"],
+        output_dir=str(out),
+        dataset_dir=str(tmp_path / "data"),
+        device="cpu",
+        torch_compile=False,
+    )
+
+    with pytest.raises(RuntimeError, match="fresh output_dir"):
+        pipeline.run_eval(config)
+    assert stubbed_pipeline.instances == []

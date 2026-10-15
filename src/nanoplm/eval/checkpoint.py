@@ -82,6 +82,10 @@ class EvalProvenance:
     ``run_name`` is the directory the checkpoint sits in, which still names the
     run when ``run.json`` is absent, so it can disagree with
     ``training_run["run_name"]`` after the run directory was moved.
+
+    ``biotrainer_version`` is what decides whether a later run may reuse the
+    results beside this record. It is ``None`` in sidecars written before the
+    field existed.
     """
 
     embedder_name: str
@@ -92,6 +96,7 @@ class EvalProvenance:
     eval_git_sha: Optional[str]
     eval_started_at: str
     training_run: Optional[dict[str, Any]]
+    biotrainer_version: Optional[str] = None
 
     @classmethod
     def resolve(
@@ -100,6 +105,7 @@ class EvalProvenance:
         checkpoint_dir: Union[str, Path],
         embedder_name: Optional[str],
         loop_count: Optional[int],
+        biotrainer_version: Optional[str] = None,
     ) -> "EvalProvenance":
         checkpoint_dir = Path(checkpoint_dir).resolve()
         return cls(
@@ -111,7 +117,16 @@ class EvalProvenance:
             eval_git_sha=git_sha(Path(__file__).resolve().parent),
             eval_started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             training_run=_read_run_manifest(checkpoint_dir.parent),
+            biotrainer_version=biotrainer_version,
         )
+
+
+def eval_provenance_path(report_path: Union[str, Path]) -> Path:
+    """The sidecar path for a report: its stem plus ``.provenance.json``."""
+    report_path = Path(report_path)
+    return report_path.with_name(
+        report_path.name.removesuffix(".json") + ".provenance.json"
+    )
 
 
 def write_eval_provenance(
@@ -122,10 +137,7 @@ def write_eval_provenance(
     It shares the report's stem so a reader holding a report path finds it by
     appending one suffix.
     """
-    report_path = Path(report_path)
-    sidecar_path = report_path.with_name(
-        report_path.name.removesuffix(".json") + ".provenance.json"
-    )
+    sidecar_path = eval_provenance_path(report_path)
     record = asdict(provenance) | {"checkpoint_dir": str(provenance.checkpoint_dir)}
     try:
         with atomic_write_path(sidecar_path) as tmp:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -10,6 +11,7 @@ import torch
 
 from nanoplm.eval.checkpoint import (
     EvalProvenance,
+    eval_provenance_path,
     load_checkpoint,
     load_model_config_from_checkpoint,
     resolve_checkpoint_dir,
@@ -36,6 +38,7 @@ REMOVED_FRAMEWORKS = {"pbc", "flip"}
 def _load_biotrainer_symbols() -> dict[str, Any]:
     """Import the biotrainer 2.1.1 symbols the eval pipeline depends on."""
     try:
+        import biotrainer
         from biotrainer.autoeval import AutoEval
         from biotrainer.bioengineer import BioEngineer, CustomBioEngineerModel
         from biotrainer.bioengineer.models import (
@@ -65,6 +68,7 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
         "ZeroShotMethod": ZeroShotMethod,
         "SequenceTooLongError": SequenceTooLongError,
         "STANDARD_AAS": STANDARD_AAS,
+        "version": biotrainer.__version__,
     }
 
 
@@ -166,6 +170,43 @@ def _refuse_stale_dataset_cache(root: Path) -> None:
         )
 
 
+def _refuse_results_from_another_biotrainer(
+    *, output_dir: Path, embedder_name: str, report_path: Path, version: str
+) -> None:
+    """Raise if this embedder's results in ``output_dir`` came from another biotrainer.
+
+    AutoEval reuses a stored framework result and the per-protein contact
+    cache without asking which biotrainer wrote them, and 2.1 reads a report
+    from an older version's development mode as a full result. Every run
+    writes its provenance sidecar before evaluating, so results whose sidecar
+    is missing or names another version are refused rather than reused.
+    Other embedders in the same ``output_dir`` are never read by this run and
+    are not checked.
+    """
+    framework_dir = output_dir / embedder_name.replace("/", "-")
+    has_results = report_path.exists() or (
+        framework_dir.is_dir() and any(framework_dir.iterdir())
+    )
+    if not has_results:
+        return
+    sidecar = eval_provenance_path(report_path)
+    try:
+        found = json.loads(sidecar.read_text(encoding="utf-8")).get(
+            "biotrainer_version"
+        )
+    except (OSError, ValueError, AttributeError):
+        found = None
+    if found == version:
+        return
+    written_by = f"biotrainer {found}" if found else "an unrecorded biotrainer version"
+    raise RuntimeError(
+        f"{output_dir} already holds results for {embedder_name!r} from "
+        f"{written_by} (per {sidecar}), and this run uses biotrainer {version}. "
+        "biotrainer would reuse them as if they were current. Choose a fresh "
+        "output_dir."
+    )
+
+
 def _completion_message(
     *, computed: list[str], reused: list[str], elapsed_s: float
 ) -> str:
@@ -197,7 +238,8 @@ def run_eval(eval_config: EvalConfig) -> None:
     ``<output_dir>/autoeval_report_<embedder>.json``, beside an
     ``autoeval_report_<embedder>.provenance.json`` sidecar naming the checkpoint
     behind it. Per-framework artefacts land under
-    ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``.
+    ``<output_dir>/<embedder>/<FRAMEWORK_NAME>/``. Results for this embedder
+    left by another biotrainer version stop the run before the model loads.
     """
     _disable_h100_triton_srelu()
 
@@ -232,6 +274,37 @@ def run_eval(eval_config: EvalConfig) -> None:
     checkpoint_dir = resolve_checkpoint_dir(eval_config.checkpoint_dir)
     logger.info(f"Resolved checkpoint: {checkpoint_dir}")
 
+    provenance = EvalProvenance.resolve(
+        checkpoint_dir=checkpoint_dir,
+        embedder_name=eval_config.embedder_name,
+        loop_count=eval_config.loop_count,
+        biotrainer_version=biotrainer["version"],
+    )
+    embedder_name = provenance.embedder_name
+    logger.info(f"Embedder name: {embedder_name}")
+
+    output_dir = Path(eval_config.output_dir)
+    report_path = output_dir / biotrainer["AutoEvalReport"].get_file_name(embedder_name)
+    _refuse_results_from_another_biotrainer(
+        output_dir=output_dir,
+        embedder_name=embedder_name,
+        report_path=report_path,
+        version=biotrainer["version"],
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reused = _reused_frameworks(
+        biotrainer=biotrainer,
+        report_path=report_path,
+        frameworks=frameworks,
+        development_mode=eval_config.development_mode,
+    )
+
+    # Written before the run so an eval that dies partway still records which
+    # checkpoint it was running, and which biotrainer its results came from.
+    sidecar = write_eval_provenance(provenance, report_path)
+    if sidecar is not None:
+        logger.info(f"Wrote eval provenance sidecar: {sidecar}")
+
     device = _resolve_device(eval_config.device)
     logger.info(f"Using device: {device}")
 
@@ -254,30 +327,6 @@ def run_eval(eval_config: EvalConfig) -> None:
         # through to the wrapped module, so `.tokenizer` and friends still work.
         logger.info("Compiling the model (dynamic shapes) ...")
         model = torch.compile(model, dynamic=True)
-
-    provenance = EvalProvenance.resolve(
-        checkpoint_dir=checkpoint_dir,
-        embedder_name=eval_config.embedder_name,
-        loop_count=eval_config.loop_count,
-    )
-    embedder_name = provenance.embedder_name
-    logger.info(f"Embedder name: {embedder_name}")
-
-    output_dir = Path(eval_config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    report_path = output_dir / biotrainer["AutoEvalReport"].get_file_name(embedder_name)
-    reused = _reused_frameworks(
-        biotrainer=biotrainer,
-        report_path=report_path,
-        frameworks=frameworks,
-        development_mode=eval_config.development_mode,
-    )
-
-    # Written before the run so an eval that dies partway still records which
-    # checkpoint it was running.
-    sidecar = write_eval_provenance(provenance, report_path)
-    if sidecar is not None:
-        logger.info(f"Wrote eval provenance sidecar: {sidecar}")
 
     bio_engineer = NanoPLMBioEngineer.build(
         model,

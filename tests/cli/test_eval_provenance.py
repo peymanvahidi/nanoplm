@@ -19,6 +19,7 @@ from nanoplm.eval.checkpoint import (
 from nanoplm.eval.pipeline import (
     FRAMEWORK_REPORT_NAMES,
     _completion_message,
+    _refuse_results_from_another_biotrainer,
     _reused_frameworks,
 )
 
@@ -93,6 +94,23 @@ def test_sidecar_records_checkpoint_step_run_and_loop_count(tmp_path):
     assert record["embedder_name"] == "loop-l20-27500"
     assert record["loop_count"] == 4
     assert record["training_run"]["git_sha"] == RUN_SHA
+
+
+def test_sidecar_records_the_biotrainer_version(tmp_path):
+    checkpoint_dir = _make_checkpoint(tmp_path)
+    provenance = EvalProvenance.resolve(
+        checkpoint_dir=checkpoint_dir,
+        embedder_name="versioned",
+        loop_count=None,
+        biotrainer_version="2.1.1",
+    )
+
+    sidecar = write_eval_provenance(
+        provenance, tmp_path / "out" / "autoeval_report_versioned.json"
+    )
+    record = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    assert record["biotrainer_version"] == "2.1.1"
 
 
 def test_missing_run_manifest_leaves_training_run_null(tmp_path):
@@ -310,6 +328,79 @@ def test_nothing_is_reused_when_no_report_exists(tmp_path):
     )
 
     assert reused == []
+
+
+EMBEDDER = "a-run-ckpt27500"
+REPORT_NAME = f"autoeval_report_{EMBEDDER}.json"
+SIDECAR_NAME = f"autoeval_report_{EMBEDDER}.provenance.json"
+
+
+def _check_version(output_dir: Path, version: str = "2.1.1") -> None:
+    _refuse_results_from_another_biotrainer(
+        output_dir=output_dir,
+        embedder_name=EMBEDDER,
+        report_path=output_dir / REPORT_NAME,
+        version=version,
+    )
+
+
+def _write_sidecar(output_dir: Path, record: dict) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / SIDECAR_NAME).write_text(json.dumps(record), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "sidecar",
+    [{"biotrainer_version": "2.0.0"}, {"embedder_name": EMBEDDER}, None],
+    ids=["other-version", "no-version-field", "no-sidecar"],
+)
+def test_results_from_another_biotrainer_are_refused(tmp_path, sidecar):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / REPORT_NAME).write_text("{}", encoding="utf-8")
+    if sidecar is not None:
+        _write_sidecar(out, sidecar)
+
+    with pytest.raises(RuntimeError, match="fresh output_dir"):
+        _check_version(out)
+
+
+def test_a_contact_cache_without_a_report_is_refused(tmp_path):
+    # A crashed run leaves the per-protein cache, which AutoEval reuses, but no report.
+    out = tmp_path / "out"
+    cache = out / EMBEDDER / "PBC_ZEROSHOT_CONTACT"
+    cache.mkdir(parents=True)
+    (cache / "zero_shot_contact_cached_results_categorical_jacobian.json").write_text("{}")
+    _write_sidecar(out, {"biotrainer_version": "2.0.0"})
+
+    with pytest.raises(RuntimeError, match="2.0.0"):
+        _check_version(out)
+
+
+def test_results_from_the_same_biotrainer_are_reused(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / REPORT_NAME).write_text("{}", encoding="utf-8")
+    (out / EMBEDDER / "PGYM").mkdir(parents=True)
+    _write_sidecar(out, {"biotrainer_version": "2.1.1"})
+
+    _check_version(out)
+
+
+def test_empty_or_missing_output_dir_is_accepted(tmp_path):
+    (tmp_path / "empty").mkdir()
+
+    _check_version(tmp_path / "empty")
+    _check_version(tmp_path / "missing")
+
+
+def test_other_embedders_in_the_output_dir_do_not_block(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "autoeval_report_old-run-ckpt100.json").write_text("{}", encoding="utf-8")
+    (out / "old-run-ckpt100" / "PGYM").mkdir(parents=True)
+
+    _check_version(out)
 
 
 def test_eval_modules_import_without_biotrainer():
