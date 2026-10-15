@@ -145,8 +145,15 @@ class NanoPLMBioEngineer:
             def _chunk_size(self, row_len: int) -> int:
                 return max(1, min(self._batch_size, TOKEN_BUDGET // max(1, row_len)))
 
-            def _get_masked_log_probabilities(self, sequence: str) -> torch.Tensor:
+            def _get_masked_log_probabilities(
+                self, sequence: str, batch_size: int = 32
+            ) -> torch.Tensor:
                 """Batched masked-marginals.
+
+                ``batch_size`` is ignored. biotrainer passes it positionally and
+                AutoEval's pgym always sends the default 32; the batches here are
+                sized by ``zero_shot_batch_size`` and ``TOKEN_BUDGET`` instead,
+                so scores do not depend on it.
 
                 biotrainer masks one position at a time and runs one forward per
                 position. This computes the same quantity, but groups positions
