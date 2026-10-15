@@ -4297,7 +4297,12 @@ def run_pure_pretraining(
             # iteration, after iter(train_loader).
             epoch_fwd_count = epoch_sub_batch_count
             partial_discarded = accum_micro_count + skipped_tail_count
-            if is_main:
+            # A budget or wall-clock stop before the last sub-batch didn't
+            # finish the pass, so don't report it as complete.
+            pass_cut_short = (wallclock_stop or global_step >= total_steps) and (
+                micro_step < synced_len - 1 or sub_batch_idx < total_sub_batches - 1
+            )
+            if is_main and not pass_cut_short:
                 logger.info(
                     "Data pass %d complete (global_step %d/%d): %d effective micro-steps, %d optimizer steps%s",
                     epoch + 1, global_step, total_steps, epoch_fwd_count,
