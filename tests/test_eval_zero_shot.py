@@ -99,10 +99,10 @@ def _sequential_masked_log_probs(wrapper, sequence: str) -> torch.Tensor:
     )
 
     # CustomBioEngineerModelWrapper does not define this method, so the attribute
-    # resolves to BertLikeEngineer's per-position loop — i.e. the exact code path
-    # our override replaces.
+    # resolves to BertLikeEngineer's implementation, the code path our override
+    # replaces. A batch of 1 makes it one forward per masked position.
     return CustomBioEngineerModelWrapper._get_masked_log_probabilities(
-        wrapper, sequence
+        wrapper, sequence, 1
     )
 
 
@@ -140,6 +140,31 @@ def test_chunk_size_shrinks_for_long_windows():
     assert wrapper._chunk_size(256) == 60          # token budget not binding
     assert wrapper._chunk_size(TOKEN_BUDGET) == 1      # one row already fills the budget
     assert wrapper._chunk_size(2 * TOKEN_BUDGET) == 1  # never drops below 1
+
+
+def test_public_masked_marginals_match_the_sequential_path():
+    """Through BioEngineer, as AutoEval's pgym calls it.
+
+    biotrainer passes ``batch_size`` positionally to the override, so a
+    signature that drops it fails here rather than on every pgym assay.
+    """
+    engineer, _, _, biotrainer = _build_engineer(batch_size=7)
+    wrapper = engineer.model_wrapper
+    mutations = ["M1A", "K2R", "A3W:L4P"]
+
+    scores = engineer.zero_shot_masked_marginals(SEQUENCE, mutations)
+    reference = wrapper._score_variants_from_marginal_probabilities(
+        SEQUENCE,
+        _sequential_masked_log_probs(wrapper, SEQUENCE),
+        mutations,
+        True,
+        biotrainer["ZeroShotMethod"].MASKED_MARGINALS,
+    )
+
+    assert len(scores) == len(mutations)
+    assert [s.total_score for s in scores] == pytest.approx(
+        [r.total_score for r in reference], abs=1e-5, rel=1e-4
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,3 +250,19 @@ def test_jacobian_contact_is_a_supported_method():
     ZeroShotMethod = biotrainer["ZeroShotMethod"]
 
     assert ZeroShotMethod.JACOBIAN_CONTACT in engineer.model_wrapper.supported_methods()
+
+
+@pytest.mark.parametrize("registers, expected", [(0, 1023), (1, 1024), (2, 1024)])
+def test_context_caps_residues_at_1022_and_tokens_at_1024(registers, expected):
+    engineer, _, _, _ = _build_engineer(num_register_tokens=registers)
+
+    assert engineer.model_wrapper.max_context_length() == expected
+
+
+def test_jacobian_refuses_a_protein_past_the_context():
+    engineer, _, _, biotrainer = _build_engineer()
+
+    with pytest.raises(biotrainer["SequenceTooLongError"]):
+        engineer.zero_shot_contact_map(
+            biotrainer["ZeroShotMethod"].JACOBIAN_CONTACT, "A" * 1100
+        )
