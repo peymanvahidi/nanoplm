@@ -39,4 +39,5 @@ def test_fsdp_first_step_after_pass_boundary_matches_ddp(tmp_path, steps):
     assert ddp.keys() == fsdp.keys()
     diff = {k: (ddp[k].float() - fsdp[k].float()).abs().max().item() for k in ddp}
     worst = max(diff, key=diff.get)
-    assert diff[worst] == 0.0, f"{worst}: max |ddp - fsdp| = {diff[worst]:.3e}"
+    # The leak shows up as ~1e-4; the margin absorbs reduction-order changes.
+    assert diff[worst] <= 1e-7, f"{worst}: max |ddp - fsdp| = {diff[worst]:.3e}"
