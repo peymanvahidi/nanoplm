@@ -17,7 +17,11 @@ pytest.importorskip("biotrainer", reason="requires the nanoplm[eval] extra")
 pytest.importorskip("biotrainer_core", reason="requires the nanoplm[eval] extra")
 
 from nanoplm.eval.pipeline import _load_biotrainer_symbols  # noqa: E402
-from nanoplm.eval.zero_shot import NanoPLMBioEngineer, special_token_offsets  # noqa: E402
+from nanoplm.eval.zero_shot import (  # noqa: E402
+    TOKEN_BUDGET,
+    NanoPLMBioEngineer,
+    special_token_offsets,
+)
 from nanoplm.pretraining.models.modern_bert.model import (  # noqa: E402
     ProtModernBertMLMConfig,
 )
@@ -134,8 +138,8 @@ def test_chunk_size_shrinks_for_long_windows():
     wrapper = engineer.model_wrapper
 
     assert wrapper._chunk_size(256) == 60          # token budget not binding
-    assert wrapper._chunk_size(65_536) == 1        # one row already fills the budget
-    assert wrapper._chunk_size(131_072) == 1       # never drops below 1
+    assert wrapper._chunk_size(TOKEN_BUDGET) == 1      # one row already fills the budget
+    assert wrapper._chunk_size(2 * TOKEN_BUDGET) == 1  # never drops below 1
 
 
 # ---------------------------------------------------------------------------
