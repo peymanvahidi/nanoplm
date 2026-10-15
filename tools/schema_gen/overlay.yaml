@@ -4,7 +4,9 @@
 # Two namespaces live in this file:
 #
 #  1. Flat field annotations, keyed "<section>.<field>". Any of:
-#     enum, minimum, maximum, backend, advanced, auto_computed, type.
+#     enum, minimum, maximum, backend, advanced, auto_computed, type, items.
+#     A field whose template default is `null` MUST set `type` to a nullable
+#     union (e.g. `type: [integer, "null"]`); emit.py refuses to guess one.
 #     Every enum below is transcribed from the authoritative validator: the
 #     `click.Choice(...)` in src/nanoplm/cli/*.py and/or the dataclass
 #     `__post_init__` check. Never from prose.
@@ -84,7 +86,11 @@ pretraining.recycling_loop_count_curriculum:
   backend: [pure_torch]
   advanced: true
 pretraining.recycling_loop_count_curriculum_steps: { backend: [pure_torch], advanced: true }
-pretraining.recycling_pretraining_eval_loop_counts: { backend: [pure_torch], advanced: true }
+pretraining.recycling_pretraining_eval_loop_counts:
+  type: [array, "null"]
+  items: { type: integer }
+  backend: [pure_torch]
+  advanced: true
 
 # Loopie stochastic depth: only meaningful with model.use_loopie, pure-torch only.
 pretraining.loopie_loop_count_jitter: { backend: [pure_torch], advanced: true, minimum: 0 }
@@ -146,8 +152,16 @@ model.recycling_loop_count: { backend: [pure_torch], advanced: true }
 model.use_huginn_looping: { backend: [pure_torch], advanced: true }
 model.use_loopie: { backend: [pure_torch], advanced: true }
 model.loopie_loop_count: { backend: [pure_torch], advanced: true }
+# ModernBertConfig.__post_init__: None (full BPTT) or int >= 1.
+model.loopie_bptt: { type: [integer, "null"], minimum: 1, backend: [pure_torch], advanced: true }
+
+# ----------------------------------------------------------------------- data
+data_dirs.local_fasta: { type: [string, "null"] }
 
 # --------------------------------------------------------------- distillation
+# Optional[int]; null = MHA. The flat key also matches the pretrain template's
+# model.num_kv_heads (default 8), which takes null the same way.
+model.num_kv_heads: { type: [integer, "null"], minimum: 1 }
 distillation.optimizer:
   enum: [adamw, muon, normuon]
 distillation.lr_scheduler:

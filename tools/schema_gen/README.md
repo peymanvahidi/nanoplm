@@ -22,7 +22,7 @@ keeping CI light and runnable without the training stack.
 | `templates.py` | load a `get-yaml` template (packaged `.yaml` or embedded Python string) and parse its fields + inline comments |
 | `dataclass_ast.py` | extract `@dataclass` fields + leading/trailing comments (for the `eval` surface + parity) |
 | `types.py` | infer a JSON-Schema type/default from a raw YAML scalar literal |
-| `overlay.py` / `overlay.yaml` | hand-authored enum / range / backend / advanced annotations literals can't express |
+| `overlay.py` / `overlay.yaml` | hand-authored type / items / enum / range / backend / advanced annotations literals can't express |
 | `gates.py` | translate `recycling_compatibility.yaml` into compat rules + field-visibility gates |
 | `emit.py` | assemble a per-surface JSON Schema (folds all of the above) |
 | `generate.py` | serialize the schemas to `website/src/generated/` (JSON-safe) |
@@ -48,6 +48,9 @@ ever drifting from the code. Fields that exist on a dataclass but are auto-popul
 - Non-finite float defaults (e.g. `max_grad_norm: .inf`) are serialized as the JSON-safe **string**
   sentinel `".inf"` (JSON has no `Infinity`; the string mirrors the YAML literal users type). So in
   the artifacts a `"type": "number"` field may carry a string `".inf"` default — expected, not a bug.
+- A template field whose default is `null` has no type to infer, so generation fails with
+  `<section>.<field> defaults to null` until `overlay.yaml` gives it a nullable union, e.g.
+  `type: [integer, "null"]` (plus `items:` for a list). The union is emitted as a JSON type array.
 - The generated `website/src/generated/*.schema.json` files are committed. The `docs` CI workflow
   regenerates them and a drift check (`git diff --exit-code`) fails the build if they're stale — so
   run the generator and commit the result after any template/dataclass/overlay change.

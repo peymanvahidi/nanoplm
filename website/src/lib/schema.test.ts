@@ -5,10 +5,12 @@ import {
   toGroups,
   groupSlug,
   stripEnumRestatement,
+  type FieldSchema,
   type Surface,
   type SectionSchema,
 } from './schema';
 import { withFieldGroups, type TocItem } from './toc';
+import data from '../generated/nanoplm.data.schema.json';
 import pretrain from '../generated/nanoplm.pretrain.schema.json';
 import evalSchema from '../generated/nanoplm.eval.schema.json';
 
@@ -58,6 +60,38 @@ describe('toRows', () => {
     const rows = toRows(pretrain as Surface, 'pretraining');
     const rb = rows.find((r) => r.key === 'recycling_bptt')!;
     expect(rb.visibleWhen?.field).toBe('recycling_loop_count');
+  });
+
+  it('renders a nullable union type as `a | null`', () => {
+    const surface: Surface = {
+      $schema: '',
+      'x-nanoplm-surface': 'test',
+      type: 'object',
+      properties: {
+        model: {
+          type: 'object',
+          properties: { k: { type: ['integer', 'null'], default: null, minimum: 1 } as FieldSchema },
+        },
+      },
+    };
+    const [k] = toRows(surface, 'model');
+    expect(k.type).toBe('integer | null');
+    expect(k.default).toBeNull();
+  });
+
+  it('never renders a bare `null` type on a published surface', () => {
+    // A `null` template default used to become `"type": "null"`, which the
+    // reference showed as `null · default null`: no hint of what the field takes.
+    const pre = pretrain as Surface;
+    const rows = [
+      ...toRows(data as Surface, 'data_dirs'),
+      ...toRows(data as Surface, 'data_params'),
+      ...toRows(pre, 'model'),
+      ...toRows(pre, 'pretraining'),
+      ...toRows(pre, 'resume'),
+      ...toRows(evalSchema as Surface),
+    ];
+    expect(rows.filter((r) => r.type === 'null').map((r) => r.key)).toEqual([]);
   });
 
   it('drops descriptions that only restate the enum', () => {

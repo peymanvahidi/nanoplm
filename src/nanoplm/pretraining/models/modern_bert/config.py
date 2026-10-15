@@ -176,10 +176,12 @@ class ModernBertConfig:
 
     # Loopie layer-loop (arXiv 2607.16051): every stored layer is applied
     # loopie_loop_count times consecutively (L1,L1,L2,L2,...), weight-tied, with
-    # full backprop and no prelude/coda/adapter/s0-noise/scheduler. Mutually
-    # exclusive with Huginn recycling.
+    # no prelude/coda/adapter/s0-noise/scheduler. Backprop runs through every
+    # application unless loopie_bptt truncates it. Mutually exclusive with
+    # Huginn recycling.
     use_loopie: bool = False
     loopie_loop_count: int = 2                # consecutive applications per stored layer (>= 2 when enabled)
+    loopie_bptt: Optional[int] = None        # grad through the last k applications (None = all)
 
     head_dim: int = field(init=False)
     rope_dim: int = field(init=False)
@@ -241,7 +243,16 @@ class ModernBertConfig:
             from nanoplm.config.recycling_compatibility import validate_recycling_compatibility
             validate_recycling_compatibility(self)
         # Loopie layer-loop validation. Kept here rather than in the YAML matrix,
-        # which is explicitly scoped to Huginn-style recycling.
+        # which is explicitly scoped to Huginn-style recycling. bool is an int
+        # subclass, so `true` would otherwise pass as 1.
+        if isinstance(self.loopie_loop_count, bool):
+            raise ValueError(f"loopie_loop_count must be an int, got {self.loopie_loop_count!r}")
+        if self.loopie_bptt is not None and (
+            isinstance(self.loopie_bptt, bool)
+            or not isinstance(self.loopie_bptt, int)
+            or self.loopie_bptt < 1
+        ):
+            raise ValueError(f"loopie_bptt must be None or int >= 1, got {self.loopie_bptt!r}")
         if self.use_loopie:
             if self.use_huginn_looping or self.recycling_loop_count > 1:
                 raise ValueError(

@@ -792,6 +792,15 @@ def _residual_add(
     return x + alpha * branch_out
 
 
+class RepeatTap(nn.Module):
+    """Identity; exists only as a forward-hook anchor so that debug metrics can
+    attribute a residual-stream sample to one loop application (see
+    ``nanoplm.pretraining.debug_metrics``)."""
+
+    def forward(self, x: torch.Tensor, rep: int) -> torch.Tensor:
+        return x
+
+
 class ModernBertEncoderLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
@@ -800,6 +809,8 @@ class ModernBertEncoderLayer(nn.Module):
         # layer per forward (1 = off). Kept inside the module so FSDP2 still
         # sees exactly one call per layer and can shard it per layer.
         self.repeats: int = int(config.loopie_loop_count) if config.use_loopie else 1
+        self.bptt: Optional[int] = config.loopie_bptt if config.use_loopie else None
+        self.repeat_tap = RepeatTap()
         self.has_mlp = (layer_idx != 0) or (not config.no_mlp_on_first_layer)
         self.norm_type = config.norm_type  # Store for fused Canon path
         self.activation_checkpointing = bool(
@@ -871,19 +882,28 @@ class ModernBertEncoderLayer(nn.Module):
         loop_count: "torch.Tensor | int | None" = None,
     ) -> torch.Tensor:
         if loop_count is None:
-            for _ in range(self.repeats):
-                x = self._forward_once(
-                    x,
-                    attn_mask=attn_mask,
-                    cos_sin=cos_sin,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    window_size=window_size,
-                    position_ids=position_ids,
-                    token_mask=token_mask,
-                    repo_active=repo_active,
-                    prores_alpha=prores_alpha,
-                )
+            once_kwargs = dict(
+                attn_mask=attn_mask,
+                cos_sin=cos_sin,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                window_size=window_size,
+                position_ids=position_ids,
+                token_mask=token_mask,
+                repo_active=repo_active,
+                prores_alpha=prores_alpha,
+            )
+            no_grad_reps = 0 if self.bptt is None else max(0, self.repeats - self.bptt)
+            for rep in range(self.repeats):
+                if rep < no_grad_reps:
+                    with torch.no_grad():
+                        h = self._forward_once(x, **once_kwargs)
+                    # Not a no-op: forward is exactly h, backward is the identity,
+                    # so the layers below keep their only path to the loss.
+                    x = h + (x - x.detach())
+                else:
+                    x = self._forward_once(x, **once_kwargs)
+                x = self.repeat_tap(x, rep)
             return x
         return self._forward_repeats(
             x,
@@ -919,10 +939,23 @@ class ModernBertEncoderLayer(nn.Module):
         ``forward`` keeps its own unrolled ``range(self.repeats)`` branch
         instead of delegating here, so a fixed-depth run traces exactly the
         graph it traced before this method existed.
+
+        Grad mode is a Dynamo guard, so with ``bptt`` set the ``no_grad``
+        applications compile their own ``_forward_once`` entries: the frame
+        needs (distinct layers) x (input shapes) x 2 cache slots, which can
+        exceed Dynamo's default 8. ``pure_pipeline._dynamo_recompile_limit``
+        sizes the limit.
         """
         r = int(loop_count.item()) if isinstance(loop_count, torch.Tensor) else int(loop_count)
-        for _ in range(r):
-            x = self._forward_once(x, **kwargs)
+        no_grad_reps = 0 if self.bptt is None else max(0, r - self.bptt)
+        for rep in range(r):
+            if rep < no_grad_reps:
+                with torch.no_grad():
+                    h = self._forward_once(x, **kwargs)
+                x = h + (x - x.detach())
+            else:
+                x = self._forward_once(x, **kwargs)
+            x = self.repeat_tap(x, rep)
         return x
 
     def _forward_once(

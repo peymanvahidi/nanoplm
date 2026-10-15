@@ -46,6 +46,7 @@ def visibility_gates() -> dict:
               "recycling_use_takase_init"):
         g[f] = gt1
     g["loopie_loop_count"] = eq_true("use_loopie")
+    g["loopie_bptt"] = eq_true("use_loopie")
     g["loopie_loop_count_jitter"] = eq_true("use_loopie")
     for f in ("canon_layers_mode", "canon_layers_kernel_size"):
         g[f] = eq_true("use_canon_layers")

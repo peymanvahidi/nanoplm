@@ -24,8 +24,12 @@
           "default": 8
         },
         "num_kv_heads": {
-          "type": "null",
+          "type": [
+            "integer",
+            "null"
+          ],
           "default": null,
+          "minimum": 1,
           "description": "GQA: set < num_attention_heads to enable; null = MHA"
         },
         "mlp_activation": {

@@ -173,6 +173,14 @@ def test_loopie_loop_count_must_be_at_least_two():
                    use_loopie=True, loopie_loop_count=1)
 
 
+@pytest.mark.parametrize("use_loopie", [True, False])
+def test_loopie_loop_count_rejects_bool(use_loopie):
+    with pytest.raises(ValueError, match="loopie_loop_count"):
+        _model_cfg(use_huginn_looping=False, recycling_loop_count=1,
+                   recycling_num_prelude_layers=0, recycling_num_coda_layers=0,
+                   use_loopie=use_loopie, loopie_loop_count=True)
+
+
 def test_loopie_loop_count_without_flag_is_rejected():
     with pytest.raises(ValueError, match="no effect"):
         _model_cfg(use_huginn_looping=False, recycling_loop_count=1,
