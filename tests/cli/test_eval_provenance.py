@@ -350,19 +350,24 @@ def _write_sidecar(output_dir: Path, record: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    "sidecar",
-    [{"biotrainer_version": "2.0.0"}, {"embedder_name": EMBEDDER}, None],
+    "sidecar, evidence",
+    [
+        ({"biotrainer_version": "2.0.0"}, "records biotrainer 2.0.0"),
+        ({"embedder_name": EMBEDDER}, "has no biotrainer_version"),
+        (None, "there is no provenance sidecar"),
+    ],
     ids=["other-version", "no-version-field", "no-sidecar"],
 )
-def test_results_from_another_biotrainer_are_refused(tmp_path, sidecar):
+def test_results_from_another_biotrainer_are_refused(tmp_path, sidecar, evidence):
     out = tmp_path / "out"
     out.mkdir()
     (out / REPORT_NAME).write_text("{}", encoding="utf-8")
     if sidecar is not None:
         _write_sidecar(out, sidecar)
 
-    with pytest.raises(RuntimeError, match="fresh output_dir"):
+    with pytest.raises(RuntimeError, match="fresh output_dir") as excinfo:
         _check_version(out)
+    assert evidence in str(excinfo.value)
 
 
 def test_a_contact_cache_without_a_report_is_refused(tmp_path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import time
 from pathlib import Path
@@ -160,6 +161,12 @@ def _refuse_stale_dataset_cache(root: Path) -> None:
     pbc = root / "PBC"
     if pbc.is_dir() and any(pbc.iterdir()) and not (pbc / "contacts").is_dir():
         stale.append(pbc)
+    # A PGYM-only cache: 2.1 reads row["pbc_dev_mode"] from this file.
+    reference = root / "PGYM" / "reference" / "reference.csv"
+    if reference.is_file():
+        with reference.open(newline="") as f:
+            if "pbc_dev_mode" not in next(csv.reader(f), []):
+                stale.append(reference)
     if stale:
         raise RuntimeError(
             f"The biotrainer dataset cache {root} has the layout of biotrainer "
@@ -198,12 +205,21 @@ def _refuse_results_from_another_biotrainer(
         found = None
     if found == version:
         return
-    written_by = f"biotrainer {found}" if found else "an unrecorded biotrainer version"
+    if found:
+        evidence = f"{sidecar} records biotrainer {found}"
+    elif sidecar.exists():
+        evidence = (
+            f"{sidecar} has no biotrainer_version (written before nanoplm "
+            "recorded it)"
+        )
+    else:
+        evidence = f"there is no provenance sidecar at {sidecar}"
     raise RuntimeError(
-        f"{output_dir} already holds results for {embedder_name!r} from "
-        f"{written_by} (per {sidecar}), and this run uses biotrainer {version}. "
-        "biotrainer would reuse them as if they were current. Choose a fresh "
-        "output_dir."
+        f"{output_dir} already holds results for {embedder_name!r} that this "
+        f"run cannot attribute to biotrainer {version}: {evidence}. biotrainer "
+        "would reuse them as if they were current. Choose a fresh output_dir, "
+        f"or move {report_path.name} and {framework_dir.name}/ out of "
+        f"{output_dir}."
     )
 
 

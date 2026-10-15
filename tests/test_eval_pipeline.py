@@ -206,6 +206,24 @@ def test_empty_or_current_cache_is_accepted(tmp_path, files):
     pipeline._refuse_stale_dataset_cache(tmp_path / "missing")
 
 
+def _write_pgym_reference(root, header):
+    path = root / "PGYM" / "reference" / "reference.csv"
+    path.parent.mkdir(parents=True)
+    path.write_text(header + "\nrow\n")
+
+
+def test_pgym_only_cache_without_pbc_dev_mode_is_refused(tmp_path):
+    # The PR-192 reference.csv lacks the column 2.1 reads per row.
+    _write_pgym_reference(tmp_path, "DMS_index,DMS_id,DMS_filename")
+    with pytest.raises(RuntimeError, match="reference.csv"):
+        pipeline._refuse_stale_dataset_cache(tmp_path)
+
+
+def test_pgym_reference_with_pbc_dev_mode_is_accepted(tmp_path):
+    _write_pgym_reference(tmp_path, "DMS_index,DMS_id,pbc_dev_mode,DMS_filename")
+    pipeline._refuse_stale_dataset_cache(tmp_path)
+
+
 @pytest.mark.parametrize("force_download", [False, True])
 def test_run_eval_checks_the_default_cache_only_without_force_download(
     stubbed_pipeline, monkeypatch, tmp_path, force_download
@@ -232,30 +250,8 @@ def test_run_eval_checks_the_default_cache_only_without_force_download(
         assert stubbed_pipeline.instances == []
 
 
-def test_run_eval_refuses_results_from_another_biotrainer(stubbed_pipeline, tmp_path):
-    out = tmp_path / "out"
-    out.mkdir()
-    (out / "autoeval_report_stub.json").write_text("{}")
-    (out / "autoeval_report_stub.provenance.json").write_text(
-        '{"biotrainer_version": "2.0.0"}'
-    )
-    config = EvalConfig(
-        checkpoint_dir=str(tmp_path / "ckpt"),
-        framework=["pgym"],
-        output_dir=str(out),
-        dataset_dir=str(tmp_path / "data"),
-        device="cpu",
-        torch_compile=False,
-    )
-
-    with pytest.raises(RuntimeError, match="fresh output_dir"):
-        pipeline.run_eval(config)
-    assert stubbed_pipeline.instances == []
-
-
-def test_run_eval_records_the_version_and_reuses_its_own_results(
-    stubbed_pipeline, monkeypatch, tmp_path
-):
+def _write_real_provenance(monkeypatch, tmp_path):
+    """Swap the fixture's no-op sidecar writer for the real one."""
     from nanoplm.eval.checkpoint import write_eval_provenance
 
     monkeypatch.setattr(pipeline, "write_eval_provenance", write_eval_provenance)
@@ -276,6 +272,59 @@ def test_run_eval_records_the_version_and_reuses_its_own_results(
             )
         ),
     )
+
+
+def test_run_eval_refuses_results_from_another_biotrainer(
+    stubbed_pipeline, monkeypatch, tmp_path
+):
+    # With the real writer, a guard that ran after the sidecar write would
+    # overwrite "2.0.0" with this run's version and then let the run through.
+    _write_real_provenance(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "autoeval_report_stub.json").write_text("{}")
+    sidecar = out / "autoeval_report_stub.provenance.json"
+    sidecar.write_text('{"biotrainer_version": "2.0.0"}')
+    config = EvalConfig(
+        checkpoint_dir=str(tmp_path / "ckpt"),
+        framework=["pbc_zeroshot_contact"],
+        output_dir=str(out),
+        dataset_dir=str(tmp_path / "data"),
+        device="cpu",
+        torch_compile=False,
+    )
+
+    with pytest.raises(RuntimeError, match="fresh output_dir"):
+        pipeline.run_eval(config)
+    assert stubbed_pipeline.instances == []
+    assert json.loads(sidecar.read_text())["biotrainer_version"] == "2.0.0"
+
+
+class _StoredResult:
+    task_filter_applied = False
+
+    def used_development_mode(self):
+        return True
+
+
+def test_run_eval_records_the_version_and_reuses_its_own_results(
+    stubbed_pipeline, monkeypatch, tmp_path
+):
+    _write_real_provenance(monkeypatch, tmp_path)
+    stored = SimpleNamespace(
+        maybe_framework_result=lambda name: (
+            _StoredResult() if name == "PBC_ZEROSHOT_CONTACT" else None
+        )
+    )
+    symbols = pipeline._load_biotrainer_symbols()
+    symbols["AutoEvalReport"].from_json_file = lambda path: stored
+    messages = []
+    real_message = pipeline._completion_message
+    monkeypatch.setattr(
+        pipeline,
+        "_completion_message",
+        lambda **kw: messages.append(kw) or real_message(**kw),
+    )
     out = tmp_path / "out"
     config = EvalConfig(
         checkpoint_dir=str(tmp_path / "ckpt"),
@@ -290,6 +339,13 @@ def test_run_eval_records_the_version_and_reuses_its_own_results(
     sidecar = out / "autoeval_report_stub.provenance.json"
     assert json.loads(sidecar.read_text())["biotrainer_version"] == "2.1.1"
 
+    assert (messages[0]["computed"], messages[0]["reused"]) == (
+        ["pbc_zeroshot_contact"], []
+    )
+
     (out / "autoeval_report_stub.json").write_text("{}")
     pipeline.run_eval(config)
     assert len(stubbed_pipeline.instances) == 2
+    assert (messages[1]["computed"], messages[1]["reused"]) == (
+        [], ["pbc_zeroshot_contact"]
+    )
