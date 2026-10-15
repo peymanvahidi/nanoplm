@@ -134,6 +134,13 @@ class NanoPLMBioEngineer:
             def strip_special_tokens(self, tensor: torch.Tensor) -> torch.Tensor:
                 return tensor[n_leading : tensor.shape[0] - n_trailing]
 
+            def max_context_length(self) -> int:
+                # ESM's residue cap (1022) whatever the special-token count, and
+                # never more than biotrainer's 1024-token context.
+                return min(
+                    super().max_context_length(), 1022 + n_leading + n_trailing
+                )
+
         class _Wrapper(CustomBioEngineerModelWrapper):
             """Adds batched masked-marginals and a configurable Jacobian batch size."""
 
