@@ -171,6 +171,9 @@ distillation.lr_scheduler:
 eval.zero_shot_method:
   enum: [masked_marginals, wt_marginals, pseudoperplexity]
 eval.loop_count: { backend: [pure_torch], advanced: true, minimum: 1 }
+# Both also take a bare string; null keeps the datasets default.
+eval.framework: { type: [array, string], items: { type: string } }
+eval.pbc_supervised_datasets: { type: [array, string, "null"], items: { type: string } }
 
 # =============================================================================
 # x-extra-fields: RESERVED KEY (not a "<section>.<field>" annotation).
@@ -199,6 +202,63 @@ eval.loop_count: { backend: [pure_torch], advanced: true, minimum: 1 }
 x-extra-fields:
   pretrain:
     pretraining:
+      eval_mlm_probability:
+        type: number
+        default: null
+        advanced: true
+        group: MLM
+        description: >-
+          Masking rate used for EVAL only. null means "same as training", which
+          is the historical behaviour. Set it when ablating mlm_probability:
+          otherwise an arm trained at 15% is also scored at 15% while the base
+          is scored at 30%, which are different tasks whose losses cannot be
+          compared.
+      eval_mask_replace_prob:
+        type: number
+        default: null
+        advanced: true
+        group: MLM
+        description: >-
+          Eval-only share of masked positions replaced with [MASK]. null means
+          "same as training". Pin it alongside eval_mlm_probability when
+          ablating the 80/10/10 split.
+      eval_random_token_prob:
+        type: number
+        default: null
+        advanced: true
+        group: MLM
+        description: >-
+          Eval-only share of masked positions replaced with a random amino
+          acid. null means "same as training".
+      eval_keep_probability:
+        type: number
+        default: null
+        advanced: true
+        group: MLM
+        description: >-
+          Eval-only share of masked positions left unchanged. null means "same
+          as training".
+      eval_mlm_masking_strategy:
+        type: string
+        default: null
+        advanced: true
+        group: MLM
+        enum: [token, span]
+        description: >-
+          Eval-only masking strategy. null means "same as training". Pin it
+          when ablating mlm_masking_strategy, for the same reason as
+          eval_mlm_probability.
+      eval_mask_seed:
+        type: integer
+        default: null
+        advanced: true
+        group: MLM
+        description: >-
+          Seed for eval masking. When set, an eval batch's mask is seeded from
+          the batch's token ids, so it is stable across runs and dataloader
+          worker counts for the same eval loader and world size; it depends on
+          batch composition. Leave null to draw fresh masks from global RNG on
+          every eval, which adds mask noise to every reported eval loss.
       train_tokens:
         type: integer
         default: null

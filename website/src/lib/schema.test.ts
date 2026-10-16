@@ -247,6 +247,6 @@ describe('toRows', () => {
     expect(cd.required).toBe(true);
     expect(cd.default).toBeUndefined();
     const fw = rows.find((r) => r.key === 'framework')!;
-    expect(fw.type).toBe('array');
+    expect(fw.type).toBe('array | string');
   });
 });

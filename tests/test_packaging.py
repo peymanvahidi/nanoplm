@@ -40,8 +40,8 @@ def test_eval_extra_unchanged():
     # biotrainer-core is declared explicitly: nanoplm.eval imports from it directly
     # (ZeroShotMethod, STANDARD_AAS, AutoEvalReport), not only through biotrainer.
     assert _load()["project"]["optional-dependencies"]["eval"] == [
-        "biotrainer==2.0.0",
-        "biotrainer-core>=2.0.0",
+        "biotrainer==2.1.1",
+        "biotrainer-core==2.1.1",
     ]
 
 

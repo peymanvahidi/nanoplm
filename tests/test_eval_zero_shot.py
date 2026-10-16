@@ -1,11 +1,11 @@
 """Tests for the biotrainer zero-shot BioEngineer wrapper in ``nanoplm.eval``.
 
-These cover the two things nanoPLM overrides on top of biotrainer 2.0.0:
+These cover what nanoPLM adds on top of biotrainer 2.1:
 
-* batched masked-marginals (biotrainer scores one masked position per forward),
-* a categorical Jacobian aligned to nanoPLM's tokenizer, which has no BOS token
-  and may append register tokens — biotrainer's implementation hardcodes a
-  ``[BOS] + residues + [EOS]`` layout.
+* batched masked-marginals, sized by the token budget rather than biotrainer's
+  fixed batch,
+* the categorical Jacobian through nanoPLM's tokenizer, which has no BOS token
+  and may append register tokens, at the configured batch size.
 
 They are skipped unless the ``eval`` extra (biotrainer 2.x) is installed.
 """
@@ -17,7 +17,11 @@ pytest.importorskip("biotrainer", reason="requires the nanoplm[eval] extra")
 pytest.importorskip("biotrainer_core", reason="requires the nanoplm[eval] extra")
 
 from nanoplm.eval.pipeline import _load_biotrainer_symbols  # noqa: E402
-from nanoplm.eval.zero_shot import NanoPLMBioEngineer, special_token_offsets  # noqa: E402
+from nanoplm.eval.zero_shot import (  # noqa: E402
+    TOKEN_BUDGET,
+    NanoPLMBioEngineer,
+    special_token_offsets,
+)
 from nanoplm.pretraining.models.modern_bert.model import (  # noqa: E402
     ProtModernBertMLMConfig,
 )
@@ -90,15 +94,15 @@ def test_strip_special_tokens_keeps_only_residue_positions():
 
 def _sequential_masked_log_probs(wrapper, sequence: str) -> torch.Tensor:
     """biotrainer's unbatched reference implementation, one forward per position."""
-    from biotrainer.bioengineer.bioengineer_custom_model import (
+    from biotrainer.bioengineer.models import (
         CustomBioEngineerModelWrapper,
     )
 
     # CustomBioEngineerModelWrapper does not define this method, so the attribute
-    # resolves to BertLikeEngineer's per-position loop — i.e. the exact code path
-    # our override replaces.
+    # resolves to BertLikeEngineer's implementation, the code path our override
+    # replaces. A batch of 1 makes it one forward per masked position.
     return CustomBioEngineerModelWrapper._get_masked_log_probabilities(
-        wrapper, sequence
+        wrapper, sequence, 1
     )
 
 
@@ -134,8 +138,33 @@ def test_chunk_size_shrinks_for_long_windows():
     wrapper = engineer.model_wrapper
 
     assert wrapper._chunk_size(256) == 60          # token budget not binding
-    assert wrapper._chunk_size(65_536) == 1        # one row already fills the budget
-    assert wrapper._chunk_size(131_072) == 1       # never drops below 1
+    assert wrapper._chunk_size(TOKEN_BUDGET) == 1      # one row already fills the budget
+    assert wrapper._chunk_size(2 * TOKEN_BUDGET) == 1  # never drops below 1
+
+
+def test_public_masked_marginals_match_the_sequential_path():
+    """Through BioEngineer, as AutoEval's pgym calls it.
+
+    biotrainer passes ``batch_size`` positionally to the override, so a
+    signature that drops it fails here rather than on every pgym assay.
+    """
+    engineer, _, _, biotrainer = _build_engineer(batch_size=7)
+    wrapper = engineer.model_wrapper
+    mutations = ["M1A", "K2R", "A3W:L4P"]
+
+    scores = engineer.zero_shot_masked_marginals(SEQUENCE, mutations)
+    reference = wrapper._score_variants_from_marginal_probabilities(
+        SEQUENCE,
+        _sequential_masked_log_probs(wrapper, SEQUENCE),
+        mutations,
+        True,
+        biotrainer["ZeroShotMethod"].MASKED_MARGINALS,
+    )
+
+    assert len(scores) == len(mutations)
+    assert [s.total_score for s in scores] == pytest.approx(
+        [r.total_score for r in reference], abs=1e-5, rel=1e-4
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +173,7 @@ def test_chunk_size_shrinks_for_long_windows():
 
 @pytest.mark.parametrize("registers", [0, 2])
 def test_categorical_jacobian_has_residue_aligned_shape(registers):
-    """biotrainer's own implementation raises here: it assumes a BOS token."""
+    """No BOS and trailing register tokens must still give an L x 20 x L x 20 map."""
     engineer, _, _, _ = _build_engineer(num_register_tokens=registers, batch_size=64)
     wrapper = engineer.model_wrapper
 
@@ -157,8 +186,8 @@ def test_categorical_jacobian_has_residue_aligned_shape(registers):
 def test_categorical_jacobian_is_aligned_to_the_right_residue():
     """Mutating residue p must be the row the Jacobian attributes to p.
 
-    This is the arithmetic biotrainer gets wrong for a tokenizer without BOS:
-    it writes mutations at column ``n+1`` and slices logits ``[1:-1]``.
+    biotrainer releases before PR #192 got this wrong for a tokenizer without
+    BOS: they wrote mutations at column ``n+1`` and sliced logits ``[1:-1]``.
     """
     engineer, _, tokenizer, biotrainer = _build_engineer(batch_size=64)
     wrapper = engineer.model_wrapper
@@ -196,6 +225,31 @@ def test_contact_map_collapses_to_l_by_l():
     assert contacts.shape == (len(short), len(short))
 
 
+def test_jacobian_batches_by_the_chunk_size_not_biotrainers_batch_size():
+    """zero_shot_contact_map passes its own batch_size; the shim must ignore it
+    and use ``_chunk_size``, which caps the configured size by the token budget."""
+    engineer, _, tokenizer, biotrainer = _build_engineer(batch_size=7)
+    wrapper = engineer.model_wrapper
+    short = SEQUENCE[:12]
+    n_leading, n_trailing = special_token_offsets(tokenizer)
+
+    rows = []
+    original = wrapper._model_batched_forward_fn
+
+    def recording(*args, **kwargs):
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        rows.append(input_ids.shape[0])
+        return original(*args, **kwargs)
+
+    wrapper._model_batched_forward_fn = recording
+    engineer.zero_shot_contact_map(
+        biotrainer["ZeroShotMethod"].JACOBIAN_CONTACT, short, 999
+    )
+
+    assert wrapper._chunk_size(n_leading + len(short) + n_trailing) == 7
+    assert rows == [7] * 34 + [2]  # 12 residues x 20 = 240 rows
+
+
 def test_jacobian_rejects_a_tokenization_it_cannot_align():
     engineer, _, _, _ = _build_engineer()
     wrapper = engineer.model_wrapper
@@ -209,7 +263,7 @@ def test_jacobian_rejects_a_tokenization_it_cannot_align():
         original_tokenize(batch, preprocess)[1][:, :-1],
     )
     try:
-        with pytest.raises(ValueError, match="does not match the expected"):
+        with pytest.raises(ValueError, match="disagree about which tokens are special"):
             wrapper._compute_categorical_jacobian(SEQUENCE[:8])
     finally:
         wrapper._tokenize = original_tokenize
@@ -221,3 +275,19 @@ def test_jacobian_contact_is_a_supported_method():
     ZeroShotMethod = biotrainer["ZeroShotMethod"]
 
     assert ZeroShotMethod.JACOBIAN_CONTACT in engineer.model_wrapper.supported_methods()
+
+
+@pytest.mark.parametrize("registers, expected", [(0, 1023), (1, 1024), (2, 1024)])
+def test_context_caps_residues_at_1022_and_tokens_at_1024(registers, expected):
+    engineer, _, _, _ = _build_engineer(num_register_tokens=registers)
+
+    assert engineer.model_wrapper.max_context_length() == expected
+
+
+def test_jacobian_refuses_a_protein_past_the_context():
+    engineer, _, _, biotrainer = _build_engineer()
+
+    with pytest.raises(biotrainer["SequenceTooLongError"]):
+        engineer.zero_shot_contact_map(
+            biotrainer["ZeroShotMethod"].JACOBIAN_CONTACT, "A" * 1100
+        )

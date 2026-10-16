@@ -7,6 +7,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 import torch
 
 from nanoplm.eval.zero_shot import TOKEN_BUDGET, special_token_offsets
+from nanoplm.pretraining.models.modern_bert.modeling import collect_attention_probs
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
 
@@ -41,7 +42,7 @@ class NanoPLMCustomEmbedder:
         """
         CustomEmbedder = biotrainer["CustomEmbedder"]
 
-        n_leading, _ = special_token_offsets(tokenizer)
+        n_leading, n_trailing = special_token_offsets(tokenizer)
         max_rows = max(1, int(batch_size))
 
         def _batches(sequences: List[str]) -> Generator[List[str], None, None]:
@@ -87,12 +88,66 @@ class NanoPLMCustomEmbedder:
                 for sequence, embedding in self.per_residue(sequences):
                     yield sequence, embedding.mean(dim=0)
 
-            def compute_attention_map(self, sequence: str):
-                raise NotImplementedError(
-                    "nanoPLM does not expose attention maps, so the "
-                    "pbc_supervised_contact framework is not wired up. Use "
-                    "pbc_zeroshot_contact for contact prediction."
+            def compute_attention_map(self, sequence: str) -> torch.Tensor:
+                """Attention features for one sequence, as ``[L, L, maps]``.
+
+                ``maps`` is layers x heads (the layer loop counts once per
+                application, so a Loopie checkpoint contributes one block per
+                pass). The recipe follows biotrainer's Huggingface embedder so
+                the probe sees the same kind of feature it does: post-softmax
+                attention, symmetrized, then average-product corrected. Its own
+                ``_apc``/``_symmetrize`` are reused rather than reimplemented,
+                which keeps the two paths from drifting apart.
+
+                Special tokens are dropped by the tokenizer's actual offsets,
+                not by ``[1:-1]``: this tokenizer emits register tokens after
+                the EOS, and a fixed single-token trim would leave them in the
+                map as spurious residues.
+
+                Cost: the returned map is L x L x maps, 512 maps for the 32x16
+                base model, so ~0.5 GB fp16 at L=500 and ~4 GB at L=2000. The
+                per-layer loop below keeps the *peak* at one layer's worth
+                rather than the whole stack's.
+                """
+                from biotrainer.embedding.huggingface.huggingface_transformer_embedder import (  # noqa: E501
+                    HuggingfaceTransformerEmbedder as _Reference,
                 )
+
+                encoded = self._tokenizer([sequence], return_tensors="pt")
+                input_ids = encoded["input_ids"].to(self._device)
+                attention_mask = encoded["attention_mask"].to(self._device)
+
+                # `self._model.model` is the uncompiled inner encoder (attribute
+                # access falls through OptimizedModule), which is what the
+                # capture needs: it hangs off the eager SDPA path, and the
+                # varlen flash path never materializes a softmax to capture.
+                with torch.no_grad(), torch.amp.autocast(
+                    "cuda",
+                    dtype=torch.bfloat16,
+                    enabled=self._device.type == "cuda",
+                ), collect_attention_probs(self._model.model) as per_layer:
+                    self._model.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        loop_count=loop_count,
+                    )
+
+                if not per_layer:
+                    raise RuntimeError(
+                        "no attention was captured; the forward pass did not "
+                        "take the padded SDPA path"
+                    )
+
+                total = input_ids.shape[-1]
+                end = total - n_trailing
+                maps = []
+                for probs in per_layer:
+                    # (1, heads, T, T) -> (heads, L, L), then correct per map.
+                    layer = probs[0, :, n_leading:end, n_leading:end].float()
+                    layer = _Reference._apc(_Reference._symmetrize(layer))
+                    maps.append(layer.to(torch.float16))
+                attention_map = torch.cat(maps, dim=0)
+                return attention_map.permute(1, 2, 0)  # (residues, residues, map)
 
             def _encode(self, batch: List[str]) -> torch.Tensor:
                 """Hidden states for ``batch``, as ``[rows, seq, hidden]``.

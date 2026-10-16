@@ -11,8 +11,6 @@ The surface is flat (a single `eval:` block) and it is short because a checkpoin
 
 Two constraints are worth knowing before you run it. Evaluation needs the `eval` extra
 (`uv pip install -e ".[eval]"` or the GitHub form in [Install](/nanoplm/start/install/)), and it
-loads **pure-torch checkpoints only**. [`tasks`](#eval-tasks) is honored only when
-[`parallel_tasks`](#eval-parallel_tasks) is greater than `0` (default `0`); in sequential mode it is
-ignored with a warning.
+loads **pure-torch checkpoints only**.
 
 <ReferenceFields surface="eval" />

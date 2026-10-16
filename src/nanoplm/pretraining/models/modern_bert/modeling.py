@@ -9,7 +9,7 @@ The model is intentionally small and readable:
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -505,6 +505,70 @@ class ModernBertAttention(nn.Module):
                 persistent=False,
             )
 
+    # Set to a list by `collect_attention_probs` to capture post-softmax
+    # attention for the supervised contact probe. A class attribute, so no
+    # instance state exists during training and the state dict is untouched.
+    _attn_probs_sink: Optional[list] = None
+    _attn_probs_dtype: torch.dtype = torch.float16
+
+    def _eager_attention_probs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Post-softmax probabilities for the padded SDPA path, as (B, H, S, S).
+
+        SDPA fuses the softmax and never returns it, so the probe recomputes
+        QK^T here rather than outside the module: at this point q and k already
+        carry RoPE and QK-norm, and `attn_mask` is the same tensor the kernel
+        gets, so the sliding window and the padding mask come along for free
+        instead of being reconstructed from config (where a one-off in the
+        window would not show up in any aggregate statistic).
+
+        Precision is matched to SDPA on both ends, which under autocast are not
+        the same: q and k are first rounded to v's dtype, because QK-norm
+        returns fp32 and autocast casts SDPA's inputs down on entry, so the
+        kernel never sees the unrounded values; the product is then accumulated
+        in fp32, because that is what SDPA does internally. Autocast has to be
+        switched off explicitly for that second half, since inside an enabled
+        region `matmul` casts its inputs back down to bf16 whatever `.float()`
+        says, which at QK-norm logit magnitudes moves probabilities by a few
+        percent.
+        """
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+        if k.dtype != v.dtype:
+            k = k.to(v.dtype)
+        if self.num_q_heads != self.num_kv_heads:
+            k = k.repeat_interleave(self.num_q_heads // self.num_kv_heads, dim=1)
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            return self._softmax_scores(q, k, attn_mask)
+
+    def _softmax_scores(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * self.scale
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                scores = scores.masked_fill(~attn_mask, float("-inf"))
+            else:
+                scores = scores + attn_mask.float()
+        probs = torch.softmax(scores, dim=-1)
+        # A padded query in a sliding layer can have a window that holds nothing
+        # but padding, leaving every score -inf and the softmax NaN (SDPA
+        # propagates the NaN too). Those rows are not real residues, so zero
+        # them rather than letting the NaN reach the APC correction, which sums
+        # over the whole map and would spread it across every pair.
+        if attn_mask is not None:
+            attended = torch.isfinite(scores).any(dim=-1, keepdim=True)
+            probs = torch.where(attended, probs, torch.zeros_like(probs))
+        return probs
+
     def _pair_varlen_qkv(
         self,
         q: torch.Tensor,
@@ -735,6 +799,21 @@ class ModernBertAttention(nn.Module):
             q, k, v = self._pair_sdpa_qkv(q, k, v, cos_sin)
             attn_mask = _pair_sdpa_attention_mask(attn_mask)
 
+        sink = self._attn_probs_sink
+        if sink is not None:
+            if self.use_paired_head_attention or self.use_diff_attn_v2:
+                raise NotImplementedError(
+                    "attention-probability capture is not implemented for "
+                    "paired-head or differential attention"
+                )
+            # fp16 on the CPU as it is produced: (32 layers, 16 heads, L, L) is
+            # 2 GB of fp32 at L=1000 if the whole stack is held on the device.
+            sink.append(
+                self._eager_attention_probs(q, k, v, attn_mask)
+                .to(self._attn_probs_dtype)
+                .cpu()
+            )
+
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -761,6 +840,41 @@ class ModernBertAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.out_drop(self.Wo(y))
+
+
+@contextmanager
+def collect_attention_probs(
+    module: nn.Module,
+    dtype: torch.dtype = torch.float16,
+):
+    """Capture post-softmax attention from every attention call under `module`.
+
+    Yields one list that the attention modules append to in call order, so
+    weight-tied layer loops contribute one entry per application rather than
+    one per module. Each entry is (B, H, S, S) on the CPU, cast to `dtype`.
+
+    The default fp16 matches what the reference implementation hands the probe
+    and halves a stack that is 2 GB of fp32 at L=1000; the softmax itself is
+    always computed in fp32. Pass fp32 to compare against the kernel output
+    without the cast in the way.
+
+    Padded (SDPA) forwards only: the varlen flash path never materializes the
+    probabilities, and asking for them there would silently yield nothing.
+    """
+    attentions = [m for m in module.modules() if isinstance(m, ModernBertAttention)]
+    sink: list = []
+    for m in attentions:
+        m._attn_probs_sink = sink
+        m._attn_probs_dtype = dtype
+    try:
+        yield sink
+    finally:
+        for m in attentions:
+            # `del`, not `= None`: leaving an instance attribute behind would
+            # contradict the class-attribute default and can cost a Dynamo
+            # recompile on a compiled model.
+            del m._attn_probs_sink
+            del m._attn_probs_dtype
 
 
 def _residual_add(

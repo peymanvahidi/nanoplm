@@ -1,6 +1,6 @@
 ---
 title: 3. Evaluate
-description: Score a checkpoint on zero-shot ProteinGym and contact-prediction benchmarks with eval.yaml.
+description: Score a checkpoint on ProteinGym, contact-prediction and supervised probe benchmarks with eval.yaml.
 ---
 
 import { FileTree, Steps } from '@astrojs/starlight/components';
@@ -11,7 +11,7 @@ This is where the checkpoint format pays off. `eval.yaml` needs **a path and a l
 
 ## Before you start
 
-Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer) 2.0.0, which is an optional
+Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer) 2.1.1, which is an optional
 dependency (not part of `nanoplm deps install`; see [Install](/nanoplm/start/install/)):
 
 ```sh
@@ -20,16 +20,13 @@ uv pip install "nanoplm[eval] @ git+https://github.com/peymanvahidi/nanoplm"
 uv pip install -e ".[eval]"
 ```
 
-:::note[pbc_zeroshot_contact needs a PR build]
-`pbc_zeroshot_contact` needs fixes not yet in the biotrainer 2.0.0 release; without them it fails with `TypeError: Got unsupported ScalarType BFloat16`. Run `tools/install_biotrainer_pr.sh` after the extra above to install biotrainer and biotrainer-core from [PR #192](https://github.com/sacdallago/biotrainer/pull/192) on top. The script needs outbound network to clone the PR branch, so run it on a machine that has one. See [Offline machines](#offline-machines) below for staging the benchmark data itself with `dataset_dir` on a compute node that doesn't.
-:::
-
 Evaluation loads **pure-torch checkpoints only**. That is one more reason to keep the stock `pure_torch: true` default when you pretrain, as [2. Pretrain](/nanoplm/pipeline/pretrain/) recommends.
 
-:::note[Zero-shot only]
-`nanoplm eval` covers biotrainer's **zero-shot** frameworks. The supervised probe
-benchmarks (`pbc`, `flip`) were dropped in the move to biotrainer 2.0.0; a config
-that still lists them fails with a message naming the replacement.
+:::note[Removed frameworks]
+The old `pbc` and `flip` probe suites were dropped in the move to biotrainer
+2.0.0; a config that still lists them fails with a message naming the supported
+frameworks. Supervised probes now run through `pbc_supervised` and
+`pbc_supervised_contact`.
 :::
 
 ## Run it
@@ -80,7 +77,9 @@ eval:
   # A checkpoint-* directory, or a run-* directory (the newest checkpoint inside it is used).
   checkpoint_dir: "output/pretraining_checkpoints/run-14071932/checkpoint-final"
 
-  framework: [pgym]                   # one or more of: pgym, pbc_zeroshot_contact
+  framework: [pgym]                   # one or more of: pgym, pbc_zeroshot_contact, pbc_supervised, pbc_supervised_contact
+
+  # pbc_supervised_datasets: [secondary_structure, scl]   # or one name, or all
 
   output_dir: "autoeval_output"
 
@@ -115,8 +114,10 @@ So during a long run you can leave `checkpoint_dir` pointed at the run directory
 | --- | --- |
 | `pgym` | ProteinGym, **zero-shot**: the model scores mutants directly, with no probe trained on top. |
 | `pbc_zeroshot_contact` | Contact maps derived from the model's **categorical Jacobian**, scored against experimental structures. |
+| `pbc_supervised` | Task heads trained on the frozen encoder's embeddings. [`pbc_supervised_datasets`](/nanoplm/reference/eval/#eval-pbc_supervised_datasets) picks the datasets; the default is `secondary_structure` and `scl`, and `all` runs all seven. |
+| `pbc_supervised_contact` | A logistic probe over the model's symmetrized, APC-corrected attention maps. |
 
-Both use the MLM head itself rather than a trained probe, so they measure how well the model models proteins — `pgym` through mutational effects, `pbc_zeroshot_contact` through the pairwise couplings the model has internalised.
+The first two use the MLM head itself rather than a trained probe, so they measure how well the model models proteins. `pgym` measures it through mutational effects, `pbc_zeroshot_contact` through the pairwise couplings the model has learned. The `pbc_supervised*` frameworks train a probe on top of the frozen model.
 
 Zero-shot scoring has three methods, set by [`zero_shot_method`](/nanoplm/reference/eval/#eval-zero_shot_method) and used only when `pgym` is in `framework`:
 
@@ -144,6 +145,10 @@ An MoE forward pass is not batch-composition invariant: what else shares the bat
 
 Benchmark datasets are downloaded on first use into `~/.cache/biotrainer/autoeval/`. On a cluster whose compute nodes have no outbound network, download once somewhere with internet and point [`dataset_dir`](/nanoplm/reference/eval/#eval-dataset_dir) at the resulting tree. `dataset_dir` and `force_download` are mutually exclusive: a pre-populated directory does not use the download cache that `force_download` clears.
 
+biotrainer 2.1 changed the dataset layout. If `~/.cache/biotrainer/autoeval` still holds datasets from an older biotrainer, `nanoplm eval` refuses to start without `dataset_dir`, because 2.1 would reuse the old files instead of downloading the current ones. Point `dataset_dir` at a fresh directory, or delete the cache.
+
+`force_download` deletes the whole `~/.cache/biotrainer/autoeval` directory before downloading, including datasets another biotrainer install may still use. To get a fresh copy without touching that cache, set `dataset_dir` to an empty directory instead.
+
 ## What you get
 
 <FileTree>
@@ -158,7 +163,7 @@ Benchmark datasets are downloaded on first use into `~/.cache/biotrainer/autoeva
 
 </FileTree>
 
-A second framework added to `framework:` later merges into the same report rather than starting a new one. That also means a framework already present in the report is **reused, not recomputed** — the run logs a warning naming which ones were served from disk. Delete the report, or use a fresh `output_dir`, to force a re-run.
+A second framework added to `framework:` later merges into the same report rather than starting a new one. That also means a framework already present in the report is **reused, not recomputed** — the run logs a warning naming which ones were served from disk. Delete the report, or use a fresh `output_dir`, to force a re-run. Results that another biotrainer version wrote are never reused: the run stops before loading the model and asks for a fresh `output_dir`.
 
 ## Next
 

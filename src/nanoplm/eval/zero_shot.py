@@ -15,8 +15,10 @@ from nanoplm.utils.logger import logger
 
 # Upper bound on tokens per batched forward pass. The effective batch is
 # ``min(zero_shot_batch_size, TOKEN_BUDGET // window_len)``, so long windows
-# shrink the batch instead of running out of memory.
-TOKEN_BUDGET = 65_536
+# shrink the batch instead of running out of memory. Sized so a full
+# 1024-token window still admits a batch of 256: below that, a configured
+# batch size is silently capped rather than honoured.
+TOKEN_BUDGET = 262_144
 
 
 def special_token_offsets(tokenizer: ProtModernBertTokenizer) -> Tuple[int, int]:
@@ -132,8 +134,15 @@ class NanoPLMBioEngineer:
             def strip_special_tokens(self, tensor: torch.Tensor) -> torch.Tensor:
                 return tensor[n_leading : tensor.shape[0] - n_trailing]
 
+            def max_context_length(self) -> int:
+                # ESM's residue cap (1022) whatever the special-token count, and
+                # never more than biotrainer's 1024-token context.
+                return min(
+                    super().max_context_length(), 1022 + n_leading + n_trailing
+                )
+
         class _Wrapper(CustomBioEngineerModelWrapper):
-            """Adds batched masked-marginals and a tokenizer-correct Jacobian."""
+            """Adds batched masked-marginals and a configurable Jacobian batch size."""
 
             def __init__(self, custom_bioengineer, device: torch.device, batch_size: int):
                 super().__init__(custom_bioengineer=custom_bioengineer, device=device)
@@ -142,8 +151,15 @@ class NanoPLMBioEngineer:
             def _chunk_size(self, row_len: int) -> int:
                 return max(1, min(self._batch_size, TOKEN_BUDGET // max(1, row_len)))
 
-            def _get_masked_log_probabilities(self, sequence: str) -> torch.Tensor:
+            def _get_masked_log_probabilities(
+                self, sequence: str, batch_size: int = 32
+            ) -> torch.Tensor:
                 """Batched masked-marginals.
+
+                ``batch_size`` is ignored. biotrainer passes it positionally and
+                AutoEval's pgym always sends the default 32; the batches here are
+                sized by ``zero_shot_batch_size`` and ``TOKEN_BUDGET`` instead,
+                so scores do not depend on it.
 
                 biotrainer masks one position at a time and runs one forward per
                 position. This computes the same quantity, but groups positions
@@ -229,69 +245,23 @@ class NanoPLMBioEngineer:
             def _compute_categorical_jacobian(
                 self, sequence: str, batch_size: int = 32
             ) -> torch.Tensor:
-                """Categorical Jacobian, corrected for nanoPLM's tokenizer.
+                """Categorical Jacobian at the configured batch size.
 
-                biotrainer's implementation hardcodes a ``[BOS] + residues + [EOS]``
-                layout: it derives ``L = input_ids.shape[1] - 2`` and slices logits
-                ``[1:-1]``. nanoPLM's tokenizer has no BOS and may append register
-                tokens, so that arithmetic is wrong here (it raises on the final
-                reshape). This uses the tokenizer's real offsets instead.
-
-                ``batch_size`` is biotrainer's hardcoded 32 — the zero-shot contact
-                pipeline offers no way to configure it — so the configured
-                ``zero_shot_batch_size`` wins.
+                biotrainer's implementation already derives residue positions
+                from ``strip_special_tokens`` and raises ``SequenceTooLongError``
+                past ``max_context_length()``; only the batching differs. The
+                Jacobian is 20*L forward rows per protein, so the configured
+                ``zero_shot_batch_size``, capped by the token budget, replaces
+                whatever biotrainer passes.
                 """
-                aa_token_ids = torch.tensor(
-                    list(self.aa_to_idx().values()), device=self._device
-                )
-                input_ids, attention_mask = self._tokenize([sequence], preprocess=True)
-
-                length = len(sequence)
-                expected_len = n_leading + length + n_trailing
-                if input_ids.shape[1] != expected_len:
-                    raise ValueError(
-                        f"Tokenized length {input_ids.shape[1]} does not match the "
-                        f"expected {expected_len} = {n_leading} leading + {length} "
-                        f"residues + {n_trailing} trailing special tokens. The "
-                        f"categorical Jacobian cannot be aligned to residues."
-                    )
-
-                n_rows = length * 20
-                chunk = self._chunk_size(expected_len)
+                n_tokens = n_leading + len(sequence) + n_trailing
+                chunk = self._chunk_size(n_tokens)
+                n_rows = len(sequence) * 20
                 logger.info(
-                    f"Categorical Jacobian: L={length} -> {n_rows} mutated sequences "
-                    f"in {-(-n_rows // chunk)} forward passes (batch {chunk})."
+                    f"Categorical Jacobian: L={len(sequence)} -> {n_rows} mutated "
+                    f"sequences in {-(-n_rows // chunk)} forward passes (batch {chunk})."
                 )
-
-                mutated_ids = torch.tile(input_ids, (n_rows, 1))
-                mutated_mask = torch.tile(attention_mask, (n_rows, 1))
-                for position in range(length):
-                    # Order of aa_token_ids matters: it defines the AA axes.
-                    mutated_ids[
-                        position * 20 : (position + 1) * 20, n_leading + position
-                    ] = aa_token_ids
-
-                ref_logits = self._model_forward_fn(input_ids, attention_mask)
-                ref_logits = ref_logits[n_leading : n_leading + length][
-                    :, aa_token_ids
-                ].cpu()
-
-                mutated_logits = []
-                for batch_ids, batch_mask in zip(
-                    torch.split(mutated_ids, chunk), torch.split(mutated_mask, chunk)
-                ):
-                    logits = self._model_batched_forward_fn(batch_ids, batch_mask)
-                    mutated_logits.append(
-                        logits[:, n_leading : n_leading + length, :][
-                            :, :, aa_token_ids
-                        ].cpu()
-                    )
-
-                # [L*20, L, 20] -> [L, 20, L, 20] in order of aa_token_ids/STANDARD_AAS
-                mutated_logits = torch.cat(mutated_logits, dim=0).reshape(
-                    length, 20, length, 20
-                )
-                return mutated_logits - ref_logits
+                return super()._compute_categorical_jacobian(sequence, chunk)
 
         return BioEngineer.from_custom_model(
             _Wrapper(custom_bioengineer=_Impl(), device=device, batch_size=batch_size),

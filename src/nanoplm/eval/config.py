@@ -4,6 +4,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Union
 
+# PBC_SUPERVISED dataset names in biotrainer 2.1.1
+# (biotrainer_core's all_pbc_supervised_datasets()), as task.dataset_name
+# spells them. Kept here so this module imports without biotrainer.
+PBC_SUPERVISED_DATASETS = (
+    "conservation",
+    "disorder_chezod",
+    "frustration-classification",
+    "frustration-regression",
+    "phages",
+    "scl",
+    "secondary_structure",
+)
 
 @dataclass
 class EvalConfig:
@@ -12,11 +24,26 @@ class EvalConfig:
     checkpoint_dir: Union[str, Path]
 
     # Benchmark framework(s) to evaluate on. One or more of: pgym,
-    # pbc_zeroshot_contact, pbc_supervised. 'pgym' scores ProteinGym DMS
-    # variants zero-shot, 'pbc_zeroshot_contact' predicts contact maps from the
-    # categorical Jacobian, 'pbc_supervised' trains task heads on the frozen
-    # encoder's embeddings.
+    # pbc_zeroshot_contact, pbc_supervised, pbc_supervised_contact. 'pgym'
+    # scores ProteinGym DMS variants zero-shot, 'pbc_zeroshot_contact' predicts
+    # contact maps from the categorical Jacobian, 'pbc_supervised_contact' fits
+    # a probe on the attention maps, and 'pbc_supervised' trains task heads on
+    # the frozen encoder's embeddings.
     framework: List[str] = field(default_factory=lambda: ["pgym"])
+
+    # Which PBC_SUPERVISED datasets to run, when 'pbc_supervised' is in
+    # `framework`. The framework holds seven task heads and embeds every
+    # sequence they need, which is ~13 min and ~30 GB of per-residue embeddings
+    # for the full set; the standing battery only wants two of them, so the
+    # default restricts it. 'all' or [] runs every dataset; a single name may
+    # be given as a bare string, and names are matched case-insensitively.
+    # None here also means every dataset, but null in YAML keeps this default:
+    # the YAML loader drops null values for every eval key.
+    #   secondary_structure -> carries the newPISCES364 test split
+    #   scl                 -> subcellular location
+    pbc_supervised_datasets: Optional[List[str]] = field(
+        default_factory=lambda: ["secondary_structure", "scl"]
+    )
 
     # Directory where autoeval results and per-framework outputs are written.
     output_dir: Union[str, Path] = "autoeval_output"
@@ -47,11 +74,13 @@ class EvalConfig:
     development_mode: bool = True
 
     # Pre-downloaded benchmark dataset directory, passed to biotrainer as
-    # custom_storage_path. Set this on machines without internet access.
+    # custom_storage_path. Set this on machines without internet access, and
+    # while ~/.cache/biotrainer/autoeval holds datasets from biotrainer < 2.1.
     # Mutually exclusive with force_download.
     dataset_dir: Optional[str] = None
 
-    # Force re-download of framework datasets (use when new tasks land upstream).
+    # Delete the whole ~/.cache/biotrainer/autoeval directory and download the
+    # datasets again. For a fresh copy elsewhere, use an empty dataset_dir.
     force_download: bool = False
 
     # Refinement depth to run this checkpoint at, overriding the depth it was
@@ -59,3 +88,41 @@ class EvalConfig:
     # Works for both loopie and huginn checkpoints; a checkpoint with no
     # looping rejects it.
     loop_count: Optional[int] = None
+
+    # Run the model through torch.compile. Zero-shot scoring is thousands of
+    # forward passes, and eager spends only ~28% of its time in matmuls: the
+    # rest is unfused elementwise work (RoPE, gating, residuals). Compiling
+    # fuses it and roughly doubles throughput (185k -> 375k tok/s on a GH200).
+    # Compiled with dynamic shapes, because every protein is a different
+    # length; warmup is a few seconds and does not recur per shape.
+    torch_compile: bool = True
+
+    def __post_init__(self):
+        wanted = self.pbc_supervised_datasets
+        if wanted is None:
+            return
+        if isinstance(wanted, str):
+            wanted = [wanted]
+        if not isinstance(wanted, (list, tuple)):
+            raise ValueError(
+                "pbc_supervised_datasets must be 'all', a dataset name or a list "
+                f"of names; got {wanted!r}."
+            )
+        wanted = [str(name) for name in wanted]
+        names = [name for name in wanted if name.lower() != "all"]
+        if not names:
+            self.pbc_supervised_datasets = None
+            return
+        if len(names) < len(wanted):
+            raise ValueError(
+                f"pbc_supervised_datasets {wanted} mixes 'all' with dataset "
+                "names. Pass 'all' alone, or only names."
+            )
+        canonical = {name.lower(): name for name in PBC_SUPERVISED_DATASETS}
+        unknown = [name for name in names if name.lower() not in canonical]
+        if unknown:
+            raise ValueError(
+                f"Unknown pbc_supervised_datasets {unknown}. Expected 'all' or "
+                f"names from: {list(PBC_SUPERVISED_DATASETS)}."
+            )
+        self.pbc_supervised_datasets = [canonical[name.lower()] for name in names]

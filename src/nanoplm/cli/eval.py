@@ -16,7 +16,12 @@ from nanoplm.eval.config import EvalConfig
 from nanoplm.utils.common import create_dirs, read_yaml
 from nanoplm.utils.logger import logger
 
-_VALID_FRAMEWORKS = {"pgym", "pbc_zeroshot_contact", "pbc_supervised"}
+_VALID_FRAMEWORKS = {
+    "pgym",
+    "pbc_zeroshot_contact",
+    "pbc_supervised",
+    "pbc_supervised_contact",
+}
 _VALID_ZERO_SHOT_METHODS = {"masked_marginals", "wt_marginals", "pseudoperplexity"}
 
 # Frameworks dropped in the biotrainer 2.0.0 migration.
@@ -30,7 +35,7 @@ def _check_biotrainer_available() -> None:
         import biotrainer_core.data_classes  # noqa: F401
     except ImportError:
         raise click.ClickException(
-            "biotrainer 2.0.x is required for nanoplm eval but is not installed.\n"
+            "biotrainer 2.1.1 is required for nanoplm eval but is not installed.\n"
             "Install it with:  pip install nanoplm[eval]"
         )
 
@@ -41,8 +46,8 @@ def _validate_frameworks(frameworks: List[str]) -> None:
     for fw in frameworks:
         if fw in _REMOVED_FRAMEWORKS:
             raise click.ClickException(
-                f"Framework {fw!r} is no longer supported. nanoplm eval moved to "
-                "biotrainer 2.0.0 and now covers: "
+                f"Framework {fw!r} is no longer supported. nanoplm eval runs on "
+                "biotrainer 2.1.1 and covers: "
                 f"{sorted(_VALID_FRAMEWORKS)}."
             )
         if fw not in _VALID_FRAMEWORKS:
@@ -109,7 +114,7 @@ def _load_eval_config(config: Optional[Dict[str, Any]]) -> EvalConfig:
         kwargs["framework"] = _coerce_list_of_str(kwargs["framework"], "framework")
 
     # Boolean flags.
-    for key in ("force_download", "development_mode"):
+    for key in ("force_download", "development_mode", "torch_compile"):
         if key in kwargs:
             kwargs[key] = bool(kwargs[key])
 
@@ -156,6 +161,18 @@ def eval():
     help=(
         "Benchmark framework(s) to evaluate on. Pass multiple times to run "
         "several, e.g. --framework pgym --framework pbc_supervised."
+    ),
+    show_default=True,
+)
+@click.option(
+    "--pbc-supervised-dataset",
+    multiple=True,
+    default=("secondary_structure", "scl"),
+    help=(
+        "PBC_SUPERVISED dataset(s) to run when --framework includes "
+        "'pbc_supervised'. Restricting them also restricts the embedding, which "
+        "is the expensive part. 'secondary_structure' carries the newPISCES364 "
+        "test split. Pass 'all' to run every dataset."
     ),
     show_default=True,
 )
@@ -230,9 +247,19 @@ def eval():
         "trained with. Requires a looped (loopie or huginn) checkpoint."
     ),
 )
+@click.option(
+    "--torch-compile/--no-torch-compile",
+    default=True,
+    help=(
+        "Run the model through torch.compile with dynamic shapes. Roughly 2x "
+        "faster; eager spends most of its time in unfused elementwise kernels."
+    ),
+    show_default=True,
+)
 def run(
     checkpoint_dir: str,
     framework: tuple,
+    pbc_supervised_dataset: tuple,
     zero_shot_method: str,
     output_dir: str,
     zero_shot_batch_size: int,
@@ -242,6 +269,7 @@ def run(
     dataset_dir: Optional[str],
     force_download: bool,
     loop_count: Optional[int],
+    torch_compile: bool,
 ):
     """Run downstream evaluation directly from CLI flags."""
     frameworks_list = list(framework)
@@ -264,6 +292,8 @@ def run(
         dataset_dir=dataset_dir,
         force_download=force_download,
         loop_count=loop_count,
+        torch_compile=torch_compile,
+        pbc_supervised_datasets=list(pbc_supervised_dataset),
     )
 
     from nanoplm.eval.pipeline import run_eval
