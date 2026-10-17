@@ -4299,8 +4299,10 @@ def run_pure_pretraining(
             partial_discarded = accum_micro_count + skipped_tail_count
             # A budget or wall-clock stop before the last sub-batch didn't
             # finish the pass, so don't report it as complete.
+            # latest_data_pos is refreshed at every step, and a stop always
+            # follows one.
             pass_cut_short = (wallclock_stop or global_step >= total_steps) and (
-                micro_step < synced_len - 1 or sub_batch_idx < total_sub_batches - 1
+                latest_data_pos["epoch_data_step"] < synced_len
             )
             if is_main and not pass_cut_short:
                 logger.info(
