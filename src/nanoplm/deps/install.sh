@@ -613,7 +613,7 @@ step_moe() {
 
 step_mmseqs() {
   local dest="$VIRTUAL_ENV/bin/mmseqs"
-  if [ "$FORCE" -eq 0 ] && [ -x "$dest" ] && "$dest" version 2>/dev/null | grep -q "^${MMSEQS_RELEASE%%-*}"; then
+  if [ "$FORCE" -eq 0 ] && [ -x "$dest" ] && "$dest" version 2>/dev/null | grep -q "^${MMSEQS_RELEASE#*-}"; then
     log "mmseqs $MMSEQS_RELEASE present; skipping."; return 0
   fi
   if [ -z "${MMSEQS_ASSET:-}" ]; then
