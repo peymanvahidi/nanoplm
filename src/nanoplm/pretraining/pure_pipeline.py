@@ -270,13 +270,19 @@ def _split_packed_batch(
         s = int(cu[start_seq].item())
         e = int(cu[end_seq].item())
         actual_tokens = e - s
+        if actual_tokens > effective_tokens_per_split:
+            raise ValueError(
+                f"Packed split produced {actual_tokens} tokens but target split size is "
+                f"{effective_tokens_per_split}. Increase micro_batch_seqs or reduce warmup divisor."
+            )
         pad_tokens = effective_tokens_per_split - actual_tokens
         sub_cu = cu[start_seq : end_seq + 1] - cu[start_seq]
         actual_max_seqlen = int((sub_cu[1:] - sub_cu[:-1]).max().item())
-        pad_cap = max_seqlen_buckets[-1] if max_seqlen_buckets else max(1, pad_tokens)
-        pad_lens = [pad_cap] * (pad_tokens // pad_cap)
-        if pad_tokens % pad_cap:
-            pad_lens.append(pad_tokens % pad_cap)
+        if max_seqlen_buckets:
+            cap = max_seqlen_buckets[-1]
+            pad_lens = [cap] * (pad_tokens // cap) + ([pad_tokens % cap] if pad_tokens % cap else [])
+        else:
+            pad_lens = [pad_tokens] if pad_tokens else []
         max_seqlen = max([actual_max_seqlen, *pad_lens])
         if max_seqlen_buckets:
             max_seqlen = _bucket_ceiling(max_seqlen, max_seqlen_buckets, name="max_seqlen")
@@ -288,11 +294,6 @@ def _split_packed_batch(
             "max_seqlen": max_seqlen,
             "num_valid_tokens": torch.tensor(actual_tokens, dtype=torch.long),
         }
-        if actual_tokens > effective_tokens_per_split:
-            raise ValueError(
-                f"Packed split produced {actual_tokens} tokens but target split size is "
-                f"{effective_tokens_per_split}. Increase micro_batch_seqs or reduce warmup divisor."
-            )
         sub["input_ids"][:actual_tokens] = batch["input_ids"][s:e]
         sub["labels"][:actual_tokens] = batch["labels"][s:e]
         if pad_lens:
