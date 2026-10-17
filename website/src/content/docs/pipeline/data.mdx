@@ -60,7 +60,7 @@ Under the hood those steps are a [DVC](https://dvc.org/) DAG: `from-yaml` regene
 
 ## The whole config
 
-`data.yaml` is about 25 lines, so here it is in full.
+`data.yaml` is about 30 lines, so here it is in full.
 
 ```yaml title="data.yaml"
 data_dirs:
@@ -87,7 +87,16 @@ data_params:
   samples_per_shard: 2000    # more, smaller shards give the dataloader more to parallelise over
   max_workers: 2             # -1 uses every core; tokenization is the slow stage
   register_tokens: 0         # 0-2 learnable scratch tokens after EOS; recorded in the manifest
+
+cluster_subsampling:     # each epoch, train on one random member of every cluster
+  enabled: false
+  members: null          # uniref90, uniref100, a FASTA URL/path, or null (= url itself)
+  clusters: auto         # auto, or a path to your own cluster_id<TAB>sequence_id table
+  identity: 0.5          # MMseqs2 clustering only: min sequence identity within a cluster
+  coverage: 0.8          # MMseqs2 clustering only: min alignment coverage
 ```
+
+`cluster_subsampling` is off by default. Turned on, each epoch trains on one random member of every cluster (for example a random UniRef90 sequence of each UniRef50 cluster) instead of a fixed set of sequences; see [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 
 ## Choosing a source
 

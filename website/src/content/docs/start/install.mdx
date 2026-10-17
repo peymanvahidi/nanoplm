@@ -94,7 +94,11 @@ Only a host with no CUDA 13 toolkit *anywhere* is refused. Watch out for one red
 ```bash
 nanoplm deps install --arch 90      # default: Hopper sm90 (NVTE_CUDA_ARCHS)
 nanoplm deps install --force      # reinstall every component even if already satisfied
+nanoplm deps install --with-mmseqs  # also put the MMseqs2 binary into the venv
+nanoplm deps install --mmseqs-only  # only MMseqs2: no GPU stack, runs on any Linux host
 ```
+
+MMseqs2 is optional. Only [cluster subsampling](/nanoplm/guides/cluster-subsampling/) of your own sequences needs it; the binary (release 18-8cc5c, sha256-checked) goes into `$VIRTUAL_ENV/bin`. The x86_64 build needs a CPU with AVX2.
 
 If the build host has no outbound internet for the FlashAttention-3 wheel, download it elsewhere, set `NANOPLM_FA3_WHEEL=/path/to/wheel.whl`, and re-run.
 
