@@ -449,7 +449,8 @@ def pretrain():
     "--debug-layerwise-metrics/--no-debug-layerwise-metrics",
     default=False,
     help="Log per-layer grad/weight norms, residual-stream RMS, and logit stats. "
-    "Activation stats are computed inside the compiled graph; small overhead.",
+    "Activation stats are computed inside the compiled graph; small overhead. "
+    "Residual RMS keys are block_XXX_rep{r} on every run (only rep0 without Loopie).",
 )
 @click.option(
     "--debug-layerwise-log-every",

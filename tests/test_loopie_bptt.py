@@ -234,6 +234,6 @@ def test_yaml_true_is_rejected_not_read_as_1():
         PureProtModernBertMLM(model_cfg)
 
 
-def test_bptt_is_inert_without_loopie():
-    model = PureProtModernBertMLM(_cfg(use_loopie=False, loopie_bptt=1))
-    assert all(l.repeats == 1 and l.bptt is None for l in model.model.layers)
+def test_bptt_without_loopie_is_rejected():
+    with pytest.raises(ValueError, match="no effect"):
+        PureProtModernBertMLM(_cfg(use_loopie=False, loopie_bptt=1))

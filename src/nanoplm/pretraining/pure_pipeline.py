@@ -64,6 +64,7 @@ from nanoplm.pretraining.collator import (
     eval_masking_kwargs_from_config,
     DataCollatorWithFlattening,
     ProtDataCollatorForLM,
+    _bucket_ceiling,
     build_power_of_two_buckets,
     mlm_masking_kwargs_from_config,
 )
@@ -226,8 +227,15 @@ def _split_packed_batch(
     batch: dict[str, Any],
     n_splits: int,
     effective_tokens_per_split: int,
+    max_seqlen_buckets: Optional[list[int]] = None,
 ) -> list[dict[str, Any]]:
-    """Split a packed flat-token batch at sequence boundaries and re-pad each split."""
+    """Split a packed flat-token batch at sequence boundaries and re-pad each split.
+
+    With ``max_seqlen_buckets`` (the static packed path), each split's
+    ``max_seqlen`` is rounded up to the collator's buckets, and the trailing
+    pad is cut into dummy segments no longer than the top bucket, so splits
+    add no compiled shapes.
+    """
     if n_splits <= 1:
         return [batch]
 
@@ -263,41 +271,52 @@ def _split_packed_batch(
         s = int(cu[start_seq].item())
         e = int(cu[end_seq].item())
         actual_tokens = e - s
-        pad_tokens = effective_tokens_per_split - actual_tokens
-        sub_cu = cu[start_seq : end_seq + 1] - cu[start_seq]
-        actual_max_seqlen = int((sub_cu[1:] - sub_cu[:-1]).max().item())
-
-        sub = {
-            "input_ids": batch["input_ids"].new_zeros(effective_tokens_per_split),
-            "labels": batch["labels"].new_full((effective_tokens_per_split,), -100),
-            "cu_seqlens": sub_cu,
-            "max_seqlen": max(actual_max_seqlen, pad_tokens),
-            "num_valid_tokens": torch.tensor(actual_tokens, dtype=torch.long),
-        }
         if actual_tokens > effective_tokens_per_split:
             raise ValueError(
                 f"Packed split produced {actual_tokens} tokens but target split size is "
                 f"{effective_tokens_per_split}. Increase micro_batch_seqs or reduce warmup divisor."
             )
+        pad_tokens = effective_tokens_per_split - actual_tokens
+        sub_cu = cu[start_seq : end_seq + 1] - cu[start_seq]
+        actual_max_seqlen = int((sub_cu[1:] - sub_cu[:-1]).max().item())
+        if max_seqlen_buckets:
+            cap = max_seqlen_buckets[-1]
+            pad_lens = [cap] * (pad_tokens // cap) + ([pad_tokens % cap] if pad_tokens % cap else [])
+        else:
+            pad_lens = [pad_tokens] if pad_tokens else []
+        max_seqlen = max([actual_max_seqlen, *pad_lens])
+        if max_seqlen_buckets:
+            max_seqlen = _bucket_ceiling(max_seqlen, max_seqlen_buckets, name="max_seqlen")
+
+        sub = {
+            "input_ids": batch["input_ids"].new_zeros(effective_tokens_per_split),
+            "labels": batch["labels"].new_full((effective_tokens_per_split,), -100),
+            "cu_seqlens": sub_cu,
+            "max_seqlen": max_seqlen,
+            "num_valid_tokens": torch.tensor(actual_tokens, dtype=torch.long),
+        }
         sub["input_ids"][:actual_tokens] = batch["input_ids"][s:e]
         sub["labels"][:actual_tokens] = batch["labels"][s:e]
-        if pad_tokens > 0:
+        if pad_lens:
             sub["cu_seqlens"] = torch.cat(
                 [
                     sub["cu_seqlens"],
-                    sub["cu_seqlens"][-1:] + pad_tokens,
+                    sub["cu_seqlens"][-1:] + sub_cu.new_tensor(pad_lens).cumsum(0, dtype=sub_cu.dtype),
                 ]
             )
 
         if "position_ids" in batch:
             sub_pos = batch["position_ids"].new_zeros(effective_tokens_per_split)
             sub_pos[:actual_tokens] = batch["position_ids"][s:e]
-            if pad_tokens > 0:
-                sub_pos[actual_tokens:] = torch.arange(
-                    pad_tokens,
-                    dtype=batch["position_ids"].dtype,
-                    device=batch["position_ids"].device,
-                )
+            if pad_lens:
+                sub_pos[actual_tokens:] = torch.cat([
+                    torch.arange(
+                        n,
+                        dtype=batch["position_ids"].dtype,
+                        device=batch["position_ids"].device,
+                    )
+                    for n in pad_lens
+                ])
             sub["position_ids"] = sub_pos
 
         for key, value in batch.items():
@@ -316,6 +335,7 @@ def _split_batch(
     *,
     n_splits: int,
     effective_tokens_per_split: Optional[int] = None,
+    max_seqlen_buckets: Optional[list[int]] = None,
 ) -> list[dict[str, Any]]:
     if n_splits <= 1:
         return [batch]
@@ -326,6 +346,7 @@ def _split_batch(
             batch,
             n_splits=n_splits,
             effective_tokens_per_split=effective_tokens_per_split,
+            max_seqlen_buckets=max_seqlen_buckets,
         )
     return _split_standard_batch(batch, n_splits=n_splits)
 
@@ -355,33 +376,34 @@ def _dynamo_recompile_limit(
 ) -> int:
     """Dynamo recompile_limit this run needs so no compiled frame falls back to eager.
 
-    Batch-size warmup keeps the 16 it always had. Its stages do not share a
-    cache (each stage boundary calls ``torch.compiler.reset()``), but split
-    micro-batches carry unbucketed ``max_seqlen`` values.
+    Returns max(floor, V x S x f):
+    - V: structurally distinct encoder layers. Under FSDP2 all layers share the
+      ``ModernBertEncoderLayer.forward`` frame (``_forward_once`` with sublayer
+      units); without FSDP the model is one frame and V overestimates.
+    - S: input shapes, the ``max_seqlen`` buckets on the static packed path.
+    - f: for loopie, max(2j + 1, 2 if ``loopie_bptt`` else 1). Int R specializes
+      the layer frame, truncation splits ``_forward_once`` on grad mode, and the
+      two do not multiply. 2 for Huginn (no_grad recurrence). 1 otherwise. The
+      MoE mlp frame stays at <= 4 entries and adds no factor.
+    - floor: 8, or 16 with batch-size warmup. The 16 is headroom kept from
+      before split micro-batches were bucketed; lowering it needs a GPU recheck.
 
-    Loopie jitter passes R as a Python int (``_loop_count_fwd_kwargs``), and
-    every frame that sees it specializes once per value in the
-    {R0 - j, ..., R0 + j} support. Under FSDP2 the dynamo-disabled per-layer
-    hooks split the model at each encoder layer, so
-    ``ModernBertEncoderLayer.forward`` becomes one frame shared by every layer
-    and needs V x S x N entries: V structurally distinct layers, S input shapes
-    (the ``max_seqlen`` buckets on the static packed path) and N = 2j + 1
-    values of R. Without FSDP the whole model is one frame and needs S x N,
-    which the same bound covers. ``loopie_bptt`` adds nothing: its ``no_grad``
-    applications are traced inside the unrolled graph. The tensor-R fallback
-    (``_forward_repeats``, off the training path) needs V x S x 2 entries on
-    ``_forward_once``, which this bound covers for any j >= 1 (MoE layers add
-    a None/tensor ``last_aux_loss`` split there).
+    Per-config cache-entry derivations live in
+    tests/test_loopie_compile_stability.py.
     """
     limit = 16 if int(global_batch_warmup_steps) > 0 else 8
-    if getattr(model_config, "use_loopie", False) and int(loopie_jitter) > 0:
-        n_r = 2 * int(loopie_jitter) + 1
-        limit = max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * n_r)
-    return limit
+    per_shape = 1
+    if getattr(model_config, "use_loopie", False):
+        n_r = 2 * max(0, int(loopie_jitter)) + 1
+        grad_modes = 2 if getattr(model_config, "loopie_bptt", None) is not None else 1
+        per_shape = max(n_r, grad_modes)
+    elif getattr(model_config, "use_huginn_looping", False):
+        per_shape = 2  # truncated recurrence runs the core layers under no_grad too
+    return max(limit, _count_layer_variants(layers) * max(1, int(n_input_shapes)) * per_shape)
 
 
 def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
-    """Raise Dynamo's recompile_limit to ``needed``; never lower a higher setting."""
+    """Raise Dynamo's recompile_limit and accumulated_recompile_limit to ``needed``; never lower either."""
     try:
         import torch._dynamo.config as dynamo_config
 
@@ -390,9 +412,17 @@ def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
             dynamo_config.recompile_limit = needed
             logger.info(
                 "torch._dynamo.config.recompile_limit raised from %d to %d "
-                "(batch-size warmup / loopie jitter shapes).",
+                "(layer variants x input shapes x recurrence R / grad modes).",
                 current_limit,
                 dynamo_config.recompile_limit,
+            )
+        accumulated_limit = int(getattr(dynamo_config, "accumulated_recompile_limit", 256))
+        if accumulated_limit < needed:
+            dynamo_config.accumulated_recompile_limit = needed
+            logger.info(
+                "torch._dynamo.config.accumulated_recompile_limit raised from %d to %d.",
+                accumulated_limit,
+                dynamo_config.accumulated_recompile_limit,
             )
     except Exception:
         logger.exception("Failed to raise Dynamo recompile_limit; continuing.")
@@ -2559,6 +2589,7 @@ def run_pure_pretraining(
 
     # ---- Collator / Sampler / Packing ----
     train_sampler = None
+    max_seqlen_buckets = None
 
     if use_packing:
         inner_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
@@ -2779,10 +2810,7 @@ def run_pure_pretraining(
             layers=base_model.model.layers,
             loopie_jitter=int(getattr(pretrain_config, "loopie_loop_count_jitter", 0)),
             global_batch_warmup_steps=global_batch_warmup_steps,
-            n_input_shapes=(
-                1 if compile_dynamic
-                else len(build_power_of_two_buckets(int(manifest.max_seq_len), min_power_of_two=32))
-            ),
+            n_input_shapes=len(max_seqlen_buckets) if max_seqlen_buckets else 1,
         )
     )
     # Must precede every torch.compile call below.
@@ -3611,6 +3639,7 @@ def run_pure_pretraining(
                     full_batch,
                     n_splits=batch_split_divisor,
                     effective_tokens_per_split=effective_tokens_per_split if "cu_seqlens" in full_batch else None,
+                    max_seqlen_buckets=max_seqlen_buckets,
                 )
                 total_sub_batches = len(sub_batches)
                 if resume_sub_batch_start > 0 and is_main:

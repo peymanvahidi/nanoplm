@@ -25,7 +25,11 @@ import nanoplm.pretraining.models.modern_bert.modeling as modeling
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.modeling import ModernBertEncoderLayer
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.pure_pipeline import _count_layer_variants, _dynamo_recompile_limit
+from nanoplm.pretraining.pure_pipeline import (
+    _count_layer_variants,
+    _dynamo_recompile_limit,
+    _maybe_raise_dynamo_recompile_limit,
+)
 
 # 10 stored layers is the production loop-imp geometry and exceeds Dynamo's
 # recompile_limit, so per-layer frame specialization would show up as an eager
@@ -367,9 +371,14 @@ def single_rank_fsdp():
         )
     mesh = init_device_mesh("cpu", (1,))
 
-    def _shard(model):
-        # Per-layer units, then the root, as pure_pipeline shards them.
+    def _shard(model, sublayer=False):
+        # Per-layer units (attn and mlp first with sublayer granularity), then
+        # the root, as pure_pipeline shards them.
         for layer in model.model.layers:
+            if sublayer:
+                fully_shard(layer.attn, mesh=mesh, reshard_after_forward=False)
+                if layer.mlp is not None:
+                    fully_shard(layer.mlp, mesh=mesh, reshard_after_forward=False)
             fully_shard(layer, mesh=mesh, reshard_after_forward=False)
         fully_shard(model, mesh=mesh, reshard_after_forward=False)
         return model
@@ -379,55 +388,114 @@ def single_rank_fsdp():
         dist.destroy_process_group()
 
 
+_MOE = dict(
+    use_moe=True, moe_num_experts=4, moe_top_k=2, moe_leading_dense_layers=2,
+    mlp_activation="swiglu",
+)
+
+
+_HUGINN = dict(
+    use_huginn_looping=True, recycling_loop_count=3,
+    recycling_num_prelude_layers=1, recycling_num_coda_layers=1,
+)
+_HUGINN_RS = (1, 2, 3, 4)
+
+
 @pytest.mark.parametrize(
-    "pattern, num_layers, variants, bptt",
+    "looping, pattern, num_layers, variants, bptt, jitter, moe, sublayer, seqlens, frame, expected",
     # "F": layer 0 (Identity attn_norm) + the rest. "FS": that, plus the
-    # sliding layers, whose window_size is an extra guard. bptt=1 shows the
-    # no_grad applications add no entries on the unrolled path.
-    [("F", 3, 2, None), ("FS", 4, 3, 1)],
+    # sliding layers, whose window_size is an extra guard. MoE with two
+    # leading dense layers: layer 0, dense, MoE. Per-layer units: the layer
+    # frame needs V x S x N, and bptt=1 adds nothing on the unrolled path.
+    # Sublayer units: the frame is _forward_once, which splits on grad mode
+    # under bptt (x 2) but not on R, and no longer sees the attention type or
+    # MLP kind (those moved into their own frames), so only layer 0 differs:
+    # 2 x S x 2, with a third max_seqlen to clear the default limit. The MoE
+    # mlp frame stays at <= 4 entries (None/tensor last_aux_loss x grad mode).
+    # The tensor-R fallback (_forward_repeats) is off the training path and
+    # not sized by the limit. MoE without looping: the dispatch workspace
+    # reuse graph-breaks at the resize_ in MoELayer._ensure_dispatch_buffers
+    # (on by default without looping, CUDA cutlass path too), so forward's MoE
+    # entry stops at the _forward_once call with no layer or max_seqlen guards
+    # and, being newest, takes every layer from the second shape on: today
+    # _forward_once holds 1 + V x (S - 1) = 13 of the 15 the limit allows (old
+    # limit 8), and forward keeps the first shape's V. That count hangs on the
+    # break, so the row (None) is bounded, not exact: 8 < entries <= limit. Huginn with recycling_bptt K = 1 (the
+    # bptt column) runs R - 1 core passes under no_grad, so the layer frame
+    # sees both grad modes, except that the prelude layer never runs under
+    # no_grad: S x (V + 1) = 9 entries for R in 1..4, against 8 before and
+    # V x S x 2 = 12 now. The limit counts x 2 for every Huginn run, since
+    # recycling_bptt lives in the pretrain config, not the model config.
+    [
+        ("loopie", "F", 3, 2, None, 1, False, False, _MAX_SEQLENS, "forward", 2 * 2 * 3),
+        ("loopie", "FS", 4, 3, 1, 1, False, False, _MAX_SEQLENS, "forward", 3 * 2 * 3),
+        ("loopie", "F", 4, 3, None, 1, True, False, _MAX_SEQLENS, "forward", 3 * 2 * 3),
+        ("loopie", "FS", 4, 3, 1, 1, False, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
+        ("loopie", "FS", 4, 3, 1, 0, False, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
+        ("loopie", "F", 4, 3, 1, 1, True, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
+        ("none", "F", 4, 3, None, 0, True, False, (4, 8, 16, 32, 64), "_forward_once", None),
+        ("huginn", "F", 4, 2, 1, 0, False, False, (16, 32, 64), "forward", 3 * (2 + 1)),
+    ],
+    ids=["F", "FS-bptt", "moe-jitter", "FS-sublayer-bptt", "FS-sublayer-bptt-j0",
+         "moe-sublayer-bptt", "moe-no-loopie", "huginn-bptt"],
 )
 def test_jitter_training_fits_the_computed_recompile_limit(
-    monkeypatch, make_counting_backend, single_rank_fsdp, pattern, num_layers, variants, bptt
+    monkeypatch, make_counting_backend, single_rank_fsdp,
+    looping, pattern, num_layers, variants, bptt, jitter, moe, sublayer, seqlens, frame, expected,
 ):
-    """Int-R jitter training under FSDP2 must fit the limit the pipeline sets.
+    """Loopie training under FSDP2 must fit the limit the pipeline sets.
 
-    FSDP2's dynamo-disabled hooks break the graph at every layer call, so
-    ``ModernBertEncoderLayer.forward`` is one frame shared by all layers, and
-    the int R specializes it: V x S x N entries. With the limit from
-    ``_dynamo_recompile_limit`` and ``fail_on_recompile_limit_hit`` on, an
-    undersized limit raises instead of silently running that shape eager.
+    FSDP2's dynamo-disabled hooks break the graph at every FSDP unit, so
+    ``ModernBertEncoderLayer.forward`` (or ``_forward_once`` with sublayer
+    units) is one frame shared by all layers, and the int R and the input
+    shapes specialize it. With the limit from ``_dynamo_recompile_limit`` and
+    ``fail_on_recompile_limit_hit`` on, an undersized limit raises instead of
+    silently running that shape eager.
     """
     monkeypatch.setattr(modeling, "_flash_varlen_fn", _stub_flash_varlen)
     monkeypatch.setattr(modeling, "_HAS_FLASH_VARLEN", True)
     torch.manual_seed(0)
+    looping_cfg = {
+        "loopie": dict(use_loopie=True, loopie_loop_count=2, loopie_bptt=bptt),
+        "none": {},
+        "huginn": _HUGINN,
+    }[looping]
     model = PureProtModernBertMLM(
         _cfg(
             num_hidden_layers=num_layers,
             attn_layer_pattern=pattern,
-            use_loopie=True,
-            loopie_loop_count=2,
-            loopie_bptt=bptt,
+            **looping_cfg,
+            **(_MOE if moe else {}),
         )
     ).train()
     assert _count_layer_variants(model.model.layers) == variants
     limit = _dynamo_recompile_limit(
         model.model_config,
         layers=model.model.layers,
-        loopie_jitter=1,
+        loopie_jitter=jitter,
         global_batch_warmup_steps=0,
-        n_input_shapes=len(_MAX_SEQLENS),
+        n_input_shapes=len(seqlens),
     )
-    expected = variants * len(_MAX_SEQLENS) * len(_JITTER_RS)
-    assert expected > 8, "test precondition: the default limit must be too small"
-    single_rank_fsdp(model)
+    if expected is not None:
+        assert expected > 8, "test precondition: the default limit must be too small"
+    single_rank_fsdp(model, sublayer=sublayer)
 
     backend, _ = make_counting_backend()
     torch._dynamo.reset()
     counters.clear()
     compiled = torch.compile(model, backend=backend, dynamic=False)
+    if looping == "loopie":
+        loop_kwargs = [dict(loop_count=r) for r in range(2 - jitter, 2 + jitter + 1)]
+    elif looping == "huginn":
+        loop_kwargs = [
+            dict(loop_count=torch.tensor(r), recycling_bptt=torch.tensor(bptt))
+            for r in _HUGINN_RS
+        ]
+    else:
+        loop_kwargs = [{}]
     with torch._dynamo.config.patch(recompile_limit=limit, fail_on_recompile_limit_hit=True):
-        for max_seqlen in _MAX_SEQLENS:
-            for r in _JITTER_RS:
+        for max_seqlen in seqlens:
+            for extra in loop_kwargs:
                 input_ids = torch.randint(0, model.model_config.vocab_size, (_PACKED_TOKENS,))
                 cu_seqlens = torch.arange(0, _PACKED_TOKENS + 1, max_seqlen, dtype=torch.int32)
                 torch._dynamo.mark_dynamic(cu_seqlens, 0)
@@ -437,17 +505,29 @@ def test_jitter_training_fits_the_computed_recompile_limit(
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
                     position_ids=torch.arange(_PACKED_TOKENS) % max_seqlen,
-                    loop_count=r,
+                    **extra,
                 )
                 out.loss.backward()
 
     breaks = [reason for reason in counters["graph_break"] if "_forward_repeats" in reason]
     assert not breaks, f"int R reached the eager driver:\n{breaks}"
-    entries = len(_debug_get_cache_entry_list(ModernBertEncoderLayer.forward.__code__))
-    assert entries == expected, (
-        f"ModernBertEncoderLayer.forward has {entries} cache entries; expected "
-        f"V={variants} x S={len(_MAX_SEQLENS)} x N={len(_JITTER_RS)}."
-    )
+    code = getattr(ModernBertEncoderLayer, frame).__code__
+    entries = len(_debug_get_cache_entry_list(code))
+    if expected is None:
+        assert 8 < entries <= limit, (
+            f"ModernBertEncoderLayer.{frame} has {entries} cache entries; "
+            f"expected 8 < n <= {limit}."
+        )
+    else:
+        assert entries == expected, (
+            f"ModernBertEncoderLayer.{frame} has {entries} cache entries; expected {expected}."
+        )
+    if looping == "none":
+        assert len(_debug_get_cache_entry_list(ModernBertEncoderLayer.forward.__code__)) == variants
+    if moe:
+        from nanoplm.pretraining.models.modern_bert.moe import MoELayer
+
+        assert len(_debug_get_cache_entry_list(MoELayer.forward.__code__)) <= 4
     torch._dynamo.reset()
 
 
@@ -455,6 +535,7 @@ def test_recompile_limit_arithmetic():
     truncated = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=1)
     full_bptt = types.SimpleNamespace(use_loopie=True, loopie_loop_count=2, loopie_bptt=None)
     plain = types.SimpleNamespace(use_loopie=False)
+    huginn = types.SimpleNamespace(use_loopie=False, use_huginn_looping=True)
 
     def limit(cfg, jitter=1, warmup=0, shapes=6, variants=3):
         return _dynamo_recompile_limit(
@@ -466,10 +547,26 @@ def test_recompile_limit_arithmetic():
         )
 
     assert _count_layer_variants([torch.nn.Linear(2, 1), torch.nn.Linear(2, 1)]) == 1
-    assert limit(plain) == 8
-    assert limit(plain, warmup=10) == 16
-    assert limit(full_bptt, jitter=0) == 8
+    assert limit(plain) == 3 * 6  # V x S
+    assert limit(plain, shapes=2, variants=2) == 8  # floor wins
+    assert limit(plain, shapes=2, variants=2, warmup=10) == 16
+    assert limit(full_bptt, jitter=0) == 3 * 6
+    assert limit(truncated, jitter=0) == 3 * 6 * 2  # sublayer _forward_once splits on grad mode
     assert limit(full_bptt) == 3 * 6 * 3  # V x S x (2j + 1)
     assert limit(full_bptt, jitter=2) == 3 * 6 * 5
-    assert limit(truncated) == limit(full_bptt)  # bptt adds no entries
+    assert limit(truncated) == limit(full_bptt)  # grad modes do not multiply R
     assert limit(full_bptt, shapes=1, variants=1, warmup=10) == 16  # warmup floor wins
+    assert limit(huginn) == 3 * 6 * 2  # no_grad recurrence splits on grad mode
+
+
+def test_maybe_raise_recompile_limit_lifts_the_accumulated_cap():
+    cfg = torch._dynamo.config
+    with cfg.patch(recompile_limit=8, accumulated_recompile_limit=256):
+        _maybe_raise_dynamo_recompile_limit(300)
+        assert (cfg.recompile_limit, cfg.accumulated_recompile_limit) == (300, 300)
+        with cfg.patch(recompile_limit=8, accumulated_recompile_limit=256):
+            _maybe_raise_dynamo_recompile_limit(10)
+            assert (cfg.recompile_limit, cfg.accumulated_recompile_limit) == (10, 256)
+        with cfg.patch(recompile_limit=50):
+            _maybe_raise_dynamo_recompile_limit(4)  # never lowers
+            assert cfg.recompile_limit == 50

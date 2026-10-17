@@ -149,7 +149,9 @@ model:
   # Cannot be used together with Huginn recycling above.
   use_loopie: false                     # master switch
   loopie_loop_count: 2                  # times each layer is applied (>= 2 when enabled)
-  loopie_bptt: null                     # null = full backprop; k = grad through the last k applications only (~1.33x a plain step at R=2 with k=1, not 2x)
+  # null = full backprop; k = grad through the last k applications only (~1.33x a plain step at R=2 with k=1, not 2x).
+  # With truncation, only k of the R applications send MoE aux- and z-loss gradient to the router, each weighted 1/R.
+  loopie_bptt: null
 
 
 # =============================================================================
@@ -304,7 +306,7 @@ pretraining:
   # ── Debug ─────────────────────────────────────────────────────────────────
 
   debug_non_finite_params: false        # NaN/Inf check on params after every step
-  debug_layerwise_metrics: false        # per-layer grad/weight norms, residual RMS, logits; overhead
+  debug_layerwise_metrics: false        # per-layer grad/weight norms, residual RMS (keys block_XXX_rep{r} on every run), logits; overhead
   debug_layerwise_log_every: 100        # log layerwise metrics every N optimizer steps
   # debug_memory_snapshot: false        # record CUDA allocator history; dumps a pickle for pytorch.org/memory_viz into the run dir
   # debug_memory_snapshot_step: -1      # also dump after this step; -1 = dump only on OOM
