@@ -189,6 +189,20 @@ class ShardedDataset(Dataset):
         return self._total_tokens
 
 
+def packing_sampler(dataset: Dataset, seed: int, distributed: bool) -> torch.utils.data.DistributedSampler:
+    """The shuffling sampler TokenPackingDataset draws its order from.
+
+    Always a DistributedSampler, also on one process (num_replicas=1): its order
+    is a seeded function of the epoch, so DataLoader workers split one shared
+    permutation instead of each drawing their own (a RandomSampler copied into
+    every worker covers only about 70% of the items per pass with 4 workers).
+    """
+    if distributed:
+        return torch.utils.data.DistributedSampler(dataset, shuffle=True, seed=seed)
+    return torch.utils.data.DistributedSampler(dataset, num_replicas=1, rank=0,
+                                               shuffle=True, seed=seed)
+
+
 class TokenPackingDataset(torch.utils.data.IterableDataset):
     """Dataset that uses sequence packing to construct batches with variable length up to a maximum number of tokens."""
 

@@ -68,7 +68,7 @@ from nanoplm.pretraining.collator import (
     build_power_of_two_buckets,
     mlm_masking_kwargs_from_config,
 )
-from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset, packing_sampler
 from nanoplm.data.datasets.cluster_sampled import ClusterSampledDataset, open_train_dataset
 from nanoplm.pretraining import cpu_offload
 from nanoplm.pretraining.fp8 import (
@@ -2608,7 +2608,7 @@ def run_pure_pretraining(
     max_seqlen_buckets = None
 
     if use_packing:
-        inner_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
+        inner_sampler = packing_sampler(train_ds, pretrain_config.seed, distributed)
 
         train_ds = TokenPackingDataset(
             train_ds,

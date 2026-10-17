@@ -218,3 +218,37 @@ if __name__ == "__main__":
     test_token_packing_dataset()
     test_data_collator_flattening()
     print("Tests passed!")
+
+
+class IdDataset(Dataset):
+    def __len__(self):
+        return 1000
+
+    def __getitem__(self, i):
+        return {"input_ids": torch.full((10,), i, dtype=torch.long)}
+
+    def get_all_sequence_lengths(self):
+        return np.full(1000, 10, dtype=np.int32)
+
+
+def _first_ids(batch):
+    return [int(s["input_ids"][0]) for s in batch]
+
+
+def test_single_process_packing_visits_each_item_once_with_four_workers():
+    from collections import Counter
+    from nanoplm.data.datasets.pretrain import packing_sampler
+    ds = IdDataset()
+    packed = TokenPackingDataset(ds, max_tokens_per_batch=100, drop_last=True,
+                                 sampler=packing_sampler(ds, seed=7, distributed=False))
+    passes = []
+    for epoch in (0, 1):
+        packed.set_epoch(epoch)
+        dl = DataLoader(packed, batch_size=None, num_workers=4, collate_fn=_first_ids,
+                        multiprocessing_context="fork")
+        batches = list(dl)
+        seen = Counter(i for b in batches for i in b)
+        assert len(seen) == 1000 and max(seen.values()) == 1
+        assert len(batches) == len(packed) == 100
+        passes.append([i for b in batches for i in b])
+    assert passes[0] != passes[1]                 # set_epoch reshuffles
