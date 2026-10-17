@@ -7,7 +7,8 @@ test_fsdp_epoch_boundary_grad.py, run in its own process.
 SPEC keys: dataset_dir, ckp_dir, out (per-rank JSON path prefix), micro, ga,
 steps, bwarm, mode ("single" | "dist"), resume (checkpoint dir or null),
 dist_mode (pipeline distributed_mode; default "ddp" for "dist" and "fsdp" for
-"single", since the pipeline rejects ddp without multi_gpu).
+"single", since the pipeline rejects ddp without multi_gpu), len_overreport
+(add this to the train loader length the pipeline syncs; default 0).
 
 Forces CPU and makes torch.compile the identity. Records, for every training
 sub-batch the loop moves to the device, (global_step, epoch, micro_step,
@@ -105,6 +106,10 @@ def run_phase(spec: dict) -> None:
     # The FSDP2 path builds its mesh on "cuda"; on CPU/gloo it must be "cpu".
     _mesh = pp.init_device_mesh
     pp.init_device_mesh = lambda _t, *a, **k: _mesh("cpu", *a, **k)
+    over = spec.get("len_overreport", 0)
+    if over:  # a loader whose __len__ over-reports, like packing with workers
+        _sync = pp._sync_train_loader_len
+        pp._sync_train_loader_len = lambda n, *a: _sync(n + over, *a)
 
     log, msgs = [], []
     orig_move = pp._move_batch_to_device

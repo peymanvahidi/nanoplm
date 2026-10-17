@@ -44,7 +44,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed._composable.fsdp import fully_shard, FSDPModule, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -959,6 +959,26 @@ _FSDP_MODES = ("fsdp", "hsdp")
 def _is_fsdp(distributed_mode: str) -> bool:
     """True for any FSDP2-backed mode (plain FSDP or HSDP)."""
     return distributed_mode in _FSDP_MODES
+
+
+def _drop_fsdp_unsynced_grads(model: torch.nn.Module) -> None:
+    """Drop gradients FSDP2 accumulated with gradient sync off.
+
+    They sit on the unsharded parameters, or in unsharded_accumulated_grad when
+    reduce_dtype differs from the param dtype (bf16 params, fp32 reduce), out of
+    optimizer.zero_grad()'s reach; the next synced backward would reduce them
+    in. FSDP2 has no public API for this (torch 2.12), so it touches private
+    state; test_fsdp_epoch_boundary_grad.py fails if that state moves.
+    """
+    for module in model.modules():
+        if not isinstance(module, FSDPModule):
+            continue
+        for group in module._get_fsdp_state()._fsdp_param_groups:
+            for fsdp_param in group.fsdp_params:
+                fsdp_param.unsharded_accumulated_grad = None
+                unsharded = getattr(fsdp_param, "_unsharded_param", None)
+                if unsharded is not None:
+                    unsharded.grad = None
 
 
 def _get_distributed_mode(cfg: PretrainingConfig, *, distributed: bool) -> str:
@@ -4295,6 +4315,10 @@ def run_pure_pretraining(
             # accumulated loss, MoE expert counts, the finite-check flag, and
             # the token/FLOP/loss window counters. Timing window is reset at
             # the top of the next epoch iteration, after iter(train_loader).
+            # A loader that yields fewer batches than synced_len (packing with
+            # several workers drops each worker's last partial batch) breaks
+            # out mid-window; FSDP2 keeps those grads on the unsharded params,
+            # so drop them explicitly.
             epoch_fwd_count = epoch_sub_batch_count
             partial_discarded = accum_micro_count + skipped_tail_count
             # A budget or wall-clock stop before the last sub-batch didn't
@@ -4312,6 +4336,8 @@ def run_pure_pretraining(
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
                     if partial_discarded else "",
                 )
+            if distributed and _is_fsdp(distributed_mode):
+                _drop_fsdp_unsynced_grads(orig_model)
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
             if _moe_layers:
