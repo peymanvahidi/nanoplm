@@ -24,10 +24,12 @@ class Release:
     xml: Path
     fasta90: Path
     fasta100: Path
-    # ground truth per level: accession -> (cluster index, is_rep, sequence)
+    # ground truth per level: accession -> (cluster index, is_rep, sequence). The
+    # UniRef100 rep is the paired one: the UniRef100 sharing the UniRef90 rep's accession.
     u90: dict = field(default_factory=dict)
     u100: dict = field(default_factory=dict)
     cluster_ids: list = field(default_factory=list)
+    literal_differs: int = 0
 
 
 def _seq(rng, n: int) -> str:
@@ -69,13 +71,13 @@ def make_release(root: Path, n_clusters: int = 400, seed: int = 3) -> Release:
         for _ in range(k90):
             acc90 = f"Q{n90:07d}"
             n90 += 1
-            # every UniRef90 has 1-3 UniRef100 records; the first one is its own seed
+            # every UniRef90 has 1-3 UniRef100 records; the first shares the UniRef90's
+            # accession and sequence (UniProt names a UniRef90 after its seed UniRef100)
             k100 = int(rng.integers(1, 4))
-            u100s = []
-            for _ in range(k100):
-                acc100 = f"P{n100:07d}"
+            u100s = [acc90]
+            for _ in range(k100 - 1):
+                u100s.append(f"P{n100:07d}")
                 n100 += 1
-                u100s.append(acc100)
             u90s.append((acc90, u100s))
         u50 = u90s[0][0] if rng.random() < 0.9 else f"R{c:07d}"
         rel.cluster_ids.append(u50)
@@ -83,8 +85,14 @@ def make_release(root: Path, n_clusters: int = 400, seed: int = 3) -> Release:
                  "<name>Cluster: Test</name>",
                  f'<property type="member count" value="{k90}"/>']
         for i, (acc90, u100s) in enumerate(u90s):
-            # several UniProtKB records per UniRef90 -> repeated UniRef90 ids in the entry
-            for j, acc100 in enumerate(u100s):
+            # several UniProtKB records per UniRef90 -> repeated UniRef90 ids in the entry.
+            # Sometimes the representativeMember is another UniRef100 of the rep UniRef90,
+            # so the literal UniRef100 rep differs from the paired one.
+            listed = list(u100s)
+            if i == 0 and len(listed) > 1 and rng.random() < 0.4:
+                listed = listed[1:] + listed[:1]
+                rel.literal_differs += 1
+            for j, acc100 in enumerate(listed):
                 wrapper = "representativeMember" if (i == 0 and j == 0) else "member"
                 lines += [f"<{wrapper}>",
                           f'<dbReference type="UniProtKB ID" id="{acc100}_TEST">',

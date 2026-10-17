@@ -1,11 +1,14 @@
-"""Join a tokenized UniRef90/UniRef100 member pool against the UniRef50 hierarchy.
+"""Join a tokenized member pool against its cluster table.
 
 Input: the pool's filtered FASTA (its record order *is* the pool row order, since the
-shard writer keeps it), the pool shards written from it, and the hierarchy arrays of
-``uniref_hierarchy``. Output in ``index_dir``, under the file names the experiment's
-index used (so ClusterSampledDataset opens either):
+shard writer keeps it), the pool shards written from it, and the canonical cluster
+table ``members.tsv`` (``cluster_table``; cluster index = order of first appearance,
+first row of a cluster = its representative). Every pool sequence must be in the table.
+Output in ``index_dir``, under the file names the experiment's index used (so
+ClusterSampledDataset opens either):
 
-  pool_cluster.npy            int32[N]    pool row -> UniRef50 cluster index
+  pool_cluster.npy            int32[N]    pool row -> cluster index
+  cluster_raw_sizes.npy       int32[C]    members per cluster in the table
   pool_is_rep.npy             bool[N]     the row is its cluster's representative
   pool_lengths.npy            int32[N]    tokens of every pool row (concatenated .idx.npy)
   cluster_sizes_filtered.npy  int32[C]    n_c: surviving members per cluster
@@ -49,6 +52,7 @@ import numpy as np
 from nanoplm.data.datasets.cluster_sampled import INDEX_MANIFEST
 from nanoplm.data.infra.atomic import atomic_write_path
 from nanoplm.data.preparation import uniref_hierarchy as uh
+from nanoplm.data.preparation.cluster_table import read_members_table
 from nanoplm.utils import logger
 
 TOOL_VERSION = 1
@@ -108,13 +112,11 @@ def read_pool_lengths(pool_dir: Path) -> tuple[np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------- FASTA scan
 
 
-def scan_pool_fasta(fasta: Path, level: str, want_rows: Optional[set] = None, salt: int = 0):
-    """Accession keys and residue counts of every record, in file order.
+def scan_pool_fasta(fasta: Path, want_rows: Optional[set] = None):
+    """Id keys (hash of the first header word) and residue counts of every record.
 
     Returns (keys uint64[N], residues int64[N], {row: sequence} for rows in want_rows).
     """
-    header = b">" + uh.LEVELS[level][1]
-    hlen = len(header)
     blob = bytearray()
     acc_len = array("H")
     residues = array("q")
@@ -130,13 +132,10 @@ def scan_pool_fasta(fasta: Path, level: str, want_rows: Optional[set] = None, sa
                     if parts is not None:
                         seqs[row] = b"".join(parts)
                 row += 1
-                if not line.startswith(header):
-                    raise ClusterIndexError(
-                        f"{fasta}: record {row} header {line[:40]!r} does not start with "
-                        f"{header.decode()!r}")
-                acc = line[hlen:].split(None, 1)[0] if len(line) > hlen else b""
-                if not 0 < len(acc) < 256:
-                    raise ClusterIndexError(f"{fasta}: record {row} has no accession")
+                parts_ = line[1:].split(None, 1)
+                acc = parts_[0] if parts_ else b""
+                if not 0 < len(acc) < 65536:
+                    raise ClusterIndexError(f"{fasta}: record {row} has no id")
                 blob.extend(acc)
                 acc_len.append(len(acc))
                 count = 0
@@ -151,7 +150,7 @@ def scan_pool_fasta(fasta: Path, level: str, want_rows: Optional[set] = None, sa
         if parts is not None:
             seqs[row] = b"".join(parts)
     lens = np.frombuffer(bytes(acc_len), dtype=np.uint16).astype(np.int64)
-    keys = uh.hash_accessions(np.frombuffer(bytes(blob), dtype=np.uint8), lens, salt=salt)
+    keys = uh.hash_accessions(np.frombuffer(bytes(blob), dtype=np.uint8), lens)
     return keys, np.frombuffer(bytes(residues), dtype=np.int64), seqs
 
 
@@ -234,14 +233,15 @@ def draw_val_nonrep_rows(members, offsets, local_idx, rep_rows, n_c, seed: int) 
 def build_cluster_index(
     fasta: Path,
     pool_dir: Path,
-    hierarchy_dir: Path,
+    members_tsv: Path,
     index_dir: Path,
-    level: str,
     max_seq_len: int,
     val_ratio: float,
     max_clusters: int = -1,
     holdout_seed: int = HOLDOUT_SEED,
     tokenizer=None,
+    level: Optional[str] = None,
+    clusters_info: Optional[dict] = None,
 ) -> dict:
     """Write the cluster index for the pool in ``pool_dir`` (built from ``fasta``).
 
@@ -251,12 +251,12 @@ def build_cluster_index(
     """
     t0 = time.time()
     fasta, pool_dir = Path(fasta), Path(pool_dir)
-    hierarchy_dir, index_dir = Path(hierarchy_dir), Path(index_dir)
+    members_tsv, index_dir = Path(members_tsv), Path(index_dir)
     if not 0 < val_ratio < 1:
         raise ValueError(f"val_ratio must be in (0, 1), got {val_ratio}")
-    stats = uh.read_stats(hierarchy_dir)
-    salt = uh.hash_self_check(stats)
-    u_keys, u_cluster, u_is_rep, raw_sizes = uh.load_hierarchy(hierarchy_dir, level)
+    logger.info(f"cluster index: reading {members_tsv}")
+    table = read_members_table(members_tsv)
+    u_keys, u_cluster, u_is_rep, raw_sizes = table.keys, table.cluster, table.is_rep, table.sizes
 
     lengths, sro = read_pool_lengths(pool_dir)
     n = len(lengths)
@@ -265,7 +265,7 @@ def build_cluster_index(
     spot = set(np.random.default_rng(holdout_seed).choice(
         n, size=min(DECODE_SPOT_ROWS, n), replace=False).tolist()) if tokenizer else None
     logger.info(f"cluster index: scanning {fasta} ({n:,} pool rows)")
-    keys, residues, spot_seqs = scan_pool_fasta(fasta, level, spot, salt=salt)
+    keys, residues, spot_seqs = scan_pool_fasta(fasta, spot)
     specials = token_length_specials(lengths, residues, max_seq_len)
     if tokenizer is not None:
         _decode_check(pool_dir, sro, lengths, spot_seqs, tokenizer, max_seq_len, index_dir)
@@ -283,19 +283,19 @@ def build_cluster_index(
     if not hit.all():
         bad = order[np.flatnonzero(~hit)[:5]].tolist()
         raise ClusterIndexError(
-            f"{int((~hit).sum())} pool accessions are not in the {level} hierarchy (rows "
-            f"{bad}); the FASTA and uniref50.xml are probably from different releases")
+            f"{int((~hit).sum())} pool sequences are not in {members_tsv} (rows {bad}); the "
+            "member FASTA and the cluster source are probably from different releases")
     pool_cluster = np.empty(n, dtype=np.int32)
     pool_is_rep = np.empty(n, dtype=bool)
     pool_cluster[order] = np.asarray(u_cluster[pos])
     pool_is_rep[order] = np.asarray(u_is_rep[pos])
-    del order, sk, pos, hit, keys
+    del order, sk, pos, hit, keys, table, u_keys, u_cluster, u_is_rep
 
     arrays, counts, cap = aggregate(pool_cluster, pool_is_rep, raw_sizes, val_ratio,
                                     max_clusters, holdout_seed)
     index_dir.mkdir(parents=True, exist_ok=True)
     arrays.update(pool_cluster=pool_cluster, pool_is_rep=pool_is_rep, pool_lengths=lengths,
-                  shard_row_offsets=sro)
+                  shard_row_offsets=sro, cluster_raw_sizes=raw_sizes)
     for name, arr in arrays.items():
         _save(index_dir / f"{name}.npy", arr)
 
@@ -312,9 +312,8 @@ def build_cluster_index(
         "tool_version": TOOL_VERSION,
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "level": level,
-        "hierarchy": {"dir": str(hierarchy_dir), "release_version":
-                      stats.get("input", {}).get("release_version"),
-                      "hash_function": stats["hash"]["function"], "hash_salt": salt},
+        "clusters": {"table": str(members_tsv), "hash_function": uh.HASH_NAME,
+                     **(clusters_info or {})},
         "pool": {"fasta": str(fasta), "fasta_size_bytes": fasta.stat().st_size,
                  "shards": str(pool_dir)},
         "filter": {"max_seq_len": max_seq_len,
@@ -330,7 +329,7 @@ def build_cluster_index(
         "seconds": round(time.time() - t0, 1),
     }
     _write_json(index_dir / INDEX_MANIFEST, manifest)
-    result = verify_cluster_index(index_dir, pool_dir, hierarchy_dir=hierarchy_dir)
+    result = verify_cluster_index(index_dir, pool_dir)
     manifest["verify"] = result
     _write_json(index_dir / INDEX_MANIFEST, manifest)
     if not result["ok"]:
@@ -505,8 +504,7 @@ def write_row_gather(pool_dir: Path, rows: np.ndarray, out_dir: Path,
 # ------------------------------------------------------------------- verify
 
 
-def verify_cluster_index(index_dir: Path, pool_dir: Path,
-                         hierarchy_dir: Optional[Path] = None) -> dict:
+def verify_cluster_index(index_dir: Path, pool_dir: Path) -> dict:
     """Re-check every structural invariant of a written index.
 
     Returns {"ok": bool, "checks": {name: bool}, "failures": [names]}.
@@ -534,8 +532,8 @@ def verify_cluster_index(index_dir: Path, pool_dir: Path,
           and train.dtype == np.int32 and g2u.dtype == np.int32)
     check("pool_cluster_in_range", n == 0 or (pc.min() >= 0 and pc.max() < c))
     check("bincount_matches_sizes", np.array_equal(np.bincount(pc, minlength=c), sizes))
-    if hierarchy_dir is not None:
-        raw = np.load(Path(hierarchy_dir) / "cluster_raw_sizes.npy")
+    if (ix / "cluster_raw_sizes.npy").exists():
+        raw = L("cluster_raw_sizes")
         check("sizes_le_raw_sizes", len(raw) == c and np.all(sizes <= raw))
     in_u = np.flatnonzero(umask)
     check("universe_is_the_mask", np.array_equal(in_u, universe))

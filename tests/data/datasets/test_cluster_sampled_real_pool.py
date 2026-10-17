@@ -7,6 +7,7 @@ Peak RAM is a few GB (the shim keeps cluster_members in memory).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -82,10 +83,35 @@ def test_holdout_draw_reproduces_the_experiments_val_clusters():
 
 def test_the_hash_matches_the_real_hierarchy():
     stats = json.loads((HIERARCHY / "hierarchy_stats.json").read_text())
-    assert uh.hash_self_check(stats) == 0
+    for acc, want in stats["hash"]["test_vectors"].items():
+        assert f"0x{uh.hash_one(acc.encode()):016x}" == want
     keys = np.load(HIERARCHY / "u90_keys.npy", mmap_mode="r")
     # the representative of UniRef50 cluster 0 is in the key set under our hash
     first_acc = (HIERARCHY / "cluster_ids.txt").open("rb").readline().strip()
     k = uh.hash_one(first_acc)
     pos = int(np.searchsorted(keys, k))
     assert pos < len(keys) and int(keys[pos]) == k
+
+
+XML = Path("/e/project1/.snapshots/weekly-20260927/profound/peyman/nanoplm/agent_space/"
+           "wt-data-sampler/experiments/data-sampler/output/raw/uniref50.xml.gz")
+FASTA = OUT / "pool/uniref90_filtered.fasta"
+
+
+@pytest.mark.skipif(not (XML.exists() and FASTA.exists()), reason="uniref50.xml.gz not found")
+def test_xml_members_table_rebuilds_the_experiments_index(tmp_path):
+    """uniref50.xml -> members.tsv -> index must equal the experiment's index byte for byte
+    (about 15 min, ~5 GB of members.tsv under tmp_path)."""
+    from nanoplm.data.preparation import cluster_index as ci
+    tsv = tmp_path / "members.tsv"
+    uh.xml_to_members_tsv(XML, tsv, "uniref90")
+    ci.build_cluster_index(FASTA, POOL, tsv, tmp_path / "index", 512, 0.0044,
+                           level="uniref90")
+    for name in ("pool_cluster", "pool_is_rep", "cluster_sizes_filtered", "universe_clusters",
+                 "global_to_universe", "cluster_offsets", "cluster_members", "cluster_rep_row",
+                 "universe_mask", "val_clusters", "val_rep_rows", "val_clusters_multimember",
+                 "val_nonrep_rows", "val_multimember_index", "train_clusters",
+                 "shard_row_offsets"):
+        a = np.load(INDEX / f"{name}.npy", mmap_mode="r")
+        b = np.load(tmp_path / "index" / f"{name}.npy", mmap_mode="r")
+        assert a.dtype == b.dtype and np.array_equal(a, b), name

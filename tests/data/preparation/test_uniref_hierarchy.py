@@ -3,7 +3,6 @@ test_extract_hierarchy.py)."""
 from __future__ import annotations
 
 import gzip
-import json
 
 import numpy as np
 import pytest
@@ -57,24 +56,44 @@ def release(tmp_path_factory):
     return make_release(tmp_path_factory.mktemp("release"))
 
 
-@pytest.mark.parametrize("level,truth_attr,prefix", [("uniref90", "u90", "u90"),
-                                                      ("uniref100", "u100", "u100")])
-def test_hierarchy_matches_ground_truth(release, tmp_path, level, truth_attr, prefix):
-    out = tmp_path / "h"
-    stats = uh.extract_hierarchy(release.xml, out, level=level)
-    truth = getattr(release, truth_attr)
-    assert stats["verify"]["ok"] and stats["counts"]["members"] == len(truth)
-    assert stats["input"]["release_version"] == "2026_03"
-    keys, cluster, is_rep, sizes = uh.load_hierarchy(out, level)
-    accs = list(truth)
-    probe = uh.hash_strings([a.encode() for a in accs])
-    pos = np.searchsorted(keys, probe)
-    assert np.array_equal(keys[pos], probe)
-    assert np.array_equal(cluster[pos], [truth[a][0] for a in accs])
-    assert np.array_equal(is_rep[pos], [truth[a][1] for a in accs])
-    assert np.array_equal(sizes, np.bincount([truth[a][0] for a in accs]))
-    assert (out / "cluster_ids.txt").read_text().split() == release.cluster_ids
-    assert (out / f"{prefix}_keys.npy").exists()
+def _rows(tsv):
+    return [tuple(line.split("\t")) for line in tsv.read_text().splitlines()]
+
+
+@pytest.mark.parametrize("level", ["uniref90", "uniref100"])
+def test_members_table_matches_ground_truth(release, tmp_path, level):
+    out = tmp_path / "members.tsv"
+    stats = uh.xml_to_members_tsv(release.xml, out, level=level)
+    truth = release.u90 if level == "uniref90" else release.u100
+    prefix = "UniRef90_" if level == "uniref90" else "UniRef100_"
+    rows = _rows(out)
+    assert stats["members"] == len(rows) == len(truth)
+    assert stats["clusters"] == len(release.cluster_ids)
+    assert stats["release_version"] == "2026_03"
+    # grouped in XML entry order, representative first, full FASTA ids
+    clusters = [c for c, _ in rows]
+    firsts = [i for i in range(len(rows)) if i == 0 or clusters[i] != clusters[i - 1]]
+    assert [clusters[i] for i in firsts] == [f"UniRef50_{u}" for u in release.cluster_ids]
+    for i, (c, m) in enumerate(rows):
+        acc = m[len(prefix):]
+        assert m.startswith(prefix)
+        cl, is_rep, _ = truth[acc]
+        assert c == f"UniRef50_{release.cluster_ids[cl]}"
+        assert is_rep == (i in set(firsts))
+
+
+def test_uniref100_uses_the_paired_rep(release, tmp_path):
+    assert release.literal_differs > 0
+    stats = uh.xml_to_members_tsv(release.xml, tmp_path / "m.tsv", level="uniref100")
+    assert stats["paired_rep_differs_from_literal"] == release.literal_differs
+    assert stats["paired_rep_missing"] == 0
+    rows90 = _rows(tmp_path / "m.tsv")
+    uh.xml_to_members_tsv(release.xml, tmp_path / "m90.tsv", level="uniref90")
+    reps90 = [m[len("UniRef90_"):] for i, (c, m) in enumerate(_rows(tmp_path / "m90.tsv"))
+              if i == 0 or c != _rows(tmp_path / "m90.tsv")[i - 1][0]]
+    reps100 = [m[len("UniRef100_"):] for i, (c, m) in enumerate(rows90)
+               if i == 0 or c != rows90[i - 1][0]]
+    assert reps100 == reps90          # the same accession, hence the same sequence
 
 
 def _xml(entries: str) -> bytes:
@@ -104,31 +123,24 @@ def test_dedup_and_representative(tmp_path):
     src = _write(tmp_path, _xml(_entry("A1", ["A1", "A1", "B2", "A1", "UPI0001"])
                                 + _entry("C3", ["C3"])
                                 + _entry("D4", ["UPI0002", "D4", "Q8WZ42-10"])))
-    uh.extract_hierarchy(src, tmp_path / "h")
-    keys, cluster, is_rep, sizes = uh.load_hierarchy(tmp_path / "h", "uniref90")
-    assert sizes.tolist() == [3, 1, 3]
-    reps = {uh.hash_one(b"A1"), uh.hash_one(b"C3"), uh.hash_one(b"UPI0002")}
-    assert set(keys[np.asarray(is_rep)].tolist()) == reps
+    uh.xml_to_members_tsv(src, tmp_path / "m.tsv")
+    assert (tmp_path / "m.tsv").read_text() == (
+        "UniRef50_A1\tUniRef90_A1\nUniRef50_A1\tUniRef90_B2\nUniRef50_A1\tUniRef90_UPI0001\n"
+        "UniRef50_C3\tUniRef90_C3\n"
+        "UniRef50_D4\tUniRef90_UPI0002\nUniRef50_D4\tUniRef90_D4\n"
+        "UniRef50_D4\tUniRef90_Q8WZ42-10\n")
 
 
-def test_plain_xml_and_python_filter_give_the_same_arrays(release, tmp_path, monkeypatch):
-    uh.extract_hierarchy(release.xml, tmp_path / "gz")
+def test_plain_xml_and_python_filter_give_the_same_table(release, tmp_path, monkeypatch):
+    uh.xml_to_members_tsv(release.xml, tmp_path / "gz.tsv")
     plain = tmp_path / "u50.xml"
     plain.write_bytes(gzip.decompress(release.xml.read_bytes()))
-    uh.extract_hierarchy(plain, tmp_path / "plain")
+    uh.xml_to_members_tsv(plain, tmp_path / "plain.tsv")
     real_which = uh.shutil.which
     monkeypatch.setattr(uh.shutil, "which", lambda n: None if n == "grep" else real_which(n))
-    uh.extract_hierarchy(release.xml, tmp_path / "py")
-    for d in ("plain", "py"):
-        for name in ("u90_keys.npy", "u90_cluster.npy", "u90_is_rep.npy",
-                     "cluster_raw_sizes.npy"):
-            assert np.array_equal(np.load(tmp_path / "gz" / name), np.load(tmp_path / d / name))
-
-
-def test_cross_entry_duplicate_is_refused(tmp_path):
-    src = _write(tmp_path, _xml(_entry("A1", ["A1", "B2"]) + _entry("C3", ["C3", "B2"])))
-    with pytest.raises(uh.HierarchyError, match="same id in two entries"):
-        uh.extract_hierarchy(src, tmp_path / "h")
+    uh.xml_to_members_tsv(release.xml, tmp_path / "py.tsv")
+    want = (tmp_path / "gz.tsv").read_bytes()
+    assert (tmp_path / "plain.tsv").read_bytes() == want == (tmp_path / "py.tsv").read_bytes()
 
 
 def test_truncated_gzip_is_refused(release, tmp_path):
@@ -136,13 +148,14 @@ def test_truncated_gzip_is_refused(release, tmp_path):
     src = tmp_path / "cut.xml.gz"
     src.write_bytes(raw[: len(raw) // 2])
     with pytest.raises(uh.HierarchyError, match="incomplete"):
-        uh.extract_hierarchy(src, tmp_path / "h")
+        uh.xml_to_members_tsv(src, tmp_path / "m.tsv")
+    assert not (tmp_path / "m.tsv").exists()
 
 
 def test_missing_root_close_is_refused(tmp_path):
     src = _write(tmp_path, _xml(_entry("A1", ["A1"]))[: -len("</UniRef50>\n")])
     with pytest.raises(uh.HierarchyError, match="incomplete"):
-        uh.extract_hierarchy(src, tmp_path / "h")
+        uh.xml_to_members_tsv(src, tmp_path / "m.tsv")
 
 
 @pytest.mark.parametrize("entry,match", [
@@ -154,30 +167,4 @@ def test_missing_root_close_is_refused(tmp_path):
 def test_malformed_entries_fail_loudly(tmp_path, entry, match):
     src = _write(tmp_path, _xml(entry))
     with pytest.raises(uh.HierarchyError, match=match):
-        uh.extract_hierarchy(src, tmp_path / "h")
-
-
-def test_verify_catches_a_tampered_array_and_a_wrong_hash(release, tmp_path):
-    out = tmp_path / "h"
-    uh.extract_hierarchy(release.xml, out)
-    cl, rep = np.load(out / "u90_cluster.npy"), np.load(out / "u90_is_rep.npy")
-    i = int(np.flatnonzero(rep)[0])
-    j = int(np.flatnonzero(~rep & (cl != cl[i]))[0])
-    rep[i], rep[j] = False, True          # one cluster loses its rep, another gains one
-    np.save(out / "u90_is_rep.npy", rep)
-    assert "one_representative_per_cluster" in uh.verify_hierarchy(out, "uniref90")["failures"]
-    stats = json.loads((out / "hierarchy_stats.json").read_text())
-    stats["hash"]["test_vectors"]["P12345"] = "0x0000000000000000"
-    assert "hash_self_check" in uh.verify_hierarchy(out, "uniref90", stats=stats)["failures"]
-
-
-def test_load_refuses_an_unverified_or_other_level_hierarchy(release, tmp_path):
-    out = tmp_path / "h"
-    uh.extract_hierarchy(release.xml, out)
-    with pytest.raises(uh.HierarchyError, match="uniref90 hierarchy, not uniref100"):
-        uh.load_hierarchy(out, "uniref100")
-    stats = json.loads((out / "hierarchy_stats.json").read_text())
-    stats["verify"]["ok"] = False
-    (out / "hierarchy_stats.json").write_text(json.dumps(stats))
-    with pytest.raises(uh.HierarchyError, match="verify.ok"):
-        uh.load_hierarchy(out, "uniref90")
+        uh.xml_to_members_tsv(src, tmp_path / "m.tsv")

@@ -31,10 +31,10 @@ def _pool(root, fasta, level="uniref90", sps=SPS):
 def _build(root, release, level="uniref90", **kw):
     fasta = release.fasta90 if level == "uniref90" else release.fasta100
     filtered = _pool(root, fasta, level)
-    uh.extract_hierarchy(release.xml, root / "hierarchy", level=level)
+    uh.xml_to_members_tsv(release.xml, root / "members.tsv", level=level)
     kw.setdefault("val_ratio", VAL_RATIO)
-    man = ci.build_cluster_index(filtered, root / "train", root / "hierarchy",
-                                 root / "cluster_index", level, MAX_LEN,
+    man = ci.build_cluster_index(filtered, root / "train", root / "members.tsv",
+                                 root / "cluster_index", MAX_LEN, level=level,
                                  tokenizer=ProtModernBertTokenizer(), **kw)
     return filtered, man
 
@@ -181,10 +181,10 @@ def test_join_refuses_an_accession_outside_the_hierarchy(release, tmp_path):
     fasta = tmp_path / "extra.fasta"
     fasta.write_text(release.fasta90.read_text() + ">UniRef90_ZZZ9999999 stray\n" + "A" * 40 + "\n")
     filtered = _pool(tmp_path, fasta)
-    uh.extract_hierarchy(release.xml, tmp_path / "hierarchy")
-    with pytest.raises(ci.ClusterIndexError, match="not in the uniref90 hierarchy"):
-        ci.build_cluster_index(filtered, tmp_path / "train", tmp_path / "hierarchy",
-                               tmp_path / "cluster_index", "uniref90", MAX_LEN, VAL_RATIO)
+    uh.xml_to_members_tsv(release.xml, tmp_path / "members.tsv")
+    with pytest.raises(ci.ClusterIndexError, match="pool sequences are not in"):
+        ci.build_cluster_index(filtered, tmp_path / "train", tmp_path / "members.tsv",
+                               tmp_path / "cluster_index", MAX_LEN, VAL_RATIO)
 
 
 def test_a_fasta_that_is_not_the_pools_order_is_fatal(built, release, tmp_path):
@@ -194,8 +194,8 @@ def test_a_fasta_that_is_not_the_pools_order_is_fatal(built, release, tmp_path):
     other = tmp_path / "rotated.fasta"
     other.write_text("".join(">" + r for r in recs[1:] + recs[:1]))
     with pytest.raises(ci.ClusterIndexError, match="not the same rows"):
-        ci.build_cluster_index(other, root / "train", root / "hierarchy",
-                               tmp_path / "ix", "uniref90", MAX_LEN, VAL_RATIO)
+        ci.build_cluster_index(other, root / "train", root / "members.tsv",
+                               tmp_path / "ix", MAX_LEN, VAL_RATIO)
 
 
 def test_decode_check_catches_an_equal_length_swap(built, tmp_path):
@@ -214,8 +214,8 @@ def test_decode_check_catches_an_equal_length_swap(built, tmp_path):
     try:
         ci.DECODE_SPOT_ROWS = 10 ** 6       # decode every row of the tiny pool
         with pytest.raises(ci.ClusterIndexError, match="not the tokenization"):
-            ci.build_cluster_index(swapped, root / "train", root / "hierarchy",
-                                   tmp_path / "ix", "uniref90", MAX_LEN, VAL_RATIO,
+            ci.build_cluster_index(swapped, root / "train", root / "members.tsv",
+                                   tmp_path / "ix", MAX_LEN, VAL_RATIO,
                                    tokenizer=ProtModernBertTokenizer())
     finally:
         ci.DECODE_SPOT_ROWS = old
@@ -233,11 +233,15 @@ def test_max_clusters_caps_the_universe_with_a_seeded_subset(release, tmp_path):
     assert len(np.load(cap_root / "cluster_index" / "val_clusters.npy")) == 10
 
 
-def test_uniref100_pool(release, tmp_path):
+def test_uniref100_pool_shares_the_uniref90_universe_and_split(built, release, tmp_path):
     _, man = _build(tmp_path, release, level="uniref100")
     assert man["verify"]["ok"] and man["level"] == "uniref100"
     rep_ok = {c for c, is_rep, seq in release.u100.values() if is_rep and _survives(seq)}
     assert set(np.load(tmp_path / "cluster_index" / "universe_clusters.npy").tolist()) == rep_ok
+    root90 = built[0]
+    for name in ("universe_clusters", "train_clusters", "val_clusters"):
+        assert np.array_equal(np.load(tmp_path / "cluster_index" / f"{name}.npy"),
+                              _ix(root90, name)), name
 
 
 def test_shard_count_over_the_sort_cliff_is_refused(built, monkeypatch):
