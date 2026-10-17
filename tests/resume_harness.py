@@ -136,8 +136,9 @@ def run_phase(spec: dict) -> None:
     manifest = read_manifest(Path(spec["dataset_dir"]))
     pp.run_pure_pretraining(_fresh_model(), cfg, manifest, resume_config=rc)
     resume_lines = [m for m in msgs if m.startswith("Resume continue:")]
+    pass_lines = [m for m in msgs if m.startswith("Data pass ")]  # rank 0 only
     Path(f"{spec['out']}.rank{rank}.json").write_text(json.dumps(
-        {"log": log, "resume_lines": resume_lines}))
+        {"log": log, "resume_lines": resume_lines, "pass_lines": pass_lines}))
 
 
 if __name__ == "__main__":

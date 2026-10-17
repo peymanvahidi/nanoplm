@@ -33,23 +33,39 @@ TORCHRUN = str(Path(PY).parent / "torchrun")
 
 pytestmark = pytest.mark.slow
 
+# passes: (global_step, effective micro-steps, optimizer steps, discarded) of
+# every "Data pass" line the uninterrupted run(N+M) logs, counted by hand. A
+# pass that the step budget ends logs nothing.
 _SCENARIOS = {
     # 5 micro-batches/pass, 2 steps/pass + 1 trailing discarded micro-batch;
     # N=3 ends at micro 2 of pass 2.
-    "mid_pass": dict(n=10, micro=2, ga=2, N=3, M=3),
+    "mid_pass": dict(n=10, micro=2, ga=2, N=3, M=3,
+                     passes=[(2, 4, 2, 1), (4, 4, 2, 1)]),
     # 4 micro-batches/pass; N=2 ends exactly on the pass boundary.
-    "pass_boundary": dict(n=8, micro=2, ga=2, N=2, M=3),
+    "pass_boundary": dict(n=8, micro=2, ga=2, N=2, M=3,
+                          passes=[(2, 4, 2, 0), (4, 4, 2, 0)]),
     # ga=3 over 5 micro-batches: one step per pass, then a 2-micro partial
     # window discarded. N=1 resumes inside the discarded tail.
-    "partial_window_tail": dict(n=10, micro=2, ga=3, N=1, M=3),
+    "partial_window_tail": dict(n=10, micro=2, ga=3, N=1, M=3,
+                                passes=[(1, 3, 1, 2), (2, 3, 1, 2), (3, 3, 1, 2)]),
     # Batch-size warmup: steps 0-2 split each micro-batch 4 ways with ga=1
     # (3-5: 2 ways). N=2 lands at sub_batch 2/4 of the first micro-batch.
-    "split_divisor": dict(n=32, micro=8, ga=2, bwarm=9, N=2, M=6),
+    # 4+2+1+1 sub-batches fill the one pass and its last one is step 8.
+    "split_divisor": dict(n=32, micro=8, ga=2, bwarm=9, N=2, M=6,
+                          passes=[(8, 8, 8, 0)]),
     # 2 micro-batches/pass, bwarm=3: steps 0-2 take one sub-batch each from
     # micro-batch 0 (split 4 ways), then ga=2. N=3 resumes at sub_batch 3/4,
     # inside a split macro-batch whose next window spans into micro-batch 1.
-    "split_tail": dict(n=16, micro=8, ga=2, bwarm=3, N=3, M=3),
+    "split_tail": dict(n=16, micro=8, ga=2, bwarm=3, N=3, M=3,
+                       passes=[(4, 5, 4, 0), (5, 2, 1, 0), (6, 2, 1, 0)]),
 }
+
+
+def _pass_line(p, gs, total, eff, steps, disc=0):
+    return (f"Data pass {p} complete (global_step {gs}/{total}): {eff} effective "
+            f"micro-steps, {steps} optimizer steps"
+            + (f" ({disc} trailing micro-step(s) discarded)" if disc else ""))
+
 
 # Launcher/scheduler state that would leak into the children: SLURM_JOB_END_TIME
 # sets a wall-clock deadline, and RANK/WORLD_SIZE/MASTER_* would make a plain
@@ -123,6 +139,9 @@ def test_continue_from_terminal_matches_uninterrupted(tmp_path, scenario, nproc)
     base = _setup(tmp_path, sc, nproc, "dist")
 
     full = _run(tmp_path, "full", dict(base, ckp_dir=str(tmp_path / "full"), steps=N + M), nproc)
+    assert full[0]["pass_lines"] == [
+        _pass_line(i + 1, gs, N + M, *rest) for i, (gs, *rest) in enumerate(sc["passes"])
+    ]
     a = _run(tmp_path, "a", dict(base, ckp_dir=str(tmp_path / "split"), steps=N), nproc)
     trunk = _ckpt(tmp_path / "split")
     st = _state(trunk)
