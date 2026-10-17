@@ -44,7 +44,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed._composable.fsdp import fully_shard, FSDPModule, MixedPrecisionPolicy
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -960,6 +960,26 @@ _FSDP_MODES = ("fsdp", "hsdp")
 def _is_fsdp(distributed_mode: str) -> bool:
     """True for any FSDP2-backed mode (plain FSDP or HSDP)."""
     return distributed_mode in _FSDP_MODES
+
+
+def _drop_fsdp_unsynced_grads(model: torch.nn.Module) -> None:
+    """Drop gradients FSDP2 accumulated with gradient sync off.
+
+    They sit on the unsharded parameters, or in unsharded_accumulated_grad when
+    reduce_dtype differs from the param dtype (bf16 params, fp32 reduce), out of
+    optimizer.zero_grad()'s reach; the next synced backward would reduce them
+    in. FSDP2 has no public API for this (torch 2.12), so it touches private
+    state; test_fsdp_epoch_boundary_grad.py fails if that state moves.
+    """
+    for module in model.modules():
+        if not isinstance(module, FSDPModule):
+            continue
+        for group in module._get_fsdp_state()._fsdp_param_groups:
+            for fsdp_param in group.fsdp_params:
+                fsdp_param.unsharded_accumulated_grad = None
+                unsharded = getattr(fsdp_param, "_unsharded_param", None)
+                if unsharded is not None:
+                    unsharded.grad = None
 
 
 def _get_distributed_mode(cfg: PretrainingConfig, *, distributed: bool) -> str:
@@ -2863,6 +2883,16 @@ def run_pure_pretraining(
             "train_loader is empty (synced_len=0); cannot satisfy the token budget. "
             "Check the dataset/manifest and per-rank sharding."
         )
+    # Batch warmup only lowers grad_accum, so a pass that fits one full window
+    # fits every warmup window too. Otherwise no pass can step and the replay
+    # loop below would spin forever.
+    if synced_len < inferred_grad_accum_steps:
+        raise RuntimeError(
+            f"train_loader yields {synced_len} micro-batches per rank per pass, fewer than "
+            f"grad_accum={inferred_grad_accum_steps}: one optimizer step "
+            f"(global_batch_tokens={pretrain_config.global_batch_tokens}) is larger than a "
+            "pass over the train set. Lower global_batch_tokens or use a larger dataset."
+        )
 
     # ---- Training horizon (token budget -> optimizer steps) ----
     # total_steps comes from the configured token/step budget, NOT from epochs.
@@ -2923,7 +2953,8 @@ def run_pure_pretraining(
     recycling_scheduler = None
     recycling_rng = None
     recycling_metrics_buffer = None
-    _model_cfg = model.model_config
+    # `model` may be DDP-wrapped here, which hides model_config.
+    _model_cfg = orig_model.model_config
     _loopie_jitter = int(getattr(pretrain_config, "loopie_loop_count_jitter", 0))
     if _model_cfg.use_loopie and _loopie_jitter > 0:
         # curriculum_complete pins current_mean at the target from step 0: there
@@ -2938,7 +2969,7 @@ def run_pure_pretraining(
         )
         recycling_rng = torch.Generator(device=device).manual_seed(int(pretrain_config.seed) + 999)
         recycling_metrics_buffer = RecyclingMetricsBuffer(window=100)
-    elif model.model_config.recycling_loop_count > 1:
+    elif _model_cfg.recycling_loop_count > 1:
         # Resume semantics for the loop-count curriculum (spec §17):
         #   - `continue` keeps the curriculum on the ORIGINAL horizon, read from
         #     the checkpoint's training_state.json (not the locally recomputed
@@ -2956,7 +2987,7 @@ def run_pure_pretraining(
             _recycling_total_steps = total_steps
         recycling_scheduler = RecyclingScheduler(
             pretrain_config,
-            target_loop_count=model.model_config.recycling_loop_count,
+            target_loop_count=_model_cfg.recycling_loop_count,
             total_training_steps=_recycling_total_steps,
             curriculum_complete=_curriculum_complete,
         )
@@ -3105,18 +3136,19 @@ def run_pure_pretraining(
                 and "epoch_data_step" in _ckp_state
             ):
                 # Restore the exact within-pass position saved at checkpoint time.
-                # (Boundary/periodic saves persist epoch_data_step/sub_batch/
-                # divisor; the dataloader fast-forwards to this point.)
+                # (Every save, terminal included, persists epoch_data_step/
+                # sub_batch/divisor; the dataloader fast-forwards to this point.)
                 resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
                 resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
                 resume_batch_split_divisor = max(
                     1, int(_ckp_state.get("batch_split_divisor", 1))
                 )
             else:
-                # Dataset changed, pre-upgrade checkpoint, or a terminal/role
-                # checkpoint without a saved within-pass position: replay the
-                # DataLoader from the top of the current pass (spec §11 honest
-                # fallback). The LR schedule still fast-forwards via global_step.
+                # Dataset changed, or a checkpoint written before the position
+                # was saved (terminal/role checkpoints only carry it since
+                # #154): replay the DataLoader from the top of the current pass
+                # (spec §11 honest fallback). The LR schedule still fast-forwards
+                # via global_step.
                 resume_data_step = 0
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
@@ -3145,7 +3177,7 @@ def run_pure_pretraining(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 mode="offline",
-                config={"pretrain": pretrain_config.__dict__, "model": model.model_config.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
@@ -3322,7 +3354,6 @@ def run_pure_pretraining(
     _moe_lb_stats: Optional[torch.Tensor] = None
     window_loss = torch.zeros((), device=device)
     window_steps = 0
-    discard_accumulation = False
     # Set by the (sync-free) per-micro-step finite poll; consumed once
     # per accumulation window, at the boundary.
     local_nonfinite = False
@@ -3436,10 +3467,14 @@ def run_pure_pretraining(
     wallclock_stop = False
     wallclock_stop_ckpt = ""
     # Where the next pass would resume, refreshed at every step boundary so the
-    # post-loop terminal save can record it too. Empty until the first step
-    # completes, so a zero-step run falls back to the old position-less save
-    # rather than reading a loop variable that was never bound.
-    latest_data_pos: dict = {}
+    # post-loop terminal save can record it too. Seeded with the resume position
+    # so a run that takes zero steps (resumed at or past total_steps) rewrites
+    # its terminal checkpoint with the position it loaded instead of dropping it.
+    latest_data_pos = dict(
+        epoch_data_step=resume_data_step,
+        epoch_sub_batch_step=resume_sub_batch_step,
+        batch_split_divisor=resume_batch_split_divisor,
+    )
 
     # Single entry point for every checkpoint write. The common kwargs are
     # captured by reference (resolved at call time); per-call-site differences
@@ -3477,6 +3512,10 @@ def run_pure_pretraining(
 
             epoch_ended_early = False
             epoch_sub_batch_count = 0
+            # Set once the micro-batches left in this pass cannot fill the
+            # next grad-accum window; the rest of the pass is skipped.
+            skip_pass_tail = False
+            skipped_tail_count = 0
             for micro_step in range(synced_len):
                 if pending_compile_rebuild:
                     if distributed and dist.is_initialized():
@@ -3586,21 +3625,27 @@ def run_pure_pretraining(
                     if sub_batch_idx < resume_sub_batch_start:
                         continue
 
+                    # A window that cannot complete before the pass ends would
+                    # be discarded at the epoch boundary, so don't run it (under
+                    # FSDP2 its unsynced gradients would otherwise need dropping
+                    # there). effective_grad_accum and mbs_divisor change only
+                    # at an optimizer step, and batch warmup splits micro-batches
+                    # only while effective_grad_accum == 1, so `remaining` is
+                    # exact whenever it can trigger a skip. It assumes the loader
+                    # yields all synced_len micro-batches; a short loader is
+                    # handled at the epoch boundary.
+                    if accum_micro_count == 0 and not skip_pass_tail:
+                        remaining = (total_sub_batches - sub_batch_idx) + (
+                            synced_len - micro_step - 1
+                        ) * mbs_divisor
+                        skip_pass_tail = remaining < effective_grad_accum
+                    if skip_pass_tail:
+                        skipped_tail_count += 1
+                        continue
+
                     accum_micro_count += 1
                     epoch_sub_batch_count += 1
                     at_accum_boundary = accum_micro_count >= effective_grad_accum
-                    if discard_accumulation:
-                        if at_accum_boundary:
-                            discard_accumulation = False
-                            local_nonfinite = False
-                            accum_micro_count = 0
-                            effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
-                                global_step,
-                                inferred_grad_accum_steps,
-                                pretrain_config.micro_batch_seqs,
-                                global_batch_warmup_steps,
-                            )
-                        continue
 
                     batch = _move_batch_to_device(batch, device)
                     upcoming_step = global_step + 1
@@ -3767,10 +3812,7 @@ def run_pure_pretraining(
                         accum_loss.zero_()
                         if _moe_layers:
                             _moe_count_accum.zero_()
-                        if at_accum_boundary:
-                            accum_micro_count = 0
-                        else:
-                            discard_accumulation = True
+                        accum_micro_count = 0
                         continue
 
                     accum_loss = accum_loss + loss.detach()
@@ -4244,6 +4286,10 @@ def run_pure_pretraining(
                                 wallclock_stop_ckpt,
                             )
                         break
+                    # A split macro-batch (batch warmup) can hold more optimizer
+                    # steps than remain; stop at the horizon, not the batch end.
+                    if global_step >= total_steps:
+                        break
 
                 if wallclock_stop:
                     break
@@ -4259,18 +4305,28 @@ def run_pure_pretraining(
                     break
 
             # ---- Epoch boundary cleanup ----
-            # When the inner loop ends (either by exhausting synced_len or
-            # breaking early via the all_reduce exhaustion check), there may
-            # be partial gradient-accumulation state left over from micro-steps
-            # that ran forward+backward but never reached an optimizer step.
-            # Flush everything to prevent gradient leak (stale .grad tensors
-            # carrying into next epoch), loss contamination, FSDP gradient
-            # desync (partial micro-steps had sync=False), and token/loss
-            # counter bleed across the boundary.  Timing window is reset at
+            # A trailing window that cannot complete is skipped above, but a
+            # loader that runs dry before synced_len (the all_reduce exhaustion
+            # check) can still leave micro-steps that ran forward+backward
+            # without reaching an optimizer step. Reset what they touched so
+            # nothing carries into the next pass: optimizer grads, the
+            # accumulated loss, MoE expert counts, the finite-check flag, and
+            # the token/FLOP/loss window counters. Timing window is reset at
             # the top of the next epoch iteration, after iter(train_loader).
+            # A loader that yields fewer batches than synced_len (packing with
+            # several workers drops each worker's last partial batch) breaks
+            # out mid-window; FSDP2 keeps those grads on the unsharded params,
+            # so drop them explicitly.
             epoch_fwd_count = epoch_sub_batch_count
-            partial_discarded = accum_micro_count
-            if is_main:
+            partial_discarded = accum_micro_count + skipped_tail_count
+            # A budget or wall-clock stop before the last sub-batch didn't
+            # finish the pass, so don't report it as complete.
+            # latest_data_pos is refreshed at every step, and a stop always
+            # follows one.
+            pass_cut_short = (wallclock_stop or global_step >= total_steps) and (
+                latest_data_pos["epoch_data_step"] < synced_len
+            )
+            if is_main and not pass_cut_short:
                 logger.info(
                     "Data pass %d complete (global_step %d/%d): %d effective micro-steps, %d optimizer steps%s",
                     epoch + 1, global_step, total_steps, epoch_fwd_count,
@@ -4278,10 +4334,14 @@ def run_pure_pretraining(
                     f" ({partial_discarded} trailing micro-step(s) discarded)"
                     if partial_discarded else "",
                 )
+            if distributed and _is_fsdp(distributed_mode):
+                _drop_fsdp_unsynced_grads(orig_model)
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
+            if _moe_layers:
+                _moe_count_accum.zero_()
+            local_nonfinite = False
             accum_micro_count = 0
-            discard_accumulation = False
             token_count.zero_()
             raw_token_count.zero_()
             window_flops.zero_()

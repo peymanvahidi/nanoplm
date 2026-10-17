@@ -60,6 +60,10 @@ nanoplm pretrain from-yaml
 nanoplm pretrain run --dataset-dir output/data/pretrain_data --pure-torch
 ```
 
+**`train_loader yields 3 micro-batches per rank per pass, fewer than grad_accum=8: one optimizer step (global_batch_tokens=...) is larger than a pass over the train set. Lower global_batch_tokens or use a larger dataset.`**
+
+One optimizer step needs more micro-batches than one pass over the train split gives each rank, so no step could ever run. Lower [`global_batch_tokens`](/nanoplm/reference/pretrain/#pretrain-pretraining-global_batch_tokens) or use a larger dataset. It usually shows up with a toy dataset on many ranks.
+
 ### Duration and schedule disagree
 
 `lr_schedule` decides which duration keys are legal. `wsd` (the default) uses the two-phase `stable_*` / `decay_*` budget; every other schedule uses a single budget.
