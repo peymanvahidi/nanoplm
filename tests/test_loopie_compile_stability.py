@@ -413,12 +413,14 @@ _HUGINN_RS = (1, 2, 3, 4)
     # 2 x S x 2, with a third max_seqlen to clear the default limit. The MoE
     # mlp frame stays at <= 4 entries (None/tensor last_aux_loss x grad mode).
     # The tensor-R fallback (_forward_repeats) is off the training path and
-    # not sized by the limit. MoE without looping: the CPU MoE
-    # dispatch graph-breaks (moe.py:641), so forward's MoE entry stops at the
-    # _forward_once call with no layer or max_seqlen guards and, being newest,
-    # takes every layer from the second shape on: _forward_once holds
-    # 1 + V x (S - 1) = 13 of the 15 the limit allows (old limit 8), and
-    # forward keeps the first shape's V. Huginn with recycling_bptt K = 1 (the
+    # not sized by the limit. MoE without looping: the dispatch workspace
+    # reuse graph-breaks at the resize_ in MoELayer._ensure_dispatch_buffers
+    # (on by default without looping, CUDA cutlass path too), so forward's MoE
+    # entry stops at the _forward_once call with no layer or max_seqlen guards
+    # and, being newest, takes every layer from the second shape on: today
+    # _forward_once holds 1 + V x (S - 1) = 13 of the 15 the limit allows (old
+    # limit 8), and forward keeps the first shape's V. That count hangs on the
+    # break, so the row (None) is bounded, not exact: 8 < entries <= limit. Huginn with recycling_bptt K = 1 (the
     # bptt column) runs R - 1 core passes under no_grad, so the layer frame
     # sees both grad modes, except that the prelude layer never runs under
     # no_grad: S x (V + 1) = 9 entries for R in 1..4, against 8 before and
@@ -431,7 +433,7 @@ _HUGINN_RS = (1, 2, 3, 4)
         ("loopie", "FS", 4, 3, 1, 1, False, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
         ("loopie", "FS", 4, 3, 1, 0, False, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
         ("loopie", "F", 4, 3, 1, 1, True, True, (16, 32, 64), "_forward_once", 2 * 3 * 2),
-        ("none", "F", 4, 3, None, 0, True, False, (4, 8, 16, 32, 64), "_forward_once", 1 + 3 * 4),
+        ("none", "F", 4, 3, None, 0, True, False, (4, 8, 16, 32, 64), "_forward_once", None),
         ("huginn", "F", 4, 2, 1, 0, False, False, (16, 32, 64), "forward", 3 * (2 + 1)),
     ],
     ids=["F", "FS-bptt", "moe-jitter", "FS-sublayer-bptt", "FS-sublayer-bptt-j0",
@@ -511,9 +513,15 @@ def test_jitter_training_fits_the_computed_recompile_limit(
     assert not breaks, f"int R reached the eager driver:\n{breaks}"
     code = getattr(ModernBertEncoderLayer, frame).__code__
     entries = len(_debug_get_cache_entry_list(code))
-    assert entries == expected, (
-        f"ModernBertEncoderLayer.{frame} has {entries} cache entries; expected {expected}."
-    )
+    if expected is None:
+        assert 8 < entries <= limit, (
+            f"ModernBertEncoderLayer.{frame} has {entries} cache entries; "
+            f"expected 8 < n <= {limit}."
+        )
+    else:
+        assert entries == expected, (
+            f"ModernBertEncoderLayer.{frame} has {entries} cache entries; expected {expected}."
+        )
     if looping == "none":
         assert len(_debug_get_cache_entry_list(ModernBertEncoderLayer.forward.__code__)) == variants
     if moe:
