@@ -18,6 +18,7 @@ Point NANOPLM_SRC at the src/ tree under test (default: this checkout's src).
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +63,18 @@ def _child_env(**over) -> dict:
     return dict(env, PYTHONPATH=SRC, CUDA_VISIBLE_DEVICES="", **over)
 
 
+def _call(cmd, cwd, env, timeout=180):
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)  # torchrun's workers too, not just the launcher
+        out, err = p.communicate()
+        pytest.fail(f"{Path(cmd[-1]).name} timed out after {timeout}s:\n{(out + err)[-4000:]}")
+    return p.returncode, out, err
+
+
 def _run(tmp: Path, name: str, spec: dict, nproc: int) -> list[dict]:
     spec = dict(spec, out=str(tmp / name))
     spec_path = tmp / f"{name}.spec.json"
@@ -71,9 +84,9 @@ def _run(tmp: Path, name: str, spec: dict, nproc: int) -> list[dict]:
     else:
         cmd = [PY, str(HARNESS), str(spec_path)]
     env = _child_env(WANDB_MODE="disabled", OMP_NUM_THREADS="1")
-    r = subprocess.run(cmd, cwd=tmp, env=env, capture_output=True, text=True, timeout=900)
-    (tmp / f"{name}.log").write_text(r.stdout + r.stderr)
-    assert r.returncode == 0, f"{name} failed:\n{(r.stdout + r.stderr)[-4000:]}"
+    rc, out, err = _call(cmd, tmp, env, timeout=900)
+    (tmp / f"{name}.log").write_text(out + err)
+    assert rc == 0, f"{name} failed:\n{(out + err)[-4000:]}"
     return [json.loads((tmp / f"{name}.rank{k}.json").read_text()) for k in range(nproc)]
 
 
@@ -81,7 +94,8 @@ def _dataset(tmp: Path, n: int) -> Path:
     d = tmp / "ds"
     code = ("import sys; sys.path.insert(0, %r); import resume_harness as h; "
             "from pathlib import Path; h.build_dataset(Path(%r), %d)") % (str(HERE), str(d), n)
-    subprocess.run([PY, "-c", code], cwd=tmp, env=_child_env(), check=True, capture_output=True)
+    rc, _, err = _call([PY, "-c", code], tmp, _child_env())
+    assert rc == 0, err[-4000:]
     return d
 
 
@@ -97,9 +111,8 @@ def _state(ckpt: Path) -> dict:
 
 def _setup(tmp, sc, nproc, mode):
     ds = _dataset(tmp, sc["n"] * nproc)
-    base = dict(dataset_dir=str(ds), micro=sc["micro"], ga=sc["ga"],
+    return dict(dataset_dir=str(ds), micro=sc["micro"], ga=sc["ga"],
                 bwarm=sc.get("bwarm", 0), mode=mode)
-    return base
 
 
 @pytest.mark.parametrize("nproc", [1, 2])
@@ -209,8 +222,7 @@ def test_pass_shorter_than_one_window_is_rejected(tmp_path):
     spec = dict(dataset_dir=str(ds), micro=2, ga=3, bwarm=0, mode="single",
                 ckp_dir=str(tmp_path / "ck"), steps=1, out=str(tmp_path / "o"))
     (tmp_path / "s.json").write_text(json.dumps(spec))
-    r = subprocess.run([PY, str(HARNESS), str(tmp_path / "s.json")], cwd=tmp_path,
-                       env=_child_env(WANDB_MODE="disabled", OMP_NUM_THREADS="1"),
-                       capture_output=True, text=True, timeout=300)
-    assert r.returncode != 0
-    assert "fewer than grad_accum=3" in r.stderr, r.stderr[-4000:]
+    rc, _, err = _call([PY, str(HARNESS), str(tmp_path / "s.json")], tmp_path,
+                       _child_env(WANDB_MODE="disabled", OMP_NUM_THREADS="1"))
+    assert rc != 0
+    assert "fewer than grad_accum=3" in err, err[-4000:]

@@ -1,4 +1,5 @@
-"""One training phase for test_resume_terminal_data_position.py, run in its own process.
+"""One training phase for test_resume_terminal_data_position.py and
+test_fsdp_epoch_boundary_grad.py, run in its own process.
 
     python resume_harness.py SPEC.json            # single process (RandomSampler)
     torchrun --nproc_per_node=K resume_harness.py SPEC.json   # gloo DDP, K ranks
@@ -114,6 +115,8 @@ def run_phase(spec: dict) -> None:
             ids, lab = batch["input_ids"], batch.get("labels")
             if lab is not None:  # undo masking: masked ids depend on RNG draws
                 ids = torch.where(lab != -100, lab, ids)
+            # Reads pure_pipeline's loop locals by name: renaming global_step/epoch/
+            # micro_step/sub_batch_idx there breaks this with a KeyError.
             L = f.f_locals
             log.append([L["global_step"], L["epoch"], L["micro_step"],
                         L["sub_batch_idx"], ids.tolist()])
