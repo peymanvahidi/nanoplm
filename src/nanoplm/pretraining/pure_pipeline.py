@@ -69,6 +69,7 @@ from nanoplm.pretraining.collator import (
     mlm_masking_kwargs_from_config,
 )
 from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
+from nanoplm.data.datasets.cluster_sampled import ClusterSampledDataset, open_train_dataset
 from nanoplm.pretraining import cpu_offload
 from nanoplm.pretraining.fp8 import (
     convert_fp8_targets,
@@ -2460,9 +2461,24 @@ def run_pure_pretraining(
         if not d.exists():
             raise FileNotFoundError(f"Shard directory not found: {d}")
 
-    logger.info("Using ShardedDataset for pre-tokenized binary shards")
-    train_ds = ShardedDataset(data_dir=str(train_shard_dir))
+    train_ds = open_train_dataset(dataset_dir, manifest, seed=pretrain_config.seed)
     val_ds = ShardedDataset(data_dir=str(val_shard_dir))
+    if isinstance(train_ds, ClusterSampledDataset):
+        # The member draw moves with set_epoch, which only the packing path
+        # forwards to the dataset (the non-packing path sets the sampler's epoch
+        # and keeps persistent workers), so refuse the combination.
+        if not pretrain_config.use_packing:
+            raise ValueError(
+                f"{dataset_dir} is a cluster-sampled dataset, which needs use_packing=true."
+            )
+        logger.info(
+            "Cluster-sampled train set (%s pool): %d train clusters per pass, one member "
+            "each, drawn with seed %d; pool %d sequences / %d tokens; ~%d tokens per pass",
+            manifest.cluster_level, manifest.train_sequences, pretrain_config.seed,
+            manifest.pool_sequences, manifest.pool_tokens, manifest.total_train_tokens,
+        )
+    else:
+        logger.info("Using ShardedDataset for pre-tokenized binary shards")
     _dataset_fingerprint = train_ds.fingerprint()
     logger.info(f"Train dataset fingerprint: {_dataset_fingerprint}")
 

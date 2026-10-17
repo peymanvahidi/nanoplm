@@ -272,3 +272,18 @@ class ClusterSampledDataset(ShardedDataset):
     def total_tokens(self) -> int:
         """Tokens in the current epoch's stream."""
         return int(self.get_all_sequence_lengths().astype(np.int64).sum())
+
+
+def open_train_dataset(dataset_dir: Union[str, Path], manifest, seed: int) -> ShardedDataset:
+    """The train set a prepared dataset directory describes.
+
+    A manifest with ``cluster_index_dir`` gives a ClusterSampledDataset keyed on the
+    training ``seed``; any other manifest a plain ShardedDataset. Validation sets are
+    always plain ShardedDatasets (cluster representatives, never resampled).
+    """
+    dataset_dir = Path(dataset_dir)
+    train_dir = dataset_dir / manifest.train_dir
+    index_dir = getattr(manifest, "cluster_index_dir", None)
+    if index_dir:
+        return ClusterSampledDataset(train_dir, dataset_dir / index_dir, seed=int(seed))
+    return ShardedDataset(data_dir=str(train_dir))

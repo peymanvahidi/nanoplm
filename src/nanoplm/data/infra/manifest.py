@@ -64,6 +64,21 @@ class PretrainManifest(DataManifestBase):
     # Default 0 so older manifests without this field still load.
     total_train_tokens: int = 0
 
+    # Cluster-sampled datasets. train_dir then holds a pool of UniRef90/UniRef100
+    # member sequences and cluster_index_dir (relative to the dataset dir) the
+    # UniRef50 cluster index over it. Each pass visits every train cluster once and
+    # draws one member, so train_sequences counts train clusters and
+    # total_train_tokens is the expected token count of one pass. None means a
+    # plain dataset.
+    cluster_index_dir: Optional[str] = None
+    cluster_level: Optional[str] = None  # "uniref90" or "uniref100"
+    pool_sequences: int = 0
+    pool_tokens: int = 0
+
+    @property
+    def is_cluster_sampled(self) -> bool:
+        return bool(self.cluster_index_dir)
+
     def __post_init__(self):
         """Set pipeline mode and validate."""
         self.pipeline_mode = "pretrain"

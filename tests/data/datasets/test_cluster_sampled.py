@@ -351,3 +351,40 @@ def test_fast_forward_moves_to_the_requested_epoch(pool):
     consumed = packed.fast_forward(4, epoch=2)
     assert packed.dataset.epoch == 2 and packed.sampler.epoch == 2
     assert consumed > 0
+
+
+# ------------------------------------------------------------ manifest and selection
+
+
+def _manifest(**over):
+    from nanoplm.data.infra.manifest import PretrainManifest
+    kw = dict(pipeline_mode="pretrain", seqs_num=10, min_seq_len=20, max_seq_len=512,
+              val_ratio=0.01, train_dir="train", val_dir="val", train_sequences=10,
+              val_sequences=1, samples_per_shard=100)
+    kw.update(over)
+    return PretrainManifest(**kw)
+
+
+def test_manifest_with_a_cluster_index_selects_the_cluster_dataset(pool, tmp_path):
+    from nanoplm.data.datasets import open_train_dataset
+    from nanoplm.data.infra.manifest import read_manifest, write_manifest
+    root = pool.pool_dir.parent
+    m = _manifest(cluster_index_dir="cluster_index", cluster_level="uniref90",
+                  train_sequences=len(pool.train_clusters), pool_sequences=len(pool.lengths))
+    write_manifest(tmp_path, m)
+    back = read_manifest(tmp_path)
+    assert back.is_cluster_sampled and back.cluster_index_dir == "cluster_index"
+    train = open_train_dataset(root, back, seed=7)
+    assert isinstance(train, ClusterSampledDataset) and train.seed == 7
+    assert len(train) == back.train_sequences
+    plain = open_train_dataset(root, _manifest(), seed=7)
+    assert type(plain) is ShardedDataset and len(plain) == len(pool.lengths)
+
+
+def test_manifests_without_the_cluster_fields_still_load(tmp_path):
+    from nanoplm.data.infra.manifest import read_manifest, write_manifest
+    write_manifest(tmp_path, _manifest())
+    text = (tmp_path / ".data_manifest").read_text()
+    assert "cluster_index_dir" not in text   # None fields are not written
+    m = read_manifest(tmp_path)
+    assert not m.is_cluster_sampled and m.pool_sequences == 0

@@ -17,6 +17,7 @@ from transformers import (
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.models.modern_bert import ProtModernBertMLM
 from nanoplm.data.datasets.pretrain import ShardedDataset
+from nanoplm.data.datasets.cluster_sampled import open_train_dataset
 from nanoplm.pretraining.collator import (
     ProtDataCollatorForLM,
     mlm_masking_kwargs_from_config,
@@ -177,7 +178,7 @@ def run_pretraining(
     logger.info("Using ShardedDataset for pre-tokenized binary shards")
 
     try:
-        train_ds = ShardedDataset(data_dir=str(train_shard_dir))
+        train_ds = open_train_dataset(dataset_dir, manifest, seed=pretrain_config.seed)
         val_ds = ShardedDataset(data_dir=str(val_shard_dir))
     except FileNotFoundError as e:
         logger.error(
