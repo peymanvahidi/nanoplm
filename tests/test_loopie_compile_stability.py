@@ -25,7 +25,11 @@ import nanoplm.pretraining.models.modern_bert.modeling as modeling
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
 from nanoplm.pretraining.models.modern_bert.modeling import ModernBertEncoderLayer
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
-from nanoplm.pretraining.pure_pipeline import _count_layer_variants, _dynamo_recompile_limit
+from nanoplm.pretraining.pure_pipeline import (
+    _count_layer_variants,
+    _dynamo_recompile_limit,
+    _maybe_raise_dynamo_recompile_limit,
+)
 
 # 10 stored layers is the production loop-imp geometry and exceeds Dynamo's
 # recompile_limit, so per-layer frame specialization would show up as an eager
@@ -542,3 +546,16 @@ def test_recompile_limit_arithmetic():
     assert limit(truncated) == limit(full_bptt)  # grad modes do not multiply R
     assert limit(full_bptt, shapes=1, variants=1, warmup=10) == 16  # warmup floor wins
     assert limit(huginn) == 3 * 6 * 2  # no_grad recurrence splits on grad mode
+
+
+def test_maybe_raise_recompile_limit_lifts_the_accumulated_cap():
+    cfg = torch._dynamo.config
+    with cfg.patch(recompile_limit=8, accumulated_recompile_limit=256):
+        _maybe_raise_dynamo_recompile_limit(300)
+        assert (cfg.recompile_limit, cfg.accumulated_recompile_limit) == (300, 300)
+        with cfg.patch(recompile_limit=8, accumulated_recompile_limit=256):
+            _maybe_raise_dynamo_recompile_limit(10)
+            assert (cfg.recompile_limit, cfg.accumulated_recompile_limit) == (10, 256)
+        with cfg.patch(recompile_limit=50):
+            _maybe_raise_dynamo_recompile_limit(4)  # never lowers
+            assert cfg.recompile_limit == 50

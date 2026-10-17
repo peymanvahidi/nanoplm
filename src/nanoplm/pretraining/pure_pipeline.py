@@ -410,7 +410,7 @@ def _dynamo_recompile_limit(
 
 
 def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
-    """Raise Dynamo's recompile_limit to ``needed``; never lower a higher setting."""
+    """Raise Dynamo's recompile_limit and accumulated_recompile_limit to ``needed``; never lower either."""
     try:
         import torch._dynamo.config as dynamo_config
 
@@ -424,12 +424,12 @@ def _maybe_raise_dynamo_recompile_limit(needed: int) -> None:
                 dynamo_config.recompile_limit,
             )
         accumulated_limit = int(getattr(dynamo_config, "accumulated_recompile_limit", 256))
-        if needed >= accumulated_limit * 3 // 4:
-            logger.warning(
-                "Dynamo recompile_limit %d is close to accumulated_recompile_limit %d, "
-                "the per-frame cap on all entries; a frame past it runs eager.",
-                dynamo_config.recompile_limit,
+        if accumulated_limit < needed:
+            dynamo_config.accumulated_recompile_limit = needed
+            logger.info(
+                "torch._dynamo.config.accumulated_recompile_limit raised from %d to %d.",
                 accumulated_limit,
+                dynamo_config.accumulated_recompile_limit,
             )
     except Exception:
         logger.exception("Failed to raise Dynamo recompile_limit; continuing.")
