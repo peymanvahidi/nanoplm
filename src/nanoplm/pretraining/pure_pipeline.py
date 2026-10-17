@@ -4290,11 +4290,11 @@ def run_pure_pretraining(
             # A trailing window that cannot complete is skipped above, but a
             # loader that runs dry before synced_len (the all_reduce exhaustion
             # check) can still leave micro-steps that ran forward+backward
-            # without reaching an optimizer step. Flush everything to prevent
-            # gradient leak (stale .grad tensors carrying into next epoch),
-            # loss contamination, and token/loss counter bleed across the
-            # boundary.  Timing window is reset at the top of the next epoch
-            # iteration, after iter(train_loader).
+            # without reaching an optimizer step. Reset what they touched so
+            # nothing carries into the next pass: optimizer grads, the
+            # accumulated loss, MoE expert counts, the finite-check flag, and
+            # the token/FLOP/loss window counters. Timing window is reset at
+            # the top of the next epoch iteration, after iter(train_loader).
             epoch_fwd_count = epoch_sub_batch_count
             partial_discarded = accum_micro_count + skipped_tail_count
             # A budget or wall-clock stop before the last sub-batch didn't
@@ -4314,6 +4314,9 @@ def run_pure_pretraining(
                 )
             optimizer.zero_grad(set_to_none=True)
             accum_loss.zero_()
+            if _moe_layers:
+                _moe_count_accum.zero_()
+            local_nonfinite = False
             accum_micro_count = 0
             token_count.zero_()
             raw_token_count.zero_()
