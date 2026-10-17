@@ -2797,10 +2797,7 @@ def run_pure_pretraining(
             layers=base_model.model.layers,
             loopie_jitter=int(getattr(pretrain_config, "loopie_loop_count_jitter", 0)),
             global_batch_warmup_steps=global_batch_warmup_steps,
-            n_input_shapes=(
-                1 if compile_dynamic
-                else len(build_power_of_two_buckets(int(manifest.max_seq_len), min_power_of_two=32))
-            ),
+            n_input_shapes=len(max_seqlen_buckets) if max_seqlen_buckets else 1,
         )
     )
     # Must precede every torch.compile call below.
