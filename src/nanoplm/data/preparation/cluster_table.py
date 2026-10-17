@@ -37,7 +37,7 @@ from nanoplm.utils import logger
 
 COV_MODE = 0
 MMSEQS_INSTALL_HINT = (
-    "Install it with `nanoplm deps install --with-mmseqs` (static binary into the venv), "
+    "Install it with `nanoplm deps install --mmseqs-only` (static binary into the venv), "
     "or put a binary from https://github.com/soedinglab/MMseqs2/releases on PATH, or set "
     "NANOPLM_MMSEQS=/path/to/mmseqs. Alternatively give your own table with "
     "cluster_subsampling.clusters: <path>.")

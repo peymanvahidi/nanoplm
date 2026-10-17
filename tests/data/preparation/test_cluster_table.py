@@ -111,7 +111,7 @@ def test_xml_table_feeds_the_index(release, pool, tmp_path):
 
 def test_missing_mmseqs_says_how_to_install(pool, tmp_path, monkeypatch):
     monkeypatch.setattr(ct, "find_mmseqs", lambda explicit=None: None)
-    with pytest.raises(ct.ClusterTableError, match="nanoplm deps install --with-mmseqs"):
+    with pytest.raises(ct.ClusterTableError, match="nanoplm deps install --mmseqs-only"):
         ct.mmseqs_members_tsv(pool[1], tmp_path / "m.tsv", 0.5, 0.8, tmp_path / "tmp")
 
 
