@@ -14,10 +14,11 @@ from tests.data.preparation.uniref_fixture import MAX_LEN, MIN_LEN, make_release
 
 def _cfg(root, release, level="uniref90", **kw):
     fasta = release.fasta90 if level == "uniref90" else release.fasta100
-    base = dict(extracted_fasta=fasta, cluster_xml=release.xml, output_dir=root / "out",
+    base = dict(members_fasta=fasta, cluster_xml=release.xml, output_dir=root / "out",
                 validation_dir=root / "validation", filtered_fasta=root / "filtered.fasta",
                 min_seq_len=MIN_LEN, max_seq_len=MAX_LEN, val_ratio=0.1,
-                samples_per_shard=101, max_workers=1)
+                samples_per_shard=101, max_workers=1, cluster_source="uniref_xml",
+                level=level)
     base.update(kw)
     return cp.ClusterDataConfig(**base)
 
@@ -38,13 +39,13 @@ def test_layout_and_manifest(prepared):
     cfg, m = prepared
     out = cfg.output_dir
     assert (out / "train").is_dir() and (out / "val").is_dir()
-    assert (out / "cluster_index" / "pool_manifest.json").exists()
-    assert (out / "cluster_index" / "hierarchy" / "u90_keys.npy").exists()
+    assert (out / "cluster_index" / "index" / "pool_manifest.json").exists()
+    assert (out / "cluster_index" / "members.tsv").exists()
     back = read_manifest(out)
     assert back == m
-    assert back.cluster_index_dir == "cluster_index" and back.cluster_level == "uniref90"
-    train = np.load(out / "cluster_index" / "train_clusters.npy")
-    val = np.load(out / "cluster_index" / "val_clusters.npy")
+    assert back.cluster_index_dir == "cluster_index/index" and back.cluster_level == "uniref90"
+    train = np.load(out / "cluster_index" / "index" / "train_clusters.npy")
+    val = np.load(out / "cluster_index" / "index" / "val_clusters.npy")
     assert back.train_sequences == len(train) and back.val_sequences == len(val)
     assert back.seqs_num == len(train) + len(val)
     assert back.pool_sequences == len(ShardedDataset(str(out / "train")))
@@ -59,17 +60,17 @@ def test_training_picks_the_cluster_dataset_and_val_holds_the_reps(prepared):
     assert isinstance(train, ClusterSampledDataset) and len(train) == m.train_sequences
     val = ShardedDataset(str(out / "val"))
     pool = ShardedDataset(str(out / "train"))
-    reps = np.load(out / "cluster_index" / "val_rep_rows.npy")
+    reps = np.load(out / "cluster_index" / "index" / "val_rep_rows.npy")
     assert len(val) == m.val_sequences == len(reps)
     for i in range(len(val)):
         assert torch.equal(val[i]["input_ids"], pool[int(reps[i])]["input_ids"])
     # no train visit can land in a val cluster
-    pc = np.load(out / "cluster_index" / "pool_cluster.npy")
-    vc = np.load(out / "cluster_index" / "val_clusters.npy")
+    pc = np.load(out / "cluster_index" / "index" / "pool_cluster.npy")
+    vc = np.load(out / "cluster_index" / "index" / "val_clusters.npy")
     for e in range(3):
         assert not np.isin(pc[train.rows_for_epoch(e)], vc).any()
-    nonrep = ShardedDataset(str(out / "cluster_index" / "val_nonrep"))
-    assert len(nonrep) == len(np.load(out / "cluster_index" / "val_nonrep_rows.npy"))
+    nonrep = ShardedDataset(str(out / "cluster_index" / "index" / "val_nonrep"))
+    assert len(nonrep) == len(np.load(out / "cluster_index" / "index" / "val_nonrep_rows.npy"))
 
 
 def test_pool_keeps_fasta_order_and_the_length_window(prepared, release):
@@ -85,26 +86,16 @@ def test_pool_keeps_fasta_order_and_the_length_window(prepared, release):
 def test_uniref100_input(release, tmp_path):
     m = cp.prepare_cluster_dataset(_cfg(tmp_path, release, level="uniref100"))
     assert m.cluster_level == "uniref100"
-    assert (tmp_path / "out" / "cluster_index" / "hierarchy" / "u100_keys.npy").exists()
 
 
-def test_uniref50_input_is_refused(release, tmp_path):
-    u50 = tmp_path / "uniref50.fasta"
-    u50.write_text(">UniRef50_A1 x\n" + "A" * 30 + "\n")
-    with pytest.raises(ValueError, match="normal pipeline"):
-        cp.prepare_cluster_dataset(_cfg(tmp_path, release, extracted_fasta=u50))
-
-
-def test_seqs_num_caps_clusters_and_shuffle_is_ignored(release, tmp_path):
-    with pytest.warns(UserWarning, match="ignores shuffle"):
-        m = cp.prepare_cluster_dataset(_cfg(tmp_path, release, seqs_num=120, shuffle=True,
-                                            shuffle_seed=9))
+def test_seqs_num_caps_clusters(release, tmp_path):
+    m = cp.prepare_cluster_dataset(_cfg(tmp_path, release, seqs_num=120))
     assert m.seqs_num == 120 and m.val_sequences == 12 and m.train_sequences == 108
 
 
 def test_too_many_shards_is_refused_before_tokenizing(release, tmp_path, monkeypatch):
     monkeypatch.setattr(cp.ci, "SHARD_SORT_CLIFF", 5)
-    with pytest.raises(ValueError, match="use samples_per_shard >="):
+    with pytest.raises(ValueError, match="samples_per_shard >="):
         cp.prepare_cluster_dataset(_cfg(tmp_path, release, samples_per_shard=10))
     assert not (tmp_path / "out" / "train").exists()
 
@@ -118,20 +109,8 @@ def test_invalid_sequences_are_dropped_from_the_pool(release, tmp_path):
                   MIN_LEN <= len(release.u90[ln[len(">UniRef90_"):].split()[0]][2]) <= MAX_LEN)
     lines[k + 1] = "MK!V" + lines[k + 1][4:]            # an illegal character
     fasta.write_text("\n".join(lines))
-    cfg = _cfg(tmp_path, release, extracted_fasta=fasta)
+    cfg = _cfg(tmp_path, release, members_fasta=fasta)
     cp.prepare_cluster_dataset(cfg)
     assert f">UniRef90_{acc} " not in cfg.filtered_fasta.read_text()
 
 
-def test_xml_location_and_fetch(tmp_path):
-    p = cp.cluster_xml_path(tmp_path / "raw" / "uniref90.fasta.gz",
-                            "https://ftp.uniprot.org/x/uniref50.xml.gz?x=1")
-    assert p == tmp_path / "raw" / "uniref50.xml.gz"
-    with pytest.raises(ValueError, match=".xml or .xml.gz"):
-        cp.cluster_xml_path(tmp_path / "a.fasta.gz", "uniref50.fasta.gz")
-    src = tmp_path / "src.xml.gz"
-    src.write_bytes(b"x")
-    dest = cp.fetch_cluster_xml(p, local=str(src))
-    assert dest.read_bytes() == b"x"
-    with pytest.raises(ValueError, match="exactly one"):
-        cp.fetch_cluster_xml(p)

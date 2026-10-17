@@ -42,7 +42,6 @@ MEMBER_TAG = 0x52_54_4D_45_4D_42
 # rows_for_epoch works in chunks so its temporaries stay small at 33M clusters
 VEC_CHUNK = 1 << 22
 
-CLUSTER_INDEX_DIRNAME = "cluster_index"
 INDEX_MANIFEST = "pool_manifest.json"
 # Identity of the member draw. Part of the fingerprint, so a change to the draw is a
 # dataset change for resume purposes. Kept equal to the shim's tag on purpose.
@@ -281,7 +280,10 @@ def open_train_dataset(dataset_dir: Union[str, Path], manifest, seed: int) -> Sh
     training ``seed``; any other manifest a plain ShardedDataset. Validation sets are
     always plain ShardedDatasets (cluster representatives, never resampled).
     """
+    from nanoplm.data.preparation.cluster_config import check_not_experiment_dir
+
     dataset_dir = Path(dataset_dir)
+    check_not_experiment_dir(dataset_dir, manifest)
     train_dir = dataset_dir / manifest.train_dir
     index_dir = getattr(manifest, "cluster_index_dir", None)
     if index_dir:
