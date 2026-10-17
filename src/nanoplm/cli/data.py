@@ -37,8 +37,14 @@ _DVC = [sys.executable, "-m", "dvc"]
 
 # Our own pipeline exceptions. Their messages are written for a user, so they
 # stand alone as a one-line error.
+from nanoplm.data.preparation.cluster_config import ClusterConfigError
+from nanoplm.data.preparation.cluster_index import ClusterIndexError
+from nanoplm.data.preparation.cluster_table import ClusterTableError
+from nanoplm.data.preparation.uniref_hierarchy import HierarchyError
+
 _PIPELINE_ERRORS = (
     DownloadError, ExtractionError, ShufflingError, FilterError, SplitError, ValidationError,
+    ClusterConfigError, ClusterIndexError, ClusterTableError, HierarchyError,
 )
 
 # Third-party and builtin types the stages raise for real input problems: h5py
@@ -735,6 +741,85 @@ def kd_reshard(input_file: str, n_shards: int, output_dir: str, total_sequences:
         click.echo(f"  {path}")
 
 
+# ---------------------------------------------------------------------------
+# Cluster subsampling stages (hidden; run by from-yaml through DVC)
+# ---------------------------------------------------------------------------
+
+@data.command("get-cluster-xml", hidden=True)
+@click.option("--url", required=True, type=str)
+@click.option("--output", "-o", required=True, type=click.Path(dir_okay=False))
+def get_cluster_xml(url: str, output: str):
+    """Internal: fetch uniref50.xml.gz, or reuse a copy already at --output."""
+    from nanoplm.data.preparation.cluster_pipeline import fetch_cluster_xml
+    out = Path(output)
+    if out.exists() and out.stat().st_size > 0:
+        click.echo(f"Reusing {out}")
+        return
+    fetch_cluster_xml(out, url=url)
+    click.echo(f"Downloaded to: {out}")
+
+
+@data.command("cluster-members", hidden=True)
+@click.option("--source", required=True, type=click.Choice(["uniref_xml", "mmseqs", "table"]))
+@click.option("--fasta", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--output", "-o", required=True, type=click.Path(dir_okay=False))
+@click.option("--level", type=click.Choice(["uniref90", "uniref100"]), default=None)
+@click.option("--xml", type=click.Path(exists=True, dir_okay=False), default=None)
+@click.option("--table", type=click.Path(exists=True, dir_okay=False), default=None)
+@click.option("--identity", type=float, default=0.5)
+@click.option("--coverage", type=float, default=0.8)
+@click.option("--tmp-dir", type=click.Path(file_okay=False), default=None)
+@click.option("--threads", type=int, default=None)
+def cluster_members(source, fasta, output, level, xml, table, identity, coverage, tmp_dir,
+                    threads):
+    """Internal: write the canonical cluster table (cluster_id<TAB>sequence_id)."""
+    from nanoplm.data.preparation.cluster_pipeline import build_members_table
+    stats = build_members_table(source, Path(output), fasta=Path(fasta), level=level,
+                                xml=Path(xml) if xml else None,
+                                table=Path(table) if table else None, identity=identity,
+                                coverage=coverage, tmp_dir=Path(tmp_dir) if tmp_dir else None,
+                                threads=threads)
+    click.echo(f"Wrote {output}: {stats['clusters']:,} clusters, {stats['members']:,} sequences")
+
+
+@data.command("cluster-pool", hidden=True)
+@click.option("--input", "-i", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--output", "-o", required=True, type=click.Path(file_okay=False))
+@click.option("--max-seq-len", required=True, type=int)
+@click.option("--samples-per-shard", required=True, type=int)
+@click.option("--register-tokens", type=int, default=0)
+@click.option("--max-workers", type=int, default=2)
+def cluster_pool(input, output, max_seq_len, samples_per_shard, register_tokens, max_workers):
+    """Internal: pre-tokenize the filtered member FASTA into the pool (FASTA order)."""
+    from nanoplm.data.preparation.cluster_pipeline import build_pool
+    build_pool(Path(input), Path(output), max_seq_len, samples_per_shard, register_tokens,
+               max_workers)
+    click.echo(f"Wrote pool shards to {output}")
+
+
+@data.command("cluster-index", hidden=True)
+@click.option("--members-tsv", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--fasta", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--pool", required=True, type=click.Path(exists=True, file_okay=False))
+@click.option("--index-dir", required=True, type=click.Path(file_okay=False))
+@click.option("--val-dir", required=True, type=click.Path(file_okay=False))
+@click.option("--max-seq-len", required=True, type=int)
+@click.option("--val-ratio", required=True, type=float)
+@click.option("--samples-per-shard", required=True, type=int)
+@click.option("--seqs-num", type=int, default=-1)
+@click.option("--register-tokens", type=int, default=0)
+def cluster_index_cmd(members_tsv, fasta, pool, index_dir, val_dir, max_seq_len, val_ratio,
+                      samples_per_shard, seqs_num, register_tokens):
+    """Internal: build the cluster index and the validation gathers."""
+    from nanoplm.data.preparation.cluster_pipeline import build_index_and_val
+    man = build_index_and_val(Path(fasta), Path(pool), Path(members_tsv), Path(index_dir),
+                              Path(val_dir), max_seq_len, val_ratio, samples_per_shard,
+                              seqs_num, register_tokens)
+    c = man["counts"]
+    click.echo(f"Cluster index: {c['train_clusters']:,} train / {c['val_clusters']:,} val "
+               f"clusters over {c['pool_rows']:,} pool sequences")
+
+
 @data.command("get-yaml")
 @click.argument("output", required=False,
                 type=click.Path(file_okay=False, writable=True, resolve_path=True))
@@ -874,6 +959,8 @@ def from_yaml(
     _reject_legacy_pipeline_mode(data_params)
     _validate_source_fields(params.get("data_dirs", {}))
     _validate_pipeline_fields(params.get("data_dirs", {}), data_params, kind, config_path)
+    if kind == "pretrain":
+        _validate_cluster_block(params, config_path)
 
     if fix:
         _flip_drop_invalid(config_path, True)
@@ -1130,6 +1217,25 @@ def _validate_pipeline_fields(data_dirs: dict, data_params: dict, kind: str, con
             )
 
 
+def _validate_cluster_block(params: dict, config_path: Path) -> None:
+    """Resolve cluster_subsampling now, so a bad block fails before DVC runs."""
+    from nanoplm.data.preparation.cluster_config import ClusterConfigError, resolve_cluster_plan
+    from nanoplm.data.preparation.cluster_table import MMSEQS_INSTALL_HINT, find_mmseqs
+    try:
+        plan = resolve_cluster_plan(params)
+    except ClusterConfigError as e:
+        raise click.ClickException(f"{config_path.name}: {e}") from e
+    if plan is None:
+        return
+    for w in plan.warnings:
+        logger.warning(w)
+        click.echo(f"Warning: {w}", err=True)
+    if plan.cluster_source == "mmseqs" and find_mmseqs() is None:
+        raise click.ClickException(
+            f"{config_path.name}: these members are clustered with MMseqs2, but `mmseqs` "
+            f"was not found. {MMSEQS_INSTALL_HINT}")
+
+
 def _detect_kind(data_params: dict, filename: str) -> str:
     """Detect pipeline kind from the config filename or data_params keys."""
     if "distillation" in filename:
@@ -1193,11 +1299,19 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path) -> Non
 @click.option("--samples-per-shard", required=True, type=int)
 @click.option("--register-tokens", type=int, default=0)
 @click.option("--teacher-model", type=str, default=None)
+@click.option("--cluster-index", is_flag=True, default=False,
+              help="Describe a cluster-subsampled dataset (one member per cluster per pass).")
 @click.help_option("--help", "-h")
 def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
-                       samples_per_shard, register_tokens, teacher_model):
+                       samples_per_shard, register_tokens, teacher_model, cluster_index):
     """Internal: write .data_manifest after shard generation."""
     output_dir = Path(output)
+    if cluster_index:
+        from nanoplm.data.preparation.cluster_pipeline import write_cluster_manifest
+        write_cluster_manifest(output_dir, min_seq_len, max_seq_len, val_ratio,
+                               samples_per_shard, register_tokens)
+        click.echo(f"Wrote manifest: {output_dir / '.data_manifest'}")
+        return
     train_dir = output_dir / "train"
     val_dir = output_dir / "val"
     for d, name in [(train_dir, "train"), (val_dir, "val")]:

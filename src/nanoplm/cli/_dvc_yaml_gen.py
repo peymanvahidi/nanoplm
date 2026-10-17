@@ -54,6 +54,15 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str) -> str:
     if kind not in {"pretrain", "distillation"}:
         raise ValueError(f"kind must be pretrain or distillation, got {kind}")
 
+    if kind == "pretrain":
+        from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
+        plan = resolve_cluster_plan(config)
+        if plan is not None:
+            return _HEADER + yaml.safe_dump(
+                {"vars": [params_filename],
+                 "stages": _cluster_stages(config, plan, params_filename)},
+                sort_keys=False, default_flow_style=False)
+
     data_dirs = config["data_dirs"]
     url = data_dirs.get("url")
     local_fasta = data_dirs.get("local_fasta")
@@ -307,3 +316,150 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str) -> str:
     doc = {"vars": [params_filename], "stages": stages}
     body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
     return _HEADER + body
+
+
+def _fetch_stages(name: str, source: str, compressed, extracted, params_filename: str,
+                  param_keys: list) -> dict:
+    """get-file (+ extract) for one FASTA source; paths embedded literally."""
+    is_url = source.startswith(("http://", "https://"))
+    target = str(compressed) if compressed else str(extracted)
+    flag = "--url" if is_url else "--local-fasta"
+    get = {
+        "cmd": f'nanoplm data get-file {flag} "{source}" -o {target}',
+        "deps": ([] if is_url else [source])
+        + [_resolve_pkg_dep("src/nanoplm/data/preparation/downloader.py")],
+        "params": [{params_filename: param_keys}],
+        "outs": [target],
+    }
+    stages = {f"get_{name}": get}
+    if compressed:
+        stages[f"extract_{name}"] = {
+            "cmd": f"nanoplm data extract -i {compressed} -o {extracted}",
+            "deps": [str(compressed), _resolve_pkg_dep("src/nanoplm/data/preparation/extractor.py")],
+            "outs": [str(extracted)],
+        }
+    return stages
+
+
+def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
+    """Stages for cluster_subsampling.enabled: true (see cluster_pipeline's docstring).
+
+    Each stage lists only the params it reads, so changing identity / coverage reruns
+    cluster_members and what follows it, never the pool.
+    """
+    dep = _resolve_pkg_dep
+    members_fasta = str(plan.members_fasta)
+    out = "${data_dirs.output_dir}"
+    stages: dict[str, Any] = {}
+    if plan.members_from_source:
+        key = "data_dirs.url" if config["data_dirs"].get("url") else "data_dirs.local_fasta"
+        stages.update(_fetch_stages("file", plan.source, plan.members_compressed,
+                                    plan.members_fasta, params_filename, [key]))
+        if "extract_file" in stages:      # the normal pipeline's name for this stage
+            stages["extract"] = stages.pop("extract_file")
+    else:
+        stages.update(_fetch_stages(
+            "members_fasta", plan.members, plan.members_compressed, plan.members_fasta,
+            params_filename, ["cluster_subsampling.members"]))
+        if "extract_members_fasta" in stages:
+            stages["extract_members"] = stages.pop("extract_members_fasta")
+    stages["check"] = {
+        "cmd": (f"nanoplm data check -i {members_fasta} -o ${{data_dirs.validation_dir}} "
+                "--drop-invalid ${data_params.drop_invalid_sequences}"),
+        "deps": [members_fasta, dep("src/nanoplm/data/preparation/checker.py"),
+                 dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c")],
+        "params": [{params_filename: ["data_dirs.validation_dir",
+                                      "data_params.drop_invalid_sequences"]}],
+        "outs": ["${data_dirs.validation_dir}"],
+    }
+    stages["filter"] = {
+        "cmd": (f"nanoplm data filter -i {members_fasta} -o ${{data_dirs.filtered_fasta}} "
+                "--min-seq-len ${data_params.min_seq_len} "
+                "--max-seq-len ${data_params.max_seq_len} --seqs-num -1 "
+                "--exclude-ids ${data_dirs.validation_dir}/invalid_ids.txt"),
+        "deps": [members_fasta, "${data_dirs.validation_dir}",
+                 dep("src/nanoplm/data/preparation/filterer.py"),
+                 dep("src/nanoplm/data/preparation/_native_ops.py"),
+                 dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c")],
+        "params": [{params_filename: ["data_dirs.filtered_fasta", "data_params.min_seq_len",
+                                      "data_params.max_seq_len"]}],
+        "outs": ["${data_dirs.filtered_fasta}"],
+    }
+    stages["cluster_pool"] = {
+        "cmd": ("nanoplm data cluster-pool -i ${data_dirs.filtered_fasta} "
+                f"-o {out}/train --max-seq-len ${{data_params.max_seq_len}} "
+                "--samples-per-shard ${data_params.samples_per_shard} "
+                "--register-tokens ${data_params.register_tokens}"),
+        "deps": ["${data_dirs.filtered_fasta}",
+                 dep("src/nanoplm/data/sharding/pretrain_shard_writer.py"),
+                 dep("src/nanoplm/data/sharding/csrc/fast_fasta_shard_writer.c"),
+                 dep("src/nanoplm/pretraining/models/modern_bert/tokenizer.py")],
+        "params": [{params_filename: ["data_dirs.output_dir", "data_params.max_seq_len",
+                                      "data_params.samples_per_shard",
+                                      "data_params.register_tokens"]}],
+        "outs": [f"{out}/train"],
+    }
+    tsv = str(plan.members_tsv)
+    info = str(plan.members_tsv.with_suffix(".json"))
+    members_deps = ["${data_dirs.filtered_fasta}",
+                    dep("src/nanoplm/data/preparation/cluster_table.py"),
+                    dep("src/nanoplm/data/preparation/cluster_pipeline.py")]
+    members_params: list = []
+    if plan.cluster_source == "uniref_xml":
+        xml = str(plan.xml_path)
+        stages["get_cluster_xml"] = {
+            "cmd": f'nanoplm data get-cluster-xml --url "{plan.xml_url}" -o {xml}',
+            "deps": [dep("src/nanoplm/data/preparation/downloader.py")],
+            # persist: an existing copy is reused, never deleted; cache: not copied
+            # into the DVC cache (20 GB)
+            "outs": [{xml: {"persist": True, "cache": False}}],
+        }
+        cmd = (f"nanoplm data cluster-members --source uniref_xml --level {plan.members_level} "
+               f"--fasta ${{data_dirs.filtered_fasta}} --xml {xml} -o {tsv}")
+        members_deps += [xml, dep("src/nanoplm/data/preparation/uniref_hierarchy.py")]
+    elif plan.cluster_source == "mmseqs":
+        cmd = ("nanoplm data cluster-members --source mmseqs "
+               "--fasta ${data_dirs.filtered_fasta} "
+               "--identity ${cluster_subsampling.identity} "
+               "--coverage ${cluster_subsampling.coverage} "
+               f"--tmp-dir {plan.mmseqs_tmp} -o {tsv}")
+        members_params = ["cluster_subsampling.identity", "cluster_subsampling.coverage"]
+    else:
+        cmd = (f"nanoplm data cluster-members --source table --table {plan.table} "
+               f"--fasta ${{data_dirs.filtered_fasta}} -o {tsv}")
+        members_deps.append(str(plan.table))
+    stages["cluster_members"] = {"cmd": cmd, "deps": members_deps, "outs": [tsv, info]}
+    if members_params:
+        stages["cluster_members"]["params"] = [{params_filename: members_params}]
+    index_dir = str(plan.index_dir)
+    stages["cluster_index"] = {
+        "cmd": (f"nanoplm data cluster-index --members-tsv {tsv} "
+                f"--fasta ${{data_dirs.filtered_fasta}} --pool {out}/train "
+                f"--index-dir {index_dir} --val-dir {out}/val "
+                "--max-seq-len ${data_params.max_seq_len} --val-ratio ${data_params.val_ratio} "
+                "--samples-per-shard ${data_params.samples_per_shard} "
+                "--seqs-num ${data_params.seqs_num} "
+                "--register-tokens ${data_params.register_tokens}"),
+        "deps": [tsv, info, "${data_dirs.filtered_fasta}", f"{out}/train",
+                 dep("src/nanoplm/data/preparation/cluster_index.py"),
+                 dep("src/nanoplm/data/preparation/cluster_table.py")],
+        "params": [{params_filename: ["data_params.max_seq_len", "data_params.val_ratio",
+                                      "data_params.samples_per_shard", "data_params.seqs_num",
+                                      "data_params.register_tokens"]}],
+        "outs": [index_dir, f"{out}/val"],
+    }
+    stages["write_manifest"] = {
+        "cmd": ("nanoplm data write-manifest --kind pretrain --cluster-index "
+                f"-o {out} --min-seq-len ${{data_params.min_seq_len}} "
+                "--max-seq-len ${data_params.max_seq_len} "
+                "--val-ratio ${data_params.val_ratio} "
+                "--samples-per-shard ${data_params.samples_per_shard} "
+                "--register-tokens ${data_params.register_tokens}"),
+        "deps": [index_dir, f"{out}/val", dep("src/nanoplm/data/infra/manifest.py"),
+                 dep("src/nanoplm/data/preparation/cluster_pipeline.py")],
+        "params": [{params_filename: ["data_params.min_seq_len", "data_params.max_seq_len",
+                                      "data_params.val_ratio", "data_params.samples_per_shard",
+                                      "data_params.register_tokens"]}],
+        "outs": [f"{out}/.data_manifest"],
+    }
+    return stages

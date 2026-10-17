@@ -157,6 +157,11 @@ model.loopie_bptt: { type: [integer, "null"], minimum: 1, backend: [pure_torch],
 
 # ----------------------------------------------------------------------- data
 data_dirs.local_fasta: { type: [string, "null"] }
+# cluster_config.resolve_cluster_plan: null = the url itself
+cluster_subsampling.members: { type: [string, "null"] }
+# cluster_config._fraction: a number in (0, 1]; 0 itself is rejected there
+cluster_subsampling.identity: { minimum: 0, maximum: 1 }
+cluster_subsampling.coverage: { minimum: 0, maximum: 1 }
 
 # --------------------------------------------------------------- distillation
 # Optional[int]; null = MHA. The flat key also matches the pretrain template's
