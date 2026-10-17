@@ -690,3 +690,34 @@ def test_step_te_resolves_headers_before_building(tmp_path):
     for header in ("nccl.h", "cudnn.h"):
         assert f"{header} is not on the toolkit's include path -- added" in r.stdout
     assert r.stdout.index("to CPATH") < r.stdout.index("--branch v2.16")
+
+
+def test_mmseqs_is_opt_in_and_pinned(tmp_path):
+    bindir = _fake_bin(tmp_path)
+    env = {"NANOPLM_DEPS_DRY_RUN": "1"}
+    plain = _run(["--force"], path=f"{bindir}:{SYS_PATH}", extra_env=env)
+    assert plain.returncode == 0, plain.stderr
+    assert "soedinglab/MMseqs2" not in plain.stdout
+    withm = _run(["--force", "--with-mmseqs"], path=f"{bindir}:{SYS_PATH}", extra_env=env)
+    assert withm.returncode == 0, withm.stderr
+    assert "soedinglab/MMseqs2/releases/download/18-8cc5c/mmseqs-linux-" in withm.stdout
+    assert f"-> {sys.prefix}/bin/mmseqs" in withm.stdout
+    # after every GPU-stack step
+    assert withm.stdout.index("soedinglab/MMseqs2") > withm.stdout.index("quack-kernels")
+
+
+def test_mmseqs_only_skips_the_gpu_preflight(tmp_path):
+    # no nvcc on PATH: a full install would fail preflight, --mmseqs-only must not care
+    bindir = _fake_bin(tmp_path, with_nvcc=False)
+    r = _run(["--mmseqs-only", "--force"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+    assert r.returncode == 0, r.stderr
+    assert "DRY> download https://github.com/soedinglab/MMseqs2" in r.stdout
+    assert "torch" not in r.stdout
+
+
+def test_mmseqs_pins_are_sha256_gated():
+    text = SCRIPT.read_text()
+    assert 'MMSEQS_SHA256="bd9b0234da5949ad528d5b5f9ea4cda9c1e23dce14b46c0791d4d919a76e61ce"' in text
+    assert 'MMSEQS_SHA256="06c9a031331562e37eed3da79ef859d30a1a3ac5c5e334411dfaee5da5e9c0d0"' in text
+    assert "sha256sum -c" in text.split("step_mmseqs()")[1].split("main()")[0]

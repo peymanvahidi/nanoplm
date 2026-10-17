@@ -7,6 +7,7 @@
 #   3. TransformerEngine v2.16 (from source) 4. flash-attn-3 (pinned wheel, sha256)
 #   5. quack-kernels[cu13]==0.5.0 + nvidia-cutlass-dsl[cu13]==4.5.3
 #      + sonic-moe (pinned commit)
+#   optional: MMseqs2 static binary (--with-mmseqs, or --mmseqs-only)
 #
 # Not user-facing: run `nanoplm deps install`.
 #
@@ -60,6 +61,20 @@ FA3_WHEEL_URLENC="${FA3_WHEEL//+/%2B}"   # GitHub's release-download endpoint 50
 # Single source: the public windreamer wheel mirror (no auth), pinned to a fixed
 # release tag. Downloaded bytes are sha256-gated in step_fa3 regardless.
 FA3_URL="https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.05.20-072445f/${FA3_WHEEL_URLENC}"
+
+# MMseqs2 (optional, --with-mmseqs / --mmseqs-only): only cluster_subsampling with
+# MMseqs2 clustering needs it. A pinned static release binary goes into
+# $VIRTUAL_ENV/bin (never $HOME), sha256-gated. The x86_64 build needs AVX2.
+MMSEQS_RELEASE="18-8cc5c"
+case "$(uname -m)" in
+  x86_64)        MMSEQS_ASSET="mmseqs-linux-avx2.tar.gz"
+                 MMSEQS_SHA256="bd9b0234da5949ad528d5b5f9ea4cda9c1e23dce14b46c0791d4d919a76e61ce" ;;
+  aarch64|arm64) MMSEQS_ASSET="mmseqs-linux-arm64.tar.gz"
+                 MMSEQS_SHA256="06c9a031331562e37eed3da79ef859d30a1a3ac5c5e334411dfaee5da5e9c0d0" ;;
+esac
+MMSEQS_URL="https://github.com/soedinglab/MMseqs2/releases/download/${MMSEQS_RELEASE}/${MMSEQS_ASSET}"
+WITH_MMSEQS=0
+MMSEQS_ONLY=0
 
 # ---- knobs -------------------------------------------------------------------
 export NVTE_FRAMEWORK="${NVTE_FRAMEWORK:-pytorch}"
@@ -596,15 +611,49 @@ step_moe() {
   fi
 }
 
+step_mmseqs() {
+  local dest="$VIRTUAL_ENV/bin/mmseqs"
+  if [ "$FORCE" -eq 0 ] && [ -x "$dest" ] && "$dest" version 2>/dev/null | grep -q "^${MMSEQS_RELEASE%%-*}"; then
+    log "mmseqs $MMSEQS_RELEASE present; skipping."; return 0
+  fi
+  if [ -z "${MMSEQS_ASSET:-}" ]; then
+    err "no MMseqs2 static build for $(uname -m)"; exit 1
+  fi
+  if [ -n "$DRY_RUN" ]; then
+    echo "DRY> download $MMSEQS_URL (sha256-verified)"
+    echo "DRY> install mmseqs/bin/mmseqs -> $dest"
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/mmseqs.XXXXXX")"
+  TMP_DIRS+=("$tmp")
+  log "downloading MMseqs2 $MMSEQS_RELEASE ($MMSEQS_ASSET)"
+  curl -fsSL -o "$tmp/$MMSEQS_ASSET" "$MMSEQS_URL" || { err "MMseqs2 download failed"; exit 1; }
+  echo "${MMSEQS_SHA256}  $tmp/$MMSEQS_ASSET" | sha256sum -c - >/dev/null \
+    || { err "MMseqs2 archive sha256 mismatch -- refusing to install."; exit 1; }
+  tar -xzf "$tmp/$MMSEQS_ASSET" -C "$tmp"
+  install -m 0755 "$tmp/mmseqs/bin/mmseqs" "$dest"
+  log "installed $dest"
+}
+
 main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --arch)   NVTE_CUDA_ARCHS="$2"; export NVTE_CUDA_ARCHS; shift 2 ;;
       --arch=*) NVTE_CUDA_ARCHS="${1#*=}"; export NVTE_CUDA_ARCHS; shift ;;
       --force)  FORCE=1; shift ;;
-      *) err "unknown argument: $1 (supported: --arch <cc>, --force)"; exit 2 ;;
+      --with-mmseqs) WITH_MMSEQS=1; shift ;;
+      --mmseqs-only) MMSEQS_ONLY=1; shift ;;
+      *) err "unknown argument: $1 (supported: --arch <cc>, --force, --with-mmseqs, --mmseqs-only)"; exit 2 ;;
     esac
   done
+  if [ "$MMSEQS_ONLY" -eq 1 ]; then
+    if [ -z "${VIRTUAL_ENV:-}" ] || [ ! -x "$PY" ]; then
+      err "no active virtualenv (\$VIRTUAL_ENV unset, or it has no bin/python)."; exit 1
+    fi
+    step_mmseqs
+    return 0
+  fi
   preflight
   step_torch
   step_dion
@@ -614,6 +663,7 @@ main() {
   # LAST on purpose -- see the comment above step_cublas. Every step above that
   # installs a torch-dependent dist re-resolves torch's pins and would undo it.
   step_cublas
+  if [ "$WITH_MMSEQS" -eq 1 ]; then step_mmseqs; fi
   log "=== hard-dependency install finished (verification runs next) ==="
 }
 

@@ -43,7 +43,12 @@ def deps():
 @click.option("--arch", default="90", show_default=True,
               help="CUDA arch for source builds (NVTE_CUDA_ARCHS). 90 = Hopper/H100.")
 @click.option("--force", is_flag=True, help="Reinstall every component even if already satisfied.")
-def install(arch: str, force: bool):
+@click.option("--with-mmseqs", is_flag=True,
+              help="Also install the MMseqs2 binary into the venv (only needed when "
+                   "cluster_subsampling clusters with MMseqs2).")
+@click.option("--mmseqs-only", is_flag=True,
+              help="Install only the MMseqs2 binary; no GPU stack, no verification.")
+def install(arch: str, force: bool, with_mmseqs: bool, mmseqs_only: bool):
     """Install the full pinned stack into the active virtualenv, then verify.
 
     On clusters, load the CUDA toolchain first (JURECA:
@@ -61,12 +66,18 @@ def install(arch: str, force: bool):
     env = dict(os.environ)
     env["VIRTUAL_ENV"] = sys.prefix
     cmd = ["bash", str(_script_path()), "--arch", arch] + (["--force"] if force else [])
+    if mmseqs_only:
+        cmd.append("--mmseqs-only")
+    elif with_mmseqs:
+        cmd.append("--with-mmseqs")
     try:
         rc = subprocess.run(cmd, env=env).returncode
     except FileNotFoundError:
         raise click.ClickException("bash is required to run the dependency installer.")
     if rc != 0:
         raise SystemExit(rc)
+    if mmseqs_only:
+        return
     click.echo(">> verifying the environment (fresh interpreter)")
     rc = _fresh_verify(env=env)
     if rc != 0:
