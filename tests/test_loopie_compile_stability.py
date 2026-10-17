@@ -411,7 +411,9 @@ _HUGINN_RS = (1, 2, 3, 4)
     # under bptt (x 2) but not on R, and no longer sees the attention type or
     # MLP kind (those moved into their own frames), so only layer 0 differs:
     # 2 x S x 2, with a third max_seqlen to clear the default limit. The MoE
-    # mlp frame stays at <= 4 entries. MoE without looping: the CPU MoE
+    # mlp frame stays at <= 4 entries (None/tensor last_aux_loss x grad mode).
+    # The tensor-R fallback (_forward_repeats) is off the training path and
+    # not sized by the limit. MoE without looping: the CPU MoE
     # dispatch graph-breaks (moe.py:641), so forward's MoE entry stops at the
     # _forward_once call with no layer or max_seqlen guards and, being newest,
     # takes every layer from the second shape on: _forward_once holds
@@ -420,7 +422,8 @@ _HUGINN_RS = (1, 2, 3, 4)
     # bptt column) runs R - 1 core passes under no_grad, so the layer frame
     # sees both grad modes, except that the prelude layer never runs under
     # no_grad: S x (V + 1) = 9 entries for R in 1..4, against 8 before and
-    # V x S x 2 = 12 now.
+    # V x S x 2 = 12 now. The limit counts x 2 for every Huginn run, since
+    # recycling_bptt lives in the pretrain config, not the model config.
     [
         ("loopie", "F", 3, 2, None, 1, False, False, _MAX_SEQLENS, "forward", 2 * 2 * 3),
         ("loopie", "FS", 4, 3, 1, 1, False, False, _MAX_SEQLENS, "forward", 3 * 2 * 3),

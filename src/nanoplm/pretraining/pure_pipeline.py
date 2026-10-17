@@ -374,29 +374,20 @@ def _dynamo_recompile_limit(
 ) -> int:
     """Dynamo recompile_limit this run needs so no compiled frame falls back to eager.
 
-    Under FSDP2 the dynamo-disabled per-layer hooks split the model at each
-    encoder layer, so ``ModernBertEncoderLayer.forward`` becomes one frame
-    shared by every layer and needs V x S entries: V structurally distinct
-    layers and S input shapes (the ``max_seqlen`` buckets on the static packed
-    path). Without FSDP the whole model is one frame and needs only S.
+    Returns max(floor, V x S x f):
+    - V: structurally distinct encoder layers. Under FSDP2 all layers share the
+      ``ModernBertEncoderLayer.forward`` frame (``_forward_once`` with sublayer
+      units); without FSDP the model is one frame and V overestimates.
+    - S: input shapes, the ``max_seqlen`` buckets on the static packed path.
+    - f: for loopie, max(2j + 1, 2 if ``loopie_bptt`` else 1). Int R specializes
+      the layer frame, truncation splits ``_forward_once`` on grad mode, and the
+      two do not multiply. 2 for Huginn (no_grad recurrence). 1 otherwise. The
+      MoE mlp frame stays at <= 4 entries and adds no factor.
+    - floor: 8, or 16 with batch-size warmup. The 16 is headroom kept from
+      before split micro-batches were bucketed; lowering it needs a GPU recheck.
 
-    Loopie jitter passes R as a Python int (``_loop_count_fwd_kwargs``), which
-    the layer frame specializes on: x N, with N = 2j + 1 values in the
-    {R0 - j, ..., R0 + j} support. ``loopie_bptt`` adds nothing to that frame,
-    since its ``no_grad`` applications are traced inside the unrolled graph.
-    With ``fsdp_shard_granularity: sublayer`` the frame is ``_forward_once``
-    instead, entered once per application, and it splits on grad mode: x 2
-    under ``loopie_bptt``, not multiplied by N. MoE needs no extra factor: the
-    MoE mlp frame sees neither ``max_seqlen`` nor R and stays at <= 4 entries
-    (None/tensor ``last_aux_loss`` x grad mode). The tensor-R fallback
-    (``_forward_repeats``) is off the training path and not sized here.
-    Huginn recycling runs the core layers under both grad modes once
-    ``recycling_bptt`` truncates the recurrence: x 2 on either frame, set for
-    every Huginn run since ``recycling_bptt`` lives in the pretrain config.
-
-    Batch-size warmup keeps a floor of 16 (8 otherwise). Its stages do not
-    share a cache (each stage boundary calls ``torch.compiler.reset()``), and
-    split micro-batches keep the collator's ``max_seqlen`` buckets.
+    Per-config cache-entry derivations live in
+    tests/test_loopie_compile_stability.py.
     """
     limit = 16 if int(global_batch_warmup_steps) > 0 else 8
     per_shape = 1
