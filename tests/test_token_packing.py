@@ -83,6 +83,45 @@ def test_token_packing_fast_forward_applies_only_to_target_epoch():
     assert len(resumed_batches) == 3
     assert len(next_epoch_batches) == 4
 
+class EpochLengthDataset(MockDataset):
+    """Lengths depend on the epoch, like a cluster-sampled dataset's members."""
+
+    def __init__(self, per_epoch):
+        self.per_epoch = per_epoch
+        self.epoch = 0
+        super().__init__(per_epoch[0])
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        self.lengths = self.per_epoch[epoch]
+
+    def get_all_sequence_lengths(self):
+        return np.asarray(self.lengths, dtype=np.int32)
+
+
+def test_token_packing_len_is_recomputed_when_the_epoch_changes():
+    ds = EpochLengthDataset({0: [10] * 6, 1: [20] * 6})
+    packed = TokenPackingDataset(ds, max_tokens_per_batch=30, drop_last=False,
+                                 sampler=SequentialSampler(ds))
+    assert len(packed) == len(list(packed)) == 2
+    packed.set_epoch(1)
+    assert len(packed) == len(list(packed)) == 6
+    packed.set_epoch(1)  # same epoch: cached value is kept
+    assert packed._cached_len == 6
+    packed.set_epoch(0)
+    assert len(packed) == 2
+
+
+def test_fast_forward_replays_the_target_epochs_lengths():
+    ds = EpochLengthDataset({0: [10] * 6, 1: [15] * 6})
+    packed = TokenPackingDataset(ds, max_tokens_per_batch=30, drop_last=False,
+                                 sampler=SequentialSampler(ds))
+    # epoch 1 packs two 15-token samples per batch (epoch 0 would pack three)
+    assert packed.fast_forward(2, epoch=1) == 4
+    assert ds.epoch == 1
+    assert len(list(packed)) == 1
+
+
 def test_data_collator_flattening():
     # Mock tokenizer
     class DummyTokenizer:

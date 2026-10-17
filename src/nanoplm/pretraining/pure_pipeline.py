@@ -2905,7 +2905,18 @@ def run_pure_pretraining(
     # ---- Optimizer / Scheduler ----
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
 
-    synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
+    # One pass == one epoch. The packed batch count can change with the epoch
+    # (the sampler reshuffles, and a cluster-sampled dataset draws other
+    # members), so synced_len is recomputed whenever the epoch changes.
+    epoch_setter = train_ds if use_packing else train_sampler
+
+    def _synced_len_at(epoch_: int) -> int:
+        if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
+            epoch_setter.set_epoch(epoch_)
+        return _sync_train_loader_len(len(train_loader), distributed, device)
+
+    synced_len = _synced_len_at(0)
+    synced_len_epoch = 0
     if synced_len == 0:
         raise RuntimeError(
             "train_loader is empty (synced_len=0); cannot satisfy the token budget. "
@@ -3180,6 +3191,9 @@ def run_pure_pretraining(
                 resume_data_step = 0
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
+            if resume_epoch != synced_len_epoch:
+                synced_len = _synced_len_at(resume_epoch)
+                synced_len_epoch = resume_epoch
             if resume_data_step >= synced_len:
                 # Saved position lands at/after the end of a pass; start the next
                 # pass cleanly from the top.
@@ -3433,7 +3447,6 @@ def run_pure_pretraining(
                 else 1
             ),
         )
-    epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
     profiler_ctx, profiler_step_cb = _make_pure_profiler(pretrain_config, output_dir, is_main)
@@ -3527,6 +3540,14 @@ def run_pure_pretraining(
         while global_step < total_steps:
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
                 epoch_setter.set_epoch(epoch)
+            if epoch != synced_len_epoch:
+                synced_len = _synced_len_at(epoch)
+                synced_len_epoch = epoch
+                if synced_len < inferred_grad_accum_steps:
+                    raise RuntimeError(
+                        f"train_loader yields {synced_len} micro-batches per rank in pass "
+                        f"{epoch + 1}, fewer than grad_accum={inferred_grad_accum_steps}."
+                    )
             # global_step at the start of this pass — used only for the
             # per-pass "optimizer steps" log line below.
             epoch_start_step = global_step
