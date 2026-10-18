@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import time
 from array import array
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -43,6 +44,8 @@ COV_MODE = 0
 # fewer than this fraction of the FASTA's ids are in the table.
 MIN_TABLE_MATCH = 0.5
 N_EXAMPLES = 5
+# hash_accessions builds an (ids x length) int64 index per batch; keep that bounded
+HASH_BATCH = 1 << 16
 MMSEQS_INSTALL_HINT = (
     "Install it with `nanoplm deps install --mmseqs-only` (static binary into the venv), "
     "or put a binary from https://github.com/soedinglab/MMseqs2/releases on PATH, or set "
@@ -118,16 +121,9 @@ def read_members_table(path) -> MembersTable:
 
 
 def fasta_ids(fasta) -> list:
-    """FASTA ids (first header word) in file order."""
-    out = []
-    with open(fasta, "rb") as f:
-        for line in f:
-            if line[:1] == b">":
-                parts = line[1:].split(None, 1)
-                if not parts:
-                    raise ClusterTableError(f"{fasta}: a header has no id")
-                out.append(parts[0])
-    return out
+    """FASTA ids (first header word) in file order, as bytes."""
+    ids = scan_fasta_ids(fasta)
+    return [_id(ids.blob, o, n) for o, n in zip(ids.offsets, ids.lens)]
 
 
 def _examples(ids) -> str:
@@ -155,60 +151,200 @@ def check_table_match(table, fasta, n_table: int, missing_table: int, ex_table: 
             f"or written differently), e.g. {_examples(ex_table)}")
 
 
+class _Ids:
+    """Sequence ids as one byte blob plus offsets (no Python object per id)."""
+
+    def __init__(self, blob: np.ndarray, lens: np.ndarray):
+        self.blob = blob
+        self.lens = lens
+        self.offsets = np.zeros(len(lens), dtype=np.int64)
+        np.cumsum(self.lens[:-1], out=self.offsets[1:])
+
+    def hashes(self) -> np.ndarray:
+        return uh.hash_accessions(self.blob, self.lens, offsets=self.offsets, batch=HASH_BATCH)
+
+    def __len__(self) -> int:
+        return len(self.lens)
+
+
+def scan_fasta_ids(fasta) -> _Ids:
+    """FASTA ids (first header word) in file order."""
+    return number_fasta(fasta, None)
+
+
+def number_fasta(fasta, out_fasta) -> _Ids:
+    """Copy ``fasta`` with headers replaced by row numbers (>0, >1, ...); return its ids.
+    With ``out_fasta`` None, only the ids are read."""
+    blob, lens = bytearray(), array("i")
+    n = 0
+    with open(fasta, "rb", buffering=1 << 24) as f, \
+            (open(out_fasta, "wb", buffering=1 << 24) if out_fasta else nullcontext()) as out:
+        for line in f:
+            if line[:1] == b">":
+                parts = line[1:].split(None, 1)
+                if not parts:
+                    raise ClusterTableError(f"{fasta}: a header has no id")
+                blob.extend(parts[0])
+                lens.append(len(parts[0]))
+                if out is not None:
+                    out.write(b">%d\n" % n)
+                n += 1
+            elif out is not None:
+                out.write(line)
+    return _Ids(np.frombuffer(blob, dtype=np.uint8), np.frombuffer(lens, dtype=np.int32))
+
+
+def _gather(off: np.ndarray, lens: np.ndarray) -> np.ndarray:
+    """Positions of the byte runs [off, off+len), concatenated."""
+    starts = np.repeat(off - (np.cumsum(lens) - lens), lens)
+    return starts + np.arange(int(lens.sum()), dtype=np.int64)
+
+
+def write_pairs(out, c_src, c_off, c_len, m_src, m_off, m_len, chunk: int = 1 << 14) -> None:
+    """Write ``cluster<TAB>member`` lines, the ids sliced out of two byte blobs."""
+    for a in range(0, len(c_off), chunk):
+        co, cl = c_off[a:a + chunk], c_len[a:a + chunk].astype(np.int64)
+        mo, ml = m_off[a:a + chunk], m_len[a:a + chunk].astype(np.int64)
+        width = cl + ml + 2
+        end = np.cumsum(width)
+        start = end - width
+        buf = np.empty(int(end[-1]), dtype=np.uint8)
+        buf[_gather(start, cl)] = c_src[_gather(co, cl)]
+        buf[start + cl] = 9
+        buf[_gather(start + cl + 1, ml)] = m_src[_gather(mo, ml)]
+        buf[end - 1] = 10
+        out.write(buf.tobytes())
+
+
+def _find(buf: np.ndarray, byte: int, chunk: int = 1 << 26) -> np.ndarray:
+    """np.flatnonzero(buf == byte) without a file-sized bool temporary."""
+    parts = [np.flatnonzero(buf[a:a + chunk] == byte) + a for a in range(0, len(buf), chunk)]
+    return np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+
+
+def _parse_table(table):
+    """A cluster_id<TAB>sequence_id table as its bytes plus per-line id positions.
+
+    Returns (buf, c_off, c_len, m_len): the member id of a line starts at
+    c_off + c_len + 1. Blank lines and ``#`` comments are skipped; columns after the
+    second are ignored.
+    """
+    buf = np.fromfile(table, dtype=np.uint8)
+    if buf.size and buf[-1] != 10:
+        buf = np.append(buf, np.uint8(10))
+    ends = _find(buf, 10)
+    starts = np.empty_like(ends)
+    starts[:1] = 0
+    starts[1:] = ends[:-1] + 1
+    cr = (ends > starts) & (buf[ends - 1] == 13)
+    ends[cr] -= 1
+    del cr
+    keep = (ends > starts) & (buf[np.minimum(starts, len(buf) - 1)] != ord("#"))
+    line_no = np.flatnonzero(keep) + 1
+    starts, ends = starts[keep], ends[keep]
+    del keep
+    tabs = _find(buf, 9)
+    if not tabs.size:
+        tabs = np.array([len(buf)], dtype=np.int64)
+    i = np.searchsorted(tabs, starts)
+    np.minimum(i, len(tabs) - 1, out=i)
+    t1 = tabs[i]
+    t2 = tabs[np.minimum(i + 1, len(tabs) - 1)]
+    del i
+    m_end = np.where((t2 > t1) & (t2 < ends), t2, ends)
+    del t2
+    c_len = (t1 - starts).astype(np.int32)
+    m_len = (m_end - t1 - 1).astype(np.int32)
+    del m_end
+    bad = (t1 >= ends) | (c_len <= 0) | (m_len <= 0)
+    if bad.any():
+        raise ClusterTableError(f"{table}: line {int(line_no[np.argmax(bad)])} is not "
+                                "cluster_id<TAB>sequence_id")
+    return buf, starts, c_len, m_len
+
+
+def _id(buf, off, length) -> bytes:
+    return buf[int(off):int(off) + int(length)].tobytes()
+
+
 def table_members_tsv(table, fasta, out_tsv) -> dict:
-    """Canonicalise a user cluster_id<TAB>sequence_id table against the member FASTA."""
+    """Canonicalise a user cluster_id<TAB>sequence_id table against the member FASTA.
+
+    Arrays, not dicts: ids are hashed (64-bit, as in read_members_table) and joined by
+    sorting, so memory stays near the table's own size plus ~60 bytes per line.
+    """
     t0 = time.time()
-    groups: dict = {}
-    where: dict = {}
-    with open(table, "rb") as f:
-        for k, line in enumerate(f, 1):
-            line = line.rstrip(b"\r\n")
-            if not line or line.startswith(b"#"):
-                continue
-            parts = line.split(b"\t")
-            if len(parts) < 2 or not parts[0] or not parts[1]:
-                raise ClusterTableError(f"{table}: line {k} is not cluster_id<TAB>sequence_id")
-            c, m = parts[0], parts[1]
-            if m in where:
-                if where[m] == c:
-                    continue
-                raise ClusterTableError(f"{table}: sequence {m.decode()} is in clusters "
-                                        f"{where[m].decode()} and {c.decode()}")
-            where[m] = c
-            groups.setdefault(c, []).append(m)
-    if not groups:
+    buf, c_off, c_len, m_len = _parse_table(table)
+    if not len(c_off):
         raise ClusterTableError(f"{table} holds no clusters")
-    n_table = len(groups)
-    singletons = 0
-    ids = fasta_ids(fasta)
-    in_fasta = set(ids)
-    miss_t = [m for m in where if m not in in_fasta]
-    miss_f = [m for m in ids if m not in where]
-    check_table_match(table, fasta, len(where), len(miss_t), miss_t[:N_EXAMPLES],
-                      len(ids), len(miss_f), miss_f[:N_EXAMPLES])
-    del miss_t, miss_f
-    del in_fasta
-    for m in ids:
-        if m not in where:
-            if m in groups:
-                raise ClusterTableError(f"{fasta}: sequence {m.decode()} is missing from the "
-                                        "table but its id is used as a cluster id there")
-            groups[m] = [m]
-            where[m] = m
-            singletons += 1
-    del where
+    m_off = c_off + c_len + 1
+    ch = uh.hash_accessions(buf, c_len, offsets=c_off, batch=HASH_BATCH)
+    mh = uh.hash_accessions(buf, m_len, offsets=m_off, batch=HASH_BATCH)
+
+    # a member listed twice: the same cluster again is dropped, another one is refused
+    order = np.argsort(mh, kind="stable")
+    same = mh[order[1:]] == mh[order[:-1]]
+    clash = same & (ch[order[1:]] != ch[order[:-1]])
+    if clash.any():
+        k = int(np.argmax(clash))
+        a, b = order[k], order[k + 1]
+        raise ClusterTableError(f"{table}: sequence {_id(buf, m_off[a], m_len[a]).decode()} is "
+                                f"in clusters {_id(buf, c_off[a], c_len[a]).decode()} and "
+                                f"{_id(buf, c_off[b], c_len[b]).decode()}")
+    kept = np.ones(len(mh), dtype=bool)
+    kept[order[1:][same]] = False
+    del order, same, clash
+    if not kept.all():
+        c_off, c_len, m_off, m_len = c_off[kept], c_len[kept], m_off[kept], m_len[kept]
+        ch, mh = ch[kept], mh[kept]
+    del kept
+
+    # clusters numbered by first appearance
+    uc, first, cid = np.unique(ch, return_index=True, return_inverse=True)
+    rank = np.empty(len(uc), dtype=np.int64)
+    rank[np.argsort(first, kind="stable")] = np.arange(len(uc))
+    cid = rank[cid].astype(np.int32)
+    del rank, first
+
+    ids = scan_fasta_ids(fasta)
+    fh = ids.hashes()
+    fs = np.sort(fh)
+    pos = np.minimum(np.searchsorted(fs, mh), max(len(fs) - 1, 0))
+    in_fasta = fs[pos] == mh if len(fs) else np.zeros(len(mh), dtype=bool)
+    del fs, pos
+    ms = np.sort(mh)
+    pos = np.minimum(np.searchsorted(ms, fh), len(ms) - 1)
+    lone = np.flatnonzero(ms[pos] != fh)          # FASTA rows not in the table
+    del ms, pos
+    miss_t = np.flatnonzero(~in_fasta)
+    check_table_match(
+        table, fasta, len(mh), len(miss_t),
+        [_id(buf, m_off[r], m_len[r]) for r in miss_t[:N_EXAMPLES]],
+        len(ids), len(lone),
+        [_id(ids.blob, ids.offsets[r], ids.lens[r]) for r in lone[:N_EXAMPLES]])
+    del miss_t, in_fasta
+    pos = np.minimum(np.searchsorted(uc, fh[lone]), len(uc) - 1)
+    named = np.flatnonzero(uc[pos] == fh[lone])
+    if named.size:
+        r = lone[named[0]]
+        raise ClusterTableError(f"{fasta}: sequence "
+                                f"{_id(ids.blob, ids.offsets[r], ids.lens[r]).decode()} is "
+                                "missing from the table but its id is used as a cluster id there")
+    del pos, named, fh
+
+    # grouped by cluster, the member named like its cluster first, else table order
+    order = np.lexsort((np.arange(len(mh)), mh != ch, cid))
+    del cid, ch, mh
     Path(out_tsv).parent.mkdir(parents=True, exist_ok=True)
     with atomic_write_path(Path(out_tsv)) as tmp, open(tmp, "wb", buffering=1 << 24) as out:
-        for c, ms in groups.items():
-            if c in ms and ms[0] != c:
-                ms = [c] + [m for m in ms if m != c]
-            out.write(b"".join(c + b"\t" + m + b"\n" for m in ms))
-    stats = {"source": "table", "input": str(table), "clusters_in_table": n_table,
-             "singletons_added": singletons, "clusters": len(groups),
-             "members": sum(len(v) for v in groups.values()),
-             "seconds": round(time.time() - t0, 1)}
-    if singletons:
-        logger.info(f"cluster table: {singletons:,} FASTA sequences are not in {table}; "
+        write_pairs(out, buf, c_off[order], c_len[order], buf, m_off[order], m_len[order])
+        write_pairs(out, ids.blob, ids.offsets[lone], ids.lens[lone],
+                    ids.blob, ids.offsets[lone], ids.lens[lone])
+    stats = {"source": "table", "input": str(table), "clusters_in_table": len(uc),
+             "singletons_added": len(lone), "clusters": len(uc) + len(lone),
+             "members": len(order) + len(lone), "seconds": round(time.time() - t0, 1)}
+    if len(lone):
+        logger.info(f"cluster table: {len(lone):,} FASTA sequences are not in {table}; "
                     "each becomes its own cluster")
     return stats
 
@@ -224,62 +360,6 @@ def find_mmseqs(explicit: Optional[str] = None) -> Optional[str]:
         return found
     venv = Path(sys.prefix) / "bin" / "mmseqs"
     return str(venv) if venv.is_file() and os.access(venv, os.X_OK) else None
-
-
-class _Ids:
-    """Sequence ids as one byte blob plus offsets (no Python object per id)."""
-
-    def __init__(self, blob: np.ndarray, lens: np.ndarray):
-        self.blob = blob
-        self.lens = lens.astype(np.int64)
-        self.offsets = np.zeros(len(lens), dtype=np.int64)
-        np.cumsum(self.lens[:-1], out=self.offsets[1:])
-
-    def __len__(self) -> int:
-        return len(self.lens)
-
-
-def number_fasta(fasta, out_fasta) -> _Ids:
-    """Copy ``fasta`` with headers replaced by row numbers (>0, >1, ...); return its ids."""
-    blob, lens = bytearray(), array("q")
-    n = 0
-    with open(fasta, "rb", buffering=1 << 24) as f, \
-            open(out_fasta, "wb", buffering=1 << 24) as out:
-        for line in f:
-            if line[:1] == b">":
-                parts = line[1:].split(None, 1)
-                if not parts:
-                    raise ClusterTableError(f"{fasta}: a header has no id")
-                blob.extend(parts[0])
-                lens.append(len(parts[0]))
-                out.write(b">%d\n" % n)
-                n += 1
-            else:
-                out.write(line)
-    return _Ids(np.frombuffer(bytes(blob), dtype=np.uint8),
-                np.frombuffer(bytes(lens), dtype=np.int64))
-
-
-def _gather(off: np.ndarray, lens: np.ndarray) -> np.ndarray:
-    """Positions of the byte runs [off, off+len), concatenated."""
-    starts = np.repeat(off - (np.cumsum(lens) - lens), lens)
-    return starts + np.arange(int(lens.sum()), dtype=np.int64)
-
-
-def write_pairs(out, c_src, c_off, c_len, m_src, m_off, m_len, chunk: int = 1 << 20) -> None:
-    """Write ``cluster<TAB>member`` lines, the ids sliced out of two byte blobs."""
-    for a in range(0, len(c_off), chunk):
-        co, cl = c_off[a:a + chunk], c_len[a:a + chunk]
-        mo, ml = m_off[a:a + chunk], m_len[a:a + chunk]
-        width = cl + ml + 2
-        end = np.cumsum(width)
-        start = end - width
-        buf = np.empty(int(end[-1]), dtype=np.uint8)
-        buf[_gather(start, cl)] = c_src[_gather(co, cl)]
-        buf[start + cl] = 9
-        buf[_gather(start + cl + 1, ml)] = m_src[_gather(mo, ml)]
-        buf[end - 1] = 10
-        out.write(buf.tobytes())
 
 
 def mmseqs_rows_to_members_tsv(cluster_tsv, ids: _Ids, out_tsv) -> dict:

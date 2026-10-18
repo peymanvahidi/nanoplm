@@ -237,3 +237,20 @@ def test_user_table_partial_match_warns_with_examples(tmp_path, monkeypatch):
     table.write_text("".join(f"c\ts{i}\n" for i in range(10)) + "c\tgone1\nc\tgone2\n")
     ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
     assert len(seen) == 1 and "2 of 12" in seen[0] and "gone1, gone2" in seen[0]
+
+
+def test_user_table_peak_allocation_stays_near_the_table_size(tmp_path):
+    import tracemalloc
+    n = 600_000
+    table, fasta = tmp_path / "t.tsv", tmp_path / "f.fasta"
+    table.write_text("".join(f"UniRef90_A{(i // 3) * 3:09d}\tUniRef90_A{i:09d}\n"
+                             for i in range(n)))
+    fasta.write_text("".join(f">UniRef90_A{i:09d} x\nMKV\n" for i in range(n)))
+    tracemalloc.start()
+    try:
+        ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    # the dict version needs ~320 B per line; the table itself is 40 B per line
+    assert peak / n < 230, f"{peak / n:.0f} B per line"
