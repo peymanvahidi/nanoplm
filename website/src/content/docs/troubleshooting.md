@@ -313,7 +313,7 @@ data_params:
 
 ### Outputs land somewhere unexpected
 
-Relative paths in `data.yaml` resolve against the **directory the YAML sits in**, not the directory you run the command from: `nanoplm data from-yaml` runs every stage there. Use absolute paths to put outputs elsewhere.
+Relative paths in `data.yaml` resolve against the **directory the YAML sits in**, not the directory you run the command from: `nanoplm data from-yaml` runs every stage there. Use absolute paths to put outputs elsewhere. The run log is the exception: it goes to `output/logs/` under the directory you run the command from.
 
 ### Editing `.data_manifest` by hand
 

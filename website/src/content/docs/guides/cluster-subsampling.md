@@ -96,11 +96,14 @@ Switching `enabled` between `true` and `false` changes how the `get_file` stage 
 
 ### Disk space
 
-DVC keeps a copy of every stage output in its cache (`.dvc/cache`), so by default a run takes about twice the space of its outputs: for UniRef90 the cached downloads, FASTAs, pool and index come to about 140 GB more. To avoid the copy, let the cache link files instead before the first run:
+DVC keeps a copy of every stage output in its cache (`.dvc/cache`), so by default a run takes about twice the space of its outputs: for UniRef90 the cached downloads, FASTAs, pool and index come to about 140 GB more. To avoid the copy, let the cache link files instead. In the directory of `data.yaml`, before the first run:
 
 ```bash
+dvc init            # add --no-scm outside a git repository, --subdir inside one
 dvc config cache.type reflink,hardlink,symlink
 ```
+
+`nanoplm data from-yaml` then uses that repository. On a project that has already run, set `cache.type` the same way and run `dvc checkout --relink`.
 
 After changing settings, `dvc gc --workspace` deletes cached versions that the current outputs no longer use.
 
