@@ -8,7 +8,7 @@ Stages (``nanoplm data from-yaml`` runs them as DVC stages; see _dvc_yaml_gen):
   filter                 Filterer on the member FASTA, min/max_seq_len, no row cap, FASTA order
   cluster_pool           pre-tokenize the filtered FASTA into output_dir/train (the pool)
   get_cluster_xml        uniref50.xml.gz next to compressed_fasta (UniProt clusters only)
-  cluster_members        cluster_index/members.tsv from the XML, MMseqs2 or the user table
+  cluster_members        cluster_index/members.tsv from the XML or MMseqs2
   cluster_index          cluster_index/index/ arrays, val/ (held-out reps) and
                          cluster_index/index/val_nonrep/
   write_manifest         .data_manifest with cluster_index_dir
@@ -34,7 +34,7 @@ from nanoplm.data.preparation import uniref_hierarchy as uh
 from nanoplm.utils import logger
 
 VAL_NONREP_DIRNAME = "val_nonrep"
-CLUSTER_SOURCES = ("uniref_xml", "mmseqs", "table")
+CLUSTER_SOURCES = ("uniref_xml", "mmseqs")
 
 
 @dataclass
@@ -42,7 +42,7 @@ class ClusterDataConfig:
     """Everything cluster-mode prep needs, resolved (see cluster_config.resolve_cluster_plan).
 
     members_fasta     extracted member FASTA (UniRef90/100 or any FASTA)
-    cluster_source    uniref_xml | mmseqs | table
+    cluster_source    uniref_xml | mmseqs
     level             uniref90 / uniref100 for uniref_xml (checked against the headers)
     """
 
@@ -57,7 +57,6 @@ class ClusterDataConfig:
     cluster_source: str = "uniref_xml"
     level: Optional[str] = None
     cluster_xml: Optional[Path] = None
-    cluster_table: Optional[Path] = None
     identity: float = cc.DEFAULT_IDENTITY
     coverage: float = cc.DEFAULT_COVERAGE
     register_tokens: int = 0
@@ -71,7 +70,7 @@ class ClusterDataConfig:
         if self.cluster_source not in CLUSTER_SOURCES:
             raise ValueError(f"cluster_source must be one of {CLUSTER_SOURCES}")
         for f in ("members_fasta", "output_dir", "validation_dir", "filtered_fasta",
-                  "cluster_xml", "cluster_table"):
+                  "cluster_xml"):
             v = getattr(self, f)
             if v is not None:
                 setattr(self, f, Path(v))
@@ -116,7 +115,7 @@ def config_from_yaml(config: dict, base_dir=None) -> tuple[ClusterDataConfig, cc
         validation_dir=at(dirs["validation_dir"]), filtered_fasta=at(dirs["filtered_fasta"]),
         min_seq_len=p["min_seq_len"], max_seq_len=p["max_seq_len"], val_ratio=p["val_ratio"],
         samples_per_shard=p["samples_per_shard"], cluster_source=plan.cluster_source,
-        level=plan.members_level, cluster_xml=at(plan.xml_path), cluster_table=at(plan.table),
+        level=plan.members_level, cluster_xml=at(plan.xml_path),
         identity=plan.identity, coverage=plan.coverage,
         register_tokens=p.get("register_tokens", 0), seqs_num=p.get("seqs_num", -1),
         drop_invalid_sequences=p.get("drop_invalid_sequences", False),
@@ -195,12 +194,12 @@ def stage_pool(cfg: ClusterDataConfig, n_rows: Optional[int] = None) -> None:
 
 
 def build_members_table(source: str, out_tsv: Path, *, fasta: Path, level: Optional[str] = None,
-                        xml: Optional[Path] = None, table: Optional[Path] = None,
+                        xml: Optional[Path] = None,
                         identity: float = cc.DEFAULT_IDENTITY,
                         coverage: float = cc.DEFAULT_COVERAGE, tmp_dir: Optional[Path] = None,
                         mmseqs: Optional[str] = None, threads: Optional[int] = None) -> dict:
-    """members.tsv from one of the three sources. ``fasta`` is the member FASTA
-    (filtered for mmseqs / table; any of them for the uniref_xml level check)."""
+    """members.tsv from one of the two sources. ``fasta`` is the member FASTA
+    (filtered for mmseqs; any of them for the uniref_xml level check)."""
     out_tsv = Path(out_tsv)
     if source == "uniref_xml":
         got = ci.detect_uniref_level(Path(fasta))
@@ -212,8 +211,6 @@ def build_members_table(source: str, out_tsv: Path, *, fasta: Path, level: Optio
         stats = ct.mmseqs_members_tsv(fasta, out_tsv, identity, coverage,
                                       tmp_dir or out_tsv.parent / cc.MMSEQS_TMP,
                                       threads=threads, mmseqs=mmseqs)
-    elif source == "table":
-        stats = ct.table_members_tsv(table, fasta, out_tsv)
     else:
         raise ValueError(f"unknown cluster source {source!r}")
     with open(out_tsv.with_suffix(".json"), "w") as f:
@@ -222,9 +219,9 @@ def build_members_table(source: str, out_tsv: Path, *, fasta: Path, level: Optio
 
 
 def stage_members(cfg: ClusterDataConfig) -> dict:
-    fasta = cfg.filtered_fasta if cfg.cluster_source != "uniref_xml" else cfg.members_fasta
+    fasta = cfg.filtered_fasta if cfg.cluster_source == "mmseqs" else cfg.members_fasta
     return build_members_table(cfg.cluster_source, cfg.members_tsv, fasta=fasta, level=cfg.level,
-                               xml=cfg.cluster_xml, table=cfg.cluster_table,
+                               xml=cfg.cluster_xml,
                                identity=cfg.identity, coverage=cfg.coverage,
                                tmp_dir=cfg.mmseqs_tmp, mmseqs=cfg.mmseqs,
                                threads=cfg.max_workers)

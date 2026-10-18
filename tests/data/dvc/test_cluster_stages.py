@@ -87,15 +87,6 @@ def test_mmseqs_params_only_reach_cluster_members(tmp_path):
     assert "members.tsv" not in str(st["cluster_pool"]["deps"])
 
 
-def test_user_table_is_a_dependency(tmp_path):
-    table = tmp_path / "t.tsv"
-    table.write_text("c\ta\n")
-    st = _stages(_enabled(data_dirs__url="https://example.org/mine.fasta.gz",
-                          cluster_subsampling__clusters=str(table)))
-    assert str(table) in st["cluster_members"]["deps"]
-    assert "--source table" in st["cluster_members"]["cmd"]
-
-
 # ------------------------------------------------------------------ end to end
 
 
@@ -194,10 +185,8 @@ def test_from_yaml_from_another_directory_reads_relative_paths_there(tmp_path):
 def test_cluster_mode_needs_a_valid_max_workers(tmp_path):
     import click
     from nanoplm.cli.data import _validate_cluster_block
-    table = tmp_path / "t.tsv"
-    table.write_text("c\ta\n")
     cfg = _enabled(data_dirs__url="https://example.org/mine.fasta.gz",
-                   cluster_subsampling__clusters=str(table), data_params__max_workers=0)
+                   data_params__max_workers=0)
     with pytest.raises(click.ClickException, match="max_workers must be -1"):
         _validate_cluster_block(cfg, tmp_path / "data.yaml")
 

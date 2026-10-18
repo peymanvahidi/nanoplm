@@ -760,23 +760,20 @@ def get_cluster_xml(url: str, output: str):
 
 
 @data.command("cluster-members", hidden=True)
-@click.option("--source", required=True, type=click.Choice(["uniref_xml", "mmseqs", "table"]))
+@click.option("--source", required=True, type=click.Choice(["uniref_xml", "mmseqs"]))
 @click.option("--fasta", required=True, type=click.Path(exists=True, dir_okay=False))
 @click.option("--output", "-o", required=True, type=click.Path(dir_okay=False))
 @click.option("--level", type=click.Choice(["uniref90", "uniref100"]), default=None)
 @click.option("--xml", type=click.Path(exists=True, dir_okay=False), default=None)
-@click.option("--table", type=click.Path(exists=True, dir_okay=False), default=None)
 @click.option("--identity", type=float, default=0.5)
 @click.option("--coverage", type=float, default=0.8)
 @click.option("--tmp-dir", type=click.Path(file_okay=False), default=None)
 @click.option("--threads", type=int, default=None)
-def cluster_members(source, fasta, output, level, xml, table, identity, coverage, tmp_dir,
-                    threads):
+def cluster_members(source, fasta, output, level, xml, identity, coverage, tmp_dir, threads):
     """Internal: write the canonical cluster table (cluster_id<TAB>sequence_id)."""
     from nanoplm.data.preparation.cluster_pipeline import build_members_table
     stats = build_members_table(source, Path(output), fasta=Path(fasta), level=level,
-                                xml=Path(xml) if xml else None,
-                                table=Path(table) if table else None, identity=identity,
+                                xml=Path(xml) if xml else None, identity=identity,
                                 coverage=coverage, tmp_dir=Path(tmp_dir) if tmp_dir else None,
                                 threads=threads)
     click.echo(f"Wrote {output}: {stats['clusters']:,} clusters, {stats['members']:,} sequences")

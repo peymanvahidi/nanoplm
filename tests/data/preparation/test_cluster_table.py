@@ -1,4 +1,4 @@
-"""members.tsv from the three cluster sources, and the index built from each."""
+"""members.tsv from the two cluster sources, and the index built from each."""
 from __future__ import annotations
 
 import numpy as np
@@ -40,48 +40,6 @@ def _index(root, filtered, tsv, name):
     man = ci.build_cluster_index(filtered, root / "train", tsv, root / name, MAX_LEN, 0.1)
     assert man["verify"]["ok"]
     return man
-
-
-def test_user_table_canonicalised_with_singletons(pool, tmp_path):
-    root, filtered = pool
-    ids = ct.fasta_ids(filtered)
-    # an ungrouped table over the first half of the pool, clusters of three
-    rows = [(f"fam{i // 3}", ids[i].decode()) for i in range(len(ids) // 2)]
-    rows = rows[1::2] + rows[::2]
-    rows.append(("fam0", "UniRef90_NOT_IN_POOL"))
-    last = ids[-1].decode()
-    rows.append((last, last))                     # a cluster named after its member
-    table = tmp_path / "t.tsv"
-    table.write_text("# my clusters\n" + "".join(f"{c}\t{m}\textra\n" for c, m in rows))
-    out = tmp_path / "members.tsv"
-    stats = build_members_table("table", out, fasta=filtered, table=table)
-    g = _groups(out)
-    half = len(ids) // 2
-    assert stats["singletons_added"] == len(ids) - half - 1   # -1: `last` is in the table
-    for i in range(half, len(ids)):
-        m = ids[i].decode()
-        assert g[m] == [m]                                    # missing -> singleton
-    assert "UniRef90_NOT_IN_POOL" in g["fam0"]
-    man = _index(root, filtered, out, "ix_table")
-    assert man["counts"]["universe_singletons"] >= len(ids) - half
-
-
-def test_user_table_rep_is_the_member_named_like_the_cluster(tmp_path):
-    fasta = tmp_path / "f.fasta"
-    fasta.write_text(">a\nMKV\n>b\nMKV\n>c\nMKV\n")
-    table = tmp_path / "t.tsv"
-    table.write_text("b\ta\nb\tb\nx\tc\n")
-    ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
-    assert (tmp_path / "m.tsv").read_text() == "b\tb\nb\ta\nx\tc\n"
-
-
-def test_a_sequence_in_two_clusters_is_refused(tmp_path):
-    fasta = tmp_path / "f.fasta"
-    fasta.write_text(">a\nMKV\n")
-    table = tmp_path / "t.tsv"
-    table.write_text("x\ta\ny\ta\n")
-    with pytest.raises(ct.ClusterTableError, match="in clusters x and y"):
-        ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
 
 
 def test_reader_needs_a_grouped_table(tmp_path):
@@ -219,43 +177,6 @@ def test_mmseqs_rows_missing_a_sequence_is_an_error(tmp_path):
         ct.mmseqs_rows_to_members_tsv(tmp_path / "c.tsv", ids, tmp_path / "m.tsv")
 
 
-def test_user_table_with_other_ids_is_refused(tmp_path):
-    fasta = tmp_path / "f.fasta"
-    fasta.write_text("".join(f">sp|P{i:05d}|X_HUMAN d\nMKV\n" for i in range(20)))
-    table = tmp_path / "t.tsv"
-    table.write_text("".join(f"c{i // 4}\tP{i:05d}\n" for i in range(20)))
-    with pytest.raises(ct.ClusterTableError, match=r"only 0\.0%.*P00000.*sp\|P00000\|X_HUMAN"):
-        ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
-
-
-def test_user_table_partial_match_warns_with_examples(tmp_path, monkeypatch):
-    seen = []
-    monkeypatch.setattr(ct.logger, "warning", lambda msg, *a, **k: seen.append(msg))
-    fasta = tmp_path / "f.fasta"
-    fasta.write_text("".join(f">s{i}\nMKV\n" for i in range(10)))
-    table = tmp_path / "t.tsv"
-    table.write_text("".join(f"c\ts{i}\n" for i in range(10)) + "c\tgone1\nc\tgone2\n")
-    ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
-    assert len(seen) == 1 and "2 of 12" in seen[0] and "gone1, gone2" in seen[0]
-
-
-def test_user_table_peak_allocation_stays_near_the_table_size(tmp_path):
-    import tracemalloc
-    n = 600_000
-    table, fasta = tmp_path / "t.tsv", tmp_path / "f.fasta"
-    table.write_text("".join(f"UniRef90_A{(i // 3) * 3:09d}\tUniRef90_A{i:09d}\n"
-                             for i in range(n)))
-    fasta.write_text("".join(f">UniRef90_A{i:09d} x\nMKV\n" for i in range(n)))
-    tracemalloc.start()
-    try:
-        ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
-        peak = tracemalloc.get_traced_memory()[1]
-    finally:
-        tracemalloc.stop()
-    # the dict version needs ~320 B per line; the table itself is 40 B per line
-    assert peak / n < 230, f"{peak / n:.0f} B per line"
-
-
 def _fake_mmseqs(tmp_path):
     """Records its argv, then makes every (row-numbered) sequence its own cluster."""
     fake = tmp_path / "fake_mmseqs"
@@ -279,16 +200,3 @@ def test_mmseqs_threads(tmp_path, threads, expect):
     assert got == (expect or str(len(os.sched_getaffinity(0))))
     assert stats["clusters"] == 2
     assert (tmp_path / "m.tsv").read_text() == "sp|P1|A\tsp|P1|A\nsp|P2|B\tsp|P2|B\n"
-
-
-def test_user_table_rep_falls_back_to_a_surviving_member(tmp_path, monkeypatch):
-    monkeypatch.setattr(ct.logger, "warning", lambda *a, **k: None)
-    fasta = tmp_path / "f.fasta"                      # the filtered FASTA: x and q were dropped
-    fasta.write_text(">b\nMKV\n>c\nMKV\n>d\nMKV\n")
-    table = tmp_path / "t.tsv"
-    table.write_text("x\tx\nx\tb\nx\tc\ny\tq\ny\td\nz\tgone\n")
-    ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
-    assert (tmp_path / "m.tsv").read_text() == (
-        "x\tb\nx\tx\nx\tc\n"        # x itself is gone, b (first surviving) leads
-        "y\td\ny\tq\n"              # same for the first listed member
-        "z\tgone\n")                # nothing survives: the order is kept

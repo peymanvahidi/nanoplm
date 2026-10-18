@@ -33,6 +33,5 @@ data_params:
 cluster_subsampling:     # each epoch, train on one random member of every cluster
   enabled: false
   members: null          # uniref90, uniref100, a FASTA URL/path, or null (= url itself)
-  clusters: auto         # auto, or a path to your own cluster_id<TAB>sequence_id table
   identity: 0.5          # MMseqs2 clustering only: min sequence identity within a cluster
   coverage: 0.8          # MMseqs2 clustering only: min alignment coverage

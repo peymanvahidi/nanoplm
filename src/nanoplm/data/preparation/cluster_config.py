@@ -1,8 +1,7 @@
 """Resolve data.yaml's ``cluster_subsampling`` block into one plan.
 
 The one place that decides where the member sequences come from, which cluster source
-``clusters: auto`` picks, every derived path, and which settings are errors or are
-ignored. Config validation, dvc.yaml generation and the stage commands all use it.
+is used, every derived path, and which settings are errors or are ignored. Config validation, dvc.yaml generation and the stage commands all use it.
 
 Relative paths are relative to ``base_dir``, the directory of data.yaml: that is
 where ``nanoplm data from-yaml`` runs DVC, so the stages see the same files.
@@ -11,12 +10,9 @@ Levels: a FASTA is UniRef50 / UniRef90 / UniRef100 by its headers (``>UniRef90_.
 when the file is on disk, else by its file name (``uniref90.fasta.gz``); anything else
 is a custom set. Stage commands re-check the headers when the file exists.
 
-clusters: auto
-  UniProt UniRef50 clusters (from uniref50.xml.gz) when the members are a UniRef90 or
-  UniRef100 set and url is UniRef50 or that same set. Otherwise MMseqs2 clusters the
-  members (easy-linclust, --min-seq-id identity, -c coverage, --cov-mode 0).
-clusters: <path>
-  a cluster_id<TAB>sequence_id table, used as given.
+Cluster source: UniProt UniRef50 clusters (from uniref50.xml.gz) when the members are a
+UniRef90 or UniRef100 set and url is UniRef50 or that same set. Otherwise MMseqs2
+clusters the members (easy-linclust, --min-seq-id identity, -c coverage, --cov-mode 0).
 """
 from __future__ import annotations
 
@@ -38,7 +34,7 @@ MEMBERS_TSV = "members.tsv"
 ARRAYS_SUBDIR = "index"          # cluster_index/index: the arrays ClusterSampledDataset reads
 CLUSTER_INDEX_DIR = f"{INDEX_SUBDIR}/{ARRAYS_SUBDIR}"   # relative to output_dir (manifest)
 MMSEQS_TMP = ".mmseqs_tmp"
-KEYS = ("enabled", "members", "clusters", "identity", "coverage")
+KEYS = ("enabled", "members", "identity", "coverage")
 # val_ratio counts clusters here; above this, warn (the template's 0.1 is sized for
 # sequences). The experiment held out 0.44% of the UniRef50 clusters.
 MAX_QUIET_VAL_RATIO = 0.01
@@ -103,10 +99,9 @@ class ClusterPlan:
     members_from_source: bool      # the members are the url itself
     members_compressed: Optional[Path]   # where get_members_fasta puts a .gz download
     members_fasta: Path            # the extracted member FASTA the pool is built from
-    cluster_source: str            # "uniref_xml" | "mmseqs" | "table"
+    cluster_source: str            # "uniref_xml" | "mmseqs"
     xml_path: Optional[Path] = None
     xml_url: Optional[str] = None
-    table: Optional[Path] = None
     identity: float = DEFAULT_IDENTITY
     coverage: float = DEFAULT_COVERAGE
     output_dir: Path = Path(".")
@@ -235,36 +230,22 @@ def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
         members_compressed = raw_dir / name if name.endswith(".gz") else None
         members_fasta = raw_dir / _strip_gz(name)
 
-    clusters = block.get("clusters", "auto")
-    if clusters in (None, "auto"):
-        if members_level in ("uniref90", "uniref100"):
-            cluster_source = "uniref_xml"
-        else:
-            cluster_source = "mmseqs"
-    elif isinstance(clusters, str):
-        cluster_source = "table"
-        if not on_disk(clusters, base_dir).is_file():
-            raise ClusterConfigError(f"cluster_subsampling.clusters: {clusters} not found")
-    else:
-        raise ClusterConfigError(f"cluster_subsampling.clusters must be auto or a path, got "
-                                 f"{clusters!r}")
+    cluster_source = "uniref_xml" if members_level in ("uniref90", "uniref100") else "mmseqs"
     if cluster_source == "mmseqs" and source_level == "uniref50":
         warnings.append("cluster_subsampling: data_dirs.url is UniRef50 and members is null, "
                         "so MMseqs2 will cluster all ~60M UniRef50 sequences (hours). To "
                         "train on the members of UniProt's UniRef50 clusters instead, set "
                         "cluster_subsampling.members: uniref90")
-    if cluster_source != "mmseqs" and (identity != DEFAULT_IDENTITY
-                                       or coverage != DEFAULT_COVERAGE):
-        what = "UniProt clusters" if cluster_source == "uniref_xml" else "your cluster table"
-        warnings.append(f"cluster_subsampling.identity / coverage only apply to MMseqs2 "
-                        f"clustering; they are ignored with {what}")
+    if cluster_source == "uniref_xml" and (identity != DEFAULT_IDENTITY
+                                           or coverage != DEFAULT_COVERAGE):
+        warnings.append("cluster_subsampling.identity / coverage only apply to MMseqs2 "
+                        "clustering; they are ignored with UniProt clusters")
     plan = ClusterPlan(
         source=source, source_level=source_level, members=members,
         members_level=members_level, members_from_source=from_source,
         members_compressed=members_compressed, members_fasta=members_fasta,
         cluster_source=cluster_source, identity=identity, coverage=coverage,
         output_dir=Path(dirs["output_dir"]), warnings=warnings,
-        table=Path(clusters) if cluster_source == "table" else None,
     )
     if cluster_source == "uniref_xml":
         plan.xml_url = UNIREF50_XML_URL

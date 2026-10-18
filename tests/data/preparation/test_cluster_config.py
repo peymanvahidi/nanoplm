@@ -26,7 +26,7 @@ def _config(url=None, local=None, **block):
 
 def test_template_block_is_off_by_default():
     cfg = yaml.safe_load(TEMPLATE.read_text())
-    assert cfg["cluster_subsampling"] == {"enabled": False, "members": None, "clusters": "auto",
+    assert cfg["cluster_subsampling"] == {"enabled": False, "members": None,
                                           "identity": 0.5, "coverage": 0.8}
     assert cc.resolve_cluster_plan(cfg) is None                      # scenario 1
 
@@ -58,15 +58,7 @@ def test_scenario4_own_fasta_is_clustered_with_mmseqs(tmp_path):
     assert p.members_level is None and p.identity == 0.5 and p.coverage == 0.8
 
 
-def test_scenario5_own_fasta_with_a_table(tmp_path):
-    table = tmp_path / "clusters.tsv"
-    table.write_text("c1\tp1\n")
-    p = cc.resolve_cluster_plan(_config(url="https://example.org/mine.fasta.gz",
-                                        clusters=str(table)))
-    assert p.cluster_source == "table" and p.table == table
-
-
-def test_scenario6_uniref90_url_or_local_fasta(tmp_path):
+def test_scenario5_uniref90_url_or_local_fasta(tmp_path):
     p = cc.resolve_cluster_plan(_config(url=U90))
     assert p.cluster_source == "uniref_xml" and p.members_from_source
     assert p.members_fasta == Path("output/data/raw/sequences.fasta")
@@ -136,8 +128,7 @@ def test_shuffle_warns_only_when_changed_from_the_template(shuffle, seed, warns)
 @pytest.mark.parametrize("block,match", [
     ({"identity": 0}, "identity must be a number in"),
     ({"coverage": 1.5}, "coverage must be a number in"),
-    ({"clusters": "/nope/table.tsv"}, "not found"),
-    ({"clusters": 3}, "auto or a path"),
+    ({"clusters": "auto"}, "unknown cluster_subsampling keys"),
     ({"members": 5}, "string or null"),
     ({"enabled": "yes"}, "true or false"),
     ({"cluster_url": "x"}, "unknown cluster_subsampling keys"),
@@ -173,16 +164,10 @@ def test_relative_paths_resolve_against_the_config_dir(tmp_path, monkeypatch):
     elsewhere.mkdir()
     # UniRef90 by its headers only: the file name says nothing
     (cfg_dir / "src/mine.fasta").write_text(">UniRef90_A0A000 x\nMKV\n")
-    (cfg_dir / "src/table.tsv").write_text("c\tUniRef90_A0A000\n")
     monkeypatch.chdir(elsewhere)
     p = cc.resolve_cluster_plan(_config(local="src/mine.fasta"), cfg_dir)
     assert p.cluster_source == "uniref_xml" and p.members_level == "uniref90"
     assert p.members_fasta == Path("output/data/raw/sequences.fasta")   # kept as written
-    p = cc.resolve_cluster_plan(_config(local="src/mine.fasta", clusters="src/table.tsv"),
-                                cfg_dir)
-    assert p.cluster_source == "table" and p.table == Path("src/table.tsv")
-    with pytest.raises(cc.ClusterConfigError, match="not found"):
-        cc.resolve_cluster_plan(_config(local="src/mine.fasta", clusters="src/table.tsv"))
 
 
 def test_template_data_params_warn_at_config_time():

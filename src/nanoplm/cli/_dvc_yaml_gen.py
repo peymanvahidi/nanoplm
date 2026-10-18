@@ -424,7 +424,7 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
                f"--fasta {members_fasta} --xml {xml} -o {tsv}")
         members_deps[0] = members_fasta
         members_deps += [xml, dep("src/nanoplm/data/preparation/uniref_hierarchy.py")]
-    elif plan.cluster_source == "mmseqs":
+    else:
         cmd = ("nanoplm data cluster-members --source mmseqs "
                "--fasta ${data_dirs.filtered_fasta} "
                "--identity ${cluster_subsampling.identity} "
@@ -433,10 +433,6 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
                f"--tmp-dir {plan.mmseqs_tmp} -o {tsv}")
         members_params = ["cluster_subsampling.identity", "cluster_subsampling.coverage",
                           "data_params.max_workers"]
-    else:
-        cmd = (f"nanoplm data cluster-members --source table --table {plan.table} "
-               f"--fasta ${{data_dirs.filtered_fasta}} -o {tsv}")
-        members_deps.append(str(plan.table))
     stages["cluster_members"] = {"cmd": cmd, "deps": members_deps, "outs": [tsv, info]}
     if members_params:
         stages["cluster_members"]["params"] = [{params_filename: members_params}]

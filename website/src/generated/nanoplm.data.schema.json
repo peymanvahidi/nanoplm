@@ -111,11 +111,6 @@
           "default": null,
           "description": "uniref90, uniref100, a FASTA URL/path, or null (= url itself)"
         },
-        "clusters": {
-          "type": "string",
-          "default": "auto",
-          "description": "auto, or a path to your own cluster_id<TAB>sequence_id table"
-        },
         "identity": {
           "type": "number",
           "default": 0.5,
