@@ -72,7 +72,11 @@ def test_mmseqs_params_only_reach_cluster_members(tmp_path):
     assert "get_cluster_xml" not in st and "get_members_fasta" not in st
     assert st["get_file"]["outs"] == ["output/data/raw/sequences.fasta"]
     assert st["cluster_members"]["params"] == [
-        {"data.yaml": ["cluster_subsampling.identity", "cluster_subsampling.coverage"]}]
+        {"data.yaml": ["cluster_subsampling.identity", "cluster_subsampling.coverage",
+                       "data_params.max_workers"]}]
+    assert "--threads ${data_params.max_workers}" in st["cluster_members"]["cmd"]
+    assert "--max-workers ${data_params.max_workers}" in st["cluster_pool"]["cmd"]
+    assert "data_params.max_workers" in st["cluster_pool"]["params"][0]["data.yaml"]
     for name, stage in st.items():
         if name != "cluster_members":
             flat = str(stage.get("params", "")) + str(stage.get("deps", ""))
@@ -183,3 +187,14 @@ def test_from_yaml_from_another_directory_reads_relative_paths_there(tmp_path):
     m = read_manifest(tmp_path / "output/data/pretrain_data")
     assert m.cluster_level == "uniref90"
     assert not (elsewhere / "output/data").exists()
+
+
+def test_cluster_mode_needs_a_valid_max_workers(tmp_path):
+    import click
+    from nanoplm.cli.data import _validate_cluster_block
+    table = tmp_path / "t.tsv"
+    table.write_text("c\ta\n")
+    cfg = _enabled(data_dirs__url="https://example.org/mine.fasta.gz",
+                   cluster_subsampling__clusters=str(table), data_params__max_workers=0)
+    with pytest.raises(click.ClickException, match="max_workers must be -1"):
+        _validate_cluster_block(cfg, tmp_path / "data.yaml")

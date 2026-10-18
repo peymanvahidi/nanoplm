@@ -418,7 +418,8 @@ def mmseqs_members_tsv(fasta, out_tsv, identity: float, coverage: float, tmp_dir
     numbered = tmp_dir / "rows.fasta"
     cmd = [binary, "easy-linclust", str(numbered), str(prefix), str(tmp_dir / "work"),
            "--min-seq-id", str(identity), "-c", str(coverage), "--cov-mode", str(COV_MODE),
-           "--threads", str(threads or max(1, len(os.sched_getaffinity(0))))]
+           "--threads", str(threads if threads and threads > 0
+                            else max(1, len(os.sched_getaffinity(0))))]
     try:
         ids = number_fasta(fasta, numbered)
         logger.info("cluster table: " + " ".join(cmd))

@@ -788,10 +788,14 @@ def cluster_members(source, fasta, output, level, xml, table, identity, coverage
 @click.option("--max-seq-len", required=True, type=int)
 @click.option("--samples-per-shard", required=True, type=int)
 @click.option("--register-tokens", type=int, default=0)
-@click.option("--max-workers", type=int, default=2)
+@click.option("--max-workers", type=int,
+              default=lambda: int(os.environ.get("NANOPLM_MAX_WORKERS", "2")),
+              show_default="$NANOPLM_MAX_WORKERS or 2")
 def cluster_pool(input, output, max_seq_len, samples_per_shard, register_tokens, max_workers):
     """Internal: pre-tokenize the filtered member FASTA into the pool (FASTA order)."""
     from nanoplm.data.preparation.cluster_pipeline import build_pool
+    if max_workers < 1 and max_workers != -1:
+        raise click.ClickException("max_workers must be either -1 (use all available cores) or at least 1")
     build_pool(Path(input), Path(output), max_seq_len, samples_per_shard, register_tokens,
                max_workers)
     click.echo(f"Wrote pool shards to {output}")
@@ -1229,6 +1233,12 @@ def _validate_cluster_block(params: dict, config_path: Path) -> None:
         raise click.ClickException(f"{config_path.name}: {e}") from e
     if plan is None:
         return
+    workers = (params.get("data_params") or {}).get("max_workers")
+    if not (isinstance(workers, int) and not isinstance(workers, bool)
+            and (workers == -1 or workers >= 1)):
+        raise click.ClickException(
+            f"{config_path.name}: data_params.max_workers must be -1 (all cores) or at "
+            f"least 1 with cluster_subsampling, got {workers!r}")
     for w in plan.warnings:
         logger.warning(w)
         click.echo(f"Warning: {w}", err=True)

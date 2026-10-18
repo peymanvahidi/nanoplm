@@ -254,3 +254,28 @@ def test_user_table_peak_allocation_stays_near_the_table_size(tmp_path):
         tracemalloc.stop()
     # the dict version needs ~320 B per line; the table itself is 40 B per line
     assert peak / n < 230, f"{peak / n:.0f} B per line"
+
+
+def _fake_mmseqs(tmp_path):
+    """Records its argv, then makes every (row-numbered) sequence its own cluster."""
+    fake = tmp_path / "fake_mmseqs"
+    fake.write_text(
+        "#!/bin/bash\n"
+        f'echo "$@" > "{tmp_path}/argv"\n'
+        "grep '^>' \"$2\" | cut -c2- | awk '{print $1\"\\t\"$1}' > \"$3_cluster.tsv\"\n")
+    fake.chmod(0o755)
+    return fake
+
+
+@pytest.mark.parametrize("threads, expect", [(3, "3"), (-1, None), (None, None)])
+def test_mmseqs_threads(tmp_path, threads, expect):
+    import os
+    fasta = tmp_path / "f.fasta"
+    fasta.write_text(">sp|P1|A\nMKV\n>sp|P2|B\nMKV\n")
+    stats = ct.mmseqs_members_tsv(fasta, tmp_path / "m.tsv", 0.5, 0.8, tmp_path / "mm",
+                                  threads=threads, mmseqs=str(_fake_mmseqs(tmp_path)))
+    argv = (tmp_path / "argv").read_text().split()
+    got = argv[argv.index("--threads") + 1]
+    assert got == (expect or str(len(os.sched_getaffinity(0))))
+    assert stats["clusters"] == 2
+    assert (tmp_path / "m.tsv").read_text() == "sp|P1|A\tsp|P1|A\nsp|P2|B\tsp|P2|B\n"
