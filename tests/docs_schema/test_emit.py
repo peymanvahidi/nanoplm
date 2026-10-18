@@ -148,3 +148,10 @@ def test_null_default_without_overlay_type_fails_loudly():
         emit._field_schema("sec", "f", "null", "", {"sec.f": {"type": "integer"}}, {})
     frag = emit._field_schema("sec", "f", "null", "", {"sec.f": {"type": ["integer", "null"]}}, {})
     assert frag["type"] == ["integer", "null"] and frag["default"] is None
+
+
+def test_cluster_fractions_exclude_zero():
+    block = emit.build_surface("data")["properties"]["cluster_subsampling"]["properties"]
+    for key in ("identity", "coverage"):
+        assert block[key]["exclusiveMinimum"] == 0 and "minimum" not in block[key]
+        assert block[key]["maximum"] == 1

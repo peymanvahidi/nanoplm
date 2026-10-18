@@ -119,14 +119,14 @@
         "identity": {
           "type": "number",
           "default": 0.5,
-          "minimum": 0,
+          "exclusiveMinimum": 0,
           "maximum": 1,
           "description": "MMseqs2 clustering only: min sequence identity within a cluster"
         },
         "coverage": {
           "type": "number",
           "default": 0.8,
-          "minimum": 0,
+          "exclusiveMinimum": 0,
           "maximum": 1,
           "description": "MMseqs2 clustering only: min alignment coverage"
         }

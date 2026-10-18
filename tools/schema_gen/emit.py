@@ -17,7 +17,8 @@ _DRAFT = "https://json-schema.org/draft/2020-12/schema"
 
 
 # Annotation keys an overlay entry (or an x-extra-fields declaration) may carry.
-_ANNOTATION_KEYS = ("type", "items", "enum", "minimum", "maximum", "backend", "advanced", "group")
+_ANNOTATION_KEYS = ("type", "items", "enum", "minimum", "exclusiveMinimum", "maximum", "backend",
+                    "advanced", "group")
 
 
 def _apply(frag: dict, key: str, description: str, ov: dict, vis: dict) -> dict:
@@ -31,7 +32,7 @@ def _apply(frag: dict, key: str, description: str, ov: dict, vis: dict) -> dict:
         frag["items"] = ov["items"]
     if "enum" in ov:
         frag["enum"] = ov["enum"]
-    for bound in ("minimum", "maximum"):
+    for bound in ("minimum", "exclusiveMinimum", "maximum"):
         if bound in ov:
             frag[bound] = ov[bound]
     if description:
