@@ -11,9 +11,11 @@ the member it returns is drawn uniformly from the cluster's ``n_c`` surviving me
     row  = cluster_members[cluster_offsets[global_to_universe[c]] + slot]
 
 The draw is a pure function of (seed, cluster, epoch). It holds no RNG state, so the
-stream does not depend on num_workers, fetch order, world size or resume. The sampler
-permutes cluster positions each epoch as it would for any other dataset, and
-``set_epoch`` moves every cluster to a fresh member.
+member a cluster gives in an epoch does not depend on num_workers, fetch order, world
+size or resume. The order of the visits does: the sampler permutes cluster positions
+each epoch as it would for any other dataset, and with packing the DataLoader workers
+each pack their share and interleave the batches. ``set_epoch`` moves every cluster to
+a fresh member.
 
 The arithmetic is bit-identical to the experiment shim it was ported from
 (``runtime_sampler_patch.py``, frozen under ``tests/fixtures/``); the test suite
