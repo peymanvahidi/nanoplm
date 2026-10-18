@@ -39,6 +39,10 @@ ARRAYS_SUBDIR = "index"          # cluster_index/index: the arrays ClusterSample
 CLUSTER_INDEX_DIR = f"{INDEX_SUBDIR}/{ARRAYS_SUBDIR}"   # relative to output_dir (manifest)
 MMSEQS_TMP = ".mmseqs_tmp"
 KEYS = ("enabled", "members", "clusters", "identity", "coverage")
+# val_ratio counts clusters here; above this, warn (the template's 0.1 is sized for
+# sequences). The experiment held out 0.44% of the UniRef50 clusters.
+MAX_QUIET_VAL_RATIO = 0.01
+EXPERIMENT_VAL_RATIO = 0.0044
 
 
 class ClusterConfigError(ValueError):
@@ -169,6 +173,15 @@ def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
     identity = _fraction(block, "identity", DEFAULT_IDENTITY)
     coverage = _fraction(block, "coverage", DEFAULT_COVERAGE)
     warnings = []
+    seqs_num = params.get("seqs_num", -1)
+    if isinstance(seqs_num, int) and seqs_num > 0:
+        warnings.append(f"cluster_subsampling: data_params.seqs_num={seqs_num} trains on at "
+                        f"most {seqs_num:,} clusters; set it to -1 for all of them")
+    val_ratio = params.get("val_ratio")
+    if isinstance(val_ratio, (int, float)) and val_ratio > MAX_QUIET_VAL_RATIO:
+        warnings.append(f"cluster_subsampling: data_params.val_ratio={val_ratio} holds out "
+                        f"{val_ratio:.1%} of the clusters for validation; the UniRef90 "
+                        f"experiment used {EXPERIMENT_VAL_RATIO}")
     if params.get("shuffle") or params.get("shuffle_seed") is not None:
         warnings.append("cluster_subsampling ignores data_params.shuffle / shuffle_seed: the "
                         "pool keeps FASTA order and the training sampler orders the visits")

@@ -93,11 +93,22 @@ def test_seqs_num_caps_clusters(release, tmp_path):
     assert m.seqs_num == 120 and m.val_sequences == 12 and m.train_sequences == 108
 
 
-def test_too_many_shards_is_refused_before_tokenizing(release, tmp_path, monkeypatch):
+def test_too_small_samples_per_shard_is_raised(release, tmp_path, monkeypatch):
     monkeypatch.setattr(cp.ci, "SHARD_SORT_CLIFF", 5)
-    with pytest.raises(ValueError, match="samples_per_shard >="):
-        cp.prepare_cluster_dataset(_cfg(tmp_path, release, samples_per_shard=10))
-    assert not (tmp_path / "out" / "train").exists()
+    m = cp.prepare_cluster_dataset(_cfg(tmp_path, release, samples_per_shard=10))
+    rows = m.pool_sequences
+    assert -(-rows // 10) >= 5                           # 10 per shard would be refused
+    assert m.samples_per_shard == cp.ci.shard_size_for(rows, 10) > 10
+    shards = sorted((tmp_path / "out" / "train").glob("*.bin"))
+    assert len(shards) == -(-rows // m.samples_per_shard) < 5
+
+
+@pytest.mark.parametrize("rows, asked, used", [
+    (97_800_000, 2000, 10_000), (97_800_000, 30_000, 30_000),
+    (169_000_000, 2000, 20_000), (9_999, 1, 1), (10_000, 1, 2), (500, 2000, 2000)])
+def test_shard_size_for(rows, asked, used):
+    assert cp.ci.shard_size_for(rows, asked) == used
+    assert -(-rows // used) < cp.ci.SHARD_SORT_CLIFF
 
 
 def test_invalid_sequences_are_dropped_from_the_pool(release, tmp_path):

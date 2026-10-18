@@ -31,15 +31,17 @@ cluster_subsampling:     # each epoch, train on one random member of every clust
 
 Then run `nanoplm data from-yaml` as usual and point `pretrain.yaml`'s `dataset_dir` at `output_dir`. Training picks the cluster-subsampled dataset from the manifest; nothing else changes in `pretrain.yaml`.
 
-### Settings for a UniRef90 run
+### Settings for a UniRef90 or UniRef100 run
 
-The template's `data_params` are sized for a quick SwissProt run. For UniRef-scale clusters change three of them:
+The template's `data_params` are sized for a quick SwissProt run. They still work in this mode, but for UniRef-scale clusters set these three:
 
-| Key | Template | UniRef90 run | Why |
+| Key | Template | UniRef90 / UniRef100 run | Why |
 | --- | --- | --- | --- |
-| `seqs_num` | `20000` | `-1` | In this mode it caps the number of **clusters**, not sequences. |
-| `samples_per_shard` | `2000` | `30000` | 97.8M pool sequences at 2000 per shard would be 49k shard files: past the 10,000 shard files the pipeline supports, and past the open-file limit of most nodes. The pool stage refuses it. |
-| `val_ratio` | `0.1` | `0.0044` | The fraction of **clusters** held out. 0.0044 holds out 145k clusters. |
+| `seqs_num` | `20000` | `-1` | In this mode it caps the number of **clusters**, not sequences. With the template's value, training sees at most 20,000 clusters. |
+| `val_ratio` | `0.1` | `0.0044` | The fraction of **clusters** held out. 0.0044 holds out 145k of the 32.9M UniRef50 clusters; 0.1 would hold out 3.3M. |
+| `samples_per_shard` | `2000` | `30000` | The pool has 97.8M (UniRef90) or 169.0M (UniRef100) sequences. At 2000 per shard that would be 49k or 85k shard files, past the 9,999 the shard names sort correctly for. A value that is too small is raised automatically and the log names the value used (10000 for UniRef90, 20000 for UniRef100); 30000 gives 3,261 and 5,635 shards. |
+
+`nanoplm data from-yaml` warns before any stage runs when `seqs_num` is positive or `val_ratio` is above 0.01.
 
 `drop_invalid_sequences` works as in a normal run, on the member sequences. A cluster whose representative is dropped (invalid or outside `min_seq_len`..`max_seq_len`) leaves training with all its members.
 

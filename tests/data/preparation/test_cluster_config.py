@@ -21,6 +21,7 @@ def _config(url=None, local=None, **block):
     cfg["data_dirs"]["local_fasta"] = local
     cfg["data_params"]["shuffle"] = False
     cfg["data_params"]["shuffle_seed"] = None
+    cfg["data_params"].update(seqs_num=-1, val_ratio=0.0044)
     cfg["cluster_subsampling"].update({"enabled": True, **block})
     return cfg
 
@@ -158,3 +159,13 @@ def test_relative_paths_resolve_against_the_config_dir(tmp_path, monkeypatch):
     assert p.cluster_source == "table" and p.table == Path("src/table.tsv")
     with pytest.raises(cc.ClusterConfigError, match="not found"):
         cc.resolve_cluster_plan(_config(local="src/mine.fasta", clusters="src/table.tsv"))
+
+
+def test_template_data_params_warn_at_config_time():
+    cfg = _config(url=U50, members="uniref90")
+    cfg["data_params"].update(seqs_num=20000, val_ratio=0.1)        # the template's
+    w = cc.resolve_cluster_plan(cfg).warnings
+    assert any("seqs_num=20000 trains on at most 20,000 clusters; set it to -1" in x
+               for x in w)
+    assert any("val_ratio=0.1 holds out 10.0% of the clusters" in x and "0.0044" in x
+               for x in w)

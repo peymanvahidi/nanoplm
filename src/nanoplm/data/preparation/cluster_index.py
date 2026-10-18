@@ -464,6 +464,24 @@ def _decode_check(pool_dir, sro, lengths, spot_seqs, tokenizer, max_seq_len, scr
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def shard_size_for(n_rows: int, samples_per_shard: int, what: str = "shards") -> int:
+    """``samples_per_shard``, raised when ``n_rows`` would need SHARD_SORT_CLIFF+ shards.
+
+    The raised value is the smallest 1, 2 or 5 x 10^k that stays below the cliff (10000
+    for UniRef90's 97.8M rows), so the data.yaml template's value works at any scale.
+    """
+    if -(-n_rows // samples_per_shard) < SHARD_SORT_CLIFF:
+        return samples_per_shard
+    need = -(-n_rows // (SHARD_SORT_CLIFF - 1))
+    scale = 10 ** (len(str(need)) - 1)
+    size = next(m * scale for m in (1, 2, 5, 10) if m * scale >= need)
+    logger.info(f"{what}: {n_rows:,} rows at samples_per_shard={samples_per_shard} would make "
+                f"{-(-n_rows // samples_per_shard):,} shards (the limit is "
+                f"{SHARD_SORT_CLIFF - 1:,}); using samples_per_shard={size} "
+                f"({-(-n_rows // size):,} shards)")
+    return size
+
+
 def write_row_gather(pool_dir: Path, rows: np.ndarray, out_dir: Path,
                      samples_per_shard: int) -> int:
     """Copy pool ``rows`` (already tokenized), in the given order, into new shards.
@@ -477,9 +495,7 @@ def write_row_gather(pool_dir: Path, rows: np.ndarray, out_dir: Path,
     rows = np.asarray(rows, dtype=np.int64)
     if len(rows) == 0:
         raise ClusterIndexError(f"no rows to write into {out_dir}")
-    if -(-len(rows) // samples_per_shard) >= SHARD_SORT_CLIFF:
-        raise ClusterIndexError(f"{len(rows)} rows at samples_per_shard={samples_per_shard} "
-                                f"make {SHARD_SORT_CLIFF}+ shards. Raise samples_per_shard.")
+    samples_per_shard = shard_size_for(len(rows), samples_per_shard, str(out_dir))
     shard_of = np.searchsorted(sro, rows, side="right") - 1
     offsets: dict = {}
     maps: dict = {}

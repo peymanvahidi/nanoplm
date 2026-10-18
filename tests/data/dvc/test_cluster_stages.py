@@ -198,3 +198,25 @@ def test_cluster_mode_needs_a_valid_max_workers(tmp_path):
                    cluster_subsampling__clusters=str(table), data_params__max_workers=0)
     with pytest.raises(click.ClickException, match="max_workers must be -1"):
         _validate_cluster_block(cfg, tmp_path / "data.yaml")
+
+
+def test_from_yaml_with_the_template_data_params(tmp_path):
+    from nanoplm.data.infra.manifest import read_manifest
+    from tests.data.preparation.uniref_fixture import make_release
+    rel = make_release(tmp_path / "src", n_clusters=80)
+    raw = tmp_path / "output/data/raw"
+    raw.mkdir(parents=True)
+    shutil.copy(rel.xml, raw / "uniref50.xml.gz")
+    cfg = _template()                                   # data_params exactly as shipped
+    cfg["data_dirs"].update(url=None, local_fasta=str(rel.fasta90))
+    cfg["cluster_subsampling"]["enabled"] = True
+    (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    env = dict(os.environ, PATH=f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+               CUDA_VISIBLE_DEVICES="")
+    r = _from_yaml(tmp_path, env)
+    err = r.stdout + r.stderr
+    assert "seqs_num=20000 trains on at most 20,000 clusters" in err
+    assert "val_ratio=0.1 holds out 10.0% of the clusters" in err
+    m = read_manifest(tmp_path / "output/data/pretrain_data")
+    assert m.cluster_level == "uniref90" and m.samples_per_shard == 2000
+    assert m.val_sequences == round(m.seqs_num * 0.1)

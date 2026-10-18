@@ -130,15 +130,6 @@ def _tokenizer(register_tokens: int):
     return ProtModernBertTokenizer(num_register_tokens=register_tokens)
 
 
-def check_shard_count(n_rows: int, samples_per_shard: int) -> None:
-    if -(-n_rows // samples_per_shard) >= ci.SHARD_SORT_CLIFF:
-        raise ValueError(
-            f"{n_rows:,} pool rows at samples_per_shard={samples_per_shard} make "
-            f"{ci.SHARD_SORT_CLIFF:,}+ shards, past what the shard file names sort correctly "
-            f"for; set data_params.samples_per_shard >= "
-            f"{-(-n_rows // (ci.SHARD_SORT_CLIFF - 1))} (30000 suits UniRef90)")
-
-
 def count_fasta_records(fasta: Path) -> int:
     n = 0
     with open(fasta, "rb") as f:
@@ -184,10 +175,15 @@ def stage_filter(cfg: ClusterDataConfig) -> int:
 def build_pool(filtered_fasta: Path, pool_dir: Path, max_seq_len: int, samples_per_shard: int,
                register_tokens: int = 0, max_workers: int = 8,
                n_rows: Optional[int] = None) -> None:
-    """Pre-tokenize the filtered FASTA into the pool, FASTA order kept."""
+    """Pre-tokenize the filtered FASTA into the pool, FASTA order kept.
+
+    samples_per_shard is raised when the pool would need too many shards
+    (cluster_index.shard_size_for); the manifest records the value used.
+    """
     from nanoplm.data.sharding.pretrain_shard_writer import ShardWriter
-    check_shard_count(count_fasta_records(filtered_fasta) if n_rows is None else n_rows,
-                      samples_per_shard)
+    samples_per_shard = ci.shard_size_for(
+        count_fasta_records(filtered_fasta) if n_rows is None else n_rows,
+        samples_per_shard, "cluster pool")
     ShardWriter(str(filtered_fasta), _tokenizer(register_tokens), max_seq_len, str(pool_dir),
                 samples_per_shard=samples_per_shard, max_workers=max_workers,
                 force=True).create_shards()
@@ -284,7 +280,7 @@ def write_cluster_manifest(output_dir: Path, min_seq_len: int, max_seq_len: int,
         val_sequences=c["val_clusters"],
         num_register_tokens=register_tokens,
         sharded=True,
-        samples_per_shard=samples_per_shard,
+        samples_per_shard=ci.shard_size_for(c["pool_rows"], samples_per_shard, "manifest"),
         total_train_tokens=c["expected_tokens_per_pass"],
         cluster_index_dir=cc.CLUSTER_INDEX_DIR,
         cluster_level=man.get("level") or man.get("clusters", {}).get("source"),

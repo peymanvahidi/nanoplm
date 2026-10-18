@@ -244,6 +244,18 @@ def test_uniref100_pool_shares_the_uniref90_universe_and_split(built, release, t
                               _ix(root90, name)), name
 
 
+def test_row_gather_raises_a_too_small_samples_per_shard(built, tmp_path, monkeypatch):
+    from nanoplm.data.datasets.pretrain import ShardedDataset
+    root = built[0]
+    rows = _ix(root, "val_rep_rows")
+    cliff = len(list((root / "train").glob("*.bin"))) + 1    # the pool itself still fits
+    assert len(rows) >= cliff
+    monkeypatch.setattr(ci, "SHARD_SORT_CLIFF", cliff)
+    ci.write_row_gather(root / "train", rows, tmp_path / "val", samples_per_shard=1)
+    assert len(list((tmp_path / "val").glob("*.bin"))) < cliff
+    assert len(ShardedDataset(str(tmp_path / "val"))) == len(rows)
+
+
 def test_shard_count_over_the_sort_cliff_is_refused(built, monkeypatch):
     root = built[0]
     monkeypatch.setattr(ci, "SHARD_SORT_CLIFF", 3)
