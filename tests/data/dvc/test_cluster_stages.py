@@ -239,3 +239,19 @@ def test_summary_counts_clusters_and_names_the_members(tmp_path, capsys):
     assert "uniref50.fasta" not in text and "Total sequences" not in text
     assert f"Members:         {cc.UNIPROT_FASTA['uniref90']}" in text
     assert "Clusters:        120 (uniref90)" in text and "Pool sequences:  400" in text
+
+
+def test_from_yaml_says_how_to_install_mmseqs(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    from nanoplm.data.preparation import cluster_table as ct
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/own.fasta").write_text(">p1\nMKVLAAGIVGLLLAAGSAQAEELK\n")
+    _project(tmp_path, {"enabled": True}, {"url": None, "local_fasta": "src/own.fasta"})
+    monkeypatch.setattr(ct, "find_mmseqs", lambda explicit=None: None)
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("DVC must not run"))
+    r = CliRunner().invoke(data, ["from-yaml", str(tmp_path / "data.yaml")])
+    assert r.exit_code != 0
+    assert "clustered with MMseqs2, but `mmseqs` was not found" in r.output
+    assert "nanoplm deps install --mmseqs-only" in r.output
+    assert not (tmp_path / "dvc.yaml").exists()
