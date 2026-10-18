@@ -222,3 +222,20 @@ def test_from_yaml_with_the_template_data_params(tmp_path):
     m = read_manifest(tmp_path / "output/data/pretrain_data")
     assert m.cluster_level == "uniref90" and m.samples_per_shard == 2000
     assert m.val_sequences == round(m.seqs_num * 0.1)
+
+
+def test_summary_counts_clusters_and_names_the_members(tmp_path, capsys):
+    from nanoplm.cli.data import _print_summary
+    cfg = _enabled(data_dirs__url=cc.UNIPROT_FASTA["uniref50"],
+                   cluster_subsampling__members="uniref90")
+    out = tmp_path / "output/data/pretrain_data"
+    out.mkdir(parents=True)
+    (out / ".data_manifest").write_text(yaml.safe_dump({
+        "seqs_num": 120, "train_sequences": 108, "val_sequences": 12,
+        "cluster_index_dir": "cluster_index/index", "cluster_level": "uniref90",
+        "pool_sequences": 400}))
+    _print_summary(tmp_path, cfg, "pretrain", tmp_path / "data.yaml")
+    text = capsys.readouterr().out
+    assert "uniref50.fasta" not in text and "Total sequences" not in text
+    assert f"Members:         {cc.UNIPROT_FASTA['uniref90']}" in text
+    assert "Clusters:        120 (uniref90)" in text and "Pool sequences:  400" in text

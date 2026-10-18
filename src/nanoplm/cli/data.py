@@ -1292,6 +1292,19 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path) -> Non
         raise click.ClickException(f"{manifest_path}: failed to parse manifest: {e}")
     title = "Pretraining" if kind == "pretrain" else "Distillation"
     src = data_dirs.get("url") or data_dirs.get("local_fasta")
+    if m.get("cluster_index_dir"):
+        from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
+        plan = resolve_cluster_plan(params, cwd)
+        click.echo(
+            f"\n{title} data pipeline complete (cluster subsampling).\n\n"
+            f"  Members:         {plan.members if plan else src}\n"
+            f"  Pool sequences:  {m.get('pool_sequences')}\n"
+            f"  Clusters:        {m.get('seqs_num')} ({m.get('cluster_level')})\n"
+            f"    Train:         {m.get('train_sequences')}\n"
+            f"    Val:           {m.get('val_sequences')}\n"
+            f"  Manifest:        {manifest_path}\n"
+        )
+        return
     click.echo(
         f"\n{title} data pipeline complete.\n\n"
         f"  Source:          {src}\n"
