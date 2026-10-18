@@ -62,7 +62,7 @@ class ClusterDataConfig:
     coverage: float = cc.DEFAULT_COVERAGE
     register_tokens: int = 0
     seqs_num: int = -1
-    drop_invalid_sequences: bool = True
+    drop_invalid_sequences: bool = False     # the data.yaml template's value
     max_workers: int = 8
     holdout_seed: int = ci.HOLDOUT_SEED
     mmseqs: Optional[str] = None
@@ -119,7 +119,7 @@ def config_from_yaml(config: dict, base_dir=None) -> tuple[ClusterDataConfig, cc
         level=plan.members_level, cluster_xml=at(plan.xml_path), cluster_table=at(plan.table),
         identity=plan.identity, coverage=plan.coverage,
         register_tokens=p.get("register_tokens", 0), seqs_num=p.get("seqs_num", -1),
-        drop_invalid_sequences=p.get("drop_invalid_sequences", True),
+        drop_invalid_sequences=p.get("drop_invalid_sequences", False),
         max_workers=p.get("max_workers") or 8,
     )
     return cfg, plan

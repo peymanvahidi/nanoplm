@@ -120,8 +120,21 @@ def test_invalid_sequences_are_dropped_from_the_pool(release, tmp_path):
                   MIN_LEN <= len(release.u90[ln[len(">UniRef90_"):].split()[0]][2]) <= MAX_LEN)
     lines[k + 1] = "MK!V" + lines[k + 1][4:]            # an illegal character
     fasta.write_text("\n".join(lines))
-    cfg = _cfg(tmp_path, release, members_fasta=fasta)
+    cfg = _cfg(tmp_path, release, members_fasta=fasta, drop_invalid_sequences=True)
     cp.prepare_cluster_dataset(cfg)
     assert f">UniRef90_{acc} " not in cfg.filtered_fasta.read_text()
 
 
+
+
+def test_programmatic_drop_invalid_default_matches_the_template():
+    import yaml
+    from nanoplm.cli.templates import load_template
+    tpl = yaml.safe_load(load_template("data_pretrain"))
+    want = tpl["data_params"]["drop_invalid_sequences"]
+    assert cp.ClusterDataConfig.__dataclass_fields__["drop_invalid_sequences"].default == want
+    tpl["data_params"].pop("drop_invalid_sequences")
+    tpl["cluster_subsampling"].update(enabled=True, members="uniref90")
+    tpl["data_dirs"]["url"] = cp.cc.UNIPROT_FASTA["uniref50"]
+    cfg, _ = cp.config_from_yaml(tpl)
+    assert cfg.drop_invalid_sequences == want
