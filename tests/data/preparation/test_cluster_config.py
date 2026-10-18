@@ -94,6 +94,14 @@ def test_uniref50_members_are_refused_clearly(members):
         cc.resolve_cluster_plan(_config(url=U50, members=members))
 
 
+def test_uniref50_url_alone_warns_about_mmseqs_over_all_of_it():
+    p = cc.resolve_cluster_plan(_config(url=U50))
+    assert p.cluster_source == "mmseqs"
+    assert any("~60M UniRef50 sequences" in w and "members: uniref90" in w for w in p.warnings)
+    assert not any("~60M" in w for w in
+                   cc.resolve_cluster_plan(_config(url=U50, members="uniref90")).warnings)
+
+
 def test_a_non_uniref_members_fasta_must_go_in_url(tmp_path):
     with pytest.raises(cc.ClusterConfigError, match=r"Put that FASTA in data_dirs.url .*"
                                                     r"members: null"):

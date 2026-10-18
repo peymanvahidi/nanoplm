@@ -243,6 +243,11 @@ def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
     else:
         raise ClusterConfigError(f"cluster_subsampling.clusters must be auto or a path, got "
                                  f"{clusters!r}")
+    if cluster_source == "mmseqs" and source_level == "uniref50":
+        warnings.append("cluster_subsampling: data_dirs.url is UniRef50 and members is null, "
+                        "so MMseqs2 will cluster all ~60M UniRef50 sequences (hours). To "
+                        "train on the members of UniProt's UniRef50 clusters instead, set "
+                        "cluster_subsampling.members: uniref90")
     if cluster_source != "mmseqs" and (identity != DEFAULT_IDENTITY
                                        or coverage != DEFAULT_COVERAGE):
         what = "UniProt clusters" if cluster_source == "uniref_xml" else "your cluster table"

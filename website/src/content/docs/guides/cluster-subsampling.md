@@ -76,6 +76,7 @@ Whatever the source, it ends up as one table, `output_dir/cluster_index/members.
 | `... clustered with MMseqs2, but mmseqs was not found` | MMseqs2 is needed (scenario 4). Install it with `nanoplm deps install --mmseqs-only`, put a release binary on `PATH`, or set `NANOPLM_MMSEQS=/path/to/mmseqs`. |
 | `... was built by the data-sampler experiment scripts ... Rebuild it with nanoplm data from-yaml` | A dataset directory from the old experiment (it has a `RUNTIME_SAMPLER_REQUIRED` marker, or a pool with the experiment's index next to it). Its manifest describes the whole pool, so it is refused. |
 | Warning: `identity / coverage only apply to MMseqs2 clustering; they are ignored ...` | `identity` or `coverage` differs from the template default (0.5 / 0.8) while UniProt clusters or your own table are used. |
+| Warning: `MMseqs2 will cluster all ~60M UniRef50 sequences` | `url` is UniRef50 and `members` is `null`, so MMseqs2 clusters UniRef50 itself. To train on the members of UniProt's UniRef50 clusters, set `members: uniref90`. |
 | Warning: `cluster_subsampling ignores data_params.shuffle / shuffle_seed` | `shuffle` or `shuffle_seed` differs from the template (`true` / `24`). The pool keeps FASTA order; the training sampler shuffles the clusters each epoch. |
 
 ## Stages and caching
