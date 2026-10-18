@@ -140,3 +140,21 @@ def test_experiment_dirs_are_refused(tmp_path):
     (d2 / "train").symlink_to(pool / "shards", target_is_directory=True)
     with pytest.raises(cc.ClusterConfigError, match="data-sampler experiment"):
         open_train_dataset(d2, _manifest(), seed=1)
+
+
+def test_relative_paths_resolve_against_the_config_dir(tmp_path, monkeypatch):
+    cfg_dir, elsewhere = tmp_path / "project", tmp_path / "elsewhere"
+    (cfg_dir / "src").mkdir(parents=True)
+    elsewhere.mkdir()
+    # UniRef90 by its headers only: the file name says nothing
+    (cfg_dir / "src/mine.fasta").write_text(">UniRef90_A0A000 x\nMKV\n")
+    (cfg_dir / "src/table.tsv").write_text("c\tUniRef90_A0A000\n")
+    monkeypatch.chdir(elsewhere)
+    p = cc.resolve_cluster_plan(_config(local="src/mine.fasta"), cfg_dir)
+    assert p.cluster_source == "uniref_xml" and p.members_level == "uniref90"
+    assert p.members_fasta == Path("output/data/raw/sequences.fasta")   # kept as written
+    p = cc.resolve_cluster_plan(_config(local="src/mine.fasta", clusters="src/table.tsv"),
+                                cfg_dir)
+    assert p.cluster_source == "table" and p.table == Path("src/table.tsv")
+    with pytest.raises(cc.ClusterConfigError, match="not found"):
+        cc.resolve_cluster_plan(_config(local="src/mine.fasta", clusters="src/table.tsv"))

@@ -97,18 +97,26 @@ class ClusterDataConfig:
         return self.output_dir / cc.INDEX_SUBDIR / cc.MMSEQS_TMP
 
 
-def config_from_yaml(config: dict) -> tuple[ClusterDataConfig, cc.ClusterPlan]:
-    """ClusterDataConfig for a parsed data.yaml with cluster_subsampling enabled."""
-    plan = cc.resolve_cluster_plan(config)
+def config_from_yaml(config: dict, base_dir=None) -> tuple[ClusterDataConfig, cc.ClusterPlan]:
+    """ClusterDataConfig for a parsed data.yaml with cluster_subsampling enabled.
+
+    ``base_dir`` is data.yaml's directory: relative paths in the config resolve against
+    it, as they do for the DVC stages. None keeps them relative to the current directory.
+    """
+    plan = cc.resolve_cluster_plan(config, base_dir)
     if plan is None:
         raise ValueError("cluster_subsampling is not enabled")
     dirs, p = config["data_dirs"], config.get("data_params") or {}
+
+    def at(path):
+        return None if path is None else cc.on_disk(path, base_dir)
+
     cfg = ClusterDataConfig(
-        members_fasta=plan.members_fasta, output_dir=plan.output_dir,
-        validation_dir=dirs["validation_dir"], filtered_fasta=dirs["filtered_fasta"],
+        members_fasta=at(plan.members_fasta), output_dir=at(plan.output_dir),
+        validation_dir=at(dirs["validation_dir"]), filtered_fasta=at(dirs["filtered_fasta"]),
         min_seq_len=p["min_seq_len"], max_seq_len=p["max_seq_len"], val_ratio=p["val_ratio"],
         samples_per_shard=p["samples_per_shard"], cluster_source=plan.cluster_source,
-        level=plan.members_level, cluster_xml=plan.xml_path, cluster_table=plan.table,
+        level=plan.members_level, cluster_xml=at(plan.xml_path), cluster_table=at(plan.table),
         identity=plan.identity, coverage=plan.coverage,
         register_tokens=p.get("register_tokens", 0), seqs_num=p.get("seqs_num", -1),
         drop_invalid_sequences=p.get("drop_invalid_sequences", True),

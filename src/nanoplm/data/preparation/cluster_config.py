@@ -4,6 +4,9 @@ The one place that decides where the member sequences come from, which cluster s
 ``clusters: auto`` picks, every derived path, and which settings are errors or are
 ignored. Config validation, dvc.yaml generation and the stage commands all use it.
 
+Relative paths are relative to ``base_dir``, the directory of data.yaml: that is
+where ``nanoplm data from-yaml`` runs DVC, so the stages see the same files.
+
 Levels: a FASTA is UniRef50 / UniRef90 / UniRef100 by its headers (``>UniRef90_...``)
 when the file is on disk, else by its file name (``uniref90.fasta.gz``); anything else
 is a custom set. Stage commands re-check the headers when the file exists.
@@ -65,10 +68,17 @@ def _header_level(path: Path) -> Optional[str]:
     return None
 
 
-def level_of(source: str) -> Optional[str]:
+def on_disk(path, base_dir=None) -> Path:
+    """``path`` as the stages see it: relative paths are under ``base_dir`` (data.yaml's
+    directory), or the current directory when ``base_dir`` is None."""
+    p = Path(path)
+    return p if p.is_absolute() or base_dir is None else Path(base_dir) / p
+
+
+def level_of(source: str, base_dir=None) -> Optional[str]:
     """'uniref50' / 'uniref90' / 'uniref100', or None for any other sequence set."""
-    if not is_url(source) and Path(source).is_file():
-        return _header_level(Path(source))
+    if not is_url(source) and on_disk(source, base_dir).is_file():
+        return _header_level(on_disk(source, base_dir))
     m = re.match(r"uniref(50|90|100)\.fasta(\.gz)?$", _name(source).lower())
     return f"uniref{m.group(1)}" if m else None
 
@@ -134,8 +144,12 @@ def is_enabled(config: dict) -> bool:
     return v
 
 
-def resolve_cluster_plan(config: dict) -> Optional[ClusterPlan]:
-    """The plan for a parsed data.yaml, or None when cluster subsampling is off."""
+def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
+    """The plan for a parsed data.yaml, or None when cluster subsampling is off.
+
+    ``base_dir`` is data.yaml's directory; files are looked up there, but the plan keeps
+    every path as written, since the stages run in that directory too.
+    """
     block = config.get("cluster_subsampling") or {}
     unknown = sorted(set(block) - set(KEYS))
     if unknown:
@@ -159,7 +173,7 @@ def resolve_cluster_plan(config: dict) -> Optional[ClusterPlan]:
         warnings.append("cluster_subsampling ignores data_params.shuffle / shuffle_seed: the "
                         "pool keeps FASTA order and the training sampler orders the visits")
 
-    source_level = level_of(source)
+    source_level = level_of(source, base_dir)
     members = block.get("members")
     if members is not None and (not isinstance(members, str) or not members):
         raise ClusterConfigError(f"cluster_subsampling.members must be a string or null, got "
@@ -169,7 +183,7 @@ def resolve_cluster_plan(config: dict) -> Optional[ClusterPlan]:
     if members is None or members == source:
         members, members_level, from_source = source, source_level, True
     else:
-        members_level, from_source = level_of(members), False
+        members_level, from_source = level_of(members, base_dir), False
         if members_level == "uniref50":
             members_level = None
         elif members_level is not None and members_level == source_level:
@@ -204,7 +218,7 @@ def resolve_cluster_plan(config: dict) -> Optional[ClusterPlan]:
             cluster_source = "mmseqs"
     elif isinstance(clusters, str):
         cluster_source = "table"
-        if not Path(clusters).is_file():
+        if not on_disk(clusters, base_dir).is_file():
             raise ClusterConfigError(f"cluster_subsampling.clusters: {clusters} not found")
     else:
         raise ClusterConfigError(f"cluster_subsampling.clusters must be auto or a path, got "

@@ -863,6 +863,7 @@ def get_yaml(output, distillation, force):
         config=parsed,
         kind=kind,
         params_filename=params_filename,
+        base_dir=output_path,
     )
     dvc_path.write_text(dvc_content, encoding="utf-8")
     click.echo(
@@ -975,6 +976,7 @@ def from_yaml(
         config=params,
         kind=kind,
         params_filename=config_path.name,
+        base_dir=cwd,
     )
     dvc_yaml_path.write_text(dvc_content, encoding="utf-8")
     # click.echo, not logger.info: this must still print at --log-level error.
@@ -1222,7 +1224,7 @@ def _validate_cluster_block(params: dict, config_path: Path) -> None:
     from nanoplm.data.preparation.cluster_config import ClusterConfigError, resolve_cluster_plan
     from nanoplm.data.preparation.cluster_table import MMSEQS_INSTALL_HINT, find_mmseqs
     try:
-        plan = resolve_cluster_plan(params)
+        plan = resolve_cluster_plan(params, config_path.parent)
     except ClusterConfigError as e:
         raise click.ClickException(f"{config_path.name}: {e}") from e
     if plan is None:

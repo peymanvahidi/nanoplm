@@ -111,9 +111,9 @@ def _project(tmp_path, block, data_dirs):
     return env
 
 
-def _from_yaml(tmp_path, env):
-    r = _run([str(Path(sys.executable).parent / "nanoplm"), "data", "from-yaml", "data.yaml"],
-             tmp_path, env)
+def _from_yaml(tmp_path, env, cwd=None, config="data.yaml"):
+    r = _run([str(Path(sys.executable).parent / "nanoplm"), "data", "from-yaml", config],
+             cwd or tmp_path, env)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     return r
 
@@ -164,3 +164,22 @@ def test_from_yaml_end_to_end_with_uniprot_clusters(tmp_path):
     assert m.cluster_level == "uniref90" and m.cluster_index_dir == "cluster_index/index"
     ds = open_train_dataset(out, m, seed=3)
     assert isinstance(ds, ClusterSampledDataset) and len(ds) == m.train_sequences
+
+
+def test_from_yaml_from_another_directory_reads_relative_paths_there(tmp_path):
+    from nanoplm.data.infra.manifest import read_manifest
+    from tests.data.preparation.uniref_fixture import make_release
+    rel = make_release(tmp_path / "src", n_clusters=60)
+    # UniRef90 only by its headers, given relative to data.yaml
+    shutil.copy(rel.fasta90, tmp_path / "src/mine.fasta")
+    raw = tmp_path / "output/data/raw"
+    raw.mkdir(parents=True)
+    shutil.copy(rel.xml, raw / "uniref50.xml.gz")
+    env = _project(tmp_path, {"enabled": True}, {"url": None, "local_fasta": "src/mine.fasta"})
+    env.pop("NANOPLM_MMSEQS", None)        # the UniProt route needs no MMseqs2
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _from_yaml(tmp_path, env, cwd=elsewhere, config="../data.yaml")
+    m = read_manifest(tmp_path / "output/data/pretrain_data")
+    assert m.cluster_level == "uniref90"
+    assert not (elsewhere / "output/data").exists()
