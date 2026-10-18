@@ -418,8 +418,11 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
             # into the DVC cache (20 GB)
             "outs": [{xml: {"persist": True, "cache": False}}],
         }
+        # the XML alone makes members.tsv; the FASTA is only read for its level, so
+        # the unfiltered one keeps a min/max_seq_len change from rerunning the XML scan
         cmd = (f"nanoplm data cluster-members --source uniref_xml --level {plan.members_level} "
-               f"--fasta ${{data_dirs.filtered_fasta}} --xml {xml} -o {tsv}")
+               f"--fasta {members_fasta} --xml {xml} -o {tsv}")
+        members_deps[0] = members_fasta
         members_deps += [xml, dep("src/nanoplm/data/preparation/uniref_hierarchy.py")]
     elif plan.cluster_source == "mmseqs":
         cmd = ("nanoplm data cluster-members --source mmseqs "

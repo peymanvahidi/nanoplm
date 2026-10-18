@@ -58,6 +58,9 @@ def test_uniref50_url_uniref90_members_stages():
     # identity / coverage are ignored here, so they must not trigger a rerun
     assert "params" not in st["cluster_members"]
     assert "--source uniref_xml --level uniref90" in st["cluster_members"]["cmd"]
+    # a length-filter change must not rerun the XML scan
+    assert "filtered_fasta" not in str(st["cluster_members"])
+    assert "output/data/raw/uniref90.fasta" in st["cluster_members"]["deps"]
     assert st["cluster_members"]["outs"] == [
         "output/data/pretrain_data/cluster_index/members.tsv",
         "output/data/pretrain_data/cluster_index/members.json"]
