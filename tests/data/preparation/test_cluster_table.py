@@ -279,3 +279,16 @@ def test_mmseqs_threads(tmp_path, threads, expect):
     assert got == (expect or str(len(os.sched_getaffinity(0))))
     assert stats["clusters"] == 2
     assert (tmp_path / "m.tsv").read_text() == "sp|P1|A\tsp|P1|A\nsp|P2|B\tsp|P2|B\n"
+
+
+def test_user_table_rep_falls_back_to_a_surviving_member(tmp_path, monkeypatch):
+    monkeypatch.setattr(ct.logger, "warning", lambda *a, **k: None)
+    fasta = tmp_path / "f.fasta"                      # the filtered FASTA: x and q were dropped
+    fasta.write_text(">b\nMKV\n>c\nMKV\n>d\nMKV\n")
+    table = tmp_path / "t.tsv"
+    table.write_text("x\tx\nx\tb\nx\tc\ny\tq\ny\td\nz\tgone\n")
+    ct.table_members_tsv(table, fasta, tmp_path / "m.tsv")
+    assert (tmp_path / "m.tsv").read_text() == (
+        "x\tb\nx\tx\nx\tc\n"        # x itself is gone, b (first surviving) leads
+        "y\td\ny\tq\n"              # same for the first listed member
+        "z\tgone\n")                # nothing survives: the order is kept

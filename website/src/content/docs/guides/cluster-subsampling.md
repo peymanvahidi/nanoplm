@@ -43,7 +43,7 @@ The template's `data_params` are sized for a quick SwissProt run. They still wor
 
 `nanoplm data from-yaml` warns before any stage runs when `seqs_num` is positive or `val_ratio` is above 0.01.
 
-`drop_invalid_sequences` works as in a normal run, on the member sequences. A cluster whose representative is dropped (invalid or outside `min_seq_len`..`max_seq_len`) leaves training with all its members.
+`drop_invalid_sequences` works as in a normal run, on the member sequences. With UniProt or MMseqs2 clusters, a cluster whose representative is dropped (invalid or outside `min_seq_len`..`max_seq_len`) leaves training with all its members; this keeps UniProt clusters identical to the experiment's index. With your own table, the first surviving member becomes the representative instead.
 
 ## Scenarios
 
@@ -62,7 +62,7 @@ A FASTA counts as UniRef90 or UniRef100 by its headers (`>UniRef90_...`) when it
 
 - **The members are a UniRef90 or UniRef100 set, and `url` is UniRef50 or that same set**: UniProt's UniRef50 clusters. `uniref50.xml.gz` is downloaded into the raw directory next to `compressed_fasta`; a copy already there is reused. Each UniRef50 entry is one cluster. For UniRef90 the representative is the entry's representative member. For UniRef100 it is the UniRef100 record with the same accession as the UniRef90 representative, which is the same sequence, so UniRef90 and UniRef100 runs share one set of clusters and one train / validation split.
 - **Anything else** (your own FASTA, TrEMBL, UniRef50 itself): MMseqs2 `easy-linclust` clusters the filtered member sequences with `--min-seq-id identity -c coverage --cov-mode 0`. Coverage mode 0 asks the alignment to cover that fraction of **both** sequences, so a fragment does not join a cluster on a short local match. The representative is the one MMseqs2 picks. MMseqs2 runs in a temporary directory under `output_dir` that is deleted afterwards.
-- **`clusters: <path>`**: the table is used as given. A cluster's representative is the member whose id equals the cluster id, else its first listed member. Sequences missing from the table become clusters of their own.
+- **`clusters: <path>`**: the table is used as given. A cluster's representative is the member whose id equals the cluster id, else its first listed member; when that one did not pass `check` and the length filter, the first listed member that did. Sequences missing from the table become clusters of their own. If fewer than half of the table's ids are in the FASTA (and fewer than half of the FASTA's ids are in the table), the run stops and names a few ids from each side; a partial match is a warning.
 
 Whatever the source, it ends up as one table, `output_dir/cluster_index/members.tsv` (`cluster_id<TAB>sequence_id`, grouped by cluster, representative first), and the rest of the pipeline is built from that table.
 

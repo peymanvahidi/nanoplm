@@ -14,7 +14,9 @@ Three sources write it:
                   runs on a copy whose headers are row numbers, mapped back after.
   a user table    ``table_members_tsv``: cluster_id<TAB>sequence_id lines in any order;
                   the representative is the member whose id equals the cluster id, else
-                  the first one listed. FASTA sequences missing from the table become
+                  the first one listed, among the members in the filtered FASTA when
+                  any is (so a rep the length filter dropped does not take its whole
+                  cluster with it). FASTA sequences missing from the table become
                   singleton clusters. Too few table ids in the FASTA is an error (the
                   ids are probably written another way); a partial match is a warning.
 
@@ -322,7 +324,7 @@ def table_members_tsv(table, fasta, out_tsv) -> dict:
         [_id(buf, m_off[r], m_len[r]) for r in miss_t[:N_EXAMPLES]],
         len(ids), len(lone),
         [_id(ids.blob, ids.offsets[r], ids.lens[r]) for r in lone[:N_EXAMPLES]])
-    del miss_t, in_fasta
+    del miss_t
     pos = np.minimum(np.searchsorted(uc, fh[lone]), len(uc) - 1)
     named = np.flatnonzero(uc[pos] == fh[lone])
     if named.size:
@@ -332,9 +334,21 @@ def table_members_tsv(table, fasta, out_tsv) -> dict:
                                 "missing from the table but its id is used as a cluster id there")
     del pos, named, fh
 
-    # grouped by cluster, the member named like its cluster first, else table order
-    order = np.lexsort((np.arange(len(mh)), mh != ch, cid))
-    del cid, ch, mh
+    # grouped by cluster, representative first, the rest in table order. The rep is the
+    # member named like its cluster, else the first listed, preferring members that are
+    # in the (filtered) FASTA: a rep the filter dropped would take its cluster with it.
+    line = np.arange(len(mh))
+    named = mh == ch
+    pref = np.where(in_fasta, 0, 2) + np.where(named, 0, 1)
+    del in_fasta
+    order = np.lexsort((line, pref, cid))
+    is_rep = np.zeros(len(mh), dtype=bool)
+    first = np.ones(len(order), dtype=bool)
+    first[1:] = cid[order[1:]] != cid[order[:-1]]
+    is_rep[order[first]] = True
+    del pref, first, named
+    order = np.lexsort((line, ~is_rep, cid))
+    del cid, ch, mh, line, is_rep
     Path(out_tsv).parent.mkdir(parents=True, exist_ok=True)
     with atomic_write_path(Path(out_tsv)) as tmp, open(tmp, "wb", buffering=1 << 24) as out:
         write_pairs(out, buf, c_off[order], c_len[order], buf, m_off[order], m_len[order])
