@@ -200,6 +200,11 @@ def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
     if members is None or members == source:
         members, members_level, from_source = source, source_level, True
     else:
+        if (members != "uniref50" and not is_url(members)
+                and not on_disk(members, base_dir).is_file()):
+            raise ClusterConfigError(
+                f"cluster_subsampling.members: {members} not found (a relative path is "
+                "relative to data.yaml's directory)")
         members_level, from_source = level_of(members, base_dir), False
         if members == "uniref50" or members_level == "uniref50":
             raise ClusterConfigError(

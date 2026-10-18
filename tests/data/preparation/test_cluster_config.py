@@ -102,6 +102,15 @@ def test_uniref50_url_alone_warns_about_mmseqs_over_all_of_it():
                    cc.resolve_cluster_plan(_config(url=U50, members="uniref90")).warnings)
 
 
+def test_a_missing_local_members_file_is_caught_at_config_time(tmp_path):
+    with pytest.raises(cc.ClusterConfigError, match="members: data/uniref90.fasta not found"):
+        cc.resolve_cluster_plan(_config(url=U50, members="data/uniref90.fasta"), tmp_path)
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data/uniref90.fasta").write_text(">UniRef90_A x\nMKV\n")
+    p = cc.resolve_cluster_plan(_config(url=U50, members="data/uniref90.fasta"), tmp_path)
+    assert p.members_level == "uniref90" and p.cluster_source == "uniref_xml"
+
+
 def test_a_non_uniref_members_fasta_must_go_in_url(tmp_path):
     with pytest.raises(cc.ClusterConfigError, match=r"Put that FASTA in data_dirs.url .*"
                                                     r"members: null"):
