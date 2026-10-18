@@ -252,3 +252,19 @@ def test_single_process_packing_visits_each_item_once_with_four_workers():
         assert len(batches) == len(packed) == 100
         passes.append([i for b in batches for i in b])
     assert passes[0] != passes[1]                 # set_epoch reshuffles
+
+
+def test_single_process_resume_replays_the_same_permutation():
+    from nanoplm.data.datasets.pretrain import packing_sampler
+    ds = IdDataset()
+
+    def packed():
+        return TokenPackingDataset(ds, max_tokens_per_batch=100, drop_last=True,
+                                   sampler=packing_sampler(ds, seed=7, distributed=False))
+
+    full = packed()
+    full.set_epoch(3)
+    ids = [i for b in full for i in _first_ids(b)]
+    resumed = packed()
+    assert resumed.fast_forward(40, epoch=3) == 400
+    assert [i for b in resumed for i in _first_ids(b)] == ids[400:]
