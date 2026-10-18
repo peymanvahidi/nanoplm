@@ -43,7 +43,7 @@ The template's `data_params` are sized for a quick SwissProt run. They still wor
 
 `nanoplm data from-yaml` warns before any stage runs when `seqs_num` is positive or `val_ratio` is above 0.01.
 
-`drop_invalid_sequences` works as in a normal run, on the member sequences. With UniProt or MMseqs2 clusters, a cluster whose representative is dropped (invalid or outside `min_seq_len`..`max_seq_len`) leaves training with all its members; this keeps UniProt clusters identical to the experiment's index. With your own table, the first surviving member becomes the representative instead.
+`drop_invalid_sequences` works as in a normal run, on the member sequences. With UniProt clusters, a cluster whose representative is dropped (invalid or outside `min_seq_len`..`max_seq_len`) leaves training with all its members; this keeps the index identical to the experiment's. With your own table, the first surviving member becomes the representative instead. MMseqs2 only clusters sequences that passed the filter, so its representatives always survive.
 
 ## Scenarios
 
@@ -90,7 +90,19 @@ get_cluster_xml → cluster_members → cluster_index → write_manifest
 
 `get_members_fasta` / `extract_members` only appear when `members` differs from `url`; otherwise the normal `get_file` / `extract` stages fetch the url. `get_cluster_xml` only appears for UniProt clusters. The `shuffle` and `split` stages are not used.
 
-Each stage reruns only when its own inputs change. Changing `identity` or `coverage` reruns `cluster_members` and the stages after it, never the downloads or the tokenized pool. Changing `val_ratio` or `seqs_num` reruns `cluster_index` and the manifest. The XML is not copied into the DVC cache.
+Each stage reruns only when its own inputs change. Changing `identity` or `coverage` reruns `cluster_members` and the stages after it, never the downloads or the tokenized pool. Changing `val_ratio` or `seqs_num` reruns `cluster_index` and the manifest. Changing `max_workers` reruns `cluster_pool` (and `cluster_members` with MMseqs2). The XML is not copied into the DVC cache.
+
+Switching `enabled` between `true` and `false` changes how the `get_file` stage is written, so DVC downloads `url` again even when the file is already there.
+
+### Disk space
+
+DVC keeps a copy of every stage output in its cache (`.dvc/cache`), so by default a run takes about twice the space of its outputs: for UniRef90 the cached downloads, FASTAs, pool and index come to about 140 GB more. To avoid the copy, let the cache link files instead before the first run:
+
+```bash
+dvc config cache.type reflink,hardlink,symlink
+```
+
+After changing settings, `dvc gc --workspace` deletes cached versions that the current outputs no longer use.
 
 ## Costs
 
