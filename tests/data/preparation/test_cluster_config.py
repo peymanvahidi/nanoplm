@@ -19,8 +19,6 @@ def _config(url=None, local=None, **block):
     cfg = copy.deepcopy(cfg)
     cfg["data_dirs"]["url"] = url
     cfg["data_dirs"]["local_fasta"] = local
-    cfg["data_params"]["shuffle"] = False
-    cfg["data_params"]["shuffle_seed"] = None
     cfg["data_params"].update(seqs_num=-1, val_ratio=0.0044)
     cfg["cluster_subsampling"].update({"enabled": True, **block})
     return cfg
@@ -102,11 +100,13 @@ def test_identity_and_coverage_are_ignored_with_uniprot_clusters():
     assert p.warnings == []
 
 
-def test_shuffle_is_ignored_with_a_warning():
+@pytest.mark.parametrize("shuffle, seed, warns", [
+    (True, 24, False), (False, 24, True), (True, 7, True), (True, None, True)])
+def test_shuffle_warns_only_when_changed_from_the_template(shuffle, seed, warns):
     cfg = _config(url=U90)
-    cfg["data_params"].update(shuffle=True, shuffle_seed=24)
+    cfg["data_params"].update(shuffle=shuffle, shuffle_seed=seed)
     assert any("ignores data_params.shuffle" in w
-               for w in cc.resolve_cluster_plan(cfg).warnings)
+               for w in cc.resolve_cluster_plan(cfg).warnings) == warns
 
 
 @pytest.mark.parametrize("block,match", [

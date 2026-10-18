@@ -42,6 +42,9 @@ KEYS = ("enabled", "members", "clusters", "identity", "coverage")
 # val_ratio counts clusters here; above this, warn (the template's 0.1 is sized for
 # sequences). The experiment held out 0.44% of the UniRef50 clusters.
 MAX_QUIET_VAL_RATIO = 0.01
+# data.yaml template values: left as they are, shuffle / shuffle_seed draw no warning
+TEMPLATE_SHUFFLE = True
+TEMPLATE_SHUFFLE_SEED = 24
 EXPERIMENT_VAL_RATIO = 0.0044
 
 
@@ -182,7 +185,8 @@ def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
         warnings.append(f"cluster_subsampling: data_params.val_ratio={val_ratio} holds out "
                         f"{val_ratio:.1%} of the clusters for validation; the UniRef90 "
                         f"experiment used {EXPERIMENT_VAL_RATIO}")
-    if params.get("shuffle") or params.get("shuffle_seed") is not None:
+    if (params.get("shuffle", TEMPLATE_SHUFFLE) != TEMPLATE_SHUFFLE
+            or params.get("shuffle_seed", TEMPLATE_SHUFFLE_SEED) != TEMPLATE_SHUFFLE_SEED):
         warnings.append("cluster_subsampling ignores data_params.shuffle / shuffle_seed: the "
                         "pool keeps FASTA order and the training sampler orders the visits")
 

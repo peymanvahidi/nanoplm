@@ -107,8 +107,7 @@ def _project(tmp_path, block, data_dirs):
     cfg = _template()
     cfg["data_dirs"].update(data_dirs)
     cfg["data_params"].update(seqs_num=-1, min_seq_len=20, max_seq_len=128, val_ratio=0.1,
-                              samples_per_shard=101, max_workers=1, shuffle=False,
-                              shuffle_seed=None)
+                              samples_per_shard=101, max_workers=1)
     cfg["cluster_subsampling"].update(block)
     (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     env = dict(os.environ, PATH=f"{Path(sys.executable).parent}:{os.environ['PATH']}",
