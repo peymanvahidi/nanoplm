@@ -201,8 +201,11 @@ def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
         members, members_level, from_source = source, source_level, True
     else:
         members_level, from_source = level_of(members, base_dir), False
-        if members_level == "uniref50":
-            members_level = None
+        if members == "uniref50" or members_level == "uniref50":
+            raise ClusterConfigError(
+                f"cluster_subsampling.members: {members} cannot be the members: UniRef50 "
+                "entries are the clusters themselves. Use members: uniref90 or uniref100 to "
+                "train on the members of UniProt's UniRef50 clusters.")
         elif members_level is not None and members_level == source_level:
             # e.g. local_fasta is uniref90 and members: uniref90 -> no second download
             members, from_source = source, True

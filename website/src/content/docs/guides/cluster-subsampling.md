@@ -71,6 +71,7 @@ Whatever the source, it ends up as one table, `output_dir/cluster_index/members.
 | Message | Cause |
 | --- | --- |
 | `cluster_subsampling.members is uniref90, so data_dirs.url must be UniRef50 or uniref90 itself` | UniRef members with a `url` (for example TrEMBL) whose clusters cannot be UniRef50. |
+| `cluster_subsampling.members: uniref50 cannot be the members` | UniRef50 entries are the clusters. Use `members: uniref90` or `uniref100`. |
 | `cluster_subsampling.members (...) is not a UniRef set and differs from data_dirs.url. Put that FASTA in data_dirs.url (or local_fasta) and set cluster_subsampling.members: null.` | Your own member FASTA goes in `url`, so there is only one source. |
 | `... clustered with MMseqs2, but mmseqs was not found` | MMseqs2 is needed (scenario 4). Install it with `nanoplm deps install --mmseqs-only`, put a release binary on `PATH`, or set `NANOPLM_MMSEQS=/path/to/mmseqs`. |
 | `... was built by the data-sampler experiment scripts ... Rebuild it with nanoplm data from-yaml` | A dataset directory from the old experiment (it has a `RUNTIME_SAMPLER_REQUIRED` marker, or a pool with the experiment's index next to it). Its manifest describes the whole pool, so it is refused. |

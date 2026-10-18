@@ -87,6 +87,13 @@ def test_uniref_members_need_a_uniref50_or_same_set_url():
         cc.resolve_cluster_plan(_config(url=U90, members="uniref100"))
 
 
+@pytest.mark.parametrize("members", ["uniref50", "https://example.org/x/uniref50.fasta.gz"])
+def test_uniref50_members_are_refused_clearly(members):
+    with pytest.raises(cc.ClusterConfigError, match="UniRef50 entries are the clusters "
+                                                    "themselves. Use members: uniref90"):
+        cc.resolve_cluster_plan(_config(url=U50, members=members))
+
+
 def test_a_non_uniref_members_fasta_must_go_in_url(tmp_path):
     with pytest.raises(cc.ClusterConfigError, match=r"Put that FASTA in data_dirs.url .*"
                                                     r"members: null"):
