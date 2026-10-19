@@ -1236,6 +1236,9 @@ def _validate_cluster_block(params: dict, config_path: Path) -> None:
         raise click.ClickException(
             f"{config_path.name}: data_params.max_workers must be -1 (all cores) or at "
             f"least 1 with cluster_subsampling, got {workers!r}")
+    click.echo(f"Cluster source: {plan.source_line()}")
+    for n in plan.notes:
+        click.echo(n)
     for w in plan.warnings:
         logger.warning(w)
         click.echo(f"Warning: {w}", err=True)
@@ -1292,9 +1295,11 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path) -> Non
     if m.get("cluster_index_dir"):
         from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
         plan = resolve_cluster_plan(params, cwd)
+        source = f"  Cluster source:  {plan.source_line()}\n" if plan else ""
         click.echo(
             f"\n{title} data pipeline complete (cluster subsampling).\n\n"
             f"  Members:         {plan.members if plan else src}\n"
+            f"{source}"
             f"  Pool sequences:  {m.get('pool_sequences')}\n"
             f"  Clusters:        {m.get('seqs_num')} ({m.get('cluster_level')})\n"
             f"    Train:         {m.get('train_sequences')}\n"

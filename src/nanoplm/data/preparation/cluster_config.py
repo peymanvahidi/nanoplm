@@ -10,9 +10,11 @@ Levels: a FASTA is UniRef50 / UniRef90 / UniRef100 by its headers (``>UniRef90_.
 when the file is on disk, else by its file name (``uniref90.fasta.gz``); anything else
 is a custom set. Stage commands re-check the headers when the file exists.
 
-Cluster source: UniProt UniRef50 clusters (from uniref50.xml.gz) when the members are a
-UniRef90 or UniRef100 set and url is UniRef50 or that same set. Otherwise MMseqs2
-clusters the members (easy-linclust, --min-seq-id identity, -c coverage, --cov-mode 0).
+Cluster source (``clustering``): ``auto`` uses UniProt UniRef50 clusters (from
+uniref50.xml.gz) when the members are a UniRef90 or UniRef100 set and url is UniRef50 or
+that same set, and MMseqs2 otherwise. ``uniprot`` requires that UniRef case; ``mmseqs2``
+always clusters the members with MMseqs2 (easy-linclust, --min-seq-id identity,
+-c coverage, --cov-mode 0).
 """
 from __future__ import annotations
 
@@ -34,7 +36,10 @@ MEMBERS_TSV = "members.tsv"
 ARRAYS_SUBDIR = "index"          # cluster_index/index: the arrays ClusterSampledDataset reads
 CLUSTER_INDEX_DIR = f"{INDEX_SUBDIR}/{ARRAYS_SUBDIR}"   # relative to output_dir (manifest)
 MMSEQS_TMP = ".mmseqs_tmp"
-KEYS = ("enabled", "members", "identity", "coverage")
+KEYS = ("enabled", "members", "clustering", "identity", "coverage")
+CLUSTERINGS = ("auto", "uniprot", "mmseqs2")
+UNIPROT_NEEDS = ("UniProt clusters need UniRef data (url UniRef50 + members uniref90/"
+                 "uniref100, or a UniRef90/100 url)")
 # val_ratio counts clusters here; above this, warn (the template's 0.1 is sized for
 # sequences). The experiment held out 0.44% of the UniRef50 clusters.
 MAX_QUIET_VAL_RATIO = 0.01
@@ -100,12 +105,22 @@ class ClusterPlan:
     members_compressed: Optional[Path]   # where get_members_fasta puts a .gz download
     members_fasta: Path            # the extracted member FASTA the pool is built from
     cluster_source: str            # "uniref_xml" | "mmseqs"
+    clustering: str = "auto"       # as written in data.yaml: auto | uniprot | mmseqs2
     xml_path: Optional[Path] = None
     xml_url: Optional[str] = None
     identity: float = DEFAULT_IDENTITY
     coverage: float = DEFAULT_COVERAGE
     output_dir: Path = Path(".")
     warnings: list = field(default_factory=list)
+    notes: list = field(default_factory=list)    # informational, printed before the stages
+
+    def source_line(self) -> str:
+        """What clusters the members, e.g. 'UniProt uniref50.xml.gz (members: UniRef90)'."""
+        if self.cluster_source == "uniref_xml":
+            return (f"UniProt {_name(self.xml_url)} "
+                    f"(members: UniRef{self.members_level[len('uniref'):]})")
+        return (f"MMseqs2 linclust, identity {self.identity:g}, coverage {self.coverage:g} "
+                f"(members: {self.members})")
 
     @property
     def members_tsv(self) -> Path:
@@ -168,6 +183,10 @@ def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
     if not extracted or not dirs.get("output_dir"):
         raise ClusterConfigError("data_dirs.extracted_fasta and data_dirs.output_dir are required")
     raw_dir = Path(compressed).parent if compressed else Path(extracted).parent
+    clustering = block.get("clustering", "auto")
+    if clustering not in CLUSTERINGS:
+        raise ClusterConfigError(f"cluster_subsampling.clustering must be one of "
+                                 f"{', '.join(CLUSTERINGS)}, got {clustering!r}")
     identity = _fraction(block, "identity", DEFAULT_IDENTITY)
     coverage = _fraction(block, "coverage", DEFAULT_COVERAGE)
     warnings = []
@@ -230,22 +249,34 @@ def resolve_cluster_plan(config: dict, base_dir=None) -> Optional[ClusterPlan]:
         members_compressed = raw_dir / name if name.endswith(".gz") else None
         members_fasta = raw_dir / _strip_gz(name)
 
-    cluster_source = "uniref_xml" if members_level in ("uniref90", "uniref100") else "mmseqs"
-    if cluster_source == "mmseqs" and source_level == "uniref50":
+    uniref = members_level in ("uniref90", "uniref100")
+    if clustering == "uniprot" and not uniref:
+        raise ClusterConfigError(
+            f"cluster_subsampling.clustering: uniprot: {UNIPROT_NEEDS}; got url {source} "
+            f"and members {block.get('members')}. Use clustering: auto or mmseqs2 to cluster "
+            "these sequences with MMseqs2.")
+    cluster_source = "uniref_xml" if uniref and clustering != "mmseqs2" else "mmseqs"
+    notes = []
+    if cluster_source == "mmseqs" and source_level == "uniref50" and clustering == "auto":
         warnings.append("cluster_subsampling: data_dirs.url is UniRef50 and members is null, "
                         "so MMseqs2 will cluster all ~60M UniRef50 sequences (hours). To "
                         "train on the members of UniProt's UniRef50 clusters instead, set "
-                        "cluster_subsampling.members: uniref90")
+                        "cluster_subsampling.members: uniref90 (with clustering: auto or "
+                        "uniprot)")
     if cluster_source == "uniref_xml" and (identity != DEFAULT_IDENTITY
                                            or coverage != DEFAULT_COVERAGE):
         warnings.append("cluster_subsampling.identity / coverage only apply to MMseqs2 "
-                        "clustering; they are ignored with UniProt clusters")
+                        "clustering; they are ignored with UniProt clusters. Set "
+                        "cluster_subsampling.clustering: mmseqs2 to use them")
+    if cluster_source == "mmseqs" and not from_source:
+        notes.append(f"clustering: mmseqs2 clusters the members ({members}); the "
+                     f"data_dirs.url FASTA ({source}) is not needed and is not downloaded")
     plan = ClusterPlan(
         source=source, source_level=source_level, members=members,
         members_level=members_level, members_from_source=from_source,
         members_compressed=members_compressed, members_fasta=members_fasta,
-        cluster_source=cluster_source, identity=identity, coverage=coverage,
-        output_dir=Path(dirs["output_dir"]), warnings=warnings,
+        cluster_source=cluster_source, clustering=clustering, identity=identity,
+        coverage=coverage, output_dir=Path(dirs["output_dir"]), warnings=warnings, notes=notes,
     )
     if cluster_source == "uniref_xml":
         plan.xml_url = UNIREF50_XML_URL

@@ -346,8 +346,8 @@ def _fetch_stages(name: str, source: str, compressed, extracted, params_filename
 def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
     """Stages for cluster_subsampling.enabled: true (see cluster_pipeline's docstring).
 
-    Each stage lists only the params it reads, so changing identity / coverage reruns
-    cluster_members and what follows it, never the pool.
+    Each stage lists only the params it reads, so changing clustering / identity /
+    coverage reruns cluster_members and what follows it, never the pool.
     """
     dep = _resolve_pkg_dep
     members_fasta = str(plan.members_fasta)
@@ -408,7 +408,10 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
     members_deps = ["${data_dirs.filtered_fasta}",
                     dep("src/nanoplm/data/preparation/cluster_table.py"),
                     dep("src/nanoplm/data/preparation/cluster_pipeline.py")]
-    members_params: list = []
+    # a data.yaml written before the key existed has no clustering (= auto); DVC
+    # refuses a listed param that is missing from the file
+    members_params = (["cluster_subsampling.clustering"]
+                      if "clustering" in config["cluster_subsampling"] else [])
     if plan.cluster_source == "uniref_xml":
         xml = str(plan.xml_path)
         stages["get_cluster_xml"] = {
@@ -431,8 +434,8 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
                "--coverage ${cluster_subsampling.coverage} "
                "--threads ${data_params.max_workers} "
                f"--tmp-dir {plan.mmseqs_tmp} -o {tsv}")
-        members_params = ["cluster_subsampling.identity", "cluster_subsampling.coverage",
-                          "data_params.max_workers"]
+        members_params += ["cluster_subsampling.identity", "cluster_subsampling.coverage",
+                           "data_params.max_workers"]
     stages["cluster_members"] = {"cmd": cmd, "deps": members_deps, "outs": [tsv, info]}
     if members_params:
         stages["cluster_members"]["params"] = [{params_filename: members_params}]

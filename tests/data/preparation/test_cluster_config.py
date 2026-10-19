@@ -27,7 +27,8 @@ def _config(url=None, local=None, **block):
 def test_template_block_is_off_by_default():
     cfg = yaml.safe_load(TEMPLATE.read_text())
     assert cfg["cluster_subsampling"] == {"enabled": False, "members": None,
-                                          "identity": 0.5, "coverage": 0.8}
+                                          "clustering": "auto", "identity": 0.5,
+                                          "coverage": 0.8}
     assert cc.resolve_cluster_plan(cfg) is None                      # scenario 1
 
 
@@ -89,9 +90,15 @@ def test_uniref50_members_are_refused_clearly(members):
 def test_uniref50_url_alone_warns_about_mmseqs_over_all_of_it():
     p = cc.resolve_cluster_plan(_config(url=U50))
     assert p.cluster_source == "mmseqs"
-    assert any("~60M UniRef50 sequences" in w and "members: uniref90" in w for w in p.warnings)
-    assert not any("~60M" in w for w in
-                   cc.resolve_cluster_plan(_config(url=U50, members="uniref90")).warnings)
+    assert any("~60M UniRef50 sequences" in w and "members: uniref90" in w
+               and "clustering: auto or uniprot" in w for w in p.warnings)
+    # the suggestion resolves cleanly, with either value it names
+    for clustering in ("auto", "uniprot"):
+        p = cc.resolve_cluster_plan(_config(url=U50, members="uniref90", clustering=clustering))
+        assert p.cluster_source == "uniref_xml" and not any("~60M" in w for w in p.warnings)
+    # an explicit mmseqs2 is the user's choice: no warning
+    p = cc.resolve_cluster_plan(_config(url=U50, clustering="mmseqs2"))
+    assert p.cluster_source == "mmseqs" and not any("~60M" in w for w in p.warnings)
 
 
 def test_a_missing_local_members_file_is_caught_at_config_time(tmp_path):
@@ -111,7 +118,12 @@ def test_a_non_uniref_members_fasta_must_go_in_url(tmp_path):
 
 def test_identity_and_coverage_are_ignored_with_uniprot_clusters():
     p = cc.resolve_cluster_plan(_config(url=U50, members="uniref90", identity=0.3))
-    assert any("ignored with UniProt clusters" in w for w in p.warnings)
+    assert any("ignored with UniProt clusters" in w and "clustering: mmseqs2 to use them" in w
+               for w in p.warnings)
+    p = cc.resolve_cluster_plan(_config(url=U50, members="uniref90", identity=0.3,
+                                        clustering="mmseqs2"))
+    assert p.cluster_source == "mmseqs" and p.identity == 0.3
+    assert not any("identity / coverage" in w for w in p.warnings)
     p = cc.resolve_cluster_plan(_config(url=U50, members="uniref90"))   # template values
     assert p.warnings == []
 
@@ -132,6 +144,8 @@ def test_shuffle_warns_only_when_changed_from_the_template(shuffle, seed, warns)
     ({"members": 5}, "string or null"),
     ({"enabled": "yes"}, "true or false"),
     ({"cluster_url": "x"}, "unknown cluster_subsampling keys"),
+    ({"clustering": "mmseqs"}, "clustering must be one of auto, uniprot, mmseqs2, got 'mmseqs'"),
+    ({"clustering": None}, "clustering must be one of auto, uniprot, mmseqs2"),
 ])
 def test_bad_values_are_refused(block, match):
     with pytest.raises(cc.ClusterConfigError, match=match):
@@ -178,3 +192,77 @@ def test_template_data_params_warn_at_config_time():
                for x in w)
     assert any("val_ratio=0.1 holds out 10.0% of the clusters" in x and "0.0044" in x
                for x in w)
+
+
+# ------------------------------------------------------------------ clustering
+
+
+def _own(tmp_path):
+    own = tmp_path / "my_proteins.fasta"
+    own.write_text(">p1 x\nMKV\n")
+    return str(own)
+
+
+# (url, local, members) -> what auto resolves to; UniRef data first, then non-UniRef
+UNIREF_CASES = {
+    "u50+uniref90": (dict(url=U50, members="uniref90"), "uniref90"),
+    "u50+uniref100": (dict(url=U50, members="uniref100"), "uniref100"),
+    "u90 url": (dict(url=U90), "uniref90"),
+    "u100 url": (dict(url=U100), "uniref100"),
+}
+NON_UNIREF_CASES = {
+    "u50 alone": dict(url=U50),
+    "trembl": dict(url=TREMBL),
+    "own fasta": "own",
+}
+
+
+@pytest.mark.parametrize("case", list(UNIREF_CASES))
+@pytest.mark.parametrize("clustering", cc.CLUSTERINGS)
+def test_clustering_on_uniref_data(case, clustering):
+    kw, level = UNIREF_CASES[case]
+    p = cc.resolve_cluster_plan(_config(clustering=clustering, **kw))
+    assert p.clustering == clustering and p.members_level == level
+    if clustering == "mmseqs2":
+        assert p.cluster_source == "mmseqs" and p.xml_url is None and p.xml_path is None
+        assert p.source_line() == f"MMseqs2 linclust, identity 0.5, coverage 0.8 (members: {p.members})"
+    else:
+        assert p.cluster_source == "uniref_xml" and p.xml_url == cc.UNIREF50_XML_URL
+        assert p.source_line() == (f"UniProt uniref50.xml.gz "
+                                   f"(members: UniRef{level[len('uniref'):]})")
+
+
+@pytest.mark.parametrize("case", list(NON_UNIREF_CASES))
+@pytest.mark.parametrize("clustering", cc.CLUSTERINGS)
+def test_clustering_on_non_uniref_data(case, clustering, tmp_path):
+    kw = NON_UNIREF_CASES[case]
+    kw = dict(local=_own(tmp_path)) if kw == "own" else kw
+    if clustering == "uniprot":
+        with pytest.raises(cc.ClusterConfigError) as e:
+            cc.resolve_cluster_plan(_config(clustering=clustering, **kw))
+        assert ("clustering: uniprot: UniProt clusters need UniRef data (url UniRef50 + "
+                "members uniref90/uniref100, or a UniRef90/100 url)") in str(e.value)
+        return
+    p = cc.resolve_cluster_plan(_config(clustering=clustering, **kw))
+    assert p.cluster_source == "mmseqs" and p.members_from_source and p.xml_url is None
+    assert p.source_line() == f"MMseqs2 linclust, identity 0.5, coverage 0.8 (members: {p.members})"
+
+
+def test_a_missing_clustering_key_means_auto():
+    cfg = _config(url=U50, members="uniref90")
+    del cfg["cluster_subsampling"]["clustering"]
+    p = cc.resolve_cluster_plan(cfg)
+    assert p.clustering == "auto" and p.cluster_source == "uniref_xml"
+
+
+def test_mmseqs2_on_uniref50_url_clusters_the_members_without_the_url_fasta():
+    p = cc.resolve_cluster_plan(_config(url=U50, members="uniref90", clustering="mmseqs2",
+                                        identity=0.3))
+    assert p.cluster_source == "mmseqs" and not p.members_from_source and p.members == U90
+    assert p.members_fasta == Path("output/data/raw/uniref90.fasta")
+    assert p.source_line() == f"MMseqs2 linclust, identity 0.3, coverage 0.8 (members: {U90})"
+    assert p.notes == [f"clustering: mmseqs2 clusters the members ({U90}); the data_dirs.url "
+                       f"FASTA ({U50}) is not needed and is not downloaded"]
+    # the member/url pairing rules hold under every clustering value
+    with pytest.raises(cc.ClusterConfigError, match="must be UniRef50 or uniref90 itself"):
+        cc.resolve_cluster_plan(_config(url=TREMBL, members="uniref90", clustering="mmseqs2"))

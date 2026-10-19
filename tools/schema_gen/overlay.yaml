@@ -159,6 +159,9 @@ model.loopie_bptt: { type: [integer, "null"], minimum: 1, backend: [pure_torch],
 data_dirs.local_fasta: { type: [string, "null"] }
 # cluster_config.resolve_cluster_plan: null = the url itself
 cluster_subsampling.members: { type: [string, "null"] }
+# cluster_config.CLUSTERINGS
+cluster_subsampling.clustering:
+  enum: [auto, uniprot, mmseqs2]
 # cluster_config._fraction: a number in (0, 1]; 0 itself is rejected there
 cluster_subsampling.identity: { exclusiveMinimum: 0, maximum: 1 }
 cluster_subsampling.coverage: { exclusiveMinimum: 0, maximum: 1 }
