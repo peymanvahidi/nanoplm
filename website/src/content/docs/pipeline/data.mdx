@@ -91,11 +91,12 @@ data_params:
 cluster_subsampling:     # each epoch, train on one random member of every cluster
   enabled: false
   members: null          # uniref90, uniref100, a FASTA URL/path, or null (= url itself)
-  identity: 0.5          # MMseqs2 clustering only: min sequence identity within a cluster
-  coverage: 0.8          # MMseqs2 clustering only: min alignment coverage
+  clustering: auto       # auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or uniprot, mmseqs2
+  identity: 0.5          # mmseqs2 only: min sequence identity within a cluster
+  coverage: 0.8          # mmseqs2 only: min alignment coverage
 ```
 
-`cluster_subsampling` is off by default. Turned on, each epoch trains on one random member of every cluster (for example a random UniRef90 sequence of each UniRef50 cluster) instead of a fixed set of sequences; see [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+`cluster_subsampling` is off by default. Turned on, each epoch trains on one random member of every cluster (for example a random UniRef90 sequence of each UniRef50 cluster) instead of a fixed set of sequences. `clustering: auto` takes UniProt's UniRef50 clusters for UniRef data and clusters anything else with MMseqs2; `uniprot` or `mmseqs2` forces one source, and `from-yaml` prints the one it uses before any stage runs. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 
 ## Choosing a source
 
