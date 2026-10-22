@@ -4207,7 +4207,11 @@ def run_pure_pretraining(
                             dist.all_reduce(_wc, op=dist.ReduceOp.MAX)
                             hit_wallclock = bool(_wc.item() > 0)
 
-                    if global_step % eval_steps == 0 or at_wsd_stable_end:
+                    # Also evaluate on the last step a run takes (the terminal step
+                    # and a wall-clock stop), so a checkpoint written off the eval
+                    # cadence still has an eval loss at its own step. No training
+                    # follows either, so this cannot move a trajectory.
+                    if global_step % eval_steps == 0 or at_wsd_stable_end or at_terminal or hit_wallclock:
                         _raise_on_nonfinite_params(f"before eval at step {global_step}")
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
                             eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
