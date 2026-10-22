@@ -801,18 +801,17 @@ class ModernBertAttention(nn.Module):
 
         sink = self._attn_probs_sink
         if sink is not None:
-            if self.use_paired_head_attention or self.use_diff_attn_v2:
+            if self.use_diff_attn_v2:
                 raise NotImplementedError(
                     "attention-probability capture is not implemented for "
-                    "paired-head or differential attention"
+                    "differential attention"
                 )
+            probs = self._eager_attention_probs(q, k, v, attn_mask)
+            if self.use_paired_head_attention:
+                probs = _unpair_attention_probs(probs)
             # fp16 on the CPU as it is produced: (32 layers, 16 heads, L, L) is
             # 2 GB of fp32 at L=1000 if the whole stack is held on the device.
-            sink.append(
-                self._eager_attention_probs(q, k, v, attn_mask)
-                .to(self._attn_probs_dtype)
-                .cpu()
-            )
+            sink.append(probs.to(self._attn_probs_dtype).cpu())
 
         y = F.scaled_dot_product_attention(
             q,
@@ -840,6 +839,20 @@ class ModernBertAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().view(bsz, seq_len, -1)
         return self.out_drop(self.Wo(y))
+
+
+def _unpair_attention_probs(probs: torch.Tensor) -> torch.Tensor:
+    """Paired-head probabilities (B, H/2, 2S, 2S) -> per-head maps (B, H, S, S).
+
+    A pair attends over 2S interleaved positions, 2i + a = token i in head slot
+    a (see `_pair_sdpa_qkv`). Head 2p + a's map is the rows of slot a, with the
+    mass on both slots of key token j summed, so every row still sums to 1 and
+    the probe sees as many maps per layer as in a plain model.
+    """
+    b, half, s2, _ = probs.shape
+    s = s2 // 2
+    probs = probs.view(b, half, s, 2, s, 2).sum(-1)
+    return probs.permute(0, 1, 3, 2, 4).reshape(b, 2 * half, s, s)
 
 
 @contextmanager
