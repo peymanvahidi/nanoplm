@@ -10,7 +10,9 @@ The model is intentionally small and readable:
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -1329,7 +1331,8 @@ class ModernBertEncoderLayer(nn.Module):
 
 
 class ModernBertAttnResidual(nn.Module):
-    """Attention residual branch: x -> x + attn(attn_norm(x))."""
+    """Attention branch of an mHC sublayer: x -> attn(attn_norm(x)). No residual
+    add: the mHC post-map carries the residual (H_res x + h_post f, as DeepSeek-V4)."""
 
     def __init__(self, encoder: ModernBertEncoderLayer):
         super().__init__()
@@ -1359,7 +1362,7 @@ class ModernBertAttnResidual(nn.Module):
                 cu_seqlens=cu_seqlens,
                 attention_mask=token_mask,
             )
-        return x + enc.attn(
+        out = enc.attn(
             attn_in,
             cos_sin=cos_sin,
             attn_mask=attn_mask,
@@ -1370,10 +1373,12 @@ class ModernBertAttnResidual(nn.Module):
             token_mask=token_mask,
             repo_active=repo_active,
         )
+        return out
 
 
 class ModernBertMLPResidual(nn.Module):
-    """MLP residual branch: x -> x + mlp(mlp_norm(x))."""
+    """MLP branch of an mHC sublayer: x -> mlp(mlp_norm(x)). No residual add (see
+    ModernBertAttnResidual)."""
 
     def __init__(self, encoder: ModernBertEncoderLayer):
         super().__init__()
@@ -1396,7 +1401,7 @@ class ModernBertMLPResidual(nn.Module):
     ) -> torch.Tensor:
         enc: ModernBertEncoderLayer = self.__dict__["_encoder"]
         if enc.mlp is None:
-            return x
+            return torch.zeros_like(x)
         mlp_in = enc.mlp_norm(x)
         if enc.canon_c is not None:
             mlp_in = enc.canon_c(
@@ -1405,12 +1410,23 @@ class ModernBertMLPResidual(nn.Module):
                 cu_seqlens=cu_seqlens,
                 attention_mask=token_mask,
             )
-        return x + enc.mlp(
+        out = enc.mlp(
             mlp_in,
             position_ids=position_ids,
             cu_seqlens=cu_seqlens,
             attention_mask=token_mask,
         )
+        return out
+
+
+@functools.lru_cache(maxsize=None)
+def _cute_available() -> bool:
+    """CuTeDSL (nvidia-cutlass-dsl) importable: the CuTe mHC kernels can be built."""
+    try:
+        import cutlass.cute  # noqa: F401
+    except Exception:
+        return False
+    return True
 
 
 def _build_permutation_matrices(n: int) -> tuple[torch.Tensor, int]:
@@ -1444,9 +1460,13 @@ class MHCLiteBlock(nn.Module):
         hidden_size: int,
         layer: nn.Module,
         triton_fused: bool = False,
+        merge_residual: bool = True,
     ):
         super().__init__()
         self.n = n_streams
+        # True: `layer` returns li + f and H_merged = H_res - h_post h_pre^T cancels li.
+        # False: `layer` returns f and the post-map uses H_res directly.
+        self.merge_residual = merge_residual
         self.C = hidden_size
         self.nC = n_streams * hidden_size
         self.layer = layer
@@ -1472,10 +1492,31 @@ class MHCLiteBlock(nn.Module):
         # Parity with ModernBertEncoderLayer: debug_metrics enumerates this
         # class as a block, so it needs a tap to sample its output stream.
         self.repeat_tap = RepeatTap()
+        if n_streams == 4:
+            # fused kernels (mhc_fused_v2 / mhc_cute_ops): (32, 16) permutation table padded
+            # with 8 zero rows so it lines up with the 32-wide projection
+            self.register_buffer(
+                "perm_mat_pad",
+                torch.cat([perm_flat.new_zeros(2 * n_streams, n_streams * n_streams), perm_flat]).float(),
+                persistent=False,
+            )
 
     @property
     def attention_type(self):
         return self.layer.attention_type
+
+    def _backend(self, x_streams: torch.Tensor) -> str:
+        """Kernel set for a triton_fused block: "cute" (CuTeDSL pre kernels + v2 post,
+        n=4, C=1024, sm90), "v2" (fused Triton pre + post, n=4) or "triton" (the
+        per-op Triton kernels). NANOPLM_MHC_BACKEND=cute|v2|triton forces one, for A/Bs."""
+        forced = os.environ.get("NANOPLM_MHC_BACKEND", "").strip().lower()
+        if forced in ("cute", "v2", "triton"):
+            return forced if (forced == "triton" or self.n == 4) else "triton"
+        if self.n != 4:
+            return "triton"
+        if self.C == 1024 and torch.cuda.get_device_capability(x_streams.device) == (9, 0) and _cute_available():
+            return "cute"
+        return "v2"
 
     def _mhc_coeffs_pytorch(
         self, x_streams: torch.Tensor
@@ -1500,6 +1541,8 @@ class MHCLiteBlock(nn.Module):
         a_res = F.softmax(self.alpha_res.to(dt) * res_proj + res_bias, dim=-1)
 
         H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
+        if not self.merge_residual:
+            return h_pre, h_post, H_res
         H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
         return h_pre, h_post, H_merged
 
@@ -1585,6 +1628,8 @@ class MHCLiteBlock(nn.Module):
         a_res = F.softmax(self.alpha_res.to(dt) * res_proj + bias[2 * n :], dim=-1)
 
         H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
+        if not self.merge_residual:
+            return h_pre, h_post, H_res
         H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
         return h_pre, h_post, H_merged
 
@@ -1671,6 +1716,23 @@ class MHCLiteBlock(nn.Module):
             and x_streams.dim() == 3  # (T, n, C) — no batch dim
         )
 
+        backend = self._backend(x_streams) if use_triton else None
+        if backend == "cute":
+            from .mhc_cute_ops import mhc_cute_block
+
+            alpha3 = torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res]).float()
+            return mhc_cute_block(
+                x_streams, self.layer, self.W_all.weight, alpha3,
+                self.W_all.bias.float(), self.perm_mat_pad.float(), merge=self.merge_residual, **kwargs,
+            )
+        if backend == "v2":
+            from .mhc_fused_v2 import mhc_fused_block
+
+            alpha3 = torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res]).float()
+            return mhc_fused_block(
+                x_streams, self.layer, self.W_all.weight, alpha3,
+                self.W_all.bias.float(), self.perm_mat_pad.float(), merge=self.merge_residual, **kwargs,
+            )
         if use_triton:
             out = self._forward_triton(x_streams, **kwargs)
         else:
@@ -1684,11 +1746,13 @@ class MHCLiteSublayersLayer(nn.Module):
     def __init__(self, config: ModernBertConfig, layer_idx: int):
         super().__init__()
         self.enc = ModernBertEncoderLayer(config, layer_idx)
+        # the branches return f alone, so the post-map uses H_res as is (no H_merged)
         self.mhc_attn = MHCLiteBlock(
             config.mhc_n_streams,
             config.hidden_size,
             ModernBertAttnResidual(self.enc),
             triton_fused=config.mhc_triton_fused,
+            merge_residual=False,
         )
         self.mhc_mlp = (
             MHCLiteBlock(
@@ -1696,6 +1760,7 @@ class MHCLiteSublayersLayer(nn.Module):
                 config.hidden_size,
                 ModernBertMLPResidual(self.enc),
                 triton_fused=config.mhc_triton_fused,
+                merge_residual=False,
             )
             if self.enc.mlp is not None
             else None
@@ -1732,6 +1797,31 @@ def _block_owns_layer_checkpoint(block: nn.Module, loop_count=None) -> bool:
         return False
     fn = getattr(block, "_use_internal_layer_ac", None)
     return bool(fn()) if callable(fn) else False
+
+
+MHC_INIT_STD = 0.02  # DeepSeek-V4 initializer_range for the mHC projections
+
+
+class MHCHyperHead(nn.Module):
+    """Final collapse of the n residual streams (DeepseekV4HyperHead): a learned,
+    per-token sigmoid weighting of the streams from the RMS-normalised n*C row,
+    summed, before the final norm. Coefficients in fp32."""
+
+    def __init__(self, n_streams: int, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.n = n_streams
+        self.nC = n_streams * hidden_size
+        self.eps = eps
+        self.hc_fn = nn.Parameter(torch.empty(n_streams, self.nC))
+        self.hc_base = nn.Parameter(torch.zeros(n_streams))
+        self.hc_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (..., n, C) -> (..., C)."""
+        flat = F.rms_norm(x.flatten(-2).float(), (self.nC,), eps=self.eps)
+        mixes = F.linear(flat, self.hc_fn.float())
+        pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
+        return (pre.unsqueeze(-1) * x.float()).sum(dim=-2).to(x.dtype)
 
 
 class ModernBertModel(nn.Module):
@@ -1804,6 +1894,10 @@ class ModernBertModel(nn.Module):
         # Identity unless debug_metrics installs an accumulator (no state_dict
         # keys); samples the encoder output handed to the head/decoder.
         self.final_norm_tap = StatsTap()
+        # mHC: learned collapse of the residual streams before final_norm (DeepseekV4HyperHead)
+        self.mhc_head = (
+            MHCHyperHead(config.mhc_n_streams, config.hidden_size) if config.use_mhc_lite else None
+        )
         # Set by cpu_offload.install() to flush the final activation offload.
         self._cpu_offload_flush = None
         self.rotary_emb = ModernBertRotaryEmbedding(config)
@@ -1829,6 +1923,15 @@ class ModernBertModel(nn.Module):
         # residual backward that inductor cannot fold away, so hand the layers
         # a plain Python list of literals instead — see `_residual_add`.
         self._prores_alphas_off: list[float] = [1.0] * config.num_hidden_layers
+
+    @staticmethod
+    def _mhc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+        """Embedding (..., C) -> n residual streams (..., n, C), each a copy (DeepSeek-V4)."""
+        return x.unsqueeze(-2).expand(*x.shape[:-1], n, x.shape[-1]).contiguous()
+
+    def _mhc_readout(self, x: torch.Tensor) -> torch.Tensor:
+        """n residual streams (..., n, C) -> (..., C) through the learned hyper-head."""
+        return self.mhc_head(x)
 
     def update_prores_alphas(self, step: int) -> None:
         """Recompute per-layer ProRes alphas. Call once per optimizer step.
@@ -2099,7 +2202,7 @@ class ModernBertModel(nn.Module):
             x = self.embeddings(input_ids)  # (total_tokens, hidden)
             if self.config.use_mhc_lite:
                 n = self.config.mhc_n_streams
-                x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))  # (T, n, C)
+                x = self._mhc_expand(x, n)  # (T, n, C)
             x0 = x if self.x0_lambdas is not None else None
             if _position_ids is None:
                 _position_ids = _position_ids_from_cu_seqlens(
@@ -2312,7 +2415,7 @@ class ModernBertModel(nn.Module):
                         )
 
             if self.config.use_mhc_lite:
-                x = x[..., 0, :]  # compress: take stream 0
+                x = self._mhc_readout(x)
             return run_flush(
                 self._cpu_offload_flush, self.final_norm_tap(self.final_norm(x))
             )
@@ -2328,7 +2431,7 @@ class ModernBertModel(nn.Module):
         x = self.embeddings(input_ids)
         if self.config.use_mhc_lite:
             n = self.config.mhc_n_streams
-            x = F.pad(x.unsqueeze(-2), (0, 0, 0, n - 1))  # (B, S, n, C)
+            x = self._mhc_expand(x, n)  # (B, S, n, C)
         x0 = x if self.x0_lambdas is not None else None
 
         attn_masks = {
@@ -2521,7 +2624,7 @@ class ModernBertModel(nn.Module):
                     )
 
         if self.config.use_mhc_lite:
-            x = x[..., 0, :]  # compress: take stream 0
+            x = self._mhc_readout(x)
         return run_flush(
             self._cpu_offload_flush, self.final_norm_tap(self.final_norm(x))
         )
@@ -2745,26 +2848,24 @@ class ModernBertForMaskedLM(nn.Module):
             if enc.attn.repo is not None:
                 nn.init.zeros_(enc.attn.repo.W_z.weight)
 
-            # mHC-lite: zero-init fused projection, set biases for identity behavior
+            # mHC coefficient init as DeepSeek-V4 (transformers DeepseekV4HyperConnection):
+            # projection ~ N(0, 0.02), biases 0, scales 1 -> h_pre ~ 0.5, h_post ~ 1 and
+            # H_res ~ the uniform doubly-stochastic matrix (all 24 permutations equally weighted)
             def _init_mhc_block(block: MHCLiteBlock) -> None:
-                nn.init.zeros_(block.W_all.weight)
-                n_s = block.n
-                bias = block.W_all.bias.data
-                # pre bias: first n values
-                bias[:n_s].fill_(-1.0)
-                bias[0] = 1.0
-                # post bias: next n values
-                bias[n_s : 2 * n_s].fill_(-1.0)
-                bias[n_s] = 1.0
-                # res bias: last n! values
-                bias[2 * n_s :].fill_(-8.0)
-                bias[2 * n_s + block._identity_idx] = 0.0
-                block.alpha_pre.fill_(0.01)
-                block.alpha_post.fill_(0.01)
-                block.alpha_res.fill_(0.01)
+                nn.init.normal_(block.W_all.weight, mean=0.0, std=MHC_INIT_STD)
+                nn.init.zeros_(block.W_all.bias)
+                block.alpha_pre.fill_(1.0)
+                block.alpha_post.fill_(1.0)
+                block.alpha_res.fill_(1.0)
 
             for block in mhc_blocks:
                 _init_mhc_block(block)
+
+        head = getattr(self.model, "mhc_head", None)
+        if head is not None:  # DeepseekV4HyperHead init
+            nn.init.normal_(head.hc_fn, mean=0.0, std=MHC_INIT_STD)
+            nn.init.zeros_(head.hc_base)
+            nn.init.ones_(head.hc_scale)
 
         nn.init.uniform_(self.head.dense.weight, -bound, bound)
         if self.head.dense.bias is not None:
