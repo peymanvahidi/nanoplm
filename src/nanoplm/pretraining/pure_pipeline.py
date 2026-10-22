@@ -3105,10 +3105,8 @@ def run_pure_pretraining(
                 )
             if is_main:
                 logger.info(
-                    "Resume decay anneals the trunk over %d steps. NOTE: the decay phase "
-                    "restarts the dataloader from the start of a pass, so weight "
-                    "equivalence with a single-run wsd decay holds only when the "
-                    "stable->decay boundary is data-pass aligned (spec sections 7/13).",
+                    "Resume decay anneals the trunk over %d steps, continuing the data "
+                    "from the trunk's saved position.",
                     resume_decay_steps,
                 )
             scheduler = _rebuild_scheduler_for_resume(
@@ -3125,18 +3123,12 @@ def run_pure_pretraining(
             total_steps = resume_decay_steps
             warmup_steps = 0
             start_step = 0
-            start_epoch = 0
             horizon = StepHorizon(total_steps=resume_decay_steps)
             resume_force_final = True
             # Re-clamp logging/eval/save to the (shorter) decay horizon.
             logging_steps = max(1, min(total_steps, logging_steps))
             eval_steps = max(1, min(total_steps, eval_steps))
             save_steps = max(1, min(total_steps, save_steps))
-            # Fresh phase: no dataloader fast-forward.
-            resume_epoch = 0
-            resume_data_step = 0
-            resume_sub_batch_step = 0
-            resume_batch_split_divisor = 1
             if is_main:
                 logger.info(
                     "Resume decay: total_steps=%d (decay), peak LR from checkpoint, "
@@ -3157,44 +3149,48 @@ def run_pure_pretraining(
                 decay_steps=horizon.decay_steps,
                 is_main=is_main,
             )
-            resume_epoch = start_epoch
-            if (
-                not _dataset_changed
-                and _ckp_state is not None
-                and "epoch_data_step" in _ckp_state
-            ):
-                # Restore the exact within-pass position saved at checkpoint time.
-                # (Every save, terminal included, persists epoch_data_step/
-                # sub_batch/divisor; the dataloader fast-forwards to this point.)
-                resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
-                resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
-                resume_batch_split_divisor = max(
-                    1, int(_ckp_state.get("batch_split_divisor", 1))
-                )
-            else:
-                # Dataset changed, or a checkpoint written before the position
-                # was saved (terminal/role checkpoints only carry it since
-                # #154): replay the DataLoader from the top of the current pass
-                # (spec §11 honest fallback). The LR schedule still fast-forwards
-                # via global_step.
-                resume_data_step = 0
-                resume_sub_batch_step = 0
-                resume_batch_split_divisor = 1
-            if resume_data_step >= synced_len:
-                # Saved position lands at/after the end of a pass; start the next
-                # pass cleanly from the top.
-                resume_data_step = 0
-                resume_sub_batch_step = 0
-                resume_batch_split_divisor = 1
-                resume_epoch = start_epoch + 1
-                start_epoch = resume_epoch
-            if is_main:
-                logger.info(
-                    "Resume continue: total_steps=%d, start_step=%d, "
-                    "fast-forward to epoch=%d data_step=%d sub_batch=%d divisor=%d",
-                    total_steps, start_step, resume_epoch, resume_data_step,
-                    resume_sub_batch_step, resume_batch_split_divisor,
-                )
+        # Both modes continue the data where the checkpoint stopped. A decay
+        # that restarted the pass would re-train on data the trunk has already
+        # seen, and arms branching from one trunk step would only share their
+        # cooldown data if that step happened to be pass-aligned.
+        resume_epoch = start_epoch
+        if (
+            not _dataset_changed
+            and _ckp_state is not None
+            and "epoch_data_step" in _ckp_state
+        ):
+            # Restore the exact within-pass position saved at checkpoint time.
+            # (Every save, terminal included, persists epoch_data_step/
+            # sub_batch/divisor; the dataloader fast-forwards to this point.)
+            resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
+            resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
+            resume_batch_split_divisor = max(
+                1, int(_ckp_state.get("batch_split_divisor", 1))
+            )
+        else:
+            # Dataset changed, or a checkpoint written before the position
+            # was saved (terminal/role checkpoints only carry it since
+            # #154): replay the DataLoader from the top of the current pass
+            # (spec §11 honest fallback). The LR schedule still fast-forwards
+            # via global_step.
+            resume_data_step = 0
+            resume_sub_batch_step = 0
+            resume_batch_split_divisor = 1
+        if resume_data_step >= synced_len:
+            # Saved position lands at/after the end of a pass; start the next
+            # pass cleanly from the top.
+            resume_data_step = 0
+            resume_sub_batch_step = 0
+            resume_batch_split_divisor = 1
+            resume_epoch = start_epoch + 1
+            start_epoch = resume_epoch
+        if is_main:
+            logger.info(
+                "Resume %s: total_steps=%d, start_step=%d, "
+                "fast-forward to epoch=%d data_step=%d sub_batch=%d divisor=%d",
+                _resume_mode, total_steps, start_step, resume_epoch, resume_data_step,
+                resume_sub_batch_step, resume_batch_split_divisor,
+            )
 
     # ---- W&B ----
     wandb_enabled = False

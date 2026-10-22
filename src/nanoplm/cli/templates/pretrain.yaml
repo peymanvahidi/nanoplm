@@ -387,9 +387,8 @@ resume:
   #   Set exactly one of decay_tokens / decay_steps. decay_shape is OPTIONAL
   #   (falls back to schedule default). lr_decay_to_fraction is REQUIRED for
   #   mode: decay.
-  #   NOTE: decay restarts the dataloader from the start of a pass, so a
-  #   resume-decay matches a single-run wsd decay bit-for-bit only when the
-  #   trunk's stable->decay boundary is data-pass aligned; keep
+  #   NOTE: decay continues the dataloader from the trunk's saved position,
+  #   so it sees the data a single-run wsd decay would; keep
   #   global_batch_tokens / world_size identical to the trunk's run.
   mode: "decay"                         # continue | decay
 
