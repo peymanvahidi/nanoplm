@@ -130,6 +130,7 @@ model:
   moe_bias_update_rate: 1e-3            # expert-bias correction step size
   moe_leading_dense_layers: 1           # first N layers stay dense (DeepSeek uses 1)
   moe_kernel_backend: 'sonicmoe'        # cutlass | sonicmoe  (SonicMoE/quack fused path)
+  moe_nan_guard: false                  # skip and log a step with a NaN instead of crashing (+1 host sync/step)
 
   # ── Recycling / Huginn looping (pure_torch only) ──────────────────────────
 

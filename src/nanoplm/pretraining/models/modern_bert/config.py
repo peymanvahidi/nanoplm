@@ -156,6 +156,13 @@ class ModernBertConfig:
     moe_topk_group: int = 1
     moe_bias_update_rate: float = 1e-3
     moe_leading_dense_layers: int = 0  # first N layers are always dense (DeepSeek uses 1)
+    # Skip-and-log NaN mitigation. A non-finite router input makes the fused top-k
+    # return an out-of-bounds index and the next gather aborts the job. With the
+    # guard on, the index is clamped (training mode only) so the forward finishes
+    # with a non-finite loss, and the pipeline skips that step and logs it. The
+    # pipeline force-enables its non-finite-loss/grad checks whenever this is on,
+    # so the clamp can never run without the skip path behind it.
+    moe_nan_guard: bool = False
     # Routed-expert compute backend (pure_torch MoE only). 'cutlass' = the custom
     # device-side grouped-GEMM kernel (default, sync-free). 'sonicmoe' = the
     # SonicMoE/quack fused expert path (sync-free fwd+bwd, fused dispatch gather);

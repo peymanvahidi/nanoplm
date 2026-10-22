@@ -3401,8 +3401,27 @@ def run_pure_pretraining(
     first_step_of_run = True
     consecutive_nonfinite_skips = 0
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
-    loss_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
+    # moe_nan_guard clamps the router index so a NaN forward finishes instead of
+    # aborting. That is only safe with the skip path below behind it, so the
+    # guard switches the non-finite loss check on by itself, plus a gradient-norm
+    # check of its own. Read from the constructed routers rather than the config,
+    # so the two cannot disagree.
+    moe_nan_guard_active = any(
+        getattr(m.router, "nan_guard", False) for m in _moe_layers
+    )
+    loss_finite_check = (
+        _DeferredFiniteCheck(device)
+        if debug_non_finite_params or moe_nan_guard_active
+        else None
+    )
     param_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
+    nonfinite_loss_skips = 0
+    nonfinite_grad_skips = 0
+    if moe_nan_guard_active and is_main:
+        logger.info(
+            "moe_nan_guard on: router index clamped in training; steps with a "
+            "non-finite loss or gradient norm are skipped and logged"
+        )
 
     def _raise_on_nonfinite_params(context: str) -> None:
         # Consumes the async verdict submitted after the previous optimizer
@@ -3804,6 +3823,7 @@ def run_pure_pretraining(
                                 loss_nonfinite = bool(_lf.item() > 0)
                     if loss_nonfinite:
                         consecutive_nonfinite_skips += 1
+                        nonfinite_loss_skips += 1
                         rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                         logger.error(
                             "Skipping optimizer step %d due to non-finite loss on rank %d "
@@ -3876,7 +3896,38 @@ def run_pure_pretraining(
                     )
 
                     step_skipped = False
-                    if scaler is not None and scaler.is_enabled():
+                    grad_nonfinite = False
+                    if moe_nan_guard_active:
+                        # A NaN that reaches the gradients but not the loss (one
+                        # born after the last router, say) would make
+                        # clip_grad_norm_ scale every gradient by NaN. Decide
+                        # globally so no rank steps while another skips. This is
+                        # one host sync per step, so only the guard pays it.
+                        _gn = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
+                        _gf = (~torch.isfinite(_gn.detach().float())).float().reshape(1)
+                        if distributed and dist.is_initialized():
+                            dist.all_reduce(_gf, op=dist.ReduceOp.MAX)
+                        grad_nonfinite = bool(_gf.item() > 0)
+                    if grad_nonfinite:
+                        # Reuses the scaler's skipped-step path below: no LR
+                        # schedule step, no MoE bias update from this window.
+                        step_skipped = True
+                        consecutive_nonfinite_skips += 1
+                        nonfinite_grad_skips += 1
+                        _rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                        logger.error(
+                            "Skipping optimizer step %d due to non-finite gradient norm on "
+                            "rank %d (consecutive=%d, total grad skips=%d).",
+                            upcoming_step, _rank, consecutive_nonfinite_skips,
+                            nonfinite_grad_skips,
+                        )
+                        if consecutive_nonfinite_skips >= _MAX_CONSECUTIVE_NONFINITE_SKIPS:
+                            raise RuntimeError(
+                                f"Aborting at step {upcoming_step}: "
+                                f"{consecutive_nonfinite_skips} consecutive non-finite skips "
+                                "(not recovering)."
+                            )
+                    elif scaler is not None and scaler.is_enabled():
                         old_scale = scaler.get_scale()
                         if isinstance(optimizer, MuonAdamWGroup):
                             scaler.step(optimizer.muon)
@@ -3947,7 +3998,8 @@ def run_pure_pretraining(
                                 ])
                         _moe_count_accum.zero_()
 
-                    consecutive_nonfinite_skips = 0
+                    if not grad_nonfinite:
+                        consecutive_nonfinite_skips = 0
                     global_step += 1
                     tokens_seen += int(achieved_global_batch_tokens)
                     profiler_step_cb(global_step)
@@ -4103,11 +4155,15 @@ def run_pure_pretraining(
                             f"dt={avg_step_ms:.2f}ms eta={eta_hours:.2f}h "
                             f"wall={wall_elapsed:.1f}s waste={waste:.1f}% "
                             f"h100_mfu={mfu:.2%} {moe_str}{vram_log}"
+                            + (f" nonfinite_skips=loss:{nonfinite_loss_skips},grad:{nonfinite_grad_skips}"
+                               if moe_nan_guard_active else "")
                         )
                         payload = {
                             "train/global_step": global_step,
                             "train/loss": avg_loss,
                             "train/grad_norm": grad_norm_val,
+                            "train/nonfinite_loss_skips": nonfinite_loss_skips,
+                            "train/nonfinite_grad_skips": nonfinite_grad_skips,
                             "train/learning_rate": learning_rate,
                             "train/epoch": epoch_progress,
                             "train/tokens_per_sec": tps,

@@ -533,6 +533,12 @@
           "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
           "description": "cutlass | sonicmoe  (SonicMoE/quack fused path)"
         },
+        "moe_nan_guard": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "description": "skip and log a step with a NaN instead of crashing (+1 host sync/step)"
+        },
         "use_huginn_looping": {
           "type": "boolean",
           "default": false,
