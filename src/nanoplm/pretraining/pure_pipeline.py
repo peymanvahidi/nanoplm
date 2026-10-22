@@ -3052,6 +3052,12 @@ def run_pure_pretraining(
             orig_model, optimizer, scheduler, resume_config.checkpoint_dir,
             device, distributed, load_scheduler=False, distributed_mode=distributed_mode,
         )
+        if device.type == "cuda":
+            # _load_checkpoint put the full (unsharded) model and optimizer state
+            # dicts on the GPU. Hand their cached blocks back to the driver so
+            # NCCL's own allocations still fit in runs that train within a few
+            # GB of the device limit.
+            torch.cuda.empty_cache()
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
         # Detect dataset change: if the current dataset differs from the
