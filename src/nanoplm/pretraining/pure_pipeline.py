@@ -1855,26 +1855,72 @@ def _resolve_world_size(cfg: PretrainingConfig) -> int:
     return int(cfg.world_size) if cfg.world_size else 1
 
 
-def _sync_train_loader_len(
-    train_loader_len: int, distributed: bool, device: torch.device
-) -> int:
-    """Return the shared number of micro-batches all ranks can safely execute."""
-    if not (distributed and dist.is_initialized()):
-        return train_loader_len
-    t = torch.tensor(train_loader_len, device=device, dtype=torch.int64)
-    mn, mx = t.clone(), t.clone()
-    dist.all_reduce(mn, op=dist.ReduceOp.MIN)
-    dist.all_reduce(mx, op=dist.ReduceOp.MAX)
-    min_len = int(mn)
-    max_len = int(mx)
-    if min_len != max_len and dist.get_rank() == 0:
-        logger.warning(
-            "Mismatched train loader lengths across ranks (min=%d, max=%d); "
-            "using min length for synchronized micro-step scheduling.",
-            min_len,
-            max_len,
+class _TrainLenSync:
+    """The shared number of micro-batches all ranks can safely execute in a pass.
+
+    Called once per pass, since the packed batch count changes with the epoch; a
+    length mismatch across ranks is warned about once per run, not once per pass.
+    """
+
+    def __init__(self, distributed: bool, device: torch.device):
+        self.distributed = distributed
+        self.device = device
+        self.warned = False
+
+    def __call__(self, train_loader_len: int) -> int:
+        if not (self.distributed and dist.is_initialized()):
+            return train_loader_len
+        t = torch.tensor(train_loader_len, device=self.device, dtype=torch.int64)
+        mn, mx = t.clone(), t.clone()
+        dist.all_reduce(mn, op=dist.ReduceOp.MIN)
+        dist.all_reduce(mx, op=dist.ReduceOp.MAX)
+        min_len = int(mn)
+        max_len = int(mx)
+        if min_len != max_len and not self.warned and dist.get_rank() == 0:
+            self.warned = True
+            logger.warning(
+                "Mismatched train loader lengths across ranks (min=%d, max=%d); "
+                "using min length for synchronized micro-step scheduling.",
+                min_len,
+                max_len,
+            )
+        return min_len
+
+
+# Pass 0 this close to one optimizer step's worth of micro-batches draws a warning: a
+# later pass can be shorter (the packed batch count moves with the shuffle, and a
+# cluster-sampled dataset draws other members) and would then stop the run.
+SHORT_PASS_MARGIN = 0.10
+
+
+def _check_pass_len(
+    synced_len: int, grad_accum: int, global_batch_tokens, pass_idx: Optional[int] = None
+) -> Optional[str]:
+    """Raise when a pass has fewer micro-batches per rank than one optimizer step
+    needs. ``pass_idx`` None is the startup check of pass 0; it returns a warning when
+    the pass is within SHORT_PASS_MARGIN of that limit."""
+    fix = "Lower global_batch_tokens or use a larger dataset."
+    if synced_len < grad_accum:
+        where = "per pass" if pass_idx is None else f"in pass {pass_idx + 1}"
+        varies = "" if pass_idx is None else (
+            " Pass lengths vary with the shuffle (and with the member draw of a "
+            "cluster-sampled dataset), so an earlier pass could be long enough."
         )
-    return min_len
+        raise RuntimeError(
+            f"train_loader yields {synced_len} micro-batches per rank {where}, fewer than "
+            f"grad_accum={grad_accum}: one optimizer step "
+            f"(global_batch_tokens={global_batch_tokens}) is larger than a pass over the "
+            f"train set.{varies} {fix}"
+        )
+    if pass_idx is None and synced_len < grad_accum * (1 + SHORT_PASS_MARGIN):
+        return (
+            f"train_loader yields {synced_len} micro-batches per rank per pass, within "
+            f"{SHORT_PASS_MARGIN:.0%} of grad_accum={grad_accum}. Pass lengths vary, so a "
+            f"later pass may come up short and stop the run. {fix}"
+        )
+    return None
+
+
   # TODO: this is comming from master branch
 # def _dist_barrier(local_rank: int) -> None:
 #     if not dist.is_initialized():
@@ -2926,10 +2972,12 @@ def run_pure_pretraining(
     # members), so synced_len is recomputed whenever the epoch changes.
     epoch_setter = train_ds if use_packing else train_sampler
 
+    sync_train_len = _TrainLenSync(distributed, device)
+
     def _synced_len_at(epoch_: int) -> int:
         if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
             epoch_setter.set_epoch(epoch_)
-        return _sync_train_loader_len(len(train_loader), distributed, device)
+        return sync_train_len(len(train_loader))
 
     synced_len = _synced_len_at(0)
     synced_len_epoch = 0
@@ -2941,13 +2989,11 @@ def run_pure_pretraining(
     # Batch warmup only lowers grad_accum, so a pass that fits one full window
     # fits every warmup window too. Otherwise no pass can step and the replay
     # loop below would spin forever.
-    if synced_len < inferred_grad_accum_steps:
-        raise RuntimeError(
-            f"train_loader yields {synced_len} micro-batches per rank per pass, fewer than "
-            f"grad_accum={inferred_grad_accum_steps}: one optimizer step "
-            f"(global_batch_tokens={pretrain_config.global_batch_tokens}) is larger than a "
-            "pass over the train set. Lower global_batch_tokens or use a larger dataset."
-        )
+    short_pass = _check_pass_len(
+        synced_len, inferred_grad_accum_steps, pretrain_config.global_batch_tokens
+    )
+    if short_pass and is_main:
+        logger.warning(short_pass)
 
     # ---- Training horizon (token budget -> optimizer steps) ----
     # total_steps comes from the configured token/step budget, NOT from epochs.
@@ -3210,6 +3256,8 @@ def run_pure_pretraining(
             if resume_epoch != synced_len_epoch:
                 synced_len = _synced_len_at(resume_epoch)
                 synced_len_epoch = resume_epoch
+                _check_pass_len(synced_len, inferred_grad_accum_steps,
+                                pretrain_config.global_batch_tokens, resume_epoch)
             if resume_data_step >= synced_len:
                 # Saved position lands at/after the end of a pass; start the next
                 # pass cleanly from the top.
@@ -3559,11 +3607,8 @@ def run_pure_pretraining(
             if epoch != synced_len_epoch:
                 synced_len = _synced_len_at(epoch)
                 synced_len_epoch = epoch
-                if synced_len < inferred_grad_accum_steps:
-                    raise RuntimeError(
-                        f"train_loader yields {synced_len} micro-batches per rank in pass "
-                        f"{epoch + 1}, fewer than grad_accum={inferred_grad_accum_steps}."
-                    )
+                _check_pass_len(synced_len, inferred_grad_accum_steps,
+                                pretrain_config.global_batch_tokens, epoch)
             # global_step at the start of this pass — used only for the
             # per-pass "optimizer steps" log line below.
             epoch_start_step = global_step

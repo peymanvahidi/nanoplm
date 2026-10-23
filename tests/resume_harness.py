@@ -108,8 +108,8 @@ def run_phase(spec: dict) -> None:
     pp.init_device_mesh = lambda _t, *a, **k: _mesh("cpu", *a, **k)
     over = spec.get("len_overreport", 0)
     if over:  # a loader whose __len__ over-reports, like packing with workers
-        _sync = pp._sync_train_loader_len
-        pp._sync_train_loader_len = lambda n, *a: _sync(n + over, *a)
+        _sync = pp._TrainLenSync.__call__
+        pp._TrainLenSync.__call__ = lambda self, n: _sync(self, n + over)
 
     log, msgs = [], []
     orig_move = pp._move_batch_to_device
