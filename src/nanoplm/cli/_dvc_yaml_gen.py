@@ -405,9 +405,10 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
     }
     tsv = str(plan.members_tsv)
     info = str(plan.members_tsv.with_suffix(".json"))
+    # cluster_table.build_members_table runs this stage; an edit elsewhere in the cluster
+    # prep code must not rerun the XML scan or MMseqs2
     members_deps = ["${data_dirs.filtered_fasta}",
-                    dep("src/nanoplm/data/preparation/cluster_table.py"),
-                    dep("src/nanoplm/data/preparation/cluster_pipeline.py")]
+                    dep("src/nanoplm/data/preparation/cluster_table.py")]
     # a data.yaml written before the key existed has no clustering (= auto); DVC
     # refuses a listed param that is missing from the file
     members_params = (["cluster_subsampling.clustering"]

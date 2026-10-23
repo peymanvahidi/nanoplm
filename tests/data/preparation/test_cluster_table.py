@@ -7,7 +7,7 @@ import pytest
 from nanoplm.data.datasets.cluster_sampled import ClusterSampledDataset
 from nanoplm.data.preparation import cluster_index as ci
 from nanoplm.data.preparation import cluster_table as ct
-from nanoplm.data.preparation.cluster_pipeline import build_members_table
+from nanoplm.data.preparation.cluster_table import build_members_table
 from tests.data.datasets.cluster_pool import REPO
 from tests.data.preparation.test_cluster_index import MAX_LEN, _pool
 from tests.data.preparation.uniref_fixture import make_release

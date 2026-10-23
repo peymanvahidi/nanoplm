@@ -1,6 +1,8 @@
 """cluster_pipeline: end-to-end prep of a cluster-sampled dataset from a tiny release."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -9,18 +11,31 @@ from nanoplm.data.datasets import ClusterSampledDataset, ShardedDataset, open_tr
 from nanoplm.data.infra.manifest import read_manifest
 from nanoplm.data.infra.validation import validate_pretrain_dataset
 from nanoplm.data.preparation import cluster_pipeline as cp
+from nanoplm.data.preparation.checker import Checker
+from nanoplm.data.preparation.cluster_table import build_members_table
+from nanoplm.data.preparation.filterer import Filterer
 from tests.data.preparation.uniref_fixture import MAX_LEN, MIN_LEN, make_release
 
 
-def _cfg(root, release, level="uniref90", **kw):
-    fasta = release.fasta90 if level == "uniref90" else release.fasta100
-    base = dict(members_fasta=fasta, cluster_xml=release.xml, output_dir=root / "out",
-                validation_dir=root / "validation", filtered_fasta=root / "filtered.fasta",
-                min_seq_len=MIN_LEN, max_seq_len=MAX_LEN, val_ratio=0.1,
-                samples_per_shard=101, max_workers=1, cluster_source="uniref_xml",
-                level=level)
-    base.update(kw)
-    return cp.ClusterDataConfig(**base)
+def _prepare(root, release, level="uniref90", members_fasta=None, seqs_num=-1,
+             samples_per_shard=101, drop_invalid_sequences=False):
+    """The DVC stages in order (check, filter, cluster_pool, cluster_members,
+    cluster_index, write_manifest), called the way their commands call them."""
+    members_fasta = members_fasta or (release.fasta90 if level == "uniref90"
+                                      else release.fasta100)
+    out, validation = root / "out", root / "validation"
+    filtered = root / "filtered.fasta"
+    Checker(members_fasta, validation, drop_invalid=drop_invalid_sequences).check()
+    exclude = validation / "invalid_ids.txt"
+    Filterer(members_fasta, filtered, MIN_LEN, MAX_LEN, -1,
+             exclude_ids=exclude if exclude.exists() else None).filter()
+    cp.build_pool(filtered, out / "train", MAX_LEN, samples_per_shard, 0, 1)
+    tsv = out / "cluster_index" / "members.tsv"
+    build_members_table("uniref_xml", tsv, fasta=members_fasta, level=level, xml=release.xml)
+    cp.build_index_and_val(filtered, out / "train", tsv, out / "cluster_index" / "index",
+                           out / "val", MAX_LEN, 0.1, samples_per_shard, seqs_num)
+    m = cp.write_cluster_manifest(out, MIN_LEN, MAX_LEN, 0.1, samples_per_shard)
+    return SimpleNamespace(output_dir=out, filtered_fasta=filtered), m
 
 
 @pytest.fixture(scope="module")
@@ -30,9 +45,7 @@ def release(tmp_path_factory):
 
 @pytest.fixture(scope="module")
 def prepared(tmp_path_factory, release):
-    root = tmp_path_factory.mktemp("prep")
-    cfg = _cfg(root, release)
-    return cfg, cp.prepare_cluster_dataset(cfg)
+    return _prepare(tmp_path_factory.mktemp("prep"), release)
 
 
 def test_layout_and_manifest(prepared):
@@ -83,18 +96,18 @@ def test_pool_keeps_fasta_order_and_the_length_window(prepared, release):
 
 
 def test_uniref100_input(release, tmp_path):
-    m = cp.prepare_cluster_dataset(_cfg(tmp_path, release, level="uniref100"))
+    _, m = _prepare(tmp_path, release, level="uniref100")
     assert m.cluster_level == "uniref100"
 
 
 def test_seqs_num_caps_clusters(release, tmp_path):
-    m = cp.prepare_cluster_dataset(_cfg(tmp_path, release, seqs_num=120))
+    _, m = _prepare(tmp_path, release, seqs_num=120)
     assert m.seqs_num == 120 and m.val_sequences == 12 and m.train_sequences == 108
 
 
 def test_too_small_samples_per_shard_is_raised(release, tmp_path, monkeypatch):
     monkeypatch.setattr(cp.ci, "SHARD_SORT_CLIFF", 5)
-    m = cp.prepare_cluster_dataset(_cfg(tmp_path, release, samples_per_shard=10))
+    _, m = _prepare(tmp_path, release, samples_per_shard=10)
     rows = m.pool_sequences
     assert -(-rows // 10) >= 5                           # 10 per shard would be refused
     assert m.samples_per_shard == cp.ci.shard_size_for(rows, 10) > 10
@@ -119,21 +132,6 @@ def test_invalid_sequences_are_dropped_from_the_pool(release, tmp_path):
                   MIN_LEN <= len(release.u90[ln[len(">UniRef90_"):].split()[0]][2]) <= MAX_LEN)
     lines[k + 1] = "MK!V" + lines[k + 1][4:]            # an illegal character
     fasta.write_text("\n".join(lines))
-    cfg = _cfg(tmp_path, release, members_fasta=fasta, drop_invalid_sequences=True)
-    cp.prepare_cluster_dataset(cfg)
+    cfg, _ = _prepare(tmp_path, release, members_fasta=fasta, drop_invalid_sequences=True)
     assert f">UniRef90_{acc} " not in cfg.filtered_fasta.read_text()
 
-
-
-
-def test_programmatic_drop_invalid_default_matches_the_template():
-    import yaml
-    from nanoplm.cli.templates import load_template
-    tpl = yaml.safe_load(load_template("data_pretrain"))
-    want = tpl["data_params"]["drop_invalid_sequences"]
-    assert cp.ClusterDataConfig.__dataclass_fields__["drop_invalid_sequences"].default == want
-    tpl["data_params"].pop("drop_invalid_sequences")
-    tpl["cluster_subsampling"].update(enabled=True, members="uniref90")
-    tpl["data_dirs"]["url"] = cp.cc.UNIPROT_FASTA["uniref50"]
-    cfg, _ = cp.config_from_yaml(tpl)
-    assert cfg.drop_invalid_sequences == want

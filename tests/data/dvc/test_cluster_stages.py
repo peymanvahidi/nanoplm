@@ -108,6 +108,7 @@ def test_mmseqs_params_only_reach_cluster_members(tmp_path):
             flat = str(stage.get("params", "")) + str(stage.get("deps", ""))
             assert "cluster_subsampling" not in flat, name
     assert "members.tsv" not in str(st["cluster_pool"]["deps"])
+    assert not any("cluster_pipeline.py" in d for d in st["cluster_members"]["deps"])
 
 
 # ------------------------------------------------------------------ end to end

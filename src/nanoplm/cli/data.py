@@ -771,7 +771,7 @@ def get_cluster_xml(url: str, output: str):
 @click.option("--threads", type=int, default=None)
 def cluster_members(source, fasta, output, level, xml, identity, coverage, tmp_dir, threads):
     """Internal: write the canonical cluster table (cluster_id<TAB>sequence_id)."""
-    from nanoplm.data.preparation.cluster_pipeline import build_members_table
+    from nanoplm.data.preparation.cluster_table import build_members_table
     stats = build_members_table(source, Path(output), fasta=Path(fasta), level=level,
                                 xml=Path(xml) if xml else None, identity=identity,
                                 coverage=coverage, tmp_dir=Path(tmp_dir) if tmp_dir else None,

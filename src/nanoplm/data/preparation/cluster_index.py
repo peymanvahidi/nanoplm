@@ -49,7 +49,8 @@ import numpy as np
 from nanoplm.data.datasets.cluster_sampled import INDEX_MANIFEST
 from nanoplm.data.infra.atomic import atomic_write_path
 from nanoplm.data.preparation import uniref_hierarchy as uh
-from nanoplm.data.preparation.cluster_table import read_members_table
+from nanoplm.data.preparation.cluster_table import (  # noqa: F401  (re-exported)
+    detect_uniref_level, read_members_table)
 from nanoplm.utils import logger
 
 TOOL_VERSION = 1
@@ -148,19 +149,6 @@ def scan_pool_fasta(fasta: Path, want_rows: Optional[set] = None):
     lens = np.frombuffer(bytes(acc_len), dtype=np.uint16).astype(np.int64)
     keys = uh.hash_accessions(np.frombuffer(bytes(blob), dtype=np.uint8), lens)
     return keys, np.frombuffer(bytes(residues), dtype=np.int64), seqs
-
-
-def detect_uniref_level(fasta: Path) -> str:
-    """'uniref50', 'uniref90' or 'uniref100', from the first FASTA header."""
-    with open(fasta, "rb") as f:
-        for line in f:
-            if line.startswith(b">"):
-                for level, n in (("uniref100", b">UniRef100_"), ("uniref90", b">UniRef90_"),
-                                 ("uniref50", b">UniRef50_")):
-                    if line.startswith(n):
-                        return level
-                raise ValueError(f"{fasta}: header {line[:40]!r} is not a UniRef header")
-    raise ValueError(f"{fasta}: no FASTA header found")
 
 
 def token_length_specials(tokens: np.ndarray, residues: np.ndarray, max_len: int) -> int:

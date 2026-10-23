@@ -19,6 +19,7 @@ the source.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -246,4 +247,41 @@ def mmseqs_members_tsv(fasta, out_tsv, identity: float, coverage: float, tmp_dir
         shutil.rmtree(tmp_dir, ignore_errors=True)
     stats.update(source="mmseqs2", input=str(fasta), identity=identity, coverage=coverage, cov_mode=COV_MODE,
                  seconds=round(time.time() - t0, 1))
+    return stats
+
+
+def detect_uniref_level(fasta: Path) -> str:
+    """'uniref50', 'uniref90' or 'uniref100', from the first FASTA header."""
+    with open(fasta, "rb") as f:
+        for line in f:
+            if line.startswith(b">"):
+                for level, n in (("uniref100", b">UniRef100_"), ("uniref90", b">UniRef90_"),
+                                 ("uniref50", b">UniRef50_")):
+                    if line.startswith(n):
+                        return level
+                raise ValueError(f"{fasta}: header {line[:40]!r} is not a UniRef header")
+    raise ValueError(f"{fasta}: no FASTA header found")
+
+
+def build_members_table(source: str, out_tsv: Path, *, fasta: Path, level: Optional[str] = None,
+                        xml: Optional[Path] = None, identity: float = 0.5,
+                        coverage: float = 0.8, tmp_dir: Optional[Path] = None,
+                        mmseqs: Optional[str] = None, threads: Optional[int] = None) -> dict:
+    """members.tsv (and members.json, its stats) from one of the two sources. ``fasta``
+    is the member FASTA (filtered for mmseqs; any of them for the uniref_xml level check)."""
+    out_tsv = Path(out_tsv)
+    if source == "uniref_xml":
+        got = detect_uniref_level(Path(fasta))
+        if got != level:
+            raise ValueError(f"{fasta} holds {got} sequences, but the plan expects {level}; "
+                             "check cluster_subsampling.members and fasta")
+        stats = uh.xml_to_members_tsv(xml, out_tsv, level)
+    elif source == "mmseqs":
+        stats = mmseqs_members_tsv(fasta, out_tsv, identity, coverage,
+                                   tmp_dir or out_tsv.parent / ".mmseqs_tmp",
+                                   threads=threads, mmseqs=mmseqs)
+    else:
+        raise ValueError(f"unknown cluster source {source!r}")
+    with open(out_tsv.with_suffix(".json"), "w") as f:
+        json.dump(stats, f, indent=1)
     return stats
