@@ -10,7 +10,7 @@ import ReferenceFields from '../../../components/ReferenceFields.astro';
 The file has three parts:
 
 - `output_dir`, the folder every file is written to. `pretrain.yaml`'s `dataset_dir` points here.
-- `sources`, the FASTA to build from. Only one source is supported for now.
+- `sources`, the FASTAs to build from. Two or more make a mix, drawn by [`weight`](#data-sources-weight); see [Mixing datasets](/nanoplm/guides/mixing/).
 - `data_params`, the settings every source uses unless it sets its own.
 
 [`max_seq_len`](#data-data_params-max_seq_len) and [`register_tokens`](#data-data_params-register_tokens) also go into the manifest, and pretraining reads them from there, so `pretrain.yaml` has neither key.

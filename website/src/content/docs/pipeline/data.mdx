@@ -98,15 +98,16 @@ This is the template with its commented examples left out.
 ```yaml title="data.yaml"
 output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml's dataset_dir points here
 
-# One entry per FASTA. Only one source is supported for now.
-# weight = share of training sequences (not tokens); with one source it is 1.0.
+# One entry per FASTA. Several entries make a mix.
+# weight = share of training sequences (not tokens); weights must sum to 1.
 sources:
   swissprot:
     fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz
-    weight: 1.0
+    weight: 1.0          # 0.2 when mixed with uniref50 below
     # max_seq_len: 1024  # any data_params field set here overrides it for this source
 
-  # (a commented UniRef50 cluster-subsampling example and a `prepared:` example follow)
+  # (a commented UniRef50 cluster-subsampling source with weight 0.8 and a
+  #  commented another_source follow)
 
 data_params:
   max_seqs: 20000        # -1 = all
@@ -122,6 +123,8 @@ data_params:
   max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores
   register_tokens: 0     # 0, 1 or 2 scratch tokens after EOS
 ```
+
+With one source, `weight` must be `1.0` or left out. Two or more sources make a mix, drawn by `weight`: see [Mixing datasets](/nanoplm/guides/mixing/).
 
 `max_seqs`, `min_seq_len`, `max_seq_len` and `val_ratio` are required. You can leave out the other `data_params`. The template's values are the defaults, so deleting one, or writing it out, reruns nothing. The [data.yaml reference](/nanoplm/reference/data/) describes each key.
 

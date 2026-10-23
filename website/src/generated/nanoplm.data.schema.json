@@ -23,7 +23,7 @@
           "weight": {
             "type": "number",
             "default": 1.0,
-            "description": "Share of training sequences (not tokens) drawn from this source. Weights must sum to 1; with one source it is 1 or left out."
+            "description": "Share of training sequences (not tokens) drawn from this source. Weights must sum to 1 (within 1e-6); with one source it is 1 or left out. Changing only the weights rebuilds only the mixture manifest. A cluster source counts one sample per cluster visit."
           },
           "prepared": {
             "type": "string",
@@ -68,7 +68,7 @@
           }
         }
       },
-      "description": "One entry per source, keyed by a name you pick (letters, digits and _). Each names a fasta to build from or a prepared folder. Any data_params field set on a source overrides the default for that source. Only one source is supported for now."
+      "description": "One entry per source, keyed by a name you pick (letters, digits and _). Each names a fasta to build from or a prepared folder. Any data_params field set on a source overrides the default for that source. Several sources make a mix: each is built on its own and training draws from them by weight."
     },
     "data_params": {
       "type": "object",

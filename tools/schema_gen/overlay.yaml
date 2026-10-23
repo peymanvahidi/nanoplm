@@ -169,14 +169,16 @@ sources:
   description: >-
     One entry per source, keyed by a name you pick (letters, digits and _). Each
     names a fasta to build from or a prepared folder. Any data_params field set on
-    a source overrides the default for that source. Only one source is supported
-    for now.
-# data_config._weight: optional; with one source it must be 1
+    a source overrides the default for that source. Several sources make a mix:
+    each is built on its own and training draws from them by weight.
+# data_config._weight: optional with one source (then 1); required in a mix
 sources.weight:
   default: 1.0
   description: >-
     Share of training sequences (not tokens) drawn from this source. Weights must
-    sum to 1; with one source it is 1 or left out.
+    sum to 1 (within 1e-6); with one source it is 1 or left out. Changing only the
+    weights rebuilds only the mixture manifest. A cluster source counts one sample
+    per cluster visit.
 # data_config.PARAM_FIELDS order; the template's plain `# Rarely changed`
 # heading opens this block.
 data_params.shuffle: { group: Rarely changed }
