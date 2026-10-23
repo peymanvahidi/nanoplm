@@ -1,7 +1,7 @@
 output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml's dataset_dir points here
 
-# One entry per FASTA (one source for now).
-# weight = share of training sequences (not tokens); weights must sum to 1.
+# One entry per FASTA. Only one source is supported for now.
+# weight = share of training sequences (not tokens); with one source it is 1.0.
 sources:
   swissprot:
     fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz
@@ -11,7 +11,7 @@ sources:
   # uniref50:
   #   fasta: uniref50
   #   max_seqs: -1         # counts clusters here: all of them
-  #   val_ratio: 0.0044    # share of clusters held out, as in the UniRef90 experiment
+  #   val_ratio: 0.0044    # share of clusters held out for validation (145k of 32.9M)
   #   # Cluster subsampling: each epoch trains on one random member of every cluster.
   #   # members: uniref90 uses UniProt's UniRef50 clusters and trains on their UniRef90
   #   # members; the UniRef50 FASTA itself is never downloaded.
@@ -35,6 +35,6 @@ data_params:
   # Rarely changed
   shuffle: true          # shuffle before the train / val split
   shuffle_seed: 24
-  samples_per_shard: 2000  # raised automatically when a cluster pool needs it
+  samples_per_shard: 2000  # sequences per shard file; raised automatically for large cluster datasets
   max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores
   register_tokens: 0     # 0, 1 or 2 scratch tokens after EOS

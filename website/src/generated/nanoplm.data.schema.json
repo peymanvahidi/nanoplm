@@ -112,7 +112,7 @@
         "samples_per_shard": {
           "type": "integer",
           "default": 2000,
-          "description": "raised automatically when a cluster pool needs it",
+          "description": "sequences per shard file; raised automatically for large cluster datasets",
           "x-nanoplm-group": "Rarely changed"
         },
         "max_workers": {
