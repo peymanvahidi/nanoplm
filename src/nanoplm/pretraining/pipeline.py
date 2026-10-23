@@ -150,6 +150,9 @@ def run_pretraining(
     manifest: DataManifest,
     resume_config: Optional[ResumeConfig] = None,
 ) -> None:
+    if getattr(manifest, "is_mixture", False):
+        raise ValueError(f"{pretrain_config.dataset_dir} is a data mixture; data mixtures "
+                         "need --pure-torch (run_pure_pretraining).")
     # This path has no training horizon to run to: PretrainingConfig carries a
     # token budget rather than an epoch count, and resolve_total_steps lives in
     # the pure-torch pipeline. The CLI already refuses it in

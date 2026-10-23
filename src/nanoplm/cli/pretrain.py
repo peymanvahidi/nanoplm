@@ -163,6 +163,20 @@ def _check_pipeline_supported(pure_torch: bool) -> None:
         )
 
 
+def _check_mixture_supported(pure_torch: bool, dataset_dir) -> None:
+    """A mixture trains only on the pure-torch path. Runs before the shards of every
+    source are validated; an unreadable manifest is left to that validation."""
+    if pure_torch:
+        return
+    try:
+        manifest = read_manifest(dataset_dir)
+    except (FileNotFoundError, ValueError):
+        return
+    if getattr(manifest, "is_mixture", False):
+        raise ValueError(f"{dataset_dir} is a data mixture; data mixtures need --pure-torch "
+                         "(or pure_torch: true).")
+
+
 @click.group(name="pretrain", cls=ConfigErrorGroup, sections=YAML_FIRST_SECTIONS)
 @click.help_option("--help", "-h")
 def pretrain():
@@ -1219,6 +1233,10 @@ def run(
             "mHC-lite's doubly-stochastic stability guarantees."
         )
     _validate_distributed_mode(cfg, pure_torch=pure_torch)
+    try:
+        _check_mixture_supported(pure_torch, cfg.dataset_dir)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     _populate_batch_setup(cfg)
 
@@ -1443,6 +1461,7 @@ def from_yaml(config: str, pure_torch: bool):
             "pure_torch: true / --pure-torch. The HF path does not implement GQA."
         )
     _validate_distributed_mode(pretrain_config, pure_torch=pure_torch)
+    _check_mixture_supported(pure_torch, pretrain_config.dataset_dir)
     _populate_batch_setup(pretrain_config)
 
     # Fail fast before any heavy model instantiation: only the pure_torch
