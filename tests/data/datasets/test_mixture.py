@@ -29,8 +29,8 @@ SEED = 5
 def built(tmp_path_factory):
     """A mixture folder with two plain sources and a cluster source under it."""
     root = tmp_path_factory.mktemp("mix")
-    a = plain_source(root / "a", 300, tag=40, seed=1)
-    b = plain_source(root / "b", 40, tag=41, seed=2)
+    a = plain_source(root / "a", 300, tag=5, seed=1)
+    b = plain_source(root / "b", 40, tag=6, seed=2)
     c, pool = cluster_source(root / "c", seed=3)
     return root, {"a": a, "b": b, "c": c}, pool
 
@@ -86,7 +86,7 @@ def test_weights_within_the_tolerance_pass():
 
 def test_register_tokens_must_agree(built, tmp_path):
     _, folders, _ = built
-    other = plain_source(tmp_path / "r", 20, tag=42, register_tokens=1)
+    other = plain_source(tmp_path / "r", 20, tag=7, register_tokens=1)
     with pytest.raises(mx.MixtureError, match="same register_tokens; got a 0, r 1"):
         mx.write_mixture(tmp_path / "m", [("a", folders["a"], 0.5, ""), ("r", other, 0.5, "")])
 
@@ -99,11 +99,11 @@ def test_a_mixture_is_not_a_source(built, tmp_path):
 
 
 def test_training_refuses_a_source_rebuilt_after_the_mix(tmp_path):
-    a = plain_source(tmp_path / "a", 30, tag=40)
-    b = plain_source(tmp_path / "b", 30, tag=41)
+    a = plain_source(tmp_path / "a", 30, tag=5)
+    b = plain_source(tmp_path / "b", 30, tag=6)
     m = _write(tmp_path, {"a": a, "b": b}, {"a": 0.5, "b": 0.5})
     validate_pretrain_dataset(tmp_path)               # fine as written
-    plain_source(tmp_path / "b", 31, tag=41)          # b rebuilt: other counts
+    plain_source(tmp_path / "b", 31, tag=6)          # b rebuilt: other counts
     for call in (lambda: open_train_dataset(tmp_path, m, seed=1),
                  lambda: validate_pretrain_dataset(tmp_path)):
         with pytest.raises(mx.MixtureError,
@@ -305,8 +305,8 @@ def test_fingerprint_follows_the_weights(built, tmp_path):
 def test_epochs_in_the_table_match_what_the_dataset_reads(tmp_path):
     """Constant lengths per source make the token budget an exact sample count: the
     table's epochs are then what E mixture epochs read from each source."""
-    a = plain_source(tmp_path / "a", 50, tag=40)
-    b = plain_source(tmp_path / "b", 7, tag=41)
+    a = plain_source(tmp_path / "a", 50, tag=5)
+    b = plain_source(tmp_path / "b", 7, tag=6)
     for folder, n in ((a, 50), (b, 7)):            # rewrite with one length
         from tests.data.datasets.mixture_sources import write_shards
         write_shards(folder / "train", [30 if n == 50 else 10] * n, 0, 1)

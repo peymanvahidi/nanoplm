@@ -161,7 +161,7 @@ def test_from_yaml_builds_a_two_source_mix_and_a_weight_change_reruns_only_the_m
 def test_from_yaml_mixes_a_prepared_source_with_a_built_one(tmp_path):
     from nanoplm.data.infra.manifest import read_manifest
     from tests.data.datasets.mixture_sources import plain_source
-    built = plain_source(tmp_path / "elsewhere/built", 60, tag=40)
+    built = plain_source(tmp_path / "elsewhere/built", 60, tag=5)
     proj = tmp_path / "proj"
     proj.mkdir()
     env = _project(proj, None, "x.fasta")
@@ -178,5 +178,5 @@ def test_from_yaml_mixes_a_prepared_source_with_a_built_one(tmp_path):
     m = read_manifest(proj / "out")
     assert m.sources[0]["dir"] == str(built.resolve()) and m.sources[0]["fasta"] is None
     assert _status(proj, env) == set()
-    plain_source(built, 61, tag=40)                    # the prepared folder is rebuilt
+    plain_source(built, 61, tag=5)                    # the prepared folder is rebuilt
     assert _status(proj, env) == {"mixture"}

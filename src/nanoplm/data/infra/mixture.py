@@ -233,3 +233,30 @@ def format_run_plan(plan: list, budget_tokens: int) -> list:
             lines.append(f"Warning: source {p['name']} is read {p['epochs']:.1f} times over "
                          f"the run (more than {REPEAT_WARN}x); lower its weight or add data")
     return lines
+
+
+# ------------------------------------------------------------------ eval
+
+
+def eval_split(val_sizes: dict, eval_names: list, micro_batch_seqs: int) -> dict:
+    """Validation sequences per evaluated source. The eval keeps the batch count one
+    loader over every source's val set would have, split evenly over ``eval_names``;
+    a source with fewer val sequences than its part uses all it has."""
+    total_batches = math.ceil(sum(val_sizes.values()) / micro_batch_seqs)
+    per_source = math.ceil(total_batches / len(eval_names)) * micro_batch_seqs
+    return {n: min(val_sizes[n], per_source) for n in eval_names}
+
+
+def eval_payload(losses: dict, weights: dict, suffix: str = "") -> dict:
+    """W&B keys of one mixture eval: ``eval/loss/<source>`` per source and ``eval/loss``,
+    the mean of those weighted by each source's share (over the sources evaluated).
+    ``suffix`` (e.g. "/r4") goes after the source name; eval/loss then gets none."""
+    out = {f"eval/loss/{n}{suffix}": v for n, v in losses.items()}
+    if not suffix:
+        out["eval/loss"] = weighted_loss(losses, weights)
+    return out
+
+
+def weighted_loss(losses: dict, weights: dict) -> float:
+    total = sum(weights[n] for n in losses)
+    return sum(weights[n] * v for n, v in losses.items()) / total

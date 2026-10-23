@@ -2456,6 +2456,82 @@ def _configure_fp8_cpu_activation_offload(
 
 
 # ---------------------------------------------------------------------------
+# Mixtures (a dataset_dir whose manifest lists several sources)
+# ---------------------------------------------------------------------------
+
+class MixturePlan:
+    """What training needs to know about a mixture: the sources evaluated, their val
+    sets (each cut to its part of the eval budget) and the per-source run plan.
+    ``open`` returns None for any other dataset."""
+
+    def __init__(self, manifest, eval_names, eval_sets):
+        self.manifest = manifest
+        self.weights = {r["name"]: float(r["weight"]) for r in manifest.sources}
+        self.eval_names = eval_names
+        self.eval_sets = eval_sets
+        self.plan: list = []
+        self.plan_lines: list = []
+
+    @classmethod
+    def open(cls, dataset_dir, manifest, pretrain_config):
+        from nanoplm.data.infra.mixture import eval_split, resolve_eval_sources
+        names = resolve_eval_sources(getattr(pretrain_config, "eval_sources", "all"), manifest)
+        if not getattr(manifest, "is_mixture", False):
+            return None
+        from nanoplm.data.datasets.mixture import open_val_datasets
+        vals = open_val_datasets(dataset_dir, manifest)
+        counts = eval_split({n: len(v) for n, v in vals.items()}, names,
+                            int(pretrain_config.micro_batch_seqs))
+        sets = {n: torch.utils.data.Subset(vals[n], range(counts[n])) for n in names}
+        logger.info("Mixture eval: " + ", ".join(f"{n} {counts[n]:,} of {len(vals[n]):,} val seqs"
+                                                 for n in names))
+        return cls(manifest, names, sets)
+
+    def eval_loaders(self, make) -> dict:
+        self.loaders = {n: make(ds) for n, ds in self.eval_sets.items()}
+        return self.loaders
+
+    def plan_run(self, budget_tokens: int) -> None:
+        from nanoplm.data.infra.mixture import format_run_plan, run_plan
+        self.plan = run_plan(self.manifest, budget_tokens)
+        self.plan_lines = format_run_plan(self.plan, budget_tokens)
+
+
+def _mixture_eval(mixture, eval_loop_counts, target_r, model, device, distributed, amp_dtype,
+                  recycling_bptt, global_step, is_main, wandb_enabled) -> bool:
+    """Eval every evaluated source of a mixture and log it. Keys: eval/loss/<source> and
+    eval/loss, the share-weighted mean over the sources evaluated. With recycling, every
+    r adds eval/loss/<source>/r<r>, the in-loop sweep payload takes the weighted mean
+    per r, and the unsuffixed keys are the target r. Returns whether W&B still logs."""
+    from nanoplm.data.infra.mixture import eval_payload, weighted_loss
+    from nanoplm.pretraining.recycling.logging import inloop_eval_payload
+    by_r: dict = {}
+    for r_value in eval_loop_counts:
+        by_r[r_value] = {
+            name: _evaluate(model, loader, device, distributed, amp_dtype, loop_count=r_value,
+                            recycling_bptt=recycling_bptt if r_value is not None else None)
+            for name, loader in mixture.loaders.items()}
+    if not is_main:
+        return wandb_enabled
+    head = target_r if target_r in by_r else next(iter(by_r))
+    payload = {"train/global_step": global_step, **eval_payload(by_r[head], mixture.weights)}
+    if head is not None:
+        for r_value, losses in by_r.items():
+            payload.update(eval_payload(losses, mixture.weights, suffix=f"/r{r_value}"))
+        payload.update(inloop_eval_payload({r: weighted_loss(l, mixture.weights)
+                                            for r, l in by_r.items()}))
+    per_source = ", ".join(f"{n}={v:.4f}" for n, v in by_r[head].items())
+    logger.info(f"[step {global_step}] eval_loss={payload['eval/loss']:.4f} ({per_source})")
+    if wandb_enabled and wandb.run is not None:
+        try:
+            wandb.log(payload)
+        except Exception as exc:
+            logger.warning(f"W&B log failed; disabling. Error: {exc}")
+            return False
+    return wandb_enabled
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -2508,8 +2584,16 @@ def run_pure_pretraining(
             raise FileNotFoundError(f"Shard directory not found: {d}")
 
     train_ds = open_train_dataset(dataset_dir, manifest, seed=pretrain_config.seed)
-    val_ds = ShardedDataset(data_dir=str(val_shard_dir))
-    if isinstance(train_ds, ClusterSampledDataset):
+    # A mixture evaluates each source on its own val set (eval_sets); any other dataset
+    # keeps one val set and today's eval.
+    mixture = MixturePlan.open(dataset_dir, manifest, pretrain_config)
+    val_ds = None if mixture else ShardedDataset(data_dir=str(val_shard_dir))
+    if mixture:
+        # like a cluster source, a mixture moves with set_epoch, which only the packing
+        # path forwards to the dataset
+        if not pretrain_config.use_packing:
+            raise ValueError(f"{dataset_dir} is a mixture, which needs use_packing=true.")
+    elif isinstance(train_ds, ClusterSampledDataset):
         # The member draw moves with set_epoch, which only the packing path
         # forwards to the dataset (the non-packing path sets the sampler's epoch
         # and keeps persistent workers), so refuse the combination.
@@ -2647,7 +2731,8 @@ def run_pure_pretraining(
                 dist.init_process_group(backend=backend)
 
     is_main = (not distributed) or dist.get_rank() == 0
-    eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
+    if not mixture:
+        eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
 
     # ---- Collator / Sampler / Packing ----
     train_sampler = None
@@ -2962,7 +3047,15 @@ def run_pure_pretraining(
         train_loader = DataLoader(train_ds, batch_size=None, collate_fn=collator, **dl_kwargs)
     else:
         train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=collator, drop_last=False, **dl_kwargs)
-    eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
+    if mixture:
+        eval_loader = None
+        mixture.eval_loaders(
+            lambda ds: DataLoader(
+                ds, sampler=DistributedSampler(ds, shuffle=False) if distributed else SequentialSampler(ds),
+                batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator,
+                drop_last=False, **dl_kwargs))
+    else:
+        eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
 
     # ---- Optimizer / Scheduler ----
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
@@ -3009,7 +3102,13 @@ def run_pure_pretraining(
         )
 
     # ---- Epochs-equivalent startup hint (passes over the train set) ----
-    if is_main:
+    if mixture:
+        # per source: share, size, tokens used and epochs over the run's budget
+        mixture.plan_run(horizon.total_steps * achieved_global_batch_tokens)
+        if is_main:
+            for line in mixture.plan_lines:
+                (logger.warning if line.startswith("Warning:") else logger.info)(line)
+    elif is_main:
         _approx = manifest.train_sequences * (manifest.min_seq_len + manifest.max_seq_len) // 2
         if pretrain_config.lr_schedule.lower() == "wsd":
             for label, steps in (("stable", horizon.stable_steps), ("decay", horizon.decay_steps),
@@ -3283,7 +3382,8 @@ def run_pure_pretraining(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 mode="offline",
-                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps,
+                        **({"data_mixture": mixture.plan} if mixture else {})},
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
@@ -4298,6 +4398,12 @@ def run_pure_pretraining(
 
                         losses_by_r: dict[int, float] = {}
                         eval_loss = None
+                        if mixture:
+                            wandb_enabled = _mixture_eval(
+                                mixture, eval_loop_counts, _static_loop_count, orig_model,
+                                device, distributed, amp_dtype, pretrain_config.recycling_bptt,
+                                global_step, is_main, wandb_enabled)
+                            eval_loop_counts = []
                         for r_value in eval_loop_counts:
                             eval_loss = _evaluate(
                                 orig_model, eval_loader, device, distributed, amp_dtype,
@@ -4307,7 +4413,7 @@ def run_pure_pretraining(
                             if r_value is not None:
                                 losses_by_r[r_value] = eval_loss
 
-                        if is_main:
+                        if is_main and not mixture:
                             if losses_by_r:
                                 losses_str = ", ".join(f"r={r}: {l:.4f}" for r, l in sorted(losses_by_r.items()))
                                 logger.info(f"[step {global_step}] in-loop eval {losses_str}")

@@ -11,14 +11,14 @@ from tests.data.datasets.cluster_pool import build_pool
 
 
 def write_shards(folder: Path, lengths, seed: int, tag: int) -> None:
-    """One shard whose rows start with ``tag`` (the source) and then a row number, so a
-    test can tell from the tokens which source and row an item is."""
+    """One shard whose rows start with ``tag`` (the source) and then the row number in
+    base 20, so every row differs. Every token is a real amino-acid id (4..24)."""
     folder.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     rows = []
     for i, n in enumerate(lengths):
         row = rng.integers(4, 25, int(n), dtype=np.uint8)
-        row[0], row[1], row[2] = tag, i // 200 + 4, i % 200 + 4
+        row[0], row[1], row[2], row[3] = tag, i // 400 % 20 + 4, i // 20 % 20 + 4, i % 20 + 4
         row[-1] = 1
         rows.append(row)
     (folder / "shard_0000.bin").write_bytes(np.concatenate(rows).tobytes())
