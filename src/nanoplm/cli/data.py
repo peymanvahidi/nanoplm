@@ -974,6 +974,8 @@ def from_yaml(
             _show_prepared(cfg.source, cwd, config_path, cfg.output_dir)
             return
         plans = _validate_sources(cfg, cwd, config_path)
+        if not cfg.legacy:
+            _warn_orphaned_outputs(cfg, cwd)
     else:
         _validate_source_fields(params.get("data_dirs", {}))
         _validate_pipeline_fields(params.get("data_dirs", {}), data_params, kind, config_path)
@@ -1327,6 +1329,46 @@ def _read_pretrain_config(config_path: Path, quiet: bool = False):
                     f"{config_path.name}: sources.{src.name}.fasta: {src.fasta} not found (a "
                     "relative path is relative to data.yaml's directory)")
     return cfg
+
+
+# what a source's build writes into its data folder (output_dir, or output_dir/<name>)
+_BUILT_OUTPUTS = ("train", "val", "cluster_index", ".data_manifest")
+
+
+def orphaned_outputs(cfg, cwd: Path) -> list:
+    """Built outputs of the other layout left in output_dir: a mix ignores the train/
+    val/ cluster_index/ of an earlier single source; one source ignores the folders of
+    an earlier mix's other sources, and the train/ val/ cluster_index/ .data_manifest in
+    its own. Nothing is deleted; DVC no longer tracks these paths."""
+    out = _resolve_path(cfg.output_dir, cwd)
+    if not out.is_dir():
+        return []
+    if cfg.is_mixture:
+        # output_dir/.data_manifest is the mixture's own
+        return [out / n for n in _BUILT_OUTPUTS[:-1] if (out / n).exists()]
+    found = []
+    for d in sorted(p for p in out.iterdir() if p.is_dir() and p.name != "downloads"):
+        if not (d / ".data_manifest").is_file():
+            continue
+        # the source's own folder keeps its intermediates; another one goes whole
+        found += ([d / n for n in _BUILT_OUTPUTS if (d / n).exists()]
+                  if d.name in cfg.sources else [d])
+    return found
+
+
+def _warn_orphaned_outputs(cfg, cwd: Path) -> None:
+    paths = orphaned_outputs(cfg, cwd)
+    if not paths:
+        return
+    was = "one source" if cfg.is_mixture else "a mix of several sources"
+    gitignores = sorted({str(p.parent / ".gitignore") for p in paths
+                         if (p.parent / ".gitignore").is_file()})
+    click.echo(f"Warning: output_dir holds the outputs of an earlier build with {was}; "
+               "this build does not use them. You can delete:", err=True)
+    for p in paths:
+        click.echo(f"  {p}", err=True)
+    if gitignores:
+        click.echo("and their lines in " + ", ".join(gitignores), err=True)
 
 
 def _validate_sources(cfg, cwd: Path, config_path: Path) -> dict:

@@ -266,3 +266,49 @@ def test_built_sources_with_other_register_tokens_fail_before_dvc(tmp_path, monk
     assert r.exit_code != 0
     assert "the sources of a mix must use the same register_tokens; got a 0, b 1" in r.output
 
+
+def _built(folder, manifest=True):
+    for n in ("train", "val"):
+        (folder / n).mkdir(parents=True)
+    if manifest:
+        (folder / ".data_manifest").write_text("x")
+
+
+def test_a_mix_names_the_train_and_val_an_earlier_single_source_left(tmp_path, capsys):
+    from nanoplm.cli.data import _warn_orphaned_outputs, orphaned_outputs
+    from nanoplm.data.preparation.data_config import parse_data_config
+    out = tmp_path / "out"
+    _built(out)
+    (out / "cluster_index").mkdir()
+    (out / ".gitignore").write_text("/train\n/val\n/.data_manifest\n")
+    cfg = parse_data_config(_mix(a={"fasta": "swissprot", "weight": 0.5},
+                                 b={"fasta": "trembl", "weight": 0.5}))
+    assert orphaned_outputs(cfg, tmp_path) == [out / "train", out / "val", out / "cluster_index"]
+    _warn_orphaned_outputs(cfg, tmp_path)
+    err = capsys.readouterr().err
+    assert "earlier build with one source" in err and f"  {out / 'train'}\n" in err
+    assert f"their lines in {out / '.gitignore'}" in err
+    assert ".data_manifest" not in err.replace(".gitignore", "")   # the mixture's own
+    for n in ("train", "val", "cluster_index"):
+        shutil.rmtree(out / n)
+    assert orphaned_outputs(cfg, tmp_path) == []
+
+
+def test_one_source_names_the_folders_an_earlier_mix_left(tmp_path):
+    from nanoplm.cli.data import orphaned_outputs
+    from nanoplm.data.preparation.data_config import parse_data_config
+    out = tmp_path / "out"
+    _built(out / "a")
+    _built(out / "b")
+    (out / "a/split").mkdir()                 # an intermediate: one source keeps it
+    (out / "downloads").mkdir()
+    cfg = yaml.safe_load(load_template("data_pretrain"))
+    cfg["output_dir"] = "out"
+    cfg["sources"] = {"a": {"fasta": "swissprot"}}
+    cfg = parse_data_config(cfg)
+    got = orphaned_outputs(cfg, tmp_path)
+    assert got == [out / "a/train", out / "a/val", out / "a/.data_manifest", out / "b"]
+    shutil.rmtree(out / "b")
+    for p in got[:3]:
+        shutil.rmtree(p) if p.is_dir() else p.unlink()
+    assert orphaned_outputs(cfg, tmp_path) == []
