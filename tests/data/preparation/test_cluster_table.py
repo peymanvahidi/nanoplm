@@ -163,9 +163,32 @@ def test_mmseqs_rows_map_back_to_fasta_ids(tmp_path):
     assert (tmp_path / "rows.fasta").read_text() == ">0\nMKV\n>1\nMKV\n>2\nMKV\n"
     (tmp_path / "c.tsv").write_text("2\t2\n2\t0\n1\t1\n")
     stats = ct.mmseqs_rows_to_members_tsv(tmp_path / "c.tsv", ids, tmp_path / "m.tsv")
+    # clusters in representative row order, members after their rep in row order
     assert (tmp_path / "m.tsv").read_text() == (
-        "gi|7|ref|NP_1|\tgi|7|ref|NP_1|\ngi|7|ref|NP_1|\tsp|P1|A\ntr|Q2|B\ttr|Q2|B\n")
+        "tr|Q2|B\ttr|Q2|B\ngi|7|ref|NP_1|\tgi|7|ref|NP_1|\ngi|7|ref|NP_1|\tsp|P1|A\n")
     assert stats["clusters"] == 2 and stats["members"] == 3
+
+
+def test_mmseqs_line_order_does_not_change_members_tsv(tmp_path):
+    """MMseqs2 makes no promise about its output order; the val split is drawn over the
+    cluster order in members.tsv, so a shuffled c.tsv must give the same bytes."""
+    rng = np.random.default_rng(0)
+    n = 500
+    fasta = tmp_path / "f.fasta"
+    fasta.write_text("".join(f">s{i}\nMKV\n" for i in range(n)))
+    ids = ct.number_fasta(fasta, tmp_path / "rows.fasta")
+    reps = np.sort(rng.choice(n, 60, replace=False))
+    rep_of = np.where(np.isin(np.arange(n), reps), np.arange(n), rng.choice(reps, n))
+    lines = [f"{r}\t{m}\n" for m, r in enumerate(rep_of)]
+    out = []
+    for k in range(3):
+        rng.shuffle(lines)
+        (tmp_path / "c.tsv").write_text("".join(lines))
+        ct.mmseqs_rows_to_members_tsv(tmp_path / "c.tsv", ids, tmp_path / f"m{k}.tsv")
+        out.append((tmp_path / f"m{k}.tsv").read_bytes())
+    assert out[0] == out[1] == out[2]
+    first = [line.split(b"\t") for line in out[0].splitlines()]
+    assert first[0] == [f"s{reps[0]}".encode()] * 2
 
 
 def test_mmseqs_rows_missing_a_sequence_is_an_error(tmp_path):

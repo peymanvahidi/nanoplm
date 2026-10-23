@@ -3,7 +3,8 @@
 Format: one ``cluster_id<TAB>sequence_id`` line per sequence. Lines are grouped by
 cluster, and the first line of each group is the cluster's representative. Sequence
 ids are FASTA ids (the first word of the header, without ``>``); each appears once.
-Cluster order is the order of first appearance.
+Cluster order is the order of first appearance (for MMseqs2: the representative's
+row in the member FASTA, then the other members in FASTA order).
 
 Two sources write it:
   uniref50.xml    ``uniref_hierarchy.xml_to_members_tsv`` (UniProt UniRef50 clusters)
@@ -197,14 +198,14 @@ def mmseqs_rows_to_members_tsv(cluster_tsv, ids: _Ids, out_tsv) -> dict:
             f"{twice:,} listed more than once); refusing to turn the missing ones into "
             f"singleton clusters")
     del seen
-    reps, first, cid = np.unique(rep, return_index=True, return_inverse=True)
+    # np.unique numbers the clusters by their representative's FASTA row, so the
+    # order (and the validation split drawn over it) does not depend on how MMseqs2
+    # ordered its output
+    reps, cid = np.unique(rep, return_inverse=True)
     if not np.all(np.isin(reps, mem[rep == mem])):
         raise ClusterTableError(f"{cluster_tsv}: a representative is not its own member")
-    rank = np.empty(len(reps), dtype=np.int64)
-    rank[np.argsort(first, kind="stable")] = np.arange(len(reps))
-    cid = rank[cid]
-    del rank, first, reps
-    order = np.lexsort((np.arange(len(mem)), mem != rep, cid))
+    del reps
+    order = np.lexsort((mem, mem != rep, cid))
     rep, mem = rep[order], mem[order]
     del order, cid
     Path(out_tsv).parent.mkdir(parents=True, exist_ok=True)
