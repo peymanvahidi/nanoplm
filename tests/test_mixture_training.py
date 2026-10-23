@@ -1,4 +1,4 @@
-"""Training on a mixture: eval split and keys, and a CPU smoke run."""
+"""Training on a mixture: eval split and keys, eval_sources, and a CPU smoke run."""
 from __future__ import annotations
 
 import json
@@ -36,6 +36,23 @@ def test_eval_payload_is_the_share_weighted_mean():
     assert mx.eval_payload({"a": 1.0}, {"a": 1.0}, suffix="/r4") == {"eval/loss/a/r4": 1.0}
 
 
+@pytest.mark.parametrize("value", ["all", ["a"], ("a", "b"), "a"])
+def test_eval_sources_config_accepts_all_or_names(value, tmp_path):
+    cfg = PretrainingConfig(dataset_dir=str(tmp_path), eval_sources=value)
+    assert cfg.eval_sources == "all" if value == "all" else isinstance(cfg.eval_sources, list)
+
+
+@pytest.mark.parametrize("value", [[], [3], [""], 5])
+def test_eval_sources_config_refuses_other_values(value, tmp_path):
+    if value == []:
+        cfg = PretrainingConfig(dataset_dir=str(tmp_path), eval_sources=value)
+        with pytest.raises(mx.MixtureError, match="empty"):
+            mx.resolve_eval_sources(cfg.eval_sources, _mixture(tmp_path))
+        return
+    with pytest.raises(ValueError, match="eval_sources must be all or a list"):
+        PretrainingConfig(dataset_dir=str(tmp_path), eval_sources=value)
+
+
 def _mixture(root):
     a = plain_source(root / "a", 50, tag=5)
     c, _ = cluster_source(root / "c", seed=2)
@@ -51,6 +68,19 @@ def test_a_single_dataset_keeps_todays_eval(tmp_path):
     cfg.eval_sources = ["a"]
     with pytest.raises(mx.MixtureError, match="not a mixture; set eval_sources: all"):
         pp.MixturePlan.open(a, m, cfg)
+
+
+def test_unknown_eval_sources_stop_the_run_before_the_model_is_built(tmp_path):
+    import click
+    from nanoplm.cli.pretrain import _load_manifest_and_inject
+    from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
+    _mixture(tmp_path)
+    cfg = PretrainingConfig(dataset_dir=str(tmp_path), eval_sources=["a", "uniref"])
+    with pytest.raises(click.ClickException,
+                       match=r"pretraining.eval_sources: unknown source uniref \(the mixture "
+                             r"has a, c\)"):
+        _load_manifest_and_inject(cfg, ProtModernBertMLMConfig(
+            hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2))
 
 
 class _Wandb:
@@ -101,6 +131,13 @@ def test_mixture_eval_with_recycling_logs_per_source_and_r(plan):
     assert p["eval/loss"] == pytest.approx(0.4 * 6 + 0.6 * 7)
     assert p["eval/loss/a/r1"] == 3.0 and p["eval/loss/c/r4"] == 7.0
     assert p["recycling/eval_inloop/inloop_eval_loss_at_r1"] == pytest.approx(0.4 * 3 + 0.6 * 4)
+
+
+def test_eval_sources_list_evaluates_only_those(tmp_path, monkeypatch):
+    m = _mixture(tmp_path)
+    plan = pp.MixturePlan.open(tmp_path, m, PretrainingConfig(
+        dataset_dir=str(tmp_path), micro_batch_seqs=4, eval_sources=["c"]))
+    assert plan.eval_names == ["c"] and len(plan.eval_sets["c"]) == 7
 
 
 def test_mixture_training_smoke_on_cpu(tmp_path):

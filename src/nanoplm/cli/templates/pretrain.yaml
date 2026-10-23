@@ -298,6 +298,7 @@ pretraining:
 
   logging_steps: 25                     # step line reports means over this many steps; should divide eval_steps
   eval_steps: 1000
+  eval_sources: all                     # mixtures: all, or a list of source names to evaluate, e.g. [swissprot]
   save_steps: 2500
   # max_wallclock_hours: 3.0            # override the SLURM-derived deadline with a fixed training duration
   seed: 42

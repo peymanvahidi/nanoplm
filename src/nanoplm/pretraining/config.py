@@ -168,6 +168,9 @@ class PretrainingConfig:
     # same eval loader and world size; it depends on batch composition. Leave
     # None to keep drawing fresh masks from global RNG.
     eval_mask_seed: Optional[int] = None
+    # Mixture datasets only: "all", or the source names to evaluate (the whole eval
+    # budget is split evenly over them). Names are checked against the dataset at start.
+    eval_sources: Union[str, list[str]] = "all"
 
     # Logging/checkpointing
     # At 1, the step line is 94% of a run log and every step pays a
@@ -432,6 +435,16 @@ class PretrainingConfig:
             )
 
         self.fp8_target = _normalize_fp8_targets(self.fp8_target)
+
+        if isinstance(self.eval_sources, str) and self.eval_sources != "all":
+            self.eval_sources = [self.eval_sources]
+        if not (self.eval_sources == "all" or (
+                isinstance(self.eval_sources, (list, tuple))
+                and all(isinstance(n, str) and n for n in self.eval_sources))):
+            raise ValueError(f"eval_sources must be all or a list of source names, got "
+                             f"{self.eval_sources!r}")
+        if not isinstance(self.eval_sources, str):
+            self.eval_sources = list(self.eval_sources)
 
         self.muon_adjust_lr = str(self.muon_adjust_lr).strip().lower()
         if self.muon_adjust_lr not in {"rms_norm", "spectral_norm", "none"}:

@@ -1162,6 +1162,12 @@
           "default": 1000,
           "x-nanoplm-group": "Logging, eval, checkpoints"
         },
+        "eval_sources": {
+          "type": "string",
+          "default": "all",
+          "x-nanoplm-group": "Logging, eval, checkpoints",
+          "description": "mixtures: all, or a list of source names to evaluate, e.g. [swissprot]"
+        },
         "save_steps": {
           "type": "integer",
           "default": 2500,

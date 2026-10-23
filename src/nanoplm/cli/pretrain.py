@@ -1702,8 +1702,13 @@ def _load_manifest_and_inject(
 
     Returns the manifest so it can be passed to the pipeline entry point.
     """
+    from nanoplm.data.infra.mixture import MixtureError, resolve_eval_sources
     manifest = read_manifest(pretrain_config.dataset_dir)
     validate_manifest_for_pipeline(manifest, expected_mode="pretrain")
+    try:
+        resolve_eval_sources(pretrain_config.eval_sources, manifest)
+    except MixtureError as exc:
+        raise click.ClickException(f"pretraining.{exc}") from exc
     model_config.num_register_tokens = manifest.num_register_tokens
     logger.info(
         f"Injected manifest.num_register_tokens = {manifest.num_register_tokens} "
