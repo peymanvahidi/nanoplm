@@ -769,8 +769,8 @@ def get_cluster_xml(url: str, output: str):
 @click.option("--coverage", type=float, default=0.8)
 @click.option("--tmp-dir", type=click.Path(file_okay=False), default=None)
 @click.option("--threads", type=int,
-              default=lambda: int(os.environ.get("NANOPLM_MAX_WORKERS", "-1")),
-              show_default="$NANOPLM_MAX_WORKERS, or -1 = all cores")
+              default=lambda: int(os.environ.get("NANOPLM_MAX_WORKERS", "2")),
+              show_default="$NANOPLM_MAX_WORKERS or 2")
 def cluster_members(source, fasta, output, level, xml, identity, coverage, tmp_dir, threads):
     """Internal: write the canonical cluster table (cluster_id<TAB>sequence_id)."""
     from nanoplm.data.preparation.cluster_table import build_members_table
@@ -1348,7 +1348,6 @@ def _validate_cluster_block(src, config_path: Path):
     for n in plan.notes:
         click.echo(n)
     for w in plan.warnings:
-        logger.warning(w)
         click.echo(f"Warning: {w}", err=True)
     if plan.cluster_source == "mmseqs" and find_mmseqs() is None:
         raise click.ClickException(

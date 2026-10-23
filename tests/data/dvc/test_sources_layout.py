@@ -276,3 +276,21 @@ def test_fix_flips_an_override_too(tmp_path, monkeypatch):
     r = _run(tmp_path / "data.yaml", "--fix", "--dry-run")
     assert r.exit_code == 0, r.output
     assert (tmp_path / "data.yaml").read_text().count("drop_invalid_sequences: true") == 2
+
+
+def test_a_cluster_warning_prints_once(tmp_path, monkeypatch):
+    """It went to the nanoplm logger and to click.echo, so the terminal showed it twice."""
+    import logging
+    logged = []
+    handler = logging.Handler()
+    handler.emit = lambda rec: logged.append(rec.getMessage())
+    logging.getLogger("nanoplm").addHandler(handler)
+    try:
+        cfg = yaml.safe_load(load_template("data_pretrain"))
+        cfg["sources"] = {"uniref50": {"fasta": "uniref50",
+                                       "cluster_subsampling": {"members": "uniref90"}}}
+        out, _ = _dry(tmp_path, monkeypatch, cfg)
+    finally:
+        logging.getLogger("nanoplm").removeHandler(handler)
+    assert (out + "\n".join(logged)).count("trains on at most 20,000 clusters") == 1
+

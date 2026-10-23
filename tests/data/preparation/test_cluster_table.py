@@ -225,11 +225,11 @@ def test_mmseqs_threads(tmp_path, threads, expect):
     assert (tmp_path / "m.tsv").read_text() == "sp|P1|A\tsp|P1|A\nsp|P2|B\tsp|P2|B\n"
 
 
-@pytest.mark.parametrize("env, expect", [("3", "3"), (None, None)])
+@pytest.mark.parametrize("env, expect", [("3", "3"), (None, "2")])
 def test_cluster_members_threads_come_from_the_env(tmp_path, monkeypatch, env, expect):
     """from-yaml passes data_params.max_workers as $NANOPLM_MAX_WORKERS, not on the
-    command line, so a core-count change does not rerun the stage."""
-    import os
+    command line, so a core-count change does not rerun the stage. Under a plain
+    `dvc repro` it is unset and the default matches cluster-pool's, 2."""
     from click.testing import CliRunner
     from nanoplm.cli.data import data
     fasta = tmp_path / "f.fasta"
@@ -245,4 +245,4 @@ def test_cluster_members_threads_come_from_the_env(tmp_path, monkeypatch, env, e
     assert r.exit_code == 0, r.output
     argv = (tmp_path / "argv").read_text().split()
     got = argv[argv.index("--threads") + 1]
-    assert got == (expect or str(max(1, len(os.sched_getaffinity(0)))))
+    assert got == expect
