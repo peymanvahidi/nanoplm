@@ -248,6 +248,12 @@ def eval_split(val_sizes: dict, eval_names: list, micro_batch_seqs: int) -> dict
     return {n: min(val_sizes[n], per_source) for n in eval_names}
 
 
+def eval_indices(size: int, k: int) -> list:
+    """``k`` of a val set's ``size`` rows, spread evenly over it. A cluster val set keeps
+    the order of the cluster table, not a random one, so its first k rows are biased."""
+    return [(2 * i + 1) * size // (2 * k) for i in range(k)]   # the middle of k equal parts
+
+
 def eval_workers(num_workers: int, n_loaders: int) -> int:
     """DataLoader workers per source's val loader: ``num_workers`` split over the
     loaders, at least one each when there are any. Eval workers start anew at every

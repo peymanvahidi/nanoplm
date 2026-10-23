@@ -2474,7 +2474,7 @@ class MixturePlan:
 
     @classmethod
     def open(cls, dataset_dir, manifest, pretrain_config):
-        from nanoplm.data.infra.mixture import eval_split, resolve_eval_sources
+        from nanoplm.data.infra.mixture import eval_indices, eval_split, resolve_eval_sources
         names = resolve_eval_sources(getattr(pretrain_config, "eval_sources", "all"), manifest)
         if not getattr(manifest, "is_mixture", False):
             return None
@@ -2493,7 +2493,8 @@ class MixturePlan:
             raise MixtureError("no mixture source has val sequences; set val_ratio above 0")
         counts = eval_split({n: len(v) for n, v in vals.items()}, names,
                             int(pretrain_config.micro_batch_seqs))
-        sets = {n: torch.utils.data.Subset(vals[n], range(counts[n])) for n in names}
+        sets = {n: torch.utils.data.Subset(vals[n], eval_indices(len(vals[n]), counts[n]))
+                for n in names}
         logger.info("Mixture eval: " + ", ".join(f"{n} {counts[n]:,} of {len(vals[n]):,} val seqs"
                                                  for n in names))
         return cls(manifest, names, sets)

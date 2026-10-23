@@ -329,3 +329,11 @@ def test_epochs_in_the_table_match_what_the_dataset_reads(tmp_path):
     assert lines[-1].startswith("Warning: sources.b: read ")
     assert "lower sources.b.weight or add data" in lines[-1]
     assert not any("sources.a:" in ln for ln in lines)
+
+
+def test_eval_takes_val_rows_spread_over_the_whole_set():
+    """The eval budget of a big val set samples all of it, not its first rows."""
+    assert mx.eval_indices(1000, 4) == [125, 375, 625, 875]
+    assert mx.eval_indices(7, 7) == list(range(7))      # all of a small set, in order
+    assert mx.eval_indices(9, 8) == [0, 1, 2, 3, 5, 6, 7, 8]  # the last row too
+

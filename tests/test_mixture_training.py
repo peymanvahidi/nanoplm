@@ -121,6 +121,9 @@ def test_mixture_eval_logs_each_source_and_the_weighted_mean(plan):
     plan, fake, calls = plan
     assert plan.eval_names == ["a", "c"]
     assert [len(d) for d in plan.eval_sets.values()] == [8, 7]   # 4 batches of 4, 2 each
+    a = plan.eval_sets["a"]                  # spread over a's val set, not its first 8
+    assert len(a.dataset) > 8 and list(a.indices) != list(range(8))
+    assert a.indices == mx.eval_indices(len(a.dataset), 8)
     assert pp._mixture_eval(plan, [None], None, None, "cpu", False, None, None, 10, True, True)
     assert calls == [("a", None), ("c", None)]
     assert fake.logged == [{"train/global_step": 10, "eval/loss/a": 2.0, "eval/loss/c": 3.0,
