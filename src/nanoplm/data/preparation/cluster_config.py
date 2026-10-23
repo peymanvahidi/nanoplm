@@ -105,12 +105,13 @@ class ClusterPlan:
     notes: list = field(default_factory=list)    # informational, printed before the stages
 
     def source_line(self) -> str:
-        """What clusters the members, e.g. 'UniProt uniref50.xml.gz (members: UniRef90)'."""
+        """What clusters the members, e.g. 'UniProt uniref50.xml.gz (members: UniRef90)' or
+        'MMseqs2 linclust, identity 0.5, coverage 0.8'."""
         if self.cluster_source == "uniref_xml":
             return (f"UniProt {_name(self.xml_url)} "
                     f"(members: UniRef{self.members_level[len('uniref'):]})")
-        return (f"MMseqs2 linclust, identity {self.identity:g}, coverage {self.coverage:g} "
-                f"(members: {self.members})")
+        # the members file is already in the table's fasta cell
+        return f"MMseqs2 linclust, identity {self.identity:g}, coverage {self.coverage:g}"
 
     @property
     def members_tsv(self) -> Path:
@@ -140,6 +141,13 @@ def _fraction(block: dict, key: str, default: float, where: str) -> float:
     if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 1:
         raise ClusterConfigError(f"{where}.{key} must be a number in (0, 1], got {v!r}")
     return float(v)
+
+
+def _setting(src, name: str) -> str:
+    """``val_ratio=0.1``, plus where it comes from when that is not the source itself."""
+    key = src.key(name)
+    text = f"{name}={src.params.get(name)}"
+    return text if key.startswith("sources.") else f"{text} (from {key.rsplit('.', 1)[0]})"
 
 
 def _members_paths(members: str, src) -> tuple[Optional[Path], Path]:
@@ -176,19 +184,16 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
     identity = _fraction(block, "identity", DEFAULT_IDENTITY, where)
     coverage = _fraction(block, "coverage", DEFAULT_COVERAGE, where)
     warnings = []
+    # every warning names the source, and a fix is set on that source alone
+    on = f"sources.{src.name}"
     max_seqs = params.get("max_seqs", -1)
     if isinstance(max_seqs, int) and max_seqs > 0:
-        warnings.append(f"cluster_subsampling: {src.key('max_seqs')}={max_seqs} trains on at "
-                        f"most {max_seqs:,} clusters; set it to -1 for all of them")
-    val_ratio = params.get("val_ratio")
-    if isinstance(val_ratio, (int, float)) and val_ratio > MAX_QUIET_VAL_RATIO:
-        warnings.append(f"cluster_subsampling: {src.key('val_ratio')}={val_ratio} holds out "
-                        f"{val_ratio:.1%} of the clusters for validation; the UniRef90 "
-                        f"experiment used {EXPERIMENT_VAL_RATIO}")
+        warnings.append(f"{on}: {_setting(src, 'max_seqs')} trains on at most {max_seqs:,} "
+                        f"clusters; set {on}.max_seqs: -1 to use all of them")
     if (params.get("shuffle", TEMPLATE_SHUFFLE) != TEMPLATE_SHUFFLE
             or params.get("shuffle_seed", TEMPLATE_SHUFFLE_SEED) != TEMPLATE_SHUFFLE_SEED):
-        warnings.append("cluster_subsampling ignores shuffle / shuffle_seed: the pool keeps "
-                        "FASTA order and the training sampler orders the visits")
+        warnings.append(f"{on}: cluster_subsampling ignores shuffle / shuffle_seed: the pool "
+                        "keeps FASTA order and the training sampler orders the visits")
 
     source_level = level_of(source, base_dir)
     members = block.get("members")
@@ -234,24 +239,32 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
     uniref = members_level in ("uniref90", "uniref100")
     if clustering == "uniprot" and not uniref:
         raise ClusterConfigError(
-            f"{where}.clustering: uniprot: {UNIPROT_NEEDS}; got fasta {source} "
-            f"and members {block.get('members')}. Use clustering: auto or mmseqs2 to cluster "
-            "these sequences with MMseqs2.")
+            f"{where}.clustering: uniprot: {UNIPROT_NEEDS}; got fasta {source} and members "
+            f"{block.get('members') or 'null'}. Use clustering: auto or mmseqs2 to cluster these "
+            "sequences with MMseqs2.")
     cluster_source = "uniref_xml" if uniref and clustering != "mmseqs2" else "mmseqs"
     notes = []
+    val_ratio = params.get("val_ratio")
+    if isinstance(val_ratio, (int, float)) and val_ratio > MAX_QUIET_VAL_RATIO:
+        # the experiment's holdout is a share of UniProt's UniRef50 clusters
+        fix = (f"the UniRef90 experiment used {on}.val_ratio: {EXPERIMENT_VAL_RATIO}"
+               if cluster_source == "uniref_xml"
+               else f"set {on}.val_ratio lower to train on more of them")
+        warnings.append(f"{on}: {_setting(src, 'val_ratio')} holds out {val_ratio:.1%} of the "
+                        f"clusters for validation; {fix}")
     if cluster_source == "mmseqs" and source_level == "uniref50" and clustering == "auto":
-        warnings.append("cluster_subsampling: fasta is UniRef50 and members is null, so "
-                        "MMseqs2 will cluster all ~60M UniRef50 sequences (hours). To train "
-                        "on the members of UniProt's UniRef50 clusters instead, set "
-                        "cluster_subsampling.members: uniref90 (with clustering: auto or "
+        warnings.append(f"{on}: fasta is UniRef50 and members is null, so MMseqs2 will "
+                        "cluster all ~60M UniRef50 sequences (hours). To train on the members "
+                        "of UniProt's UniRef50 clusters instead, set "
+                        f"{on}.cluster_subsampling.members: uniref90 (with clustering: auto or "
                         "uniprot)")
     if cluster_source == "uniref_xml" and (identity != DEFAULT_IDENTITY
                                            or coverage != DEFAULT_COVERAGE):
-        warnings.append("cluster_subsampling.identity / coverage only apply to MMseqs2 "
+        warnings.append(f"{on}: cluster_subsampling.identity / coverage only apply to MMseqs2 "
                         "clustering; they are ignored with UniProt clusters. Set "
-                        "cluster_subsampling.clustering: mmseqs2 to use them")
+                        f"{on}.cluster_subsampling.clustering: mmseqs2 to use them")
     if cluster_source == "mmseqs" and not from_source:
-        notes.append(f"clustering: mmseqs2 clusters the members ({members}); the source "
+        notes.append(f"{on}: clustering: mmseqs2 clusters the members ({members}); the source "
                      f"fasta ({source}) is not needed and is not downloaded")
     plan = ClusterPlan(
         source=source, source_level=source_level, members=members,

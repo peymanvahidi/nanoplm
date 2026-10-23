@@ -194,10 +194,34 @@ def test_template_data_params_warn_at_config_time():
     cfg = _config(url=U50, members="uniref90")
     cfg["data_params"].update(max_seqs=20000, val_ratio=0.1)        # the template's
     w = _plan(cfg).warnings
-    assert any("data_params.max_seqs=20000 trains on at most 20,000 clusters; set it to -1" in x
-               for x in w)
-    assert any("val_ratio=0.1 holds out 10.0% of the clusters" in x and "0.0044" in x
-               for x in w)
+    assert ("sources.src: max_seqs=20000 (from data_params) trains on at most 20,000 "
+            "clusters; set sources.src.max_seqs: -1 to use all of them") in w
+    assert ("sources.src: val_ratio=0.1 (from data_params) holds out 10.0% of the clusters "
+            "for validation; the UniRef90 experiment used sources.src.val_ratio: 0.0044") in w
+
+
+def test_cluster_warnings_name_the_source_and_its_own_override(tmp_path):
+    """A mix shares data_params, so every warning says which source it is about and
+    the fix is set on that source; the 0.0044 hint is for UniProt clusters only."""
+    cfg = _config(local=_own(tmp_path))
+    cfg["sources"]["src"]["val_ratio"] = 0.2
+    w = _plan(cfg).warnings
+    assert ("sources.src: val_ratio=0.2 holds out 20.0% of the clusters for validation; "
+            "set sources.src.val_ratio lower to train on more of them") in w
+    assert not any("0.0044" in x for x in w)
+    p = _plan(_config(url=U50, members="uniref90", identity=0.3))
+    assert any(x.startswith("sources.src: ") and
+               "Set sources.src.cluster_subsampling.clustering: mmseqs2" in x
+               for x in p.warnings)
+    p = _plan(_config(url=U50))
+    assert any(x.startswith("sources.src: fasta is UniRef50 and members is null") and
+               "set sources.src.cluster_subsampling.members: uniref90" in x
+               for x in p.warnings)
+
+
+def test_uniprot_error_says_members_null(tmp_path):
+    with pytest.raises(cc.ClusterConfigError, match="and members null. Use clustering"):
+        _plan(_config(local=_own(tmp_path), clustering="uniprot"))
 
 
 # ------------------------------------------------------------------ clustering
@@ -231,7 +255,7 @@ def test_clustering_on_uniref_data(case, clustering):
     assert p.clustering == clustering and p.members_level == level
     if clustering == "mmseqs2":
         assert p.cluster_source == "mmseqs" and p.xml_url is None and p.xml_path is None
-        assert p.source_line() == f"MMseqs2 linclust, identity 0.5, coverage 0.8 (members: {p.members})"
+        assert p.source_line() == "MMseqs2 linclust, identity 0.5, coverage 0.8"
     else:
         assert p.cluster_source == "uniref_xml" and p.xml_url == cc.UNIREF50_XML_URL
         assert p.source_line() == (f"UniProt uniref50.xml.gz "
@@ -251,7 +275,7 @@ def test_clustering_on_non_uniref_data(case, clustering, tmp_path):
         return
     p = _plan(_config(clustering=clustering, **kw))
     assert p.cluster_source == "mmseqs" and p.members_from_source and p.xml_url is None
-    assert p.source_line() == f"MMseqs2 linclust, identity 0.5, coverage 0.8 (members: {p.members})"
+    assert p.source_line() == "MMseqs2 linclust, identity 0.5, coverage 0.8"
 
 
 def test_a_missing_clustering_key_means_auto():
@@ -266,8 +290,8 @@ def test_mmseqs2_on_uniref50_url_clusters_the_members_without_the_url_fasta():
                                         identity=0.3))
     assert p.cluster_source == "mmseqs" and not p.members_from_source and p.members == U90
     assert p.members_fasta == WORK / "uniref90.fasta"
-    assert p.source_line() == f"MMseqs2 linclust, identity 0.3, coverage 0.8 (members: {U90})"
-    assert p.notes == [f"clustering: mmseqs2 clusters the members ({U90}); the source "
+    assert p.source_line() == "MMseqs2 linclust, identity 0.3, coverage 0.8"
+    assert p.notes == [f"sources.src: clustering: mmseqs2 clusters the members ({U90}); the source "
                        f"fasta ({U50}) is not needed and is not downloaded"]
     # the member/url pairing rules hold under every clustering value
     with pytest.raises(cc.ClusterConfigError, match="must be UniRef50 or uniref90 itself"):

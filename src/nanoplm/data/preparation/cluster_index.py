@@ -347,8 +347,12 @@ def aggregate(pool_cluster, pool_is_rep, raw_sizes, val_ratio, max_clusters, hol
 
     val_local = draw_val_clusters(cu, val_ratio, holdout_seed)
     if len(val_local) == 0 or len(val_local) == cu:
-        raise ClusterIndexError(f"val_ratio={val_ratio} over {cu} clusters holds out "
-                                f"{len(val_local)}; need at least one train and one val")
+        raise ClusterIndexError(
+            f"val_ratio={val_ratio} over {cu} clusters holds out {len(val_local)}; need at "
+            "least one train and one val cluster. Set this source's val_ratio in data.yaml "
+            "(sources.<name>.val_ratio, or data_params.val_ratio) "
+            + (f"to at least {1 / cu:.2g}" if len(val_local) == 0 else
+               f"below {1 - 1 / cu:.2g}"))
     in_val = np.zeros(cu, dtype=bool)
     in_val[val_local] = True
     val_clusters = universe[val_local]

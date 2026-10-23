@@ -154,7 +154,9 @@ def test_several_sources_are_not_supported_yet():
     (lambda c: c.update(sources={"src": {}}), "sources.src needs fasta or prepared"),
     (lambda c: c.update(sources={"src": {"fasta": "swissprot", "prepared": "x"}}),
      "set fasta .* or prepared .*, not both"),
-    (lambda c: c.update(sources={"src": {"fasta": "x.txt"}}), "must end with .fasta or .fasta.gz"),
+    (lambda c: c.update(sources={"src": {"fasta": "x.txt"}}), "ends with .fasta or .fasta.gz"),
+    (lambda c: c.update(sources={"src": {"fasta": "swisprot"}}),
+     r"must be a shortcut \(swissprot, trembl, uniref50, uniref90, uniref100\) or a URL"),
     (lambda c: c.update(sources={"train": {"fasta": "swissprot"}}), "train is a folder name"),
     (lambda c: c.update(sources={"my.src": {"fasta": "swissprot"}}), "letters, digits and _"),
     (lambda c: c.update(sources={"cluster_subsampling": {"members": None}}),
@@ -252,13 +254,34 @@ def test_output_dir_is_optional_only_without_a_fasta():
 
 
 def test_prepared_takes_no_build_settings():
-    src = _parse(_with_source({"prepared": "../built"})).source
+    src = _parse(_with_source({"prepared": "../built"}, data_params=None)).source
     assert src.prepared == "../built" and src.fasta is None
     with pytest.raises(dc.DataConfigError, match="prepared source is used as it was built; "
                                                   "remove max_seq_len"):
-        _parse(_with_source({"prepared": "../built", "max_seq_len": 5}))
+        _parse(_with_source({"prepared": "../built", "max_seq_len": 5}, data_params=None))
     with pytest.raises(dc.DataConfigError, match="remove cluster_subsampling"):
-        _parse(_with_source({"prepared": "../built", "cluster_subsampling": {"members": None}}))
+        _parse(_with_source({"prepared": "../built", "cluster_subsampling": {"members": None}},
+                            data_params=None))
+
+
+def test_data_params_with_only_prepared_sources_is_an_error():
+    """Nothing is built, so data_params would be silently ignored."""
+    with pytest.raises(dc.DataConfigError,
+                       match="data_params has no effect on prepared sources"):
+        _parse(_with_source({"prepared": "../built"}))
+    _parse(_with_source({"prepared": "../built"}, data_params={}))     # empty is fine
+
+
+@pytest.mark.parametrize("max_seqs, val_ratio", [(100, 0.001), (3, 0.9)])
+def test_a_cluster_holdout_of_none_or_all_is_an_error_at_config_time(max_seqs, val_ratio):
+    cfg = _with_source({"fasta": "uniref90", "cluster_subsampling": {"members": None}})
+    cfg["data_params"].update(max_seqs=max_seqs, val_ratio=val_ratio)
+    with pytest.raises(dc.DataConfigError,
+                       match=rf"sources.src: data_params.val_ratio={val_ratio:g} of at most "
+                             rf"{max_seqs} clusters \(data_params.max_seqs\) holds out"):
+        _parse(cfg)
+    cfg["data_params"].update(max_seqs=-1)        # the count is known only after the build
+    _parse(cfg)
 
 
 # ------------------------------------------------------------------ old layout
@@ -316,6 +339,22 @@ def test_the_hint_never_deletes_what_it_reuses():
     src = _parse(new).source
     assert src.fasta == d["compressed_fasta"] and not src.is_url
     assert src.paths["compressed_fasta"] == d["compressed_fasta"]   # read in place
+
+
+def test_the_hint_renames_seqs_num_only_when_it_is_used():
+    assert "rename data_params.seqs_num" in _parse(copy.deepcopy(OLD)).warnings[0]
+    old = copy.deepcopy(OLD)
+    old["data_params"]["max_seqs"] = old["data_params"].pop("seqs_num")
+    hint = _parse(old).warnings[0]
+    assert "seqs_num" not in hint and "The new layout keeps intermediate files" in hint
+
+
+def test_the_hint_keeps_compressed_fasta_off_the_list_for_a_plain_local_fasta():
+    """get_file links a plain local_fasta to extracted_fasta; compressed_fasta is unused."""
+    old = copy.deepcopy(OLD)
+    old["data_dirs"].update(url=None, local_fasta="/data/mine.fasta")
+    deletable = _parse(old).warnings[0].split("Then these old files can be deleted: ", 1)[1]
+    assert old["data_dirs"]["compressed_fasta"] not in deletable
 
 
 def test_the_old_layout_local_fasta_hint():

@@ -5,6 +5,8 @@ _dvc_yaml_gen with the package path replaced by <PKG>.
 """
 from __future__ import annotations
 
+import datetime
+import os
 import re
 from pathlib import Path
 
@@ -109,8 +111,8 @@ def test_summary_for_a_plain_source(tmp_path, monkeypatch):
     table = out[:out.index("Regenerated")]
     assert table == (
         f"data.yaml: 1 source -> {tmp_path}/output/data/pretrain_data\n"
-        "source     fasta                         seqs    len     val  clustering\n"
-        "swissprot  uniprot_sprot.fasta.gz (url)  20,000  20-512  0.1  off\n")
+        "source     fasta                         max seqs  len     val  clustering\n"
+        "swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off\n")
     assert "Rebuild: all (first run)" in out
     assert out.index("Rebuild:") < out.index("Running dvc repro")
 
@@ -123,8 +125,9 @@ def test_summary_for_a_uniref_cluster_source_marks_overrides(tmp_path, monkeypat
     table = out[out.index("data.yaml: 1 source"):out.index("Regenerated")]
     assert table == (
         f"data.yaml: 1 source -> {tmp_path}/output/data/pretrain_data\n"
-        "source    fasta                                            seqs  len     val      clustering\n"
-        "uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all*  20-512  0.0044*  "
+        "source    fasta                                            max seqs       len     val      "
+        "clustering\n"
+        "uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all clusters*  20-512  0.0044*  "
         "UniProt uniref50.xml.gz (members: UniRef90)\n"
         "* = set on this source\n")
 
@@ -138,25 +141,34 @@ def test_summary_names_the_files_a_cluster_run_reads(tmp_path, monkeypatch):
     cfg = yaml.safe_load(load_template("data_pretrain"))
     cfg["sources"] = {"u": {"fasta": "uniref50", "cluster_subsampling": {"members": "uniref90"}}}
     out, _ = _dry(tmp_path, monkeypatch, cfg)
-    assert "uniref90.fasta.gz (url) + uniref50.xml.gz (reuse, 2.0 kB)" in out
+    day = _day(dl / "uniref50.xml.gz")
+    assert f"uniref90.fasta.gz (url) + uniref50.xml.gz (reuse, 2.0 kB, {day})" in out
     assert "uniref50.fasta" not in out
     # members: null on a UniRef90 fasta: the fasta itself, and the XML
     cfg["sources"] = {"u": {"fasta": "uniref90", "cluster_subsampling": {"members": None}}}
     out, _ = _dry(tmp_path, monkeypatch, cfg)
-    assert "uniref90.fasta.gz (url) + uniref50.xml.gz (reuse, 2.0 kB)" in out
+    assert f"uniref90.fasta.gz (url) + uniref50.xml.gz (reuse, 2.0 kB, {day})" in out
 
 
 def test_summary_shows_a_reused_download_and_a_local_file(tmp_path, monkeypatch):
     got = tmp_path / "output/data/pretrain_data/downloads/uniprot_sprot.fasta.gz"
     got.parent.mkdir(parents=True)
     got.write_bytes(b"x" * 2_500_000)
+    os.utime(got, (0, 1_760_000_000))                 # 2025-10-09 (UTC), the download's date
     out, _ = _dry(tmp_path, monkeypatch, load_template("data_pretrain"))
-    assert "uniprot_sprot.fasta.gz (reuse, 2.5 MB)" in out
+    assert f"uniprot_sprot.fasta.gz (reuse, 2.5 MB, {_day(got)})" in out
     (tmp_path / "mine.fasta").write_text(">a\nMKV\n")
     cfg = yaml.safe_load(load_template("data_pretrain"))
     cfg["sources"] = {"mine": {"fasta": "mine.fasta"}}
     out, _ = _dry(tmp_path, monkeypatch, cfg)
     assert "mine.fasta (local, 7 B)" in out
+
+
+RERUN = "May rerun (DVC skips a stage its run cache already has): "
+
+
+def _day(path) -> str:
+    return datetime.date.fromtimestamp(path.stat().st_mtime).isoformat()
 
 
 def test_the_rebuild_line_asks_dvc_status_after_the_first_run(tmp_path, monkeypatch):
@@ -168,7 +180,7 @@ def test_the_rebuild_line_asks_dvc_status_after_the_first_run(tmp_path, monkeypa
     r = _run(_write(tmp_path, load_template("data_pretrain")), "--dry-run")
     assert r.exit_code == 0, r.output
     # pre-tokenize@val and write_manifest read what split writes, so they rerun too
-    assert ("Rebuild: filter, split, pre-tokenize@train, pre-tokenize@val, write_manifest. "
+    assert ("May rerun (DVC skips a stage its run cache already has): filter, split, pre-tokenize@train, pre-tokenize@val, write_manifest. "
             "Up to date: get_file, extract, check, shuffle.") in r.output
 
 
@@ -179,7 +191,8 @@ def _rebuild_line(tmp_path, monkeypatch, cfg, status):
         "R", (), {"returncode": 0, "stdout": status if "status" in a[0] else ""})())
     r = _run(_write(tmp_path, cfg), "--dry-run")
     assert r.exit_code == 0, r.output
-    return next(line for line in r.output.splitlines() if line.startswith(("Rebuild", "Up to")))
+    return next(line for line in r.output.splitlines()
+                if line.startswith(("Rebuild", "May rerun", "Up to")))
 
 
 def test_the_rebuild_line_follows_cluster_outputs_downstream(tmp_path, monkeypatch):
@@ -187,7 +200,7 @@ def test_the_rebuild_line_follows_cluster_outputs_downstream(tmp_path, monkeypat
     cfg["sources"] = {"uniref50": {"fasta": "uniref50",
                                    "cluster_subsampling": {"members": "uniref90"}}}
     line = _rebuild_line(tmp_path, monkeypatch, cfg, '{"cluster_members": []}')
-    assert line == ("Rebuild: cluster_members, cluster_index, write_manifest. Up to date: "
+    assert line == (f"{RERUN}cluster_members, cluster_index, write_manifest. Up to date: "
                     "get_members_fasta, extract_members, check, filter, cluster_pool, "
                     "get_cluster_xml.")
 
@@ -197,7 +210,7 @@ def test_the_rebuild_line_resolves_old_layout_paths(tmp_path, monkeypatch):
     data.yaml."""
     line = _rebuild_line(tmp_path, monkeypatch, (GOLDEN / "url_gz.data.yaml").read_text(),
                          '{"shuffle": []}')
-    assert line == ("Rebuild: shuffle, filter, split, pre-tokenize@train, pre-tokenize@val, "
+    assert line == (f"{RERUN}shuffle, filter, split, pre-tokenize@train, pre-tokenize@val, "
                     "write_manifest. Up to date: get_file, extract, check.")
 
 
@@ -205,7 +218,7 @@ def test_old_layout_warns_with_the_block_to_paste(tmp_path, monkeypatch):
     out, _ = _dry(tmp_path, monkeypatch, (GOLDEN / "url_gz.data.yaml").read_text())
     assert "Warning: data_dirs is the old data.yaml layout" in out
     assert "sources:\n  main:\n    fasta: swissprot" in out
-    assert "\nmain    sequences.fasta.gz (url)  20,000  20-512  0.1  off\n" in out
+    assert "\nmain    sequences.fasta.gz (url)  20,000    20-512  0.1  off\n" in out
     # the dvc.yaml it writes is master's
     assert (tmp_path / "dvc.yaml").read_text().replace(str(_NANOPLM_PKG_DIR), "<PKG>") == \
         (GOLDEN / "url_gz.dvc.yaml").read_text()
@@ -256,7 +269,8 @@ def test_a_bad_override_names_the_source(tmp_path, monkeypatch):
     cfg = yaml.safe_load(load_template("data_pretrain"))
     cfg["sources"]["swissprot"]["val_ratio"] = 2
     r = _run(_write(tmp_path, cfg))
-    assert r.exit_code != 0 and "sources.swissprot.val_ratio has an invalid value: 2" in r.output
+    assert r.exit_code != 0 and ("sources.swissprot.val_ratio has an invalid value: 2 (expected a number between 0 and "
+            "1, both excluded)") in " ".join(r.output.split())
 
 
 def _built(folder, **extra):

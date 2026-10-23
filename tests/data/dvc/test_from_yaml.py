@@ -104,6 +104,7 @@ def test_from_yaml_summary_uses_yaml_manifest(tmp_path, monkeypatch):
     assert "Total sequences: 42" in result.output
     assert "Train:         38" in result.output
     assert "Val:           4" in result.output
+    assert f"Set pretrain.yaml's dataset_dir to {out_dir.resolve()}." in result.output
 
 
 def test_from_yaml_fix_preserves_comments(tmp_path):
@@ -207,16 +208,12 @@ def test_from_yaml_warns_when_compressed_fasta_set_in_plain_mode(tmp_path, monke
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".dvc").mkdir(exist_ok=True)
 
-    # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
-    warnings_seen = []
-    from nanoplm.utils.logger import logger as _nplm_logger
-    monkeypatch.setattr(_nplm_logger, "warning",
-                        lambda msg, *a, **k: warnings_seen.append(msg))
-
     runner = CliRunner()
     result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
     assert result.exit_code == 0, result.output
-    assert any("unused" in w for w in warnings_seen)
+    # the same "Warning: ..." line every other data.yaml warning prints
+    assert ("Warning: data_dirs.compressed_fasta is unused when the source is a plain .fasta "
+            "file") in result.output
 
 
 def test_from_yaml_plain_local_omits_compressed_fasta_ok(tmp_path, monkeypatch):

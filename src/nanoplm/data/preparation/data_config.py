@@ -242,7 +242,8 @@ def _fasta(value, where: str, base_dir) -> str:
             raise DataConfigError(f"{where}.fasta is a directory, not a .fasta/.fasta.gz file: "
                                   f"{fasta}")
     if not (name.endswith(".fasta") or name.endswith(".fasta.gz")):
-        raise DataConfigError(f"{where}.fasta must end with .fasta or .fasta.gz, got: {fasta}")
+        raise DataConfigError(f"{where}.fasta must be a shortcut ({', '.join(FASTA_SHORTCUTS)}) "
+                              f"or a URL or path that ends with .fasta or .fasta.gz, got: {fasta}")
     return fasta
 
 
@@ -350,8 +351,30 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
                                   if is_default(src.params[f], d))
         src.overrides = tuple(f for f in PARAM_FIELDS if f in over)
         src.paths = _source_paths(src)
+        if src.cluster is not None:
+            _check_cluster_holdout(src)
         out[name] = src
+    if defaults_raw and all(s.prepared for s in out.values()):
+        raise DataConfigError(f"{name_of}: data_params has no effect on prepared sources (they "
+                              "are used as they were built); remove data_params")
     return DataConfig(output_dir=output_dir, sources=out, warnings=warnings)
+
+
+def _check_cluster_holdout(src: Source) -> None:
+    """With max_seqs > 0 a cluster source has at most max_seqs clusters, so a val_ratio
+    that holds out none of them (or all) is known before any stage runs."""
+    n, ratio = src.params.get("max_seqs"), src.params.get("val_ratio")
+    if not (isinstance(n, int) and not isinstance(n, bool) and n > 0
+            and isinstance(ratio, (int, float)) and 0 < ratio < 1):
+        return
+    held = round(n * ratio)
+    if held == 0 or held == n:
+        raise DataConfigError(
+            f"sources.{src.name}: {src.key('val_ratio')}={ratio:g} of at most {n:,} clusters "
+            f"({src.key('max_seqs')}) holds out {held}; cluster subsampling needs at least one "
+            f"train and one val cluster. Set sources.{src.name}.val_ratio "
+            + (f"to at least {1 / n:.2g}" if held == 0 else f"below {1 - 1 / n:.2g}")
+            + f", or sources.{src.name}.max_seqs: -1")
 
 
 def _source_paths(src: Source) -> dict:
@@ -436,18 +459,19 @@ def migration_hint(config: dict, cluster: Optional[dict] = None) -> str:
         lines.append("    cluster_subsampling:")
         lines.append(f"      members: {_scalar(cluster.get('members'))}")
         lines += [f"      {k}: {_scalar(cluster[k])}" for k in CLUSTER_KEYS[1:] if k in cluster]
+    rename = ("and rename data_params.seqs_num to max_seqs. "
+              if "seqs_num" in (config.get("data_params") or {}) else "")
     lines += [
         "",
-        "and rename data_params.seqs_num to max_seqs. The new layout keeps intermediate "
-        f"files under output_dir/{LEGACY_NAME}/, so the first run after switching rebuilds "
-        "them.",
+        f"{rename}The new layout keeps intermediate files under output_dir/{LEGACY_NAME}/, "
+        "so the first run after switching rebuilds them.",
     ]
     compressed = dirs.get("compressed_fasta")
     old = [dirs[k] for k in _OLD_INTERMEDIATES if dirs.get(k)]
     if dirs.get("url") and compressed:
         lines.append(f'To skip the download, set fasta: "{compressed}" (the file already '
                      "downloaded; it is read where it is, so keep it).")
-    elif compressed and dirs.get("local_fasta"):
+    elif compressed and dirs.get("local_fasta") and is_compressed(dirs["local_fasta"]):
         old.append(compressed)          # get_file's link to local_fasta
     if old:
         lines.append(f"Then these old files can be deleted: {', '.join(old)}.")

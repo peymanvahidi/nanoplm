@@ -223,8 +223,7 @@ def test_from_yaml_end_to_end_with_mmseqs(tmp_path):
     own.write_text(rel.fasta90.read_text().replace(">UniRef90_", ">seq_"))
     env = _project(tmp_path, {"clustering": "auto", "identity": 0.5, "coverage": 0.8}, str(own))
     r = _from_yaml(tmp_path, env)
-    _assert_source_line_first(r, f"MMseqs2 linclust, identity 0.5, coverage 0.8 "
-                                 f"(members: {own})")
+    _assert_source_line_first(r, "MMseqs2 linclust, identity 0.5, coverage 0.8")
     assert f"  Cluster source:  MMseqs2 linclust, identity 0.5" in r.stdout   # summary
     out = tmp_path / OUT
     assert (out / "cluster_index/members.tsv").exists()
@@ -287,8 +286,7 @@ def test_from_yaml_mmseqs2_on_uniref_data_never_fetches_the_xml(tmp_path, layout
     env.update(HTTPS_PROXY="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9",
                https_proxy="http://127.0.0.1:9", http_proxy="http://127.0.0.1:9")
     r = _from_yaml(tmp_path, env)
-    _assert_source_line_first(r, f"MMseqs2 linclust, identity 0.5, coverage 0.8 "
-                                 f"(members: {rel.fasta90})")
+    _assert_source_line_first(r, "MMseqs2 linclust, identity 0.5, coverage 0.8")
     dvc_yaml = (tmp_path / "dvc.yaml").read_text()
     assert "get_cluster_xml" not in dvc_yaml and "uniref50.xml" not in dvc_yaml
     assert not list((tmp_path / OUT).rglob("*.xml*"))
@@ -341,8 +339,9 @@ def test_from_yaml_with_the_template_data_params(tmp_path):
                CUDA_VISIBLE_DEVICES="")
     r = _from_yaml(tmp_path, env)
     err = r.stdout + r.stderr
-    assert "data_params.max_seqs=20000 trains on at most 20,000 clusters" in err
-    assert "data_params.val_ratio=0.1 holds out 10.0% of the clusters" in err
+    assert ("sources.src: max_seqs=20000 (from data_params) trains on at most 20,000 clusters"
+            in err)
+    assert "sources.src: val_ratio=0.1 (from data_params) holds out 10.0% of the clusters" in err
     m = read_manifest(tmp_path / OUT)
     assert m.cluster_level == "uniref90" and m.samples_per_shard == 2000
     assert m.val_sequences == round(m.seqs_num * 0.1)
@@ -364,7 +363,9 @@ def test_summary_counts_clusters_and_names_the_members(tmp_path, capsys):
     assert "uniref50.fasta" not in text and "Total sequences" not in text
     assert f"Members:         {cc.UNIPROT_FASTA['uniref90']}" in text
     assert "Cluster source:  UniProt uniref50.xml.gz (members: UniRef90)" in text
-    assert "Clusters:        120 (uniref90)" in text and "Pool sequences:  400" in text
+    assert "UniRef50 clusters: 120 (members from UniRef90)" in text
+    assert "Pool sequences:  400" in text
+    assert f"Set pretrain.yaml's dataset_dir to {out.resolve()}." in text
 
 
 def test_from_yaml_says_how_to_install_mmseqs(tmp_path, monkeypatch):
@@ -378,8 +379,10 @@ def test_from_yaml_says_how_to_install_mmseqs(tmp_path, monkeypatch):
     monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("DVC must not run"))
     r = CliRunner().invoke(data, ["from-yaml", str(tmp_path / "data.yaml")])
     assert r.exit_code != 0
-    assert "clustered with MMseqs2, but `mmseqs` was not found" in r.output
+    assert "sources.src: these members are clustered with MMseqs2, but `mmseqs` was not found" \
+        in " ".join(r.output.split())
     assert "nanoplm deps install --mmseqs-only" in r.output
+    assert "clustering: auto" not in r.output         # not UniRef: UniProt clusters can't help
     assert not (tmp_path / "dvc.yaml").exists()
 
 
@@ -413,3 +416,4 @@ def test_forced_mmseqs2_on_uniref_data_needs_the_binary(tmp_path, monkeypatch):
     monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("DVC must not run"))
     r = CliRunner().invoke(data, ["from-yaml", str(tmp_path / "data.yaml")])
     assert r.exit_code != 0 and "clustered with MMseqs2, but `mmseqs` was not found" in r.output
+    assert "set sources.src.cluster_subsampling.clustering: auto" in " ".join(r.output.split())

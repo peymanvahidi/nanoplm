@@ -891,7 +891,8 @@ def get_yaml(output, distillation, force):
     type=str,
     required=False,
     default=None,
-    help="DVC stage to run (e.g., split). Defaults to full pipeline.",
+    help="DVC stage to run, as named in dvc.yaml (e.g. split, or cluster_index with "
+         "cluster subsampling). Defaults to the full pipeline.",
 )
 @click.option(
     "--no-auto-init",
@@ -1170,10 +1171,8 @@ def _validate_source_fields(data_dirs: dict) -> None:
             "data_dirs.compressed_fasta is required when source is a .gz file."
         )
     if (not compressed_source) and compressed:
-        logger.warning(
-            "data_dirs.compressed_fasta is unused when source is a plain .fasta file; "
-            "it can be removed."
-        )
+        click.echo("Warning: data_dirs.compressed_fasta is unused when the source is a plain "
+                   ".fasta file; it can be removed.", err=True)
 
 
 # data_dirs path keys that generate_dvc_yaml (_dvc_yaml_gen.py) substitutes as
@@ -1184,31 +1183,46 @@ _DATA_DIRS_REQUIRED = [
 ]
 
 
+def _expects(text: str):
+    """Attach what a validator accepts, for the invalid-value error."""
+    def wrap(fn):
+        fn.expects = text
+        return fn
+    return wrap
+
+
 def _int_at_least(lo: int):
-    return lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= lo
+    return _expects(f"an integer >= {lo}")(
+        lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= lo)
 
 
 def _int_in_range(lo: int, hi: int):
-    return lambda v: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+    return _expects(f"an integer from {lo} to {hi}")(
+        lambda v: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi)
 
 
+@_expects("-1 (no sharding) or an integer >= 1")
 def _shard_count(v) -> bool:
     """-1 (no sharding) or a positive shard size, matching kd-embed's own check."""
     return isinstance(v, int) and not isinstance(v, bool) and (v == -1 or v > 0)
 
 
+@_expects("a number between 0 and 1, both excluded")
 def _unit_float(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 1
 
 
+@_expects("an integer or null")
 def _optional_int(v) -> bool:
     return v is None or (isinstance(v, int) and not isinstance(v, bool))
 
 
+@_expects("true or false")
 def _is_bool(v) -> bool:
     return isinstance(v, bool)
 
 
+@_expects("a non-empty string")
 def _nonempty_str(v) -> bool:
     return isinstance(v, str) and bool(v)
 
@@ -1256,7 +1270,8 @@ def _validate_pipeline_fields(data_dirs: dict, data_params: dict, kind: str, con
         value = data_params[field]
         if not is_valid(value):
             raise click.ClickException(
-                f"{config_path.name}: data_params.{field} has an invalid value: {value!r}"
+                f"{config_path.name}: data_params.{field} has an invalid value: {value!r} "
+                f"(expected {is_valid.expects})"
             )
 
 
@@ -1270,7 +1285,8 @@ def _validate_source_params(src, config_path: Path) -> None:
         value = src.params[field]
         if not is_valid(value):
             raise click.ClickException(
-                f"{config_path.name}: {src.key(field)} has an invalid value: {value!r}")
+                f"{config_path.name}: {src.key(field)} has an invalid value: {value!r} "
+                f"(expected {is_valid.expects})")
 
 
 def _read_pretrain_config(config_path: Path, quiet: bool = False):
@@ -1347,15 +1363,18 @@ def _validate_cluster_block(src, config_path: Path):
             and (workers == -1 or workers >= 1)):
         raise click.ClickException(
             f"{config_path.name}: {src.key('max_workers')} must be -1 (all cores) or at "
-            f"least 1 with cluster_subsampling, got {workers!r}")
+            f"least 1 with cluster_subsampling (sources.{src.name}), got {workers!r}")
     for n in plan.notes:
         click.echo(n)
     for w in plan.warnings:
         click.echo(f"Warning: {w}", err=True)
     if plan.cluster_source == "mmseqs" and find_mmseqs() is None:
+        uniprot = (f" Or set sources.{src.name}.cluster_subsampling.clustering: auto to use "
+                   "UniProt's clusters, which need no MMseqs2."
+                   if plan.members_level in ("uniref90", "uniref100") else "")
         raise click.ClickException(
-            f"{config_path.name}: these members are clustered with MMseqs2, but `mmseqs` "
-            f"was not found. {MMSEQS_INSTALL_HINT}")
+            f"{config_path.name}: sources.{src.name}: these members are clustered with "
+            f"MMseqs2, but `mmseqs` was not found. {MMSEQS_INSTALL_HINT}{uniprot}")
     return plan
 
 
@@ -1404,6 +1423,12 @@ def _size(path: Path) -> str:
     return f"{n} B"
 
 
+def _date(path: Path) -> str:
+    """When a file was written (a download: which release it is)."""
+    import datetime
+    return datetime.date.fromtimestamp(path.stat().st_mtime).isoformat()
+
+
 def _file_cell(value: str, download, cwd: Path) -> str:
     """Where one input file comes from: a URL to download (``download`` is where it
     goes), a copy already downloaded, or a local file read in place."""
@@ -1412,7 +1437,7 @@ def _file_cell(value: str, download, cwd: Path) -> str:
         on_disk = _resolve_path(download, cwd) if download else None
         name = Path(download).name if download else value
         if on_disk is not None and on_disk.is_file():
-            return f"{name} (reuse, {_size(on_disk)})"
+            return f"{name} (reuse, {_size(on_disk)}, {_date(on_disk)})"
         return f"{name} (url)"
     on_disk = _resolve_path(value, cwd)
     return f"{value} (local, {_size(on_disk)})" if on_disk.is_file() else f"{value} (local)"
@@ -1431,12 +1456,18 @@ def _fasta_cell(src, plan, cwd: Path) -> str:
     return cell
 
 
+def _max_seqs_cell(max_seqs: int, clusters: bool) -> str:
+    """The max_seqs cap; it counts clusters for a cluster-subsampled source."""
+    cap = "all" if max_seqs == -1 else f"{max_seqs:,}"
+    return f"{cap} clusters" if clusters else cap
+
+
 def plan_table(cfg, plan, cwd: Path, config_path: Path) -> str:
     """The pre-run summary: one row per source, before any DVC call."""
     out = _resolve_path(cfg.output_dir, cwd)
     n = len(cfg.sources)
     lines = [f"{config_path.name}: {n} source{'s' if n > 1 else ''} -> {out}"]
-    rows = [("source", "fasta", "seqs", "len", "val", "clustering")]
+    rows = [("source", "fasta", "max seqs", "len", "val", "clustering")]
     starred = False
     for src in cfg.sources.values():
         over = set(src.overrides)
@@ -1446,7 +1477,7 @@ def plan_table(cfg, plan, cwd: Path, config_path: Path) -> str:
             return text + ("*" if over & set(fields) else "")
 
         p = src.params
-        seqs = "all" if p["max_seqs"] == -1 else f"{p['max_seqs']:,}"
+        seqs = _max_seqs_cell(p["max_seqs"], plan is not None)
         rows.append((
             src.name, _fasta_cell(src, plan, cwd), mark(seqs, "max_seqs"),
             mark(f"{p['min_seq_len']}-{p['max_seq_len']}", "min_seq_len", "max_seq_len"),
@@ -1543,8 +1574,10 @@ def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict, params: dict) ->
     if not rebuild:
         click.echo("Up to date: all stages")
         return
-    click.echo(f"Rebuild: {', '.join(rebuild)}."
-               + (f" Up to date: {', '.join(fresh)}." if fresh else ""))
+    # dvc status cannot tell which of these DVC's run cache already holds (repro then
+    # restores the outputs instead of running the stage), hence "may"
+    click.echo(f"May rerun (DVC skips a stage its run cache already has): "
+               f"{', '.join(rebuild)}." + (f" Up to date: {', '.join(fresh)}." if fresh else ""))
 
 
 _STATUS_TIMEOUT = 120
@@ -1583,10 +1616,11 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
             f"  Members:         {plan.members if plan else src_value}\n"
             f"{source}"
             f"  Pool sequences:  {m.get('pool_sequences')}\n"
-            f"  Clusters:        {m.get('seqs_num')} ({m.get('cluster_level')})\n"
+            f"  {_clusters_line(m)}\n"
             f"    Train:         {m.get('train_sequences')}\n"
             f"    Val:           {m.get('val_sequences')}\n"
             f"  Manifest:        {manifest_path}\n"
+            f"{_dataset_dir_line(manifest_path, kind)}"
         )
         return
     click.echo(
@@ -1596,7 +1630,23 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
         f"    Train:         {m.get('train_sequences')}\n"
         f"    Val:           {m.get('val_sequences')}\n"
         f"  Manifest:        {manifest_path}\n"
+        f"{_dataset_dir_line(manifest_path, kind)}"
     )
+
+
+def _clusters_line(m: dict) -> str:
+    """'UniRef50 clusters: 265 (members from UniRef90)', or 'MMseqs2 clusters: 40'."""
+    level = m.get("cluster_level")
+    if level in ("uniref90", "uniref100"):
+        return (f"UniRef50 clusters: {m.get('seqs_num')} "
+                f"(members from UniRef{level[len('uniref'):]})")
+    return f"MMseqs2 clusters:  {m.get('seqs_num')}"
+
+
+def _dataset_dir_line(manifest_path: Path, kind: str) -> str:
+    if kind != "pretrain":
+        return ""
+    return f"  Set pretrain.yaml's dataset_dir to {manifest_path.parent.resolve()}.\n"
 
 
 @data.command("write-manifest", hidden=True)
