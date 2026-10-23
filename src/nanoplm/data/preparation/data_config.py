@@ -23,7 +23,8 @@ The sources layout puts everything under ``output_dir``:
 
 With several sources, train/ val/ cluster_index/ and .data_manifest of each source go
 into ``<source>/`` (Source.data_dir) and ``output_dir/.data_manifest`` is the mixture
-manifest (nanoplm.data.infra.mixture).
+manifest (nanoplm.data.infra.mixture). A .gz is extracted into downloads/ and checked
+there (``<file>_validation/``), once for all the sources that read it.
 """
 from __future__ import annotations
 
@@ -419,12 +420,14 @@ def _check_mix(sources: dict, name_of: str) -> None:
 
 def _source_paths(src: Source) -> dict:
     work = src.work_dir
+    # a mix extracts into downloads/, so the sources that read one .gz share the extract
+    unpacked = src.downloads_dir if src.mixed else work
     if src.is_url:
         got = src.download_path(src.fasta)
-        compressed, extracted = (got, _join(work, strip_gz(file_name(src.fasta)))) \
+        compressed, extracted = (got, _join(unpacked, strip_gz(file_name(src.fasta)))) \
             if src.is_compressed else (None, got)
     elif src.is_compressed:                 # a local .gz is read in place
-        compressed, extracted = src.fasta, _join(work, strip_gz(file_name(src.fasta)))
+        compressed, extracted = src.fasta, _join(unpacked, strip_gz(file_name(src.fasta)))
     else:                                   # a local .fasta is read in place
         compressed, extracted = None, src.fasta
     return {

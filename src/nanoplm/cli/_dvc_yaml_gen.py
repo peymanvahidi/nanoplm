@@ -10,10 +10,11 @@ each data_params field where data.yaml sets it: ${data_params.X}, or
 ${sources.<name>.X} for a per-source override.
 
 Several sources (a mix) give one dvc.yaml: each source's stages named
-``<source>-<stage>``, one ``download-<file>`` stage per URL however many sources use
-it, and a last ``mixture`` stage that writes output_dir/.data_manifest from the source
+``<source>-<stage>``; one ``download-<file>``, ``extract-<file>`` and ``check-<file>``
+stage per file in downloads/ however many sources read it; and a last ``mixture`` stage that writes output_dir/.data_manifest from the source
 manifests. Only that stage reads the weights, so changing them reruns it alone.
 """
+import os
 import re
 from typing import Any
 import yaml
@@ -21,7 +22,7 @@ import nanoplm as _nanoplm
 from pathlib import Path as _Path
 
 from nanoplm.data.preparation.data_config import (
-    DataConfigError, Source, file_name, is_url, legacy_source, parse_data_config,
+    DataConfigError, Source, _join, file_name, is_url, legacy_source, parse_data_config,
 )
 
 
@@ -439,8 +440,11 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     return stages
 
 
-# stages that fetch one URL into downloads/; a mix shares each between its sources
-_DOWNLOAD_STAGES = ("get_file", "get_members_fasta", "get_cluster_xml")
+# stages a mix runs once per output path, whichever sources need them: fetching a URL,
+# extracting a .gz and checking the result, all in downloads/
+_SHARED_STAGES = {"get_file": "download", "get_members_fasta": "download",
+                  "get_cluster_xml": "download", "extract": "extract",
+                  "extract_members": "extract", "check": "check"}
 
 
 def _out_path(stage: dict) -> str:
@@ -448,35 +452,59 @@ def _out_path(stage: dict) -> str:
     return next(iter(out)) if isinstance(out, dict) else out
 
 
-def _source_stages(src: Source, params_filename: str, base_dir) -> dict:
-    from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
-    plan = resolve_cluster_plan(src, base_dir)
-    return (_cluster_stages(src, plan, params_filename) if plan is not None
-            else _plain_stages(src, "pretrain", params_filename))
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "_", name)
+
+
+def _in_downloads(path: str, src: Source) -> bool:
+    return os.path.normpath(path).startswith(os.path.normpath(src.downloads_dir) + os.sep)
+
+
+def _share_check(src: Source, plan) -> None:
+    """Check a FASTA in downloads/ (a download or an extract) there, so the sources that
+    read it share the check. A per-source drop_invalid_sequences keeps its own check."""
+    fasta = str(plan.members_fasta) if plan is not None else src.paths["extracted_fasta"]
+    if _in_downloads(fasta, src) and "drop_invalid_sequences" not in src.overrides:
+        # no dot in the folder name: the check command takes a suffix for a file name
+        src.paths["validation_dir"] = _join(src.downloads_dir,
+                                            _safe(file_name(fasta)) + "_validation")
 
 
 def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
-    """Download stages (one per URL), then each source's stages, then the mixture."""
-    downloads: dict[str, tuple] = {}            # out path -> (stage name, stage, source)
+    """Shared stages (one per output path), then each source's stages, then the mixture."""
+    from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
+    shared: dict[str, tuple] = {}               # out path -> (stage name, stage, source)
     per_source: dict[str, Any] = {}
     for src in cfg.sources.values():
         if src.prepared:
             continue
-        for name, stage in _source_stages(src, params_filename, base_dir).items():
-            if name not in _DOWNLOAD_STAGES:
+        plan = resolve_cluster_plan(src, base_dir)
+        _share_check(src, plan)
+        stages = (_cluster_stages(src, plan, params_filename) if plan is not None
+                  else _plain_stages(src, "pretrain", params_filename))
+        for name, stage in stages.items():
+            if name not in _SHARED_STAGES:
                 per_source[f"{src.name}-{name}"] = stage
                 continue
             out = _out_path(stage)
-            if out in downloads:
-                if downloads[out][1]["cmd"] != stage["cmd"]:
-                    raise DataConfigError(
-                        f"sources.{downloads[out][2]} and sources.{src.name} download "
-                        f"different URLs to the same file {out}; rename one of the files "
-                        "or download it yourself and give its path")
+            if name == "check" and not _in_downloads(out, src):
+                per_source[f"{src.name}-{name}"] = stage
                 continue
-            step = "download-" + re.sub(r"[^A-Za-z0-9_-]", "_", file_name(out))
-            downloads[out] = (step, stage, src.name)
-    stages = {step: stage for step, stage, _ in downloads.values()}
+            out = os.path.normpath(out)      # ./out/x and out/x are one file
+            if out in shared:
+                if shared[out][1]["cmd"] != stage["cmd"]:
+                    what = "download different URLs" if _SHARED_STAGES[name] == "download" \
+                        else "extract different files"
+                    raise DataConfigError(
+                        f"sources.{shared[out][2]} and sources.{src.name} {what} to the same "
+                        f"file {out}; rename one of the files or download it yourself and "
+                        "give its path")
+                continue
+            # a check is named after the FASTA it reads
+            step = _SHARED_STAGES[name] + "-" + _safe(file_name(
+                stage["deps"][0] if name == "check" else out))
+            shared[out] = (step, stage, src.name)
+    stages = {step: stage for step, stage, _ in shared.values()}
     stages.update(per_source)
     cmd = [f"nanoplm data write-mixture -o {cfg.output_dir}"]
     deps, params = [], []

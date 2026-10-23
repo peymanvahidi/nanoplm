@@ -154,12 +154,13 @@ def _members_paths(members: str, src) -> tuple[Optional[Path], Path]:
     """(compressed, extracted) for a members FASTA that is not the source fasta: a URL
     is downloaded into downloads/, a local file is read in place."""
     name = _name(members)
+    # a mix extracts into downloads/ (data_config._source_paths)
+    unpacked = Path(src.downloads_dir if src.mixed else src.work_dir)
     if is_url(members):
         got = Path(src.download_path(members))
-        return (got, Path(src.work_dir) / strip_gz(name)) if name.endswith(".gz") \
-            else (None, got)
+        return (got, unpacked / strip_gz(name)) if name.endswith(".gz") else (None, got)
     if name.endswith(".gz"):
-        return Path(members), Path(src.work_dir) / strip_gz(name)
+        return Path(members), unpacked / strip_gz(name)
     return None, Path(members)
 
 

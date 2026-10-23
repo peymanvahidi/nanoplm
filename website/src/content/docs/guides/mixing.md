@@ -30,7 +30,7 @@ sources:
 
 ## What reruns
 
-There is one `dvc.yaml`. Each source has its own stages (`swissprot-filter`, `uniref50-cluster_index`, ...). A URL that several sources use is downloaded once. The last stage, `mixture`, is the only one that reads the weights, so changing only the weights reruns only that stage, in seconds.
+There is one `dvc.yaml`. Each source has its own stages (`swissprot-filter`, `uniref50-cluster_index`, ...). A URL that several sources use is downloaded once, and a `.gz` that several sources read is extracted and checked once, into `output_dir/downloads/` (stages `download-<file>`, `extract-<file>`, `check-<file>`). A source that sets its own `drop_invalid_sequences` keeps its own check. The last stage, `mixture`, is the only one that reads the weights, so changing only the weights reruns only that stage, in seconds.
 
 The mixture manifest records a hash of each source's manifest. If a source is rebuilt or edited after the mix was written, training stops and asks you to rerun `nanoplm data from-yaml`.
 

@@ -42,9 +42,18 @@ def test_three_sources_one_download_per_url_and_a_mixture_stage():
     downloads = [n for n in st if n.startswith("download-")]
     assert downloads == ["download-uniprot_sprot_fasta_gz", "download-uniref90_fasta_gz",
                          "download-uniref50_xml_gz"]
-    # uniref50's members and u90's fasta are the same file: fetched once, read twice
-    assert st["u90-extract"]["deps"][0] == "out/downloads/uniref90.fasta.gz"
-    assert st["uniref50-extract_members"]["deps"][0] == "out/downloads/uniref90.fasta.gz"
+    # uniref50's members and u90's fasta are the same file: fetched, extracted and
+    # checked once, read twice
+    assert [n for n in st if n.startswith(("extract", "check")) or "-extract" in n
+            or n.endswith("-check")] == [
+        "extract-uniprot_sprot_fasta", "check-uniprot_sprot_fasta",
+        "extract-uniref90_fasta", "check-uniref90_fasta"]
+    assert st["extract-uniref90_fasta"]["deps"][0] == "out/downloads/uniref90.fasta.gz"
+    assert st["extract-uniref90_fasta"]["outs"] == ["out/downloads/uniref90.fasta"]
+    assert st["check-uniref90_fasta"]["outs"] == ["out/downloads/uniref90_fasta_validation"]
+    for name in ("uniref50-filter", "u90-shuffle"):
+        assert st[name]["deps"][:2] == ["out/downloads/uniref90.fasta",
+                                        "out/downloads/uniref90_fasta_validation"]
     assert st["download-uniref50_xml_gz"]["outs"] == [
         {"out/downloads/uniref50.xml.gz": {"persist": True, "cache": False}}]
     for name in ("swissprot", "uniref50", "u90"):
@@ -69,6 +78,40 @@ def test_two_urls_with_one_file_name_are_refused():
                b={"fasta": "https://y.org/b/prot.fasta.gz", "weight": 0.5})
     with pytest.raises(DataConfigError, match="sources.a and sources.b download different "
                                               "URLs to the same file out/downloads/prot"):
+        _stages(cfg)
+
+
+def test_a_shared_gz_is_extracted_and_checked_once_in_any_source_order():
+    a = {"fasta": "prot.fasta.gz", "weight": 0.5}
+    b = {"fasta": "prot.fasta.gz", "weight": 0.4, "max_seq_len": 100}
+    c = {"fasta": "small.fasta", "weight": 0.1}
+    st = _stages(_mix(a=a, b=b, c=c))
+    assert [n for n in st if n.startswith(("extract", "check"))] == [
+        "extract-prot_fasta", "check-prot_fasta"]
+    assert st["extract-prot_fasta"]["cmd"] == \
+        "nanoplm data extract -i prot.fasta.gz -o out/downloads/prot.fasta"
+    assert st["a-shuffle"]["deps"][:2] == st["b-shuffle"]["deps"][:2] == [
+        "out/downloads/prot.fasta", "out/downloads/prot_fasta_validation"]
+    assert "c-check" in st                  # a local FASTA is checked per source
+    assert st["c-check"]["outs"] == ["out/c/validation"]
+    flipped = _stages(_mix(c=c, b=b, a=a))
+    assert {n: flipped[n] for n in ("extract-prot_fasta", "check-prot_fasta")} == \
+        {n: st[n] for n in ("extract-prot_fasta", "check-prot_fasta")}
+
+
+def test_a_per_source_drop_invalid_keeps_its_own_check():
+    st = _stages(_mix(a={"fasta": "prot.fasta.gz", "weight": 0.5},
+                      b={"fasta": "prot.fasta.gz", "weight": 0.5,
+                         "drop_invalid_sequences": True}))
+    assert "check-prot_fasta" in st and st["b-check"]["outs"] == ["out/b/validation"]
+    assert st["b-check"]["deps"][0] == "out/downloads/prot.fasta"
+
+
+def test_two_local_gz_with_one_file_name_are_refused():
+    cfg = _mix(a={"fasta": "x/prot.fasta.gz", "weight": 0.5},
+               b={"fasta": "y/prot.fasta.gz", "weight": 0.5})
+    with pytest.raises(DataConfigError, match="sources.a and sources.b extract different "
+                                              "files to the same file out/downloads/prot"):
         _stages(cfg)
 
 
