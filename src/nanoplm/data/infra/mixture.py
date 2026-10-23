@@ -247,6 +247,14 @@ def eval_split(val_sizes: dict, eval_names: list, micro_batch_seqs: int) -> dict
     return {n: min(val_sizes[n], per_source) for n in eval_names}
 
 
+def eval_workers(num_workers: int, n_loaders: int) -> int:
+    """DataLoader workers per source's val loader: ``num_workers`` split over the
+    loaders, at least one each when there are any. Eval workers start anew at every
+    eval when persistent workers are off (packing), so K loaders of num_workers each
+    would start K times as many processes as one val set does."""
+    return 0 if num_workers <= 0 else max(1, math.ceil(num_workers / n_loaders))
+
+
 def eval_payload(losses: dict, weights: dict, suffix: str = "") -> dict:
     """W&B keys of one mixture eval: ``eval/loss/<source>`` per source and ``eval/loss``,
     the mean of those weighted by each source's share (over the sources evaluated).

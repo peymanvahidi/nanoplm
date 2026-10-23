@@ -3061,12 +3061,15 @@ def run_pure_pretraining(
     else:
         train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=collator, drop_last=False, **dl_kwargs)
     if mixture:
+        from nanoplm.data.infra.mixture import eval_workers
         eval_loader = None
+        # one val loader per source, num_workers split between them
+        eval_kwargs = dict(dl_kwargs, num_workers=eval_workers(num_workers, len(mixture.eval_sets)))
         mixture.eval_loaders(
             lambda ds: DataLoader(
                 ds, sampler=DistributedSampler(ds, shuffle=False) if distributed else SequentialSampler(ds),
                 batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator,
-                drop_last=False, **dl_kwargs))
+                drop_last=False, **eval_kwargs))
     else:
         eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
 

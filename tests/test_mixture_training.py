@@ -36,6 +36,11 @@ def test_eval_payload_is_the_share_weighted_mean():
     assert mx.eval_payload({"a": 1.0}, {"a": 1.0}, suffix="/r4") == {"eval/loss/a/r4": 1.0}
 
 
+def test_eval_workers_are_split_over_the_source_loaders():
+    assert [mx.eval_workers(8, k) for k in (1, 2, 3, 8, 20)] == [8, 4, 3, 1, 1]
+    assert mx.eval_workers(0, 3) == 0
+
+
 @pytest.mark.parametrize("value", ["all", ["a"], ("a", "b"), "a"])
 def test_eval_sources_config_accepts_all_or_names(value, tmp_path):
     cfg = PretrainingConfig(dataset_dir=str(tmp_path), eval_sources=value)
