@@ -461,8 +461,8 @@ x-extra-fields:
           members:
             type: [string, "null"]
             description: >-
-              uniref90, uniref100, a FASTA URL/path, or null (= this source's
-              fasta). Required.
+              uniref90, uniref100, a UniRef90/100 FASTA URL/path, or null (= this
+              source's fasta). Required.
           # cluster_config.CLUSTERINGS
           clustering:
             type: string

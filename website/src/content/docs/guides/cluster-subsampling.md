@@ -21,13 +21,13 @@ sources:
   uniref50:
     fasta: uniref50
     cluster_subsampling:
-      members: uniref90  # uniref90, uniref100, a FASTA URL/path, or null (= this fasta)
+      members: uniref90  # uniref90, uniref100, a UniRef90/100 FASTA URL/path, or null (= this fasta)
       clustering: auto   # auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or uniprot, mmseqs2
       identity: 0.5      # mmseqs2 only: min sequence identity within a cluster
       coverage: 0.8      # mmseqs2 only: min alignment coverage
 ```
 
-- [`members`](/nanoplm/reference/data/#data-cluster_subsampling-members): the sequences training draws from. It is required, so an empty block is an error rather than a silent default. `uniref90` and `uniref100` are shortcuts for UniProt's `uniref90.fasta.gz` / `uniref100.fasta.gz`. A value starting with `http(s)://` or `ftp://` is downloaded, anything else is a local path. `null` uses the source's `fasta` itself.
+- [`members`](/nanoplm/reference/data/#data-cluster_subsampling-members): the sequences training draws from. It is required, so an empty block is an error rather than a silent default. `uniref90` and `uniref100` are shortcuts for UniProt's `uniref90.fasta.gz` / `uniref100.fasta.gz`. Any other value is a UniRef90 or UniRef100 FASTA: one starting with `http(s)://` or `ftp://` is downloaded, anything else is a local path. `null` uses the source's `fasta` itself; that is how to cluster your own sequences.
 - [`clustering`](/nanoplm/reference/data/#data-cluster_subsampling-clustering): where the clusters come from. `auto` uses UniProt's UniRef50 clusters for UniRef data and MMseqs2 for anything else (see [Where the clusters come from](#where-the-clusters-come-from)). `uniprot` requires UniProt clusters and fails at config time when the data is not UniRef. `mmseqs2` always clusters the members with MMseqs2, also for UniRef data.
 - [`identity`](/nanoplm/reference/data/#data-cluster_subsampling-identity) and [`coverage`](/nanoplm/reference/data/#data-cluster_subsampling-coverage) are only read when MMseqs2 does the clustering.
 
