@@ -326,5 +326,6 @@ def test_epochs_in_the_table_match_what_the_dataset_reads(tmp_path):
     assert plan[1]["epochs"] > 10
     lines = mx.format_run_plan(plan, budget)
     assert lines[1].split() == ["source", "share", "size", "tokens", "used", "epochs"]
-    assert lines[-1].startswith("Warning: source b is read")
-    assert not any("source a is read" in ln for ln in lines)
+    assert lines[-1].startswith("Warning: sources.b: read ")
+    assert "lower sources.b.weight or add data" in lines[-1]
+    assert not any("sources.a:" in ln for ln in lines)

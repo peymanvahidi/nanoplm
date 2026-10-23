@@ -230,8 +230,9 @@ def format_run_plan(plan: list, budget_tokens: int) -> list:
                                for i, (c, w) in enumerate(zip(r, widths))) for r in rows]
     for p in plan:
         if p["epochs"] > REPEAT_WARN:
-            lines.append(f"Warning: source {p['name']} is read {p['epochs']:.1f} times over "
-                         f"the run (more than {REPEAT_WARN}x); lower its weight or add data")
+            lines.append(f"Warning: sources.{p['name']}: read {p['epochs']:.1f} times over "
+                         f"the run (more than {REPEAT_WARN}x); lower sources.{p['name']}.weight "
+                         "or add data")
     return lines
 
 

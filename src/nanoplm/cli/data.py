@@ -892,7 +892,8 @@ def get_yaml(output, distillation, force):
     required=False,
     default=None,
     help="DVC stage to run, as named in dvc.yaml (e.g. split, or cluster_index with "
-         "cluster subsampling). Defaults to the full pipeline.",
+         "cluster subsampling; in a mix <source>-<step>, e.g. swissprot-split). Defaults "
+         "to the full pipeline.",
 )
 @click.option(
     "--no-auto-init",
@@ -1061,7 +1062,8 @@ def from_yaml(
         )
 
     if kind == "pretrain":
-        _print_rebuild_line(cwd, dvc_content, repro_env, params)
+        _print_rebuild_line(cwd, dvc_content, repro_env, params,
+                            list(cfg.sources) if cfg.is_mixture else None)
 
     # dvc repro --dry fails at a stage whose input an earlier stage has not written yet
     # (a pending download), so a dry run previews up to the stages that write it
@@ -1333,31 +1335,54 @@ def _read_pretrain_config(config_path: Path, quiet: bool = False):
 
 # what a source's build writes into its data folder (output_dir, or output_dir/<name>)
 _BUILT_OUTPUTS = ("train", "val", "cluster_index", ".data_manifest")
+# what a build writes into output_dir/<name>; a folder there with none of these is not ours
+_SOURCE_FOLDER_OUTPUTS = _BUILT_OUTPUTS + ("validation", "shuffled.fasta", "filtered.fasta",
+                                           "split")
 
 
 def orphaned_outputs(cfg, cwd: Path) -> list:
-    """Built outputs of the other layout left in output_dir: a mix ignores the train/
-    val/ cluster_index/ of an earlier single source; one source ignores the folders of
-    an earlier mix's other sources, and the train/ val/ cluster_index/ .data_manifest in
-    its own. Nothing is deleted; DVC no longer tracks these paths."""
+    """Outputs of an earlier build left in output_dir that this data.yaml does not use:
+    the folder of a source it no longer has; the cluster_index/ of a source whose
+    cluster_subsampling block is gone; uniref50.xml.gz when no source uses UniProt
+    clusters; and the outputs of the other layout (a mix ignores the train/ val/
+    cluster_index/ of an earlier single source; one source ignores the train/ val/
+    cluster_index/ .data_manifest of an earlier mix in its own folder, and the extract
+    and check each layout keeps elsewhere). Nothing is deleted; DVC no longer tracks
+    these paths."""
+    from nanoplm.data.preparation.cluster_config import (
+        INDEX_SUBDIR, UNIREF50_XML_URL, resolve_cluster_plan,
+    )
+    from nanoplm.data.preparation.data_config import RESERVED_NAMES, file_name, is_url
     out = _resolve_path(cfg.output_dir, cwd)
     if not out.is_dir():
         return []
+    found = []
+
+    def add(paths):
+        found.extend(p for p in paths if p.exists() and not any(
+            p == f or p.is_relative_to(f) for f in found))
+
     if cfg.is_mixture:
         # output_dir/.data_manifest is the mixture's own
-        found = [out / n for n in _BUILT_OUTPUTS[:-1] if (out / n).exists()]
-    else:
-        found = []
-        for d in sorted(p for p in out.iterdir() if p.is_dir() and p.name != "downloads"):
-            if not (d / ".data_manifest").is_file():
-                continue
-            # the source's own folder keeps its intermediates; another one goes whole
-            found += ([d / n for n in _BUILT_OUTPUTS if (d / n).exists()]
-                      if d.name in cfg.sources else [d])
-    for src in cfg.sources.values():
-        if not src.prepared:
-            found += [p for p in (_resolve_path(q, cwd) for q in _other_layout_prep(src, cwd))
-                      if p.exists() and not any(p.is_relative_to(f) for f in found)]
+        add(out / n for n in _BUILT_OUTPUTS[:-1])
+    built = [s for s in cfg.sources.values() if not s.prepared]
+    plans = {s.name: resolve_cluster_plan(s, cwd) for s in built}
+    # a folder that holds a file this build reads is never listed
+    inputs = [_resolve_path(q, cwd) for s in cfg.sources.values()
+              for q in (s.fasta, s.prepared, plans.get(s.name) and plans[s.name].members)
+              if q and not is_url(q)]
+    for d in sorted(p for p in out.iterdir() if p.is_dir() and p.name not in RESERVED_NAMES):
+        if d.name in cfg.sources:
+            if not cfg.is_mixture and (d / ".data_manifest").is_file():
+                add(d / n for n in _BUILT_OUTPUTS)     # its intermediates are still used
+        elif (any((d / n).exists() for n in _SOURCE_FOLDER_OUTPUTS)
+              and not any(i.is_relative_to(d) for i in inputs)):
+            add([d])                                   # a source data.yaml no longer has
+    add(_resolve_path(s.data_dir, cwd) / INDEX_SUBDIR for s in built if plans[s.name] is None)
+    if not any(p is not None and p.xml_path for p in plans.values()):
+        add([out / "downloads" / file_name(UNIREF50_XML_URL)])
+    for src in built:
+        add(_resolve_path(q, cwd) for q in _other_layout_prep(src, cwd))
     return found
 
 
@@ -1389,11 +1414,10 @@ def _warn_orphaned_outputs(cfg, cwd: Path) -> None:
     paths = orphaned_outputs(cfg, cwd)
     if not paths:
         return
-    was = "one source" if cfg.is_mixture else "a mix of several sources"
     gitignores = sorted({str(p.parent / ".gitignore") for p in paths
                          if (p.parent / ".gitignore").is_file()})
-    click.echo(f"Warning: output_dir holds the outputs of an earlier build with {was}; "
-               "this build does not use them. You can delete:", err=True)
+    click.echo("Warning: output_dir holds outputs of an earlier build that this data.yaml "
+               "does not use; nothing deletes them. You can delete:", err=True)
     for p in paths:
         click.echo(f"  {p}", err=True)
     if gitignores:
@@ -1579,10 +1603,11 @@ def _max_seqs_cell(max_seqs: int, clusters: bool) -> str:
 
 
 def _prepared_row(src, m) -> tuple:
+    """A prepared source's row: what it holds (a count, not a cap; built already)."""
     what = f"cluster ({m.cluster_level})" if m.cluster_index_dir else "off"
+    count = f"{m.train_sequences:,}" + (" clusters" if m.cluster_index_dir else "")
     return (src.name, f"{src.weight:g}", f"{src.prepared} (prepared)",
-            f"{m.train_sequences:,}", f"{m.min_seq_len}-{m.max_seq_len}", f"{m.val_ratio:g}",
-            what)
+            f"{count} (built)", f"{m.min_seq_len}-{m.max_seq_len}", f"{m.val_ratio:g}", what)
 
 
 def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
@@ -1595,8 +1620,8 @@ def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
     lines = [f"{config_path.name}: {n} source{'s' if n > 1 else ''} -> {out}"]
     if mix:
         lines.append("weight = share of training sequences")
-    rows = [("source",) + (("weight",) if mix else ()) + ("fasta", "max seqs", "len", "val",
-                                                          "clustering")]
+    rows = [("source",) + (("weight",) if mix else ())
+            + ("fasta", "max seqs", "len", "val", "clustering")]
     starred = False
     shared = {} if mix else None
     for src in cfg.sources.values():
@@ -1698,10 +1723,12 @@ def _pending_stages(cwd: Path, dvc_content: str, params: dict) -> list:
             and any(missing(o) and any(_overlaps(o, d) for d in reads) for o in outs)]
 
 
-def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict, params: dict) -> None:
+def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict, params: dict,
+                        sources=None) -> None:
     """Which stages dvc repro will run. Without a dvc.lock that is all of them; otherwise
     the stages `dvc status` reports changed (it reuses DVC's file-hash cache after the
-    first run) and every stage downstream of one, since their inputs will change too."""
+    first run) and every stage downstream of one, since their inputs will change too.
+    ``sources`` (the names of a mix) turns the stage list into one summary per source."""
     import json
     graph = _stage_graph(dvc_content, params)
     names = list(graph)
@@ -1723,6 +1750,9 @@ def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict, params: dict) ->
     if not rebuild:
         click.echo("Up to date: all stages")
         return
+    if sources:
+        click.echo(_rebuild_summary(names, changed, sources))
+        return
     # dvc status cannot tell which of these DVC's run cache already holds (repro then
     # restores the outputs instead of running the stage), hence "may"
     click.echo(f"May rerun (DVC skips a stage its run cache already has): "
@@ -1730,6 +1760,33 @@ def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict, params: dict) ->
 
 
 _STATUS_TIMEOUT = 120
+_RUN_CACHE_NOTE = "(DVC skips a stage its run cache already has.)"
+
+
+def _rebuild_summary(names: list, changed: set, sources) -> str:
+    """'Rebuild: swissprot: up to date; uniref50: 6 of 7 stages may rerun; mixture: may
+    rerun.' A mix's stages are <source>-<step>; the shared download, extract and check
+    stages are grouped as downloads."""
+    groups: dict = {}
+    for n in names:
+        head = n.split("-", 1)[0]
+        group = n if n == "mixture" else head if head in sources else "downloads"
+        groups.setdefault(group, []).append(n)
+    order = (["downloads"] if "downloads" in groups else []) + \
+        [s for s in sources if s in groups] + ["mixture"]
+    parts = []
+    for g in order:
+        stages = groups.get(g, [])
+        k = sum(n in changed for n in stages)
+        if not stages:
+            continue
+        if k == 0:
+            parts.append(f"{g}: up to date")
+        elif len(stages) == 1:
+            parts.append(f"{g}: may rerun")
+        else:
+            parts.append(f"{g}: {k} of {len(stages)} stages may rerun")
+    return f"Rebuild: {'; '.join(parts)}. {_RUN_CACHE_NOTE}"
 
 
 def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=None) -> None:

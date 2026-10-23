@@ -198,6 +198,9 @@ def test_a_mix_with_a_prepared_source_needs_output_dir():
     with pytest.raises(dc.DataConfigError, match="output_dir is required"):
         _parse(cfg)
     cfg["output_dir"] = "mix"
+    with pytest.raises(dc.DataConfigError, match="data_params has no effect on prepared"):
+        _parse(cfg)                               # nothing is built from data_params
+    del cfg["data_params"]
     got = _parse(cfg)
     assert [s.prepared for s in got.sources.values()] == ["../x", "../y"]
 

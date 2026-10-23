@@ -189,7 +189,9 @@ def test_from_yaml_builds_a_two_source_mix_and_a_weight_change_reruns_only_the_m
         base_dir=tmp_path))
     assert _status(tmp_path, env) == {"mixture"}
     r = _from_yaml(tmp_path, env)
-    assert "Rebuild: mixture." in r.stdout
+    assert ("Rebuild: downloads: up to date; plain: up to date; clus: up to date; mixture: "
+            "may rerun. (DVC skips a "
+            "stage its run cache already has.)") in r.stdout
     assert r.stdout.count("Running stage") == 1 and "Running stage 'mixture'" in r.stdout
     assert [s["weight"] for s in read_manifest(out).sources] == [0.6, 0.4]
 
@@ -217,6 +219,8 @@ def test_from_yaml_mixes_a_prepared_source_with_a_built_one(tmp_path):
     (proj / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     r = _from_yaml(proj, env)
     assert "../elsewhere/built (prepared)" in r.stdout
+    row = next(ln for ln in r.stdout.splitlines() if ln.startswith("mine "))
+    assert "60 (built)" in row                        # a count, not a max_seqs cap
     assert "Running stage 'mine-" not in r.stdout
     m = read_manifest(proj / "out")
     assert m.sources[0]["dir"] == str(built.resolve()) and m.sources[0]["fasta"] is None
@@ -286,7 +290,8 @@ def test_a_mix_names_the_train_and_val_an_earlier_single_source_left(tmp_path, c
     assert orphaned_outputs(cfg, tmp_path) == [out / "train", out / "val", out / "cluster_index"]
     _warn_orphaned_outputs(cfg, tmp_path)
     err = capsys.readouterr().err
-    assert "earlier build with one source" in err and f"  {out / 'train'}\n" in err
+    assert "earlier build that this data.yaml does not use; nothing deletes them" in err
+    assert f"  {out / 'train'}\n" in err
     assert f"their lines in {out / '.gitignore'}" in err
     assert ".data_manifest" not in err.replace(".gitignore", "")   # the mixture's own
     for n in ("train", "val", "cluster_index"):
@@ -332,5 +337,68 @@ def test_a_layout_switch_names_the_extract_and_check_it_moved(tmp_path):
     one = yaml.safe_load(load_template("data_pretrain"))
     one["output_dir"] = "out"
     one["sources"] = {"a": {"fasta": "prot.fasta.gz"}}
+    # b and c are sources this data.yaml no longer has
     assert orphaned_outputs(parse_data_config(one), tmp_path) == [
-        out / "downloads/prot.fasta", out / "downloads/prot_fasta_validation"]
+        out / "b", out / "c", out / "downloads/prot.fasta", out / "downloads/prot_fasta_validation"]
+
+
+def test_removing_a_source_names_its_folder(tmp_path):
+    from nanoplm.cli.data import orphaned_outputs
+    from nanoplm.data.preparation.data_config import parse_data_config
+    out = tmp_path / "out"
+    for name in ("a", "b", "gone"):
+        _built(out / name)
+    (out / "gone/split").mkdir()
+    (out / "notes").mkdir()                       # not a source folder: none of its outputs
+    (out / "mine").mkdir()
+    (out / "mine/validation").mkdir()
+    (out / "mine/x.fasta").write_text(">a\nMK\n")  # holds an input: never listed
+    cfg = parse_data_config(_mix(a={"fasta": "swissprot", "weight": 0.5},
+                                 b={"fasta": "out/mine/x.fasta", "weight": 0.5}))
+    assert orphaned_outputs(cfg, tmp_path) == [out / "gone"]
+    assert (out / "gone").is_dir()                # listed, never deleted
+
+
+def test_dropping_a_cluster_block_names_its_index_and_the_xml(tmp_path, capsys):
+    from nanoplm.cli.data import _warn_orphaned_outputs, orphaned_outputs
+    from nanoplm.data.preparation.data_config import parse_data_config
+    out = tmp_path / "out"
+    _built(out / "a")
+    _built(out / "u")
+    (out / "u/cluster_index/index").mkdir(parents=True)
+    (out / "downloads").mkdir()
+    (out / "downloads/uniref50.xml.gz").write_bytes(b"x")
+    cluster = {"fasta": "uniref90", "weight": 0.5, "cluster_subsampling": {"members": None}}
+    on = parse_data_config(_mix(a={"fasta": "swissprot", "weight": 0.5}, u=cluster))
+    assert orphaned_outputs(on, tmp_path) == []
+    off = parse_data_config(_mix(a={"fasta": "swissprot", "weight": 0.5},
+                                 u={"fasta": "uniref90", "weight": 0.5}))
+    assert orphaned_outputs(off, tmp_path) == [out / "u/cluster_index",
+                                               out / "downloads/uniref50.xml.gz"]
+    _warn_orphaned_outputs(off, tmp_path)
+    err = capsys.readouterr().err
+    assert f"  {out / 'u/cluster_index'}\n" in err and "uniref50.xml.gz" in err
+    assert (out / "downloads/uniref50.xml.gz").exists()
+
+
+def test_one_source_without_its_cluster_block_names_cluster_index(tmp_path):
+    from nanoplm.cli.data import orphaned_outputs
+    from nanoplm.data.preparation.data_config import parse_data_config
+    out = tmp_path / "out"
+    _built(out)
+    (out / "cluster_index").mkdir()
+    one = _mix(u={"fasta": "uniref90"})
+    assert orphaned_outputs(parse_data_config(one), tmp_path) == [out / "cluster_index"]
+    one["sources"]["u"]["cluster_subsampling"] = {"members": None}
+    one["data_params"].update(max_seqs=-1, val_ratio=0.0044)
+    assert orphaned_outputs(parse_data_config(one), tmp_path) == []
+
+
+def test_the_rebuild_line_of_a_mix_is_one_summary_per_source():
+    from nanoplm.cli.data import _rebuild_summary
+    names = ["download-uniref50_xml_gz", "swissprot-check", "swissprot-filter",
+             "uniref50-check", "uniref50-filter", "uniref50-cluster_index", "mixture"]
+    changed = {"uniref50-filter", "uniref50-cluster_index", "mixture"}
+    assert _rebuild_summary(names, changed, ["swissprot", "uniref50"]) == (
+        "Rebuild: downloads: up to date; swissprot: up to date; uniref50: 2 of 3 stages may "
+        "rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)")
