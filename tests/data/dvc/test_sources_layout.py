@@ -299,6 +299,21 @@ def test_a_prepared_source_is_checked_and_nothing_is_built(tmp_path, monkeypatch
     assert not (tmp_path / "dvc.yaml").exists() and not (tmp_path / ".dvc").exists()
 
 
+def test_a_prepared_source_names_an_earlier_build_left_in_output_dir(tmp_path, monkeypatch):
+    """output_dir/.data_manifest of an earlier build is not the prepared data."""
+    _no_dvc(monkeypatch)
+    _built(tmp_path / "other")
+    _built(tmp_path / "out")
+    cfg = {"output_dir": "out", "sources": {"mine": {"prepared": "other"}}}
+    r = _run(_write(tmp_path, cfg))
+    assert r.exit_code == 0, r.output
+    assert (f"Warning: output_dir {(tmp_path / 'out').resolve()} still holds an earlier "
+            "build") in r.output
+    assert f"Point dataset_dir at {(tmp_path / 'other').resolve()}" in r.output
+    cfg["output_dir"] = "other"                      # the prepared folder itself: no warning
+    assert "Warning" not in _run(_write(tmp_path, cfg)).output
+
+
 @pytest.mark.parametrize("setup, message", [
     (lambda p: None, "is not a folder"),
     (lambda p: p.mkdir(parents=True), "is not a built dataset"),

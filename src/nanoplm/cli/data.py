@@ -973,7 +973,7 @@ def from_yaml(
         if src.prepared:
             # TODO(step 2): a prepared source is one input of a mixture; the mixture
             # manifest will record it. With one source there is nothing to build.
-            _show_prepared(src, cwd, config_path)
+            _show_prepared(src, cwd, config_path, cfg.output_dir)
             return
         plan = _validate_cluster_block(src, config_path)
     else:
@@ -1322,8 +1322,9 @@ def _read_pretrain_config(config_path: Path, quiet: bool = False):
     return cfg
 
 
-def _show_prepared(src, cwd: Path, config_path: Path) -> None:
-    """Check a prepared folder's manifest and say what it holds; nothing is built."""
+def _show_prepared(src, cwd: Path, config_path: Path, output_dir: str = "") -> None:
+    """Check a prepared folder's manifest and say what it holds; nothing is built. An
+    output_dir that still holds an earlier build is named: its data is not this one."""
     from nanoplm.data.infra.manifest import read_manifest
     folder = _resolve_path(src.prepared, cwd)
     where = f"{config_path.name}: sources.{src.name}.prepared"
@@ -1344,6 +1345,11 @@ def _show_prepared(src, cwd: Path, config_path: Path) -> None:
     click.echo(f"sources.{src.name}: prepared {folder}\n"
                f"  {what}, max_seq_len {m.max_seq_len}\n"
                f"Nothing to build. Set pretrain.yaml's dataset_dir to {folder}.")
+    out = _resolve_path(output_dir, cwd) if output_dir else None
+    if out is not None and out != folder and (out / ".data_manifest").is_file():
+        click.echo(f"Warning: output_dir {out} still holds an earlier build; training on it "
+                   f"would read that old data. Point dataset_dir at {folder}, not at "
+                   "output_dir.", err=True)
 
 
 def _validate_cluster_block(src, config_path: Path):
