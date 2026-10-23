@@ -68,12 +68,12 @@ class PretrainManifest(DataManifestBase):
     # member sequences and cluster_index_dir (relative to the dataset dir) the
     # UniRef50 cluster index over it. Each pass visits every train cluster once and
     # draws one member, so train_sequences counts train clusters and
-    # total_train_tokens is the expected token count of one pass. None means a
-    # plain dataset.
+    # total_train_tokens is the expected token count of one pass. All four are None
+    # for a plain dataset, so its manifest keeps only the fields master's code reads.
     cluster_index_dir: Optional[str] = None
     cluster_level: Optional[str] = None  # "uniref90" or "uniref100"
-    pool_sequences: int = 0
-    pool_tokens: int = 0
+    pool_sequences: Optional[int] = None
+    pool_tokens: Optional[int] = None
 
     @property
     def is_cluster_sampled(self) -> bool:

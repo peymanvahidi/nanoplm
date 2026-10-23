@@ -387,4 +387,4 @@ def test_manifests_without_the_cluster_fields_still_load(tmp_path):
     text = (tmp_path / ".data_manifest").read_text()
     assert "cluster_index_dir" not in text   # None fields are not written
     m = read_manifest(tmp_path)
-    assert not m.is_cluster_sampled and m.pool_sequences == 0
+    assert not m.is_cluster_sampled and m.pool_sequences is None
