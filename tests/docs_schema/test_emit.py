@@ -208,3 +208,10 @@ def test_only_marked_top_level_scalars_are_documented():
     """data.yaml's output_dir is a field; pretrain.yaml's `pure_torch: true` is not."""
     assert "output_dir" in emit.build_surface("data")["properties"]
     assert "pure_torch" not in emit.build_surface("pretrain")["properties"]
+
+
+def test_eval_sources_is_a_name_or_a_list_of_names():
+    """pretrain.yaml's eval_sources is "all" or a list of source names."""
+    es = emit.build_surface("pretrain")["properties"]["pretraining"]["properties"]["eval_sources"]
+    assert es["type"] == ["string", "array"] and es["items"] == {"type": "string"}
+    assert es["default"] == "all"

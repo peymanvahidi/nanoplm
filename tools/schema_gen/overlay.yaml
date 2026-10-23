@@ -22,6 +22,8 @@
 # click.Choice --optimizer
 pretraining.optimizer:
   enum: [adamw, stable_adamw, muon, normuon, nordion2]
+# PretrainingConfig.eval_sources: "all" or a list of mixture source names
+pretraining.eval_sources: { type: [string, array], items: { type: string } }
 # click.Choice --lr-schedule + _validate_duration_config's `valid` set
 pretraining.lr_schedule:
   enum: [wsd, warmup_stable, cosine, linear]
