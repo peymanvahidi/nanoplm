@@ -202,3 +202,9 @@ def test_nested_entry_outside_a_map_section_fails_loudly(monkeypatch):
     monkeypatch.setattr(emit._tpl, "load_template_text", lambda s: "sec:\n  a:\n    f: 1\n")
     with pytest.raises(ValueError, match="map: true"):
         emit.build_surface("data")
+
+
+def test_only_marked_top_level_scalars_are_documented():
+    """data.yaml's output_dir is a field; pretrain.yaml's `pure_torch: true` is not."""
+    assert "output_dir" in emit.build_surface("data")["properties"]
+    assert "pure_torch" not in emit.build_surface("pretrain")["properties"]

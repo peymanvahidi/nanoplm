@@ -233,7 +233,10 @@ def build_surface(surface: str) -> dict:
             frag = _field_schema(f.section, f.key, f.raw_default, _template_description(f, ov),
                                  o, vis, f.group)
             if not f.section:
-                sections[f.key] = frag
+                # Only the top-level scalars overlay.yaml names: pretrain.yaml's
+                # `pure_torch: true` has one legal value and is not a setting.
+                if ov.get("top_level"):
+                    sections[f.key] = frag
                 continue
             if f.entry:
                 # Inside a name -> spec mapping the template's value is an example

@@ -162,6 +162,8 @@ model.loopie_bptt: { type: [integer, "null"], minimum: 1, backend: [pure_torch],
 # section whose keys are names the user picks, each holding a spec: the
 # template's fields under its example entry (`swissprot:`) describe every entry,
 # and are emitted as the section's additionalProperties.
+# A column-0 `key: value` is documented only when marked top_level here.
+output_dir: { top_level: true }
 sources:
   map: true
   description: >-
