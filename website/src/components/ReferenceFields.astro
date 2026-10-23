@@ -9,13 +9,14 @@
 // The distill surface is still generated (the parity gate keeps it honest), but it
 // is deliberately not rendered: distillation is unmaintained and gets one prose
 // page, not a config reference.
-import { toRows, toGroups, type Surface } from '../lib/schema';
+import { toRows, toGroups, sectionPrefix, type Surface } from '../lib/schema';
 import data from '../generated/nanoplm.data.schema.json';
 import pretrain from '../generated/nanoplm.pretrain.schema.json';
 import evalSchema from '../generated/nanoplm.eval.schema.json';
 
 interface Props {
   surface: 'data' | 'pretrain' | 'eval';
+  /** A section, or a dotted path to a nested block (`sources.cluster_subsampling`). */
   section?: string;
 }
 
@@ -32,7 +33,7 @@ const rows = toRows(SCHEMAS[surface], section);
 // A section runs to ~90 fields; the banners are how the tool itself breaks that
 // up, so the page reads in the same blocks as the file the reader is editing.
 const groups = toGroups(rows, SCHEMAS[surface], section);
-const prefix = section ? `${surface}-${section}` : surface;
+const prefix = sectionPrefix(SCHEMAS[surface], section);
 
 function fmtDefault(value: unknown): string {
   if (typeof value === 'string') return value;

@@ -32,7 +32,7 @@ const SCHEMAS: Record<string, Surface> = {
 /** Which reference page renders which surface, and under which heading slugs. */
 const PAGES: Record<string, { surface: string; sections: string[] }> = {
   'reference/pretrain': { surface: 'pretrain', sections: ['model', 'pretraining', 'resume'] },
-  'reference/data': { surface: 'data', sections: ['data_dirs', 'data_params'] },
+  'reference/data': { surface: 'data', sections: ['data_params'] },
 };
 
 /** Depth-first search for the entry whose heading slug is `slug`. */
@@ -48,9 +48,8 @@ function find(items: TocItem[], slug: string): TocItem | undefined {
 /**
  * Return `items` with each config section's field blocks added as children.
  *
- * A no-op for any page not in PAGES, and for any section whose template carries
- * no `# ── Title ───` banners (data and eval have none today, so they keep the
- * flat ToC they have now). Never mutates the input.
+ * A no-op for any page not in PAGES, and for any section with no titled group
+ * (eval has none, so it keeps a flat ToC). Never mutates the input.
  */
 export function withFieldGroups(items: TocItem[], slug: string): TocItem[] {
   const page = PAGES[slug];

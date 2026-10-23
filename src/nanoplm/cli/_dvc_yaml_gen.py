@@ -1,14 +1,23 @@
 # src/nanoplm/cli/_dvc_yaml_gen.py
 """
 Generates the dvc.yaml file from a parsed data.yaml / distillation_data.yaml.
-The generator produces different stage shapes for URL-mode vs local-fasta-mode
-(the get_file stage gains a `deps:` line in local-fasta mode).
+
+data.yaml is read into one source (data_config). The old data_dirs layout, and
+distillation_data.yaml, keep the stages they always had: every path is a
+${data_dirs.X} reference, so an existing dvc.lock stays valid. The sources layout
+writes its paths (all under output_dir) into the stages directly and references
+each data_params field where data.yaml sets it: ${data_params.X}, or
+${sources.<name>.X} for a per-source override.
 """
 from typing import Any
 import yaml
 import nanoplm as _nanoplm
 from pathlib import Path as _Path
 from urllib.parse import urlparse as _urlparse
+
+from nanoplm.data.preparation.data_config import (
+    DataConfigError, Source, legacy_source, parse_data_config,
+)
 
 
 def _source_is_compressed(source: str) -> bool:
@@ -56,166 +65,164 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str, base_dir=No
     if kind not in {"pretrain", "distillation"}:
         raise ValueError(f"kind must be pretrain or distillation, got {kind}")
 
-    if kind == "pretrain":
-        from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
-        plan = resolve_cluster_plan(config, base_dir)
-        if plan is not None:
-            return _HEADER + yaml.safe_dump(
-                {"vars": [params_filename],
-                 "stages": _cluster_stages(config, plan, params_filename)},
-                sort_keys=False, default_flow_style=False)
-
-    data_dirs = config["data_dirs"]
-    url = data_dirs.get("url")
-    local_fasta = data_dirs.get("local_fasta")
-    source = url if url else local_fasta
-    # If both source fields are empty, the validator (_validate_source_fields)
-    # would have already rejected the config; the `else True` is a defensive
-    # default and the actual stage shape doesn't matter in that case.
-    is_compressed = _source_is_compressed(source) if source else True
-
-    stages: dict[str, Any] = {}
-
-    # get_file — output target depends on whether the source is compressed.
-    get_file_outs_field = "compressed_fasta" if is_compressed else "extracted_fasta"
-    get_file_stage: dict[str, Any] = {
-        "deps": [_resolve_pkg_dep("src/nanoplm/data/preparation/downloader.py")],
-        "outs": [f"${{data_dirs.{get_file_outs_field}}}"],
-    }
-    if local_fasta:
-        get_file_stage["cmd"] = (
-            f"nanoplm data get-file --local-fasta \"${{data_dirs.local_fasta}}\" "
-            f"-o ${{data_dirs.{get_file_outs_field}}}"
-        )
-        get_file_stage["deps"].insert(0, "${data_dirs.local_fasta}")
-        get_file_stage["params"] = [
-            {params_filename: ["data_dirs.local_fasta", f"data_dirs.{get_file_outs_field}"]}
-        ]
+    if kind == "distillation":
+        stages = _plain_stages(legacy_source(config), kind, params_filename)
     else:
-        get_file_stage["cmd"] = (
-            f"nanoplm data get-file --url \"${{data_dirs.url}}\" "
-            f"-o ${{data_dirs.{get_file_outs_field}}}"
-        )
-        get_file_stage["params"] = [
-            {params_filename: ["data_dirs.url", f"data_dirs.{get_file_outs_field}"]}
-        ]
-    stages["get_file"] = get_file_stage
+        src = parse_data_config(config, base_dir, params_filename).source
+        if src.prepared:
+            raise DataConfigError(f"sources.{src.name} is prepared ({src.prepared}): there is "
+                                  "nothing to build")
+        from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
+        plan = None if src.legacy else resolve_cluster_plan(src, base_dir)
+        stages = (_cluster_stages(src, plan, params_filename) if plan is not None
+                  else _plain_stages(src, kind, params_filename))
+    doc = {"vars": [params_filename], "stages": stages}
+    body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
+    return _HEADER + body
 
-    # extract — only emitted when the source is compressed.
-    if is_compressed:
-        stages["extract"] = {
-            "cmd": "nanoplm data extract -i ${data_dirs.compressed_fasta} -o ${data_dirs.extracted_fasta}",
-            "deps": ["${data_dirs.compressed_fasta}", _resolve_pkg_dep("src/nanoplm/data/preparation/extractor.py")],
-            "params": [{params_filename: ["data_dirs.extracted_fasta"]}],
-            "outs": ["${data_dirs.extracted_fasta}"],
+
+def _params(params_filename: str, keys: list) -> dict:
+    """{"params": [...]} for a stage, or nothing when it reads no params."""
+    return {"params": [{params_filename: keys}]} if keys else {}
+
+
+def _download_stage(url: str, out: str) -> dict:
+    """Fetch one URL into downloads/. Only the URL is in the stage, so nothing else
+    (a source rename, the cluster block, a data_params change) downloads it again."""
+    return {
+        "cmd": f'nanoplm data get-file --url "{url}" -o {out}',
+        "deps": [_resolve_pkg_dep("src/nanoplm/data/preparation/downloader.py")],
+        "outs": [out],
+    }
+
+
+def _get_stages(src: Source, params_filename: str) -> dict:
+    """get_file (+ extract) for the source fasta. A local file in the sources layout is
+    read in place, so it has no get_file stage."""
+    stages: dict[str, Any] = {}
+    out_field = "compressed_fasta" if src.is_compressed else "extracted_fasta"
+    if src.legacy:
+        local = bool(src.paths.get("local_fasta"))
+        stage: dict[str, Any] = {
+            "deps": [_resolve_pkg_dep("src/nanoplm/data/preparation/downloader.py")],
+            "outs": [f"${{data_dirs.{out_field}}}"],
         }
+        flag, key = ("--local-fasta", "local_fasta") if local else ("--url", "url")
+        stage["cmd"] = (f"nanoplm data get-file {flag} \"${{data_dirs.{key}}}\" "
+                        f"-o ${{data_dirs.{out_field}}}")
+        if local:
+            stage["deps"].insert(0, "${data_dirs.local_fasta}")
+        stage["params"] = [{params_filename: [f"data_dirs.{key}", f"data_dirs.{out_field}"]}]
+        stages["get_file"] = stage
+    elif src.is_url:
+        stages["get_file"] = _download_stage(src.fasta, src.paths[out_field])
+    if src.is_compressed:
+        stages["extract"] = {
+            "cmd": (f"nanoplm data extract -i {src.path('compressed_fasta')} "
+                    f"-o {src.path('extracted_fasta')}"),
+            "deps": [src.path("compressed_fasta"),
+                     _resolve_pkg_dep("src/nanoplm/data/preparation/extractor.py")],
+            **_params(params_filename, src.path_params("extracted_fasta")),
+            "outs": [src.path("extracted_fasta")],
+        }
+    return stages
 
-    # check
-    stages["check"] = {
+
+def _check_stage(src: Source, fasta: str, params_filename: str) -> dict:
+    return {
         "cmd": (
-            "nanoplm data check -i ${data_dirs.extracted_fasta} "
-            "-o ${data_dirs.validation_dir} "
-            "--drop-invalid ${data_params.drop_invalid_sequences}"
+            f"nanoplm data check -i {fasta} "
+            f"-o {src.path('validation_dir')} "
+            f"--drop-invalid {src.ref('drop_invalid_sequences')}"
         ),
         "deps": [
-            "${data_dirs.extracted_fasta}",
+            fasta,
             _resolve_pkg_dep("src/nanoplm/data/preparation/checker.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c"),
         ],
-        "params": [{params_filename: [
-            "data_dirs.validation_dir",
-            "data_params.drop_invalid_sequences",
-        ]}],
-        "outs": ["${data_dirs.validation_dir}"],
+        **_params(params_filename, src.path_params("validation_dir")
+                  + [src.key("drop_invalid_sequences")]),
+        "outs": [src.path("validation_dir")],
     }
 
-    # shuffle
+
+def _plain_stages(src: Source, kind: str, params_filename: str) -> dict:
+    p, ref, key = src.path, src.ref, src.key
+    stages: dict[str, Any] = _get_stages(src, params_filename)
+
+    stages["check"] = _check_stage(src, p("extracted_fasta"), params_filename)
+
     stages["shuffle"] = {
         "cmd": (
-            "nanoplm data shuffle -i ${data_dirs.extracted_fasta} "
-            "-o ${data_dirs.shuffled_fasta} "
-            "--shuffle ${data_params.shuffle} --seed ${data_params.shuffle_seed}"
+            f"nanoplm data shuffle -i {p('extracted_fasta')} "
+            f"-o {p('shuffled_fasta')} "
+            f"--shuffle {ref('shuffle')} --seed {ref('shuffle_seed')}"
         ),
         "deps": [
-            "${data_dirs.extracted_fasta}",
-            "${data_dirs.validation_dir}",
+            p("extracted_fasta"),
+            p("validation_dir"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/shuffler.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/_native_ops.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c"),
         ],
-        "params": [{params_filename: [
-            "data_dirs.shuffled_fasta",
-            "data_params.shuffle",
-            "data_params.shuffle_seed",
-        ]}],
-        "outs": ["${data_dirs.shuffled_fasta}"],
+        **_params(params_filename, src.path_params("shuffled_fasta")
+                  + [key("shuffle"), key("shuffle_seed")]),
+        "outs": [p("shuffled_fasta")],
     }
 
-    # filter
     stages["filter"] = {
         "cmd": (
-            "nanoplm data filter -i ${data_dirs.shuffled_fasta} "
-            "-o ${data_dirs.filtered_fasta} "
-            "--min-seq-len ${data_params.min_seq_len} "
-            "--max-seq-len ${data_params.max_seq_len} "
-            "--seqs-num ${data_params.seqs_num} "
-            "--exclude-ids ${data_dirs.validation_dir}/invalid_ids.txt"
+            f"nanoplm data filter -i {p('shuffled_fasta')} "
+            f"-o {p('filtered_fasta')} "
+            f"--min-seq-len {ref('min_seq_len')} "
+            f"--max-seq-len {ref('max_seq_len')} "
+            f"--seqs-num {ref('max_seqs')} "
+            f"--exclude-ids {p('validation_dir')}/invalid_ids.txt"
         ),
         "deps": [
-            "${data_dirs.shuffled_fasta}",
-            "${data_dirs.validation_dir}",
+            p("shuffled_fasta"),
+            p("validation_dir"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/filterer.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/_native_ops.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c"),
         ],
-        "params": [{params_filename: [
-            "data_dirs.filtered_fasta",
-            "data_params.min_seq_len",
-            "data_params.max_seq_len",
-            "data_params.seqs_num",
-            "data_params.drop_invalid_sequences",
-        ]}],
-        "outs": ["${data_dirs.filtered_fasta}"],
+        **_params(params_filename, src.path_params("filtered_fasta") + [
+            key("min_seq_len"), key("max_seq_len"), key("max_seqs"),
+            key("drop_invalid_sequences"),
+        ]),
+        "outs": [p("filtered_fasta")],
     }
 
-    # split
     stages["split"] = {
         "cmd": (
-            "nanoplm data split -i ${data_dirs.filtered_fasta} "
-            "-o ${data_dirs.splitted_fasta_dir} "
-            "--val-ratio ${data_params.val_ratio}"
+            f"nanoplm data split -i {p('filtered_fasta')} "
+            f"-o {p('splitted_fasta_dir')} "
+            f"--val-ratio {ref('val_ratio')}"
         ),
         "deps": [
-            "${data_dirs.filtered_fasta}",
+            p("filtered_fasta"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/splitor.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/_native_ops.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c"),
         ],
-        "params": [{params_filename: [
-            "data_dirs.splitted_fasta_dir",
-            "data_params.val_ratio",
-        ]}],
-        "outs": ["${data_dirs.splitted_fasta_dir}"],
+        **_params(params_filename, src.path_params("splitted_fasta_dir") + [key("val_ratio")]),
+        "outs": [p("splitted_fasta_dir")],
     }
 
+    split, out = p("splitted_fasta_dir"), p("output_dir")
+    items = {
+        "train": {"input": f"{split}/train.fasta", "outdir": f"{out}/train"},
+        "val": {"input": f"{split}/val.fasta", "outdir": f"{out}/val"},
+    }
     if kind == "pretrain":
         stages["pre-tokenize"] = {
-            "foreach": {
-                "train": {
-                    "input": "${data_dirs.splitted_fasta_dir}/train.fasta",
-                    "outdir": "${data_dirs.output_dir}/train",
-                },
-                "val": {
-                    "input": "${data_dirs.splitted_fasta_dir}/val.fasta",
-                    "outdir": "${data_dirs.output_dir}/val",
-                },
-            },
+            "foreach": items,
             "do": {
                 "cmd": (
                     "nanoplm data pre-tokenize -i ${item.input} -o ${item.outdir} "
-                    "--max-seq-len ${data_params.max_seq_len} "
-                    "--samples-per-shard ${data_params.samples_per_shard} "
-                    "--register-tokens ${data_params.register_tokens}"
+                    f"--max-seq-len {ref('max_seq_len')} "
+                    f"--samples-per-shard {ref('samples_per_shard')} "
+                    f"--register-tokens {ref('register_tokens')}"
                 ),
                 "deps": [
                     "${item.input}",
@@ -223,196 +230,144 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str, base_dir=No
                     _resolve_pkg_dep("src/nanoplm/data/sharding/csrc/fast_fasta_shard_writer.c"),
                     _resolve_pkg_dep("src/nanoplm/pretraining/models/modern_bert/tokenizer.py"),
                 ],
-                "params": [{params_filename: [
-                    "data_dirs.output_dir",
-                    "data_params.max_seq_len",
-                    "data_params.samples_per_shard",
-                    "data_params.register_tokens",
-                ]}],
+                **_params(params_filename, src.path_params("output_dir") + [
+                    key("max_seq_len"), key("samples_per_shard"), key("register_tokens"),
+                ]),
                 "outs": ["${item.outdir}"],
             },
         }
         stages["write_manifest"] = {
             "cmd": (
                 "nanoplm data write-manifest --kind pretrain "
-                "-o ${data_dirs.output_dir} "
-                "--min-seq-len ${data_params.min_seq_len} "
-                "--max-seq-len ${data_params.max_seq_len} "
-                "--val-ratio ${data_params.val_ratio} "
-                "--samples-per-shard ${data_params.samples_per_shard} "
-                "--register-tokens ${data_params.register_tokens}"
+                f"-o {out} "
+                f"--min-seq-len {ref('min_seq_len')} "
+                f"--max-seq-len {ref('max_seq_len')} "
+                f"--val-ratio {ref('val_ratio')} "
+                f"--samples-per-shard {ref('samples_per_shard')} "
+                f"--register-tokens {ref('register_tokens')}"
             ),
             "deps": [
-                "${data_dirs.output_dir}/train",
-                "${data_dirs.output_dir}/val",
+                f"{out}/train",
+                f"{out}/val",
                 _resolve_pkg_dep("src/nanoplm/data/infra/manifest.py"),
             ],
-            "params": [{params_filename: [
-                "data_params.min_seq_len",
-                "data_params.max_seq_len",
-                "data_params.val_ratio",
-                "data_params.samples_per_shard",
-                "data_params.register_tokens",
-            ]}],
-            "outs": ["${data_dirs.output_dir}/.data_manifest"],
+            **_params(params_filename, [
+                key("min_seq_len"), key("max_seq_len"), key("val_ratio"),
+                key("samples_per_shard"), key("register_tokens"),
+            ]),
+            "outs": [f"{out}/.data_manifest"],
         }
     else:  # distillation
         stages["kd-embed"] = {
-            "foreach": {
-                "train": {
-                    "input": "${data_dirs.splitted_fasta_dir}/train.fasta",
-                    "outdir": "${data_dirs.output_dir}/train",
-                },
-                "val": {
-                    "input": "${data_dirs.splitted_fasta_dir}/val.fasta",
-                    "outdir": "${data_dirs.output_dir}/val",
-                },
-            },
+            "foreach": items,
             "do": {
                 "cmd": (
                     "nanoplm data kd-embed -i ${item.input} -o ${item.outdir} "
-                    "--teacher-model ${data_params.teacher_model} "
-                    "--max-seq-len ${data_params.max_seq_len} "
-                    "--samples-per-shard ${data_params.samples_per_shard} "
-                    "--batch-size ${data_params.embed_calc_batch_size}"
+                    f"--teacher-model {ref('teacher_model')} "
+                    f"--max-seq-len {ref('max_seq_len')} "
+                    f"--samples-per-shard {ref('samples_per_shard')} "
+                    f"--batch-size {ref('embed_calc_batch_size')}"
                 ),
                 "deps": [
                     "${item.input}",
                     _resolve_pkg_dep("src/nanoplm/data/sharding/distill_shard_writer.py"),
                 ],
-                "params": [{params_filename: [
-                    "data_dirs.output_dir",
-                    "data_params.teacher_model",
-                    "data_params.max_seq_len",
-                    "data_params.samples_per_shard",
-                    "data_params.embed_calc_batch_size",
-                ]}],
+                **_params(params_filename, src.path_params("output_dir") + [
+                    key("teacher_model"), key("max_seq_len"), key("samples_per_shard"),
+                    key("embed_calc_batch_size"),
+                ]),
                 "outs": ["${item.outdir}"],
             },
         }
         stages["write_manifest"] = {
             "cmd": (
                 "nanoplm data write-manifest --kind distillation "
-                "-o ${data_dirs.output_dir} "
-                "--min-seq-len ${data_params.min_seq_len} "
-                "--max-seq-len ${data_params.max_seq_len} "
-                "--val-ratio ${data_params.val_ratio} "
-                "--samples-per-shard ${data_params.samples_per_shard} "
-                "--teacher-model ${data_params.teacher_model}"
+                f"-o {out} "
+                f"--min-seq-len {ref('min_seq_len')} "
+                f"--max-seq-len {ref('max_seq_len')} "
+                f"--val-ratio {ref('val_ratio')} "
+                f"--samples-per-shard {ref('samples_per_shard')} "
+                f"--teacher-model {ref('teacher_model')}"
             ),
             "deps": [
-                "${data_dirs.output_dir}/train",
-                "${data_dirs.output_dir}/val",
+                f"{out}/train",
+                f"{out}/val",
                 _resolve_pkg_dep("src/nanoplm/data/infra/manifest.py"),
             ],
-            "params": [{params_filename: [
-                "data_params.min_seq_len",
-                "data_params.max_seq_len",
-                "data_params.val_ratio",
-                "data_params.samples_per_shard",
-                "data_params.teacher_model",
-            ]}],
-            "outs": ["${data_dirs.output_dir}/.data_manifest"],
-        }
-
-    doc = {"vars": [params_filename], "stages": stages}
-    body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
-    return _HEADER + body
-
-
-def _fetch_stages(name: str, source: str, compressed, extracted, params_filename: str,
-                  param_keys: list) -> dict:
-    """get-file (+ extract) for one FASTA source; paths embedded literally."""
-    is_url = source.startswith(("http://", "https://"))
-    target = str(compressed) if compressed else str(extracted)
-    flag = "--url" if is_url else "--local-fasta"
-    get = {
-        "cmd": f'nanoplm data get-file {flag} "{source}" -o {target}',
-        "deps": ([] if is_url else [source])
-        + [_resolve_pkg_dep("src/nanoplm/data/preparation/downloader.py")],
-        "params": [{params_filename: param_keys}],
-        "outs": [target],
-    }
-    stages = {f"get_{name}": get}
-    if compressed:
-        stages[f"extract_{name}"] = {
-            "cmd": f"nanoplm data extract -i {compressed} -o {extracted}",
-            "deps": [str(compressed), _resolve_pkg_dep("src/nanoplm/data/preparation/extractor.py")],
-            "outs": [str(extracted)],
+            **_params(params_filename, [
+                key("min_seq_len"), key("max_seq_len"), key("val_ratio"),
+                key("samples_per_shard"), key("teacher_model"),
+            ]),
+            "outs": [f"{out}/.data_manifest"],
         }
     return stages
 
 
-def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
-    """Stages for cluster_subsampling.enabled: true (see cluster_pipeline's docstring).
+def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
+    """Stages for a source with a cluster_subsampling block (see cluster_pipeline's docstring).
 
     Each stage lists only the params it reads, so changing clustering / identity /
     coverage reruns cluster_members and what follows it, never the pool. max_workers
     reaches cluster-pool and cluster-members through $NANOPLM_MAX_WORKERS, as for
     pre-tokenize, so a different core count reruns nothing.
+
+    get_file, extract and check are the plain pipeline's stages when the members are the
+    source fasta, so adding or removing the block does not fetch or extract it again.
     """
     dep = _resolve_pkg_dep
+    ref, key = src.ref, src.key
     members_fasta = str(plan.members_fasta)
-    out = "${data_dirs.output_dir}"
+    out = src.output_dir
+    filtered = src.paths["filtered_fasta"]
     stages: dict[str, Any] = {}
     if plan.members_from_source:
-        key = "data_dirs.url" if config["data_dirs"].get("url") else "data_dirs.local_fasta"
-        stages.update(_fetch_stages("file", plan.source, plan.members_compressed,
-                                    plan.members_fasta, params_filename, [key]))
-        if "extract_file" in stages:      # the normal pipeline's name for this stage
-            stages["extract"] = stages.pop("extract_file")
+        stages.update(_get_stages(src, params_filename))
     else:
-        stages.update(_fetch_stages(
-            "members_fasta", plan.members, plan.members_compressed, plan.members_fasta,
-            params_filename, ["cluster_subsampling.members"]))
-        if "extract_members_fasta" in stages:
-            stages["extract_members"] = stages.pop("extract_members_fasta")
-    stages["check"] = {
-        "cmd": (f"nanoplm data check -i {members_fasta} -o ${{data_dirs.validation_dir}} "
-                "--drop-invalid ${data_params.drop_invalid_sequences}"),
-        "deps": [members_fasta, dep("src/nanoplm/data/preparation/checker.py"),
-                 dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c")],
-        "params": [{params_filename: ["data_dirs.validation_dir",
-                                      "data_params.drop_invalid_sequences"]}],
-        "outs": ["${data_dirs.validation_dir}"],
-    }
+        compressed = str(plan.members_compressed) if plan.members_compressed else None
+        if plan.members.startswith(("http://", "https://", "ftp://")):
+            stages["get_members_fasta"] = _download_stage(plan.members,
+                                                          compressed or members_fasta)
+        if compressed:
+            stages["extract_members"] = {
+                "cmd": f"nanoplm data extract -i {compressed} -o {members_fasta}",
+                "deps": [compressed, dep("src/nanoplm/data/preparation/extractor.py")],
+                "outs": [members_fasta],
+            }
+    stages["check"] = _check_stage(src, members_fasta, params_filename)
     stages["filter"] = {
-        "cmd": (f"nanoplm data filter -i {members_fasta} -o ${{data_dirs.filtered_fasta}} "
-                "--min-seq-len ${data_params.min_seq_len} "
-                "--max-seq-len ${data_params.max_seq_len} --seqs-num -1 "
-                "--exclude-ids ${data_dirs.validation_dir}/invalid_ids.txt"),
-        "deps": [members_fasta, "${data_dirs.validation_dir}",
+        "cmd": (f"nanoplm data filter -i {members_fasta} -o {filtered} "
+                f"--min-seq-len {ref('min_seq_len')} "
+                f"--max-seq-len {ref('max_seq_len')} --seqs-num -1 "
+                f"--exclude-ids {src.paths['validation_dir']}/invalid_ids.txt"),
+        "deps": [members_fasta, src.paths["validation_dir"],
                  dep("src/nanoplm/data/preparation/filterer.py"),
                  dep("src/nanoplm/data/preparation/_native_ops.py"),
                  dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c")],
-        "params": [{params_filename: ["data_dirs.filtered_fasta", "data_params.min_seq_len",
-                                      "data_params.max_seq_len"]}],
-        "outs": ["${data_dirs.filtered_fasta}"],
+        "params": [{params_filename: [key("min_seq_len"), key("max_seq_len")]}],
+        "outs": [filtered],
     }
     stages["cluster_pool"] = {
-        "cmd": ("nanoplm data cluster-pool -i ${data_dirs.filtered_fasta} "
-                f"-o {out}/train --max-seq-len ${{data_params.max_seq_len}} "
-                "--samples-per-shard ${data_params.samples_per_shard} "
-                "--register-tokens ${data_params.register_tokens}"),
-        "deps": ["${data_dirs.filtered_fasta}",
+        "cmd": (f"nanoplm data cluster-pool -i {filtered} "
+                f"-o {out}/train --max-seq-len {ref('max_seq_len')} "
+                f"--samples-per-shard {ref('samples_per_shard')} "
+                f"--register-tokens {ref('register_tokens')}"),
+        "deps": [filtered,
                  dep("src/nanoplm/data/sharding/pretrain_shard_writer.py"),
                  dep("src/nanoplm/data/sharding/csrc/fast_fasta_shard_writer.c"),
                  dep("src/nanoplm/pretraining/models/modern_bert/tokenizer.py")],
-        "params": [{params_filename: ["data_dirs.output_dir", "data_params.max_seq_len",
-                                      "data_params.samples_per_shard",
-                                      "data_params.register_tokens"]}],
+        "params": [{params_filename: [key("max_seq_len"), key("samples_per_shard"),
+                                      key("register_tokens")]}],
         "outs": [f"{out}/train"],
     }
     tsv = str(plan.members_tsv)
     info = str(plan.members_tsv.with_suffix(".json"))
     # cluster_table.build_members_table runs this stage; an edit elsewhere in the cluster
     # prep code must not rerun the XML scan or MMseqs2
-    members_deps = ["${data_dirs.filtered_fasta}",
-                    dep("src/nanoplm/data/preparation/cluster_table.py")]
-    # a data.yaml written before the key existed has no clustering (= auto); DVC
-    # refuses a listed param that is missing from the file
-    members_params = (["cluster_subsampling.clustering"]
-                      if "clustering" in config["cluster_subsampling"] else [])
+    members_deps = [filtered, dep("src/nanoplm/data/preparation/cluster_table.py")]
+    # only keys written in the block: DVC refuses a listed param missing from the file
+    block_key = f"sources.{src.name}.cluster_subsampling"
+    members_params = [f"{block_key}.{k}" for k in ("clustering",)
+                      if src.cluster.get(k) is not None]
     if plan.cluster_source == "uniref_xml":
         xml = str(plan.xml_path)
         stages["get_cluster_xml"] = {
@@ -429,44 +384,49 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
         members_deps[0] = members_fasta
         members_deps += [xml, dep("src/nanoplm/data/preparation/uniref_hierarchy.py")]
     else:
+        # a key left out (or null) is the default, written into the command as is
+        def value(k, default):
+            return ("${" + f"{block_key}.{k}" + "}" if src.cluster.get(k) is not None
+                    else f"{default:g}")
         cmd = ("nanoplm data cluster-members --source mmseqs "
-               "--fasta ${data_dirs.filtered_fasta} "
-               "--identity ${cluster_subsampling.identity} "
-               "--coverage ${cluster_subsampling.coverage} "
+               f"--fasta {filtered} "
+               f"--identity {value('identity', plan.identity)} "
+               f"--coverage {value('coverage', plan.coverage)} "
                f"--tmp-dir {plan.mmseqs_tmp} -o {tsv}")
-        members_params += ["cluster_subsampling.identity", "cluster_subsampling.coverage"]
+        members_params += [f"{block_key}.{k}" for k in ("identity", "coverage")
+                           if src.cluster.get(k) is not None]
     stages["cluster_members"] = {"cmd": cmd, "deps": members_deps, "outs": [tsv, info]}
     if members_params:
         stages["cluster_members"]["params"] = [{params_filename: members_params}]
     index_dir = str(plan.index_dir)
     stages["cluster_index"] = {
         "cmd": (f"nanoplm data cluster-index --members-tsv {tsv} "
-                f"--fasta ${{data_dirs.filtered_fasta}} --pool {out}/train "
+                f"--fasta {filtered} --pool {out}/train "
                 f"--index-dir {index_dir} --val-dir {out}/val "
-                "--max-seq-len ${data_params.max_seq_len} --val-ratio ${data_params.val_ratio} "
-                "--samples-per-shard ${data_params.samples_per_shard} "
-                "--seqs-num ${data_params.seqs_num} "
-                "--register-tokens ${data_params.register_tokens}"),
-        "deps": [tsv, info, "${data_dirs.filtered_fasta}", f"{out}/train",
+                f"--max-seq-len {ref('max_seq_len')} --val-ratio {ref('val_ratio')} "
+                f"--samples-per-shard {ref('samples_per_shard')} "
+                f"--seqs-num {ref('max_seqs')} "
+                f"--register-tokens {ref('register_tokens')}"),
+        "deps": [tsv, info, filtered, f"{out}/train",
                  dep("src/nanoplm/data/preparation/cluster_index.py"),
                  dep("src/nanoplm/data/preparation/cluster_table.py")],
-        "params": [{params_filename: ["data_params.max_seq_len", "data_params.val_ratio",
-                                      "data_params.samples_per_shard", "data_params.seqs_num",
-                                      "data_params.register_tokens"]}],
+        "params": [{params_filename: [key("max_seq_len"), key("val_ratio"),
+                                      key("samples_per_shard"), key("max_seqs"),
+                                      key("register_tokens")]}],
         "outs": [index_dir, f"{out}/val"],
     }
     stages["write_manifest"] = {
         "cmd": ("nanoplm data write-manifest --kind pretrain --cluster-index "
-                f"-o {out} --min-seq-len ${{data_params.min_seq_len}} "
-                "--max-seq-len ${data_params.max_seq_len} "
-                "--val-ratio ${data_params.val_ratio} "
-                "--samples-per-shard ${data_params.samples_per_shard} "
-                "--register-tokens ${data_params.register_tokens}"),
+                f"-o {out} --min-seq-len {ref('min_seq_len')} "
+                f"--max-seq-len {ref('max_seq_len')} "
+                f"--val-ratio {ref('val_ratio')} "
+                f"--samples-per-shard {ref('samples_per_shard')} "
+                f"--register-tokens {ref('register_tokens')}"),
         "deps": [index_dir, f"{out}/val", dep("src/nanoplm/data/infra/manifest.py"),
                  dep("src/nanoplm/data/preparation/cluster_pipeline.py")],
-        "params": [{params_filename: ["data_params.min_seq_len", "data_params.max_seq_len",
-                                      "data_params.val_ratio", "data_params.samples_per_shard",
-                                      "data_params.register_tokens"]}],
+        "params": [{params_filename: [key("min_seq_len"), key("max_seq_len"),
+                                      key("val_ratio"), key("samples_per_shard"),
+                                      key("register_tokens")]}],
         "outs": [f"{out}/.data_manifest"],
     }
     return stages

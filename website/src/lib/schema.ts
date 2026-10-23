@@ -16,6 +16,8 @@ export interface FieldSchema {
 export interface SectionSchema {
   type: 'object';
   properties: Record<string, FieldSchema>;
+  /** A name -> spec map (data's `sources`): the spec every entry follows. */
+  additionalProperties?: SectionSchema;
   /** Banner-intro prose per group, keyed by group title. */
   'x-nanoplm-group-notes'?: Record<string, string>;
 }
@@ -136,16 +138,50 @@ export function stripEnumRestatement(
   return description;
 }
 
+/** Whether a property is a block of fields rather than a field. */
+function isSection(node: unknown): node is SectionSchema {
+  const n = node as SectionSchema | undefined;
+  return !!n && (n.properties !== undefined || n.additionalProperties !== undefined);
+}
+
+/**
+ * The block of fields a section path names. A path is dotted for a nested block
+ * (`sources.cluster_subsampling`), and a name -> spec map (`sources`) stands for
+ * the spec its entries follow.
+ */
+export function sectionNode(surface: Surface, section: string): SectionSchema | undefined {
+  let node: unknown = surface;
+  for (const part of section.split('.')) {
+    node = (node as SectionSchema | undefined)?.properties?.[part];
+    const spec = (node as SectionSchema | undefined)?.additionalProperties;
+    if (spec) node = spec;
+  }
+  return isSection(node) ? node : undefined;
+}
+
+/**
+ * The DOM id prefix for a section's fields. A nested block is named by its last
+ * segment (`data-cluster_subsampling-members`), so a link to a field keeps working
+ * when its block moves under another one.
+ */
+export function sectionPrefix(surface: Surface, section?: string): string {
+  const name = surface['x-nanoplm-surface'];
+  return section ? `${name}-${section.split('.').pop()}` : name;
+}
+
 /**
  * Flatten one surface (optionally one section of it) into reference rows.
  * Template surfaces (data/pretrain/distill) are nested by section
- * (`properties[section].properties[field]`); the eval surface is flat
- * (`properties[field]`), so call `toRows(surface)` with no section for it.
+ * (`properties[section].properties[field]`); see sectionNode() for nested paths.
+ * With no section, the surface's top-level fields: all of eval's, or data's
+ * `output_dir` (its sections are left to their own calls).
  */
 export function toRows(surface: Surface, section?: string): Row[] {
   const node: Record<string, FieldSchema> = section
-    ? ((surface.properties[section] as SectionSchema)?.properties ?? {})
-    : (surface.properties as Record<string, FieldSchema>);
+    ? (sectionNode(surface, section)?.properties ?? {})
+    : Object.fromEntries(
+        Object.entries(surface.properties).filter(([, f]) => !isSection(f)),
+      ) as Record<string, FieldSchema>;
   const required = new Set(surface.required ?? []);
 
   return Object.entries(node).map(([key, field]) => {
@@ -173,14 +209,12 @@ export function toRows(surface: Surface, section?: string): Row[] {
  *
  * `toRows` already returns fields grouped and in template order (the generator
  * keeps each block contiguous), so this only has to break the run whenever the
- * group label changes. A surface whose template carries no banners (data, eval)
- * yields a single untitled group, which renders exactly as the flat list did.
+ * group label changes. A section with no groups (eval, say) yields a single
+ * untitled group, which renders exactly as the flat list did.
  */
 export function toGroups(rows: Row[], surface: Surface, section?: string): Group[] {
-  const prefix = section ? `${surface['x-nanoplm-surface']}-${section}` : surface['x-nanoplm-surface'];
-  const notes = section
-    ? ((surface.properties[section] as SectionSchema)?.['x-nanoplm-group-notes'] ?? {})
-    : {};
+  const prefix = sectionPrefix(surface, section);
+  const notes = section ? (sectionNode(surface, section)?.['x-nanoplm-group-notes'] ?? {}) : {};
   const groups: Group[] = [];
   for (const row of rows) {
     const title = row.group ?? '';

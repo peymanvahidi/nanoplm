@@ -957,21 +957,41 @@ def from_yaml(
     except Exception as e:
         raise click.ClickException(f"Failed to read {config_path}: {e}") from e
 
-    data_params = params.get("data_params", {})
+    data_params = params.get("data_params") or {}
     kind = _detect_kind(data_params, config_path.name)
-
     _reject_legacy_pipeline_mode(data_params)
-    _validate_source_fields(params.get("data_dirs", {}))
-    _validate_pipeline_fields(params.get("data_dirs", {}), data_params, kind, config_path)
+
+    cfg = None
     if kind == "pretrain":
-        _validate_cluster_block(params, config_path)
+        cfg = _read_pretrain_config(config_path)
+        params = cfg.raw
+        src = cfg.source
+        if src.prepared:
+            # TODO(step 2): a prepared source is one input of a mixture; the mixture
+            # manifest will record it. With one source there is nothing to build.
+            _show_prepared(src, cwd, config_path)
+            return
+        plan = _validate_cluster_block(src, config_path)
+    else:
+        _validate_source_fields(params.get("data_dirs", {}))
+        _validate_pipeline_fields(params.get("data_dirs", {}), data_params, kind, config_path)
 
     if fix:
         _flip_drop_invalid(config_path, True)
-        click.echo(f"Set {config_path.name}: data_params.drop_invalid_sequences=true")
+        click.echo(f"Set {config_path.name}: drop_invalid_sequences=true")
         # Re-read after flip so dvc.yaml is generated with updated value
-        params = read_yaml(str(config_path))
-        data_params = params.get("data_params", {})
+        if kind == "pretrain":
+            cfg = _read_pretrain_config(config_path, quiet=True)
+            params, src = cfg.raw, cfg.source
+        else:
+            params = read_yaml(str(config_path))
+            data_params = params.get("data_params", {})
+
+    if kind == "pretrain":
+        _print_plan(cfg, plan, cwd, config_path)
+        max_workers = src.params.get("max_workers")
+    else:
+        max_workers = data_params.get("max_workers")
 
     # Regenerate dvc.yaml BEFORE any DVC subprocess call
     dvc_yaml_path = cwd / "dvc.yaml"
@@ -1008,7 +1028,6 @@ def from_yaml(
             )
 
     # Build environment for repro
-    max_workers = data_params.get("max_workers")
     device = data_params.get("device")
     repro_env = dict(os.environ)
     if max_workers is not None:
@@ -1024,6 +1043,9 @@ def from_yaml(
             f"{cwd} has no .dvc/. Run 'nanoplm data from-yaml' once without "
             f"--dry-run, or 'dvc init', then retry."
         )
+
+    if kind == "pretrain":
+        _print_rebuild_line(cwd, dvc_content, repro_env)
 
     # Build repro command
     if dry_run:
@@ -1049,12 +1071,13 @@ def from_yaml(
         )
 
     if not dry_run:
-        _print_summary(cwd, params, kind, config_path)
+        _print_summary(cwd, params, kind, config_path, cfg)
 
 
 # ---------------------------------------------------------------------------
 # Private helpers for from-yaml
 # ---------------------------------------------------------------------------
+
 
 def _resolve_config_path(config: str | None) -> Path:
     """Resolve the config argument to an absolute Path.
@@ -1189,7 +1212,8 @@ _DATA_PARAMS_TABLE = [
     ("shuffle_seed", _BOTH, _optional_int),
     ("min_seq_len", _BOTH, _int_at_least(0)),
     ("max_seq_len", _BOTH, _int_at_least(0)),
-    ("seqs_num", _BOTH, _int_at_least(-1)),
+    ("max_seqs", _PRETRAIN, _int_at_least(-1)),
+    ("seqs_num", _DISTILLATION, _int_at_least(-1)),
     ("val_ratio", _BOTH, _unit_float),
     ("samples_per_shard", _PRETRAIN, _int_at_least(1)),
     ("samples_per_shard", _DISTILLATION, _shard_count),
@@ -1222,23 +1246,94 @@ def _validate_pipeline_fields(data_dirs: dict, data_params: dict, kind: str, con
             )
 
 
-def _validate_cluster_block(params: dict, config_path: Path) -> None:
-    """Resolve cluster_subsampling now, so a bad block fails before DVC runs."""
+def _validate_source_params(src, config_path: Path) -> None:
+    """The pretraining data_params of one source, each named where data.yaml sets it."""
+    for field, kinds, is_valid in _DATA_PARAMS_TABLE:
+        if "pretrain" not in kinds:
+            continue
+        if field not in src.params:
+            raise click.ClickException(f"{config_path.name}: data_params.{field} is required.")
+        value = src.params[field]
+        if not is_valid(value):
+            raise click.ClickException(
+                f"{config_path.name}: {src.key(field)} has an invalid value: {value!r}")
+
+
+def _read_pretrain_config(config_path: Path, quiet: bool = False):
+    """data.yaml read strictly (duplicate and unknown keys are errors) into one source."""
+    from nanoplm.data.preparation.data_config import (
+        DataConfigError, load_strict, parse_data_config,
+    )
+    try:
+        raw = load_strict(config_path)
+        _reject_legacy_pipeline_mode(raw.get("data_params") or {})
+        cfg = parse_data_config(raw, config_path.parent, config_path.name)
+    except DataConfigError as e:
+        msg = str(e)
+        raise click.ClickException(msg if msg.startswith(config_path.name)
+                                   else f"{config_path.name}: {msg}") from e
+    cfg.raw = raw
+    src = cfg.source
+    if not quiet:
+        for w in cfg.warnings:
+            click.echo(f"Warning: {w}", err=True)
+    if cfg.legacy:
+        _validate_source_fields(raw.get("data_dirs", {}))
+        _validate_pipeline_fields(raw.get("data_dirs", {}), {}, "none", config_path)
+    if src.prepared:
+        return cfg
+    _validate_source_params(src, config_path)
+    if not cfg.legacy and not src.is_url:
+        local = _resolve_path(src.fasta, config_path.parent)
+        if not local.is_file():
+            raise click.ClickException(
+                f"{config_path.name}: sources.{src.name}.fasta: {src.fasta} not found (a "
+                "relative path is relative to data.yaml's directory)")
+    return cfg
+
+
+def _show_prepared(src, cwd: Path, config_path: Path) -> None:
+    """Check a prepared folder's manifest and say what it holds; nothing is built."""
+    from nanoplm.data.infra.manifest import read_manifest
+    folder = _resolve_path(src.prepared, cwd)
+    where = f"{config_path.name}: sources.{src.name}.prepared"
+    if not folder.is_dir():
+        raise click.ClickException(f"{where}: {folder} is not a folder")
+    try:
+        m = read_manifest(folder)
+    except (FileNotFoundError, ValueError) as e:
+        raise click.ClickException(f"{where}: {folder} is not a built dataset ({e})") from e
+    kind = getattr(m, "pipeline_mode", None)
+    if kind != "pretrain":
+        raise click.ClickException(f"{where}: {folder} holds {kind} data, not pretraining data")
+    if m.cluster_index_dir:
+        what = (f"cluster subsampling ({m.cluster_level}): {m.train_sequences:,} train / "
+                f"{m.val_sequences:,} val clusters over {m.pool_sequences:,} sequences")
+    else:
+        what = f"{m.train_sequences:,} train / {m.val_sequences:,} val sequences"
+    click.echo(f"sources.{src.name}: prepared {folder}\n"
+               f"  {what}, max_seq_len {m.max_seq_len}\n"
+               f"Nothing to build. Set pretrain.yaml's dataset_dir to {folder}.")
+
+
+def _validate_cluster_block(src, config_path: Path):
+    """Resolve the source's cluster block now, so a bad block fails before DVC runs."""
     from nanoplm.data.preparation.cluster_config import ClusterConfigError, resolve_cluster_plan
     from nanoplm.data.preparation.cluster_table import MMSEQS_INSTALL_HINT, find_mmseqs
+    if src.legacy:
+        return None
     try:
-        plan = resolve_cluster_plan(params, config_path.parent)
+        plan = resolve_cluster_plan(src, config_path.parent)
     except ClusterConfigError as e:
         raise click.ClickException(f"{config_path.name}: {e}") from e
     if plan is None:
-        return
-    workers = (params.get("data_params") or {}).get("max_workers")
+        return None
+    workers = src.params.get("max_workers")
     if not (isinstance(workers, int) and not isinstance(workers, bool)
             and (workers == -1 or workers >= 1)):
         raise click.ClickException(
-            f"{config_path.name}: data_params.max_workers must be -1 (all cores) or at "
+            f"{config_path.name}: {src.key('max_workers')} must be -1 (all cores) or at "
             f"least 1 with cluster_subsampling, got {workers!r}")
-    click.echo(f"Cluster source: {plan.source_line()}")
     for n in plan.notes:
         click.echo(n)
     for w in plan.warnings:
@@ -1248,6 +1343,7 @@ def _validate_cluster_block(params: dict, config_path: Path) -> None:
         raise click.ClickException(
             f"{config_path.name}: these members are clustered with MMseqs2, but `mmseqs` "
             f"was not found. {MMSEQS_INSTALL_HINT}")
+    return plan
 
 
 def _detect_kind(data_params: dict, filename: str) -> str:
@@ -1260,7 +1356,8 @@ def _detect_kind(data_params: dict, filename: str) -> str:
 
 
 def _flip_drop_invalid(config_path: Path, value: bool) -> None:
-    """Edit a single key in YAML preserving file structure as best as we can."""
+    """Edit drop_invalid_sequences in place (every occurrence, so a per-source
+    override flips too), keeping the file's comments and layout."""
     import re
     text = config_path.read_text()
     new_val = "true" if value else "false"
@@ -1273,14 +1370,112 @@ def _flip_drop_invalid(config_path: Path, value: bool) -> None:
     config_path.write_text(new_text)
 
 
-def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path) -> None:
+def _size(path: Path) -> str:
+    n = path.stat().st_size
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if n >= scale:
+            return f"{n / scale:.1f} {unit}"
+    return f"{n} B"
+
+
+def _fasta_cell(src, cwd: Path) -> str:
+    """Where the fasta comes from: a URL to download, a copy already downloaded, or a
+    local file read in place."""
+    if src.is_url:
+        got = src.paths.get("compressed_fasta" if src.is_compressed else "extracted_fasta")
+        on_disk = _resolve_path(got, cwd) if got else None
+        name = Path(got).name if got else src.fasta
+        if on_disk is not None and on_disk.is_file():
+            return f"{name} (reuse, {_size(on_disk)})"
+        return f"{name} (url)"
+    on_disk = _resolve_path(src.fasta, cwd)
+    return f"{src.fasta} (local, {_size(on_disk)})" if on_disk.is_file() else \
+        f"{src.fasta} (local)"
+
+
+def plan_table(cfg, plan, cwd: Path, config_path: Path) -> str:
+    """The pre-run summary: one row per source, before any DVC call."""
+    out = _resolve_path(cfg.output_dir, cwd)
+    n = len(cfg.sources)
+    lines = [f"{config_path.name}: {n} source{'s' if n > 1 else ''} -> {out}"]
+    rows = [("source", "fasta", "seqs", "len", "val", "clustering")]
+    starred = False
+    for src in cfg.sources.values():
+        over = set(src.overrides)
+        starred |= bool(over & {"max_seqs", "min_seq_len", "max_seq_len", "val_ratio"})
+
+        def mark(text, *fields):
+            return text + ("*" if over & set(fields) else "")
+
+        p = src.params
+        seqs = "all" if p["max_seqs"] == -1 else f"{p['max_seqs']:,}"
+        rows.append((
+            src.name, _fasta_cell(src, cwd), mark(seqs, "max_seqs"),
+            mark(f"{p['min_seq_len']}-{p['max_seq_len']}", "min_seq_len", "max_seq_len"),
+            mark(f"{p['val_ratio']:g}", "val_ratio"),
+            plan.source_line() if plan is not None else "off",
+        ))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    for r in rows:
+        lines.append("  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[-1])
+    if starred:
+        lines.append("* = set on this source")
+    return "\n".join(lines)
+
+
+def _print_plan(cfg, plan, cwd: Path, config_path: Path) -> None:
+    click.echo(plan_table(cfg, plan, cwd, config_path))
+
+
+def _stage_names(dvc_content: str) -> list:
+    import yaml as _yaml
+    names = []
+    for name, stage in (_yaml.safe_load(dvc_content).get("stages") or {}).items():
+        names += [f"{name}@{k}" for k in stage["foreach"]] if "foreach" in stage else [name]
+    return names
+
+
+def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict) -> None:
+    """Which stages dvc repro will run. Without a dvc.lock that is all of them; otherwise
+    ask `dvc status`, which reuses DVC's file-hash cache after the first run."""
+    import json
+    names = _stage_names(dvc_content)
+    if not (cwd / "dvc.lock").exists():
+        click.echo("Rebuild: all (first run)")
+        return
+    try:
+        r = subprocess.run(_DVC + ["status", "--json"], cwd=str(cwd), env=env,
+                           capture_output=True, text=True, timeout=_STATUS_TIMEOUT)
+        changed = set(json.loads(getattr(r, "stdout", "") or "{}"))
+        if getattr(r, "returncode", 1) != 0:
+            return
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        click.echo("Rebuild: unknown (dvc status was slow; dvc repro decides)")
+        return
+    rebuild = [n for n in names if n in changed]
+    fresh = [n for n in names if n not in changed]
+    if not rebuild:
+        click.echo("Up to date: all stages")
+        return
+    click.echo(f"Rebuild: {', '.join(rebuild)}."
+               + (f" Up to date: {', '.join(fresh)}." if fresh else ""))
+
+
+_STATUS_TIMEOUT = 120
+
+
+def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=None) -> None:
     """Print a human-readable summary using .data_manifest if present."""
     import yaml as _yaml
-    data_dirs = params.get("data_dirs") or {}
-    output_dir_value = data_dirs.get("output_dir")
+    if cfg is not None:
+        output_dir_value, src_value = cfg.output_dir, cfg.source.fasta
+    else:
+        data_dirs = params.get("data_dirs") or {}
+        output_dir_value = data_dirs.get("output_dir")
+        src_value = data_dirs.get("url") or data_dirs.get("local_fasta")
     if not output_dir_value:
         raise click.ClickException(
-            f"{config_path.name}: data_dirs.output_dir is missing; cannot locate the pipeline output."
+            f"{config_path.name}: output_dir is missing; cannot locate the pipeline output."
         )
     output_dir = Path(output_dir_value)
     manifest_path = (cwd / output_dir / ".data_manifest") if not output_dir.is_absolute() \
@@ -1293,14 +1488,13 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path) -> Non
     except _yaml.YAMLError as e:
         raise click.ClickException(f"{manifest_path}: failed to parse manifest: {e}")
     title = "Pretraining" if kind == "pretrain" else "Distillation"
-    src = data_dirs.get("url") or data_dirs.get("local_fasta")
     if m.get("cluster_index_dir"):
         from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
-        plan = resolve_cluster_plan(params, cwd)
+        plan = resolve_cluster_plan(cfg.source, cwd) if cfg is not None else None
         source = f"  Cluster source:  {plan.source_line()}\n" if plan else ""
         click.echo(
             f"\n{title} data pipeline complete (cluster subsampling).\n\n"
-            f"  Members:         {plan.members if plan else src}\n"
+            f"  Members:         {plan.members if plan else src_value}\n"
             f"{source}"
             f"  Pool sequences:  {m.get('pool_sequences')}\n"
             f"  Clusters:        {m.get('seqs_num')} ({m.get('cluster_level')})\n"
@@ -1311,7 +1505,7 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path) -> Non
         return
     click.echo(
         f"\n{title} data pipeline complete.\n\n"
-        f"  Source:          {src}\n"
+        f"  Source:          {src_value}\n"
         f"  Total sequences: {m.get('seqs_num')}\n"
         f"    Train:         {m.get('train_sequences')}\n"
         f"    Val:           {m.get('val_sequences')}\n"

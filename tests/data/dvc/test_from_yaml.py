@@ -70,12 +70,12 @@ def test_from_yaml_summary_uses_yaml_manifest(tmp_path, monkeypatch):
 
     # Materialize config and override output_dir to tmp_path
     cfg_dict = _yaml.safe_load(load_template("data_pretrain"))
-    cfg_dict["data_dirs"]["output_dir"] = str(tmp_path / "pretrain_out")
+    cfg_dict["output_dir"] = str(tmp_path / "pretrain_out")
     cfg = tmp_path / "data.yaml"
     cfg.write_text(_yaml.safe_dump(cfg_dict))
 
     # Pre-create the manifest as the real write-manifest stage would
-    out_dir = Path(cfg_dict["data_dirs"]["output_dir"])
+    out_dir = Path(cfg_dict["output_dir"])
     out_dir.mkdir(parents=True)
     manifest_text = (
         "# This file is AUTO-GENERATED\n"
@@ -111,8 +111,8 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
     cfg.write_text(load_template("data_pretrain"))
-    # data_pretrain.yaml has commented-out alt-URL lines starting with "# swissprot"
-    assert "# swissprot:" in cfg.read_text()
+    # data_pretrain.yaml has a commented-out source example starting with "# uniref50:"
+    assert "# uniref50:" in cfg.read_text()
     (tmp_path / ".dvc").mkdir(exist_ok=True)
 
     # Stub dvc subprocess
@@ -129,7 +129,7 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     assert result.exit_code == 0, result.output
     # Comments preserved + key flipped
     after = cfg.read_text()
-    assert "# swissprot:" in after
+    assert "# uniref50:" in after
     assert "drop_invalid_sequences: true" in after
 
 

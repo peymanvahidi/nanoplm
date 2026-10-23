@@ -4,6 +4,7 @@ import {
   toRows,
   toGroups,
   groupSlug,
+  sectionPrefix,
   stripEnumRestatement,
   type FieldSchema,
   type Surface,
@@ -84,7 +85,9 @@ describe('toRows', () => {
     // reference showed as `null · default null`: no hint of what the field takes.
     const pre = pretrain as Surface;
     const rows = [
-      ...toRows(data as Surface, 'data_dirs'),
+      ...toRows(data as Surface),
+      ...toRows(data as Surface, 'sources'),
+      ...toRows(data as Surface, 'sources.cluster_subsampling'),
       ...toRows(data as Surface, 'data_params'),
       ...toRows(pre, 'model'),
       ...toRows(pre, 'pretraining'),
@@ -239,6 +242,20 @@ describe('toRows', () => {
       withFieldGroups(input, 'reference/pretrain');
       expect(input[0].children[0].children).toEqual([]);
     });
+  });
+
+  it('reads the data surface\'s top-level field, source spec and nested block', () => {
+    const d = data as Surface;
+    // No section: only the top-level scalar, not the sections beside it.
+    expect(toRows(d).map((r) => r.key)).toEqual(['output_dir']);
+    // `sources` is a name -> spec map; its rows are the spec's fields.
+    const spec = toRows(d, 'sources').map((r) => r.key);
+    expect(spec).toEqual(expect.arrayContaining(['fasta', 'prepared', 'weight']));
+    const cluster = toRows(d, 'sources.cluster_subsampling');
+    expect(cluster.find((r) => r.key === 'clustering')?.enum).toContain('mmseqs2');
+    // Nested blocks are named by their last segment, so guide links keep resolving.
+    expect(sectionPrefix(d, 'sources.cluster_subsampling')).toBe('data-cluster_subsampling');
+    expect(toRows(d, 'no.such.block')).toEqual([]);
   });
 
   it('reads a flat (sectionless) eval surface and marks required fields', () => {

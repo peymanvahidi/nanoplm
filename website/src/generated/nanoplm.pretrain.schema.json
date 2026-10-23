@@ -1615,6 +1615,10 @@
       "x-nanoplm-group-notes": {
         "Decay-mode fields (omit / null for mode: continue)": "decay-mode fields (leave null / omit for mode: continue):"
       }
+    },
+    "pure_torch": {
+      "type": "boolean",
+      "default": true
     }
   },
   "x-nanoplm-compat": {

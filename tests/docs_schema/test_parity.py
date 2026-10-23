@@ -32,3 +32,34 @@ def test_no_invented_fields(surface, section, pkey):
     documented = _documented(surface, section)
     invented = documented - real
     assert not invented, f"{pkey}: documented fields not on the dataclass: {sorted(invented)}"
+
+
+# ---- data surface -----------------------------------------------------------
+# data.yaml has no dataclass; its field rules are module-level tuples in
+# data_config.py / cluster_config.py. Read them statically (no nanoplm import).
+
+def _module_tuple(path, name):
+    import ast
+    from pathlib import Path
+    for node in ast.parse(Path(path).read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            return tuple(ast.literal_eval(node.value))
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def test_data_surface_matches_data_config():
+    from tools.schema_gen.sources import REPO_SRC
+    prep = REPO_SRC / "data" / "preparation"
+    props = emit.build_surface("data")["properties"]
+    spec = props["sources"]["additionalProperties"]["properties"]
+
+    assert set(props) == set(_module_tuple(prep / "data_config.py", "TOP_KEYS"))
+    assert list(props["data_params"]["properties"]) == list(
+        _module_tuple(prep / "data_config.py", "PARAM_FIELDS"))
+    assert set(spec) == set(_module_tuple(prep / "data_config.py", "SOURCE_KEYS"))
+    assert set(spec["cluster_subsampling"]["properties"]) == set(
+        _module_tuple(prep / "data_config.py", "CLUSTER_KEYS"))
+    assert spec["cluster_subsampling"]["properties"]["clustering"]["enum"] == list(
+        _module_tuple(prep / "cluster_config.py", "CLUSTERINGS"))

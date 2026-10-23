@@ -3,59 +3,80 @@
   "x-nanoplm-surface": "data",
   "type": "object",
   "properties": {
-    "data_dirs": {
+    "output_dir": {
+      "type": "string",
+      "default": "output/data/pretrain_data",
+      "description": "every file goes here; pretrain.yaml's dataset_dir points here"
+    },
+    "sources": {
       "type": "object",
-      "properties": {
-        "url": {
-          "type": "string",
-          "default": "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
-        },
-        "local_fasta": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null,
-          "description": "optional local .fasta or .fasta.gz file (skips network download)"
-        },
-        "compressed_fasta": {
-          "type": "string",
-          "default": "output/data/raw/sequences.fasta.gz",
-          "description": "unused if source is a plain .fasta (URL or local_fasta)"
-        },
-        "extracted_fasta": {
-          "type": "string",
-          "default": "output/data/raw/sequences.fasta"
-        },
-        "validation_dir": {
-          "type": "string",
-          "default": "output/data/validation"
-        },
-        "shuffled_fasta": {
-          "type": "string",
-          "default": "output/data/raw/sequences_shuffled.fasta"
-        },
-        "filtered_fasta": {
-          "type": "string",
-          "default": "output/data/filter/sequences_filtered.fasta"
-        },
-        "splitted_fasta_dir": {
-          "type": "string",
-          "default": "output/data/split"
-        },
-        "output_dir": {
-          "type": "string",
-          "default": "output/data/pretrain_data"
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "fasta": {
+            "type": "string",
+            "description": "swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz",
+            "examples": [
+              "swissprot"
+            ]
+          },
+          "weight": {
+            "type": "number",
+            "default": 1.0,
+            "description": "Share of training sequences (not tokens) drawn from this source. Weights must sum to 1; with one source it is 1 or left out."
+          },
+          "prepared": {
+            "type": "string",
+            "description": "A folder another data.yaml built, used as it is. Set fasta or prepared, not both. A prepared source takes no data_params overrides and no cluster_subsampling."
+          },
+          "cluster_subsampling": {
+            "type": "object",
+            "properties": {
+              "members": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "uniref90, uniref100, a FASTA URL/path, or null (= this source's fasta). Required."
+              },
+              "clustering": {
+                "type": "string",
+                "default": "auto",
+                "enum": [
+                  "auto",
+                  "uniprot",
+                  "mmseqs2"
+                ],
+                "description": "auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or uniprot, mmseqs2"
+              },
+              "identity": {
+                "type": "number",
+                "default": 0.5,
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "description": "mmseqs2 only: min sequence identity within a cluster"
+              },
+              "coverage": {
+                "type": "number",
+                "default": 0.8,
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "description": "mmseqs2 only: min alignment coverage"
+              }
+            },
+            "description": "Turns on cluster subsampling for this source: each epoch trains on one random member of every cluster. The block being present turns it on; delete or comment it out to turn it off. max_seqs and val_ratio then count clusters, not sequences."
+          }
         }
-      }
+      },
+      "description": "One entry per source, keyed by a name you pick (letters, digits and _). Each names a fasta to build from or a prepared folder. Any data_params field set on a source overrides the default for that source. Only one source is supported for now."
     },
     "data_params": {
       "type": "object",
       "properties": {
-        "seqs_num": {
+        "max_seqs": {
           "type": "integer",
           "default": 20000,
-          "description": "FASTA pipeline"
+          "description": "-1 = all"
         },
         "min_seq_len": {
           "type": "integer",
@@ -63,77 +84,42 @@
         },
         "max_seq_len": {
           "type": "integer",
-          "default": 512
+          "default": 512,
+          "description": "longer sequences are dropped"
         },
         "val_ratio": {
           "type": "number",
           "default": 0.1
         },
-        "shuffle": {
-          "type": "boolean",
-          "default": true
-        },
-        "shuffle_seed": {
-          "type": "integer",
-          "default": 24
-        },
         "drop_invalid_sequences": {
           "type": "boolean",
           "default": false
         },
+        "shuffle": {
+          "type": "boolean",
+          "default": true,
+          "x-nanoplm-group": "Rarely changed"
+        },
+        "shuffle_seed": {
+          "type": "integer",
+          "default": 24,
+          "x-nanoplm-group": "Rarely changed"
+        },
         "samples_per_shard": {
           "type": "integer",
           "default": 2000,
-          "description": "Shard generation"
+          "description": "raised automatically when a cluster pool needs it",
+          "x-nanoplm-group": "Rarely changed"
         },
         "max_workers": {
           "type": "integer",
-          "default": 2
+          "default": 2,
+          "x-nanoplm-group": "Rarely changed"
         },
         "register_tokens": {
           "type": "integer",
-          "default": 0
-        }
-      }
-    },
-    "cluster_subsampling": {
-      "type": "object",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": false
-        },
-        "members": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null,
-          "description": "uniref90, uniref100, a FASTA URL/path, or null (= url itself)"
-        },
-        "clustering": {
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "auto",
-            "uniprot",
-            "mmseqs2"
-          ],
-          "description": "auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or uniprot, mmseqs2"
-        },
-        "identity": {
-          "type": "number",
-          "default": 0.5,
-          "exclusiveMinimum": 0,
-          "maximum": 1,
-          "description": "mmseqs2 only: min sequence identity within a cluster"
-        },
-        "coverage": {
-          "type": "number",
-          "default": 0.8,
-          "exclusiveMinimum": 0,
-          "maximum": 1,
-          "description": "mmseqs2 only: min alignment coverage"
+          "default": 0,
+          "x-nanoplm-group": "Rarely changed"
         }
       }
     }

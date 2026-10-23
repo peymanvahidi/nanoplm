@@ -33,10 +33,35 @@ def test_parse_fields_captures_section_key_default_and_comments():
     canon = by_key[("model", "use_canon_layers")]
     assert "Canon" in canon.description
 
-def test_data_template_has_data_dirs_and_data_params_sections():
+def test_data_template_has_top_level_scalar_sources_and_data_params():
     fields = templates.parse_fields(templates.load_template_text("data"))
-    sections = {f.section for f in fields}
-    assert {"data_dirs", "data_params"} <= sections
+    by_key = {(f.section, f.key): f for f in fields}
+    # A column-0 `key: value` is a field of the file, not a section header.
+    out = by_key[("", "output_dir")]
+    assert out.raw_default == '"output/data/pretrain_data"'
+    assert "dataset_dir" in out.eol_comment
+    # Fields under the example source name carry it as their entry; the name
+    # itself is not a field.
+    assert by_key[("sources", "fasta")].entry == "swissprot"
+    assert by_key[("sources", "weight")].entry == "swissprot"
+    assert ("sources", "swissprot") not in by_key
+    assert by_key[("data_params", "max_seqs")].entry == ""
+    assert {f.section for f in fields} == {"", "sources", "data_params"}
+
+
+def test_nested_entry_ends_at_its_own_indent():
+    text = (
+        "sources:\n"
+        "  a:\n"
+        "    fasta: x\n"
+        "  b:\n"
+        "    fasta: y\n"
+        "params:\n"
+        "  n: 1\n"
+    )
+    got = [(f.section, f.entry, f.key, f.raw_default) for f in templates.parse_fields(text)]
+    assert got == [("sources", "a", "fasta", "x"), ("sources", "b", "fasta", "y"),
+                   ("params", "", "n", "1")]
 
 def test_commented_out_field_not_attached_as_description():
     by_key = {(f.section, f.key): f for f in templates.parse_fields(templates.load_template_text("pretrain"))}
@@ -115,6 +140,8 @@ def test_group_banners_become_groups_and_notes():
 
 
 def test_templates_without_banners_are_ungrouped():
+    # The data template has no `# ── Title ───` banners; its `# Rarely changed`
+    # block is grouped through overlay.yaml instead.
     fields, notes = templates.parse_template(templates.load_template_text("data"))
     assert {f.group for f in fields} == {""}
     assert notes == {}
