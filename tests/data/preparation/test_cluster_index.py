@@ -169,6 +169,15 @@ def test_join_refuses_an_accession_outside_the_hierarchy(release, tmp_path):
     with pytest.raises(ci.ClusterIndexError, match="pool sequences are not in"):
         ci.build_cluster_index(filtered, tmp_path / "train", tmp_path / "members.tsv",
                                tmp_path / "cluster_index", MAX_LEN, VAL_RATIO)
+    # through the stage, the error names the persisted XML and how to refresh it
+    from nanoplm.data.preparation.cluster_pipeline import build_index_and_val
+    from nanoplm.data.preparation.cluster_table import build_members_table
+    build_members_table("uniref_xml", tmp_path / "members.tsv", fasta=release.fasta90,
+                        level="uniref90", xml=release.xml)
+    with pytest.raises(ci.ClusterIndexError,
+                       match=f"{release.xml} is kept between runs .* delete it to re-download"):
+        build_index_and_val(filtered, tmp_path / "train", tmp_path / "members.tsv",
+                            tmp_path / "cluster_index", tmp_path / "val", MAX_LEN, VAL_RATIO, 50)
 
 
 def test_a_fasta_that_is_not_the_pools_order_is_fatal(built, release, tmp_path):

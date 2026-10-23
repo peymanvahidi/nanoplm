@@ -206,12 +206,14 @@ def build_cluster_index(
     tokenizer=None,
     level: Optional[str] = None,
     clusters_info: Optional[dict] = None,
+    cluster_xml: Optional[str] = None,
 ) -> dict:
     """Write the cluster index for the pool in ``pool_dir`` (built from ``fasta``).
 
     ``tokenizer`` (optional) re-tokenizes a few hundred FASTA records with the shard
     writer and compares them to their pool rows byte for byte; the token-length rule
-    alone cannot see an equal-length reorder.
+    alone cannot see an equal-length reorder. ``cluster_xml`` is the uniref50.xml.gz
+    members.tsv came from, named when the two releases disagree.
     """
     t0 = time.time()
     fasta, pool_dir = Path(fasta), Path(pool_dir)
@@ -246,9 +248,12 @@ def build_cluster_index(
     hit = np.asarray(u_keys[pos]) == sk
     if not hit.all():
         bad = order[np.flatnonzero(~hit)[:5]].tolist()
-        raise ClusterIndexError(
-            f"{int((~hit).sum())} pool sequences are not in {members_tsv} (rows {bad}); the "
-            "member FASTA and the cluster source are probably from different releases")
+        msg = (f"{int((~hit).sum())} pool sequences are not in {members_tsv} (rows {bad}); "
+               "the member FASTA and the cluster source are probably from different releases")
+        if cluster_xml:
+            msg += (f". {cluster_xml} is kept between runs and may be from an older UniProt "
+                    "release: delete it to re-download")
+        raise ClusterIndexError(msg)
     pool_cluster = np.empty(n, dtype=np.int32)
     pool_is_rep = np.empty(n, dtype=bool)
     pool_cluster[order] = np.asarray(u_cluster[pos])

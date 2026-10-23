@@ -87,7 +87,8 @@ def build_index_and_val(filtered_fasta: Path, pool_dir: Path, members_tsv: Path,
         max_clusters=seqs_num, holdout_seed=holdout_seed,
         tokenizer=_tokenizer(register_tokens), level=info.get("level"),
         clusters_info={k: info[k] for k in ("source", "release_version", "identity",
-                                             "coverage", "cov_mode") if k in info})
+                                             "coverage", "cov_mode") if k in info},
+        cluster_xml=info.get("input") if info.get("source") == "uniref50_xml" else None)
     rep = np.load(Path(index_dir) / "val_rep_rows.npy")
     ci.write_row_gather(pool_dir, rep, val_dir, samples_per_shard)
     return man
