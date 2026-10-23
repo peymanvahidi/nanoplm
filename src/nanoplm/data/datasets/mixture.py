@@ -141,13 +141,14 @@ class MixtureDataset(torch.utils.data.Dataset):
         n, k = self.sizes[s], self.counts[s]
         q = e * k + np.arange(k, dtype=np.int64)
         p, u = np.divmod(q, n)
-        items = np.empty(k, dtype=np.int64)
-        for pv in np.unique(p):
-            sel = p == pv
-            a, b = self._perm(s, int(pv))
-            with np.errstate(over="ignore"):
-                items[sel] = ((np.uint64(a) * u[sel].astype(np.uint64) + np.uint64(b))
-                              % np.uint64(n)).astype(np.int64)
+        # one (a, b) per pass, then all slots at once: a small source can repeat
+        # thousands of times in one mixture epoch
+        passes, which = np.unique(p, return_inverse=True)
+        ab = np.array([pass_permutation(self.seed, self.names[s], int(pv), n) for pv in passes],
+                      dtype=np.uint64).reshape(-1, 2)
+        with np.errstate(over="ignore"):
+            items = ((ab[which, 0] * u.astype(np.uint64) + ab[which, 1])
+                     % np.uint64(n)).astype(np.int64)
         return items, p
 
     def get_all_sequence_lengths(self) -> np.ndarray:
