@@ -1414,8 +1414,10 @@ def _warn_orphaned_outputs(cfg, cwd: Path) -> None:
     paths = orphaned_outputs(cfg, cwd)
     if not paths:
         return
+    # the .gitignore lines DVC wrote for these paths (one per output, "/<name>")
     gitignores = sorted({str(p.parent / ".gitignore") for p in paths
-                         if (p.parent / ".gitignore").is_file()})
+                         if (p.parent / ".gitignore").is_file() and f"/{p.name}" in
+                         (p.parent / ".gitignore").read_text().split()})
     click.echo("Warning: output_dir holds outputs of an earlier build that this data.yaml "
                "does not use; nothing deletes them. You can delete:", err=True)
     for p in paths:
