@@ -93,7 +93,7 @@ Rewrites `dvc.yaml` from the config, runs `dvc init` if needed, then runs the pi
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--target TEXT` | Run one DVC stage, as named in `dvc.yaml` (for example `split`, or `cluster_index` with cluster subsampling), instead of the whole pipeline | full pipeline |
+| `--target TEXT` | Run one DVC stage, as named in `dvc.yaml` (for example `split`, or `cluster_index` with cluster subsampling; in a mix `<source>-<step>`, e.g. `swissprot-split`), instead of the whole pipeline | full pipeline |
 | `--no-auto-init` | Fail instead of running `dvc init` when DVC is not initialized | off |
 | `--force` | Pass `-f` to `dvc repro`, re-running stages DVC considers unchanged | off |
 | `--verbose` | Pass `-v` to `dvc repro` | off |
