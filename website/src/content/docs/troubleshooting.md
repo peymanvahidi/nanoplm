@@ -288,28 +288,28 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 
 ### data.yaml won't load
 
-`nanoplm data from-yaml` checks the whole file before any stage runs and names the key it stopped at. `sp` stands for your source name.
+`nanoplm data from-yaml` checks the whole file before any stage runs and names the key it stopped at. In these messages the source is named `sp`.
 
 | Message | Fix |
 | --- | --- |
 | `sources.sp.fasta must be a shortcut (swissprot, trembl, uniref50, uniref90, uniref100) or a URL or path that ends with .fasta or .fasta.gz, got: swisprot` | Fix the spelling, or give a URL or a `.fasta` / `.fasta.gz` path. |
 | `sources.sp: unknown key weigth (allowed: fasta, prepared, weight, ...)` | A typo, or a key at the wrong level. The message lists the keys allowed there. |
-| `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name, indented as `sources:`, then `sp:`, then `fasta:`. |
+| `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name. Indent it as `sources:`, then `sp:`, then `fasta:`. |
 | `output_dir is required (the folder pretrain.yaml's dataset_dir points at)` | Add `output_dir` at the top level. |
 | `mixing several sources is not supported yet (one source only); sources has 2: sp, tr` | Keep one entry under `sources`. |
 | `sources.sp.weight is 0.5; with one source the weight must be 1 (or leave it out)` | Set `weight: 1.0` or delete it. |
 | `data_dirs is the old layout; use output_dir + sources without data_dirs` | The file has both layouts. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml). |
 | `data.yaml:5: duplicate key 'fasta' (first on line 4)` | The same key appears twice in one block. Delete one. |
 
-Errors about a `cluster_subsampling` block, and MMseqs2 not found, are in the [cluster subsampling guide](/nanoplm/guides/cluster-subsampling/#errors-and-warnings).
+For errors about a `cluster_subsampling` block, or MMseqs2 not found, see the [cluster subsampling guide](/nanoplm/guides/cluster-subsampling/#errors-and-warnings).
 
-A `Warning: data_dirs is the old data.yaml layout` is not an error. The old file still runs. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml).
+`Warning: data_dirs is the old data.yaml layout` is not an error. The old file still runs. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml).
 
 ### The `check` stage fails on invalid sequences
 
 **`Error: Validation found 2 problematic sequence(s).`**
 
-With the default [`drop_invalid_sequences: false`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences), the `check` stage stops the pipeline when a sequence has a residue it does not recognise. Look at `output_dir/<source>/validation/invalid.fasta`, then run `nanoplm data from-yaml --fix` to drop those sequences and continue. [Prepare data](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once) shows the full output.
+With the default [`drop_invalid_sequences: false`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences), the `check` stage stops the pipeline when a sequence has a residue it does not recognise. Look at `output_dir/<source>/validation/invalid.fasta`. Then run `nanoplm data from-yaml --fix` to drop those sequences and continue ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
 
 ### `--dry-run` refuses or stops early
 
@@ -319,21 +319,21 @@ Run `nanoplm data from-yaml` once without `--dry-run`, or run `dvc init` in the 
 
 **`The dry run stops after get_members_fasta, get_cluster_xml: DVC cannot preview the stages that read their outputs until those exist.`**
 
-Not an error. A download has not happened yet, so the preview ends there. The real run goes on past it.
+This is not an error. A download has not happened yet, so the preview ends there. The real run goes on past it.
 
 ### The dataset was prepared for the wrong pipeline
 
 **`Dataset was prepared for 'distillation' pipeline, but 'pretrain' was expected.`**
 
-[`dataset_dir`](/nanoplm/reference/pretrain/#pretrain-pretraining-dataset_dir) points at a distillation dataset (HDF5 teacher embeddings), not pretraining shards. Point it at the `output_dir` from a `nanoplm data from-yaml` run made **without** `--distillation`.
+[`dataset_dir`](/nanoplm/reference/pretrain/#pretrain-pretraining-dataset_dir) points at a distillation dataset (HDF5 teacher embeddings), not pretraining shards. Point it at the `output_dir` of a `data.yaml` from `nanoplm data get-yaml` without `--distillation`.
 
 ### Outputs land somewhere unexpected
 
-Relative paths in `data.yaml` resolve against the **folder `data.yaml` is in**, not the folder you run the command from: `nanoplm data from-yaml` runs every stage there. Use an absolute `output_dir` to put outputs elsewhere. The run log is the exception: it goes to `output/logs/` under the folder you run the command from.
+`nanoplm data from-yaml` runs every stage in the folder `data.yaml` is in, so relative paths in `data.yaml` start from there, not from the folder you run the command in. Use an absolute `output_dir` to put outputs elsewhere. The run log is the exception. It goes to `output/logs/` under the folder you run the command in.
 
 ### Editing `.data_manifest` by hand
 
-Don't. It is generated, it carries a `# DO NOT EDIT THIS FILE MANUALLY.` header, and it records the exact parameters the binary shards were built with. If you need different `max_seq_len` or `samples_per_shard`, change `data.yaml` and re-run `nanoplm data from-yaml` so the shards and the manifest are regenerated together.
+Don't. The manifest records the settings the shards were built with, so a hand edit makes it disagree with the shards. To change `max_seq_len` or `samples_per_shard`, change `data.yaml` and run `nanoplm data from-yaml` again. It rebuilds the shards and the manifest together.
 
 ## Still stuck?
 

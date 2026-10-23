@@ -26,8 +26,8 @@ puts in the env.
 
 <Steps>
 
-1. **Scaffold the config.** This writes two files: `data.yaml`, which you edit, and `dvc.yaml`, which
-   is the generated stage graph and which you never edit.
+1. **Scaffold the config.** This writes `data.yaml`, which you edit, and `dvc.yaml`, which nanoPLM
+   generates and you never edit.
 
    ```bash
    nanoplm data get-yaml
@@ -35,9 +35,8 @@ puts in the env.
    # Edit data.yaml and run `nanoplm data from-yaml` to execute.
    ```
 
-2. **Check three keys.** The template already points at SwissProt, so there is little to change,
-   but these are the three values that decide how big and how long your dataset is, and they are
-   worth setting on purpose.
+2. **Check three keys.** The template already points at SwissProt, so you can run it as it is.
+   These three keys decide which sequences you train on, how many, and how long they can be.
 
    ```yaml title="data.yaml" {4,8,10}
    output_dir: "output/data/pretrain_data"   # pretrain.yaml reads from here
@@ -53,8 +52,8 @@ puts in the env.
      # ...
    ```
 
-3. **Run the pipeline.** nanoPLM drives the download → extract → check → shuffle → filter → split →
-   tokenize graph through DVC.
+3. **Run the pipeline.** This downloads SwissProt, checks and filters the sequences, splits them
+   into train and validation sets, and tokenizes them.
 
    ```bash
    nanoplm data from-yaml
@@ -76,14 +75,14 @@ puts in the env.
    #   Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
    ```
 
-   The table at the top is printed before anything runs. It has one row per source, with the file
-   it reads and the settings it uses. [Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run)
-   explains each column. If the `check` stage stops on invalid sequences, run
-   `nanoplm data from-yaml --fix` ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
+   `from-yaml` prints the table at the top before anything runs, so you can check the file and
+   settings first ([columns explained here](/nanoplm/pipeline/data/#read-the-table-before-the-run)).
+   If the `check` stage stops on invalid sequences, run `nanoplm data from-yaml --fix`
+   ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
 
 </Steps>
 
-You now have binary token shards and the manifest that describes them:
+You now have the tokenized sequences in binary shard files, and a manifest that describes them:
 
 <FileTree>
 
@@ -95,7 +94,7 @@ You now have binary token shards and the manifest that describes them:
   - val/
     - shard_0000.bin
     - shard_0000.idx.npy
-  - .data_manifest **the contract: pretraining reads some information from here**
+  - .data_manifest **pretraining reads max_seq_len and the shard folders from here**
 
 </FileTree>
 
@@ -219,7 +218,7 @@ The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:
      # ...
    ```
 
-3. **Run the benchmark.** nanoPLM scores the benchmark's mutants with your model's MLM head — no
+3. **Run the benchmark.** nanoPLM scores the benchmark's mutants with your model's MLM head. No
    probe is trained on top.
 
    ```bash
@@ -251,7 +250,7 @@ embedder's directory, which defaults to the checkpoint's directory name:
 
 ## Verify
 
-You are done when all three are true:
+You are done when all four are true:
 
 - `output/data/pretrain_data/.data_manifest` exists and reports 18,000 train and 2,000 val sequences.
 - Training reached `[step 154/154]` and your loss fell from around 3.4 to under 2.5. A tiny model on
