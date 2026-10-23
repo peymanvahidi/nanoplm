@@ -107,17 +107,6 @@ def test_holdout_is_seeded_whole_cluster_and_not_a_prefix(built):
     assert man["holdout"]["val_ratio"] == VAL_RATIO
 
 
-def test_val_nonrep_rows(built):
-    root, _, _ = built
-    pc, rep = _ix(root, "pool_cluster"), _ix(root, "pool_is_rep")
-    val, mm, nonrep = _ix(root, "val_clusters"), _ix(root, "val_clusters_multimember"), \
-        _ix(root, "val_nonrep_rows")
-    sizes = _ix(root, "cluster_sizes_filtered")
-    assert np.array_equal(mm, val[sizes[val] >= 2]) and len(mm) > 0
-    assert np.array_equal(pc[nonrep], mm) and not rep[nonrep].any()
-    assert np.array_equal(val[_ix(root, "val_multimember_index")], mm)
-
-
 def test_manifest_counts_and_verify(built):
     root, _, man = built
     assert man["verify"]["ok"], man["verify"]["failures"]
@@ -152,7 +141,6 @@ def _copy(built, tmp_path):
     ("csr_swap", "csr_member_cluster_agrees_with_pool_cluster"),
     ("pool_lengths", "pool_lengths_is_the_concatenated_shard_index"),
     ("train_holds_val", "train_is_universe_minus_val"),
-    ("nonrep_is_rep", "val_nonrep_rows_in_their_cluster_and_not_the_rep"),
 ])
 def test_verify_rejects_a_tampered_index(built, tmp_path, tamper, check):
     d = _copy(built, tmp_path)
@@ -166,13 +154,9 @@ def test_verify_rejects_a_tampered_index(built, tmp_path, tamper, check):
         L = np.load(ix / "pool_lengths.npy")
         L[3] += 1
         np.save(ix / "pool_lengths.npy", L)
-    elif tamper == "train_holds_val":
+    else:
         np.save(ix / "train_clusters.npy", np.sort(np.concatenate(
             [np.load(ix / "train_clusters.npy"), np.load(ix / "val_clusters.npy")[:1]])))
-    else:
-        nr = np.load(ix / "val_nonrep_rows.npy")
-        nr[0] = np.load(ix / "val_rep_rows.npy")[np.load(ix / "val_multimember_index.npy")[0]]
-        np.save(ix / "val_nonrep_rows.npy", nr)
     res = ci.verify_cluster_index(ix, d / "train")
     assert not res["ok"] and check in res["failures"]
 

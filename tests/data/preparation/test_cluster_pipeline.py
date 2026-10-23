@@ -69,8 +69,7 @@ def test_training_picks_the_cluster_dataset_and_val_holds_the_reps(prepared):
     vc = np.load(out / "cluster_index" / "index" / "val_clusters.npy")
     for e in range(3):
         assert not np.isin(pc[train.rows_for_epoch(e)], vc).any()
-    nonrep = ShardedDataset(str(out / "cluster_index" / "index" / "val_nonrep"))
-    assert len(nonrep) == len(np.load(out / "cluster_index" / "index" / "val_nonrep_rows.npy"))
+    assert not (out / "cluster_index" / "index" / "val_nonrep").exists()
 
 
 def test_pool_keeps_fasta_order_and_the_length_window(prepared, release):

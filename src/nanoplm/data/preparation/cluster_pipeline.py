@@ -9,8 +9,7 @@ Stages (``nanoplm data from-yaml`` runs them as DVC stages; see _dvc_yaml_gen):
   cluster_pool           pre-tokenize the filtered FASTA into output_dir/train (the pool)
   get_cluster_xml        uniref50.xml.gz next to compressed_fasta (UniProt clusters only)
   cluster_members        cluster_index/members.tsv from the XML or MMseqs2
-  cluster_index          cluster_index/index/ arrays, val/ (held-out reps) and
-                         cluster_index/index/val_nonrep/
+  cluster_index          cluster_index/index/ arrays and val/ (held-out reps)
   write_manifest         .data_manifest with cluster_index_dir
 
 val_ratio is the fraction of clusters held out, seqs_num caps the number of clusters,
@@ -33,7 +32,6 @@ from nanoplm.data.preparation import cluster_table as ct
 from nanoplm.data.preparation import uniref_hierarchy as uh
 from nanoplm.utils import logger
 
-VAL_NONREP_DIRNAME = "val_nonrep"
 CLUSTER_SOURCES = ("uniref_xml", "mmseqs")
 
 
@@ -231,7 +229,7 @@ def build_index_and_val(filtered_fasta: Path, pool_dir: Path, members_tsv: Path,
                         index_dir: Path, val_dir: Path, max_seq_len: int, val_ratio: float,
                         samples_per_shard: int, seqs_num: int = -1, register_tokens: int = 0,
                         holdout_seed: int = ci.HOLDOUT_SEED) -> dict:
-    """The cluster index, then val/ (held-out reps) and index/val_nonrep/."""
+    """The cluster index, then val/ (the held-out clusters' representatives)."""
     info_path = Path(members_tsv).with_suffix(".json")
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
     man = ci.build_cluster_index(
@@ -241,11 +239,7 @@ def build_index_and_val(filtered_fasta: Path, pool_dir: Path, members_tsv: Path,
         clusters_info={k: info[k] for k in ("source", "release_version", "identity",
                                              "coverage", "cov_mode") if k in info})
     rep = np.load(Path(index_dir) / "val_rep_rows.npy")
-    nonrep = np.load(Path(index_dir) / "val_nonrep_rows.npy")
     ci.write_row_gather(pool_dir, rep, val_dir, samples_per_shard)
-    if len(nonrep):
-        ci.write_row_gather(pool_dir, nonrep, Path(index_dir) / VAL_NONREP_DIRNAME,
-                            samples_per_shard)
     return man
 
 

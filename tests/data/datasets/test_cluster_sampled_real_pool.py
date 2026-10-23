@@ -109,8 +109,7 @@ def test_xml_members_table_rebuilds_the_experiments_index(tmp_path):
                            level="uniref90")
     for name in ("pool_cluster", "pool_is_rep", "cluster_sizes_filtered", "universe_clusters",
                  "global_to_universe", "cluster_offsets", "cluster_members", "cluster_rep_row",
-                 "universe_mask", "val_clusters", "val_rep_rows", "val_clusters_multimember",
-                 "val_nonrep_rows", "val_multimember_index", "train_clusters",
+                 "universe_mask", "val_clusters", "val_rep_rows", "train_clusters",
                  "shard_row_offsets"):
         a = np.load(INDEX / f"{name}.npy", mmap_mode="r")
         b = np.load(tmp_path / "index" / f"{name}.npy", mmap_mode="r")

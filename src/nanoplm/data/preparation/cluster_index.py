@@ -20,9 +20,6 @@ ClusterSampledDataset opens either):
   cluster_members.npy         int32[M]    pool rows grouped by universe cluster, ascending
   val_clusters.npy            int32       held-out clusters (global, sorted)
   val_rep_rows.npy            int32       their representatives, aligned with val_clusters
-  val_clusters_multimember.npy int32      the n_c >= 2 subset of val_clusters
-  val_nonrep_rows.npy         int32       one non-representative member per such cluster
-  val_multimember_index.npy   int32       position in val_clusters of each multimember one
   train_clusters.npy          int32       universe minus val: what training visits
   shard_row_offsets.npy       int64       cumulative rows per shard
   pool_manifest.json          counts, holdout, cap, and the verify block
@@ -59,7 +56,6 @@ TOOL_VERSION = 1
 # The experiment's holdout seed: rebuilding on its release with its val_ratio (0.0044)
 # reproduces its val_clusters.npy exactly.
 HOLDOUT_SEED = 20260918
-VAL_NONREP_SEED_OFFSET = 1
 CAP_SEED_OFFSET = 2
 # ShardedDataset finds shards with sorted(glob("*.bin")) and the writer names them
 # shard_%04d, so from 10,000 shards on the sorted order stops being the row order.
@@ -207,26 +203,6 @@ def draw_cap(n: int, k: int, seed: int) -> np.ndarray:
     return np.sort(rng.choice(n, size=k, replace=False, shuffle=False).astype(np.int64))
 
 
-def draw_val_nonrep_rows(members, offsets, local_idx, rep_rows, n_c, seed: int) -> np.ndarray:
-    """One uniformly drawn non-representative pool row per multi-member cluster."""
-    rng = np.random.default_rng(seed)
-    if np.any(np.asarray(n_c) < 2):
-        raise ClusterIndexError("draw_val_nonrep_rows needs n_c >= 2 for every cluster")
-    if len(local_idx) == 0:
-        return np.empty(0, dtype=np.int32)
-    k = rng.integers(0, np.asarray(n_c, dtype=np.int64) - 1)
-    out = np.empty(len(local_idx), dtype=np.int32)
-    for i in range(len(local_idx)):
-        li = int(local_idx[i])
-        seg = members[int(offsets[li]):int(offsets[li + 1])]
-        pos = int(np.searchsorted(seg, rep_rows[i]))
-        if pos >= len(seg) or int(seg[pos]) != int(rep_rows[i]):
-            raise ClusterIndexError(f"cluster {li}: representative is not among its members")
-        j = int(k[i])
-        out[i] = seg[j + (j >= pos)]
-    return out
-
-
 # ------------------------------------------------------------------- the build
 
 
@@ -320,7 +296,6 @@ def build_cluster_index(
                    "token_length_rule": f"tokens = min(residues + {specials}, {max_seq_len})"},
         "counts": counts,
         "holdout": {"seed": holdout_seed, "val_ratio": val_ratio,
-                    "nonrep_seed": holdout_seed + VAL_NONREP_SEED_OFFSET,
                     "drawn_from": "universe-local cluster indices, numpy Generator(PCG64)"
                                   ".choice(replace=False, shuffle=False), sorted"},
         "cap": cap,
@@ -384,13 +359,8 @@ def aggregate(pool_cluster, pool_is_rep, raw_sizes, val_ratio, max_clusters, hol
     in_val = np.zeros(cu, dtype=bool)
     in_val[val_local] = True
     val_clusters = universe[val_local]
-    multi_local = val_local[n_u[val_local] >= 2]
-    val_multi = universe[multi_local]
     train_clusters = universe[~in_val]
     val_rep_rows = cluster_rep_row[val_clusters]
-    mm_index = np.searchsorted(val_clusters, val_multi).astype(np.int32)
-    val_nonrep = draw_val_nonrep_rows(members, offsets, multi_local, cluster_rep_row[val_multi],
-                                      n_u[multi_local], holdout_seed + VAL_NONREP_SEED_OFFSET)
     arrays = {
         "cluster_sizes_filtered": sizes.astype(np.int32),
         "universe_mask": universe_mask,
@@ -400,10 +370,7 @@ def aggregate(pool_cluster, pool_is_rep, raw_sizes, val_ratio, max_clusters, hol
         "cluster_offsets": offsets,
         "cluster_members": members,
         "val_clusters": val_clusters.astype(np.int32),
-        "val_clusters_multimember": val_multi.astype(np.int32),
         "val_rep_rows": val_rep_rows.astype(np.int32),
-        "val_nonrep_rows": val_nonrep,
-        "val_multimember_index": mm_index,
         "train_clusters": train_clusters.astype(np.int32),
     }
     counts = {
@@ -413,7 +380,7 @@ def aggregate(pool_cluster, pool_is_rep, raw_sizes, val_ratio, max_clusters, hol
         "universe_members": int(len(members)),
         "universe_singletons": int((n_u == 1).sum()),
         "val_clusters": int(len(val_clusters)),
-        "val_clusters_multimember": int(len(val_multi)),
+        "val_clusters_multimember": int((n_u[val_local] >= 2).sum()),
         "train_clusters": int(len(train_clusters)),
         "train_members": int(n_u[~in_val].sum()),
         "pool_rows_outside_universe": int(n - len(members)),
@@ -537,8 +504,7 @@ def verify_cluster_index(index_dir: Path, pool_dir: Path) -> dict:
     sizes, umask, rep_row = L("cluster_sizes_filtered"), L("universe_mask"), L("cluster_rep_row")
     universe, g2u = L("universe_clusters"), L("global_to_universe")
     off, mem = L("cluster_offsets"), L("cluster_members")
-    val, val_rep, val_mm = L("val_clusters"), L("val_rep_rows"), L("val_clusters_multimember")
-    nonrep, mm_index, train = L("val_nonrep_rows"), L("val_multimember_index"), L("train_clusters")
+    val, val_rep, train = L("val_clusters"), L("val_rep_rows"), L("train_clusters")
     sro = L("shard_row_offsets")
     n, c = len(pc), len(sizes)
 
@@ -582,12 +548,6 @@ def verify_cluster_index(index_dir: Path, pool_dir: Path) -> dict:
     check("train_is_universe_minus_val",
           np.array_equal(train, np.setdiff1d(universe, val)) and not np.isin(val, train).any())
     check("val_rep_rows_are_the_held_out_representatives", np.array_equal(val_rep, rep_row[val]))
-    check("val_multimember_is_the_n_c_ge_2_subset", np.array_equal(val_mm, val[sizes[val] >= 2]))
-    check("val_multimember_index_joins_nonrep_to_rep",
-          len(mm_index) == len(val_mm) and np.array_equal(val[mm_index], val_mm))
-    check("val_nonrep_rows_in_their_cluster_and_not_the_rep",
-          len(nonrep) == len(val_mm) and np.array_equal(pc[nonrep], val_mm)
-          and not np.any(rep[nonrep]) and len(np.unique(nonrep)) == len(nonrep))
     lens, sro_shards = read_pool_lengths(pool_dir)
     check("shard_row_offsets_match_the_shards", np.array_equal(sro, sro_shards))
     check("pool_lengths_is_the_concatenated_shard_index", np.array_equal(lengths, lens))
