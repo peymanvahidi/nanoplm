@@ -2513,8 +2513,9 @@ def _mixture_eval(mixture, eval_loop_counts, target_r, model, device, distribute
     """Eval every evaluated source of a mixture and log it. Keys: eval/loss/<source> and
     eval/loss, the share-weighted mean over the sources evaluated. With recycling, every
     r adds eval/loss/<source>/r<r>, the in-loop sweep payload takes the weighted mean
-    per r, and the unsuffixed keys are the target r. Returns whether W&B still logs."""
-    from nanoplm.data.infra.mixture import eval_payload, weighted_loss
+    per r, and the unsuffixed keys are the target r (none when the sweep leaves it out;
+    see mixture.eval_keys). Returns whether W&B still logs."""
+    from nanoplm.data.infra.mixture import eval_keys, weighted_loss
     from nanoplm.pretraining.recycling.logging import inloop_eval_payload
     by_r: dict = {}
     for r_value in eval_loop_counts:
@@ -2524,15 +2525,16 @@ def _mixture_eval(mixture, eval_loop_counts, target_r, model, device, distribute
             for name, loader in mixture.loaders.items()}
     if not is_main:
         return wandb_enabled
-    head = target_r if target_r in by_r else next(iter(by_r))
-    payload = {"train/global_step": global_step, **eval_payload(by_r[head], mixture.weights)}
-    if head is not None:
-        for r_value, losses in by_r.items():
-            payload.update(eval_payload(losses, mixture.weights, suffix=f"/r{r_value}"))
-        payload.update(inloop_eval_payload({r: weighted_loss(l, mixture.weights)
-                                            for r, l in by_r.items()}))
-    per_source = ", ".join(f"{n}={v:.4f}" for n, v in by_r[head].items())
-    logger.info(f"[step {global_step}] eval_loss={payload['eval/loss']:.4f} ({per_source})")
+    payload = {"train/global_step": global_step,
+               **eval_keys(by_r, target_r, mixture.weights)}
+    if None in by_r:
+        per_source = ", ".join(f"{n}={v:.4f}" for n, v in by_r[None].items())
+        logger.info(f"[step {global_step}] eval_loss={payload['eval/loss']:.4f} ({per_source})")
+    else:
+        weighted = {r: weighted_loss(l, mixture.weights) for r, l in by_r.items()}
+        payload.update(inloop_eval_payload(weighted))
+        logger.info(f"[step {global_step}] in-loop eval " + ", ".join(
+            f"r={r}: {v:.4f}" for r, v in sorted(weighted.items())))
     if wandb_enabled and wandb.run is not None:
         try:
             wandb.log(payload)

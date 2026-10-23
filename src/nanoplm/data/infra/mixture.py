@@ -257,6 +257,22 @@ def eval_payload(losses: dict, weights: dict, suffix: str = "") -> dict:
     return out
 
 
+def eval_keys(by_r: dict, target_r, weights: dict) -> dict:
+    """The loss keys of one mixture eval. ``by_r`` maps each loop count r evaluated to
+    {source: loss}; without recycling it holds the one key None. With recycling every r
+    gives eval/loss/<source>/r<r>, and the unsuffixed keys are those of ``target_r``,
+    left out when the sweep does not hold it (as a single-source run leaves out
+    eval/loss)."""
+    if None in by_r:
+        return eval_payload(by_r[None], weights)
+    out = {}
+    for r, losses in by_r.items():
+        out.update(eval_payload(losses, weights, suffix=f"/r{r}"))
+    if target_r in by_r:
+        out.update(eval_payload(by_r[target_r], weights))
+    return out
+
+
 def weighted_loss(losses: dict, weights: dict) -> float:
     total = sum(weights[n] for n in losses)
     return sum(weights[n] * v for n, v in losses.items()) / total

@@ -44,7 +44,7 @@ At the start, training prints one row per source: share, size, tokens used and e
 
 ## Eval
 
-Eval keeps today's batch count and splits it evenly over the sources. It logs `eval/loss/<source>` for each source and `eval/loss`, the share-weighted mean of those. With a recycling eval sweep, each loop count adds `eval/loss/<source>/r<k>`.
+Eval keeps today's batch count and splits it evenly over the sources. It logs `eval/loss/<source>` for each source and `eval/loss`, the share-weighted mean of those. With a recycling eval sweep, each loop count adds `eval/loss/<source>/r<k>`, and the unsuffixed keys are those of the target loop count; when the sweep leaves that out, they are not logged (as for a single dataset).
 
 To evaluate only some sources, set `eval_sources` in `pretrain.yaml`; they then get the whole eval budget:
 

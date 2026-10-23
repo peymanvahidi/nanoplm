@@ -133,6 +133,15 @@ def test_mixture_eval_with_recycling_logs_per_source_and_r(plan):
     assert p["recycling/eval_inloop/inloop_eval_loss_at_r1"] == pytest.approx(0.4 * 3 + 0.6 * 4)
 
 
+def test_a_target_r_outside_the_sweep_logs_no_unsuffixed_loss(plan):
+    # single-source runs leave out eval/loss then; a mix must not take the first r's
+    plan, fake, _ = plan
+    pp._mixture_eval(plan, [1, 4], 8, None, "cpu", False, None, 2, 10, True, True)
+    p = fake.logged[0]
+    assert "eval/loss" not in p and "eval/loss/a" not in p and "eval/loss/c" not in p
+    assert p["eval/loss/a/r1"] == 3.0 and p["eval/loss/c/r4"] == 7.0
+
+
 def test_a_source_without_val_sequences_is_not_averaged_in(tmp_path):
     import numpy as np
     m = _mixture(tmp_path)
