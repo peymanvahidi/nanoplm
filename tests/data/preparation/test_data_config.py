@@ -184,8 +184,6 @@ def test_mix_weights_not_summing_to_1_name_each_weight_and_the_sum():
     ({"fasta": "trembl", "weight": "0.5"}, "sources.b.weight must be a number"),
     ({"fasta": "trembl", "weight": 0.5, "max_workers": 4},
      "sources.b.max_workers: set it in data_params"),
-    ({"fasta": "trembl", "weight": 0.5, "register_tokens": 1},
-     "same register_tokens; got a 0, b 1"),
     ({"prepared": "../x", "weight": 0.5, "max_seq_len": 9},
      "a prepared source is used as it was built; remove max_seq_len"),
 ])

@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 import yaml
 
 from nanoplm.config.datasets import DATASET_URLS
+from nanoplm.data.infra.mixture import WEIGHT_TOLERANCE, weights_error
 
 FASTA_SHORTCUTS = {k: DATASET_URLS[k]
                    for k in ("swissprot", "trembl", "uniref50", "uniref90", "uniref100")}
@@ -60,7 +61,6 @@ RESERVED_NAMES = ("downloads", "train", "val", "cluster_index")
 LEGACY_NAME = "main"
 # data_params keys older data.yaml templates shipped that nothing reads any more
 LEGACY_IGNORED = ("pipeline_backend", "device")
-WEIGHT_TOLERANCE = 1e-6
 # data_params fields that one setting serves every source of a mix: max_workers reaches
 # the stages through one environment variable
 SHARED_FIELDS = ("max_workers",)
@@ -409,16 +409,12 @@ def _check_cluster_holdout(src: Source) -> None:
 
 
 def _check_mix(sources: dict, name_of: str) -> None:
-    """The rules for several sources: weights sum to 1, one register_tokens."""
-    from nanoplm.data.infra.mixture import weights_error
+    """The weights of several sources sum to 1. One register_tokens for all of them is
+    checked by `nanoplm data from-yaml` (it reads the prepared manifests too) and again
+    by write_mixture."""
     err = weights_error({n: s.weight for n, s in sources.items()})
     if err:
         raise DataConfigError(f"{name_of}: {err}")
-    regs = {n: s.params["register_tokens"] for n, s in sources.items() if not s.prepared}
-    if len(set(regs.values())) > 1:
-        got = ", ".join(f"{n} {v}" for n, v in regs.items())
-        raise DataConfigError(f"{name_of}: the sources of a mix must use the same "
-                              f"register_tokens; got {got}")
 
 
 def _source_paths(src: Source) -> dict:

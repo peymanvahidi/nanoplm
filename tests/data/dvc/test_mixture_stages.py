@@ -210,3 +210,16 @@ def test_a_prepared_source_with_other_register_tokens_fails_before_dvc(tmp_path,
     assert r.exit_code != 0
     assert "the sources of a mix must use the same register_tokens; got mine 1, swissprot 0" \
         in r.output
+
+
+def test_built_sources_with_other_register_tokens_fail_before_dvc(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    cfg = _mix(a={"fasta": "swissprot", "weight": 0.5},
+               b={"fasta": "trembl", "weight": 0.5, "register_tokens": 1})
+    (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("DVC must not run"))
+    r = CliRunner().invoke(data, ["from-yaml", str(tmp_path / "data.yaml")])
+    assert r.exit_code != 0
+    assert "the sources of a mix must use the same register_tokens; got a 0, b 1" in r.output
+

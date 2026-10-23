@@ -31,8 +31,9 @@ from typing import Dict, Optional, Sequence, Union
 import numpy as np
 import torch
 
-from nanoplm.data.datasets.cluster_sampled import MASK64, ClusterSampledDataset, _sm64
+from nanoplm.data.datasets.cluster_sampled import ClusterSampledDataset
 from nanoplm.data.datasets.pretrain import ShardedDataset
+from nanoplm.data.datasets.splitmix import MASK64, splitmix64
 from nanoplm.utils import logger
 
 # b"MIXPRM": separates the per-pass permutation keys from the member stream
@@ -60,16 +61,25 @@ def _name_key(name: str) -> int:
     return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "little")
 
 
-def pass_permutation(seed: int, name: str, pass_: int, n: int) -> tuple:
-    """(a, b) of the affine permutation ``u -> (a*u + b) % n`` of one source's pass."""
+def source_key(seed: int, name: str) -> int:
+    """The 64-bit key every pass permutation of source ``name`` starts from."""
+    return splitmix64(((int(seed) ^ PERM_TAG) & MASK64) ^ _name_key(name))
+
+
+def _affine(key: int, pass_: int, n: int) -> tuple:
     if n <= 1:
         return 1, 0
-    k = _sm64(_sm64(((int(seed) ^ PERM_TAG) & MASK64) ^ _name_key(name)) ^ (int(pass_) & MASK64))
+    k = splitmix64(key ^ (int(pass_) & MASK64))
     a = 1 + (k % (n - 1))
     while math.gcd(a, n) != 1:
         a = a % (n - 1) + 1
-    b = _sm64(k) % n
+    b = splitmix64(k) % n
     return a, b
+
+
+def pass_permutation(seed: int, name: str, pass_: int, n: int) -> tuple:
+    """(a, b) of the affine permutation ``u -> (a*u + b) % n`` of one source's pass."""
+    return _affine(source_key(seed, name), pass_, n)
 
 
 class MixtureDataset(torch.utils.data.Dataset):
@@ -91,6 +101,7 @@ class MixtureDataset(torch.utils.data.Dataset):
         self._n = sum(self.sizes)
         self.counts = allocate(self.weights, self._n)
         self.starts = np.concatenate([[0], np.cumsum(self.counts)]).astype(np.int64)
+        self._keys = [source_key(self.seed, n) for n in self.names]
         self._perm_cache: dict = {}
         self._lengths_cache: Optional[tuple] = None
 
@@ -114,7 +125,7 @@ class MixtureDataset(torch.utils.data.Dataset):
         if got is None:
             if len(self._perm_cache) > 4096:
                 self._perm_cache.clear()
-            got = pass_permutation(self.seed, self.names[s], p, self.sizes[s])
+            got = _affine(self._keys[s], p, self.sizes[s])
             self._perm_cache[key] = got
         return got
 
@@ -142,9 +153,10 @@ class MixtureDataset(torch.utils.data.Dataset):
         q = e * k + np.arange(k, dtype=np.int64)
         p, u = np.divmod(q, n)
         # one (a, b) per pass, then all slots at once: a small source can repeat
-        # thousands of times in one mixture epoch
-        passes, which = np.unique(p, return_inverse=True)
-        ab = np.array([pass_permutation(self.seed, self.names[s], int(pv), n) for pv in passes],
+        # thousands of times in one mixture epoch. q is contiguous, so are the passes.
+        which = p - p[0]
+        ab = np.array([_affine(self._keys[s], int(pv), n)
+                       for pv in range(int(p[0]), int(p[-1]) + 1)],
                       dtype=np.uint64).reshape(-1, 2)
         with np.errstate(over="ignore"):
             items = ((ab[which, 0] * u.astype(np.uint64) + ab[which, 1])
@@ -165,11 +177,6 @@ class MixtureDataset(torch.utils.data.Dataset):
             self._lengths_cache = (key, np.concatenate(parts).astype(np.int32))
         return self._lengths_cache[1]
 
-    def passes_after(self, samples: int) -> list:
-        """Passes over each source after ``samples`` mixture samples (whole epochs exact,
-        a partial one by its share)."""
-        return [samples * (k / self._n) / n for k, n in zip(self.counts, self.sizes)]
-
     # ---- pickling: drop the caches, keep the sources ----------------------------
     def __getstate__(self) -> dict:
         state = dict(self.__dict__)
@@ -185,11 +192,6 @@ class MixtureDataset(torch.utils.data.Dataset):
             h.update(name.encode() + b"\0" + ds.fingerprint().encode()
                      + int(k).to_bytes(8, "little"))
         return h.hexdigest()[:16]
-
-    @property
-    def total_tokens(self) -> int:
-        """Tokens in the current mixture epoch."""
-        return int(self.get_all_sequence_lengths().astype(np.int64).sum())
 
 
 def open_mixture(dataset_dir: Union[str, Path], manifest, seed: int) -> MixtureDataset:

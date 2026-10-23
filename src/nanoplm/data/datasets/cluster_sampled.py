@@ -33,12 +33,9 @@ import numpy as np
 import torch
 
 from nanoplm.data.datasets.pretrain import ShardedDataset
+from nanoplm.data.datasets.splitmix import MASK64, splitmix64, splitmix64_vec
 from nanoplm.utils import logger
 
-MASK64 = (1 << 64) - 1
-GAMMA = 0x9E3779B97F4A7C15
-C1 = 0xBF58476D1CE4E5B9
-C2 = 0x94D049BB133111EB
 # b"RTMEMB": separates the member stream from anything else keyed on the same seed
 MEMBER_TAG = 0x52_54_4D_45_4D_42
 # rows_for_epoch works in chunks so its temporaries stay small at 33M clusters
@@ -53,49 +50,28 @@ _FINGERPRINT_TAG = b"runtime-cluster-sampler-v1"
 # ------------------------------------------------------------------ the stateless draw
 
 
-def _sm64(z: int) -> int:
-    """splitmix64 output function applied to z + gamma (one full avalanche)."""
-    z = (z + GAMMA) & MASK64
-    z = ((z ^ (z >> 30)) * C1) & MASK64
-    z = ((z ^ (z >> 27)) * C2) & MASK64
-    return z ^ (z >> 31)
-
-
 def member_seed_key(seed: int) -> int:
     """The 64-bit key every member draw starts from; the training seed goes in as is."""
-    return _sm64((int(seed) ^ MEMBER_TAG) & MASK64)
+    return splitmix64((int(seed) ^ MEMBER_TAG) & MASK64)
 
 
 def member_key(seed: int, cluster: int, epoch: int) -> int:
-    return _sm64(_sm64(member_seed_key(seed) ^ int(cluster)) ^ int(epoch))
+    return splitmix64(splitmix64(member_seed_key(seed) ^ int(cluster)) ^ int(epoch))
 
 
 def member_slot(seed: int, cluster: int, epoch: int, n: int) -> int:
     return member_key(seed, cluster, epoch) % int(n)
 
 
-def _sm64_vec(z: np.ndarray) -> np.ndarray:
-    z = z + np.uint64(GAMMA)
-    z = (z ^ (z >> np.uint64(30))) * np.uint64(C1)
-    z = (z ^ (z >> np.uint64(27))) * np.uint64(C2)
-    return z ^ (z >> np.uint64(31))
-
-
-def member_slots_vec(seed: int, clusters: np.ndarray, epoch: int, n: np.ndarray) -> np.ndarray:
-    """Vectorized ``member_slot``; returns the same values."""
+def member_slots_vec(seed: int, clusters: np.ndarray, epoch, n: np.ndarray) -> np.ndarray:
+    """Vectorized ``member_slot``; returns the same values. ``epoch`` is one int or an
+    array broadcast against ``clusters`` (a mixture draws each item at its own pass)."""
     k0 = np.uint64(member_seed_key(seed))
+    e = np.asarray(epoch)
+    e = np.uint64(int(e) & MASK64) if e.ndim == 0 else e.astype(np.uint64)
     with np.errstate(over="ignore"):
-        z = _sm64_vec(np.asarray(clusters).astype(np.uint64) ^ k0)
-        z = _sm64_vec(z ^ np.uint64(int(epoch) & MASK64))
-    return (z % np.asarray(n).astype(np.uint64)).astype(np.int64)
-
-
-def member_slots_at(seed: int, clusters: np.ndarray, epochs: np.ndarray, n: np.ndarray) -> np.ndarray:
-    """``member_slot`` for arrays of clusters, epochs and sizes, element by element."""
-    k0 = np.uint64(member_seed_key(seed))
-    with np.errstate(over="ignore"):
-        z = _sm64_vec(np.asarray(clusters).astype(np.uint64) ^ k0)
-        z = _sm64_vec(z ^ np.asarray(epochs).astype(np.uint64))
+        z = splitmix64_vec(np.asarray(clusters).astype(np.uint64) ^ k0)
+        z = splitmix64_vec(z ^ e)
     return (z % np.asarray(n).astype(np.uint64)).astype(np.int64)
 
 
@@ -254,7 +230,7 @@ class ClusterSampledDataset(ShardedDataset):
             uloc = np.asarray(self._g2u[tc], dtype=np.int64)
             start = np.asarray(self._off[uloc], dtype=np.int64)
             size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
-            slot = member_slots_at(self.seed, tc, np.asarray(epochs)[a:b], size)
+            slot = member_slots_vec(self.seed, tc, np.asarray(epochs)[a:b], size)
             out[a:b] = lengths[self._members[start + slot]]
         return out
 

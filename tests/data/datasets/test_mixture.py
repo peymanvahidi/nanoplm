@@ -275,8 +275,6 @@ def test_mid_epoch_resume_reproduces_the_rest_of_the_epoch(built, workers):
     resumed = _packed(root, m)
     resumed.set_epoch(epoch)
     assert _batches(resumed, workers)[skip:] == want[skip:]
-    ff = _packed(root, m)
-    assert ff.fast_forward(skip, epoch=epoch) > 0 and ff.dataset.epoch == epoch
 
 
 def test_packed_length_is_recomputed_for_each_epoch(built):
@@ -324,7 +322,6 @@ def test_epochs_in_the_table_match_what_the_dataset_reads(tmp_path):
         reads.update(mix.locate(i, e)[0] for i in range(len(mix)))
     for s, p in enumerate(plan):
         assert p["epochs"] == pytest.approx(reads[s] / mix.sizes[s])
-        assert p["epochs"] == pytest.approx(mix.passes_after(epochs * len(mix))[s])
         assert p["share"] == mix.counts[s] / len(mix)
     assert plan[1]["epochs"] > 10
     lines = mx.format_run_plan(plan, budget)
