@@ -72,7 +72,10 @@ def test_the_template_matches_masters_template_stage_for_stage():
         o, n = old[name], new[name]
         o, n = (o["do"], n["do"]) if "foreach" in o else (o, n)
         assert moved(o["cmd"]) == n["cmd"], name
-        assert moved(o["deps"]) == n["deps"], name
+        deps = moved(o["deps"])
+        if name == "get_file":     # a download depends only on its URL, in the command
+            deps = [d for d in deps if not d.endswith("/downloader.py")]
+        assert deps == n.get("deps", []), name
         assert moved(o["outs"]) == n["outs"], name
         assert params(o) == params(n), name
     assert moved(old["pre-tokenize"]["foreach"]) == new["pre-tokenize"]["foreach"]

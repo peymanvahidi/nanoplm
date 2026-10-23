@@ -74,10 +74,10 @@ def _params(params_filename: str, keys: list) -> dict:
 
 def _download_stage(url: str, out: str) -> dict:
     """Fetch one URL into downloads/. Only the URL is in the stage, so nothing else
-    (a source rename, the cluster block, a data_params change) downloads it again."""
+    (a source rename, the cluster block, a data_params change, a nanoplm upgrade that
+    moves the package) downloads it again."""
     return {
         "cmd": f'nanoplm data get-file --url "{url}" -o {out}',
-        "deps": [_resolve_pkg_dep("src/nanoplm/data/preparation/downloader.py")],
         "outs": [out],
     }
 
@@ -367,8 +367,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     if plan.cluster_source == "uniref_xml":
         xml = str(plan.xml_path)
         stages["get_cluster_xml"] = {
+            # like _download_stage, only the URL: no package path to rerun it
             "cmd": f'nanoplm data get-cluster-xml --url "{plan.xml_url}" -o {xml}',
-            "deps": [dep("src/nanoplm/data/preparation/downloader.py")],
             # persist: an existing copy is reused, never deleted; cache: not copied
             # into the DVC cache (20 GB)
             "outs": [{xml: {"persist": True, "cache": False}}],

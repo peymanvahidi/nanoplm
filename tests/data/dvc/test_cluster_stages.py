@@ -57,7 +57,7 @@ def test_the_cluster_block_never_refetches_the_source():
         assert plain[name] == clustered[name], name
     assert plain["get_file"] == {
         "cmd": f'nanoplm data get-file --url "{u90}" -o {OUT}/downloads/uniref90.fasta.gz',
-        "deps": [plain["get_file"]["deps"][0]], "outs": [f"{OUT}/downloads/uniref90.fasta.gz"]}
+        "outs": [f"{OUT}/downloads/uniref90.fasta.gz"]}
     # the shortcut and its URL are the same download
     assert _stages(_source("uniref90"))["get_file"] == plain["get_file"]
 
@@ -82,7 +82,9 @@ def test_uniref50_url_uniref90_members_stages():
                         "cluster_pool", "get_cluster_xml", "cluster_members", "cluster_index",
                         "write_manifest"]
     assert cc.UNIPROT_FASTA["uniref90"] in st["get_members_fasta"]["cmd"]
-    assert "params" not in st["get_members_fasta"]          # depends only on the URL
+    # a download depends only on its URL: no package path, which a reinstall moves
+    for name in ("get_members_fasta", "get_cluster_xml"):
+        assert "deps" not in st[name] and "params" not in st[name], name
     assert st["get_cluster_xml"]["outs"] == [
         {f"{OUT}/downloads/uniref50.xml.gz": {"persist": True, "cache": False}}]
     # identity / coverage are ignored here, and clustering: auto is the default
