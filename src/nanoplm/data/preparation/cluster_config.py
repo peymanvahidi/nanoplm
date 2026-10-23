@@ -25,7 +25,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+
+from nanoplm.data.preparation.data_config import file_name as _name, is_url, strip_gz
 
 UNIREF_BASE = "https://ftp.uniprot.org/pub/databases/uniprot/uniref"
 UNIPROT_FASTA = {lvl: f"{UNIREF_BASE}/{lvl}/{lvl}.fasta.gz"
@@ -52,14 +53,6 @@ EXPERIMENT_VAL_RATIO = 0.0044
 
 class ClusterConfigError(ValueError):
     """A cluster_subsampling block cannot be resolved."""
-
-
-def _name(source: str) -> str:
-    return Path(urlparse(source).path if "://" in source else source).name
-
-
-def is_url(source: str) -> bool:
-    return source.startswith(("http://", "https://", "ftp://"))
 
 
 def _header_level(path: Path) -> Optional[str]:
@@ -90,10 +83,6 @@ def level_of(source: str, base_dir=None) -> Optional[str]:
         return _header_level(on_disk(source, base_dir))
     m = re.match(r"uniref(50|90|100)\.fasta(\.gz)?$", _name(source).lower())
     return f"uniref{m.group(1)}" if m else None
-
-
-def _strip_gz(name: str) -> str:
-    return name[:-3] if name.endswith(".gz") else name
 
 
 @dataclass
@@ -159,10 +148,10 @@ def _members_paths(members: str, src) -> tuple[Optional[Path], Path]:
     name = _name(members)
     if is_url(members):
         got = Path(src.download_path(members))
-        return (got, Path(src.work_dir) / _strip_gz(name)) if name.endswith(".gz") \
+        return (got, Path(src.work_dir) / strip_gz(name)) if name.endswith(".gz") \
             else (None, got)
     if name.endswith(".gz"):
-        return Path(members), Path(src.work_dir) / _strip_gz(name)
+        return Path(members), Path(src.work_dir) / strip_gz(name)
     return None, Path(members)
 
 

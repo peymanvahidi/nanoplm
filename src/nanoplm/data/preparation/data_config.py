@@ -96,12 +96,18 @@ def load_strict(path) -> dict:
 
 
 def is_url(value: str) -> bool:
+    """A FASTA that is downloaded (http, https or ftp), not a local path."""
     return value.startswith(URL_SCHEMES)
 
 
 def file_name(value: str) -> str:
     """The file name of a URL (query and fragment dropped) or a path."""
-    return Path(urlparse(value).path if is_url(value) else value).name
+    return Path(urlparse(value).path if "://" in value else value).name
+
+
+def is_compressed(value: str) -> bool:
+    """Whether a URL or path names a .gz file (by its extension only)."""
+    return file_name(value).endswith(".gz")
 
 
 def strip_gz(name: str) -> str:
@@ -120,7 +126,6 @@ class Source:
     name: str
     legacy: bool = False
     fasta: Optional[str] = None            # URL or path; a shortcut is expanded
-    fasta_written: Optional[str] = None    # as written in data.yaml
     prepared: Optional[str] = None
     weight: Optional[float] = None
     params: dict = field(default_factory=dict)
@@ -137,7 +142,7 @@ class Source:
 
     @property
     def is_compressed(self) -> bool:
-        return bool(self.fasta) and file_name(self.fasta).endswith(".gz")
+        return bool(self.fasta) and is_compressed(self.fasta)
 
     @property
     def work_dir(self) -> str:
@@ -300,7 +305,6 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
             src.prepared = spec["prepared"]
             out[name] = src
             continue
-        src.fasta_written = spec["fasta"]
         src.fasta = _fasta(spec["fasta"], where, base_dir)
         if "cluster_subsampling" in spec:
             src.cluster = _cluster_block(spec["cluster_subsampling"], where)
@@ -346,7 +350,6 @@ def legacy_source(config: dict) -> Source:
     params = dict(config.get("data_params") or {})
     src = Source(name=LEGACY_NAME, legacy=True)
     src.fasta = dirs.get("url") or dirs.get("local_fasta") or None
-    src.fasta_written = src.fasta
     src.paths = {k: dirs.get(k) for k in DATA_DIRS_KEYS}
     src.output_dir = dirs.get("output_dir") or ""
     if "seqs_num" in params and "max_seqs" not in params:

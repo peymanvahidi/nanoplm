@@ -1136,7 +1136,7 @@ def _validate_source_fields(data_dirs: dict) -> None:
     - compressed_fasta is required only when the source is gzipped.
       In plain-.fasta mode it is optional; warn if it's set anyway.
     """
-    from nanoplm.cli._dvc_yaml_gen import _source_is_compressed
+    from nanoplm.data.preparation.data_config import file_name, is_compressed
 
     url = data_dirs.get("url") or None
     local_fasta = data_dirs.get("local_fasta") or None
@@ -1150,11 +1150,9 @@ def _validate_source_fields(data_dirs: dict) -> None:
         )
 
     source = url if url else local_fasta
-    is_compressed = _source_is_compressed(source)
+    compressed_source = is_compressed(source)
     # Extension whitelist: must end in .fasta or .fasta.gz (after stripping URL query/fragment).
-    from urllib.parse import urlparse
-    suffix_target = urlparse(source).path if "://" in source else source
-    if not (suffix_target.endswith(".fasta") or suffix_target.endswith(".fasta.gz")):
+    if not file_name(source).endswith((".fasta", ".fasta.gz")):
         raise click.ClickException(
             f"url/local_fasta must end with .fasta or .fasta.gz, got: {source}"
         )
@@ -1164,11 +1162,11 @@ def _validate_source_fields(data_dirs: dict) -> None:
         raise click.ClickException("data_dirs.extracted_fasta is required.")
 
     compressed = data_dirs.get("compressed_fasta") or None
-    if is_compressed and not compressed:
+    if compressed_source and not compressed:
         raise click.ClickException(
             "data_dirs.compressed_fasta is required when source is a .gz file."
         )
-    if (not is_compressed) and compressed:
+    if (not compressed_source) and compressed:
         logger.warning(
             "data_dirs.compressed_fasta is unused when source is a plain .fasta file; "
             "it can be removed."

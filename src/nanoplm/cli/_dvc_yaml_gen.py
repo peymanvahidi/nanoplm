@@ -13,26 +13,10 @@ from typing import Any
 import yaml
 import nanoplm as _nanoplm
 from pathlib import Path as _Path
-from urllib.parse import urlparse as _urlparse
 
 from nanoplm.data.preparation.data_config import (
-    DataConfigError, Source, legacy_source, parse_data_config,
+    DataConfigError, Source, is_url, legacy_source, parse_data_config,
 )
-
-
-def _source_is_compressed(source: str) -> bool:
-    """Return True if *source* points at a gzipped FASTA, False if plain.
-
-    - URLs (anything containing '://') are parsed so query/fragment don't break the suffix check.
-    - Local paths are checked directly.
-    Detection is extension-only; misnamed files (e.g. gzipped bytes in a .fasta
-    file) are out of scope.
-    """
-    if "://" in source:
-        path = _urlparse(source).path
-    else:
-        path = source
-    return path.endswith(".gz")
 
 
 _NANOPLM_PKG_DIR = _Path(_nanoplm.__file__).resolve().parent
@@ -324,7 +308,7 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
         stages.update(_get_stages(src, params_filename))
     else:
         compressed = str(plan.members_compressed) if plan.members_compressed else None
-        if plan.members.startswith(("http://", "https://", "ftp://")):
+        if is_url(plan.members):
             stages["get_members_fasta"] = _download_stage(plan.members,
                                                           compressed or members_fasta)
         if compressed:

@@ -35,7 +35,7 @@ def test_the_template_is_one_plain_swissprot_source():
     cfg = _parse(_template())
     assert not cfg.legacy and list(cfg.sources) == ["swissprot"]
     src = cfg.source
-    assert src.fasta == SPROT and src.fasta_written == "swissprot" and src.weight == 1.0
+    assert src.fasta == SPROT and src.weight == 1.0
     assert src.cluster is None and src.prepared is None and src.overrides == ()
     assert src.params["max_seqs"] == 20000 and src.key("max_seqs") == "data_params.max_seqs"
     out = "output/data/pretrain_data"
