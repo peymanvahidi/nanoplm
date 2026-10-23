@@ -294,16 +294,16 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 | --- | --- |
 | `sources.sp.fasta must be a shortcut (swissprot, trembl, uniref50, uniref90, uniref100) or a URL or path that ends with .fasta or .fasta.gz, got: swisprot` | Fix the spelling, or give a URL or a `.fasta` / `.fasta.gz` path. |
 | `sources.sp: unknown key weigth (allowed: fasta, prepared, weight, ...)` | A typo, or a key at the wrong level. The message lists the keys allowed there. |
-| `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name: `sources:` then `sp:` then `fasta:`. |
+| `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name, indented as `sources:`, then `sp:`, then `fasta:`. |
 | `output_dir is required (the folder pretrain.yaml's dataset_dir points at)` | Add `output_dir` at the top level. |
 | `mixing several sources is not supported yet (one source only); sources has 2: sp, tr` | Keep one entry under `sources`. |
 | `sources.sp.weight is 0.5; with one source the weight must be 1 (or leave it out)` | Set `weight: 1.0` or delete it. |
 | `data_dirs is the old layout; use output_dir + sources without data_dirs` | The file has both layouts. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml). |
-| `line N: duplicate key ...` | The same key appears twice in one block. |
+| `data.yaml:5: duplicate key 'fasta' (first on line 4)` | The same key appears twice in one block. Delete one. |
 
 Errors about a `cluster_subsampling` block, and MMseqs2 not found, are in the [cluster subsampling guide](/nanoplm/guides/cluster-subsampling/#errors-and-warnings).
 
-A `Warning: data_dirs is the old data.yaml layout` is not an error: the old file still runs. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml).
+A `Warning: data_dirs is the old data.yaml layout` is not an error. The old file still runs. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml).
 
 ### The `check` stage fails on invalid sequences
 

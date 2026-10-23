@@ -62,6 +62,7 @@ puts in the env.
    # source     fasta                         max seqs  len     val  clustering
    # swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
    # Regenerated <cwd>/dvc.yaml
+   # Initialized DVC repository in: <cwd> (cache.type hardlink,symlink)
    # Rebuild: all (first run)
    # Running dvc repro (full pipeline)...
    # ...
@@ -75,8 +76,8 @@ puts in the env.
    #   Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
    ```
 
-   The table at the top is printed before anything runs: one row per source, with the file it
-   reads and the settings it uses. [Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run)
+   The table at the top is printed before anything runs. It has one row per source, with the file
+   it reads and the settings it uses. [Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run)
    explains each column. If the `check` stage stops on invalid sequences, run
    `nanoplm data from-yaml --fix` ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
 

@@ -111,12 +111,13 @@ data.yaml: 1 source -> <cwd>/output/data/pretrain_data
 source     fasta                         max seqs  len     val  clustering
 swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
 Regenerated <cwd>/dvc.yaml
+Initialized DVC repository in: <cwd> (cache.type hardlink,symlink)
 Rebuild: all (first run)
 Running dvc repro (full pipeline)...
 # ... dvc stage output ...
 ```
 
-[Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run) explains the table and the line under it. `--dry-run` needs a folder where `from-yaml` has already run once, and stops at the first download that has not happened yet. `--fix` is for when the `check` stage rejects invalid sequences: see [Prepare data](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once).
+[Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run) explains the table, the line under it, and [what `--dry-run` can preview](/nanoplm/pipeline/data/#read-the-table-before-the-run). `--fix` is for when the `check` stage rejects invalid sequences: see [Prepare data](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once).
 
 ### data get-file
 

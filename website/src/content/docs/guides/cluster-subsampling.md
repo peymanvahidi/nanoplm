@@ -29,9 +29,9 @@ sources:
       coverage: 0.8      # mmseqs2 only: min alignment coverage
 ```
 
-This trains on UniRef90 sequences under UniProt's UniRef50 clusters. The UniRef50 FASTA itself is never downloaded: the stages fetch `uniref90.fasta.gz` and `uniref50.xml.gz`, which lists each cluster's members.
+This trains on UniRef90 sequences under UniProt's UniRef50 clusters. The UniRef50 FASTA itself is never downloaded. The stages fetch `uniref90.fasta.gz` and `uniref50.xml.gz`, which lists each cluster's members.
 
-- [`members`](/nanoplm/reference/data/#data-cluster_subsampling-members) is the set of sequences training draws from, and it is required. `uniref90` and `uniref100` are shortcuts for UniProt's files. A URL or path must be a UniRef90 or UniRef100 FASTA. `null` uses the source's own `fasta`: that is how you cluster your own sequences.
+- [`members`](/nanoplm/reference/data/#data-cluster_subsampling-members) is the set of sequences training draws from, and it is required. `uniref90` and `uniref100` are shortcuts for UniProt's files. A URL or path must be a UniRef90 or UniRef100 FASTA. `null` uses the source's own `fasta`, which is how you cluster your own sequences.
 - [`clustering`](/nanoplm/reference/data/#data-cluster_subsampling-clustering) picks where the clusters come from. See [When MMseqs2 runs](#when-mmseqs2-runs).
 - [`identity`](/nanoplm/reference/data/#data-cluster_subsampling-identity) and [`coverage`](/nanoplm/reference/data/#data-cluster_subsampling-coverage) only apply when MMseqs2 makes the clusters.
 
@@ -42,7 +42,7 @@ Warning: sources.uniref50: max_seqs=20000 trains on at most 20,000 clusters; set
 Warning: sources.uniref50: val_ratio=0.1 holds out 10.0% of the clusters for validation; the UniRef90 experiment used sources.uniref50.val_ratio: 0.0044
 ```
 
-`val_ratio: 0.0044` holds out 145k of the 32.9M UniRef50 clusters. You do not need to change `samples_per_shard`: when the pool would need more than 9,999 shards, the pool stage raises it and logs the value it used.
+`val_ratio: 0.0044` holds out 145k of the 32.9M UniRef50 clusters. You do not need to change `samples_per_shard`. When the pool would need more than 9,999 shards, the pool stage raises it and logs the value it used.
 
 Then point `pretrain.yaml`'s `dataset_dir` at `output_dir`. Training reads the cluster index from the manifest; nothing else in `pretrain.yaml` changes.
 
@@ -85,7 +85,7 @@ UniProt publishes the UniRef50 clusters, so for UniRef90 or UniRef100 members na
 
 `clustering: mmseqs2` uses MMseqs2 in every row, for example to cluster UniRef90 at `identity: 0.3` instead of UniProt's 50%. Then `uniref50.xml.gz` is not downloaded, and with `fasta: uniref50` the UniRef50 FASTA is not either: only the members are. `clustering: uniprot` accepts only the first two rows and fails at config time on the others.
 
-UniRef90 and UniRef100 members share one set of clusters and one train / validation split: the UniRef100 representative is the same sequence as the UniRef90 one.
+UniRef90 and UniRef100 members share one set of clusters and one train / validation split, because the UniRef100 representative is the same sequence as the UniRef90 one.
 
 MMseqs2 runs `easy-linclust --min-seq-id <identity> -c <coverage> --cov-mode 0` over the filtered members. Coverage mode 0 means the alignment must cover that share of **both** sequences, so a fragment does not join a cluster on a short local match. MMseqs2 picks each cluster's representative. Install it with `nanoplm deps install --mmseqs-only` (see [Install](/nanoplm/start/install/#flags)). `from-yaml` checks for the binary before any stage runs.
 
@@ -135,6 +135,7 @@ The total assumes DVC's linked cache, the default for a new folder (see [Stages 
 | `...clustering: uniprot: UniProt clusters need UniRef data` | Use one of the UniProt rows in [When MMseqs2 runs](#when-mmseqs2-runs), or `clustering: auto`. |
 | `sources.<name>: these members are clustered with MMseqs2, but mmseqs was not found` | `nanoplm deps install --mmseqs-only`, a release binary on `PATH`, or `NANOPLM_MMSEQS=/path/to/mmseqs`. |
 | `...val_ratio=... of at most ... clusters (max_seqs) holds out 0; cluster subsampling needs at least one train and one val cluster` | Raise `val_ratio` to the value the message names, or set `max_seqs: -1`. |
+| `... is a cluster-sampled dataset, which needs use_packing=true.` (at pretraining start) | Set `use_packing: true` in `pretrain.yaml`. |
 | `... was built by the data-sampler experiment scripts ...` (at pretraining start) | `dataset_dir` is a folder from the old experiment scripts. Rebuild it with `nanoplm data from-yaml`. |
 | Warning: `max_seqs=... trains on at most ... clusters` / `val_ratio=... holds out ...% of the clusters` | See [Turn it on](#turn-it-on). |
 | Warning: `fasta is UniRef50 and members is null, so MMseqs2 will cluster all ~60M UniRef50 sequences` | To use UniProt's clusters, set `members: uniref90`. To cluster UniRef50 on purpose, set `clustering: mmseqs2` and the warning goes away. |
@@ -163,4 +164,4 @@ Each stage reruns only when its own inputs change:
 | `max_workers` | Nothing. |
 | Remove the block from `fasta: uniref50` + `members: uniref90` | Downloads `uniref50.fasta.gz`, which the cluster run never fetched. |
 
-When `from-yaml` creates the DVC repository, it sets `cache.type hardlink,symlink`, so DVC's cache (`.dvc/cache`) links to the outputs instead of holding a second copy. Linked outputs are read-only; run `dvc unprotect <path>` before editing one. If `output_dir` and `.dvc/cache` are on different file systems, DVC falls back to symlinks and the data lives in `.dvc/cache`: deleting the cache then breaks the dataset. After changing settings, `dvc gc --workspace` deletes cached versions that the current outputs no longer use, and keeps the current ones. A repository that already existed keeps its own `cache.type`; to switch it, run `dvc config cache.type hardlink,symlink` and `dvc checkout --relink` in the folder of `data.yaml`.
+When `from-yaml` creates the DVC repository, it sets `cache.type hardlink,symlink`, so DVC's cache (`.dvc/cache`) links to the outputs instead of holding a second copy. Linked outputs are read-only; run `dvc unprotect <path>` before editing one. If `output_dir` and `.dvc/cache` are on different file systems, DVC falls back to symlinks and the data lives in `.dvc/cache`, so deleting the cache breaks the dataset. After changing settings, `dvc gc --workspace` deletes cached versions that the current outputs no longer use, and keeps the current ones. A repository that already existed keeps its own `cache.type`; to switch it, run `dvc config cache.type hardlink,symlink` and `dvc checkout --relink` in the folder of `data.yaml`.

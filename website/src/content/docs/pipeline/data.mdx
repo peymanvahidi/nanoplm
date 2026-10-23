@@ -39,6 +39,7 @@ download → extract → check → shuffle → filter → split → tokenize →
    source     fasta                         max seqs  len     val  clustering
    swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
    Regenerated <cwd>/dvc.yaml
+   Initialized DVC repository in: <cwd> (cache.type hardlink,symlink)
    Rebuild: all (first run)
    Running dvc repro (full pipeline)...
    # ...
@@ -60,7 +61,7 @@ The stages run through [DVC](https://dvc.org/): `from-yaml` regenerates `dvc.yam
 
 ## Use your own FASTA
 
-Point `fasta` at the file. A relative path is relative to the folder `data.yaml` is in. The file is read where it is, never copied. The source name (`mine` here) is yours to pick: it names the folder for this source's intermediate files.
+Point `fasta` at the file. A relative path is relative to the folder `data.yaml` is in. The file is read where it is, never copied. The source name (`mine` here) is yours to pick. It names the folder for this source's intermediate files.
 
 ```yaml title="data.yaml"
 sources:
@@ -90,7 +91,7 @@ mine    my_proteins.fasta (local, 66.0 kB)  200       20-512  0.1  off
 
 Start with SwissProt (about 570k sequences). It downloads in minutes, which is enough to check the whole pipeline before a UniRef-scale run.
 
-A source can name `prepared:` instead of `fasta`: a folder another `data.yaml` already built. `from-yaml` checks its manifest, prints what it holds and builds nothing. With only a `prepared` source, `output_dir` can be left out.
+Instead of `fasta`, a source can name `prepared:`, a folder another `data.yaml` already built. `from-yaml` checks its manifest, prints what it holds and builds nothing. With only a `prepared` source, `output_dir` can be left out.
 
 To train on one random member of every cluster per epoch (for example UniRef90 sequences under UniRef50 clusters), add a `cluster_subsampling` block to the source. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 
@@ -128,17 +129,17 @@ data_params:
 
 With one source, `weight` must be `1.0` or left out.
 
-`max_seqs`, `min_seq_len`, `max_seq_len` and `val_ratio` are required. The other `data_params` can be left out: the template's values are the defaults, and writing a default out or deleting it reruns nothing. Each key is described in the [data.yaml reference](/nanoplm/reference/data/).
+`max_seqs`, `min_seq_len`, `max_seq_len` and `val_ratio` are required. The other `data_params` can be left out. The template's values are the defaults, and writing a default out or deleting it reruns nothing. Each key is described in the [data.yaml reference](/nanoplm/reference/data/).
 
 :::caution[max_seq_len is set here and nowhere else]
-`max_seq_len` is written into `.data_manifest`, and pretraining reads it back to compute gradient accumulation: `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`. There is no `max_seq_len` key in `pretrain.yaml`. To train on longer sequences, change it here and run the data stage again, because the shards themselves change.
+`max_seq_len` is written into `.data_manifest`, and pretraining reads it back to compute gradient accumulation, `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`. There is no `max_seq_len` key in `pretrain.yaml`. To train on longer sequences, change it here and run the data stage again, because the shards themselves change.
 :::
 
 Attention cost grows with the square of the sequence length, so `512` is a cheap place to start. Raise it when your proteins need the context.
 
 ## Read the table before the run
 
-Before any stage runs, `from-yaml` prints one row per source and one line saying what will run. Check it: a wrong `fasta`, a `max_seqs` you forgot, or a full rebuild you did not expect shows up here, before hours of work.
+Before any stage runs, `from-yaml` prints one row per source and one line saying what will run. A wrong `fasta`, a `max_seqs` you forgot, or a full rebuild you did not expect shows up here, before hours of work.
 
 ```text
 data.yaml: 1 source -> /work/output/data/pretrain_data
@@ -186,7 +187,7 @@ To exclude these sequences and continue the pipeline:
     nanoplm data from-yaml --fix
 ```
 
-Look at `invalid.fasta` first: a large count usually means the file is not what you thought it was. To drop them and continue:
+Look at `invalid.fasta` first. A large count usually means the file is not what you thought it was. To drop them and continue:
 
 ```sh
 nanoplm data from-yaml --fix
@@ -253,7 +254,7 @@ You never edit this file. Pretraining reads `max_seq_len` and `num_register_toke
 
 ## Move an old data.yaml
 
-A `data.yaml` from before the `sources:` layout has a `data_dirs` block with `url` or `local_fasta` and seven paths. It still works: `from-yaml` reads it as one source named `main`, builds the same files in the same places, and prints the block to paste in instead:
+A `data.yaml` from before the `sources:` layout has a `data_dirs` block with `url` or `local_fasta` and seven paths. It still works. `from-yaml` reads it as one source named `main`, builds the same files in the same places, and prints the block to paste in instead:
 
 ```text title="Output"
 Warning: data_dirs is the old data.yaml layout. It still works, read as one source named "main". To switch, replace data_dirs with:
@@ -295,7 +296,7 @@ data_params:
   # ... the rest unchanged
 ```
 
-The first run after the switch rebuilds the intermediate files under `output_dir/main/` and then the shards. Keep `data_dirs` or `sources`, not both: a file with both is an error. The old name `seqs_num` still works, with a warning.
+The first run after the switch rebuilds the intermediate files under `output_dir/main/` and then the shards. Keep `data_dirs` or `sources`, not both; a file with both is an error. The old name `seqs_num` still works, with a warning. A folder whose `.dvc/` was created by an old run keeps DVC's copy cache, which stores every output twice; to switch it to links, see [Stages and caching](/nanoplm/guides/cluster-subsampling/#stages-and-caching).
 
 ## Next
 
