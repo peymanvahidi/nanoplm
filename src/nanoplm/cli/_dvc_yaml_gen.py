@@ -8,14 +8,20 @@ ${data_dirs.X} reference, so an existing dvc.lock stays valid. The sources layou
 writes its paths (all under output_dir) into the stages directly and references
 each data_params field where data.yaml sets it: ${data_params.X}, or
 ${sources.<name>.X} for a per-source override.
+
+Several sources (a mix) give one dvc.yaml: each source's stages named
+``<source>-<stage>``, one ``download-<file>`` stage per URL however many sources use
+it, and a last ``mixture`` stage that writes output_dir/.data_manifest from the source
+manifests. Only that stage reads the weights, so changing them reruns it alone.
 """
+import re
 from typing import Any
 import yaml
 import nanoplm as _nanoplm
 from pathlib import Path as _Path
 
 from nanoplm.data.preparation.data_config import (
-    DataConfigError, Source, is_url, legacy_source, parse_data_config,
+    DataConfigError, Source, file_name, is_url, legacy_source, parse_data_config,
 )
 
 
@@ -51,6 +57,9 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str, base_dir=No
 
     if kind == "distillation":
         stages = _plain_stages(legacy_source(config), kind, params_filename)
+    elif len(config.get("sources") or {}) > 1:
+        stages = _mixture_stages(parse_data_config(config, base_dir, params_filename),
+                                 params_filename, base_dir)
     else:
         src = parse_data_config(config, base_dir, params_filename).source
         if src.prepared:
@@ -303,7 +312,7 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     dep = _resolve_pkg_dep
     ref, key = src.ref, src.param_key
     members_fasta = str(plan.members_fasta)
-    out = src.output_dir
+    out = src.data_dir
     filtered = src.paths["filtered_fasta"]
     stages: dict[str, Any] = {}
     if plan.members_from_source:
@@ -426,5 +435,61 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                                       key("val_ratio"), key("samples_per_shard"),
                                       key("register_tokens")]),
         "outs": [f"{out}/.data_manifest"],
+    }
+    return stages
+
+
+# stages that fetch one URL into downloads/; a mix shares each between its sources
+_DOWNLOAD_STAGES = ("get_file", "get_members_fasta", "get_cluster_xml")
+
+
+def _out_path(stage: dict) -> str:
+    out = stage["outs"][0]
+    return next(iter(out)) if isinstance(out, dict) else out
+
+
+def _source_stages(src: Source, params_filename: str, base_dir) -> dict:
+    from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
+    plan = resolve_cluster_plan(src, base_dir)
+    return (_cluster_stages(src, plan, params_filename) if plan is not None
+            else _plain_stages(src, "pretrain", params_filename))
+
+
+def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
+    """Download stages (one per URL), then each source's stages, then the mixture."""
+    downloads: dict[str, tuple] = {}            # out path -> (stage name, stage, source)
+    per_source: dict[str, Any] = {}
+    for src in cfg.sources.values():
+        if src.prepared:
+            continue
+        for name, stage in _source_stages(src, params_filename, base_dir).items():
+            if name not in _DOWNLOAD_STAGES:
+                per_source[f"{src.name}-{name}"] = stage
+                continue
+            out = _out_path(stage)
+            if out in downloads:
+                if downloads[out][1]["cmd"] != stage["cmd"]:
+                    raise DataConfigError(
+                        f"sources.{downloads[out][2]} and sources.{src.name} download "
+                        f"different URLs to the same file {out}; rename one of the files "
+                        "or download it yourself and give its path")
+                continue
+            step = "download-" + re.sub(r"[^A-Za-z0-9_-]", "_", file_name(out))
+            downloads[out] = (step, stage, src.name)
+    stages = {step: stage for step, stage, _ in downloads.values()}
+    stages.update(per_source)
+    cmd = [f"nanoplm data write-mixture -o {cfg.output_dir}"]
+    deps, params = [], []
+    for src in cfg.sources.values():
+        folder = src.prepared.rstrip("/") if src.prepared else src.data_dir
+        fasta = f'"{src.fasta}"' if src.fasta else "-"
+        cmd.append(f"--source {src.name} {folder} ${{sources.{src.name}.weight}} {fasta}")
+        deps.append(f"{folder}/.data_manifest")
+        params.append(f"sources.{src.name}.weight")
+    stages["mixture"] = {
+        "cmd": " ".join(cmd),
+        "deps": deps + [_resolve_pkg_dep("src/nanoplm/data/infra/mixture.py")],
+        **_params(params_filename, params),
+        "outs": [f"{cfg.output_dir}/.data_manifest"],
     }
     return stages

@@ -56,7 +56,7 @@ def test_the_template_comments_say_what_the_design_asks():
     assert "weight = share of training sequences (not tokens); weights must sum to 1" in text
     assert "max_seqs: 20000        # -1 = all" in text
     assert "# Rarely changed" in text
-    assert "#   cluster_subsampling:" in text and "#   prepared:" in text
+    assert "#   cluster_subsampling:" in text and "# prepared:" in text
     assert "enabled" not in text and "data_dirs" not in text
 
 
@@ -139,12 +139,77 @@ def test_weight_may_be_left_out():
     assert _parse(_with_source({"fasta": "swissprot"})).source.weight is None
 
 
-def test_several_sources_are_not_supported_yet():
+def _mix(**sources):
     cfg = _template()
-    cfg["sources"]["trembl"] = {"fasta": "trembl"}
+    cfg["sources"] = sources
+    return cfg
+
+
+def test_the_templates_commented_mix_parses():
+    """Uncommenting uniref50 and setting swissprot to 0.2 gives the design's mix."""
+    text = load_template("data_pretrain")
+    block = text[text.index("  # uniref50:"):text.index("  # another_source:")]
+    uncommented = "\n".join(ln.replace("  # ", "  ", 1) for ln in block.splitlines())
+    cfg = yaml.safe_load(text.replace(block, uncommented + "\n")
+                         .replace("weight: 1.0 ", "weight: 0.2 "))
+    got = _parse(cfg)
+    assert got.is_mixture and {n: s.weight for n, s in got.sources.items()} == {
+        "swissprot": 0.2, "uniref50": 0.8}
+    assert got.sources["uniref50"].cluster["members"] == "uniref90"
+    out = "output/data/pretrain_data"
+    assert got.sources["uniref50"].data_dir == f"{out}/uniref50"
+    assert got.sources["swissprot"].paths["output_dir"] == f"{out}/swissprot"
+    with pytest.raises(dc.DataConfigError, match="2 sources; use cfg.sources"):
+        got.source
+
+
+@pytest.mark.parametrize("weights", [(0.1, 0.2, 0.7), (0.3333333, 0.3333333, 0.3333334)])
+def test_mix_weights_summing_to_1_pass(weights):
+    got = _parse(_mix(**{f"s{i}": {"fasta": "swissprot", "weight": w}
+                         for i, w in enumerate(weights)}))
+    assert [s.weight for s in got.sources.values()] == list(weights)
+
+
+def test_mix_weights_not_summing_to_1_name_each_weight_and_the_sum():
     with pytest.raises(dc.DataConfigError,
-                       match=r"mixing several sources is not supported yet \(one source only\)"):
+                       match=r"weights must sum to 1 .*: 20 \(a\) \+ 80 \(b\) = 100"):
+        _parse(_mix(a={"fasta": "swissprot", "weight": 20}, b={"fasta": "trembl", "weight": 80}))
+    with pytest.raises(dc.DataConfigError, match=r"0\.5 \(a\) \+ 0\.4 \(b\) = 0\.9"):
+        _parse(_mix(a={"fasta": "swissprot", "weight": 0.5}, b={"fasta": "trembl", "weight": 0.4}))
+
+
+@pytest.mark.parametrize("spec, match", [
+    ({"fasta": "trembl"}, "sources.b needs a weight"),
+    ({"fasta": "trembl", "weight": 0}, "sources.b.weight must be above 0"),
+    ({"fasta": "trembl", "weight": "0.5"}, "sources.b.weight must be a number"),
+    ({"fasta": "trembl", "weight": 0.5, "max_workers": 4},
+     "sources.b.max_workers: set it in data_params"),
+    ({"fasta": "trembl", "weight": 0.5, "register_tokens": 1},
+     "same register_tokens; got a 0, b 1"),
+    ({"prepared": "../x", "weight": 0.5, "max_seq_len": 9},
+     "a prepared source is used as it was built; remove max_seq_len"),
+])
+def test_mix_errors(spec, match):
+    with pytest.raises(dc.DataConfigError, match=match):
+        _parse(_mix(a={"fasta": "swissprot", "weight": 0.5}, b=spec))
+
+
+def test_a_mix_with_a_prepared_source_needs_output_dir():
+    cfg = _mix(a={"prepared": "../x", "weight": 0.5}, b={"prepared": "../y", "weight": 0.5})
+    del cfg["output_dir"]
+    with pytest.raises(dc.DataConfigError, match="output_dir is required"):
         _parse(cfg)
+    cfg["output_dir"] = "mix"
+    got = _parse(cfg)
+    assert [s.prepared for s in got.sources.values()] == ["../x", "../y"]
+
+
+def test_a_source_name_written_twice_is_refused(tmp_path):
+    p = tmp_path / "data.yaml"
+    p.write_text("output_dir: o\nsources:\n  a:\n    fasta: swissprot\n    weight: 0.5\n"
+                 "  a:\n    fasta: trembl\n    weight: 0.5\n")
+    with pytest.raises(dc.DataConfigError, match=r"data.yaml:6: duplicate key 'a'"):
+        dc.load_strict(p)
 
 
 @pytest.mark.parametrize("cfg_edit, match", [

@@ -93,7 +93,7 @@ def write_mixture(output_dir: Union[str, Path], entries: Sequence[tuple]) -> Pat
             "dir": _rel(folder, out),
             "weight": float(weight),
             "kind": "cluster" if m.is_cluster_sampled else "plain",
-            "fasta": str(fasta),
+            "fasta": None if fasta is None else str(fasta),
             "train_sequences": m.train_sequences,
             "val_sequences": m.val_sequences,
             "pool_sequences": m.pool_sequences,

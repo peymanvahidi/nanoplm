@@ -9,15 +9,21 @@ Two layouts are accepted:
   data_dirs layout the old one: ``data_dirs.url`` / ``local_fasta`` and nine paths. It is
                    read as one source named "main" and every stage keeps its old shape.
 
-Only one source is supported for now. Relative paths are relative to data.yaml's
+Several sources make a mixture: each has a weight, its share of the training
+sequences, and the weights sum to 1. Relative paths are relative to data.yaml's
 directory, where ``nanoplm data from-yaml`` runs DVC.
 
 The sources layout puts everything under ``output_dir``:
 
-  downloads/<file>          one file per URL (the source FASTA, members, uniref50.xml.gz)
+  downloads/<file>          one file per URL (the source FASTA, members, uniref50.xml.gz),
+                            shared by every source that names that URL
   <source>/                 that source's intermediate FASTAs, validation/ and split/
   train/ val/ .data_manifest   the dataset pretrain.yaml's dataset_dir points at
   cluster_index/            members.tsv and the index (cluster subsampling only)
+
+With several sources, train/ val/ cluster_index/ and .data_manifest of each source go
+into ``<source>/`` (Source.data_dir) and ``output_dir/.data_manifest`` is the mixture
+manifest (nanoplm.data.infra.mixture).
 """
 from __future__ import annotations
 
@@ -55,7 +61,9 @@ LEGACY_NAME = "main"
 # data_params keys older data.yaml templates shipped that nothing reads any more
 LEGACY_IGNORED = ("pipeline_backend", "device")
 WEIGHT_TOLERANCE = 1e-6
-ONE_SOURCE = "mixing several sources is not supported yet (one source only)"
+# data_params fields that one setting serves every source of a mix: max_workers reaches
+# the stages through one environment variable
+SHARED_FIELDS = ("max_workers",)
 
 
 class DataConfigError(ValueError):
@@ -151,6 +159,13 @@ class Source:
     paths: dict = field(default_factory=dict)
     output_dir: str = ""                   # the top-level output_dir (dataset_dir)
     downloads_dir: str = ""
+    mixed: bool = False                    # one of several sources
+
+    @property
+    def data_dir(self) -> str:
+        """Where the source's train/ val/ and .data_manifest go: output_dir itself for
+        a single source, ``<output_dir>/<name>`` in a mix."""
+        return self.work_dir if self.mixed else self.output_dir
 
     @property
     def is_url(self) -> bool:
@@ -201,8 +216,14 @@ class DataConfig:
 
     @property
     def source(self) -> Source:
-        """The one source (several are refused while parsing)."""
+        """The one source of a single-source config."""
+        if len(self.sources) != 1:
+            raise DataConfigError(f"{len(self.sources)} sources; use cfg.sources")
         return next(iter(self.sources.values()))
+
+    @property
+    def is_mixture(self) -> bool:
+        return len(self.sources) > 1
 
 
 # ------------------------------------------------------------------ parsing
@@ -264,9 +285,11 @@ def _cluster_block(block, where: str) -> Optional[dict]:
     return dict(block)
 
 
-def _weight(value, where: str) -> float:
+def _weight(value, where: str, single: bool) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise DataConfigError(f"{where}.weight must be a number, got {value!r}")
+    if not single:
+        return float(value)
     if abs(value - 1) > WEIGHT_TOLERANCE:
         raise DataConfigError(f"{where}.weight is {value:g}; with one source the weight must "
                               "be 1 (or leave it out). Weights are shares of training "
@@ -282,9 +305,10 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
         raise DataConfigError(f"{name_of}: sources needs one entry, e.g. "
                               "sources: {swissprot: {fasta: swissprot}}")
     output_dir = config.get("output_dir")
-    # a prepared source is used where it is, so data.yaml builds nothing without a fasta
-    only_prepared = all(isinstance(s, dict) and s.get("prepared") is not None
-                        for s in sources.values())
+    # a prepared source is used where it is, so one prepared source builds nothing; a
+    # mix of them still writes the mixture manifest into output_dir
+    only_prepared = len(sources) == 1 and all(isinstance(s, dict) and s.get("prepared")
+                                              is not None for s in sources.values())
     if output_dir is None and only_prepared:
         output_dir = ""
     elif not isinstance(output_dir, str) or not output_dir:
@@ -292,9 +316,7 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
                               "dataset_dir points at)")
     else:
         output_dir = output_dir.rstrip("/") or "/"
-    if len(sources) > 1:
-        raise DataConfigError(f"{name_of}: {ONE_SOURCE}; sources has {len(sources)}: "
-                              f"{', '.join(map(str, sources))}")
+    single = len(sources) == 1
     defaults_raw = config.get("data_params") or {}
     if not isinstance(defaults_raw, dict):
         raise DataConfigError(f"{name_of}: data_params must be a mapping")
@@ -316,11 +338,18 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
             raise DataConfigError(f"{where} must be a mapping with fasta or prepared")
         allowed = SOURCE_KEYS + PARAM_FIELDS
         _check_keys(where, [OLD_PARAM_NAMES.get(k, k) for k in spec], allowed)
-        src = Source(name=name, output_dir=output_dir,
+        src = Source(name=name, output_dir=output_dir, mixed=not single,
                      downloads_dir=_join(output_dir, "downloads"))
         over = _params({k: v for k, v in spec.items() if k not in SOURCE_KEYS}, where, warnings)
         if "weight" in spec:
-            src.weight = _weight(spec["weight"], where)
+            src.weight = _weight(spec["weight"], where, single)
+        elif not single:
+            raise DataConfigError(f"{where} needs a weight (its share of training sequences; "
+                                  "the weights must sum to 1)")
+        shared = [f for f in SHARED_FIELDS if f in over]
+        if shared and not single:
+            raise DataConfigError(f"{where}.{shared[0]}: set it in data_params; it applies to "
+                                  "every source of a mix")
         has_fasta, has_prepared = spec.get("fasta") is not None, spec.get("prepared") is not None
         if has_fasta == has_prepared:
             raise DataConfigError(f"{where}: set fasta (a FASTA to build from) or prepared (a "
@@ -354,6 +383,8 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
         if src.cluster is not None:
             _check_cluster_holdout(src)
         out[name] = src
+    if not single:
+        _check_mix(out, name_of)
     if defaults_raw and all(s.prepared for s in out.values()):
         raise DataConfigError(f"{name_of}: data_params has no effect on prepared sources (they "
                               "are used as they were built); remove data_params")
@@ -377,6 +408,19 @@ def _check_cluster_holdout(src: Source) -> None:
             + f", or sources.{src.name}.max_seqs: -1")
 
 
+def _check_mix(sources: dict, name_of: str) -> None:
+    """The rules for several sources: weights sum to 1, one register_tokens."""
+    from nanoplm.data.infra.mixture import weights_error
+    err = weights_error({n: s.weight for n, s in sources.items()})
+    if err:
+        raise DataConfigError(f"{name_of}: {err}")
+    regs = {n: s.params["register_tokens"] for n, s in sources.items() if not s.prepared}
+    if len(set(regs.values())) > 1:
+        got = ", ".join(f"{n} {v}" for n, v in regs.items())
+        raise DataConfigError(f"{name_of}: the sources of a mix must use the same "
+                              f"register_tokens; got {got}")
+
+
 def _source_paths(src: Source) -> dict:
     work = src.work_dir
     if src.is_url:
@@ -394,7 +438,7 @@ def _source_paths(src: Source) -> dict:
         "shuffled_fasta": _join(work, "shuffled.fasta"),
         "filtered_fasta": _join(work, "filtered.fasta"),
         "splitted_fasta_dir": _join(work, "split"),
-        "output_dir": src.output_dir,
+        "output_dir": src.data_dir,
     }
 
 

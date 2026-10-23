@@ -969,13 +969,11 @@ def from_yaml(
     if kind == "pretrain":
         cfg = _read_pretrain_config(config_path)
         params = cfg.raw
-        src = cfg.source
-        if src.prepared:
-            # TODO(step 2): a prepared source is one input of a mixture; the mixture
-            # manifest will record it. With one source there is nothing to build.
-            _show_prepared(src, cwd, config_path, cfg.output_dir)
+        if not cfg.is_mixture and cfg.source.prepared:
+            # one prepared source: nothing to build or mix
+            _show_prepared(cfg.source, cwd, config_path, cfg.output_dir)
             return
-        plan = _validate_cluster_block(src, config_path)
+        plans = _validate_sources(cfg, cwd, config_path)
     else:
         _validate_source_fields(params.get("data_dirs", {}))
         _validate_pipeline_fields(params.get("data_dirs", {}), data_params, kind, config_path)
@@ -986,14 +984,16 @@ def from_yaml(
         # Re-read after flip so dvc.yaml is generated with updated value
         if kind == "pretrain":
             cfg = _read_pretrain_config(config_path, quiet=True)
-            params, src = cfg.raw, cfg.source
+            params = cfg.raw
         else:
             params = read_yaml(str(config_path))
             data_params = params.get("data_params", {})
 
     if kind == "pretrain":
-        _print_plan(cfg, plan, cwd, config_path)
-        max_workers = src.params.get("max_workers")
+        _print_plan(cfg, plans, cwd, config_path)
+        built = [s for s in cfg.sources.values() if not s.prepared]
+        # one value for every source: a mix refuses a per-source max_workers
+        max_workers = built[0].params.get("max_workers") if built else None
     else:
         max_workers = data_params.get("max_workers")
 
@@ -1310,28 +1310,37 @@ def _read_pretrain_config(config_path: Path, quiet: bool = False):
         raise click.ClickException(msg if msg.startswith(config_path.name)
                                    else f"{config_path.name}: {msg}") from e
     cfg.raw = raw
-    src = cfg.source
     if not quiet:
         for w in cfg.warnings:
             click.echo(f"Warning: {w}", err=True)
     if cfg.legacy:
         _validate_source_fields(raw.get("data_dirs", {}))
         _validate_pipeline_fields(raw.get("data_dirs", {}), {}, "none", config_path)
-    if src.prepared:
-        return cfg
-    _validate_source_params(src, config_path)
-    if not cfg.legacy and not src.is_url:
-        local = _resolve_path(src.fasta, config_path.parent)
-        if not local.is_file():
-            raise click.ClickException(
-                f"{config_path.name}: sources.{src.name}.fasta: {src.fasta} not found (a "
-                "relative path is relative to data.yaml's directory)")
+    for src in cfg.sources.values():
+        if src.prepared:
+            continue
+        _validate_source_params(src, config_path)
+        if not cfg.legacy and not src.is_url:
+            local = _resolve_path(src.fasta, config_path.parent)
+            if not local.is_file():
+                raise click.ClickException(
+                    f"{config_path.name}: sources.{src.name}.fasta: {src.fasta} not found (a "
+                    "relative path is relative to data.yaml's directory)")
     return cfg
 
 
-def _show_prepared(src, cwd: Path, config_path: Path, output_dir: str = "") -> None:
-    """Check a prepared folder's manifest and say what it holds; nothing is built. An
-    output_dir that still holds an earlier build is named: its data is not this one."""
+def _validate_sources(cfg, cwd: Path, config_path: Path) -> dict:
+    """Check every source before DVC runs: {name: cluster plan, or None; for a prepared
+    source its manifest}."""
+    out = {}
+    for src in cfg.sources.values():
+        out[src.name] = (_prepared_manifest(src, cwd, config_path)[1] if src.prepared
+                         else _validate_cluster_block(src, config_path))
+    return out
+
+
+def _prepared_manifest(src, cwd: Path, config_path: Path):
+    """(folder, manifest) of a prepared source, checked to be a built pretraining set."""
     from nanoplm.data.infra.manifest import read_manifest
     folder = _resolve_path(src.prepared, cwd)
     where = f"{config_path.name}: sources.{src.name}.prepared"
@@ -1344,6 +1353,16 @@ def _show_prepared(src, cwd: Path, config_path: Path, output_dir: str = "") -> N
     kind = getattr(m, "pipeline_mode", None)
     if kind != "pretrain":
         raise click.ClickException(f"{where}: {folder} holds {kind} data, not pretraining data")
+    if m.is_mixture:
+        raise click.ClickException(f"{where}: {folder} is a mixture; list its sources here "
+                                   "instead")
+    return folder, m
+
+
+def _show_prepared(src, cwd: Path, config_path: Path, output_dir: str = "") -> None:
+    """Check a prepared folder's manifest and say what it holds; nothing is built. An
+    output_dir that still holds an earlier build is named: its data is not this one."""
+    folder, m = _prepared_manifest(src, cwd, config_path)
     if m.cluster_index_dir:
         what = (f"cluster subsampling ({m.cluster_level}): {m.train_sequences:,} train / "
                 f"{m.val_sequences:,} val clusters over {m.pool_sequences:,} sequences")
@@ -1442,13 +1461,18 @@ def _date(path: Path) -> str:
     return datetime.date.fromtimestamp(path.stat().st_mtime).isoformat()
 
 
-def _file_cell(value: str, download, cwd: Path) -> str:
+def _file_cell(value: str, download, cwd: Path, shared=None, owner: str = "") -> str:
     """Where one input file comes from: a URL to download (``download`` is where it
-    goes), a copy already downloaded, or a local file read in place."""
+    goes), a copy already downloaded, or a local file read in place. ``shared`` maps
+    each download already shown to its source, so a shared one is listed once."""
     from nanoplm.data.preparation.data_config import is_url
     if is_url(value):
         on_disk = _resolve_path(download, cwd) if download else None
         name = Path(download).name if download else value
+        if shared is not None and download:
+            if download in shared:
+                return f"{name} (same download as {shared[download]})"
+            shared[download] = owner
         if on_disk is not None and on_disk.is_file():
             return f"{name} (reuse, {_size(on_disk)}, {_date(on_disk)})"
         return f"{name} (url)"
@@ -1456,16 +1480,18 @@ def _file_cell(value: str, download, cwd: Path) -> str:
     return f"{value} (local, {_size(on_disk)})" if on_disk.is_file() else f"{value} (local)"
 
 
-def _fasta_cell(src, plan, cwd: Path) -> str:
+def _fasta_cell(src, plan, cwd: Path, shared=None) -> str:
     """The files the stages read: the fasta, or the members FASTA when the members
     differ from it (the fasta is then never fetched), plus the cluster XML."""
     if plan is None or plan.members_from_source:
         cell = _file_cell(src.fasta, src.paths.get(
-            "compressed_fasta" if src.is_compressed else "extracted_fasta"), cwd)
+            "compressed_fasta" if src.is_compressed else "extracted_fasta"), cwd,
+            shared, src.name)
     else:
-        cell = _file_cell(plan.members, plan.members_compressed or plan.members_fasta, cwd)
+        cell = _file_cell(plan.members, str(plan.members_compressed or plan.members_fasta),
+                          cwd, shared, src.name)
     if plan is not None and plan.xml_url:
-        cell += " + " + _file_cell(plan.xml_url, plan.xml_path, cwd)
+        cell += " + " + _file_cell(plan.xml_url, str(plan.xml_path), cwd, shared, src.name)
     return cell
 
 
@@ -1475,14 +1501,32 @@ def _max_seqs_cell(max_seqs: int, clusters: bool) -> str:
     return f"{cap} clusters" if clusters else cap
 
 
-def plan_table(cfg, plan, cwd: Path, config_path: Path) -> str:
-    """The pre-run summary: one row per source, before any DVC call."""
+def _prepared_row(src, m) -> tuple:
+    what = f"cluster ({m.cluster_level})" if m.cluster_index_dir else "off"
+    return (src.name, f"{src.weight:g}", f"{src.prepared} (prepared)",
+            f"{m.train_sequences:,}", f"{m.min_seq_len}-{m.max_seq_len}", f"{m.val_ratio:g}",
+            what)
+
+
+def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
+    """The pre-run summary: one row per source, before any DVC call. ``plans`` maps
+    each source to its cluster plan (None = off), or a prepared source to its manifest.
+    A mix adds the weight column and lists a download shared by sources once."""
     out = _resolve_path(cfg.output_dir, cwd)
     n = len(cfg.sources)
+    mix = cfg.is_mixture
     lines = [f"{config_path.name}: {n} source{'s' if n > 1 else ''} -> {out}"]
-    rows = [("source", "fasta", "max seqs", "len", "val", "clustering")]
+    if mix:
+        lines.append("weight = share of training sequences")
+    rows = [("source",) + (("weight",) if mix else ()) + ("fasta", "max seqs", "len", "val",
+                                                          "clustering")]
     starred = False
+    shared = {} if mix else None
     for src in cfg.sources.values():
+        plan = plans.get(src.name)
+        if src.prepared:
+            rows.append(_prepared_row(src, plan))
+            continue
         over = set(src.overrides)
         starred |= bool(over & {"max_seqs", "min_seq_len", "max_seq_len", "val_ratio"})
 
@@ -1491,8 +1535,8 @@ def plan_table(cfg, plan, cwd: Path, config_path: Path) -> str:
 
         p = src.params
         seqs = _max_seqs_cell(p["max_seqs"], plan is not None)
-        rows.append((
-            src.name, _fasta_cell(src, plan, cwd), mark(seqs, "max_seqs"),
+        rows.append((src.name,) + ((f"{src.weight:g}",) if mix else ()) + (
+            _fasta_cell(src, plan, cwd, shared), mark(seqs, "max_seqs"),
             mark(f"{p['min_seq_len']}-{p['max_seq_len']}", "min_seq_len", "max_seq_len"),
             mark(f"{p['val_ratio']:g}", "val_ratio"),
             plan.source_line() if plan is not None else "off",
@@ -1505,8 +1549,8 @@ def plan_table(cfg, plan, cwd: Path, config_path: Path) -> str:
     return "\n".join(lines)
 
 
-def _print_plan(cfg, plan, cwd: Path, config_path: Path) -> None:
-    click.echo(plan_table(cfg, plan, cwd, config_path))
+def _print_plan(cfg, plans: dict, cwd: Path, config_path: Path) -> None:
+    click.echo(plan_table(cfg, plans, cwd, config_path))
 
 
 def _stage_graph(dvc_content: str, params: dict) -> dict:
@@ -1614,6 +1658,9 @@ _STATUS_TIMEOUT = 120
 def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=None) -> None:
     """Print a human-readable summary using .data_manifest if present."""
     import yaml as _yaml
+    if cfg is not None and cfg.is_mixture:
+        _print_mixture_summary(cwd, cfg)
+        return
     if cfg is not None:
         output_dir_value, src_value = cfg.output_dir, cfg.source.fasta
     else:
@@ -1675,6 +1722,26 @@ def _dataset_dir_line(manifest_path: Path, kind: str) -> str:
     if kind != "pretrain":
         return ""
     return f"  Set pretrain.yaml's dataset_dir to {manifest_path.parent.resolve()}.\n"
+
+
+def _print_mixture_summary(cwd: Path, cfg) -> None:
+    from nanoplm.data.infra.manifest import read_manifest
+    folder = _resolve_path(cfg.output_dir, cwd)
+    try:
+        m = read_manifest(folder)
+    except (FileNotFoundError, ValueError):
+        click.echo("Pipeline completed (no mixture manifest found).")
+        return
+    rows = [("source", "weight", "kind", "train", "val")] + [
+        (r["name"], f"{r['weight']:g}", r["kind"], f"{r['train_sequences']:,}",
+         f"{r['val_sequences']:,}") for r in m.sources]
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    click.echo(f"\nPretraining data mixture complete ({len(m.sources)} sources; train and "
+               "val count clusters for a cluster source).\n")
+    for r in rows:
+        click.echo("  " + "  ".join(c.ljust(w) for c, w in zip(r, widths)))
+    click.echo(f"\n  Manifest:  {folder / '.data_manifest'}\n"
+               f"  Set pretrain.yaml's dataset_dir to {folder}.\n")
 
 
 @data.command("write-manifest", hidden=True)
@@ -1758,6 +1825,23 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
         )
     write_manifest(output_dir, manifest)
     click.echo(f"Wrote manifest: {output_dir / '.data_manifest'}")
+
+
+@data.command("write-mixture", hidden=True)
+@click.option("--output", "-o", required=True, type=click.Path(file_okay=False))
+@click.option("--source", "sources", multiple=True, required=True,
+              type=(str, click.Path(file_okay=False), float, str),
+              help="NAME FOLDER WEIGHT FASTA ('-' for a prepared folder); once per source.")
+@click.help_option("--help", "-h")
+def write_mixture_cmd(output, sources):
+    """Internal: write the mixture manifest of a data.yaml with several sources."""
+    from nanoplm.data.infra.mixture import MixtureError, write_mixture
+    entries = [(n, Path(d), w, None if f == "-" else f) for n, d, w, f in sources]
+    try:
+        path = write_mixture(Path(output), entries)
+    except MixtureError as e:
+        raise click.ClickException(f"write-mixture: {e}") from e
+    click.echo(f"Wrote mixture manifest: {path}")
 
 
 def _count_pretrain_shard_sequences(shard_dir: Path) -> int:

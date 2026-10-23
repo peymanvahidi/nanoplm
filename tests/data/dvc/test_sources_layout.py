@@ -266,7 +266,7 @@ def test_dvc_init_links_the_cache_for_the_sources_layout_only(tmp_path, monkeypa
      "data.yaml:4: duplicate key 'a' (first on line 3)"),
     ("output_dir: out\nsources:\n  a: {fasta: swissprot}\n  b: {fasta: trembl}\n"
      "data_params: {}\n",
-     "mixing several sources is not supported yet (one source only)"),
+     "sources.a needs a weight (its share of training sequences"),
     ("output_dir: out\nsources:\n  a: {fasta: swissprot, max_seq_lenn: 5}\n",
      "data.yaml: sources.a: unknown key max_seq_lenn"),
     ("output_dir: out\nsources:\n  a: {fasta: missing.fasta}\n"
@@ -346,8 +346,8 @@ def test_a_prepared_source_must_be_a_built_folder(tmp_path, monkeypatch, setup, 
 
 
 def test_fix_flips_an_override_too(tmp_path, monkeypatch):
-    cfg = load_template("data_pretrain").replace(
-        "    weight: 1.0\n", "    weight: 1.0\n    drop_invalid_sequences: false\n")
+    cfg = re.sub(r"(    weight: 1.0[^\n]*\n)", r"\1    drop_invalid_sequences: false\n",
+                 load_template("data_pretrain"), count=1)
     _dry(tmp_path, monkeypatch, cfg)
     r = _run(tmp_path / "data.yaml", "--fix", "--dry-run")
     assert r.exit_code == 0, r.output

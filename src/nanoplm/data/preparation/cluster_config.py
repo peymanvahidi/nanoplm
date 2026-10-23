@@ -271,7 +271,7 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
         members_level=members_level, members_from_source=from_source,
         members_compressed=members_compressed, members_fasta=members_fasta,
         cluster_source=cluster_source, clustering=clustering, identity=identity,
-        coverage=coverage, output_dir=Path(src.output_dir), warnings=warnings, notes=notes,
+        coverage=coverage, output_dir=Path(src.data_dir), warnings=warnings, notes=notes,
     )
     if cluster_source == "uniref_xml":
         plan.xml_url = UNIREF50_XML_URL
