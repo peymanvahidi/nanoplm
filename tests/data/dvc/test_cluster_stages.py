@@ -97,6 +97,21 @@ def test_uniref50_url_uniref90_members_stages():
     assert "--cluster-index" in st["write_manifest"]["cmd"]
 
 
+@pytest.mark.parametrize("block", [{"members": "uniref90"}, {"clustering": "mmseqs2"}])
+def test_each_cluster_stage_depends_on_the_modules_it_runs(block):
+    """An edit to cluster_pipeline.py reruns the pool and the index, never the members."""
+    st = _stages(_source("uniref50", block))
+
+    def mods(name):
+        return {Path(d).name for d in st[name]["deps"] if d.endswith(".py")}
+
+    assert {"cluster_pipeline.py", "cluster_index.py"} <= mods("cluster_pool")
+    assert {"cluster_pipeline.py", "cluster_index.py", "cluster_table.py",
+            "uniref_hierarchy.py"} <= mods("cluster_index")
+    assert "cluster_pipeline.py" not in mods("cluster_members")
+    assert "cluster_index.py" not in mods("cluster_members")
+
+
 def test_an_override_is_referenced_where_it_is_set():
     cfg = _source("uniref50", {"members": "uniref90"})
     cfg["sources"]["src"]["max_seq_len"] = 1024

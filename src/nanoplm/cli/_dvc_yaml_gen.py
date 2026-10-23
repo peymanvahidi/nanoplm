@@ -351,7 +351,10 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                 f"-o {out}/train --max-seq-len {ref('max_seq_len')} "
                 f"--samples-per-shard {ref('samples_per_shard')} "
                 f"--register-tokens {ref('register_tokens')}"),
+        # build_pool runs it, with cluster_index.shard_size_for
         "deps": [filtered,
+                 dep("src/nanoplm/data/preparation/cluster_pipeline.py"),
+                 dep("src/nanoplm/data/preparation/cluster_index.py"),
                  dep("src/nanoplm/data/sharding/pretrain_shard_writer.py"),
                  dep("src/nanoplm/data/sharding/csrc/fast_fasta_shard_writer.c"),
                  dep("src/nanoplm/pretraining/models/modern_bert/tokenizer.py")],
@@ -407,9 +410,13 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                 f"--samples-per-shard {ref('samples_per_shard')} "
                 f"--seqs-num {ref('max_seqs')} "
                 f"--register-tokens {ref('register_tokens')}"),
+        # build_index_and_val runs it; cluster_index reads members.tsv with
+        # cluster_table and hashes accessions with uniref_hierarchy
         "deps": [tsv, info, filtered, f"{out}/train",
+                 dep("src/nanoplm/data/preparation/cluster_pipeline.py"),
                  dep("src/nanoplm/data/preparation/cluster_index.py"),
-                 dep("src/nanoplm/data/preparation/cluster_table.py")],
+                 dep("src/nanoplm/data/preparation/cluster_table.py"),
+                 dep("src/nanoplm/data/preparation/uniref_hierarchy.py")],
         "params": [{params_filename: [key("max_seq_len"), key("val_ratio"),
                                       key("samples_per_shard"), key("max_seqs"),
                                       key("register_tokens")]}],
