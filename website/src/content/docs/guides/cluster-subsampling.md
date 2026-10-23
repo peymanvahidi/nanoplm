@@ -99,7 +99,6 @@ Either way, the clusters end up as one table, `output_dir/cluster_index/members.
 | `cluster_subsampling.members (...) is not a UniRef set and differs from sources.<name>.fasta. Put that FASTA in fasta and set members: null.` | Your own member FASTA goes in `fasta`. |
 | `cluster_subsampling is empty. It needs members (null = this fasta)` / `needs members` | A bare `cluster_subsampling:`, or one with every field commented out. Set `members`, or delete the block to turn it off. |
 | `remove enabled; the block being present turns it on` | An `enabled` key left over from an earlier layout. |
-| `cluster_subsampling now sits under its source` | A top-level `cluster_subsampling` block. Move it under the source. |
 | `sources.<name>: these members are clustered with MMseqs2, but mmseqs was not found` | MMseqs2 is needed (scenarios 4 and 6). Install it with `nanoplm deps install --mmseqs-only`, put a release binary on `PATH`, or set `NANOPLM_MMSEQS=/path/to/mmseqs`. |
 | `... was built by the data-sampler experiment scripts ... Rebuild it with nanoplm data from-yaml` | A dataset directory from the old experiment (it has a `RUNTIME_SAMPLER_REQUIRED` marker, or a pool with the experiment's index next to it). Its manifest describes the whole pool, so it is refused. |
 | Warning: `identity / coverage only apply to MMseqs2 clustering; they are ignored with UniProt clusters. Set sources.<name>.cluster_subsampling.clustering: mmseqs2 to use them` | `identity` or `coverage` differs from the template default (0.5 / 0.8) while UniProt clusters are used. |

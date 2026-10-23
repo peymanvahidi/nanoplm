@@ -5,7 +5,7 @@ description: Every field in the data-preparation config, extracted from the nano
 
 import ReferenceFields from '../../../components/ReferenceFields.astro';
 
-`data.yaml` describes one FASTA-to-shards pipeline. Scaffold it with `nanoplm data get-yaml`, edit it, then run `nanoplm data from-yaml` to produce the binary shards and the `.data_manifest`. See [Prepare data](/nanoplm/pipeline/data/) for the walkthrough and the [CLI reference](/nanoplm/reference/cli/) for the commands.
+`data.yaml` says which FASTA to read and how to turn it into binary shards. Scaffold it with `nanoplm data get-yaml`, edit it, then run `nanoplm data from-yaml` to produce the binary shards and the `.data_manifest`. See [Prepare data](/nanoplm/pipeline/data/) for the walkthrough and the [CLI reference](/nanoplm/reference/cli/) for the commands.
 
 Everything the pipeline writes goes under `output_dir`, which is the folder `pretrain.yaml`'s `dataset_dir` points at. Each entry under `sources` (only one is supported for now) names a `fasta` to build from or a `prepared` folder another `data.yaml` built, and may set any `data_params` field to override it for that source. `data_params` holds the defaults for every source. A `cluster_subsampling` block under a source switches it to training on one random member of every cluster per epoch, see [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 

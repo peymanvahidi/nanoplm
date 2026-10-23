@@ -98,7 +98,7 @@ nanoplm deps install --with-mmseqs  # also put the MMseqs2 binary into the venv
 nanoplm deps install --mmseqs-only  # only MMseqs2: no GPU stack, runs on any Linux host
 ```
 
-MMseqs2 is optional. Only [cluster subsampling](/nanoplm/guides/cluster-subsampling/) of your own sequences needs it; the binary (release 18-8cc5c, sha256-checked) goes into `$VIRTUAL_ENV/bin`. The x86_64 build needs a CPU with AVX2.
+MMseqs2 is optional. [Cluster subsampling](/nanoplm/guides/cluster-subsampling/) needs it only when MMseqs2 makes the clusters: for your own sequences, for `fasta: uniref50` with `members: null`, and for `clustering: mmseqs2`. UniProt's own UniRef50 clusters (`members: uniref90` or `uniref100`) need no MMseqs2. The binary (release 18-8cc5c, sha256-checked) goes into `$VIRTUAL_ENV/bin`. The x86_64 build needs a CPU with AVX2.
 
 If the build host has no outbound internet for the FlashAttention-3 wheel, download it elsewhere, set `NANOPLM_FA3_WHEEL=/path/to/wheel.whl`, and re-run.
 

@@ -75,7 +75,7 @@ uv pip install "biotrainer==2.1.1" "biotrainer-core==2.1.1"
 nanoplm data get-yaml
 ```
 
->You'll get [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) and a dvc.yaml files. Just edit the params.yaml if you want.
+>You'll get [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) and a dvc.yaml file. Edit data.yaml if you want; leave dvc.yaml alone, `from-yaml` regenerates it.
 
 > We're using DVC under the hood, so you can track your data version.
 

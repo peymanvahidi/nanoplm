@@ -94,11 +94,11 @@ Regenerates `dvc.yaml` from the config, runs `dvc init` if needed, then executes
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--target TEXT` | Run one DVC stage (for example `split`) instead of the whole pipeline | full pipeline |
+| `--target TEXT` | Run one DVC stage, as named in `dvc.yaml` (for example `split`, or `cluster_index` with cluster subsampling), instead of the whole pipeline | full pipeline |
 | `--no-auto-init` | Fail instead of running `dvc init` when DVC is not initialized | off |
 | `--force` | Pass `-f` to `dvc repro`, re-running stages DVC considers unchanged | off |
 | `--verbose` | Pass `-v` to `dvc repro` | off |
-| `--fix` | Rewrite `data_params.drop_invalid_sequences: true` in the config, then run | off |
+| `--fix` | Set `drop_invalid_sequences: true` in the config (every occurrence, so a per-source override too), then run | off |
 | `--dry-run` | Print the DVC plan without executing it | off |
 | `--log-level [debug\|info\|warning\|error]` | nanoplm log level | `info` |
 
@@ -107,6 +107,11 @@ nanoplm data from-yaml
 ```
 
 ```
+data.yaml: 1 source -> <cwd>/output/data/pretrain_data
+source     fasta                         max seqs  len     val  clustering
+swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
+Regenerated <cwd>/dvc.yaml
+Rebuild: all (first run)
 Running dvc repro (full pipeline)...
 # ... dvc stage output ...
 
@@ -116,7 +121,8 @@ Pretraining data pipeline complete.
   Total sequences: 20000
     Train:         18000
     Val:           2000
-  Manifest:        output/data/pretrain_data/.data_manifest
+  Manifest:        <cwd>/output/data/pretrain_data/.data_manifest
+  Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
 ```
 
 `--fix` is the escape hatch when the `check` stage rejects invalid sequences: see [Troubleshooting](/nanoplm/troubleshooting/).

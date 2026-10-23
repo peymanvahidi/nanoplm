@@ -37,11 +37,12 @@ download → extract → validate → shuffle → filter → split → tokenize 
    ```
 
    ```text title="Output (trimmed)"
-   Regenerated dvc.yaml in <cwd>
+   data.yaml: 1 source -> <cwd>/output/data/pretrain_data
+   source     fasta                         max seqs  len     val  clustering
+   swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
+   Regenerated <cwd>/dvc.yaml
+   Rebuild: all (first run)
    Running dvc repro (full pipeline)...
-   # ...
-   Successfully created 9 shard files:
-     output/data/pretrain_data/train/shard_0000.bin
    # ...
    Wrote manifest: output/data/pretrain_data/.data_manifest
 
@@ -51,7 +52,8 @@ download → extract → validate → shuffle → filter → split → tokenize 
      Total sequences: 20000
        Train:         18000
        Val:           2000
-     Manifest:        output/data/pretrain_data/.data_manifest
+     Manifest:        <cwd>/output/data/pretrain_data/.data_manifest
+     Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
    ```
 
 </Steps>
@@ -60,7 +62,7 @@ Under the hood those steps are a [DVC](https://dvc.org/) DAG: `from-yaml` regene
 
 ## The whole config
 
-`data.yaml` is about 40 lines, so here it is in full.
+`data.yaml` is about 40 lines. Here it is with the commented examples left out.
 
 ```yaml title="data.yaml"
 output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml's dataset_dir points here
@@ -77,17 +79,17 @@ sources:
 
 data_params:
   max_seqs: 20000        # -1 = all
-  min_seq_len: 20
+  min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
-  val_ratio: 0.1
-  drop_invalid_sequences: false
+  val_ratio: 0.1         # share held out for validation loss
+  drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
 
   # Rarely changed
-  shuffle: true
+  shuffle: true          # shuffle before the train / val split
   shuffle_seed: 24
   samples_per_shard: 2000  # raised automatically when a cluster pool needs it
-  max_workers: 2
-  register_tokens: 0
+  max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores
+  register_tokens: 0     # 0, 1 or 2 scratch tokens after EOS
 ```
 
 Everything the pipeline writes sits under `output_dir`: `downloads/` holds one file per URL, `swissprot/` holds that source's intermediate FASTAs, and `train/`, `val/` and `.data_manifest` are the dataset itself. Before any stage runs, `from-yaml` prints one row per source with its fasta, `max_seqs`, length range, `val_ratio` and clustering, then which stages will rebuild.
@@ -118,18 +120,18 @@ Start with SwissProt (about 570k sequences). It downloads in minutes and is enou
 
 ## The parameters that matter
 
-| Key | Default | What it does |
+| Key | Template value | What it does |
 | --- | --- | --- |
 | [`max_seqs`](/nanoplm/reference/data/#data-data_params-max_seqs) | `20000` | How many sequences to keep after filtering. `-1` keeps all of them. Older configs call it `seqs_num`. |
 | [`min_seq_len`](/nanoplm/reference/data/#data-data_params-min_seq_len) | `20` | Sequences shorter than this are dropped. |
-| [`max_seq_len`](/nanoplm/reference/data/#data-data_params-max_seq_len) | `512` | Sequences are truncated to this length. See the callout below. |
+| [`max_seq_len`](/nanoplm/reference/data/#data-data_params-max_seq_len) | `512` | Sequences longer than this are dropped. See the callout below. |
 | [`val_ratio`](/nanoplm/reference/data/#data-data_params-val_ratio) | `0.1` | Fraction held out for validation loss. |
 | [`samples_per_shard`](/nanoplm/reference/data/#data-data_params-samples_per_shard) | `2000` | Sequences per `shard_NNNN.bin`. |
 | [`max_workers`](/nanoplm/reference/data/#data-data_params-max_workers) | `2` | Processes used for tokenization, and MMseqs2 threads with [cluster subsampling](/nanoplm/guides/cluster-subsampling/). `-1` uses every core. |
 | [`register_tokens`](/nanoplm/reference/data/#data-data_params-register_tokens) | `0` | 0, 1, or 2 learnable scratch tokens appended after EOS. Recorded in the manifest and injected into the model at pretrain time. |
 | [`drop_invalid_sequences`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences) | `false` | Whether a sequence with an unrecognised residue kills the run or gets excluded. See below. |
 
-`drop_invalid_sequences`, `shuffle`, `shuffle_seed`, `samples_per_shard`, `max_workers` and `register_tokens` can be left out of `data.yaml`; the template's values are the defaults. Writing a default out or deleting it reruns nothing.
+`max_seqs`, `min_seq_len`, `max_seq_len` and `val_ratio` are required. `drop_invalid_sequences`, `shuffle`, `shuffle_seed`, `samples_per_shard`, `max_workers` and `register_tokens` can be left out of `data.yaml`; the template's values are the defaults. Writing a default out or deleting it reruns nothing.
 
 :::caution[max_seq_len is set here and nowhere else]
 `max_seq_len` is written into `.data_manifest`, and pretraining reads it back to compute gradient accumulation: `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`. There is no `max_seq_len` key in `pretrain.yaml`. If you want longer sequences, change it here and re-run the data stage: the shards themselves have to change.
@@ -147,10 +149,11 @@ nanoplm data from-yaml
 
 ```text title="Output (trimmed)"
 Running dvc repro (full pipeline)...
+Running stage 'check':
 # ...
 Error: Validation found 37 problematic sequence(s).
-  Inspect: output/data/validation/invalid.fasta
-  Summary: output/data/validation/validation.json
+  Inspect: output/data/pretrain_data/swissprot/validation/invalid.fasta
+  Summary: output/data/pretrain_data/swissprot/validation/validation.json
 
 To exclude these sequences and continue the pipeline:
     nanoplm data from-yaml --fix
@@ -163,8 +166,10 @@ nanoplm data from-yaml --fix
 ```
 
 ```text title="Output (trimmed)"
-Set data.yaml: data_params.drop_invalid_sequences=true
-Regenerated dvc.yaml in <cwd>
+Set data.yaml: drop_invalid_sequences=true
+data.yaml: 1 source -> <cwd>/output/data/pretrain_data
+# ...
+Regenerated <cwd>/dvc.yaml
 Running dvc repro (full pipeline)...
 # ...
 ```
