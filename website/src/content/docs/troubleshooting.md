@@ -296,7 +296,8 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 | `sources.sp: unknown key weigth (allowed: fasta, prepared, weight, ...)` | A typo, or a key at the wrong level. The message lists the keys allowed there. |
 | `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name. Indent it as `sources:`, then `sp:`, then `fasta:`. |
 | `output_dir is required (the folder pretrain.yaml's dataset_dir points at)` | Add `output_dir` at the top level. |
-| `mixing several sources is not supported yet (one source only); sources has 2: sp, tr` | Keep one entry under `sources`. |
+| `sources.sp needs a weight (its share of training sequences; the weights must sum to 1)` | Every source of a mix needs a `weight`. See [Mixing datasets](/nanoplm/guides/mixing/). |
+| `the weights must sum to 1 (they are shares of training sequences): 0.5 (sp) + 0.4 (tr) = 0.9` | Change the weights so they add up to 1. |
 | `sources.sp.weight is 0.5; with one source the weight must be 1 (or leave it out)` | Set `weight: 1.0` or delete it. |
 | `data_dirs is the old layout; use output_dir + sources without data_dirs` | The file has both layouts. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml). |
 | `data.yaml:5: duplicate key 'fasta' (first on line 4)` | The same key appears twice in one block. Delete one. |
