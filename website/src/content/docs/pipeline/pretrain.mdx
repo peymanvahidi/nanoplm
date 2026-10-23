@@ -52,7 +52,7 @@ The pretraining stage reads the shards and `.data_manifest` the [data stage](/na
 
 Read those startup lines. They are the config after nanoPLM has resolved it: the sequence length came from the manifest, the gradient accumulation was inferred, and your token budget became 504 optimizer steps. If any of those numbers surprise you, stop the run now rather than in six hours.
 
-When `dataset_dir` holds a [mix of several sources](/nanoplm/guides/mixing/), the three `Budget` lines become a table with one row per source: its share, the tokens it supplies and how many times it is read. A mix also needs `use_packing: true`, which the template sets, and `eval_sources` picks which sources eval covers.
+If `dataset_dir` is a [mix of several sources](/nanoplm/guides/mixing/), a table with one row per source replaces the three `Budget` lines. It shows how many times training reads each source.
 
 ## The pure-torch backend
 
