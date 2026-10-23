@@ -194,8 +194,8 @@ def test_data_params_rarely_changed_group():
     assert "seqs_num" not in params and params["max_seqs"]["default"] == 20000
     assert "x-nanoplm-group" not in params["max_seq_len"]
     assert params["shuffle"]["x-nanoplm-group"] == "Rarely changed"
-    # The heading labels the block; it is no longer shuffle's description.
-    assert "description" not in params["shuffle"]
+    # The heading labels the block; shuffle's description is its own comment.
+    assert params["shuffle"]["description"] == "shuffle before the train / val split"
 
 
 def test_nested_entry_outside_a_map_section_fails_loudly(monkeypatch):

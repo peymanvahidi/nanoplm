@@ -80,7 +80,8 @@
         },
         "min_seq_len": {
           "type": "integer",
-          "default": 20
+          "default": 20,
+          "description": "shorter sequences are dropped"
         },
         "max_seq_len": {
           "type": "integer",
@@ -89,15 +90,18 @@
         },
         "val_ratio": {
           "type": "number",
-          "default": 0.1
+          "default": 0.1,
+          "description": "share held out for validation loss"
         },
         "drop_invalid_sequences": {
           "type": "boolean",
-          "default": false
+          "default": false,
+          "description": "true: drop sequences with unknown residues instead of stopping"
         },
         "shuffle": {
           "type": "boolean",
           "default": true,
+          "description": "shuffle before the train / val split",
           "x-nanoplm-group": "Rarely changed"
         },
         "shuffle_seed": {
@@ -114,11 +118,13 @@
         "max_workers": {
           "type": "integer",
           "default": 2,
+          "description": "tokenizer processes and MMseqs2 threads; -1 = all cores",
           "x-nanoplm-group": "Rarely changed"
         },
         "register_tokens": {
           "type": "integer",
           "default": 0,
+          "description": "0, 1 or 2 scratch tokens after EOS",
           "x-nanoplm-group": "Rarely changed"
         }
       }

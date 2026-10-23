@@ -27,14 +27,14 @@ sources:
 
 data_params:
   max_seqs: 20000        # -1 = all
-  min_seq_len: 20
+  min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
-  val_ratio: 0.1
-  drop_invalid_sequences: false
+  val_ratio: 0.1         # share held out for validation loss
+  drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
 
   # Rarely changed
-  shuffle: true
+  shuffle: true          # shuffle before the train / val split
   shuffle_seed: 24
   samples_per_shard: 2000  # raised automatically when a cluster pool needs it
-  max_workers: 2
-  register_tokens: 0
+  max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores
+  register_tokens: 0     # 0, 1 or 2 scratch tokens after EOS
