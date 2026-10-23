@@ -114,18 +114,9 @@ Regenerated <cwd>/dvc.yaml
 Rebuild: all (first run)
 Running dvc repro (full pipeline)...
 # ... dvc stage output ...
-
-Pretraining data pipeline complete.
-
-  Source:          https://ftp.uniprot.org/pub/.../uniprot_sprot.fasta.gz
-  Total sequences: 20000
-    Train:         18000
-    Val:           2000
-  Manifest:        <cwd>/output/data/pretrain_data/.data_manifest
-  Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
 ```
 
-`--fix` is the escape hatch when the `check` stage rejects invalid sequences: see [Troubleshooting](/nanoplm/troubleshooting/).
+[Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run) explains the table and the line under it. `--dry-run` needs a folder where `from-yaml` has already run once, and stops at the first download that has not happened yet. `--fix` is for when the `check` stage rejects invalid sequences: see [Prepare data](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once).
 
 ### data get-file
 
@@ -232,7 +223,7 @@ Pretraining-specific. Tokenizes a FASTA into the binary shards (`shard_NNNN.bin`
 | `--register-tokens INTEGER` | Learnable scratch tokens (`0`, `1`, or `2`) appended after EOS | `0` |
 | `--force`, `-f` | Overwrite existing output | off |
 
-`nanoplm data write-manifest` also exists but is hidden: the generated `dvc.yaml` calls it to write the `.data_manifest`. You do not invoke it yourself.
+`write-manifest`, and the cluster subsampling stages `get-cluster-xml`, `cluster-members`, `cluster-pool` and `cluster-index`, also exist but are hidden: the generated `dvc.yaml` calls them. You do not run them yourself.
 
 ---
 
@@ -379,6 +370,7 @@ nanoplm eval run --checkpoint-dir DIR [OPTIONS]
 | --- | --- |
 | `NANOPLM_MAX_WORKERS` | Default for `data pre-tokenize --max-workers` (otherwise `2`). `data from-yaml` exports it from `data_params.max_workers`. |
 | `NANOPLM_DEVICE` | Default device for the distillation `kd-embed` stage (otherwise `auto`). `data from-yaml` exports it from `data_params.device`. |
+| `NANOPLM_MMSEQS` | Path to the `mmseqs` binary for [cluster subsampling](/nanoplm/guides/cluster-subsampling/#when-mmseqs2-runs). Otherwise nanoPLM looks on `PATH`, then in the venv's `bin/`. |
 | `NANOPLM_DISABLE_NATIVE_SHARD_WRITER` | Set to `1` to fall back to the Python shard writer instead of the native C one. |
 | `NANOPLM_DISABLE_NATIVE_FASTA_OPS` | Set to `1` to fall back to the Python FASTA shuffle/filter/split/validate path. |
 | `SLURM_JOB_ID` | When set, it replaces the `DDMMHHMM` timestamp in the run directory name, making the run directory `<run_name>-<SLURM_JOB_ID>`. |

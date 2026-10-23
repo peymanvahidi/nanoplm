@@ -286,24 +286,40 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 
 ## Data pipeline
 
+### data.yaml won't load
+
+`nanoplm data from-yaml` checks the whole file before any stage runs and names the key it stopped at. `sp` stands for your source name.
+
+| Message | Fix |
+| --- | --- |
+| `sources.sp.fasta must be a shortcut (swissprot, trembl, uniref50, uniref90, uniref100) or a URL or path that ends with .fasta or .fasta.gz, got: swisprot` | Fix the spelling, or give a URL or a `.fasta` / `.fasta.gz` path. |
+| `sources.sp: unknown key weigth (allowed: fasta, prepared, weight, ...)` | A typo, or a key at the wrong level. The message lists the keys allowed there. |
+| `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name: `sources:` then `sp:` then `fasta:`. |
+| `output_dir is required (the folder pretrain.yaml's dataset_dir points at)` | Add `output_dir` at the top level. |
+| `mixing several sources is not supported yet (one source only); sources has 2: sp, tr` | Keep one entry under `sources`. |
+| `sources.sp.weight is 0.5; with one source the weight must be 1 (or leave it out)` | Set `weight: 1.0` or delete it. |
+| `data_dirs is the old layout; use output_dir + sources without data_dirs` | The file has both layouts. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml). |
+| `line N: duplicate key ...` | The same key appears twice in one block. |
+
+Errors about a `cluster_subsampling` block, and MMseqs2 not found, are in the [cluster subsampling guide](/nanoplm/guides/cluster-subsampling/#errors-and-warnings).
+
+A `Warning: data_dirs is the old data.yaml layout` is not an error: the old file still runs. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml).
+
 ### The `check` stage fails on invalid sequences
 
-By default [`drop_invalid_sequences`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences) is `false`, which means the `check` stage **exits non-zero** the moment it finds an invalid sequence and halts the pipeline. That is deliberate: you should see what is in your FASTA before you train on it.
+**`Error: Validation found 2 problematic sequence(s).`**
 
-Inspect `invalid.fasta` and `validation.json` in the `validation_dir`. Note that `invalid_ids.txt` is **empty** in this mode, so nothing downstream drops records by accident.
+With the default [`drop_invalid_sequences: false`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences), the `check` stage stops the pipeline when a sequence has a residue it does not recognise. Look at `output_dir/<source>/validation/invalid.fasta`, then run `nanoplm data from-yaml --fix` to drop those sequences and continue. [Prepare data](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once) shows the full output.
 
-To proceed, drop them:
+### `--dry-run` refuses or stops early
 
-```bash
-nanoplm data from-yaml --fix
-```
+**`Error: --dry-run needs an initialized DVC repo and will not create one.`**
 
-`--fix` rewrites `data_params.drop_invalid_sequences: true` in your config **in place**, then reruns. The `check` stage now records the offending IDs in `invalid_ids.txt`, `filter` excludes them, and the run continues. Setting the key by hand is equivalent:
+Run `nanoplm data from-yaml` once without `--dry-run`, or run `dvc init` in the folder of `data.yaml`.
 
-```yaml title="data.yaml"
-data_params:
-  drop_invalid_sequences: true
-```
+**`The dry run stops after get_members_fasta, get_cluster_xml: DVC cannot preview the stages that read their outputs until those exist.`**
+
+Not an error. A download has not happened yet, so the preview ends there. The real run goes on past it.
 
 ### The dataset was prepared for the wrong pipeline
 
@@ -313,7 +329,7 @@ data_params:
 
 ### Outputs land somewhere unexpected
 
-Relative paths in `data.yaml` resolve against the **directory the YAML sits in**, not the directory you run the command from: `nanoplm data from-yaml` runs every stage there. Use absolute paths to put outputs elsewhere. The run log is the exception: it goes to `output/logs/` under the directory you run the command from.
+Relative paths in `data.yaml` resolve against the **folder `data.yaml` is in**, not the folder you run the command from: `nanoplm data from-yaml` runs every stage there. Use an absolute `output_dir` to put outputs elsewhere. The run log is the exception: it goes to `output/logs/` under the folder you run the command from.
 
 ### Editing `.data_manifest` by hand
 

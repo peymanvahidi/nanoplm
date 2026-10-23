@@ -5,24 +5,22 @@ description: Every field in the data-preparation config, extracted from the nano
 
 import ReferenceFields from '../../../components/ReferenceFields.astro';
 
-`data.yaml` says which FASTA to read and how to turn it into binary shards. Scaffold it with `nanoplm data get-yaml`, edit it, then run `nanoplm data from-yaml` to produce the binary shards and the `.data_manifest`. See [Prepare data](/nanoplm/pipeline/data/) for the walkthrough and the [CLI reference](/nanoplm/reference/cli/) for the commands.
+`data.yaml` says which FASTA to read and how to turn it into binary shards. Scaffold it with `nanoplm data get-yaml`, edit it, then run `nanoplm data from-yaml`. [Prepare data](/nanoplm/pipeline/data/) walks through a run, and the [CLI reference](/nanoplm/reference/cli/#data) lists the commands.
 
-Everything the pipeline writes goes under `output_dir`, which is the folder `pretrain.yaml`'s `dataset_dir` points at. Each entry under `sources` (only one is supported for now) names a `fasta` to build from or a `prepared` folder another `data.yaml` built, and may set any `data_params` field to override it for that source. `data_params` holds the defaults for every source. A `cluster_subsampling` block under a source switches it to training on one random member of every cluster per epoch, see [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+The file has three parts: `output_dir`, the folder everything is written to and `pretrain.yaml`'s `dataset_dir` points at; `sources`, the FASTA to build from (one source for now); and `data_params`, the settings every source uses unless it sets its own. [`max_seq_len`](#data-data_params-max_seq_len) and [`register_tokens`](#data-data_params-register_tokens) are recorded in the manifest and read back by pretraining, so `pretrain.yaml` has neither key.
 
-Two fields reach beyond this file. [`max_seq_len`](#data-data_params-max_seq_len) is recorded in the manifest and is the value pretraining reads back for its token math, which is why you never set a sequence length in `pretrain.yaml`. [`register_tokens`](#data-data_params-register_tokens) is recorded the same way and injected into the model config at pretrain time.
-
-The fields below are generated from the `get-yaml` template itself, so they cannot drift from the tool.
+The fields below are generated from the `get-yaml` template, so they match the tool.
 
 ## output_dir
 <ReferenceFields surface="data" />
 
 ## sources
-Each key under `sources` is a name you pick (letters, digits and `_`); the template's is `swissprot`. Its value is the spec below. Set exactly one of `fasta` and `prepared`. Any [`data_params`](#data_params) field set on a source overrides the default for that source, for example `max_seq_len: 1024`. Relative paths resolve against the **directory the YAML sits in**, not the directory you run the command from.
+Each key under `sources` is a name you pick (letters, digits and `_`); the template's is `swissprot`. It also names the folder under `output_dir` for that source's intermediate files. Set exactly one of `fasta` and `prepared`. Any [`data_params`](#data_params) field set on a source overrides the default for that source, for example `max_seq_len: 1024`. Relative paths resolve against the **folder `data.yaml` is in**, not the folder you run the command from.
 
 <ReferenceFields surface="data" section="sources" />
 
 ### cluster_subsampling
-The template ships this block commented out. Writing it under a source turns cluster subsampling on; there is no `enabled` switch.
+The template ships this block commented out. Writing it under a source turns cluster subsampling on; there is no `enabled` switch. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 
 <ReferenceFields surface="data" section="sources.cluster_subsampling" />
 

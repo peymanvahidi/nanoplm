@@ -1,12 +1,12 @@
 ---
 title: Your first PLM
-description: Train and evaluate a small protein language model on UniProt50, end to end, in about half an hour on one GPU.
+description: Train and evaluate a small protein language model on SwissProt, end to end, in about half an hour on one GPU.
 ---
 
 import { Steps, FileTree } from '@astrojs/starlight/components';
 
 You are going to pretrain a real protein language model (a 2.3M-parameter ModernBERT-style
-encoder) on 20,000 UniProt50 sequences, then score it on a downstream benchmark. Every command is
+encoder) on 20,000 SwissProt sequences, then score it on a downstream benchmark. Every command is
 run from the same working directory, and each stage hands its artifacts to the next.
 
 **What you need**
@@ -14,7 +14,7 @@ run from the same working directory, and each stage hands its artifacts to the n
 - A supported install: Linux + Hopper GPU + CUDA 13, via `nanoplm deps install`. See
   [Install](/nanoplm/start/install/).
 - The `eval` extra for Stage 3 (`uv pip install -e ".[eval]"` or the GitHub equivalent).
-- About 30 minutes: roughly 10 for the UniProt50 download and tokenization, a few for training, and
+- About 30 minutes: roughly 10 for the SwissProt download and tokenization, a few for training, and
   the rest for benchmarking.
 
 :::note
@@ -58,6 +58,11 @@ puts in the env.
 
    ```bash
    nanoplm data from-yaml
+   # data.yaml: 1 source -> <cwd>/output/data/pretrain_data
+   # source     fasta                         max seqs  len     val  clustering
+   # swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
+   # Regenerated <cwd>/dvc.yaml
+   # Rebuild: all (first run)
    # Running dvc repro (full pipeline)...
    # ...
    # Pretraining data pipeline complete.
@@ -66,8 +71,14 @@ puts in the env.
    #   Total sequences: 20000
    #     Train:         18000
    #     Val:           2000
-   #   Manifest:        output/data/pretrain_data/.data_manifest
+   #   Manifest:        <cwd>/output/data/pretrain_data/.data_manifest
+   #   Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
    ```
+
+   The table at the top is printed before anything runs: one row per source, with the file it
+   reads and the settings it uses. [Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run)
+   explains each column. If the `check` stage stops on invalid sequences, run
+   `nanoplm data from-yaml --fix` ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
 
 </Steps>
 
