@@ -1021,7 +1021,17 @@ def from_yaml(
             elif is_git_subdir(cwd):
                 init_cmd.append("--subdir")
             subprocess.run(init_cmd, cwd=str(cwd), check=True)
-            click.echo(f"Initialized DVC repository in: {cwd}")
+            # Link outputs into the cache instead of copying them: a UniRef90 cluster
+            # run would otherwise keep a second ~160 GB copy. Linked outputs are
+            # read-only; edit one only after `dvc unprotect <path>`. Not for the
+            # data_dirs layout: its get_file symlinks local_fasta into the outputs, and
+            # a linked cache would make the user's own file read-only.
+            if cfg is not None and not cfg.legacy:
+                subprocess.run(_DVC + ["config", "cache.type", _CACHE_TYPE], cwd=str(cwd),
+                               check=True)
+                click.echo(f"Initialized DVC repository in: {cwd} (cache.type {_CACHE_TYPE})")
+            else:
+                click.echo(f"Initialized DVC repository in: {cwd}")
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             raise click.ClickException(
                 f"Failed to initialize DVC in {cwd}. Details: {e}"
@@ -1077,6 +1087,9 @@ def from_yaml(
 # ---------------------------------------------------------------------------
 # Private helpers for from-yaml
 # ---------------------------------------------------------------------------
+
+# reflink is left out: on GPFS / Lustre DVC would try it on every file first
+_CACHE_TYPE = "hardlink,symlink"
 
 
 def _resolve_config_path(config: str | None) -> Path:

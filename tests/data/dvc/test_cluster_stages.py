@@ -197,6 +197,7 @@ def test_from_yaml_end_to_end_with_mmseqs(tmp_path):
     assert _status(tmp_path, env) == set()
     # the local FASTA is read in place: DVC neither links nor protects it
     assert own.stat().st_nlink == 1 and os.access(own, os.W_OK)
+    assert (tmp_path / ".dvc/config").read_text().count("hardlink,symlink") == 1
     # a core-count change reruns nothing
     _edit(tmp_path, lambda c: c["data_params"].update(max_workers=3))
     assert _status(tmp_path, env) == set()

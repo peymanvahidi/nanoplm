@@ -159,6 +159,20 @@ def test_old_layout_warns_with_the_block_to_paste(tmp_path, monkeypatch):
         (GOLDEN / "url_gz.dvc.yaml").read_text()
 
 
+def test_dvc_init_links_the_cache_for_the_sources_layout_only(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: calls.append(a[0]) or
+                        type("R", (), {"returncode": 0, "stdout": ""})())
+    new, old = tmp_path / "new", tmp_path / "old"
+    new.mkdir(), old.mkdir()
+    assert _run(_write(new, load_template("data_pretrain"))).exit_code == 0
+    assert any(c[-3:] == ["config", "cache.type", "hardlink,symlink"] for c in calls)
+    calls.clear()
+    assert _run(_write(old, (GOLDEN / "local_gz.data.yaml").read_text())).exit_code == 0
+    assert any("init" in c for c in calls)
+    assert not any("cache.type" in c for c in calls)
+
+
 @pytest.mark.parametrize("text, message", [
     ("output_dir: out\nsources:\n  a: {fasta: swissprot}\n  a: {fasta: trembl}\n",
      "data.yaml:4: duplicate key 'a' (first on line 3)"),
