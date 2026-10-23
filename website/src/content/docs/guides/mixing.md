@@ -14,6 +14,8 @@ sources:
   uniref50:
     fasta: uniref50
     weight: 0.8
+    max_seqs: -1         # counts clusters here: all of them
+    val_ratio: 0.0044    # share of clusters held out, as in the UniRef90 experiment
     cluster_subsampling:
       members: uniref90
 ```
@@ -32,7 +34,7 @@ sources:
 
 There is one `dvc.yaml`. Each source has its own stages (`swissprot-filter`, `uniref50-cluster_index`, ...). A URL that several sources use is downloaded once, and a `.gz` that several sources read is extracted and checked once, into `output_dir/downloads/` (stages `download-<file>`, `extract-<file>`, `check-<file>`). A source that sets its own `drop_invalid_sequences` keeps its own check. The last stage, `mixture`, is the only one that reads the weights, so changing only the weights reruns only that stage, in seconds.
 
-Going from one source to several (or back) moves where the dataset lives: one source writes `train/` and `val/` into `output_dir`, a mix writes them into `output_dir/<source>/`. A mix also extracts and checks a `.gz` in `downloads/` instead of `output_dir/<source>/`. The old outputs are not deleted. `from-yaml` prints a warning listing them, and you can delete them.
+Going from one source to several (or back) moves where the dataset lives: one source writes `train/` and `val/` into `output_dir`, a mix writes them into `output_dir/<source>/`. A mix also extracts and checks a `.gz` in `downloads/` instead of `output_dir/<source>/`. The old outputs are not deleted. `from-yaml` prints a warning listing them, and you can delete them. The same warning lists the folder of a source you remove, the `cluster_index/` of a source whose `cluster_subsampling` block you delete, and `downloads/uniref50.xml.gz` once no source uses UniProt clusters.
 
 The mixture manifest records a hash of each source's manifest. If a source is rebuilt or edited after the mix was written, training stops and asks you to rerun `nanoplm data from-yaml`.
 
