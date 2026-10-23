@@ -80,8 +80,12 @@ def _resolve_effective_world_size(cfg: PretrainingConfig) -> int:
 
 
 def _populate_batch_setup(cfg: PretrainingConfig) -> None:
+    from nanoplm.data.infra.mixture import MixtureError
     dataset_dir = Path(cfg.dataset_dir)
-    validation_result = validate_pretrain_dataset(dataset_dir)
+    try:
+        validation_result = validate_pretrain_dataset(dataset_dir)
+    except MixtureError as exc:
+        raise click.ClickException(f"{dataset_dir}: {exc}") from exc
     manifest = validation_result["manifest"]
 
     effective_world_size = _resolve_effective_world_size(cfg)

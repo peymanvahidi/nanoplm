@@ -146,6 +146,17 @@ def test_a_source_without_val_sequences_is_not_averaged_in(tmp_path):
             dataset_dir=str(tmp_path), micro_batch_seqs=4, eval_sources=["a", "c"]))
 
 
+def test_a_source_rebuilt_after_the_mix_stops_the_cli_with_the_rerun_hint(tmp_path):
+    import click
+    from nanoplm.cli.pretrain import _populate_batch_setup
+    _mixture(tmp_path)
+    plain_source(tmp_path / "a", 51, tag=5)          # a rebuilt after the mix
+    with pytest.raises(click.ClickException,
+                       match=r"mixture source a: .*changed after the mixture was written.*"
+                             r"Rerun `nanoplm data from-yaml`"):
+        _populate_batch_setup(PretrainingConfig(dataset_dir=str(tmp_path)))
+
+
 def test_eval_sources_list_evaluates_only_those(tmp_path, monkeypatch):
     m = _mixture(tmp_path)
     plan = pp.MixturePlan.open(tmp_path, m, PretrainingConfig(
