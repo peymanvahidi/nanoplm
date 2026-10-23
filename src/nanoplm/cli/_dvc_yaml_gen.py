@@ -347,7 +347,9 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
     """Stages for cluster_subsampling.enabled: true (see cluster_pipeline's docstring).
 
     Each stage lists only the params it reads, so changing clustering / identity /
-    coverage reruns cluster_members and what follows it, never the pool.
+    coverage reruns cluster_members and what follows it, never the pool. max_workers
+    reaches cluster-pool and cluster-members through $NANOPLM_MAX_WORKERS, as for
+    pre-tokenize, so a different core count reruns nothing.
     """
     dep = _resolve_pkg_dep
     members_fasta = str(plan.members_fasta)
@@ -391,16 +393,14 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
         "cmd": ("nanoplm data cluster-pool -i ${data_dirs.filtered_fasta} "
                 f"-o {out}/train --max-seq-len ${{data_params.max_seq_len}} "
                 "--samples-per-shard ${data_params.samples_per_shard} "
-                "--register-tokens ${data_params.register_tokens} "
-                "--max-workers ${data_params.max_workers}"),
+                "--register-tokens ${data_params.register_tokens}"),
         "deps": ["${data_dirs.filtered_fasta}",
                  dep("src/nanoplm/data/sharding/pretrain_shard_writer.py"),
                  dep("src/nanoplm/data/sharding/csrc/fast_fasta_shard_writer.c"),
                  dep("src/nanoplm/pretraining/models/modern_bert/tokenizer.py")],
         "params": [{params_filename: ["data_dirs.output_dir", "data_params.max_seq_len",
                                       "data_params.samples_per_shard",
-                                      "data_params.register_tokens",
-                                      "data_params.max_workers"]}],
+                                      "data_params.register_tokens"]}],
         "outs": [f"{out}/train"],
     }
     tsv = str(plan.members_tsv)
@@ -433,10 +433,8 @@ def _cluster_stages(config: dict, plan, params_filename: str) -> dict:
                "--fasta ${data_dirs.filtered_fasta} "
                "--identity ${cluster_subsampling.identity} "
                "--coverage ${cluster_subsampling.coverage} "
-               "--threads ${data_params.max_workers} "
                f"--tmp-dir {plan.mmseqs_tmp} -o {tsv}")
-        members_params += ["cluster_subsampling.identity", "cluster_subsampling.coverage",
-                           "data_params.max_workers"]
+        members_params += ["cluster_subsampling.identity", "cluster_subsampling.coverage"]
     stages["cluster_members"] = {"cmd": cmd, "deps": members_deps, "outs": [tsv, info]}
     if members_params:
         stages["cluster_members"]["params"] = [{params_filename: members_params}]

@@ -110,7 +110,7 @@ get_cluster_xml → cluster_members → cluster_index → write_manifest
 
 `get_members_fasta` / `extract_members` only appear when `members` differs from `url`; otherwise the normal `get_file` / `extract` stages fetch the url. `get_cluster_xml` only appears for UniProt clusters, so `clustering: mmseqs2` never fetches the XML. The `shuffle` and `split` stages are not used.
 
-Each stage reruns only when its own inputs change. Changing `clustering`, `identity` or `coverage` reruns `cluster_members` and the stages after it, never the tokenized pool. Switching `clustering` between UniProt and MMseqs2 also adds or drops `get_cluster_xml`. Changing `val_ratio` or `seqs_num` reruns `cluster_index` and the manifest. Changing `max_workers` reruns `cluster_pool` (and `cluster_members` with MMseqs2). The XML is not copied into the DVC cache.
+Each stage reruns only when its own inputs change. Changing `clustering`, `identity` or `coverage` reruns `cluster_members` and the stages after it, never the tokenized pool. Switching `clustering` between UniProt and MMseqs2 also adds or drops `get_cluster_xml`. Changing `val_ratio` or `seqs_num` reruns `cluster_index` and the manifest. Changing `max_workers` reruns nothing: it only sets how many cores the stages use. The XML is not copied into the DVC cache.
 
 Switching `enabled` between `true` and `false` changes how the `get_file` stage is written, so DVC downloads `url` again even when the file is already there.
 

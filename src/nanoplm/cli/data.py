@@ -768,7 +768,9 @@ def get_cluster_xml(url: str, output: str):
 @click.option("--identity", type=float, default=0.5)
 @click.option("--coverage", type=float, default=0.8)
 @click.option("--tmp-dir", type=click.Path(file_okay=False), default=None)
-@click.option("--threads", type=int, default=None)
+@click.option("--threads", type=int,
+              default=lambda: int(os.environ.get("NANOPLM_MAX_WORKERS", "-1")),
+              show_default="$NANOPLM_MAX_WORKERS, or -1 = all cores")
 def cluster_members(source, fasta, output, level, xml, identity, coverage, tmp_dir, threads):
     """Internal: write the canonical cluster table (cluster_id<TAB>sequence_id)."""
     from nanoplm.data.preparation.cluster_table import build_members_table

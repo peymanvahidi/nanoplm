@@ -99,10 +99,10 @@ def test_mmseqs_params_only_reach_cluster_members(tmp_path):
     assert st["get_file"]["outs"] == ["output/data/raw/sequences.fasta"]
     assert st["cluster_members"]["params"] == [
         {"data.yaml": ["cluster_subsampling.clustering", "cluster_subsampling.identity",
-                       "cluster_subsampling.coverage", "data_params.max_workers"]}]
-    assert "--threads ${data_params.max_workers}" in st["cluster_members"]["cmd"]
-    assert "--max-workers ${data_params.max_workers}" in st["cluster_pool"]["cmd"]
-    assert "data_params.max_workers" in st["cluster_pool"]["params"][0]["data.yaml"]
+                       "cluster_subsampling.coverage"]}]
+    # the core count comes from $NANOPLM_MAX_WORKERS, so changing it reruns nothing
+    assert "max_workers" not in yaml.safe_dump(st)
+    assert "--threads" not in st["cluster_members"]["cmd"]
     for name, stage in st.items():
         if name != "cluster_members":
             flat = str(stage.get("params", "")) + str(stage.get("deps", ""))
