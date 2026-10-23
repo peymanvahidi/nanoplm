@@ -112,7 +112,7 @@ Older configs with `data_dirs` (`url` / `local_fasta` and nine paths) still work
 | `uniref90` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` |
 | `uniref100` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz` |
 
-Instead of `fasta`, a source can name `prepared:`, a folder another `data.yaml` already built. `from-yaml` checks its manifest, prints what it holds and builds nothing.
+Instead of `fasta`, a source can name `prepared:`, a folder another `data.yaml` already built. `from-yaml` checks its manifest, prints what it holds and builds nothing. `output_dir` can then be left out.
 
 Start with SwissProt (about 570k sequences). It downloads in minutes and is enough to prove your pipeline works before you commit to a UniRef-scale run.
 
@@ -125,9 +125,11 @@ Start with SwissProt (about 570k sequences). It downloads in minutes and is enou
 | [`max_seq_len`](/nanoplm/reference/data/#data-data_params-max_seq_len) | `512` | Sequences are truncated to this length. See the callout below. |
 | [`val_ratio`](/nanoplm/reference/data/#data-data_params-val_ratio) | `0.1` | Fraction held out for validation loss. |
 | [`samples_per_shard`](/nanoplm/reference/data/#data-data_params-samples_per_shard) | `2000` | Sequences per `shard_NNNN.bin`. |
-| [`max_workers`](/nanoplm/reference/data/#data-data_params-max_workers) | `2` | Processes used for tokenization. `-1` uses every core. |
+| [`max_workers`](/nanoplm/reference/data/#data-data_params-max_workers) | `2` | Processes used for tokenization, and MMseqs2 threads with [cluster subsampling](/nanoplm/guides/cluster-subsampling/). `-1` uses every core. |
 | [`register_tokens`](/nanoplm/reference/data/#data-data_params-register_tokens) | `0` | 0, 1, or 2 learnable scratch tokens appended after EOS. Recorded in the manifest and injected into the model at pretrain time. |
 | [`drop_invalid_sequences`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences) | `false` | Whether a sequence with an unrecognised residue kills the run or gets excluded. See below. |
+
+`drop_invalid_sequences`, `shuffle`, `shuffle_seed`, `samples_per_shard`, `max_workers` and `register_tokens` can be left out of `data.yaml`; the template's values are the defaults. Writing a default out or deleting it reruns nothing.
 
 :::caution[max_seq_len is set here and nowhere else]
 `max_seq_len` is written into `.data_manifest`, and pretraining reads it back to compute gradient accumulation: `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`. There is no `max_seq_len` key in `pretrain.yaml`. If you want longer sequences, change it here and re-run the data stage: the shards themselves have to change.
