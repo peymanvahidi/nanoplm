@@ -306,3 +306,11 @@ def test_old_layout_errors(edit, match):
     edit(cfg)
     with pytest.raises(dc.DataConfigError, match=match):
         _parse(cfg)
+
+
+def test_old_layout_keys_that_older_templates_shipped_are_ignored():
+    old = copy.deepcopy(OLD)
+    old["data_params"].update(pipeline_backend="fast", device="auto")
+    cfg = _parse(old)
+    assert any("data_params.pipeline_backend is no longer used" in w for w in cfg.warnings)
+    assert any("data_params.device is no longer used" in w for w in cfg.warnings)

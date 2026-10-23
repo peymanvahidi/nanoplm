@@ -47,6 +47,8 @@ DATA_DIRS_KEYS = ("url", "local_fasta", "compressed_fasta", "extracted_fasta", "
 # folders under output_dir that a source name would collide with
 RESERVED_NAMES = ("downloads", "train", "val", "cluster_index")
 LEGACY_NAME = "main"
+# data_params keys older data.yaml templates shipped that nothing reads any more
+LEGACY_IGNORED = ("pipeline_backend", "device")
 WEIGHT_TOLERANCE = 1e-6
 ONE_SOURCE = "mixing several sources is not supported yet (one source only)"
 
@@ -399,8 +401,12 @@ def parse_data_config(config: dict, base_dir=None, name_of: str = "data.yaml") -
             raise DataConfigError(f"{name_of}: data_dirs must be a mapping")
         _check_keys("data_dirs", dirs, DATA_DIRS_KEYS)
         params = config.get("data_params") or {}
-        _check_keys("data_params", [OLD_PARAM_NAMES.get(k, k) for k in params], PARAM_FIELDS)
+        _check_keys("data_params", [OLD_PARAM_NAMES.get(k, k) for k in params],
+                    PARAM_FIELDS + LEGACY_IGNORED)
         src = legacy_source(config)
+        warnings = [migration_hint(config)]
+        warnings += [f"data_params.{k} is no longer used and is ignored; remove it"
+                     for k in LEGACY_IGNORED if k in params]
         return DataConfig(output_dir=src.output_dir, sources={src.name: src}, legacy=True,
-                          warnings=[migration_hint(config)])
+                          warnings=warnings)
     return _parse_sources(config, base_dir, name_of)
