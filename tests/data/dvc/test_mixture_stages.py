@@ -180,3 +180,18 @@ def test_from_yaml_mixes_a_prepared_source_with_a_built_one(tmp_path):
     assert _status(proj, env) == set()
     plain_source(built, 61, tag=5)                    # the prepared folder is rebuilt
     assert _status(proj, env) == {"mixture"}
+
+
+def test_the_table_has_a_weight_column_and_lists_a_shared_download_once(tmp_path):
+    from nanoplm.cli.data import plan_table
+    from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
+    from nanoplm.data.preparation.data_config import parse_data_config
+    cfg = parse_data_config(_mix(**THREE))
+    plans = {n: resolve_cluster_plan(s) for n, s in cfg.sources.items()}
+    lines = plan_table(cfg, plans, tmp_path, tmp_path / "data.yaml").splitlines()
+    assert lines[1] == "weight = share of training sequences"
+    assert lines[2].split()[:3] == ["source", "weight", "fasta"]
+    rows = {ln.split()[0]: ln for ln in lines[3:]}
+    assert rows["uniref50"].split()[1] == "0.7"
+    assert "uniref90.fasta.gz (url) + uniref50.xml.gz (url)" in rows["uniref50"]
+    assert "uniref90.fasta.gz (same download as uniref50)" in rows["u90"]
