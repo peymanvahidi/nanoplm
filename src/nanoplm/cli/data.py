@@ -1061,19 +1061,23 @@ def from_yaml(
     if kind == "pretrain":
         _print_rebuild_line(cwd, dvc_content, repro_env, params)
 
+    # dvc repro --dry fails at a stage whose input an earlier stage has not written yet
+    # (a pending download), so a dry run previews up to the stages that write it
+    pending = _pending_stages(cwd, dvc_content, params) if dry_run and not target else []
+
     # Build repro command
     if dry_run:
-        cmd: list[str] = _DVC + ["repro", "--dry", "--allow-missing"]
+        # --allow-missing would skip exactly the pending stages, whose outputs are missing
+        cmd: list[str] = _DVC + ["repro", "--dry"] + ([] if pending else ["--allow-missing"])
     else:
         cmd = _DVC + ["repro"]
     if verbose:
         cmd.append("-v")
     if force_repro:
         cmd.append("-f")
-    if target:
-        cmd.append(target)
+    cmd += [target] if target else pending
 
-    repro_target_desc = target if target else "full pipeline"
+    repro_target_desc = target or (f"up to {', '.join(pending)}" if pending else "full pipeline")
     click.echo(f"Running dvc repro ({repro_target_desc}){'  [dry-run]' if dry_run else ''}...")
     try:
         result = subprocess.run(cmd, cwd=str(cwd), env=repro_env)
@@ -1084,6 +1088,9 @@ def from_yaml(
             "'dvc' command not found. Please install DVC (pip install dvc)."
         )
 
+    if pending:
+        click.echo(f"The dry run stops after {', '.join(pending)}: DVC cannot preview the "
+                   "stages that read their outputs until those exist.")
     if not dry_run:
         _print_summary(cwd, params, kind, config_path, cfg)
 
@@ -1538,21 +1545,36 @@ def _stage_graph(dvc_content: str, params: dict) -> dict:
     return graph
 
 
-def _with_downstream(changed: set, graph: dict) -> set:
-    """``changed`` plus every stage that reads, directly or not, what one of them writes.
-    A dep inside an out (``split/train.fasta`` in ``split``) counts."""
-    def overlaps(a: str, b: str) -> bool:
-        return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+def _overlaps(a: str, b: str) -> bool:
+    """One path is the other or inside it (``split/train.fasta`` in ``split``)."""
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
+
+def _with_downstream(changed: set, graph: dict) -> set:
+    """``changed`` plus every stage that reads, directly or not, what one of them writes."""
     out = set(changed)
     todo = list(changed)
     while todo:
         outs = graph.get(todo.pop(), ((), ()))[1]
         for name, (deps, _) in graph.items():
-            if name not in out and any(overlaps(d, o) for d in deps for o in outs):
+            if name not in out and any(_overlaps(d, o) for d in deps for o in outs):
                 out.add(name)
                 todo.append(name)
     return out
+
+
+def _pending_stages(cwd: Path, dvc_content: str, params: dict) -> list:
+    """Stages whose inputs are all there but which have not written an output another
+    stage reads (e.g. a download not fetched yet)."""
+    graph = _stage_graph(dvc_content, params)
+    reads = [d for deps, _ in graph.values() for d in deps]
+
+    def missing(p: str) -> bool:
+        return not _resolve_path(p, cwd).exists()
+
+    return [name for name, (deps, outs) in graph.items()
+            if not any(missing(d) for d in deps)
+            and any(missing(o) and any(_overlaps(o, d) for d in reads) for o in outs)]
 
 
 def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict, params: dict) -> None:

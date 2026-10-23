@@ -120,6 +120,26 @@ def test_summary_for_a_plain_source(tmp_path, monkeypatch):
     assert out.index("Rebuild:") < out.index("Running dvc repro")
 
 
+def test_a_dry_run_previews_up_to_a_pending_download(tmp_path, monkeypatch):
+    """dvc repro --dry fails at a stage whose input is not downloaded yet, so a dry run
+    stops at the download; once every input is there it previews the whole pipeline."""
+    out, calls = _dry(tmp_path, monkeypatch, load_template("data_pretrain"))
+    repro = [c[0] for c in calls if "repro" in c[0]][-1]
+    assert repro[-3:] == ["repro", "--dry", "get_file"]       # no --allow-missing: it skips it
+    assert "Running dvc repro (up to get_file)  [dry-run]" in out
+    assert "The dry run stops after get_file" in out
+    out_dir = tmp_path / "output/data/pretrain_data"
+    for p in ("downloads/uniprot_sprot.fasta.gz", "swissprot/uniprot_sprot.fasta",
+              "swissprot/validation", "swissprot/shuffled.fasta", "swissprot/filtered.fasta",
+              "swissprot/split/train.fasta", "swissprot/split/val.fasta", "train", "val"):
+        (out_dir / p).parent.mkdir(parents=True, exist_ok=True)
+        (out_dir / p).touch()
+    out, calls = _dry(tmp_path, monkeypatch, load_template("data_pretrain"))
+    assert [c[0] for c in calls if "repro" in c[0]][-1][-3:] == ["repro", "--dry",
+                                                                 "--allow-missing"]
+    assert "(full pipeline)" in out and "stops after" not in out
+
+
 def test_summary_for_a_uniref_cluster_source_marks_overrides(tmp_path, monkeypatch):
     cfg = yaml.safe_load(load_template("data_pretrain"))
     cfg["sources"] = {"uniref50": {"fasta": "uniref50", "max_seqs": -1, "val_ratio": 0.0044,
