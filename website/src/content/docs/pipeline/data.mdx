@@ -60,57 +60,51 @@ Under the hood those steps are a [DVC](https://dvc.org/) DAG: `from-yaml` regene
 
 ## The whole config
 
-`data.yaml` is about 30 lines, so here it is in full.
+`data.yaml` is about 40 lines, so here it is in full.
 
 ```yaml title="data.yaml"
-data_dirs:
-  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
-  local_fasta: null          # set this INSTEAD of url to use a file already on disk
+output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml's dataset_dir points here
 
-  compressed_fasta:   "output/data/raw/uniprot_sprot.fasta.gz"  # only used when the source is .gz
-  extracted_fasta:    "output/data/raw/uniprot_sprot.fasta"
-  validation_dir:     "output/data/validation"
-  shuffled_fasta:     "output/data/raw/uniprot_sprot_shuffled.fasta"
-  filtered_fasta:     "output/data/filter/uniprot_sprot_filtered.fasta"
-  splitted_fasta_dir: "output/data/split"
-  output_dir:         "output/data/pretrain_data"   # pretrain.yaml's dataset_dir points here
+# One entry per FASTA (one source for now).
+# weight = share of training sequences (not tokens); weights must sum to 1.
+sources:
+  swissprot:
+    fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz
+    weight: 1.0
+    # max_seq_len: 1024  # any data_params field set here overrides it for this source
+
+  # (a commented UniRef50 cluster-subsampling example and a `prepared:` example follow)
 
 data_params:
-  seqs_num: 20000            # -1 keeps every sequence; start small and scale up once the loop works
-  min_seq_len: 20            # fragments below this teach the model nothing
-  max_seq_len: 512           # truncation length AND the length pretraining does its token math with
+  max_seqs: 20000        # -1 = all
+  min_seq_len: 20
+  max_seq_len: 512       # longer sequences are dropped
   val_ratio: 0.1
+  drop_invalid_sequences: false
+
+  # Rarely changed
   shuffle: true
-  shuffle_seed: 24           # same seed, same split: so two runs stay comparable
-  drop_invalid_sequences: false   # false = an invalid sequence FAILS the run instead of vanishing
-
-  samples_per_shard: 2000    # more, smaller shards give the dataloader more to parallelise over
-  max_workers: 2             # -1 uses every core; tokenization is the slow stage
-  register_tokens: 0         # 0-2 learnable scratch tokens after EOS; recorded in the manifest
-
-cluster_subsampling:     # each epoch, train on one random member of every cluster
-  enabled: false
-  members: null          # uniref90, uniref100, a FASTA URL/path, or null (= url itself)
-  clustering: auto       # auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or uniprot, mmseqs2
-  identity: 0.5          # mmseqs2 only: min sequence identity within a cluster
-  coverage: 0.8          # mmseqs2 only: min alignment coverage
+  shuffle_seed: 24
+  samples_per_shard: 2000  # raised automatically when a cluster pool needs it
+  max_workers: 2
+  register_tokens: 0
 ```
 
-`cluster_subsampling` is off by default. Turned on, each epoch trains on one random member of every cluster (for example a random UniRef90 sequence of each UniRef50 cluster) instead of a fixed set of sequences. `clustering: auto` takes UniProt's UniRef50 clusters for UniRef data and clusters anything else with MMseqs2; `uniprot` or `mmseqs2` forces one source, and `from-yaml` prints the one it uses before any stage runs. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+Everything the pipeline writes sits under `output_dir`: `downloads/` holds one file per URL, `swissprot/` holds that source's intermediate FASTAs, and `train/`, `val/` and `.data_manifest` are the dataset itself. Before any stage runs, `from-yaml` prints one row per source with its fasta, `max_seqs`, length range, `val_ratio` and clustering, then which stages will rebuild.
+
+A `cluster_subsampling` block under a source makes each epoch train on one random member of every cluster (for example a random UniRef90 sequence of each UniRef50 cluster) instead of a fixed set of sequences. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+
+Older configs with `data_dirs` (`url` / `local_fasta` and nine paths) still work. They are read as one source named `main`, and `from-yaml` prints the `sources:` block to paste in instead.
 
 ## Choosing a source
 
-Set **exactly one** of `url` or `local_fasta`. Setting both, or neither, is an error:
+`fasta` takes one of three things:
 
-```text title="Output"
-Error: Set either data_dirs.url or data_dirs.local_fasta, not both.
-```
+- a shortcut: `swissprot`, `trembl`, `uniref50`, `uniref90` or `uniref100`, the UniProt files below;
+- a URL (`http://`, `https://` or `ftp://`), downloaded once into `output_dir/downloads/`;
+- a local `.fasta` or `.fasta.gz` file, read where it is. A relative path is relative to `data.yaml`'s directory.
 
-A `local_fasta` is hard-linked rather than copied, so a 200 GB file costs nothing to "download". `compressed_fasta` only matters when the source ends in `.gz`; with a plain `.fasta` the extract step is not even added to the DAG, and the value is ignored.
-
-The scaffold ships the five built-in datasets as commented-out lines. Paste one into `url`:
-
-| Dataset | URL |
+| Shortcut | URL |
 | --- | --- |
 | `swissprot` | `https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz` |
 | `trembl` | `https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz` |
@@ -118,13 +112,15 @@ The scaffold ships the five built-in datasets as commented-out lines. Paste one 
 | `uniref90` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` |
 | `uniref100` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz` |
 
+Instead of `fasta`, a source can name `prepared:`, a folder another `data.yaml` already built. `from-yaml` checks its manifest, prints what it holds and builds nothing.
+
 Start with SwissProt (about 570k sequences). It downloads in minutes and is enough to prove your pipeline works before you commit to a UniRef-scale run.
 
 ## The parameters that matter
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| [`seqs_num`](/nanoplm/reference/data/#data-data_params-seqs_num) | `20000` | How many sequences to keep after filtering. `-1` keeps all of them. |
+| [`max_seqs`](/nanoplm/reference/data/#data-data_params-max_seqs) | `20000` | How many sequences to keep after filtering. `-1` keeps all of them. Older configs call it `seqs_num`. |
 | [`min_seq_len`](/nanoplm/reference/data/#data-data_params-min_seq_len) | `20` | Sequences shorter than this are dropped. |
 | [`max_seq_len`](/nanoplm/reference/data/#data-data_params-max_seq_len) | `512` | Sequences are truncated to this length. See the callout below. |
 | [`val_ratio`](/nanoplm/reference/data/#data-data_params-val_ratio) | `0.1` | Fraction held out for validation loss. |
@@ -171,34 +167,33 @@ Running dvc repro (full pipeline)...
 # ...
 ```
 
-`--fix` rewrites `drop_invalid_sequences: true` in your `data.yaml` **in place** and re-runs. The `filter` stage then excludes the IDs listed in `validation_dir/invalid_ids.txt`. Your config on disk now reflects what actually happened, which is the point: the change is visible in `git diff`, not hidden in a flag you forgot you passed.
+`--fix` rewrites `drop_invalid_sequences: true` in your `data.yaml` **in place** and re-runs. The `filter` stage then excludes the IDs listed in `<source>/validation/invalid_ids.txt`. Your config on disk now reflects what actually happened, which is the point: the change is visible in `git diff`, not hidden in a flag you forgot you passed.
 
 ## What you get
 
 <FileTree>
 
-- output/data/
-  - raw/
-    - uniprot_sprot.fasta.gz downloaded
+- output/data/pretrain_data/ point pretraining.dataset_dir here
+  - downloads/
+    - uniprot_sprot.fasta.gz downloaded, one file per URL
+  - swissprot/ this source's intermediate files
     - uniprot_sprot.fasta extracted
-    - uniprot_sprot_shuffled.fasta
-  - validation/
-    - validation.json
-    - invalid.fasta
-    - invalid_ids.txt consumed by `filter --exclude-ids`
-  - filter/
-    - uniprot_sprot_filtered.fasta
-  - split/
-    - train.fasta
-    - val.fasta
-  - **pretrain_data/** point pretraining.dataset_dir here
-    - train/
-      - shard_0000.bin uint8 token ids
-      - shard_0000.idx.npy per-sequence lengths
-      - …
-    - val/
-      - …
-    - .data_manifest
+    - validation/
+      - validation.json
+      - invalid.fasta
+      - invalid_ids.txt consumed by `filter --exclude-ids`
+    - shuffled.fasta
+    - filtered.fasta
+    - split/
+      - train.fasta
+      - val.fasta
+  - train/
+    - shard_0000.bin uint8 token ids
+    - shard_0000.idx.npy per-sequence lengths
+    - …
+  - val/
+    - …
+  - .data_manifest
 
 </FileTree>
 
