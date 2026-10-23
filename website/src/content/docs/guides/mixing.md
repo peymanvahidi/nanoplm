@@ -27,10 +27,13 @@ data_params:            # defaults for every source; a source may override any o
 
 For a third source, add an entry and lower the other weights so they still sum to 1:
 
-```yaml
+```yaml title="data.yaml"
+sources:
   small:
+    fasta: "small.fasta"
     weight: 0.2
   big:
+    fasta: "big.fasta"
     weight: 0.7
   extra:
     fasta: "extra.fasta"
@@ -145,22 +148,22 @@ The last stage of the pipeline, `mixture`, is the only one that reads the weight
 Rebuild: small: up to date; big: up to date; mixture: may rerun. (DVC skips a stage its run cache already has.)
 ```
 
-That rewrites the one mix in `output_dir`. To keep several ratios side by side, give each its own `data.yaml` and `output_dir`, and point every source at a folder you built already with `prepared:`:
+That rewrites the one mix in `output_dir`. To keep several ratios side by side, give each ratio its own folder with its own `data.yaml`, and point every source at a dataset you built already with `prepared:`. Say `base/` holds the `data.yaml` above and its built output, and `sweep_50_50/` sits next to it:
 
-```yaml title="sweep/data.yaml"
-output_dir: "output/mix_50_50"
+```yaml title="sweep_50_50/data.yaml"
+output_dir: "output/mix"
 sources:
   small:
-    prepared: "../mix1/output/data/pretrain_data/small"
+    prepared: "../base/output/data/pretrain_data/small"
     weight: 0.5
   big:
-    prepared: "../mix1/output/data/pretrain_data/big"
+    prepared: "../base/output/data/pretrain_data/big"
     weight: 0.5
 ```
 
-`from-yaml` then runs only the `mixture` stage. `output/mix_50_50/` holds one file, the 1 kB `.data_manifest`, and `dataset_dir` points at it. A few things to know:
+`nanoplm data from-yaml sweep_50_50/data.yaml` writes its `dvc.yaml` next to that `data.yaml`, so it does not touch `base/`. It runs only the `mixture` stage. `sweep_50_50/output/mix/` then holds only the mixture manifest, about 1 kB, and `dataset_dir` points at it. A few things to know:
 
-- `prepared:` names a source's folder, `<output_dir>/<source>`. The mix's own `output_dir` is refused, with `is a mixture; list its sources here instead`.
+- `prepared:` names a built dataset: a mix's `<output_dir>/<source>`, or the `output_dir` of a single-source `data.yaml`. A mix's own `output_dir` is refused, with `is a mixture; list its sources here instead`.
 - A prepared source is used as it was built. You cannot set `data_params` on it.
 - If a source is rebuilt in the original folder, every mix that uses it is stale. Training stops and says the source's manifest `changed after the mixture was written`. Rerun `from-yaml` in each sweep folder.
 
