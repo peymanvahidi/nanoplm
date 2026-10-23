@@ -312,3 +312,25 @@ def test_one_source_names_the_folders_an_earlier_mix_left(tmp_path):
     for p in got[:3]:
         shutil.rmtree(p) if p.is_dir() else p.unlink()
     assert orphaned_outputs(cfg, tmp_path) == []
+
+
+def test_a_layout_switch_names_the_extract_and_check_it_moved(tmp_path):
+    from nanoplm.cli.data import orphaned_outputs
+    from nanoplm.data.preparation.data_config import parse_data_config
+    out = tmp_path / "out"
+    for p in ("a/validation", "b/validation", "c/validation", "downloads/prot_fasta_validation"):
+        (out / p).mkdir(parents=True)
+    for p in ("a/prot.fasta", "b/prot.fasta", "downloads/prot.fasta"):
+        (out / p).write_text(">x\nMK\n")
+    a = {"fasta": "prot.fasta.gz", "weight": 0.4}
+    b = {"fasta": "prot.fasta.gz", "weight": 0.4, "drop_invalid_sequences": True}
+    c = {"fasta": "small.fasta", "weight": 0.2}
+    mix = parse_data_config(_mix(a=a, b=b, c=c))
+    # b keeps its own check, c (a local FASTA) its own check and no extract
+    assert orphaned_outputs(mix, tmp_path) == [out / "a/prot.fasta", out / "a/validation",
+                                               out / "b/prot.fasta"]
+    one = yaml.safe_load(load_template("data_pretrain"))
+    one["output_dir"] = "out"
+    one["sources"] = {"a": {"fasta": "prot.fasta.gz"}}
+    assert orphaned_outputs(parse_data_config(one), tmp_path) == [
+        out / "downloads/prot.fasta", out / "downloads/prot_fasta_validation"]

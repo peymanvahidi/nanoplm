@@ -1345,15 +1345,44 @@ def orphaned_outputs(cfg, cwd: Path) -> list:
         return []
     if cfg.is_mixture:
         # output_dir/.data_manifest is the mixture's own
-        return [out / n for n in _BUILT_OUTPUTS[:-1] if (out / n).exists()]
-    found = []
-    for d in sorted(p for p in out.iterdir() if p.is_dir() and p.name != "downloads"):
-        if not (d / ".data_manifest").is_file():
-            continue
-        # the source's own folder keeps its intermediates; another one goes whole
-        found += ([d / n for n in _BUILT_OUTPUTS if (d / n).exists()]
-                  if d.name in cfg.sources else [d])
+        found = [out / n for n in _BUILT_OUTPUTS[:-1] if (out / n).exists()]
+    else:
+        found = []
+        for d in sorted(p for p in out.iterdir() if p.is_dir() and p.name != "downloads"):
+            if not (d / ".data_manifest").is_file():
+                continue
+            # the source's own folder keeps its intermediates; another one goes whole
+            found += ([d / n for n in _BUILT_OUTPUTS if (d / n).exists()]
+                      if d.name in cfg.sources else [d])
+    for src in cfg.sources.values():
+        if not src.prepared:
+            found += [p for p in (_resolve_path(q, cwd) for q in _other_layout_prep(src, cwd))
+                      if p.exists() and not any(p.is_relative_to(f) for f in found)]
     return found
+
+
+def _other_layout_prep(src, base_dir) -> list:
+    """The extracted FASTA and check folder this source has in the other layout: a mix
+    extracts a .gz into downloads/ and checks a FASTA there (the dvc.yaml generator's
+    _share_check), one source does both in output_dir/<name>/."""
+    from nanoplm.cli._dvc_yaml_gen import _in_downloads, _safe
+    from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
+    from nanoplm.data.preparation.data_config import _join, file_name, strip_gz
+    plan = resolve_cluster_plan(src, base_dir)
+    if plan is not None and not plan.members_from_source:
+        packed, fasta, read = plan.members_compressed, plan.members, str(plan.members_fasta)
+    else:
+        packed, fasta, read = src.paths["compressed_fasta"], src.fasta, src.paths["extracted_fasta"]
+    downloads, work = src.downloads_dir, src.work_dir
+    name = strip_gz(file_name(str(fasta)))
+    mix_read = _join(downloads, name) if packed else read
+    paths = {}
+    if packed:
+        paths["extract"] = (_join(downloads, name), _join(work, name))
+    if _in_downloads(mix_read, src) and "drop_invalid_sequences" not in src.overrides:
+        paths["check"] = (_join(downloads, _safe(file_name(mix_read)) + "_validation"),
+                          _join(work, "validation"))
+    return [single if src.mixed else mix for mix, single in paths.values()]
 
 
 def _warn_orphaned_outputs(cfg, cwd: Path) -> None:
