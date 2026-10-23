@@ -1404,19 +1404,31 @@ def _size(path: Path) -> str:
     return f"{n} B"
 
 
-def _fasta_cell(src, cwd: Path) -> str:
-    """Where the fasta comes from: a URL to download, a copy already downloaded, or a
-    local file read in place."""
-    if src.is_url:
-        got = src.paths.get("compressed_fasta" if src.is_compressed else "extracted_fasta")
-        on_disk = _resolve_path(got, cwd) if got else None
-        name = Path(got).name if got else src.fasta
+def _file_cell(value: str, download, cwd: Path) -> str:
+    """Where one input file comes from: a URL to download (``download`` is where it
+    goes), a copy already downloaded, or a local file read in place."""
+    from nanoplm.data.preparation.data_config import is_url
+    if is_url(value):
+        on_disk = _resolve_path(download, cwd) if download else None
+        name = Path(download).name if download else value
         if on_disk is not None and on_disk.is_file():
             return f"{name} (reuse, {_size(on_disk)})"
         return f"{name} (url)"
-    on_disk = _resolve_path(src.fasta, cwd)
-    return f"{src.fasta} (local, {_size(on_disk)})" if on_disk.is_file() else \
-        f"{src.fasta} (local)"
+    on_disk = _resolve_path(value, cwd)
+    return f"{value} (local, {_size(on_disk)})" if on_disk.is_file() else f"{value} (local)"
+
+
+def _fasta_cell(src, plan, cwd: Path) -> str:
+    """The files the stages read: the fasta, or the members FASTA when the members
+    differ from it (the fasta is then never fetched), plus the cluster XML."""
+    if plan is None or plan.members_from_source:
+        cell = _file_cell(src.fasta, src.paths.get(
+            "compressed_fasta" if src.is_compressed else "extracted_fasta"), cwd)
+    else:
+        cell = _file_cell(plan.members, plan.members_compressed or plan.members_fasta, cwd)
+    if plan is not None and plan.xml_url:
+        cell += " + " + _file_cell(plan.xml_url, plan.xml_path, cwd)
+    return cell
 
 
 def plan_table(cfg, plan, cwd: Path, config_path: Path) -> str:
@@ -1436,7 +1448,7 @@ def plan_table(cfg, plan, cwd: Path, config_path: Path) -> str:
         p = src.params
         seqs = "all" if p["max_seqs"] == -1 else f"{p['max_seqs']:,}"
         rows.append((
-            src.name, _fasta_cell(src, cwd), mark(seqs, "max_seqs"),
+            src.name, _fasta_cell(src, plan, cwd), mark(seqs, "max_seqs"),
             mark(f"{p['min_seq_len']}-{p['max_seq_len']}", "min_seq_len", "max_seq_len"),
             mark(f"{p['val_ratio']:g}", "val_ratio"),
             plan.source_line() if plan is not None else "off",

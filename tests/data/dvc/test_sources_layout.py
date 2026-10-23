@@ -123,10 +123,27 @@ def test_summary_for_a_uniref_cluster_source_marks_overrides(tmp_path, monkeypat
     table = out[out.index("data.yaml: 1 source"):out.index("Regenerated")]
     assert table == (
         f"data.yaml: 1 source -> {tmp_path}/output/data/pretrain_data\n"
-        "source    fasta                    seqs  len     val      clustering\n"
-        "uniref50  uniref50.fasta.gz (url)  all*  20-512  0.0044*  "
+        "source    fasta                                            seqs  len     val      clustering\n"
+        "uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all*  20-512  0.0044*  "
         "UniProt uniref50.xml.gz (members: UniRef90)\n"
         "* = set on this source\n")
+
+
+def test_summary_names_the_files_a_cluster_run_reads(tmp_path, monkeypatch):
+    """uniref50.fasta.gz is never fetched when the members differ, so it is not shown;
+    the members and the XML are, with a copy already there marked reuse."""
+    dl = tmp_path / "output/data/pretrain_data/downloads"
+    dl.mkdir(parents=True)
+    (dl / "uniref50.xml.gz").write_bytes(b"x" * 2_000)
+    cfg = yaml.safe_load(load_template("data_pretrain"))
+    cfg["sources"] = {"u": {"fasta": "uniref50", "cluster_subsampling": {"members": "uniref90"}}}
+    out, _ = _dry(tmp_path, monkeypatch, cfg)
+    assert "uniref90.fasta.gz (url) + uniref50.xml.gz (reuse, 2.0 kB)" in out
+    assert "uniref50.fasta" not in out
+    # members: null on a UniRef90 fasta: the fasta itself, and the XML
+    cfg["sources"] = {"u": {"fasta": "uniref90", "cluster_subsampling": {"members": None}}}
+    out, _ = _dry(tmp_path, monkeypatch, cfg)
+    assert "uniref90.fasta.gz (url) + uniref50.xml.gz (reuse, 2.0 kB)" in out
 
 
 def test_summary_shows_a_reused_download_and_a_local_file(tmp_path, monkeypatch):

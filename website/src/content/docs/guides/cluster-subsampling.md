@@ -31,12 +31,12 @@ sources:
 - [`clustering`](/nanoplm/reference/data/#data-cluster_subsampling-clustering): where the clusters come from. `auto` uses UniProt's UniRef50 clusters for UniRef data and MMseqs2 for anything else (see [Where the clusters come from](#where-the-clusters-come-from)). `uniprot` requires UniProt clusters and fails at config time when the data is not UniRef. `mmseqs2` always clusters the members with MMseqs2, also for UniRef data.
 - [`identity`](/nanoplm/reference/data/#data-cluster_subsampling-identity) and [`coverage`](/nanoplm/reference/data/#data-cluster_subsampling-coverage) are only read when MMseqs2 does the clustering.
 
-Before any stage runs, `nanoplm data from-yaml` prints one row per source. The last column names the cluster source it picked; `*` marks a value set on the source:
+Before any stage runs, `nanoplm data from-yaml` prints one row per source. The `fasta` column lists the files the stages read: here the members FASTA and the XML, since `uniref50.fasta.gz` is never fetched. `(url)` means it will be downloaded, `(reuse, <size>)` that a copy is already there. The last column names the cluster source it picked; `*` marks a value set on the source:
 
 ```text title="Output"
 data.yaml: 1 source -> /work/output/data/pretrain_data
-source    fasta                    seqs  len     val      clustering
-uniref50  uniref50.fasta.gz (url)  all*  20-512  0.0044*  UniProt uniref50.xml.gz (members: UniRef90)
+source    fasta                                            seqs  len     val      clustering
+uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all*  20-512  0.0044*  UniProt uniref50.xml.gz (members: UniRef90)
 * = set on this source
 ```
 
