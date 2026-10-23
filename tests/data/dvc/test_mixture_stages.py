@@ -195,3 +195,18 @@ def test_the_table_has_a_weight_column_and_lists_a_shared_download_once(tmp_path
     assert rows["uniref50"].split()[1] == "0.7"
     assert "uniref90.fasta.gz (url) + uniref50.xml.gz (url)" in rows["uniref50"]
     assert "uniref90.fasta.gz (same download as uniref50)" in rows["u90"]
+
+
+def test_a_prepared_source_with_other_register_tokens_fails_before_dvc(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    from tests.data.datasets.mixture_sources import plain_source
+    plain_source(tmp_path / "built", 20, tag=5, register_tokens=1)
+    cfg = _mix(mine={"prepared": "built", "weight": 0.5},
+               swissprot={"fasta": "swissprot", "weight": 0.5})
+    (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("DVC must not run"))
+    r = CliRunner().invoke(data, ["from-yaml", str(tmp_path / "data.yaml")])
+    assert r.exit_code != 0
+    assert "the sources of a mix must use the same register_tokens; got mine 1, swissprot 0" \
+        in r.output

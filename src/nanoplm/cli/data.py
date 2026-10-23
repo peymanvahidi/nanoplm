@@ -1336,6 +1336,12 @@ def _validate_sources(cfg, cwd: Path, config_path: Path) -> dict:
     for src in cfg.sources.values():
         out[src.name] = (_prepared_manifest(src, cwd, config_path)[1] if src.prepared
                          else _validate_cluster_block(src, config_path))
+    regs = {s.name: out[s.name].num_register_tokens if s.prepared
+            else s.params["register_tokens"] for s in cfg.sources.values()}
+    if cfg.is_mixture and len(set(regs.values())) > 1:
+        got = ", ".join(f"{n} {v}" for n, v in regs.items())
+        raise click.ClickException(f"{config_path.name}: the sources of a mix must use the "
+                                   f"same register_tokens; got {got}")
     return out
 
 
