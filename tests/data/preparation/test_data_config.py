@@ -244,6 +244,13 @@ def test_a_top_level_cluster_block_points_at_its_new_place():
 # ------------------------------------------------------------------ prepared
 
 
+def test_output_dir_is_optional_only_without_a_fasta():
+    cfg = _parse({"sources": {"mine": {"prepared": "../built"}}})
+    assert cfg.source.prepared == "../built" and cfg.output_dir == ""
+    with pytest.raises(dc.DataConfigError, match="output_dir is required"):
+        _parse({"sources": {"mine": {"fasta": "swissprot"}}})
+
+
 def test_prepared_takes_no_build_settings():
     src = _parse(_with_source({"prepared": "../built"})).source
     assert src.prepared == "../built" and src.fasta is None

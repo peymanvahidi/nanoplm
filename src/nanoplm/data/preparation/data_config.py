@@ -276,15 +276,21 @@ def _weight(value, where: str) -> float:
 def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
     warnings: list = []
     _check_keys(name_of, config, TOP_KEYS)
-    output_dir = config.get("output_dir")
-    if not isinstance(output_dir, str) or not output_dir:
-        raise DataConfigError(f"{name_of}: output_dir is required (the folder pretrain.yaml's "
-                              "dataset_dir points at)")
-    output_dir = output_dir.rstrip("/") or "/"
     sources = config.get("sources")
     if not isinstance(sources, dict) or not sources:
         raise DataConfigError(f"{name_of}: sources needs one entry, e.g. "
                               "sources: {swissprot: {fasta: swissprot}}")
+    output_dir = config.get("output_dir")
+    # a prepared source is used where it is, so data.yaml builds nothing without a fasta
+    only_prepared = all(isinstance(s, dict) and s.get("prepared") is not None
+                        for s in sources.values())
+    if output_dir is None and only_prepared:
+        output_dir = ""
+    elif not isinstance(output_dir, str) or not output_dir:
+        raise DataConfigError(f"{name_of}: output_dir is required (the folder pretrain.yaml's "
+                              "dataset_dir points at)")
+    else:
+        output_dir = output_dir.rstrip("/") or "/"
     if len(sources) > 1:
         raise DataConfigError(f"{name_of}: {ONE_SOURCE}; sources has {len(sources)}: "
                               f"{', '.join(map(str, sources))}")

@@ -250,10 +250,12 @@ def _built(folder, **extra):
         "val_sequences": 4, "sharded": True, "samples_per_shard": 2000, **extra}))
 
 
-def test_a_prepared_source_is_checked_and_nothing_is_built(tmp_path, monkeypatch):
+@pytest.mark.parametrize("top", [{"output_dir": "out"}, {}])
+def test_a_prepared_source_is_checked_and_nothing_is_built(tmp_path, monkeypatch, top):
+    """output_dir may be left out: a prepared folder is used where it is."""
     _no_dvc(monkeypatch)
     _built(tmp_path / "other/out")
-    cfg = {"output_dir": "out", "sources": {"mine": {"prepared": "other/out"}}}
+    cfg = {**top, "sources": {"mine": {"prepared": "other/out"}}}
     r = _run(_write(tmp_path, cfg))
     assert r.exit_code == 0, r.output
     folder = (tmp_path / "other/out").resolve()
