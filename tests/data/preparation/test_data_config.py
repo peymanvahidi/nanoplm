@@ -287,15 +287,71 @@ def test_the_old_layout_is_source_main():
     assert 'To skip the download, set fasta: "output/data/raw/sequences.fasta.gz"' in hint
 
 
+def _pasted(hint: str, old: dict) -> dict:
+    """data.yaml after following the hint: the block replaces data_dirs."""
+    block = hint.split(" with:\n\n", 1)[1].split("\n\n", 1)[0]
+    params = dict(old["data_params"])
+    params["max_seqs"] = params.pop("seqs_num")
+    return {**yaml.safe_load(block), "data_params": params}
+
+
+def test_the_hint_never_deletes_what_it_reuses():
+    """It offers the downloaded file as the new fasta, so that file, the old output_dir
+    (the new one) and the user's own local_fasta are not in the delete list."""
+    hint = _parse(copy.deepcopy(OLD)).warnings[0]
+    deletable = hint.split("Then these old files can be deleted: ", 1)[1].rstrip(".")
+    d = OLD["data_dirs"]
+    assert deletable.split(", ") == [d["extracted_fasta"], d["validation_dir"],
+                                     d["shuffled_fasta"], d["filtered_fasta"],
+                                     d["splitted_fasta_dir"]]
+    new = _pasted(hint, OLD)
+    new["sources"]["main"]["fasta"] = d["compressed_fasta"]
+    src = _parse(new).source
+    assert src.fasta == d["compressed_fasta"] and not src.is_url
+    assert src.paths["compressed_fasta"] == d["compressed_fasta"]   # read in place
+
+
 def test_the_old_layout_local_fasta_hint():
     old = copy.deepcopy(OLD)
-    old["data_dirs"].update(url=None, local_fasta="/data/mine.fasta")
+    old["data_dirs"].update(url=None, local_fasta="/data/mine.fasta.gz")
     hint = _parse(old).warnings[0]
-    assert "    fasta: '/data/mine.fasta'" in hint and "skip the download" not in hint
+    assert '    fasta: "/data/mine.fasta.gz"' in hint and "skip the download" not in hint
+    deletable = hint.split("Then these old files can be deleted: ", 1)[1]
+    assert "/data/mine.fasta.gz" not in deletable
+    assert old["data_dirs"]["compressed_fasta"] in deletable       # get_file's link to it
+
+
+@pytest.mark.parametrize("block", [None, {}, {"enabled": False, "members": "uniref90"},
+                                   {"members": None, "clustering": "auto"}])
+def test_an_old_top_level_cluster_block_that_is_off_is_ignored(block):
+    cfg = copy.deepcopy(OLD)
+    cfg["cluster_subsampling"] = block
+    got = _parse(cfg)
+    assert got.legacy and got.source.cluster is None
+    assert any("cluster_subsampling at the top level is off and is ignored" in w
+               for w in got.warnings)
+
+
+def test_an_old_top_level_cluster_block_that_is_on_says_what_to_paste(tmp_path):
+    from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
+    cfg = copy.deepcopy(OLD)
+    cfg["data_dirs"]["url"] = dc.FASTA_SHORTCUTS["uniref50"]
+    cfg["cluster_subsampling"] = {"enabled": True, "clustering": "uniprot", "identity": 0.5}
+    with pytest.raises(dc.DataConfigError) as e:
+        _parse(cfg)
+    msg = str(e.value)
+    assert "cluster_subsampling now sits under its source" in msg
+    assert ("    fasta: uniref50\n    cluster_subsampling:\n      members: null\n"
+            "      clustering: uniprot\n      identity: 0.5\n") in msg
+    new = _pasted(msg, cfg)
+    new["sources"]["main"]["cluster_subsampling"]["members"] = "uniref90"
+    src = _parse(new).source
+    assert src.cluster == {"members": "uniref90", "clustering": "uniprot", "identity": 0.5}
+    assert resolve_cluster_plan(src).cluster_source == "uniref_xml"
 
 
 @pytest.mark.parametrize("edit, match", [
-    (lambda c: c.update(cluster_subsampling={"enabled": False}),
+    (lambda c: c.update(cluster_subsampling={"enabled": True}),
      "cluster_subsampling now sits under its source"),
     (lambda c: c.update(sources={}), "data_dirs is the old layout; use output_dir"),
     (lambda c: c["data_dirs"].update(urll="x"), "data_dirs: unknown key urll"),

@@ -389,39 +389,89 @@ def legacy_source(config: dict) -> Source:
     return src
 
 
-def migration_hint(config: dict) -> str:
-    """The deprecation warning for a data_dirs config, with the block to paste in."""
+def _scalar(value) -> str:
+    """A YAML scalar for the paste-in block: a word (a shortcut, a choice) bare, a path or
+    URL quoted."""
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        bare = re.fullmatch(r"[a-z][a-z0-9_]*", value) and value not in (
+            "null", "true", "false", "yes", "no", "on", "off")
+        return value if bare else f'"{value}"'
+    return literal(value)
+
+
+# data_dirs files that the sources layout no longer reads
+_OLD_INTERMEDIATES = ("extracted_fasta", "validation_dir", "shuffled_fasta", "filtered_fasta",
+                      "splitted_fasta_dir")
+
+
+def migration_hint(config: dict, cluster: Optional[dict] = None) -> str:
+    """The deprecation warning for a data_dirs config, with the block to paste in.
+    ``cluster`` is an old top-level cluster_subsampling block to move under the source."""
     dirs = config.get("data_dirs") or {}
     fasta = dirs.get("url") or dirs.get("local_fasta")
     shortcut = next((k for k, v in FASTA_SHORTCUTS.items() if v == fasta), None)
     out = dirs.get("output_dir") or "output/data/pretrain_data"
+    intro = ("data_dirs is the old data.yaml layout. It still works, read as one source "
+             f'named "{LEGACY_NAME}". To switch, replace data_dirs with:')
+    if cluster is not None:
+        intro = ("Cluster subsampling needs the sources layout. Replace data_dirs and "
+                 "cluster_subsampling with:")
     lines = [
-        "data_dirs is the old data.yaml layout. It still works, read as one source named "
-        f'"{LEGACY_NAME}". To switch, replace data_dirs with:',
+        intro,
         "",
         f'output_dir: "{out}"',
         "sources:",
         f"  {LEGACY_NAME}:",
-        f'    fasta: {shortcut if shortcut else repr(fasta)}',
+        f"    fasta: {shortcut or _scalar(fasta)}",
+    ]
+    if cluster is not None:
+        lines.append("    cluster_subsampling:")
+        lines.append(f"      members: {_scalar(cluster.get('members'))}")
+        lines += [f"      {k}: {_scalar(cluster[k])}" for k in CLUSTER_KEYS[1:] if k in cluster]
+    lines += [
         "",
         "and rename data_params.seqs_num to max_seqs. The new layout keeps intermediate "
         f"files under output_dir/{LEGACY_NAME}/, so the first run after switching rebuilds "
-        "everything; the old ones in data_dirs can then be deleted.",
+        "them.",
     ]
     compressed = dirs.get("compressed_fasta")
+    old = [dirs[k] for k in _OLD_INTERMEDIATES if dirs.get(k)]
     if dirs.get("url") and compressed:
         lines.append(f'To skip the download, set fasta: "{compressed}" (the file already '
-                     "downloaded).")
+                     "downloaded; it is read where it is, so keep it).")
+    elif compressed and dirs.get("local_fasta"):
+        old.append(compressed)          # get_file's link to local_fasta
+    if old:
+        lines.append(f"Then these old files can be deleted: {', '.join(old)}.")
     return "\n".join(lines)
+
+
+def _top_level_cluster(config: dict, name_of: str, warnings: list) -> dict:
+    """An old (507bca9) top-level cluster_subsampling block. Off (enabled false or left
+    out, or an empty block) next to data_dirs: warned about and dropped. On: an error
+    with the sources layout to paste in. Without data_dirs it is always an error."""
+    block = config["cluster_subsampling"]
+    off = block is None or (isinstance(block, dict) and block.get("enabled") is not True)
+    if "data_dirs" in config and off:
+        warnings.append("cluster_subsampling at the top level is off and is ignored; "
+                        "remove it. To turn it on, move it under a source (see "
+                        "`nanoplm data get-yaml`)")
+        return {k: v for k, v in config.items() if k != "cluster_subsampling"}
+    msg = (f"{name_of}: cluster_subsampling now sits under its source: "
+           "sources.<name>.cluster_subsampling (see `nanoplm data get-yaml`), without "
+           "enabled: the block being present turns it on")
+    if "data_dirs" in config and isinstance(block, dict):
+        msg += ".\n" + migration_hint(config, block)
+    raise DataConfigError(msg)
 
 
 def parse_data_config(config: dict, base_dir=None, name_of: str = "data.yaml") -> DataConfig:
     """Read a parsed pretraining data.yaml. ``base_dir`` is its directory (None = cwd)."""
+    early: list = []
     if "cluster_subsampling" in config:
-        raise DataConfigError(
-            f"{name_of}: cluster_subsampling now sits under its source: "
-            "sources.<name>.cluster_subsampling (see `nanoplm data get-yaml`), without "
-            "enabled: the block being present turns it on")
+        config = _top_level_cluster(config, name_of, early)
     if "data_dirs" in config:
         if "sources" in config or "output_dir" in config:
             raise DataConfigError(f"{name_of}: data_dirs is the old layout; use output_dir + "
@@ -435,7 +485,7 @@ def parse_data_config(config: dict, base_dir=None, name_of: str = "data.yaml") -
         _check_keys("data_params", [OLD_PARAM_NAMES.get(k, k) for k in params],
                     PARAM_FIELDS + LEGACY_IGNORED)
         src = legacy_source(config)
-        warnings = [migration_hint(config)]
+        warnings = [migration_hint(config)] + early
         warnings += [f"data_params.{k} is no longer used and is ignored; remove it"
                      for k in LEGACY_IGNORED if k in params]
         return DataConfig(output_dir=src.output_dir, sources={src.name: src}, legacy=True,
