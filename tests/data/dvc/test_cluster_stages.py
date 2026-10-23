@@ -85,8 +85,8 @@ def test_uniref50_url_uniref90_members_stages():
     assert "params" not in st["get_members_fasta"]          # depends only on the URL
     assert st["get_cluster_xml"]["outs"] == [
         {f"{OUT}/downloads/uniref50.xml.gz": {"persist": True, "cache": False}}]
-    # identity / coverage are ignored here, so they must not trigger a rerun
-    assert st["cluster_members"]["params"] == [{"data.yaml": [f"{BLOCK}.clustering"]}]
+    # identity / coverage are ignored here, and clustering: auto is the default
+    assert "params" not in st["cluster_members"]
     assert "--source uniref_xml --level uniref90" in st["cluster_members"]["cmd"]
     # a length-filter change must not rerun the XML scan
     assert "filtered.fasta" not in str(st["cluster_members"])
@@ -99,6 +99,19 @@ def test_uniref50_url_uniref90_members_stages():
     assert st["cluster_index"]["cmd"].endswith(
         f" --cluster-xml {OUT}/downloads/uniref50.xml.gz")
     assert "--cluster-xml" not in _stages(_source("uniref50", {}))["cluster_index"]["cmd"]
+
+
+def test_writing_a_cluster_default_out_changes_nothing(tmp_path):
+    """identity 0.5, coverage 0.8 and clustering auto are what a left-out key means, so
+    writing them gives the same dvc.yaml (no new DVC param, no rerun)."""
+    own = tmp_path / "mine.fasta"
+    own.write_text(">a\nMKV\n")
+    for fasta, block in ((str(own), {}), ("uniref50", {"members": "uniref90"})):
+        written = {**block, "clustering": "auto", "identity": 0.5, "coverage": 0.8}
+        assert _stages(_source(fasta, written)) == _stages(_source(fasta, block))
+    changed = _stages(_source(str(own), {"identity": 0.6}))["cluster_members"]
+    assert "--identity ${" + BLOCK + ".identity} --coverage 0.8" in changed["cmd"]
+    assert changed["params"] == [{"data.yaml": [f"{BLOCK}.identity"]}]
 
 
 @pytest.mark.parametrize("block", [{"members": "uniref90"}, {"clustering": "mmseqs2"}])
@@ -128,7 +141,7 @@ def test_an_override_is_referenced_where_it_is_set():
 def test_mmseqs_params_only_reach_cluster_members(tmp_path):
     own = tmp_path / "mine.fasta"
     own.write_text(">a\nMKV\n")
-    st = _stages(_source(str(own), {"clustering": "auto", "identity": 0.5, "coverage": 0.8}))
+    st = _stages(_source(str(own), {"clustering": "mmseqs2", "identity": 0.6, "coverage": 0.9}))
     assert "get_cluster_xml" not in st and "get_members_fasta" not in st
     # a local file is read in place: no get_file, and check reads it directly
     assert "get_file" not in st and st["check"]["deps"][0] == str(own)
@@ -185,9 +198,13 @@ def _status(tmp_path, env):
 
 
 def _edit(tmp_path, fn):
+    """Edit data.yaml and regenerate dvc.yaml, as `nanoplm data from-yaml` does before it
+    runs DVC (a value at its default is in the command, not a ${...} reference)."""
     cfg = yaml.safe_load((tmp_path / "data.yaml").read_text())
     fn(cfg)
     (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    (tmp_path / "dvc.yaml").write_text(
+        generate_dvc_yaml(cfg, "pretrain", "data.yaml", base_dir=tmp_path))
 
 
 def _assert_source_line_first(r, text):

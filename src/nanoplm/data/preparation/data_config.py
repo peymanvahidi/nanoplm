@@ -38,6 +38,11 @@ URL_SCHEMES = ("http://", "https://", "ftp://")
 # data_params fields of a pretraining run, in template order
 PARAM_FIELDS = ("max_seqs", "min_seq_len", "max_seq_len", "val_ratio", "drop_invalid_sequences",
                 "shuffle", "shuffle_seed", "samples_per_shard", "max_workers", "register_tokens")
+# the "rarely changed" fields may be left out (master's template values). In the sources
+# layout a field at its default goes into dvc.yaml as a value, not a DVC param, so
+# writing it out or deleting it reruns nothing.
+PARAM_DEFAULTS = {"drop_invalid_sequences": False, "shuffle": True, "shuffle_seed": 24,
+                  "samples_per_shard": 2000, "max_workers": 2, "register_tokens": 0}
 OLD_PARAM_NAMES = {"seqs_num": "max_seqs"}
 SOURCE_KEYS = ("fasta", "prepared", "weight", "cluster_subsampling")
 CLUSTER_KEYS = ("members", "clustering", "identity", "coverage")
@@ -114,6 +119,16 @@ def strip_gz(name: str) -> str:
     return name[:-3] if name.endswith(".gz") else name
 
 
+def literal(value) -> str:
+    """A value as DVC writes a ${...} reference to it into a command."""
+    return ("true" if value else "false") if isinstance(value, bool) else str(value)
+
+
+def is_default(value, default) -> bool:
+    """``value == default`` without True == 1 or 0 == False."""
+    return type(value) is type(default) and value == default
+
+
 def _join(*parts: str) -> str:
     return "/".join(p.rstrip("/") for p in parts if p)
 
@@ -131,6 +146,7 @@ class Source:
     params: dict = field(default_factory=dict)
     keys: dict = field(default_factory=dict)
     overrides: tuple = ()                  # data_params fields set on this source
+    defaulted: frozenset = frozenset()     # fields at their PARAM_DEFAULTS value
     cluster: Optional[dict] = None         # the cluster_subsampling block, None = off
     paths: dict = field(default_factory=dict)
     output_dir: str = ""                   # the top-level output_dir (dataset_dir)
@@ -149,10 +165,18 @@ class Source:
         return _join(self.output_dir, self.name)
 
     def key(self, name: str) -> str:
+        """Where data.yaml sets a field (``data_params.X`` when it is left out)."""
         return self.keys[name]
 
+    def param_key(self, name: str) -> Optional[str]:
+        """The DVC param for a field, None for one at its default."""
+        return None if name in self.defaulted else self.keys[name]
+
     def ref(self, name: str) -> str:
-        """``${data_params.max_seq_len}``, or the source's override."""
+        """``${data_params.max_seq_len}``, or the source's override; a field at its
+        default is written as its value."""
+        if name in self.defaulted:
+            return literal(self.params[name])
         return "${" + self.keys[name] + "}"
 
     def path(self, name: str) -> str:
@@ -309,11 +333,15 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
         if "cluster_subsampling" in spec:
             src.cluster = _cluster_block(spec["cluster_subsampling"], where)
         merged = {**defaults, **over}
-        missing = [f for f in PARAM_FIELDS if f not in merged]
+        missing = [f for f in PARAM_FIELDS if f not in merged and f not in PARAM_DEFAULTS]
         if missing:
             raise DataConfigError(f"{name_of}: data_params.{missing[0]} is required")
-        src.params = {f: merged[f][0] for f in PARAM_FIELDS}
-        src.keys = {f: merged[f][1] for f in PARAM_FIELDS}
+        src.params = {f: merged[f][0] if f in merged else PARAM_DEFAULTS[f]
+                      for f in PARAM_FIELDS}
+        src.keys = {f: merged[f][1] if f in merged else f"data_params.{f}"
+                    for f in PARAM_FIELDS}
+        src.defaulted = frozenset(f for f, d in PARAM_DEFAULTS.items()
+                                  if is_default(src.params[f], d))
         src.overrides = tuple(f for f in PARAM_FIELDS if f in over)
         src.paths = _source_paths(src)
         out[name] = src

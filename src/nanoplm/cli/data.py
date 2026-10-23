@@ -1370,12 +1370,25 @@ def _detect_kind(data_params: dict, filename: str) -> str:
 
 def _flip_drop_invalid(config_path: Path, value: bool) -> None:
     """Edit drop_invalid_sequences in place (every occurrence, so a per-source
-    override flips too), keeping the file's comments and layout."""
+    override flips too), keeping the file's comments and layout. A data.yaml that
+    leaves it out (it defaults to false) gets it added under data_params."""
     import re
     text = config_path.read_text()
     new_val = "true" if value else "false"
     pattern = re.compile(r"^(\s*drop_invalid_sequences\s*:\s*)(true|false)(\s*(?:#.*)?)$", re.M)
     new_text, n = pattern.subn(rf"\g<1>{new_val}\g<3>", text)
+    if n == 0 and not re.search(r"^\s*drop_invalid_sequences\s*:", text, re.M):
+        line = f"drop_invalid_sequences: {new_val}"
+        section = re.search(r"^data_params:[ \t]*(#.*)?$", text, re.M)
+        if section:
+            # the indent of data_params' first field, so the mapping stays valid
+            first = re.compile(r"^([ \t]+)[A-Za-z_]", re.M).search(text, section.end())
+            indent = first.group(1) if first else "  "
+            new_text = text[:section.end()] + f"\n{indent}{line}" + text[section.end():]
+            n = 1
+        elif not re.search(r"^data_params\s*:", text, re.M):
+            new_text = text.rstrip("\n") + f"\n\ndata_params:\n  {line}\n"
+            n = 1
     if n == 0:
         raise click.ClickException(
             "Couldn't find drop_invalid_sequences in config to flip."

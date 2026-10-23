@@ -15,7 +15,7 @@ from click.testing import CliRunner
 from nanoplm.cli._dvc_yaml_gen import _NANOPLM_PKG_DIR, generate_dvc_yaml
 from nanoplm.cli.data import data
 from nanoplm.cli.templates import load_template
-from nanoplm.data.preparation.data_config import parse_data_config
+from nanoplm.data.preparation.data_config import literal, parse_data_config
 
 GOLDEN = Path(__file__).parent / "golden"
 
@@ -35,8 +35,9 @@ def test_old_configs_give_masters_dvc_yaml_byte_for_byte(name, fn, kind):
 
 
 def test_the_template_matches_masters_template_stage_for_stage():
-    """The sources layout moves the paths under output_dir and drops the data_dirs params;
-    otherwise every stage is master's: same names, commands, deps, params and outs."""
+    """The sources layout moves the paths under output_dir and drops the data_dirs params,
+    and writes a field at its default as a value instead of a param; otherwise every
+    stage is master's: same names, commands, deps, params and outs."""
     old_cfg = yaml.safe_load((GOLDEN / "url_gz.data.yaml").read_text())
     old = yaml.safe_load((GOLDEN / "url_gz.dvc.yaml").read_text())["stages"]
     new = yaml.safe_load(_gen(yaml.safe_load(load_template("data_pretrain"))))["stages"]
@@ -44,6 +45,9 @@ def test_the_template_matches_masters_template_stage_for_stage():
     to_new = {f"${{data_dirs.{k}}}": v for k, v in src.paths.items() if v}
     to_new["${data_dirs.url}"] = src.fasta
     to_new["${data_params.seqs_num}"] = "${data_params.max_seqs}"
+    to_new.update({f"${{data_params.{f}}}": literal(src.params[f]) for f in src.defaulted})
+    assert src.defaulted == {"shuffle", "shuffle_seed", "samples_per_shard", "max_workers",
+                             "register_tokens", "drop_invalid_sequences"}
     assert old_cfg["data_dirs"]["url"] == src.fasta
 
     def moved(x):
@@ -58,7 +62,8 @@ def test_the_template_matches_masters_template_stage_for_stage():
 
     def params(stage):
         keys = [k for p in stage.get("params", []) for k in p["data.yaml"]]
-        return [k.replace("seqs_num", "max_seqs") for k in keys if not k.startswith("data_dirs.")]
+        return [k.replace("seqs_num", "max_seqs") for k in keys
+                if not k.startswith("data_dirs.") and k[len("data_params."):] not in src.defaulted]
 
     assert list(new) == list(old)
     for name in old:
@@ -294,3 +299,74 @@ def test_a_cluster_warning_prints_once(tmp_path, monkeypatch):
         logging.getLogger("nanoplm").removeHandler(handler)
     assert (out + "\n".join(logged)).count("trains on at most 20,000 clusters") == 1
 
+
+
+# ------------------------------------------------------------------ defaults
+
+RARE = ("shuffle", "shuffle_seed", "samples_per_shard", "max_workers", "register_tokens",
+        "drop_invalid_sequences")
+
+
+def _without_rare(cfg):
+    cfg = yaml.safe_load(cfg) if isinstance(cfg, str) else cfg
+    for k in RARE:
+        cfg["data_params"].pop(k)
+    return cfg
+
+
+@pytest.mark.parametrize("cluster", [False, True])
+def test_rarely_changed_fields_may_be_left_out(cluster):
+    """Leaving them out means master's template values, and gives the same dvc.yaml as
+    writing them, so deleting the lines reruns nothing."""
+    full = yaml.safe_load(load_template("data_pretrain"))
+    if cluster:
+        full["sources"] = {"u": {"fasta": "uniref50",
+                                 "cluster_subsampling": {"members": "uniref90"}}}
+    short = _without_rare(yaml.safe_load(yaml.safe_dump(full)))
+    assert _gen(short) == _gen(full)
+    src = parse_data_config(short).source
+    assert {k: src.params[k] for k in RARE} == {
+        "shuffle": True, "shuffle_seed": 24, "samples_per_shard": 2000, "max_workers": 2,
+        "register_tokens": 0, "drop_invalid_sequences": False}
+    stages = yaml.safe_load(_gen(short))["stages"]
+    for name, st in stages.items():
+        st = st.get("do", st)
+        for p in st.get("params", []):
+            assert all(p.values()), name           # no empty key list: DVC reads it as all
+    # a changed value is a DVC param again, referenced where it is set
+    short["data_params"]["samples_per_shard"] = 5000
+    pool = "cluster_pool" if cluster else "pre-tokenize"
+    st = yaml.safe_load(_gen(short))["stages"][pool]
+    st = st.get("do", st)
+    assert "--samples-per-shard ${data_params.samples_per_shard}" in st["cmd"]
+    assert "data_params.samples_per_shard" in st["params"][0]["data.yaml"]
+
+
+def test_the_first_five_fields_stay_required():
+    cfg = _without_rare(load_template("data_pretrain"))
+    del cfg["data_params"]["max_seq_len"]
+    with pytest.raises(ValueError, match="data_params.max_seq_len is required"):
+        parse_data_config(cfg)
+
+
+def test_old_layout_still_needs_every_field(tmp_path, monkeypatch):
+    """data_dirs configs keep master's checks (and master's dvc.yaml)."""
+    cfg = yaml.safe_load((GOLDEN / "url_gz.data.yaml").read_text())
+    del cfg["data_params"]["shuffle"]
+    _no_dvc(monkeypatch)
+    r = _run(_write(tmp_path, cfg), "--dry-run")
+    assert r.exit_code != 0 and "data_params.shuffle is required" in r.output
+
+
+@pytest.mark.parametrize("indent", ["  ", "    "])
+def test_fix_adds_drop_invalid_when_it_is_left_out(tmp_path, indent):
+    from nanoplm.cli.data import _flip_drop_invalid
+    text = load_template("data_pretrain").replace("  drop_invalid_sequences: false\n", "")
+    text = text.replace("\n  ", "\n" + indent) if indent != "  " else text
+    p = _write(tmp_path, text)
+    _flip_drop_invalid(p, True)
+    assert parse_data_config(yaml.safe_load(p.read_text())).source.params[
+        "drop_invalid_sequences"] is True
+    p.write_text("output_dir: out\nsources:\n  s:\n    fasta: swissprot\n")
+    _flip_drop_invalid(p, True)
+    assert yaml.safe_load(p.read_text())["data_params"] == {"drop_invalid_sequences": True}

@@ -66,7 +66,9 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str, base_dir=No
 
 
 def _params(params_filename: str, keys: list) -> dict:
-    """{"params": [...]} for a stage, or nothing when it reads no params."""
+    """{"params": [...]} for a stage, or nothing when it reads no params. A None key
+    (a field at its default, written into the command as a value) is left out."""
+    keys = [k for k in keys if k]
     return {"params": [{params_filename: keys}]} if keys else {}
 
 
@@ -125,13 +127,13 @@ def _check_stage(src: Source, fasta: str, params_filename: str) -> dict:
             _resolve_pkg_dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c"),
         ],
         **_params(params_filename, src.path_params("validation_dir")
-                  + [src.key("drop_invalid_sequences")]),
+                  + [src.param_key("drop_invalid_sequences")]),
         "outs": [src.path("validation_dir")],
     }
 
 
 def _plain_stages(src: Source, kind: str, params_filename: str) -> dict:
-    p, ref, key = src.path, src.ref, src.key
+    p, ref, key = src.path, src.ref, src.param_key
     stages: dict[str, Any] = _get_stages(src, params_filename)
 
     stages["check"] = _check_stage(src, p("extracted_fasta"), params_filename)
@@ -299,7 +301,7 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     source fasta, so adding or removing the block does not fetch or extract it again.
     """
     dep = _resolve_pkg_dep
-    ref, key = src.ref, src.key
+    ref, key = src.ref, src.param_key
     members_fasta = str(plan.members_fasta)
     out = src.output_dir
     filtered = src.paths["filtered_fasta"]
@@ -327,7 +329,7 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                  dep("src/nanoplm/data/preparation/filterer.py"),
                  dep("src/nanoplm/data/preparation/_native_ops.py"),
                  dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c")],
-        "params": [{params_filename: [key("min_seq_len"), key("max_seq_len")]}],
+        **_params(params_filename, [key("min_seq_len"), key("max_seq_len")]),
         "outs": [filtered],
     }
     stages["cluster_pool"] = {
@@ -342,8 +344,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                  dep("src/nanoplm/data/sharding/pretrain_shard_writer.py"),
                  dep("src/nanoplm/data/sharding/csrc/fast_fasta_shard_writer.c"),
                  dep("src/nanoplm/pretraining/models/modern_bert/tokenizer.py")],
-        "params": [{params_filename: [key("max_seq_len"), key("samples_per_shard"),
-                                      key("register_tokens")]}],
+        **_params(params_filename, [key("max_seq_len"), key("samples_per_shard"),
+                                      key("register_tokens")]),
         "outs": [f"{out}/train"],
     }
     tsv = str(plan.members_tsv)
@@ -351,10 +353,17 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     # cluster_table.build_members_table runs this stage; an edit elsewhere in the cluster
     # prep code must not rerun the XML scan or MMseqs2
     members_deps = [filtered, dep("src/nanoplm/data/preparation/cluster_table.py")]
-    # only keys written in the block: DVC refuses a listed param missing from the file
+    from nanoplm.data.preparation.cluster_config import DEFAULT_COVERAGE, DEFAULT_IDENTITY
+    # A key at its default (left out, null, or written as the default) is no DVC param
+    # and goes into the command as a value, so writing the default out reruns nothing.
+    # Any other value was written in the block, so the ${...} reference resolves.
     block_key = f"sources.{src.name}.cluster_subsampling"
-    members_params = [f"{block_key}.{k}" for k in ("clustering",)
-                      if src.cluster.get(k) is not None]
+    defaults = {"clustering": "auto", "identity": DEFAULT_IDENTITY, "coverage": DEFAULT_COVERAGE}
+
+    def changed(k):
+        return getattr(plan, k) != defaults[k]
+
+    members_params = [f"{block_key}.clustering"] if changed("clustering") else []
     if plan.cluster_source == "uniref_xml":
         xml = str(plan.xml_path)
         stages["get_cluster_xml"] = {
@@ -371,17 +380,14 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
         members_deps[0] = members_fasta
         members_deps += [xml, dep("src/nanoplm/data/preparation/uniref_hierarchy.py")]
     else:
-        # a key left out (or null) is the default, written into the command as is
-        def value(k, default):
-            return ("${" + f"{block_key}.{k}" + "}" if src.cluster.get(k) is not None
-                    else f"{default:g}")
+        def value(k):
+            return "${" + f"{block_key}.{k}" + "}" if changed(k) else f"{getattr(plan, k):g}"
         cmd = ("nanoplm data cluster-members --source mmseqs "
                f"--fasta {filtered} "
-               f"--identity {value('identity', plan.identity)} "
-               f"--coverage {value('coverage', plan.coverage)} "
+               f"--identity {value('identity')} "
+               f"--coverage {value('coverage')} "
                f"--tmp-dir {plan.mmseqs_tmp} -o {tsv}")
-        members_params += [f"{block_key}.{k}" for k in ("identity", "coverage")
-                           if src.cluster.get(k) is not None]
+        members_params += [f"{block_key}.{k}" for k in ("identity", "coverage") if changed(k)]
     stages["cluster_members"] = {"cmd": cmd, "deps": members_deps, "outs": [tsv, info]}
     if members_params:
         stages["cluster_members"]["params"] = [{params_filename: members_params}]
@@ -402,9 +408,9 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                  dep("src/nanoplm/data/preparation/cluster_index.py"),
                  dep("src/nanoplm/data/preparation/cluster_table.py"),
                  dep("src/nanoplm/data/preparation/uniref_hierarchy.py")],
-        "params": [{params_filename: [key("max_seq_len"), key("val_ratio"),
+        **_params(params_filename, [key("max_seq_len"), key("val_ratio"),
                                       key("samples_per_shard"), key("max_seqs"),
-                                      key("register_tokens")]}],
+                                      key("register_tokens")]),
         "outs": [index_dir, f"{out}/val"],
     }
     stages["write_manifest"] = {
@@ -416,9 +422,9 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                 f"--register-tokens {ref('register_tokens')}"),
         "deps": [index_dir, f"{out}/val", dep("src/nanoplm/data/infra/manifest.py"),
                  dep("src/nanoplm/data/preparation/cluster_pipeline.py")],
-        "params": [{params_filename: [key("min_seq_len"), key("max_seq_len"),
+        **_params(params_filename, [key("min_seq_len"), key("max_seq_len"),
                                       key("val_ratio"), key("samples_per_shard"),
-                                      key("register_tokens")]}],
+                                      key("register_tokens")]),
         "outs": [f"{out}/.data_manifest"],
     }
     return stages
