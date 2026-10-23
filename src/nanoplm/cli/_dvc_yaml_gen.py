@@ -393,7 +393,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                 f"--max-seq-len {ref('max_seq_len')} --val-ratio {ref('val_ratio')} "
                 f"--samples-per-shard {ref('samples_per_shard')} "
                 f"--seqs-num {ref('max_seqs')} "
-                f"--register-tokens {ref('register_tokens')}"),
+                f"--register-tokens {ref('register_tokens')}"
+                + (f" --cluster-xml {plan.xml_path}" if plan.xml_path else "")),
         # build_index_and_val runs it; cluster_index reads members.tsv with
         # cluster_table and hashes accessions with uniref_hierarchy
         "deps": [tsv, info, filtered, f"{out}/train",

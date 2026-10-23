@@ -95,6 +95,10 @@ def test_uniref50_url_uniref90_members_stages():
         f"{OUT}/cluster_index/members.tsv", f"{OUT}/cluster_index/members.json"]
     assert f"{OUT}/cluster_index/index" in st["cluster_index"]["outs"]
     assert "--cluster-index" in st["write_manifest"]["cmd"]
+    # named in the release-mismatch error; members.json no longer records it
+    assert st["cluster_index"]["cmd"].endswith(
+        f" --cluster-xml {OUT}/downloads/uniref50.xml.gz")
+    assert "--cluster-xml" not in _stages(_source("uniref50", {}))["cluster_index"]["cmd"]
 
 
 @pytest.mark.parametrize("block", [{"members": "uniref90"}, {"clustering": "mmseqs2"}])

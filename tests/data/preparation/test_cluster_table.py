@@ -246,3 +246,26 @@ def test_cluster_members_threads_come_from_the_env(tmp_path, monkeypatch, env, e
     argv = (tmp_path / "argv").read_text().split()
     got = argv[argv.index("--threads") + 1]
     assert got == expect
+
+
+def test_members_json_is_the_same_after_an_identical_rebuild(release, tmp_path, monkeypatch):
+    """members.json is a DVC dep of cluster_index: timing or an input path in it would
+    rerun the index although members.tsv did not change."""
+    import json
+    import time
+    clock = iter(range(0, 1000, 7))
+    monkeypatch.setattr(time, "time", lambda: float(next(clock)))
+    fasta = tmp_path / "f.fasta"
+    fasta.write_text(">sp|P1|A\nMKV\n>sp|P2|B\nMKV\n")
+    fake = str(_fake_mmseqs(tmp_path))
+    runs = [
+        lambda out: build_members_table("uniref_xml", out, fasta=release.fasta90,
+                                        level="uniref90", xml=release.xml),
+        lambda out: build_members_table("mmseqs", out, fasta=fasta, mmseqs=fake),
+    ]
+    for i, run in enumerate(runs):
+        first, second = tmp_path / f"a{i}" / "members.tsv", tmp_path / f"b{i}" / "members.tsv"
+        run(first), run(second)
+        a, b = first.with_suffix(".json"), second.with_suffix(".json")
+        assert a.read_bytes() == b.read_bytes()
+        assert not {"seconds", "input"} & set(json.loads(a.read_text()))

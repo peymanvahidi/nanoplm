@@ -245,8 +245,9 @@ def mmseqs_members_tsv(fasta, out_tsv, identity: float, coverage: float, tmp_dir
         stats = mmseqs_rows_to_members_tsv(Path(f"{prefix}_cluster.tsv"), ids, out_tsv)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-    stats.update(source="mmseqs2", input=str(fasta), identity=identity, coverage=coverage, cov_mode=COV_MODE,
-                 seconds=round(time.time() - t0, 1))
+    stats.update(source="mmseqs2", identity=identity, coverage=coverage, cov_mode=COV_MODE)
+    logger.info(f"cluster table: MMseqs2 made {stats['clusters']:,} clusters of "
+                f"{stats['members']:,} sequences ({time.time() - t0:.1f}s)")
     return stats
 
 
@@ -263,12 +264,19 @@ def detect_uniref_level(fasta: Path) -> str:
     raise ValueError(f"{fasta}: no FASTA header found")
 
 
+VOLATILE_STATS = ("input", "seconds")
+
+
 def build_members_table(source: str, out_tsv: Path, *, fasta: Path, level: Optional[str] = None,
                         xml: Optional[Path] = None, identity: float = 0.5,
                         coverage: float = 0.8, tmp_dir: Optional[Path] = None,
                         mmseqs: Optional[str] = None, threads: Optional[int] = None) -> dict:
     """members.tsv (and members.json, its stats) from one of the two sources. ``fasta``
-    is the member FASTA (filtered for mmseqs; any of them for the uniref_xml level check)."""
+    is the member FASTA (filtered for mmseqs; any of them for the uniref_xml level check).
+
+    members.json is a DVC output that cluster_index depends on, so it holds only what
+    the table is: no timing and no input path, which would rerun cluster_index after an
+    identical rebuild. The timing goes to the log."""
     out_tsv = Path(out_tsv)
     if source == "uniref_xml":
         got = detect_uniref_level(Path(fasta))
@@ -283,5 +291,5 @@ def build_members_table(source: str, out_tsv: Path, *, fasta: Path, level: Optio
     else:
         raise ValueError(f"unknown cluster source {source!r}")
     with open(out_tsv.with_suffix(".json"), "w") as f:
-        json.dump(stats, f, indent=1)
+        json.dump({k: v for k, v in stats.items() if k not in VOLATILE_STATS}, f, indent=1)
     return stats

@@ -177,7 +177,8 @@ def test_join_refuses_an_accession_outside_the_hierarchy(release, tmp_path):
     with pytest.raises(ci.ClusterIndexError,
                        match=f"{release.xml} is kept between runs .* delete it to re-download"):
         build_index_and_val(filtered, tmp_path / "train", tmp_path / "members.tsv",
-                            tmp_path / "cluster_index", tmp_path / "val", MAX_LEN, VAL_RATIO, 50)
+                            tmp_path / "cluster_index", tmp_path / "val", MAX_LEN, VAL_RATIO, 50,
+                            cluster_xml=release.xml)
 
 
 def test_a_fasta_that_is_not_the_pools_order_is_fatal(built, release, tmp_path):

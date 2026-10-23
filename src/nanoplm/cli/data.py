@@ -811,13 +811,16 @@ def cluster_pool(input, output, max_seq_len, samples_per_shard, register_tokens,
 @click.option("--samples-per-shard", required=True, type=int)
 @click.option("--seqs-num", type=int, default=-1)
 @click.option("--register-tokens", type=int, default=0)
+@click.option("--cluster-xml", type=click.Path(dir_okay=False), default=None,
+              help="The UniProt XML members.tsv came from, named in a release-mismatch error.")
 def cluster_index_cmd(members_tsv, fasta, pool, index_dir, val_dir, max_seq_len, val_ratio,
-                      samples_per_shard, seqs_num, register_tokens):
+                      samples_per_shard, seqs_num, register_tokens, cluster_xml):
     """Internal: build the cluster index and the validation gathers."""
     from nanoplm.data.preparation.cluster_pipeline import build_index_and_val
     man = build_index_and_val(Path(fasta), Path(pool), Path(members_tsv), Path(index_dir),
                               Path(val_dir), max_seq_len, val_ratio, samples_per_shard,
-                              seqs_num, register_tokens)
+                              seqs_num, register_tokens,
+                              cluster_xml=Path(cluster_xml) if cluster_xml else None)
     c = man["counts"]
     click.echo(f"Cluster index: {c['train_clusters']:,} train / {c['val_clusters']:,} val "
                f"clusters over {c['pool_rows']:,} pool sequences")

@@ -78,8 +78,10 @@ def build_pool(filtered_fasta: Path, pool_dir: Path, max_seq_len: int, samples_p
 def build_index_and_val(filtered_fasta: Path, pool_dir: Path, members_tsv: Path,
                         index_dir: Path, val_dir: Path, max_seq_len: int, val_ratio: float,
                         samples_per_shard: int, seqs_num: int = -1, register_tokens: int = 0,
-                        holdout_seed: int = ci.HOLDOUT_SEED) -> dict:
-    """The cluster index, then val/ (the held-out clusters' representatives)."""
+                        holdout_seed: int = ci.HOLDOUT_SEED,
+                        cluster_xml: Optional[Path] = None) -> dict:
+    """The cluster index, then val/ (the held-out clusters' representatives).
+    ``cluster_xml`` is the UniProt XML members.tsv came from, named if the releases differ."""
     info_path = Path(members_tsv).with_suffix(".json")
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
     man = ci.build_cluster_index(
@@ -88,7 +90,7 @@ def build_index_and_val(filtered_fasta: Path, pool_dir: Path, members_tsv: Path,
         tokenizer=_tokenizer(register_tokens), level=info.get("level"),
         clusters_info={k: info[k] for k in ("source", "release_version", "identity",
                                              "coverage", "cov_mode") if k in info},
-        cluster_xml=info.get("input") if info.get("source") == "uniref50_xml" else None)
+        cluster_xml=str(cluster_xml) if cluster_xml else None)
     rep = np.load(Path(index_dir) / "val_rep_rows.npy")
     ci.write_row_gather(pool_dir, rep, val_dir, samples_per_shard)
     return man
