@@ -79,6 +79,10 @@ class PretrainManifest(DataManifestBase):
     def is_cluster_sampled(self) -> bool:
         return bool(self.cluster_index_dir)
 
+    @property
+    def is_mixture(self) -> bool:
+        return False
+
     def __post_init__(self):
         """Set pipeline mode and validate."""
         self.pipeline_mode = "pretrain"
@@ -144,6 +148,24 @@ class DistillationManifest(DataManifestBase):
             # Clear on-the-fly mode fields for clarity
             self.train_fasta = None
             self.val_fasta = None
+
+
+@dataclass
+class MixtureManifest(PretrainManifest):
+    """Manifest of a mixture: several prepared pretraining datasets drawn by weight.
+
+    ``sources`` lists each one (see ``nanoplm.data.infra.mixture``): its folder relative
+    to the mixture folder, its weight (share of training sequences), kind, counts and the
+    sha256 of its own .data_manifest. The top-level fields summarise the sources:
+    max_seq_len is the largest, train_sequences and total_train_tokens are sums over one
+    pass of each. train_dir / val_dir are empty: the shards live in the sources.
+    """
+
+    sources: list = field(default_factory=list)
+
+    @property
+    def is_mixture(self) -> bool:
+        return True
 
 
 # Type alias for any manifest type
@@ -216,6 +238,8 @@ def read_manifest(dataset_dir: Union[str, Path]) -> DataManifest:
         )
 
     try:
+        if pipeline_mode == "pretrain" and "sources" in data:
+            return MixtureManifest(**data)
         if pipeline_mode == "pretrain":
             return PretrainManifest(**data)
         elif pipeline_mode == "distillation":

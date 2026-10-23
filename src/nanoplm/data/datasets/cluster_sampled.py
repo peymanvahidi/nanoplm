@@ -90,6 +90,15 @@ def member_slots_vec(seed: int, clusters: np.ndarray, epoch: int, n: np.ndarray)
     return (z % np.asarray(n).astype(np.uint64)).astype(np.int64)
 
 
+def member_slots_at(seed: int, clusters: np.ndarray, epochs: np.ndarray, n: np.ndarray) -> np.ndarray:
+    """``member_slot`` for arrays of clusters, epochs and sizes, element by element."""
+    k0 = np.uint64(member_seed_key(seed))
+    with np.errstate(over="ignore"):
+        z = _sm64_vec(np.asarray(clusters).astype(np.uint64) ^ k0)
+        z = _sm64_vec(z ^ np.asarray(epochs).astype(np.uint64))
+    return (z % np.asarray(n).astype(np.uint64)).astype(np.int64)
+
+
 # ------------------------------------------------------------------------ the dataset
 
 
@@ -225,6 +234,30 @@ class ClusterSampledDataset(ShardedDataset):
             raise IndexError(f"Index {idx} out of bounds for {self._n} train clusters")
         return self.read_pool_row(self.pool_row(idx))
 
+    def item_at(self, idx: int, epoch: int) -> Dict[str, torch.Tensor]:
+        """Position ``idx`` with the member of pass ``epoch``, whatever the current epoch
+        is. A mixture keeps one pass counter per source and reads through this."""
+        c = int(self._tc[idx])
+        u = int(self._g2u[c])
+        start = int(self._off[u])
+        slot = member_slot(self.seed, c, int(epoch), int(self._off[u + 1]) - start)
+        return self.read_pool_row(int(self._members[start + slot]))
+
+    def lengths_at(self, idx: np.ndarray, epochs: np.ndarray) -> np.ndarray:
+        """Token count of the member position ``idx[i]`` gives in pass ``epochs[i]``."""
+        idx = np.asarray(idx, dtype=np.int64)
+        out = np.empty(len(idx), dtype=np.int32)
+        lengths = self.pool_lengths()
+        for a in range(0, len(idx), VEC_CHUNK):
+            b = min(a + VEC_CHUNK, len(idx))
+            tc = np.asarray(self._tc[idx[a:b]])
+            uloc = np.asarray(self._g2u[tc], dtype=np.int64)
+            start = np.asarray(self._off[uloc], dtype=np.int64)
+            size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
+            slot = member_slots_at(self.seed, tc, np.asarray(epochs)[a:b], size)
+            out[a:b] = lengths[self._members[start + slot]]
+        return out
+
     def read_pool_row(self, row: int) -> Dict[str, torch.Tensor]:
         """Pool row ``row``, read the way ShardedDataset.__getitem__ reads its rows.
 
@@ -279,12 +312,16 @@ def open_train_dataset(dataset_dir: Union[str, Path], manifest, seed: int) -> Sh
     """The train set a prepared dataset directory describes.
 
     A manifest with ``cluster_index_dir`` gives a ClusterSampledDataset keyed on the
-    training ``seed``; any other manifest a plain ShardedDataset. Validation sets are
+    training ``seed``, a mixture manifest a MixtureDataset over its sources, any other
+    manifest a plain ShardedDataset. Validation sets are
     always plain ShardedDatasets (cluster representatives, never resampled).
     """
     from nanoplm.data.preparation.cluster_config import check_not_experiment_dir
 
     dataset_dir = Path(dataset_dir)
+    if getattr(manifest, "is_mixture", False):
+        from nanoplm.data.datasets.mixture import open_mixture
+        return open_mixture(dataset_dir, manifest, seed=int(seed))
     check_not_experiment_dir(dataset_dir, manifest)
     train_dir = dataset_dir / manifest.train_dir
     index_dir = getattr(manifest, "cluster_index_dir", None)
