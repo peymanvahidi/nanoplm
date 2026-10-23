@@ -271,127 +271,97 @@ def test_built_sources_with_other_register_tokens_fail_before_dvc(tmp_path, monk
     assert "the sources of a mix must use the same register_tokens; got a 0, b 1" in r.output
 
 
-def _built(folder, manifest=True):
-    for n in ("train", "val"):
-        (folder / n).mkdir(parents=True)
-    if manifest:
-        (folder / ".data_manifest").write_text("x")
+def _lock_from(tmp_path, cfg):
+    """The dvc.lock a build of ``cfg`` leaves, and its outputs on disk."""
+    from nanoplm.cli.data import _stage_graph
+    graph = _stage_graph(generate_dvc_yaml(cfg, "pretrain", "data.yaml", tmp_path), cfg)
+    stages = {n: {"cmd": "x", "outs": [{"path": p} for p in outs]}
+              for n, (_, outs) in graph.items()}
+    (tmp_path / "dvc.lock").write_text(yaml.safe_dump({"schema": "2.0", "stages": stages}))
+    for _, outs in graph.values():
+        for p in map(tmp_path.joinpath, outs):
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch() if "." in p.name else p.mkdir(exist_ok=True)
 
 
-def test_a_mix_names_the_train_and_val_an_earlier_single_source_left(tmp_path, capsys):
-    from nanoplm.cli.data import _warn_orphaned_outputs, orphaned_outputs
-    from nanoplm.data.preparation.data_config import parse_data_config
-    out = tmp_path / "out"
-    _built(out)
-    (out / "cluster_index").mkdir()
-    (out / ".gitignore").write_text("/train\n/val\n/.data_manifest\n")
-    cfg = parse_data_config(_mix(a={"fasta": "swissprot", "weight": 0.5},
-                                 b={"fasta": "trembl", "weight": 0.5}))
-    assert orphaned_outputs(cfg, tmp_path) == [out / "train", out / "val", out / "cluster_index"]
-    _warn_orphaned_outputs(cfg, tmp_path)
+def _orphans(tmp_path, cfg, keep=()):
+    from nanoplm.cli.data import orphaned_outputs
+    found = orphaned_outputs(tmp_path, generate_dvc_yaml(cfg, "pretrain", "data.yaml",
+                                                         tmp_path), cfg, keep)
+    return [str(p.relative_to(tmp_path / "out")) for p in found]
+
+
+A = {"fasta": "swissprot", "weight": 0.5}
+
+
+def _one(**src):
+    return _mix(**{n: {k: v for k, v in s.items() if k != "weight"} for n, s in src.items()})
+
+
+def test_a_mix_names_what_an_earlier_single_source_left(tmp_path, capsys):
+    from nanoplm.cli.data import _warn_orphaned_outputs
+    _lock_from(tmp_path, _one(a=A))
+    (tmp_path / "out/.gitignore").write_text("/train\n/val\n/.data_manifest\n")
+    mix = _mix(a=A, b={"fasta": "trembl", "weight": 0.5})
+    got = _orphans(tmp_path, mix)
+    # one source writes the dataset into output_dir and extracts the .gz in its own
+    # folder; a mix uses output_dir/a/ and downloads/
+    assert sorted(got) == ["a/uniprot_sprot.fasta", "a/validation", "train", "val"]
+    _warn_orphaned_outputs(tmp_path, generate_dvc_yaml(mix, "pretrain", "data.yaml"), mix)
     err = capsys.readouterr().err
-    assert "earlier build that this data.yaml does not use; nothing deletes them" in err
-    assert f"  {out / 'train'}\n" in err
-    assert f"their lines in {out / '.gitignore'}" in err
-    assert ".data_manifest" not in err.replace(".gitignore", "")   # the mixture's own
-    for n in ("train", "val", "cluster_index"):
-        shutil.rmtree(out / n)
-    assert orphaned_outputs(cfg, tmp_path) == []
+    assert f"  {tmp_path / 'out/train'}\n" in err and ".data_manifest" not in err.replace(
+        ".gitignore", "")                               # the mixture's own
+    assert f"their lines in {tmp_path / 'out/.gitignore'}" in err
+    assert "delete them and run `dvc gc --workspace`" in err
+    for p in got:
+        (tmp_path / "out" / p).rmdir() if (tmp_path / "out" / p).is_dir() else \
+            (tmp_path / "out" / p).unlink()
+    assert _orphans(tmp_path, mix) == []               # listed, never deleted
 
 
-def test_one_source_names_the_folders_an_earlier_mix_left(tmp_path):
-    from nanoplm.cli.data import orphaned_outputs
-    from nanoplm.data.preparation.data_config import parse_data_config
-    out = tmp_path / "out"
-    _built(out / "a")
-    _built(out / "b")
-    (out / "a/split").mkdir()                 # an intermediate: one source keeps it
-    (out / "downloads").mkdir()
-    cfg = yaml.safe_load(load_template("data_pretrain"))
-    cfg["output_dir"] = "out"
-    cfg["sources"] = {"a": {"fasta": "swissprot"}}
-    cfg = parse_data_config(cfg)
-    got = orphaned_outputs(cfg, tmp_path)
-    assert got == [out / "a/train", out / "a/val", out / "a/.data_manifest", out / "b"]
-    shutil.rmtree(out / "b")
-    for p in got[:3]:
-        shutil.rmtree(p) if p.is_dir() else p.unlink()
-    assert orphaned_outputs(cfg, tmp_path) == []
+def test_one_source_names_what_an_earlier_mix_left(tmp_path):
+    _lock_from(tmp_path, _mix(a=A, b={"fasta": "trembl", "weight": 0.5}))
+    got = _orphans(tmp_path, _one(a=A))
+    assert [p for p in got if p.startswith("b/")] and "b" not in got
+    assert {"a/train", "a/val", "a/.data_manifest", "downloads/uniprot_sprot.fasta",
+            "downloads/uniprot_sprot_fasta_validation"} <= set(got)
+    assert not any(p.startswith("downloads/uniprot_sprot.fasta.gz") for p in got)
 
 
-def test_a_layout_switch_names_the_extract_and_check_it_moved(tmp_path):
-    from nanoplm.cli.data import orphaned_outputs
-    from nanoplm.data.preparation.data_config import parse_data_config
-    out = tmp_path / "out"
-    for p in ("a/validation", "b/validation", "c/validation", "downloads/prot_fasta_validation"):
-        (out / p).mkdir(parents=True)
-    for p in ("a/prot.fasta", "b/prot.fasta", "downloads/prot.fasta"):
-        (out / p).write_text(">x\nMK\n")
-    a = {"fasta": "prot.fasta.gz", "weight": 0.4}
-    b = {"fasta": "prot.fasta.gz", "weight": 0.4, "drop_invalid_sequences": True}
-    c = {"fasta": "small.fasta", "weight": 0.2}
-    mix = parse_data_config(_mix(a=a, b=b, c=c))
-    # b keeps its own check, c (a local FASTA) its own check and no extract
-    assert orphaned_outputs(mix, tmp_path) == [out / "a/prot.fasta", out / "a/validation",
-                                               out / "b/prot.fasta"]
-    one = yaml.safe_load(load_template("data_pretrain"))
-    one["output_dir"] = "out"
-    one["sources"] = {"a": {"fasta": "prot.fasta.gz"}}
-    # b and c are sources this data.yaml no longer has
-    assert orphaned_outputs(parse_data_config(one), tmp_path) == [
-        out / "b", out / "c", out / "downloads/prot.fasta", out / "downloads/prot_fasta_validation"]
+def test_removing_or_renaming_a_source_names_its_outputs(tmp_path):
+    three = _mix(a={"fasta": "swissprot", "weight": 0.4}, b={"fasta": "trembl", "weight": 0.3},
+                 c={"fasta": "local.fasta", "weight": 0.3})
+    _lock_from(tmp_path, three)
+    two = _mix(a={"fasta": "swissprot", "weight": 0.5}, b={"fasta": "trembl", "weight": 0.5})
+    got = _orphans(tmp_path, two)
+    assert got and all(p.startswith("c/") for p in got) and "c/train" in got
+    renamed = _mix(a={"fasta": "swissprot", "weight": 0.5}, d={"fasta": "trembl", "weight": 0.5})
+    got = _orphans(tmp_path, renamed)
+    assert "b/train" in got and not any(p.startswith(("a/", "downloads/")) for p in got)
 
 
-def test_removing_a_source_names_its_folder(tmp_path):
-    from nanoplm.cli.data import orphaned_outputs
-    from nanoplm.data.preparation.data_config import parse_data_config
-    out = tmp_path / "out"
-    for name in ("a", "b", "gone"):
-        _built(out / name)
-    (out / "gone/split").mkdir()
-    (out / "notes").mkdir()                       # not a source folder: none of its outputs
-    (out / "mine").mkdir()
-    (out / "mine/validation").mkdir()
-    (out / "mine/x.fasta").write_text(">a\nMK\n")  # holds an input: never listed
-    cfg = parse_data_config(_mix(a={"fasta": "swissprot", "weight": 0.5},
-                                 b={"fasta": "out/mine/x.fasta", "weight": 0.5}))
-    assert orphaned_outputs(cfg, tmp_path) == [out / "gone"]
-    assert (out / "gone").is_dir()                # listed, never deleted
+def test_dropping_a_cluster_block_names_its_index_and_the_xml(tmp_path):
+    u = {"fasta": "uniref50", "weight": 0.5, "max_seqs": -1, "val_ratio": 0.0044,
+         "cluster_subsampling": {"members": "uniref90"}}
+    _lock_from(tmp_path, _mix(a=A, u=u))
+    assert _orphans(tmp_path, _mix(a=A, u=u)) == []
+    off = _mix(a=A, u={"fasta": "uniref50", "weight": 0.5})
+    got = _orphans(tmp_path, off)
+    assert "downloads/uniref50.xml.gz" in got and "u/cluster_index/index" in got
+    assert "downloads/uniref90.fasta.gz" in got         # the members download, unused now
+    assert (tmp_path / "out/downloads/uniref50.xml.gz").exists()
 
 
-def test_dropping_a_cluster_block_names_its_index_and_the_xml(tmp_path, capsys):
-    from nanoplm.cli.data import _warn_orphaned_outputs, orphaned_outputs
-    from nanoplm.data.preparation.data_config import parse_data_config
-    out = tmp_path / "out"
-    _built(out / "a")
-    _built(out / "u")
-    (out / "u/cluster_index/index").mkdir(parents=True)
-    (out / "downloads").mkdir()
-    (out / "downloads/uniref50.xml.gz").write_bytes(b"x")
-    cluster = {"fasta": "uniref90", "weight": 0.5, "cluster_subsampling": {"members": None}}
-    on = parse_data_config(_mix(a={"fasta": "swissprot", "weight": 0.5}, u=cluster))
-    assert orphaned_outputs(on, tmp_path) == []
-    off = parse_data_config(_mix(a={"fasta": "swissprot", "weight": 0.5},
-                                 u={"fasta": "uniref90", "weight": 0.5}))
-    assert orphaned_outputs(off, tmp_path) == [out / "u/cluster_index",
-                                               out / "downloads/uniref50.xml.gz"]
-    _warn_orphaned_outputs(off, tmp_path)
-    err = capsys.readouterr().err
-    assert f"  {out / 'u/cluster_index'}\n" in err and "uniref50.xml.gz" in err
-    assert (out / "downloads/uniref50.xml.gz").exists()
+def test_a_prepared_source_keeps_the_folder_it_points_at(tmp_path):
+    _lock_from(tmp_path, _mix(a=A, b={"fasta": "trembl", "weight": 0.5}))
+    mix = _mix(a=A, b2={"prepared": "out/b", "weight": 0.5})
+    assert not any(p.startswith("b/") for p in _orphans(tmp_path, mix, keep=["out/b"]))
+    assert any(p.startswith("b/") for p in _orphans(tmp_path, mix))
 
 
-def test_one_source_without_its_cluster_block_names_cluster_index(tmp_path):
-    from nanoplm.cli.data import orphaned_outputs
-    from nanoplm.data.preparation.data_config import parse_data_config
-    out = tmp_path / "out"
-    _built(out)
-    (out / "cluster_index").mkdir()
-    one = _mix(u={"fasta": "uniref90"})
-    assert orphaned_outputs(parse_data_config(one), tmp_path) == [out / "cluster_index"]
-    one["sources"]["u"]["cluster_subsampling"] = {"members": None}
-    one["data_params"].update(max_seqs=-1, val_ratio=0.0044)
-    assert orphaned_outputs(parse_data_config(one), tmp_path) == []
+def test_no_dvc_lock_no_orphans(tmp_path):
+    (tmp_path / "out/b/train").mkdir(parents=True)
+    assert _orphans(tmp_path, _mix(a=A, c={"fasta": "trembl", "weight": 0.5})) == []
 
 
 def test_the_rebuild_line_of_a_mix_is_one_summary_per_source():

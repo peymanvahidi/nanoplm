@@ -975,8 +975,6 @@ def from_yaml(
             _show_prepared(cfg.source, cwd, config_path, cfg.output_dir)
             return
         plans = _validate_sources(cfg, cwd, config_path)
-        if not cfg.legacy:
-            _warn_orphaned_outputs(cfg, cwd)
     else:
         _validate_source_fields(params.get("data_dirs", {}))
         _validate_pipeline_fields(params.get("data_dirs", {}), data_params, kind, config_path)
@@ -1008,6 +1006,8 @@ def from_yaml(
         params_filename=config_path.name,
         base_dir=cwd,
     )
+    prepared = [s.prepared for s in cfg.sources.values() if s.prepared] if cfg else []
+    _warn_orphaned_outputs(cwd, dvc_content, params, prepared)
     dvc_yaml_path.write_text(dvc_content, encoding="utf-8")
     # click.echo, not logger.info: this must still print at --log-level error.
     click.echo(f"Regenerated {dvc_yaml_path}")
@@ -1333,97 +1333,50 @@ def _read_pretrain_config(config_path: Path, quiet: bool = False):
     return cfg
 
 
-# what a source's build writes into its data folder (output_dir, or output_dir/<name>)
-_BUILT_OUTPUTS = ("train", "val", "cluster_index", ".data_manifest")
-# what a build writes into output_dir/<name>; a folder there with none of these is not ours
-_SOURCE_FOLDER_OUTPUTS = _BUILT_OUTPUTS + ("validation", "shuffled.fasta", "filtered.fasta",
-                                           "split")
-
-
-def orphaned_outputs(cfg, cwd: Path) -> list:
-    """Outputs of an earlier build left in output_dir that this data.yaml does not use:
-    the folder of a source it no longer has; the cluster_index/ of a source whose
-    cluster_subsampling block is gone; uniref50.xml.gz when no source uses UniProt
-    clusters; and the outputs of the other layout (a mix ignores the train/ val/
-    cluster_index/ of an earlier single source; one source ignores the train/ val/
-    cluster_index/ .data_manifest of an earlier mix in its own folder, and the extract
-    and check each layout keeps elsewhere). Nothing is deleted; DVC no longer tracks
-    these paths."""
-    from nanoplm.data.preparation.cluster_config import (
-        INDEX_SUBDIR, UNIREF50_XML_URL, resolve_cluster_plan,
-    )
-    from nanoplm.data.preparation.data_config import RESERVED_NAMES, file_name, is_url
-    out = _resolve_path(cfg.output_dir, cwd)
-    if not out.is_dir():
+def orphaned_outputs(cwd: Path, dvc_content: str, params: dict, keep=()) -> list:
+    """Outputs of an earlier build that this dvc.yaml no longer writes or reads, still on
+    disk: what dvc.lock records (DVC keeps a removed stage's entry) minus every path of
+    the new stages. Covers a removed or renamed source, a dropped cluster block, a
+    members switch and the move between one source and a mix. ``keep`` (a prepared
+    folder) is never listed. Nothing is deleted."""
+    import yaml as _yaml
+    lock = cwd / "dvc.lock"
+    if not lock.is_file():
         return []
+    try:
+        stages = (_yaml.safe_load(lock.read_text(encoding="utf-8")) or {}).get("stages") or {}
+    except _yaml.YAMLError:
+        return []
+    graph = _stage_graph(dvc_content, params)
+    used = [str(_resolve_path(p, cwd)) for deps, outs in graph.values() for p in deps + outs]
+    used += [str(_resolve_path(k, cwd)) for k in keep]
     found = []
-
-    def add(paths):
-        found.extend(p for p in paths if p.exists() and not any(
-            p == f or p.is_relative_to(f) for f in found))
-
-    if cfg.is_mixture:
-        # output_dir/.data_manifest is the mixture's own
-        add(out / n for n in _BUILT_OUTPUTS[:-1])
-    built = [s for s in cfg.sources.values() if not s.prepared]
-    plans = {s.name: resolve_cluster_plan(s, cwd) for s in built}
-    # a folder that holds a file this build reads is never listed
-    inputs = [_resolve_path(q, cwd) for s in cfg.sources.values()
-              for q in (s.fasta, s.prepared, plans.get(s.name) and plans[s.name].members)
-              if q and not is_url(q)]
-    for d in sorted(p for p in out.iterdir() if p.is_dir() and p.name not in RESERVED_NAMES):
-        if d.name in cfg.sources:
-            if not cfg.is_mixture and (d / ".data_manifest").is_file():
-                add(d / n for n in _BUILT_OUTPUTS)     # its intermediates are still used
-        elif (any((d / n).exists() for n in _SOURCE_FOLDER_OUTPUTS)
-              and not any(i.is_relative_to(d) for i in inputs)):
-            add([d])                                   # a source data.yaml no longer has
-    add(_resolve_path(s.data_dir, cwd) / INDEX_SUBDIR for s in built if plans[s.name] is None)
-    if not any(p is not None and p.xml_path for p in plans.values()):
-        add([out / "downloads" / file_name(UNIREF50_XML_URL)])
-    for src in built:
-        add(_resolve_path(q, cwd) for q in _other_layout_prep(src, cwd))
+    for stage in stages.values():
+        for out in (stage or {}).get("outs") or []:
+            path = _resolve_path(os.path.normpath(out["path"]), cwd)
+            if (path.exists() and path not in found
+                    and not any(_overlaps(str(path), u) for u in used)):
+                found.append(path)
     return found
 
 
-def _other_layout_prep(src, base_dir) -> list:
-    """The extracted FASTA and check folder this source has in the other layout: a mix
-    extracts a .gz into downloads/ and checks a FASTA there (the dvc.yaml generator's
-    _share_check), one source does both in output_dir/<name>/."""
-    from nanoplm.cli._dvc_yaml_gen import _in_downloads, _safe
-    from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
-    from nanoplm.data.preparation.data_config import _join, file_name, strip_gz
-    plan = resolve_cluster_plan(src, base_dir)
-    if plan is not None and not plan.members_from_source:
-        packed, fasta, read = plan.members_compressed, plan.members, str(plan.members_fasta)
-    else:
-        packed, fasta, read = src.paths["compressed_fasta"], src.fasta, src.paths["extracted_fasta"]
-    downloads, work = src.downloads_dir, src.work_dir
-    name = strip_gz(file_name(str(fasta)))
-    mix_read = _join(downloads, name) if packed else read
-    paths = {}
-    if packed:
-        paths["extract"] = (_join(downloads, name), _join(work, name))
-    if _in_downloads(mix_read, src) and "drop_invalid_sequences" not in src.overrides:
-        paths["check"] = (_join(downloads, _safe(file_name(mix_read)) + "_validation"),
-                          _join(work, "validation"))
-    return [single if src.mixed else mix for mix, single in paths.values()]
-
-
-def _warn_orphaned_outputs(cfg, cwd: Path) -> None:
-    paths = orphaned_outputs(cfg, cwd)
+def _warn_orphaned_outputs(cwd: Path, dvc_content: str, params: dict, keep=()) -> None:
+    paths = orphaned_outputs(cwd, dvc_content, params, keep)
     if not paths:
         return
     # the .gitignore lines DVC wrote for these paths (one per output, "/<name>")
     gitignores = sorted({str(p.parent / ".gitignore") for p in paths
                          if (p.parent / ".gitignore").is_file() and f"/{p.name}" in
                          (p.parent / ".gitignore").read_text().split()})
-    click.echo("Warning: output_dir holds outputs of an earlier build that this data.yaml "
-               "does not use; nothing deletes them. You can delete:", err=True)
+    click.echo("Warning: an earlier build left these outputs, which the new dvc.yaml no "
+               "longer uses; nothing deletes them:", err=True)
     for p in paths:
         click.echo(f"  {p}", err=True)
     if gitignores:
         click.echo("and their lines in " + ", ".join(gitignores), err=True)
+    # a linked cache keeps the data on disk until DVC drops its copy too
+    click.echo("To free the disk, delete them and run `dvc gc --workspace` (it removes every "
+               "cached file the current dvc.lock does not use).", err=True)
 
 
 def _validate_sources(cfg, cwd: Path, config_path: Path) -> dict:
