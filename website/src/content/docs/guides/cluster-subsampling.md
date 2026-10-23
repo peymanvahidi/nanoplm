@@ -122,25 +122,28 @@ A download stage depends only on its URL. Adding or removing the `cluster_subsam
 
 ### Disk space
 
-DVC keeps a copy of every stage output in its cache (`.dvc/cache`), so by default a run takes about twice the space of its outputs: for UniRef90 the cached downloads, FASTAs, pool and index come to about 140 GB more. To avoid the copy, let the cache link files instead. In the directory of `data.yaml`, before the first run:
+A run's files all sit under `output_dir`: `downloads/` (one file per URL), `<source>/` (extracted, filtered and split FASTAs), and the dataset itself (`train/`, `val/`, `cluster_index/`, `.data_manifest`).
 
-```bash
-dvc init            # add --no-scm outside a git repository, --subdir inside one
-dvc config cache.type reflink,hardlink,symlink
-```
+DVC keeps every stage output in its cache (`.dvc/cache`). When `nanoplm data from-yaml` creates the DVC repository for a `sources:` data.yaml, it sets `cache.type hardlink,symlink`, so the cache links to the outputs instead of holding a second copy. Linked outputs are read-only; to edit one, run `dvc unprotect <path>` first. If `output_dir` and `.dvc/cache` are on different file systems, DVC cannot hardlink and falls back to symlinks into the cache. A repository that already exists keeps its own `cache.type`. To switch one, run `dvc config cache.type hardlink,symlink` and `dvc checkout --relink` in the directory of `data.yaml`. Old `data_dirs` configs keep DVC's default copy cache, because their `get_file` stage links a `local_fasta` into the outputs and a linked cache would make your own file read-only.
 
-`nanoplm data from-yaml` then uses that repository. On a project that has already run, set `cache.type` the same way and run `dvc checkout --relink`.
-
-After changing settings, `dvc gc --workspace` deletes cached versions that the current outputs no longer use.
+The extracted and filtered FASTAs stay in the cache. With a linked cache that costs no extra disk, and keeping them lets DVC restore them instead of extracting again. With a copy cache they would take about 97 GB extra for UniRef90. After changing settings, `dvc gc --workspace` deletes cached versions that the current outputs no longer use.
 
 ## Costs
 
-Measured on UniProt release 2026_03, on one login node:
+Measured on UniProt release 2026_03 on a login node (decimal GB). Index build times include verification and the validation shards.
 
-| Item | Size or time |
-| --- | --- |
-| Downloads | `uniref90.fasta.gz` 32 GB, `uniref100.fasta.gz` 63 GB, `uniref50.xml.gz` 20.6 GB |
-| UniRef90 pool (`train/`) | about 25 GB, 97.8M sequences in 3,261 shards (plus the 34 GB filtered FASTA) |
-| `members.tsv` (UniRef90) | 4.8 GB, 121.5M lines; reading the XML takes about 3.5 min |
-| Cluster index (UniRef90) | about 2.3 GB (`cluster_index/index/`); building it takes about 10 min |
-| MMseqs2 | roughly linear in the number of sequences: minutes for a few million, hours for about 100M |
+| Item | UniRef90 | UniRef100 |
+| --- | --- | --- |
+| Download (`downloads/`) | `uniref90.fasta.gz` 32.1 GB, about 27 min | `uniref100.fasta.gz` 63.2 GB, about 53 min |
+| `uniref50.xml.gz` (both) | 20.6 GB, about 20 min; not in the DVC cache | same file |
+| Extracted FASTA (`<source>/`) | 61.0 GB, about 4 min | 121.1 GB, about 8 min |
+| Filtered FASTA | 36.2 GB, about 2.5 min | 66.7 GB, about 5 min |
+| Pool (`train/`) | 24.9 GB, 97.8M sequences in 3,261 shards, about 3 min | 46.6 GB, 169.0M sequences in 5,635 shards, about 5 min |
+| `members.tsv` | 4.8 GB, about 3.5 min | 8.9 GB, about 5 min |
+| Cluster index + `val/` | about 2.3 GB, 10-14 min, 10-12 GB RAM | about 3.2 GB, 15-20 min, 18-20 GB RAM |
+| **Total disk** | **about 182 GB** (about 343 GB with a copy cache) | **about 330 GB** (about 640 GB with a copy cache) |
+| Needed for training | about 27 GB (`train/`, `cluster_index/`, `val/`) | about 50 GB |
+
+On a busy GPFS file system, DVC hashing the outputs adds 15-50 min to a first run.
+
+MMseqs2 (`clustering: mmseqs2`, or your own FASTA) runs time roughly linear in the number of sequences. With 8 threads, 2M sequences took 5 min, 2.6 GB RAM and 4 GB of temporary disk; 10M sequences take about 25-30 min, 10-13 GB RAM and 15-20 GB of temporary disk under `output_dir/cluster_index/.mmseqs_tmp`, about 3 times the filtered FASTA. About 100M sequences take hours. The temporary directory is deleted afterwards. Run MMseqs2 on a compute node, not a shared login node.
