@@ -133,6 +133,19 @@ def test_mixture_eval_with_recycling_logs_per_source_and_r(plan):
     assert p["recycling/eval_inloop/inloop_eval_loss_at_r1"] == pytest.approx(0.4 * 3 + 0.6 * 4)
 
 
+def test_a_source_without_val_sequences_is_not_averaged_in(tmp_path):
+    import numpy as np
+    m = _mixture(tmp_path)
+    (tmp_path / "a/val/shard_0000.bin").write_bytes(b"")   # a's val set: no sequences
+    np.save(tmp_path / "a/val/shard_0000.idx.npy", np.zeros(0, dtype=np.int32))
+    plan = pp.MixturePlan.open(tmp_path, m, PretrainingConfig(dataset_dir=str(tmp_path),
+                                                              micro_batch_seqs=4))
+    assert plan.eval_names == ["c"]
+    with pytest.raises(mx.MixtureError, match="a has no val sequences"):
+        pp.MixturePlan.open(tmp_path, m, PretrainingConfig(
+            dataset_dir=str(tmp_path), micro_batch_seqs=4, eval_sources=["a", "c"]))
+
+
 def test_eval_sources_list_evaluates_only_those(tmp_path, monkeypatch):
     m = _mixture(tmp_path)
     plan = pp.MixturePlan.open(tmp_path, m, PretrainingConfig(

@@ -2479,7 +2479,18 @@ class MixturePlan:
         if not getattr(manifest, "is_mixture", False):
             return None
         from nanoplm.data.datasets.mixture import open_val_datasets
+        from nanoplm.data.infra.mixture import MixtureError
         vals = open_val_datasets(dataset_dir, manifest)
+        # a source without val sequences would add a loss of 0 to the weighted mean
+        empty = [n for n in names if len(vals[n]) == 0]
+        if empty and getattr(pretrain_config, "eval_sources", "all") != "all":
+            raise MixtureError(f"eval_sources: {', '.join(empty)} has no val sequences "
+                               "(val_ratio 0?)")
+        if empty:
+            logger.info(f"Mixture eval skips {', '.join(empty)}: no val sequences")
+            names = [n for n in names if n not in empty]
+        if not names:
+            raise MixtureError("no mixture source has val sequences; set val_ratio above 0")
         counts = eval_split({n: len(v) for n, v in vals.items()}, names,
                             int(pretrain_config.micro_batch_seqs))
         sets = {n: torch.utils.data.Subset(vals[n], range(counts[n])) for n in names}
