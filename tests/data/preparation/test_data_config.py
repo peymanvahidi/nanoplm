@@ -236,10 +236,10 @@ def test_members_null_means_this_fasta():
     assert src.cluster == {"members": None}
 
 
-def test_a_top_level_cluster_block_points_at_its_new_place():
+def test_a_top_level_cluster_block_is_an_unknown_key():
     cfg = _template()
-    cfg["cluster_subsampling"] = {"enabled": True, "members": "uniref90"}
-    with pytest.raises(dc.DataConfigError, match="sources.<name>.cluster_subsampling"):
+    cfg["cluster_subsampling"] = {"members": "uniref90"}
+    with pytest.raises(dc.DataConfigError, match="unknown key cluster_subsampling"):
         _parse(cfg)
 
 
@@ -367,38 +367,9 @@ def test_the_old_layout_local_fasta_hint():
     assert old["data_dirs"]["compressed_fasta"] in deletable       # get_file's link to it
 
 
-@pytest.mark.parametrize("block", [None, {}, {"enabled": False, "members": "uniref90"},
-                                   {"members": None, "clustering": "auto"}])
-def test_an_old_top_level_cluster_block_that_is_off_is_ignored(block):
-    cfg = copy.deepcopy(OLD)
-    cfg["cluster_subsampling"] = block
-    got = _parse(cfg)
-    assert got.legacy and got.source.cluster is None
-    assert any("cluster_subsampling at the top level is off and is ignored" in w
-               for w in got.warnings)
-
-
-def test_an_old_top_level_cluster_block_that_is_on_says_what_to_paste(tmp_path):
-    from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
-    cfg = copy.deepcopy(OLD)
-    cfg["data_dirs"]["url"] = dc.FASTA_SHORTCUTS["uniref50"]
-    cfg["cluster_subsampling"] = {"enabled": True, "clustering": "uniprot", "identity": 0.5}
-    with pytest.raises(dc.DataConfigError) as e:
-        _parse(cfg)
-    msg = str(e.value)
-    assert "cluster_subsampling now sits under its source" in msg
-    assert ("    fasta: uniref50\n    cluster_subsampling:\n      members: null\n"
-            "      clustering: uniprot\n      identity: 0.5\n") in msg
-    new = _pasted(msg, cfg)
-    new["sources"]["main"]["cluster_subsampling"]["members"] = "uniref90"
-    src = _parse(new).source
-    assert src.cluster == {"members": "uniref90", "clustering": "uniprot", "identity": 0.5}
-    assert resolve_cluster_plan(src).cluster_source == "uniref_xml"
-
-
 @pytest.mark.parametrize("edit, match", [
-    (lambda c: c.update(cluster_subsampling={"enabled": True}),
-     "cluster_subsampling now sits under its source"),
+    (lambda c: c.update(cluster_subsampling={"members": None}),
+     "unknown key cluster_subsampling"),
     (lambda c: c.update(sources={}), "data_dirs is the old layout; use output_dir"),
     (lambda c: c["data_dirs"].update(urll="x"), "data_dirs: unknown key urll"),
     (lambda c: c["data_params"].update(seqs_numm=1), "data_params: unknown key seqs_numm"),

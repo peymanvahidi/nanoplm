@@ -421,14 +421,3 @@ def test_fix_adds_drop_invalid_when_it_is_left_out(tmp_path, indent):
     p.write_text("output_dir: out\nsources:\n  s:\n    fasta: swissprot\n")
     _flip_drop_invalid(p, True)
     assert yaml.safe_load(p.read_text())["data_params"] == {"drop_invalid_sequences": True}
-
-
-def test_an_old_config_with_cluster_subsampling_off_still_runs(tmp_path, monkeypatch):
-    """507bca9's template shipped a top-level cluster_subsampling block with enabled: false."""
-    text = (GOLDEN / "url_gz.data.yaml").read_text() + (
-        "\ncluster_subsampling:\n  enabled: false\n  members: null\n  clustering: auto\n"
-        "  identity: 0.5\n  coverage: 0.8\n")
-    out, _ = _dry(tmp_path, monkeypatch, text)
-    assert "cluster_subsampling at the top level is off and is ignored" in out
-    assert (tmp_path / "dvc.yaml").read_text().replace(str(_NANOPLM_PKG_DIR), "<PKG>") == \
-        (GOLDEN / "url_gz.dvc.yaml").read_text()
