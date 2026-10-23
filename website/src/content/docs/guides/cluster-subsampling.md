@@ -20,6 +20,8 @@ Add a `cluster_subsampling` block under the source in `data.yaml`. The block bei
 sources:
   uniref50:
     fasta: uniref50
+    max_seqs: -1         # counts clusters here: all of them
+    val_ratio: 0.0044    # share of clusters held out, as in the UniRef90 experiment
     cluster_subsampling:
       members: uniref90  # uniref90, uniref100, a UniRef90/100 FASTA URL/path, or null (= this fasta)
       clustering: auto   # auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or uniprot, mmseqs2
@@ -31,16 +33,16 @@ sources:
 - [`clustering`](/nanoplm/reference/data/#data-cluster_subsampling-clustering): where the clusters come from. `auto` uses UniProt's UniRef50 clusters for UniRef data and MMseqs2 for anything else (see [Where the clusters come from](#where-the-clusters-come-from)). `uniprot` requires UniProt clusters and fails at config time when the data is not UniRef. `mmseqs2` always clusters the members with MMseqs2, also for UniRef data.
 - [`identity`](/nanoplm/reference/data/#data-cluster_subsampling-identity) and [`coverage`](/nanoplm/reference/data/#data-cluster_subsampling-coverage) are only read when MMseqs2 does the clustering.
 
-Before any stage runs, `nanoplm data from-yaml` prints one row per source. The `fasta` column lists the files the stages read: here the members FASTA and the XML, since `uniref50.fasta.gz` is never fetched. `(url)` means it will be downloaded, `(reuse, <size>)` that a copy is already there. The last column names the cluster source it picked; `*` marks a value set on the source:
+Before any stage runs, `nanoplm data from-yaml` prints one row per source. The `fasta` column lists the files the stages read: here the members FASTA and the XML, since `uniref50.fasta.gz` is never fetched. `(url)` means it will be downloaded, `(reuse, <size>, <date>)` that a copy written on that date is already there. The last column names the cluster source it picked; `*` marks a value set on the source:
 
 ```text title="Output"
 data.yaml: 1 source -> /work/output/data/pretrain_data
-source    fasta                                            seqs  len     val      clustering
-uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all*  20-512  0.0044*  UniProt uniref50.xml.gz (members: UniRef90)
+source    fasta                                            max seqs       len     val      clustering
+uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all clusters*  20-512  0.0044*  UniProt uniref50.xml.gz (members: UniRef90)
 * = set on this source
 ```
 
-With your own FASTA the last column reads `MMseqs2 linclust, identity 0.5, coverage 0.8 (members: /data/my_proteins.fasta)`. The summary at the end repeats it.
+With your own FASTA the last column reads `MMseqs2 linclust, identity 0.5, coverage 0.8`. The summary at the end repeats it.
 
 Then point `pretrain.yaml`'s `dataset_dir` at `output_dir`. Training picks the cluster-subsampled dataset from the manifest; nothing else changes in `pretrain.yaml`.
 
@@ -98,9 +100,9 @@ Either way, the clusters end up as one table, `output_dir/cluster_index/members.
 | `cluster_subsampling is empty. It needs members (null = this fasta)` / `needs members` | A bare `cluster_subsampling:`, or one with every field commented out. Set `members`, or delete the block to turn it off. |
 | `remove enabled; the block being present turns it on` | An `enabled` key left over from an earlier layout. |
 | `cluster_subsampling now sits under its source` | A top-level `cluster_subsampling` block. Move it under the source. |
-| `... clustered with MMseqs2, but mmseqs was not found` | MMseqs2 is needed (scenarios 4 and 6). Install it with `nanoplm deps install --mmseqs-only`, put a release binary on `PATH`, or set `NANOPLM_MMSEQS=/path/to/mmseqs`. |
+| `sources.<name>: these members are clustered with MMseqs2, but mmseqs was not found` | MMseqs2 is needed (scenarios 4 and 6). Install it with `nanoplm deps install --mmseqs-only`, put a release binary on `PATH`, or set `NANOPLM_MMSEQS=/path/to/mmseqs`. |
 | `... was built by the data-sampler experiment scripts ... Rebuild it with nanoplm data from-yaml` | A dataset directory from the old experiment (it has a `RUNTIME_SAMPLER_REQUIRED` marker, or a pool with the experiment's index next to it). Its manifest describes the whole pool, so it is refused. |
-| Warning: `identity / coverage only apply to MMseqs2 clustering; they are ignored with UniProt clusters. Set cluster_subsampling.clustering: mmseqs2 to use them` | `identity` or `coverage` differs from the template default (0.5 / 0.8) while UniProt clusters are used. |
+| Warning: `identity / coverage only apply to MMseqs2 clustering; they are ignored with UniProt clusters. Set sources.<name>.cluster_subsampling.clustering: mmseqs2 to use them` | `identity` or `coverage` differs from the template default (0.5 / 0.8) while UniProt clusters are used. |
 | Warning: `MMseqs2 will cluster all ~60M UniRef50 sequences` | `fasta` is UniRef50, `members` is `null` and `clustering` is `auto`, so MMseqs2 clusters UniRef50 itself. To train on the members of UniProt's UniRef50 clusters, set `members: uniref90` (with `clustering: auto` or `uniprot`). An explicit `clustering: mmseqs2` does not warn. |
 | `clustering: mmseqs2 clusters the members (...); the source fasta (...) is not needed and is not downloaded` | Not a warning: scenario 6 with `fasta: uniref50` and UniRef members. |
 | Warning: `cluster_subsampling ignores shuffle / shuffle_seed` | `shuffle` or `shuffle_seed` differs from the template (`true` / `24`). The pool keeps FASTA order; the training sampler shuffles the clusters each epoch. |

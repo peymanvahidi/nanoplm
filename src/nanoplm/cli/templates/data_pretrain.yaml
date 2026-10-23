@@ -10,10 +10,11 @@ sources:
 
   # uniref50:
   #   fasta: uniref50
+  #   max_seqs: -1         # counts clusters here: all of them
+  #   val_ratio: 0.0044    # share of clusters held out, as in the UniRef90 experiment
   #   # Cluster subsampling: each epoch trains on one random member of every cluster.
   #   # members: uniref90 uses UniProt's UniRef50 clusters and trains on their UniRef90
   #   # members; the UniRef50 FASTA itself is never downloaded.
-  #   # max_seqs and val_ratio count clusters here: set max_seqs: -1 and val_ratio: 0.0044.
   #   # Delete or comment out the block to turn it off.
   #   cluster_subsampling:
   #     members: uniref90  # uniref90, uniref100, a UniRef90/100 FASTA URL/path, or null (= this fasta)
