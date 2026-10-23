@@ -22,25 +22,29 @@ sources:
 
 `nanoplm data from-yaml` builds each source into `output_dir/<source>/` and then writes the mixture manifest to `output_dir/.data_manifest`. Point `pretrain.yaml`'s `dataset_dir` at `output_dir` as usual.
 
+SwissProt sequences are also UniRef90 members, so in this mix the two sources overlap: a sequence in one source's val set can be a training sequence of the other. Keep that in mind when you read `eval/loss/swissprot` or `eval/loss/uniref50`; nothing removes the overlap.
+
 ## Rules
 
 - Weights are above 0 and sum to 1 (within 1e-6). The error lists each weight and the sum.
 - All sources use the same `register_tokens`. `max_workers` is set once, in `data_params`.
 - A source can be `prepared: <folder>`, a dataset another `data.yaml` built. It is not rebuilt.
-- Pretraining needs `use_packing: true` (the template default).
+- Pretraining needs `pure_torch: true` (or `--pure-torch`) and `use_packing: true` (the template default).
 - The model's position check uses the largest `max_seq_len` of the sources.
 
 ## What reruns
 
 There is one `dvc.yaml`. Each source has its own stages (`swissprot-filter`, `uniref50-cluster_index`, ...). A URL that several sources use is downloaded once, and a `.gz` that several sources read is extracted and checked once, into `output_dir/downloads/` (stages `download-<file>`, `extract-<file>`, `check-<file>`). A source that sets its own `drop_invalid_sequences` keeps its own check. The last stage, `mixture`, is the only one that reads the weights, so changing only the weights reruns only that stage, in seconds.
 
-Going from one source to several (or back) moves where the dataset lives: one source writes `train/` and `val/` into `output_dir`, a mix writes them into `output_dir/<source>/`. A mix also extracts and checks a `.gz` in `downloads/` instead of `output_dir/<source>/`. The old outputs are not deleted. `from-yaml` prints a warning listing them, and you can delete them. The same warning lists the folder of a source you remove, the `cluster_index/` of a source whose `cluster_subsampling` block you delete, and `downloads/uniref50.xml.gz` once no source uses UniProt clusters.
+Going from one source to several (or back) moves where the dataset lives: one source writes `train/` and `val/` into `output_dir`, a mix writes them into `output_dir/<source>/`. A mix also extracts and checks a `.gz` in `downloads/` instead of `output_dir/<source>/`.
+
+`from-yaml` compares `dvc.lock` with the new `dvc.yaml` and lists the outputs that no stage writes any more: the old layout's after such a switch, those of a source you remove or rename, the `cluster_index/` of a source whose `cluster_subsampling` block you delete, and `downloads/uniref50.xml.gz` once no source uses UniProt clusters. Nothing deletes them. DVC's cache holds a linked copy of each, so deleting them frees the disk only after `dvc gc --workspace`, which removes every cached file the current `dvc.lock` does not use.
 
 The mixture manifest records a hash of each source's manifest. If a source is rebuilt or edited after the mix was written, training stops and asks you to rerun `nanoplm data from-yaml`.
 
 ## How training draws
 
-Each source keeps its own epoch counter. A small source with a large weight repeats; a large source with a small weight is read partly. A cluster-subsampled source draws new members every time it repeats.
+Each source keeps its own epoch counter. A small source with a large weight repeats; a large source with a small weight is read partly. A cluster-subsampled source draws new members every time it repeats. A `decay` resume starts again from the first mixture epoch, so the anneal reads the same order and member draw as the trunk's first epoch.
 
 One mixture epoch is `N` samples, the sum of the source sizes (sequences, or clusters for a cluster source). Each source gets `weight × N` of them. The shares are exact over each mixture epoch.
 
@@ -48,7 +52,7 @@ At the start, training prints one row per source: share, size, tokens used and e
 
 ## Eval
 
-Eval keeps today's batch count and splits it evenly over the sources. It logs `eval/loss/<source>` for each source and `eval/loss`, the share-weighted mean of those. With a recycling eval sweep, each loop count adds `eval/loss/<source>/r<k>`, and the unsuffixed keys are those of the target loop count; when the sweep leaves that out, they are not logged (as for a single dataset).
+Eval keeps the batch count of one val set holding every source's val sequences, and splits it evenly over the sources. A source with more val sequences than its part evaluates rows spread evenly over its whole val set. It logs `eval/loss/<source>` for each source and `eval/loss`, the share-weighted mean of those. With a recycling eval sweep, each loop count adds `eval/loss/<source>/r<k>`, and the unsuffixed keys are those of the target loop count; when the sweep leaves that out, they are not logged (as for a single dataset).
 
 Each source has its own val loader; `num_workers` is split between them, so an eval starts about as many worker processes as with one dataset.
 
