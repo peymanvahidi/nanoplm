@@ -145,8 +145,38 @@ def test_the_rebuild_line_asks_dvc_status_after_the_first_run(tmp_path, monkeypa
         "R", (), {"returncode": 0, "stdout": status if "status" in a[0] else ""})())
     r = _run(_write(tmp_path, load_template("data_pretrain")), "--dry-run")
     assert r.exit_code == 0, r.output
-    assert ("Rebuild: filter, split, pre-tokenize@train. Up to date: get_file, extract, check, "
-            "shuffle, pre-tokenize@val, write_manifest.") in r.output
+    # pre-tokenize@val and write_manifest read what split writes, so they rerun too
+    assert ("Rebuild: filter, split, pre-tokenize@train, pre-tokenize@val, write_manifest. "
+            "Up to date: get_file, extract, check, shuffle.") in r.output
+
+
+def _rebuild_line(tmp_path, monkeypatch, cfg, status):
+    (tmp_path / "dvc.lock").write_text("schema: '2.0'\n")
+    (tmp_path / ".dvc").mkdir(exist_ok=True)
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: type(
+        "R", (), {"returncode": 0, "stdout": status if "status" in a[0] else ""})())
+    r = _run(_write(tmp_path, cfg), "--dry-run")
+    assert r.exit_code == 0, r.output
+    return next(line for line in r.output.splitlines() if line.startswith(("Rebuild", "Up to")))
+
+
+def test_the_rebuild_line_follows_cluster_outputs_downstream(tmp_path, monkeypatch):
+    cfg = yaml.safe_load(load_template("data_pretrain"))
+    cfg["sources"] = {"uniref50": {"fasta": "uniref50",
+                                   "cluster_subsampling": {"members": "uniref90"}}}
+    line = _rebuild_line(tmp_path, monkeypatch, cfg, '{"cluster_members": []}')
+    assert line == ("Rebuild: cluster_members, cluster_index, write_manifest. Up to date: "
+                    "get_members_fasta, extract_members, check, filter, cluster_pool, "
+                    "get_cluster_xml.")
+
+
+def test_the_rebuild_line_resolves_old_layout_paths(tmp_path, monkeypatch):
+    """data_dirs stages name their files as ${data_dirs.X}; the graph reads them from
+    data.yaml."""
+    line = _rebuild_line(tmp_path, monkeypatch, (GOLDEN / "url_gz.data.yaml").read_text(),
+                         '{"shuffle": []}')
+    assert line == ("Rebuild: shuffle, filter, split, pre-tokenize@train, pre-tokenize@val, "
+                    "write_manifest. Up to date: get_file, extract, check.")
 
 
 def test_old_layout_warns_with_the_block_to_paste(tmp_path, monkeypatch):

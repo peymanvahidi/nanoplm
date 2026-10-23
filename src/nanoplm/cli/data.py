@@ -1055,7 +1055,7 @@ def from_yaml(
         )
 
     if kind == "pretrain":
-        _print_rebuild_line(cwd, dvc_content, repro_env)
+        _print_rebuild_line(cwd, dvc_content, repro_env, params)
 
     # Build repro command
     if dry_run:
@@ -1440,19 +1440,66 @@ def _print_plan(cfg, plan, cwd: Path, config_path: Path) -> None:
     click.echo(plan_table(cfg, plan, cwd, config_path))
 
 
-def _stage_names(dvc_content: str) -> list:
+def _stage_graph(dvc_content: str, params: dict) -> dict:
+    """{stage: (deps, outs)} in dvc.yaml order, a foreach stage expanded per item
+    (``pre-tokenize@train``). ${...} references are filled in from data.yaml."""
+    import os.path
+    import re
     import yaml as _yaml
-    names = []
+
+    def lookup(ref: str, item: dict):
+        node = {"item": item, **params}
+        for part in ref.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return "${" + ref + "}"
+            node = node[part]
+        return str(node)
+
+    def paths(entries, item):
+        out = []
+        for e in entries or []:
+            for p in (e if isinstance(e, dict) else [e]):
+                p = str(p)
+                for _ in range(3):      # an item value may hold ${data_dirs.X} itself
+                    p = re.sub(r"\$\{([^}]+)\}", lambda m: lookup(m.group(1), item), p)
+                out.append(os.path.normpath(p))
+        return out
+
+    graph = {}
     for name, stage in (_yaml.safe_load(dvc_content).get("stages") or {}).items():
-        names += [f"{name}@{k}" for k in stage["foreach"]] if "foreach" in stage else [name]
-    return names
+        if "foreach" in stage:
+            for key, item in stage["foreach"].items():
+                graph[f"{name}@{key}"] = (paths(stage["do"].get("deps"), item),
+                                          paths(stage["do"].get("outs"), item))
+        else:
+            graph[name] = (paths(stage.get("deps"), {}), paths(stage.get("outs"), {}))
+    return graph
 
 
-def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict) -> None:
+def _with_downstream(changed: set, graph: dict) -> set:
+    """``changed`` plus every stage that reads, directly or not, what one of them writes.
+    A dep inside an out (``split/train.fasta`` in ``split``) counts."""
+    def overlaps(a: str, b: str) -> bool:
+        return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+    out = set(changed)
+    todo = list(changed)
+    while todo:
+        outs = graph.get(todo.pop(), ((), ()))[1]
+        for name, (deps, _) in graph.items():
+            if name not in out and any(overlaps(d, o) for d in deps for o in outs):
+                out.add(name)
+                todo.append(name)
+    return out
+
+
+def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict, params: dict) -> None:
     """Which stages dvc repro will run. Without a dvc.lock that is all of them; otherwise
-    ask `dvc status`, which reuses DVC's file-hash cache after the first run."""
+    the stages `dvc status` reports changed (it reuses DVC's file-hash cache after the
+    first run) and every stage downstream of one, since their inputs will change too."""
     import json
-    names = _stage_names(dvc_content)
+    graph = _stage_graph(dvc_content, params)
+    names = list(graph)
     if not (cwd / "dvc.lock").exists():
         click.echo("Rebuild: all (first run)")
         return
@@ -1465,6 +1512,7 @@ def _print_rebuild_line(cwd: Path, dvc_content: str, env: dict) -> None:
     except (subprocess.TimeoutExpired, ValueError, OSError):
         click.echo("Rebuild: unknown (dvc status was slow; dvc repro decides)")
         return
+    changed = _with_downstream(changed & set(names), graph)
     rebuild = [n for n in names if n in changed]
     fresh = [n for n in names if n not in changed]
     if not rebuild:
