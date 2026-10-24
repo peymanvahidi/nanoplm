@@ -110,13 +110,15 @@ def test_data_and_distill_surfaces_build():
     assert "x-nanoplm-compat" not in emit.build_surface("data")
 
 
-def _leaf_fields(schema: dict):
+def _leaf_fields(schema: dict, prefix: str = ""):
     for key, frag in schema["properties"].items():
+        name = f"{prefix}{key}"
+        # A name -> spec map (data's `sources`) describes its entries here.
+        frag = frag.get("additionalProperties", frag)
         if frag.get("type") == "object" and "properties" in frag:
-            for sub, sub_frag in frag["properties"].items():
-                yield f"{key}.{sub}", sub_frag
+            yield from _leaf_fields(frag, f"{name}.")
         else:
-            yield key, frag
+            yield name, frag
 
 
 def test_no_field_is_typed_null_only():
@@ -135,8 +137,9 @@ def test_null_default_fields_get_their_overlay_type():
     counts = pre["pretraining"]["properties"]["recycling_pretraining_eval_loop_counts"]
     assert counts["type"] == ["array", "null"]
     assert counts["items"] == {"type": "integer"}
-    fasta = emit.build_surface("data")["properties"]["data_dirs"]["properties"]["local_fasta"]
-    assert fasta["type"] == ["string", "null"]
+    source = emit.build_surface("data")["properties"]["sources"]["additionalProperties"]
+    members = source["properties"]["cluster_subsampling"]["properties"]["members"]
+    assert members["type"] == ["string", "null"]
     kv = emit.build_surface("distill")["properties"]["model"]["properties"]["num_kv_heads"]
     assert kv["type"] == ["integer", "null"] and kv["default"] is None
 
@@ -148,3 +151,67 @@ def test_null_default_without_overlay_type_fails_loudly():
         emit._field_schema("sec", "f", "null", "", {"sec.f": {"type": "integer"}}, {})
     frag = emit._field_schema("sec", "f", "null", "", {"sec.f": {"type": ["integer", "null"]}}, {})
     assert frag["type"] == ["integer", "null"] and frag["default"] is None
+
+
+def _source_spec() -> dict:
+    return emit.build_surface("data")["properties"]["sources"]["additionalProperties"]
+
+
+def test_cluster_fractions_exclude_zero():
+    block = _source_spec()["properties"]["cluster_subsampling"]["properties"]
+    for key in ("identity", "coverage"):
+        assert block[key]["exclusiveMinimum"] == 0 and "minimum" not in block[key]
+        assert block[key]["maximum"] == 1
+    assert block["identity"]["default"] == 0.5 and block["coverage"]["default"] == 0.8
+    assert block["clustering"]["enum"] == ["auto", "uniprot", "mmseqs2"]
+    assert "default" not in block["members"]  # the block needs members
+
+
+def test_data_schema_nests_source_specs_under_sources():
+    props = emit.build_surface("data")["properties"]
+    assert list(props) == ["output_dir", "sources", "data_params"]
+    assert props["output_dir"] == {
+        "type": "string",
+        "default": "output/data/pretrain_data",
+        "description": "every file goes here; pretrain.yaml's dataset_dir points here",
+    }
+    sources = props["sources"]
+    # A name -> spec map: no fixed keys, every entry is a source spec.
+    assert sources["type"] == "object" and "properties" not in sources
+    assert "override" in sources["description"]
+    spec = sources["additionalProperties"]["properties"]
+    # The template's `fasta: swissprot` is an example, not a default.
+    assert "default" not in spec["fasta"] and spec["fasta"]["examples"] == ["swissprot"]
+    assert "uniref90" in spec["fasta"]["description"]
+    assert spec["weight"]["type"] == "number" and spec["weight"]["default"] == 1.0
+    assert "not tokens" in spec["weight"]["description"]
+    assert spec["prepared"]["type"] == "string"
+    assert spec["cluster_subsampling"]["type"] == "object"
+
+
+def test_data_params_rarely_changed_group():
+    params = emit.build_surface("data")["properties"]["data_params"]["properties"]
+    assert "seqs_num" not in params and params["max_seqs"]["default"] == 20000
+    assert "x-nanoplm-group" not in params["max_seq_len"]
+    assert params["shuffle"]["x-nanoplm-group"] == "Rarely changed"
+    # The heading labels the block; shuffle's description is its own comment.
+    assert params["shuffle"]["description"] == "shuffle before the train / val split"
+
+
+def test_nested_entry_outside_a_map_section_fails_loudly(monkeypatch):
+    monkeypatch.setattr(emit._tpl, "load_template_text", lambda s: "sec:\n  a:\n    f: 1\n")
+    with pytest.raises(ValueError, match="map: true"):
+        emit.build_surface("data")
+
+
+def test_only_marked_top_level_scalars_are_documented():
+    """data.yaml's output_dir is a field; pretrain.yaml's `pure_torch: true` is not."""
+    assert "output_dir" in emit.build_surface("data")["properties"]
+    assert "pure_torch" not in emit.build_surface("pretrain")["properties"]
+
+
+def test_eval_sources_is_a_name_or_a_list_of_names():
+    """pretrain.yaml's eval_sources is "all" or a list of source names."""
+    es = emit.build_surface("pretrain")["properties"]["pretraining"]["properties"]["eval_sources"]
+    assert es["type"] == ["string", "array"] and es["items"] == {"type": "string"}
+    assert es["default"] == "all"

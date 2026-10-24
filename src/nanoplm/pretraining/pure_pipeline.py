@@ -68,7 +68,8 @@ from nanoplm.pretraining.collator import (
     build_power_of_two_buckets,
     mlm_masking_kwargs_from_config,
 )
-from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset
+from nanoplm.data.datasets.pretrain import ShardedDataset, TokenPackingDataset, packing_sampler
+from nanoplm.data.datasets.cluster_sampled import ClusterSampledDataset, open_train_dataset
 from nanoplm.pretraining import cpu_offload
 from nanoplm.pretraining.fp8 import (
     convert_fp8_targets,
@@ -1854,26 +1855,72 @@ def _resolve_world_size(cfg: PretrainingConfig) -> int:
     return int(cfg.world_size) if cfg.world_size else 1
 
 
-def _sync_train_loader_len(
-    train_loader_len: int, distributed: bool, device: torch.device
-) -> int:
-    """Return the shared number of micro-batches all ranks can safely execute."""
-    if not (distributed and dist.is_initialized()):
-        return train_loader_len
-    t = torch.tensor(train_loader_len, device=device, dtype=torch.int64)
-    mn, mx = t.clone(), t.clone()
-    dist.all_reduce(mn, op=dist.ReduceOp.MIN)
-    dist.all_reduce(mx, op=dist.ReduceOp.MAX)
-    min_len = int(mn)
-    max_len = int(mx)
-    if min_len != max_len and dist.get_rank() == 0:
-        logger.warning(
-            "Mismatched train loader lengths across ranks (min=%d, max=%d); "
-            "using min length for synchronized micro-step scheduling.",
-            min_len,
-            max_len,
+class _TrainLenSync:
+    """The shared number of micro-batches all ranks can safely execute in a pass.
+
+    Called once per pass, since the packed batch count changes with the epoch; a
+    length mismatch across ranks is warned about once per run, not once per pass.
+    """
+
+    def __init__(self, distributed: bool, device: torch.device):
+        self.distributed = distributed
+        self.device = device
+        self.warned = False
+
+    def __call__(self, train_loader_len: int) -> int:
+        if not (self.distributed and dist.is_initialized()):
+            return train_loader_len
+        t = torch.tensor(train_loader_len, device=self.device, dtype=torch.int64)
+        mn, mx = t.clone(), t.clone()
+        dist.all_reduce(mn, op=dist.ReduceOp.MIN)
+        dist.all_reduce(mx, op=dist.ReduceOp.MAX)
+        min_len = int(mn)
+        max_len = int(mx)
+        if min_len != max_len and not self.warned and dist.get_rank() == 0:
+            self.warned = True
+            logger.warning(
+                "Mismatched train loader lengths across ranks (min=%d, max=%d); "
+                "using min length for synchronized micro-step scheduling.",
+                min_len,
+                max_len,
+            )
+        return min_len
+
+
+# Pass 0 this close to one optimizer step's worth of micro-batches draws a warning: a
+# later pass can be shorter (the packed batch count moves with the shuffle, and a
+# cluster-sampled dataset draws other members) and would then stop the run.
+SHORT_PASS_MARGIN = 0.10
+
+
+def _check_pass_len(
+    synced_len: int, grad_accum: int, global_batch_tokens, pass_idx: Optional[int] = None
+) -> Optional[str]:
+    """Raise when a pass has fewer micro-batches per rank than one optimizer step
+    needs. ``pass_idx`` None is the startup check of pass 0; it returns a warning when
+    the pass is within SHORT_PASS_MARGIN of that limit."""
+    fix = "Lower global_batch_tokens or use a larger dataset."
+    if synced_len < grad_accum:
+        where = "per pass" if pass_idx is None else f"in pass {pass_idx + 1}"
+        varies = "" if pass_idx is None else (
+            " Pass lengths vary with the shuffle (and with the member draw of a "
+            "cluster-sampled dataset), so an earlier pass could be long enough."
         )
-    return min_len
+        raise RuntimeError(
+            f"train_loader yields {synced_len} micro-batches per rank {where}, fewer than "
+            f"grad_accum={grad_accum}: one optimizer step "
+            f"(global_batch_tokens={global_batch_tokens}) is larger than a pass over the "
+            f"train set.{varies} {fix}"
+        )
+    if pass_idx is None and synced_len < grad_accum * (1 + SHORT_PASS_MARGIN):
+        return (
+            f"train_loader yields {synced_len} micro-batches per rank per pass, within "
+            f"{SHORT_PASS_MARGIN:.0%} of grad_accum={grad_accum}. Pass lengths vary, so a "
+            f"later pass may come up short and stop the run. {fix}"
+        )
+    return None
+
+
   # TODO: this is comming from master branch
 # def _dist_barrier(local_rank: int) -> None:
 #     if not dist.is_initialized():
@@ -2409,6 +2456,96 @@ def _configure_fp8_cpu_activation_offload(
 
 
 # ---------------------------------------------------------------------------
+# Mixtures (a dataset_dir whose manifest lists several sources)
+# ---------------------------------------------------------------------------
+
+class MixturePlan:
+    """What training needs to know about a mixture: the sources evaluated, their val
+    sets (each cut to its part of the eval budget) and the per-source run plan.
+    ``open`` returns None for any other dataset."""
+
+    def __init__(self, manifest, eval_names, eval_sets):
+        self.manifest = manifest
+        self.weights = {r["name"]: float(r["weight"]) for r in manifest.sources}
+        self.eval_names = eval_names
+        self.eval_sets = eval_sets
+        self.plan: list = []
+        self.plan_lines: list = []
+
+    @classmethod
+    def open(cls, dataset_dir, manifest, pretrain_config):
+        from nanoplm.data.infra.mixture import eval_indices, eval_split, resolve_eval_sources
+        names = resolve_eval_sources(getattr(pretrain_config, "eval_sources", "all"), manifest)
+        if not getattr(manifest, "is_mixture", False):
+            return None
+        from nanoplm.data.datasets.mixture import open_val_datasets
+        from nanoplm.data.infra.mixture import MixtureError
+        vals = open_val_datasets(dataset_dir, manifest)
+        # a source without val sequences would add a loss of 0 to the weighted mean
+        empty = [n for n in names if len(vals[n]) == 0]
+        if empty and getattr(pretrain_config, "eval_sources", "all") != "all":
+            raise MixtureError(f"eval_sources: {', '.join(empty)} has no val sequences "
+                               "(val_ratio 0?)")
+        if empty:
+            logger.info(f"Mixture eval skips {', '.join(empty)}: no val sequences")
+            names = [n for n in names if n not in empty]
+        if not names:
+            raise MixtureError("no mixture source has val sequences; set val_ratio above 0")
+        counts = eval_split({n: len(v) for n, v in vals.items()}, names,
+                            int(pretrain_config.micro_batch_seqs))
+        sets = {n: torch.utils.data.Subset(vals[n], eval_indices(len(vals[n]), counts[n]))
+                for n in names}
+        logger.info("Mixture eval: " + ", ".join(f"{n} {counts[n]:,} of {len(vals[n]):,} val seqs"
+                                                 for n in names))
+        return cls(manifest, names, sets)
+
+    def eval_loaders(self, make) -> dict:
+        self.loaders = {n: make(ds) for n, ds in self.eval_sets.items()}
+        return self.loaders
+
+    def plan_run(self, budget_tokens: int) -> None:
+        from nanoplm.data.infra.mixture import format_run_plan, run_plan
+        self.plan = run_plan(self.manifest, budget_tokens)
+        self.plan_lines = format_run_plan(self.plan, budget_tokens)
+
+
+def _mixture_eval(mixture, eval_loop_counts, target_r, model, device, distributed, amp_dtype,
+                  recycling_bptt, global_step, is_main, wandb_enabled) -> bool:
+    """Eval every evaluated source of a mixture and log it. Keys: eval/loss/<source> and
+    eval/loss, the share-weighted mean over the sources evaluated. With recycling, every
+    r adds eval/loss/<source>/r<r>, the in-loop sweep payload takes the weighted mean
+    per r, and the unsuffixed keys are the target r (none when the sweep leaves it out;
+    see mixture.eval_keys). Returns whether W&B still logs."""
+    from nanoplm.data.infra.mixture import eval_keys, weighted_loss
+    from nanoplm.pretraining.recycling.logging import inloop_eval_payload
+    by_r: dict = {}
+    for r_value in eval_loop_counts:
+        by_r[r_value] = {
+            name: _evaluate(model, loader, device, distributed, amp_dtype, loop_count=r_value,
+                            recycling_bptt=recycling_bptt if r_value is not None else None)
+            for name, loader in mixture.loaders.items()}
+    if not is_main:
+        return wandb_enabled
+    payload = {"train/global_step": global_step,
+               **eval_keys(by_r, target_r, mixture.weights)}
+    if None in by_r:
+        per_source = ", ".join(f"{n}={v:.4f}" for n, v in by_r[None].items())
+        logger.info(f"[step {global_step}] eval_loss={payload['eval/loss']:.4f} ({per_source})")
+    else:
+        weighted = {r: weighted_loss(l, mixture.weights) for r, l in by_r.items()}
+        payload.update(inloop_eval_payload(weighted))
+        logger.info(f"[step {global_step}] in-loop eval " + ", ".join(
+            f"r={r}: {v:.4f}" for r, v in sorted(weighted.items())))
+    if wandb_enabled and wandb.run is not None:
+        try:
+            wandb.log(payload)
+        except Exception as exc:
+            logger.warning(f"W&B log failed; disabling. Error: {exc}")
+            return False
+    return wandb_enabled
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -2460,9 +2597,32 @@ def run_pure_pretraining(
         if not d.exists():
             raise FileNotFoundError(f"Shard directory not found: {d}")
 
-    logger.info("Using ShardedDataset for pre-tokenized binary shards")
-    train_ds = ShardedDataset(data_dir=str(train_shard_dir))
-    val_ds = ShardedDataset(data_dir=str(val_shard_dir))
+    train_ds = open_train_dataset(dataset_dir, manifest, seed=pretrain_config.seed)
+    # A mixture evaluates each source on its own val set (eval_sets); any other dataset
+    # keeps one val set and today's eval.
+    mixture = MixturePlan.open(dataset_dir, manifest, pretrain_config)
+    val_ds = None if mixture else ShardedDataset(data_dir=str(val_shard_dir))
+    if mixture:
+        # like a cluster source, a mixture moves with set_epoch, which only the packing
+        # path forwards to the dataset
+        if not pretrain_config.use_packing:
+            raise ValueError(f"{dataset_dir} is a mixture, which needs use_packing=true.")
+    elif isinstance(train_ds, ClusterSampledDataset):
+        # The member draw moves with set_epoch, which only the packing path
+        # forwards to the dataset (the non-packing path sets the sampler's epoch
+        # and keeps persistent workers), so refuse the combination.
+        if not pretrain_config.use_packing:
+            raise ValueError(
+                f"{dataset_dir} is a cluster-sampled dataset, which needs use_packing=true."
+            )
+        logger.info(
+            "Cluster-sampled train set (%s pool): %d train clusters per pass, one member "
+            "each, drawn with seed %d; pool %d sequences / %d tokens; ~%d tokens per pass",
+            manifest.cluster_level, manifest.train_sequences, pretrain_config.seed,
+            manifest.pool_sequences, manifest.pool_tokens, manifest.total_train_tokens,
+        )
+    else:
+        logger.info("Using ShardedDataset for pre-tokenized binary shards")
     _dataset_fingerprint = train_ds.fingerprint()
     logger.info(f"Train dataset fingerprint: {_dataset_fingerprint}")
 
@@ -2585,14 +2745,15 @@ def run_pure_pretraining(
                 dist.init_process_group(backend=backend)
 
     is_main = (not distributed) or dist.get_rank() == 0
-    eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
+    if not mixture:
+        eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
 
     # ---- Collator / Sampler / Packing ----
     train_sampler = None
     max_seqlen_buckets = None
 
     if use_packing:
-        inner_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
+        inner_sampler = packing_sampler(train_ds, pretrain_config.seed, distributed)
 
         train_ds = TokenPackingDataset(
             train_ds,
@@ -2900,12 +3061,36 @@ def run_pure_pretraining(
         train_loader = DataLoader(train_ds, batch_size=None, collate_fn=collator, **dl_kwargs)
     else:
         train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=collator, drop_last=False, **dl_kwargs)
-    eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
+    if mixture:
+        from nanoplm.data.infra.mixture import eval_workers
+        eval_loader = None
+        # one val loader per source, num_workers split between them
+        eval_kwargs = dict(dl_kwargs, num_workers=eval_workers(num_workers, len(mixture.eval_sets)))
+        mixture.eval_loaders(
+            lambda ds: DataLoader(
+                ds, sampler=DistributedSampler(ds, shuffle=False) if distributed else SequentialSampler(ds),
+                batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator,
+                drop_last=False, **eval_kwargs))
+    else:
+        eval_loader = DataLoader(val_ds, sampler=eval_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=eval_collator, drop_last=False, **dl_kwargs)
 
     # ---- Optimizer / Scheduler ----
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
 
-    synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
+    # One pass == one epoch. The packed batch count can change with the epoch
+    # (the sampler reshuffles, and a cluster-sampled dataset draws other
+    # members), so synced_len is recomputed whenever the epoch changes.
+    epoch_setter = train_ds if use_packing else train_sampler
+
+    sync_train_len = _TrainLenSync(distributed, device)
+
+    def _synced_len_at(epoch_: int) -> int:
+        if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
+            epoch_setter.set_epoch(epoch_)
+        return sync_train_len(len(train_loader))
+
+    synced_len = _synced_len_at(0)
+    synced_len_epoch = 0
     if synced_len == 0:
         raise RuntimeError(
             "train_loader is empty (synced_len=0); cannot satisfy the token budget. "
@@ -2914,13 +3099,11 @@ def run_pure_pretraining(
     # Batch warmup only lowers grad_accum, so a pass that fits one full window
     # fits every warmup window too. Otherwise no pass can step and the replay
     # loop below would spin forever.
-    if synced_len < inferred_grad_accum_steps:
-        raise RuntimeError(
-            f"train_loader yields {synced_len} micro-batches per rank per pass, fewer than "
-            f"grad_accum={inferred_grad_accum_steps}: one optimizer step "
-            f"(global_batch_tokens={pretrain_config.global_batch_tokens}) is larger than a "
-            "pass over the train set. Lower global_batch_tokens or use a larger dataset."
-        )
+    short_pass = _check_pass_len(
+        synced_len, inferred_grad_accum_steps, pretrain_config.global_batch_tokens
+    )
+    if short_pass and is_main:
+        logger.warning(short_pass)
 
     # ---- Training horizon (token budget -> optimizer steps) ----
     # total_steps comes from the configured token/step budget, NOT from epochs.
@@ -2936,7 +3119,13 @@ def run_pure_pretraining(
         )
 
     # ---- Epochs-equivalent startup hint (passes over the train set) ----
-    if is_main:
+    if mixture:
+        # per source: share, size, tokens used and epochs over the run's budget
+        mixture.plan_run(horizon.total_steps * achieved_global_batch_tokens)
+        if is_main:
+            for line in mixture.plan_lines:
+                (logger.warning if line.startswith("Warning:") else logger.info)(line)
+    elif is_main:
         _approx = manifest.train_sequences * (manifest.min_seq_len + manifest.max_seq_len) // 2
         if pretrain_config.lr_schedule.lower() == "wsd":
             for label, steps in (("stable", horizon.stable_steps), ("decay", horizon.decay_steps),
@@ -3180,6 +3369,11 @@ def run_pure_pretraining(
                 resume_data_step = 0
                 resume_sub_batch_step = 0
                 resume_batch_split_divisor = 1
+            if resume_epoch != synced_len_epoch:
+                synced_len = _synced_len_at(resume_epoch)
+                synced_len_epoch = resume_epoch
+                _check_pass_len(synced_len, inferred_grad_accum_steps,
+                                pretrain_config.global_batch_tokens, resume_epoch)
             if resume_data_step >= synced_len:
                 # Saved position lands at/after the end of a pass; start the next
                 # pass cleanly from the top.
@@ -3205,7 +3399,8 @@ def run_pure_pretraining(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 mode="offline",
-                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps,
+                        **({"data_mixture": mixture.plan} if mixture else {})},
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
@@ -3433,7 +3628,6 @@ def run_pure_pretraining(
                 else 1
             ),
         )
-    epoch_setter = train_ds if use_packing else train_sampler
     # [0]=loss, [1]=grad_norm (local)
     log_buf = torch.empty(2, device=device, dtype=torch.float32)
     profiler_ctx, profiler_step_cb = _make_pure_profiler(pretrain_config, output_dir, is_main)
@@ -3527,6 +3721,11 @@ def run_pure_pretraining(
         while global_step < total_steps:
             if epoch_setter is not None and hasattr(epoch_setter, "set_epoch"):
                 epoch_setter.set_epoch(epoch)
+            if epoch != synced_len_epoch:
+                synced_len = _synced_len_at(epoch)
+                synced_len_epoch = epoch
+                _check_pass_len(synced_len, inferred_grad_accum_steps,
+                                pretrain_config.global_batch_tokens, epoch)
             # global_step at the start of this pass — used only for the
             # per-pass "optimizer steps" log line below.
             epoch_start_step = global_step
@@ -4216,6 +4415,12 @@ def run_pure_pretraining(
 
                         losses_by_r: dict[int, float] = {}
                         eval_loss = None
+                        if mixture:
+                            wandb_enabled = _mixture_eval(
+                                mixture, eval_loop_counts, _static_loop_count, orig_model,
+                                device, distributed, amp_dtype, pretrain_config.recycling_bptt,
+                                global_step, is_main, wandb_enabled)
+                            eval_loop_counts = []
                         for r_value in eval_loop_counts:
                             eval_loss = _evaluate(
                                 orig_model, eval_loader, device, distributed, amp_dtype,
@@ -4225,7 +4430,7 @@ def run_pure_pretraining(
                             if r_value is not None:
                                 losses_by_r[r_value] = eval_loss
 
-                        if is_main:
+                        if is_main and not mixture:
                             if losses_by_r:
                                 losses_str = ", ".join(f"r={r}: {l:.4f}" for r, l in sorted(losses_by_r.items()))
                                 logger.info(f"[step {global_step}] in-loop eval {losses_str}")

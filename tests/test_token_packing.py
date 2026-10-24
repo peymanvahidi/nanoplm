@@ -83,6 +83,45 @@ def test_token_packing_fast_forward_applies_only_to_target_epoch():
     assert len(resumed_batches) == 3
     assert len(next_epoch_batches) == 4
 
+class EpochLengthDataset(MockDataset):
+    """Lengths depend on the epoch, like a cluster-sampled dataset's members."""
+
+    def __init__(self, per_epoch):
+        self.per_epoch = per_epoch
+        self.epoch = 0
+        super().__init__(per_epoch[0])
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        self.lengths = self.per_epoch[epoch]
+
+    def get_all_sequence_lengths(self):
+        return np.asarray(self.lengths, dtype=np.int32)
+
+
+def test_token_packing_len_is_recomputed_when_the_epoch_changes():
+    ds = EpochLengthDataset({0: [10] * 6, 1: [20] * 6})
+    packed = TokenPackingDataset(ds, max_tokens_per_batch=30, drop_last=False,
+                                 sampler=SequentialSampler(ds))
+    assert len(packed) == len(list(packed)) == 2
+    packed.set_epoch(1)
+    assert len(packed) == len(list(packed)) == 6
+    packed.set_epoch(1)  # same epoch: cached value is kept
+    assert packed._cached_len == 6
+    packed.set_epoch(0)
+    assert len(packed) == 2
+
+
+def test_fast_forward_replays_the_target_epochs_lengths():
+    ds = EpochLengthDataset({0: [10] * 6, 1: [15] * 6})
+    packed = TokenPackingDataset(ds, max_tokens_per_batch=30, drop_last=False,
+                                 sampler=SequentialSampler(ds))
+    # epoch 1 packs two 15-token samples per batch (epoch 0 would pack three)
+    assert packed.fast_forward(2, epoch=1) == 4
+    assert ds.epoch == 1
+    assert len(list(packed)) == 1
+
+
 def test_data_collator_flattening():
     # Mock tokenizer
     class DummyTokenizer:
@@ -179,3 +218,53 @@ if __name__ == "__main__":
     test_token_packing_dataset()
     test_data_collator_flattening()
     print("Tests passed!")
+
+
+class IdDataset(Dataset):
+    def __len__(self):
+        return 1000
+
+    def __getitem__(self, i):
+        return {"input_ids": torch.full((10,), i, dtype=torch.long)}
+
+    def get_all_sequence_lengths(self):
+        return np.full(1000, 10, dtype=np.int32)
+
+
+def _first_ids(batch):
+    return [int(s["input_ids"][0]) for s in batch]
+
+
+def test_single_process_packing_visits_each_item_once_with_four_workers():
+    from collections import Counter
+    from nanoplm.data.datasets.pretrain import packing_sampler
+    ds = IdDataset()
+    packed = TokenPackingDataset(ds, max_tokens_per_batch=100, drop_last=True,
+                                 sampler=packing_sampler(ds, seed=7, distributed=False))
+    passes = []
+    for epoch in (0, 1):
+        packed.set_epoch(epoch)
+        dl = DataLoader(packed, batch_size=None, num_workers=4, collate_fn=_first_ids,
+                        multiprocessing_context="fork")
+        batches = list(dl)
+        seen = Counter(i for b in batches for i in b)
+        assert len(seen) == 1000 and max(seen.values()) == 1
+        assert len(batches) == len(packed) == 100
+        passes.append([i for b in batches for i in b])
+    assert passes[0] != passes[1]                 # set_epoch reshuffles
+
+
+def test_single_process_resume_replays_the_same_permutation():
+    from nanoplm.data.datasets.pretrain import packing_sampler
+    ds = IdDataset()
+
+    def packed():
+        return TokenPackingDataset(ds, max_tokens_per_batch=100, drop_last=True,
+                                   sampler=packing_sampler(ds, seed=7, distributed=False))
+
+    full = packed()
+    full.set_epoch(3)
+    ids = [i for b in full for i in _first_ids(b)]
+    resumed = packed()
+    assert resumed.fast_forward(40, epoch=3) == 400
+    assert [i for b in resumed for i in _first_ids(b)] == ids[400:]

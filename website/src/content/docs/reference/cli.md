@@ -55,10 +55,9 @@ Checks torch build (`2.12.1+cu130`), hard-dep imports (`dion`, `transformer_engi
 
 ## data
 
-`nanoplm data` builds the binary shards and the `.data_manifest` that pretraining consumes. Its `--help` is grouped, and that grouping is the right mental model:
+`nanoplm data` builds the binary shards and the `.data_manifest` that pretraining reads. Most users only need two commands, `get-yaml` and `from-yaml`.
 
-- **Main commands**: `get-yaml`, `from-yaml`. Most users only ever need these two.
-- **Individual pipeline stages**: `get-file`, `extract`, `check`, `shuffle`, `filter`, `split`, plus the pretraining-specific `pre-tokenize`. `from-yaml` orchestrates all of them through DVC. You can also run any of them standalone to debug one step.
+The other commands are the single stages that `from-yaml` runs through DVC: `get-file`, `extract`, `check`, `shuffle`, `filter`, `split` and `pre-tokenize`. You can run one by hand to debug that step.
 
 Field-by-field descriptions live in the [data.yaml reference](/nanoplm/reference/data/).
 
@@ -68,7 +67,7 @@ Field-by-field descriptions live in the [data.yaml reference](/nanoplm/reference
 nanoplm data get-yaml [OUTPUT] [OPTIONS]
 ```
 
-Writes `data.yaml` **and** a matching `dvc.yaml` (the stage DAG). `OUTPUT` is a target directory and defaults to the current directory.
+Writes `data.yaml` and a matching `dvc.yaml`, the stage list DVC runs. `OUTPUT` is the directory to write to and defaults to the current directory.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
@@ -90,15 +89,15 @@ Edit data.yaml and run `nanoplm data from-yaml` to execute.
 nanoplm data from-yaml [CONFIG] [OPTIONS]
 ```
 
-Regenerates `dvc.yaml` from the config, runs `dvc init` if needed, then executes the pipeline with `dvc repro`. `CONFIG` defaults to `data.yaml` in the current directory (falling back to `distillation_data.yaml`).
+Rewrites `dvc.yaml` from the config, runs `dvc init` if needed, then runs the pipeline with `dvc repro`. `CONFIG` defaults to `data.yaml` in the current directory, then `distillation_data.yaml`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
-| `--target TEXT` | Run one DVC stage (for example `split`) instead of the whole pipeline | full pipeline |
+| `--target TEXT` | Run one DVC stage, as named in `dvc.yaml` (for example `split`, or `cluster_index` with cluster subsampling; in a mix `<source>-<step>`, e.g. `swissprot-split`), instead of the whole pipeline | full pipeline |
 | `--no-auto-init` | Fail instead of running `dvc init` when DVC is not initialized | off |
 | `--force` | Pass `-f` to `dvc repro`, re-running stages DVC considers unchanged | off |
 | `--verbose` | Pass `-v` to `dvc repro` | off |
-| `--fix` | Rewrite `data_params.drop_invalid_sequences: true` in the config, then run | off |
+| `--fix` | Set `drop_invalid_sequences: true` in the config (every occurrence, so a per-source override too), then run | off |
 | `--dry-run` | Print the DVC plan without executing it | off |
 | `--log-level [debug\|info\|warning\|error]` | nanoplm log level | `info` |
 
@@ -107,19 +106,17 @@ nanoplm data from-yaml
 ```
 
 ```
+data.yaml: 1 source -> <cwd>/output/data/pretrain_data
+source     fasta                         max seqs  len     val  clustering
+swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
+Regenerated <cwd>/dvc.yaml
+Initialized DVC repository in: <cwd> (cache.type hardlink,symlink)
+Rebuild: all (first run)
 Running dvc repro (full pipeline)...
 # ... dvc stage output ...
-
-Pretraining data pipeline complete.
-
-  Source:          https://ftp.uniprot.org/pub/.../uniprot_sprot.fasta.gz
-  Total sequences: 20000
-    Train:         18000
-    Val:           2000
-  Manifest:        output/data/pretrain_data/.data_manifest
 ```
 
-`--fix` is the escape hatch when the `check` stage rejects invalid sequences: see [Troubleshooting](/nanoplm/troubleshooting/).
+[Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run) explains the table, the line under it, and what `--dry-run` can preview. Use `--fix` when the `check` stage rejects invalid sequences ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
 
 ### data get-file
 
@@ -127,7 +124,7 @@ Pretraining data pipeline complete.
 nanoplm data get-file [DATASET] [OPTIONS]
 ```
 
-Acquire a FASTA source. Give **exactly one** of a `DATASET` key (`swissprot`, `trembl`, `uniref50`, `uniref90`, `uniref100`), `--url`, or `--local-fasta`.
+Fetches a FASTA file. Give exactly one of a `DATASET` key (`swissprot`, `trembl`, `uniref50`, `uniref90`, `uniref100`), `--url`, or `--local-fasta`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
@@ -142,7 +139,7 @@ Acquire a FASTA source. Give **exactly one** of a `DATASET` key (`swissprot`, `t
 nanoplm data extract [OPTIONS]
 ```
 
-Decompress a `.gz` source. This stage is skipped entirely when the source is already a plain `.fasta`.
+Decompresses a `.gz` file. `from-yaml` skips this stage when the source is already a plain `.fasta`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
@@ -156,7 +153,7 @@ Decompress a `.gz` source. This stage is skipped entirely when the source is alr
 nanoplm data check [OPTIONS]
 ```
 
-Validate the FASTA. Writes `validation.json`, `invalid.fasta`, and `invalid_ids.txt` into the output directory. With `--drop-invalid false` it **exits non-zero** if any sequence is invalid, halting the pipeline.
+Checks every sequence for unknown residues. Writes `validation.json`, `invalid.fasta` and `invalid_ids.txt` into the output directory. With `--drop-invalid false` it exits non-zero if any sequence is invalid, which stops the pipeline.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
@@ -200,7 +197,7 @@ nanoplm data filter [OPTIONS]
 nanoplm data split [OPTIONS]
 ```
 
-Split into `train.fasta` and `val.fasta`.
+Splits a FASTA into `train.fasta` and `val.fasta`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
@@ -214,7 +211,7 @@ Split into `train.fasta` and `val.fasta`.
 nanoplm data pre-tokenize [OPTIONS]
 ```
 
-Pretraining-specific. Tokenizes a FASTA into the binary shards (`shard_NNNN.bin` + `shard_NNNN.idx.npy`) that pretraining memory-maps.
+Tokenizes a FASTA into the binary shards that pretraining reads, `shard_NNNN.bin` and `shard_NNNN.idx.npy`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
@@ -226,7 +223,7 @@ Pretraining-specific. Tokenizes a FASTA into the binary shards (`shard_NNNN.bin`
 | `--register-tokens INTEGER` | Learnable scratch tokens (`0`, `1`, or `2`) appended after EOS | `0` |
 | `--force`, `-f` | Overwrite existing output | off |
 
-`nanoplm data write-manifest` also exists but is hidden: the generated `dvc.yaml` calls it to write the `.data_manifest`. You do not invoke it yourself.
+`write-manifest` and the cluster subsampling stages (`get-cluster-xml`, `cluster-members`, `cluster-pool`, `cluster-index`) are hidden. Only the generated `dvc.yaml` calls them.
 
 ---
 
@@ -373,6 +370,7 @@ nanoplm eval run --checkpoint-dir DIR [OPTIONS]
 | --- | --- |
 | `NANOPLM_MAX_WORKERS` | Default for `data pre-tokenize --max-workers` (otherwise `2`). `data from-yaml` exports it from `data_params.max_workers`. |
 | `NANOPLM_DEVICE` | Default device for the distillation `kd-embed` stage (otherwise `auto`). `data from-yaml` exports it from `data_params.device`. |
+| `NANOPLM_MMSEQS` | Path to the `mmseqs` binary for [cluster subsampling](/nanoplm/guides/cluster-subsampling/#when-mmseqs2-runs). Otherwise nanoPLM looks on `PATH`, then in the venv's `bin/`. |
 | `NANOPLM_DISABLE_NATIVE_SHARD_WRITER` | Set to `1` to fall back to the Python shard writer instead of the native C one. |
 | `NANOPLM_DISABLE_NATIVE_FASTA_OPS` | Set to `1` to fall back to the Python FASTA shuffle/filter/split/validate path. |
 | `SLURM_JOB_ID` | When set, it replaces the `DDMMHHMM` timestamp in the run directory name, making the run directory `<run_name>-<SLURM_JOB_ID>`. |

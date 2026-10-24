@@ -52,6 +52,8 @@ The pretraining stage reads the shards and `.data_manifest` the [data stage](/na
 
 Read those startup lines. They are the config after nanoPLM has resolved it: the sequence length came from the manifest, the gradient accumulation was inferred, and your token budget became 504 optimizer steps. If any of those numbers surprise you, stop the run now rather than in six hours.
 
+If `dataset_dir` is a [mix of several sources](/nanoplm/guides/mixing/), a table with one row per source replaces the three `Budget` lines. It shows how many times training reads each source.
+
 ## The pure-torch backend
 
 The stock template ships `pure_torch: true` at the bottom of `pretrain.yaml`, so `nanoplm pretrain from-yaml` already runs the pure-torch backend. You do **not** need `--pure-torch` for a normal YAML run.

@@ -189,6 +189,20 @@ class ShardedDataset(Dataset):
         return self._total_tokens
 
 
+def packing_sampler(dataset: Dataset, seed: int, distributed: bool) -> torch.utils.data.DistributedSampler:
+    """The shuffling sampler TokenPackingDataset draws its order from.
+
+    Always a DistributedSampler, also on one process (num_replicas=1): its order
+    is a seeded function of the epoch, so DataLoader workers split one shared
+    permutation instead of each drawing their own (a RandomSampler copied into
+    every worker covers only about 70% of the items per pass with 4 workers).
+    """
+    if distributed:
+        return torch.utils.data.DistributedSampler(dataset, shuffle=True, seed=seed)
+    return torch.utils.data.DistributedSampler(dataset, num_replicas=1, rank=0,
+                                               shuffle=True, seed=seed)
+
+
 class TokenPackingDataset(torch.utils.data.IterableDataset):
     """Dataset that uses sequence packing to construct batches with variable length up to a maximum number of tokens."""
 
@@ -220,10 +234,11 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
 
     def _resolve_sample_lengths(self) -> list[int]:
         if hasattr(self.dataset, "get_all_sequence_lengths"):
-            lengths = self.dataset.get_all_sequence_lengths()
+            lengths = np.asarray(self.dataset.get_all_sequence_lengths())
             if self.sampler is None:
-                return [int(length) for length in lengths.tolist()]
-            return [int(lengths[idx]) for idx in self.sampler]
+                return lengths.tolist()
+            order = np.fromiter(iter(self.sampler), dtype=np.int64)
+            return lengths[order].tolist()
 
         if self.sampler is not None:
             if not hasattr(self.dataset, "__getitem__"):
@@ -400,6 +415,10 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
             self._skip_epoch = None
             return 0
 
+        # The packing replay must see the order and lengths of the epoch it is
+        # skipping into, so move there first.
+        if epoch is not None and int(epoch) != self._epoch:
+            self.set_epoch(int(epoch))
         lengths = self._resolve_sample_lengths()
         batches_seen = 0
         samples_consumed = 0
@@ -430,11 +449,18 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
                         current_length -= self.max_tokens_per_batch
 
         self._skip_samples = samples_consumed
-        self._skip_epoch = self._epoch if epoch is None else int(epoch)
+        self._skip_epoch = self._epoch
         return samples_consumed
 
     def set_epoch(self, epoch: int):
-        """Set the epoch for the dataset."""
+        """Set the epoch for the dataset.
+
+        The batch count depends on the epoch: a shuffling sampler reorders the
+        samples, and an epoch-dependent dataset can return other sequences, so
+        the cached length is dropped whenever the epoch changes.
+        """
+        if int(epoch) != self._epoch:
+            self._cached_len = None
         self._epoch = int(epoch)
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(self._epoch)

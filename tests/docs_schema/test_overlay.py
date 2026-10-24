@@ -25,7 +25,7 @@ def test_extra_fields_key_is_reserved_not_a_field_annotation():
     assert overlay.for_field(o, "pretraining.lr_schedule")["enum"][0] == "wsd"
 
 def test_extra_fields_for_unknown_surface_is_empty():
-    assert overlay.extra_fields(overlay.load(), "data") == {}
+    assert overlay.extra_fields(overlay.load(), "no_such_surface") == {}
 
 def test_backend_tag_for_pure_torch_only_field():
     o = overlay.load()

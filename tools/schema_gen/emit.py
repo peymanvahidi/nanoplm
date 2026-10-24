@@ -17,7 +17,14 @@ _DRAFT = "https://json-schema.org/draft/2020-12/schema"
 
 
 # Annotation keys an overlay entry (or an x-extra-fields declaration) may carry.
-_ANNOTATION_KEYS = ("type", "items", "enum", "minimum", "maximum", "backend", "advanced", "group")
+_ANNOTATION_KEYS = ("type", "items", "enum", "minimum", "exclusiveMinimum", "maximum", "backend",
+                    "advanced", "group", "default")
+
+
+def _overlay_key(section: str, key: str) -> str:
+    """The flat overlay key of a field: `<section>.<field>`, or the bare field
+    name for a top-level scalar (data.yaml's `output_dir`)."""
+    return f"{section}.{key}" if section else key
 
 
 def _apply(frag: dict, key: str, description: str, ov: dict, vis: dict) -> dict:
@@ -31,9 +38,16 @@ def _apply(frag: dict, key: str, description: str, ov: dict, vis: dict) -> dict:
         frag["items"] = ov["items"]
     if "enum" in ov:
         frag["enum"] = ov["enum"]
-    for bound in ("minimum", "maximum"):
+    for bound in ("minimum", "exclusiveMinimum", "maximum"):
         if bound in ov:
             frag[bound] = ov[bound]
+    # An overlay `default` / `description` replaces what the template gave, for a
+    # field whose template value is only an example or whose comment the parser
+    # cannot attach (it sits above the section header, say).
+    if "default" in ov:
+        frag["default"] = ov["default"]
+    if "description" in ov:
+        description = ov["description"]
     if description:
         frag["description"] = description
     if ov.get("backend"):
@@ -52,7 +66,7 @@ def _apply(frag: dict, key: str, description: str, ov: dict, vis: dict) -> dict:
 
 def _fold(frag: dict, section: str, key: str, description: str, o: dict, vis: dict) -> dict:
     """Fold the flat `<section>.<field>` overlay entry onto a fragment."""
-    return _apply(frag, key, description, _overlay.for_field(o, f"{section}.{key}"), vis)
+    return _apply(frag, key, description, _overlay.for_field(o, _overlay_key(section, key)), vis)
 
 
 def _field_schema(section: str, key: str, raw_default: str, description: str,
@@ -85,9 +99,29 @@ def _extra_field_schema(section: str, key: str, spec: dict, o: dict, vis: dict) 
     frag: dict = {"type": spec.get("type", "string")}
     if "default" in spec:
         frag["default"] = spec["default"]
-    ov = _overlay.for_field(o, f"{section}.{key}")
+    # A nested block (a source's `cluster_subsampling`) declares its own fields.
+    if "properties" in spec:
+        frag["properties"] = {
+            sub: _extra_field_schema(f"{section}.{key}", sub, sub_spec or {}, o, vis)
+            for sub, sub_spec in spec["properties"].items()
+        }
+    ov = _overlay.for_field(o, _overlay_key(section, key))
     ov.update({k: v for k, v in spec.items() if k in _ANNOTATION_KEYS})
     return _apply(frag, key, spec.get("description", ""), ov, vis)
+
+
+def _template_description(f, ov: dict) -> str:
+    """A field's description, minus a heading the overlay turned into its group.
+
+    A plain `# Rarely changed` line above a field reads to the parser as that
+    field's description; once overlay.yaml files the block under that title, the
+    heading is the group's label and must not stay on the field.
+    """
+    group = ov.get("group")
+    if group and f.preceding and f.preceding[0].strip() == group:
+        parts = [*f.preceding[1:], f.eol_comment]
+        return " ".join(p.strip() for p in parts if p.strip())
+    return f.description
 
 
 # ---- dataclass surface (eval) -------------------------------------------------
@@ -191,13 +225,32 @@ def build_surface(surface: str) -> dict:
 
     if surface in TEMPLATE_SOURCES:
         text = _tpl.load_template_text(surface)
+        # Top-level scalars and sections, in template order.
         sections: dict[str, dict] = {}
         parsed, group_notes = _tpl.parse_template(text)
         for f in parsed:
+            ov = _overlay.for_field(o, _overlay_key(f.section, f.key))
+            frag = _field_schema(f.section, f.key, f.raw_default, _template_description(f, ov),
+                                 o, vis, f.group)
+            if not f.section:
+                # Only the top-level scalars overlay.yaml names: pretrain.yaml's
+                # `pure_torch: true` has one legal value and is not a setting.
+                if ov.get("top_level"):
+                    sections[f.key] = frag
+                continue
+            if f.entry:
+                # Inside a name -> spec mapping the template's value is an example
+                # (`fasta: swissprot`), not a default, unless the overlay says so.
+                if "default" not in ov:
+                    frag["examples"] = [frag.pop("default")]
+                if not _overlay.for_field(o, f.section).get("map"):
+                    raise ValueError(
+                        f"{f.section}.{f.entry}.{f.key} is nested under {f.entry!r}: mark "
+                        f"`{f.section}: {{map: true}}` in overlay.yaml if {f.section} maps "
+                        "names to specs"
+                    )
             sec = sections.setdefault(f.section, {"type": "object", "properties": {}})
-            sec["properties"][f.key] = _field_schema(
-                f.section, f.key, f.raw_default, f.description, o, vis, f.group
-            )
+            sec["properties"][f.key] = frag
         # Fold in the fields the template ships commented out (see overlay.yaml's
         # `x-extra-fields`). They are user-settable and must be documented.
         for sec_name, extras in _overlay.extra_fields(o, surface).items():
@@ -205,12 +258,21 @@ def build_surface(surface: str) -> dict:
             for key, spec in (extras or {}).items():
                 sec["properties"][key] = _extra_field_schema(sec_name, key, spec or {}, o, vis)
         for sec_name, sec in sections.items():
+            if "properties" not in sec:
+                continue  # a top-level scalar
             sec["properties"] = _regroup(sec["properties"])
             # The banner-intro prose for each block that has any, so the docs can
             # render it under the heading instead of on the block's first field.
             notes = {g: note for (s, g), note in group_notes.items() if s == sec_name}
             if notes:
                 sec["x-nanoplm-group-notes"] = notes
+            sec_ov = _overlay.for_field(o, sec_name)
+            if sec_ov.get("map"):
+                # `sources: {<name>: <spec>}`: the fields describe every entry.
+                spec = {"type": "object", **{k: v for k, v in sec.items() if k != "type"}}
+                sections[sec_name] = sec = {"type": "object", "additionalProperties": spec}
+            if sec_ov.get("description"):
+                sec["description"] = sec_ov["description"]
         props = sections
     elif surface in DATACLASS_SOURCES:
         spec = DATACLASS_SOURCES[surface]

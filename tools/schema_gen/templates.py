@@ -13,12 +13,17 @@ from tools.schema_gen.sources import TEMPLATE_SOURCES
 
 @dataclass
 class ExtractedField:
-    section: str          # top-level key, e.g. "model" / "pretraining" / "data_params"
+    section: str          # top-level key, e.g. "model" / "pretraining" / "data_params";
+                          # "" for a top-level scalar such as data.yaml's `output_dir`
     key: str              # field name
     raw_default: str      # exact text of the value, e.g. '64', '"adamw"', '.inf', 'null'
     eol_comment: str      # end-of-line comment text (no leading '#')
     group: str = ""       # nearest `# ── Title ───` banner above the key ("" if none)
     preceding: list[str] = field(default_factory=list)  # full-line comments above the key
+    # The value-less key this field is nested under inside its section, e.g.
+    # "swissprot" for `sources: / swissprot: / fasta: ...`. "" for a plain
+    # section field. Only one level of nesting is tracked.
+    entry: str = ""
 
     @property
     def description(self) -> str:
@@ -78,7 +83,8 @@ def load_template_text(surface: str) -> str:
     raise ValueError(f"Could not extract template for surface={surface} from {spec.file}")
 
 
-_TOP = re.compile(r"^(?P<key>[A-Za-z_][\w]*):")  # column-0 lines in these templates are bare section headers
+# A column-0 key: a section header when it has no value, else a top-level scalar.
+_TOP = re.compile(r"^(?P<key>[A-Za-z_][\w]*):\s?(?P<val_and_comment>.*)$")
 _FIELD = re.compile(r"^\s+(?P<key>[A-Za-z_][\w]*):\s?(?P<val_and_comment>.*)$")
 
 # A group banner: `# ── Norms & MLP ──────────────`. The pretrain template uses
@@ -177,6 +183,8 @@ def parse_template(text: str) -> tuple[list[ExtractedField], dict[tuple[str, str
     notes: dict[tuple[str, str], str] = {}
     section = ""
     group = ""
+    entry = ""        # value-less key the following deeper fields sit under
+    entry_indent = -1
     at_group_start = False  # no field seen yet under the current banner
     pending: list[str] = []  # buffered full-line comments awaiting the next field
     # The same comments with their indentation intact, for group notes only.
@@ -212,8 +220,18 @@ def parse_template(text: str) -> tuple[list[ExtractedField], dict[tuple[str, str
             continue
         m_top = _TOP.match(raw)
         if m_top and not raw.startswith((" ", "\t")):
-            section = m_top.group("key")
+            val, comment = _split_value_comment(m_top.group("val_and_comment"))
+            if val:
+                # `output_dir: "..."`: a field of the file itself, not a section.
+                fields.append(ExtractedField(
+                    section="", key=m_top.group("key"), raw_default=val, eol_comment=comment,
+                    preceding=_preceding_for(pending, m_top.group("key")),
+                ))
+                section = ""
+            else:
+                section = m_top.group("key")
             group = ""
+            entry, entry_indent = "", -1
             at_group_start = False
             flush()
             continue
@@ -221,6 +239,15 @@ def parse_template(text: str) -> tuple[list[ExtractedField], dict[tuple[str, str
         if m_field:
             key = m_field.group("key")
             val, comment = _split_value_comment(m_field.group("val_and_comment"))
+            indent = len(raw) - len(raw.lstrip())
+            if entry and indent <= entry_indent:
+                entry, entry_indent = "", -1
+            if not val and not entry:
+                # A value-less key opens a nested mapping (`sources: / swissprot:`).
+                # It is a name, not a field; the deeper fields below it are.
+                entry, entry_indent = key, indent
+                flush()
+                continue
             # Prose sitting between the banner and this, the block's first field,
             # belongs to the block, so take it whole rather than through
             # _preceding_for, which exists to strip commented-out *fields* from a
@@ -246,6 +273,7 @@ def parse_template(text: str) -> tuple[list[ExtractedField], dict[tuple[str, str
                     eol_comment=comment,
                     group=group,
                     preceding=preceding,
+                    entry=entry,
                 )
             )
             flush()

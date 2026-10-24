@@ -1,0 +1,195 @@
+---
+title: Mixing datasets
+description: Train on several FASTA sources at once, for example 20% SwissProt and 80% UniRef50. One data.yaml, one dataset_dir.
+---
+
+A mix trains on two or more FASTA files at once. You list each file under `sources` in `data.yaml` and give it a `weight`, its share of the training sequences. With `weight: 0.2`, one training sequence in five comes from that source, whatever the sequence lengths.
+
+## Write a mix
+
+1. List the sources in `data.yaml`. The weights must be above 0 and sum to 1.
+
+   ```yaml title="data.yaml"
+   output_dir: "output/data/pretrain_data"
+   sources:
+     swissprot:
+       fasta: "swissprot_300.fasta"
+       weight: 0.2
+     uniref50:
+       fasta: "uniref50_3000.fasta"
+       weight: 0.8
+   data_params:            # defaults for every source; a source may override any of them
+     max_seqs: -1
+     min_seq_len: 20
+     max_seq_len: 512
+     val_ratio: 0.05
+   ```
+
+   The outputs on this page come from this tiny mix of two local files, 300 and 3,000 sequences. For the full datasets, write `fasta: swissprot` and `fasta: uniref50`.
+
+2. Build it:
+
+   ```sh
+   nanoplm data from-yaml data.yaml
+   ```
+
+   ```text title="Output (trimmed)"
+   data.yaml: 2 sources -> <cwd>/output/data/pretrain_data
+   weight = share of training sequences
+   source     weight  fasta                                  max seqs  len     val   clustering
+   swissprot  0.2     swissprot_300.fasta (local, 37.0 kB)   all       20-512  0.05  off
+   uniref50   0.8     uniref50_3000.fasta (local, 662.8 kB)  all       20-512  0.05  off
+   ...
+   Pretraining data mixture complete (2 sources; train and val count clusters for a cluster source).
+     source     weight  kind   train  val
+     swissprot  0.2     plain  285    15
+     uniref50   0.8     plain  2,850  150
+     Manifest:  <cwd>/output/data/pretrain_data/.data_manifest
+     Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
+   ```
+
+   Each source gets its own folder, `output_dir/<source>/`. The file `output_dir/.data_manifest` lists the sources and their weights.
+
+3. Set `dataset_dir` in `pretrain.yaml` to `output_dir`, as for one source, and train.
+
+If the weights do not sum to 1, `from-yaml` stops before it builds anything:
+
+```text
+Error: data.yaml: the weights must sum to 1 (they are shares of training sequences): 0.2 (swissprot) + 0.7 (uniref50) = 0.9
+```
+
+A mix also has these rules:
+
+- Pretraining needs `use_packing: true`, the template default. Without it the run stops with `... is a mixture, which needs use_packing=true.`
+- All sources use the same `register_tokens`. Set `max_workers` once, in `data_params`.
+- The model's position limit must fit the largest `max_seq_len` of the sources.
+
+### With cluster subsampling
+
+This mix trains on one UniRef90 member of each UniRef50 cluster per epoch. See [cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+
+```yaml title="data.yaml"
+output_dir: "output/data/pretrain_data"
+sources:
+  swissprot:
+    fasta: swissprot
+    weight: 0.2
+  uniref50:
+    fasta: uniref50
+    weight: 0.8
+    max_seqs: -1         # counts clusters here: all of them
+    val_ratio: 0.0044    # share of clusters held out, as in the UniRef90 experiment
+    cluster_subsampling:
+      members: uniref90
+```
+
+SwissProt sequences are also UniRef90 members, so the two sources overlap. A SwissProt validation sequence can be a UniRef50 training sequence, and nothing removes it. Keep that in mind when you compare `eval/loss/swissprot` and `eval/loss/uniref50`.
+
+## How often each source is read
+
+Training runs for a token budget, not a number of epochs. An epoch of a source is one full read of its training sequences. How many epochs each source gets follows from its weight and size. Training prints them at the start:
+
+```text title="Training start"
+Data mixture over a budget of 3,014,656 tokens (share = share of training sequences):
+  source     share        size  tokens used  epochs
+  swissprot  0.200    285 seqs      361,851   10.85
+  uniref50   0.800  2,850 seqs    2,652,805    4.34
+Warning: sources.swissprot: read 10.8 times over the run (more than 10x); lower sources.swissprot.weight or add data
+```
+
+SwissProt holds 9% of the training sequences but gets 20% of the draws, so the run reads it 10.85 times. Above 10 reads, training warns.
+
+The numbers are estimates that ignore packing waste. For a cluster source, `size` counts clusters. W&B stores the table in the run config as `data_mixture`.
+
+A source with `epochs` below 1 trains on a part of itself, spread over the whole source. Each new epoch of a source reads it in a new order, and a cluster source draws new members. A `decay` resume starts the mix again from its first epoch, as described in [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
+
+## Validation
+
+Each source keeps its own validation sequences, held out by that source's `val_ratio`. Each eval logs:
+
+| Key | Value |
+| --- | --- |
+| `eval/loss/<source>` | The loss on that source's validation sequences |
+| `eval/loss` | The mean of the source losses, weighted by `weight`: here 0.2 × swissprot + 0.8 × uniref50 |
+
+With a [recycling](/nanoplm/guides/recycling/) eval sweep, each loop count `k` adds `eval/loss/<source>/r<k>`.
+
+An eval runs as many batches as one combined validation set would, split evenly over the sources. Here 165 sequences at `micro_batch_seqs: 4` make 42 batches, so each source gets 21 batches, up to 84 sequences. SwissProt has only 15 and uses all of them. Its unused part does not go to UniRef50, which uses 84 of its 150, spread over the whole set. Training logs the split at the start:
+
+```text
+Mixture eval: swissprot 15 of 15 val seqs, uniref50 84 of 150 val seqs
+```
+
+To evaluate only some sources, list them in `pretrain.yaml`:
+
+```yaml title="pretrain.yaml"
+pretraining:
+  eval_sources: [swissprot]   # default: all
+```
+
+The listed sources get all the eval batches, and `eval/loss` averages over them only. It is an error to list an unknown name, a source with no validation sequences, or any name when `dataset_dir` is not a mix. Under `all`, a source with no validation sequences is skipped.
+
+## Compare several ratios
+
+Only the last stage of the build, `mixture`, reads the weights. If you change only the weights and rerun `from-yaml`, it rebuilds no source:
+
+```text
+Rebuild: swissprot: up to date; uniref50: up to date; mixture: may rerun. (DVC skips a stage its run cache already has.)
+```
+
+That replaces the mix in `output_dir`. To keep several ratios side by side, give each ratio its own folder that reuses the built sources:
+
+1. Make a folder next to the one you built, say `sweep_50_50/` next to `base/`.
+2. In it, write a `data.yaml` that names each built source folder with `prepared:` instead of `fasta:`:
+
+   ```yaml title="sweep_50_50/data.yaml"
+   output_dir: "output/mix"
+   sources:
+     swissprot:
+       prepared: "../base/output/data/pretrain_data/swissprot"
+       weight: 0.5
+     uniref50:
+       prepared: "../base/output/data/pretrain_data/uniref50"
+       weight: 0.5
+   ```
+
+3. Run `nanoplm data from-yaml sweep_50_50/data.yaml`. It runs only the `mixture` stage and does not touch `base/`. `sweep_50_50/output/mix/` holds just the 1 kB `.data_manifest`.
+4. Set `dataset_dir` to `sweep_50_50/output/mix`.
+
+What `prepared:` accepts and what can break it:
+
+- It takes a source folder of a mix, `<output_dir>/<source>`, or the `output_dir` of a single-source `data.yaml`. It refuses a mix's own `output_dir` with `is a mixture; list its sources here instead`.
+- A prepared source is used as it was built. You cannot set `data_params` on it.
+- If you rebuild a source in `base/`, every sweep that uses it is out of date. Training stops and says the source's manifest `changed after the mixture was written`. Rerun `from-yaml` in each sweep folder.
+- The sweep's manifest stores each `prepared:` folder outside its `output_dir` as an absolute path. If you move `base/`, fix the `prepared:` paths if they changed, then run `nanoplm data from-yaml sweep_50_50/data.yaml --force --target mixture`. A plain rerun skips the `mixture` stage and keeps the old paths.
+
+## Add, remove or rename a source
+
+Adding a source builds only that source and the `mixture` stage:
+
+```text
+Rebuild: swissprot: up to date; uniref50: up to date; pdb: 7 of 7 stages may rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)
+```
+
+Removing or renaming a source deletes nothing. `from-yaml` lists the files left behind on every run until they are gone:
+
+```text
+Warning: an earlier build left these outputs, which the new dvc.yaml no longer uses; nothing deletes them:
+  <cwd>/output/data/pretrain_data/pdb/validation
+  <cwd>/output/data/pretrain_data/pdb/shuffled.fasta
+  ...
+  <cwd>/output/data/pretrain_data/pdb/.data_manifest
+and their lines in <cwd>/output/data/pretrain_data/pdb/.gitignore
+To free the disk, delete them and run `dvc gc --workspace` (it removes every cached file the current dvc.lock does not use).
+```
+
+The same warning appears when you switch between one source and a mix, because one source writes `train/` and `val/` into `output_dir` and a mix writes them into `output_dir/<source>/`. Deleting a `cluster_subsampling` block leaves that source's `cluster_index/` behind too.
+
+DVC keeps a linked copy of every output in its cache, so the disk is freed only after both steps:
+
+```sh
+rm -rf output/data/pretrain_data/pdb
+dvc gc --workspace      # asks y/n first; -f skips the question
+```
+
+`dvc gc` also removes older mixture manifests. Before you delete a source folder, check that no sweep uses it as `prepared:`.

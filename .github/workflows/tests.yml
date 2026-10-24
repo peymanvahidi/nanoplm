@@ -1,0 +1,58 @@
+# .github/workflows/tests.yml
+#
+# CPU tests for the data pipeline (data.yaml, DVC stages, cluster subsampling, mixing)
+# and the training-side data code (token packing, mixtures, the short-pass check,
+# pipeline gating).
+# No GPU: torch comes from the CPU wheel index, and every test here runs on CPU.
+#
+# What is left out, and why:
+# - --run-slow tests: they run end-to-end DVC builds and take minutes; run them by hand.
+# - tests/test_data_loading.py: pre-existing ImportErrors on master.
+# - the real-pool and MMseqs2 tests need data or a binary under agent_space/; they skip
+#   themselves when it is missing, as it is here.
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      # torch first, from the CPU index, at the version pyproject.toml pins: a plain
+      # `pip install -e .` would pull the CUDA wheels (several GB) from PyPI.
+      - run: pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -e .
+      # DVC tests run `git init` and commit in scratch repos.
+      - run: |
+          git config --global user.name "nanoplm-ci"
+          git config --global user.email "nanoplm-ci@users.noreply.github.com"
+      - name: CPU tests
+        run: >-
+          python -m pytest -q
+          tests/data
+          tests/docs_schema
+          tests/deps/test_install_sh.py
+          tests/test_token_packing.py
+          tests/test_mixture_training.py
+          tests/test_pass_length_check.py
+          tests/cli/test_pipeline_gating.py
+          --ignore=tests/test_data_loading.py

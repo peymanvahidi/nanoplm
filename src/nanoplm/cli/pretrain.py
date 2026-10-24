@@ -80,8 +80,12 @@ def _resolve_effective_world_size(cfg: PretrainingConfig) -> int:
 
 
 def _populate_batch_setup(cfg: PretrainingConfig) -> None:
+    from nanoplm.data.infra.mixture import MixtureError
     dataset_dir = Path(cfg.dataset_dir)
-    validation_result = validate_pretrain_dataset(dataset_dir)
+    try:
+        validation_result = validate_pretrain_dataset(dataset_dir)
+    except MixtureError as exc:
+        raise click.ClickException(f"{dataset_dir}: {exc}") from exc
     manifest = validation_result["manifest"]
 
     effective_world_size = _resolve_effective_world_size(cfg)
@@ -157,6 +161,20 @@ def _check_pipeline_supported(pure_torch: bool) -> None:
             "Pretraining requires pure_torch: true. "
             "The HF Trainer pretraining path is no longer supported."
         )
+
+
+def _check_mixture_supported(pure_torch: bool, dataset_dir) -> None:
+    """A mixture trains only on the pure-torch path. Runs before the shards of every
+    source are validated; an unreadable manifest is left to that validation."""
+    if pure_torch:
+        return
+    try:
+        manifest = read_manifest(dataset_dir)
+    except (FileNotFoundError, ValueError):
+        return
+    if getattr(manifest, "is_mixture", False):
+        raise ValueError(f"{dataset_dir} is a data mixture; data mixtures need --pure-torch "
+                         "(or pure_torch: true).")
 
 
 @click.group(name="pretrain", cls=ConfigErrorGroup, sections=YAML_FIRST_SECTIONS)
@@ -1215,6 +1233,10 @@ def run(
             "mHC-lite's doubly-stochastic stability guarantees."
         )
     _validate_distributed_mode(cfg, pure_torch=pure_torch)
+    try:
+        _check_mixture_supported(pure_torch, cfg.dataset_dir)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     _populate_batch_setup(cfg)
 
@@ -1439,6 +1461,7 @@ def from_yaml(config: str, pure_torch: bool):
             "pure_torch: true / --pure-torch. The HF path does not implement GQA."
         )
     _validate_distributed_mode(pretrain_config, pure_torch=pure_torch)
+    _check_mixture_supported(pure_torch, pretrain_config.dataset_dir)
     _populate_batch_setup(pretrain_config)
 
     # Fail fast before any heavy model instantiation: only the pure_torch
@@ -1702,8 +1725,13 @@ def _load_manifest_and_inject(
 
     Returns the manifest so it can be passed to the pipeline entry point.
     """
+    from nanoplm.data.infra.mixture import MixtureError, resolve_eval_sources
     manifest = read_manifest(pretrain_config.dataset_dir)
     validate_manifest_for_pipeline(manifest, expected_mode="pretrain")
+    try:
+        resolve_eval_sources(pretrain_config.eval_sources, manifest)
+    except MixtureError as exc:
+        raise click.ClickException(f"pretraining.{exc}") from exc
     model_config.num_register_tokens = manifest.num_register_tokens
     logger.info(
         f"Injected manifest.num_register_tokens = {manifest.num_register_tokens} "

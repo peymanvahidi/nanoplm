@@ -67,6 +67,8 @@ export default defineConfig({
             { label: 'Choose an optimizer', link: '/guides/optimizers/' },
             { label: 'Cooldown and resuming', link: '/guides/cooldown-and-resume/' },
             { label: 'Recycling', link: '/guides/recycling/' },
+            { label: 'Cluster subsampling', link: '/guides/cluster-subsampling/' },
+            { label: 'Mixing datasets', link: '/guides/mixing/' },
           ],
         },
         {

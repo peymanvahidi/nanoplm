@@ -1,7 +1,8 @@
 # tests/data/dvc/test_dvc_yaml_regen.py
 import pytest
 import yaml
-from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml, _source_is_compressed
+from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
+from nanoplm.data.preparation.data_config import is_compressed
 
 
 PRETRAIN_URL_CONFIG = {
@@ -123,7 +124,7 @@ def test_distillation_uses_distillation_yaml_filename():
     ("https://example.com/x.fasta#section", False),
 ])
 def test_source_is_compressed(source, expected):
-    assert _source_is_compressed(source) is expected
+    assert is_compressed(source) is expected
 
 
 PLAIN_LOCAL_CONFIG = {

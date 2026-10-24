@@ -1,12 +1,12 @@
 ---
 title: Your first PLM
-description: Train and evaluate a small protein language model on UniProt50, end to end, in about half an hour on one GPU.
+description: Train and evaluate a small protein language model on SwissProt, end to end, in about half an hour on one GPU.
 ---
 
 import { Steps, FileTree } from '@astrojs/starlight/components';
 
 You are going to pretrain a real protein language model (a 2.3M-parameter ModernBERT-style
-encoder) on 20,000 UniProt50 sequences, then score it on a downstream benchmark. Every command is
+encoder) on 20,000 SwissProt sequences, then score it on a downstream benchmark. Every command is
 run from the same working directory, and each stage hands its artifacts to the next.
 
 **What you need**
@@ -14,7 +14,7 @@ run from the same working directory, and each stage hands its artifacts to the n
 - A supported install: Linux + Hopper GPU + CUDA 13, via `nanoplm deps install`. See
   [Install](/nanoplm/start/install/).
 - The `eval` extra for Stage 3 (`uv pip install -e ".[eval]"` or the GitHub equivalent).
-- About 30 minutes: roughly 10 for the UniProt50 download and tokenization, a few for training, and
+- About 30 minutes: roughly 10 for the SwissProt download and tokenization, a few for training, and
   the rest for benchmarking.
 
 :::note
@@ -26,8 +26,8 @@ puts in the env.
 
 <Steps>
 
-1. **Scaffold the config.** This writes two files: `data.yaml`, which you edit, and `dvc.yaml`, which
-   is the generated stage graph and which you never edit.
+1. **Scaffold the config.** This writes `data.yaml`, which you edit, and `dvc.yaml`, which nanoPLM
+   generates and you never edit.
 
    ```bash
    nanoplm data get-yaml
@@ -35,28 +35,34 @@ puts in the env.
    # Edit data.yaml and run `nanoplm data from-yaml` to execute.
    ```
 
-2. **Check three keys.** The template already points at UniProt50, so there is little to change,
-   but these are the three values that decide how big and how long your dataset is, and they are
-   worth setting on purpose.
+2. **Check three keys.** The template already points at SwissProt, so you can run it as it is.
+   These three keys decide which sequences you train on, how many, and how long they can be.
 
-   ```yaml title="data.yaml" {2,7,9}
-   data_dirs:
-     url: "https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz"
-     # ...
-     output_dir: "output/data/pretrain_data"   # pretrain.yaml reads from here
+   ```yaml title="data.yaml" {4,8,10}
+   output_dir: "output/data/pretrain_data"   # pretrain.yaml reads from here
+   sources:
+     swissprot:
+       fasta: swissprot     # or uniref50, uniref90, a URL, or a local FASTA
+   # ...
 
    data_params:
-     seqs_num: 20000        # UniProt50 has ~40M; 20k trains fast and still learns
+     max_seqs: 20000        # -1 = all; 20k trains fast and still learns
      min_seq_len: 20
-     max_seq_len: 512       # only sequences below this length will be selected
+     max_seq_len: 512       # longer sequences are dropped
      # ...
    ```
 
-3. **Run the pipeline.** nanoPLM drives the download → extract → check → shuffle → filter → split →
-   tokenize graph through DVC.
+3. **Run the pipeline.** This downloads SwissProt, checks and filters the sequences, splits them
+   into train and validation sets, and tokenizes them.
 
    ```bash
    nanoplm data from-yaml
+   # data.yaml: 1 source -> <cwd>/output/data/pretrain_data
+   # source     fasta                         max seqs  len     val  clustering
+   # swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
+   # Regenerated <cwd>/dvc.yaml
+   # Initialized DVC repository in: <cwd> (cache.type hardlink,symlink)
+   # Rebuild: all (first run)
    # Running dvc repro (full pipeline)...
    # ...
    # Pretraining data pipeline complete.
@@ -65,12 +71,18 @@ puts in the env.
    #   Total sequences: 20000
    #     Train:         18000
    #     Val:           2000
-   #   Manifest:        output/data/pretrain_data/.data_manifest
+   #   Manifest:        <cwd>/output/data/pretrain_data/.data_manifest
+   #   Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
    ```
+
+   `from-yaml` prints the table at the top before anything runs, so you can check the file and
+   settings first ([columns explained here](/nanoplm/pipeline/data/#read-the-table-before-the-run)).
+   If the `check` stage stops on invalid sequences, run `nanoplm data from-yaml --fix`
+   ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
 
 </Steps>
 
-You now have binary token shards and the manifest that describes them:
+You now have the tokenized sequences in binary shard files, and a manifest that describes them:
 
 <FileTree>
 
@@ -82,7 +94,7 @@ You now have binary token shards and the manifest that describes them:
   - val/
     - shard_0000.bin
     - shard_0000.idx.npy
-  - .data_manifest **the contract: pretraining reads some information from here**
+  - .data_manifest **pretraining reads max_seq_len and the shard folders from here**
 
 </FileTree>
 
@@ -206,7 +218,7 @@ The run directory is named `<run_name>-<DDMMHHMM>`, so yours will differ:
      # ...
    ```
 
-3. **Run the benchmark.** nanoPLM scores the benchmark's mutants with your model's MLM head — no
+3. **Run the benchmark.** nanoPLM scores the benchmark's mutants with your model's MLM head. No
    probe is trained on top.
 
    ```bash
@@ -238,7 +250,7 @@ embedder's directory, which defaults to the checkpoint's directory name:
 
 ## Verify
 
-You are done when all three are true:
+You are done when all four are true:
 
 - `output/data/pretrain_data/.data_manifest` exists and reports 18,000 train and 2,000 val sequences.
 - Training reached `[step 154/154]` and your loss fell from around 3.4 to under 2.5. A tiny model on

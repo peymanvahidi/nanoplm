@@ -70,12 +70,12 @@ def test_from_yaml_summary_uses_yaml_manifest(tmp_path, monkeypatch):
 
     # Materialize config and override output_dir to tmp_path
     cfg_dict = _yaml.safe_load(load_template("data_pretrain"))
-    cfg_dict["data_dirs"]["output_dir"] = str(tmp_path / "pretrain_out")
+    cfg_dict["output_dir"] = str(tmp_path / "pretrain_out")
     cfg = tmp_path / "data.yaml"
     cfg.write_text(_yaml.safe_dump(cfg_dict))
 
     # Pre-create the manifest as the real write-manifest stage would
-    out_dir = Path(cfg_dict["data_dirs"]["output_dir"])
+    out_dir = Path(cfg_dict["output_dir"])
     out_dir.mkdir(parents=True)
     manifest_text = (
         "# This file is AUTO-GENERATED\n"
@@ -104,6 +104,7 @@ def test_from_yaml_summary_uses_yaml_manifest(tmp_path, monkeypatch):
     assert "Total sequences: 42" in result.output
     assert "Train:         38" in result.output
     assert "Val:           4" in result.output
+    assert f"Set pretrain.yaml's dataset_dir to {out_dir.resolve()}." in result.output
 
 
 def test_from_yaml_fix_preserves_comments(tmp_path):
@@ -111,8 +112,8 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
     cfg.write_text(load_template("data_pretrain"))
-    # data_pretrain.yaml has commented-out alt-URL lines starting with "# swissprot"
-    assert "# swissprot:" in cfg.read_text()
+    # data_pretrain.yaml has a commented-out source example starting with "# uniref50:"
+    assert "# uniref50:" in cfg.read_text()
     (tmp_path / ".dvc").mkdir(exist_ok=True)
 
     # Stub dvc subprocess
@@ -129,7 +130,7 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     assert result.exit_code == 0, result.output
     # Comments preserved + key flipped
     after = cfg.read_text()
-    assert "# swissprot:" in after
+    assert "# uniref50:" in after
     assert "drop_invalid_sequences: true" in after
 
 
@@ -207,16 +208,12 @@ def test_from_yaml_warns_when_compressed_fasta_set_in_plain_mode(tmp_path, monke
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".dvc").mkdir(exist_ok=True)
 
-    # Spy on the nanoplm logger (caplog doesn't work because propagate=False)
-    warnings_seen = []
-    from nanoplm.utils.logger import logger as _nplm_logger
-    monkeypatch.setattr(_nplm_logger, "warning",
-                        lambda msg, *a, **k: warnings_seen.append(msg))
-
     runner = CliRunner()
     result = runner.invoke(data, ["from-yaml", str(cfg), "--dry-run"])
     assert result.exit_code == 0, result.output
-    assert any("unused" in w for w in warnings_seen)
+    # the same "Warning: ..." line every other data.yaml warning prints
+    assert ("Warning: data_dirs.compressed_fasta is unused when the source is a plain .fasta "
+            "file") in result.output
 
 
 def test_from_yaml_plain_local_omits_compressed_fasta_ok(tmp_path, monkeypatch):

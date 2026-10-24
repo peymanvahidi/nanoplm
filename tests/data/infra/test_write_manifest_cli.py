@@ -82,3 +82,26 @@ def test_write_manifest_pretrain_records_register_tokens(tmp_path):
 
     manifest = yaml.safe_load((tmp_path / ".data_manifest").read_text())
     assert manifest["num_register_tokens"] == 2
+
+
+# PretrainManifest's fields on master (before cluster subsampling). Master reads a
+# manifest with PretrainManifest(**data), so any other key makes it fail; old
+# worktrees and checkpoints' code must keep reading a plain dataset built today.
+MASTER_PRETRAIN_FIELDS = {
+    "pipeline_mode", "seqs_num", "min_seq_len", "max_seq_len", "val_ratio", "train_dir",
+    "val_dir", "train_sequences", "val_sequences", "num_register_tokens", "created_at",
+    "sharded", "samples_per_shard", "total_train_tokens",
+}
+
+
+def test_plain_manifest_has_only_the_fields_master_reads(tmp_path):
+    _make_pretrain_shard_dir(tmp_path / "train", [100])
+    _make_pretrain_shard_dir(tmp_path / "val", [10])
+    result = CliRunner().invoke(data, [
+        "write-manifest", "--kind", "pretrain", "-o", str(tmp_path),
+        "--min-seq-len", "20", "--max-seq-len", "512",
+        "--val-ratio", "0.1", "--samples-per-shard", "100",
+    ])
+    assert result.exit_code == 0, result.output
+    keys = set(yaml.safe_load((tmp_path / ".data_manifest").read_text()))
+    assert keys <= MASTER_PRETRAIN_FIELDS, keys - MASTER_PRETRAIN_FIELDS

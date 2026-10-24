@@ -5,13 +5,7 @@ description: Turn a FASTA file into tokenized binary shards and a manifest, with
 
 import { FileTree, Steps } from '@astrojs/starlight/components';
 
-The data stage takes a FASTA file (a URL or a local path) and produces the two things pretraining consumes: **tokenized binary shards** and a **`.data_manifest`**.
-
-In between, it runs a fixed sequence of steps:
-
-```
-download → extract → validate → shuffle → filter → split → tokenize → write manifest
-```
+This step turns a FASTA file into what pretraining reads: tokenized sequences in binary shard files under `train/` and `val/`, and a small `.data_manifest` file that records how they were built. You edit one file, `data.yaml`, and run one command.
 
 ## Run it
 
@@ -28,7 +22,7 @@ download → extract → validate → shuffle → filter → split → tokenize 
    Edit data.yaml and run `nanoplm data from-yaml` to execute.
    ```
 
-2. Edit `data.yaml` (the whole file is shown below; it is short).
+2. Edit `data.yaml` (the whole file is shown [below](#the-whole-config)). The template already builds 20,000 SwissProt sequences, so you can run it as it is.
 
 3. Run the pipeline.
 
@@ -37,11 +31,13 @@ download → extract → validate → shuffle → filter → split → tokenize 
    ```
 
    ```text title="Output (trimmed)"
-   Regenerated dvc.yaml in <cwd>
+   data.yaml: 1 source -> <cwd>/output/data/pretrain_data
+   source     fasta                         max seqs  len     val  clustering
+   swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
+   Regenerated <cwd>/dvc.yaml
+   Initialized DVC repository in: <cwd> (cache.type hardlink,symlink)
+   Rebuild: all (first run)
    Running dvc repro (full pipeline)...
-   # ...
-   Successfully created 9 shard files:
-     output/data/pretrain_data/train/shard_0000.bin
    # ...
    Wrote manifest: output/data/pretrain_data/.data_manifest
 
@@ -51,57 +47,37 @@ download → extract → validate → shuffle → filter → split → tokenize 
      Total sequences: 20000
        Train:         18000
        Val:           2000
-     Manifest:        output/data/pretrain_data/.data_manifest
+     Manifest:        <cwd>/output/data/pretrain_data/.data_manifest
+     Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
    ```
 
 </Steps>
 
-Under the hood those steps are a [DVC](https://dvc.org/) DAG: `from-yaml` regenerates `dvc.yaml` from your config and runs `dvc repro`. You do not have to think about DVC, but it explains two behaviours you will notice. Re-running after an edit only redoes the stages your edit affected, and an interrupted run picks up where it stopped instead of re-downloading 60 GB of TrEMBL.
+`from-yaml` runs these stages in order, through [DVC](https://dvc.org/):
 
-## The whole config
+```
+download → extract → check → shuffle → filter → split → tokenize → write manifest
+```
 
-`data.yaml` is about 25 lines, so here it is in full.
+`from-yaml` rewrites `dvc.yaml` from your `data.yaml` each time, so never edit `dvc.yaml`. DVC remembers what each finished stage produced. A second run, or a run after an interrupted one, skips every stage whose inputs have not changed. A download cut off halfway starts again from the beginning.
+
+## Use your own FASTA
+
+Point `fasta` at the file. A relative path starts from the folder `data.yaml` is in. nanoPLM reads the file where it is and never copies it. You pick the source name (`mine` here). It is also the name of the folder that holds this source's intermediate files.
 
 ```yaml title="data.yaml"
-data_dirs:
-  url: "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
-  local_fasta: null          # set this INSTEAD of url to use a file already on disk
-
-  compressed_fasta:   "output/data/raw/uniprot_sprot.fasta.gz"  # only used when the source is .gz
-  extracted_fasta:    "output/data/raw/uniprot_sprot.fasta"
-  validation_dir:     "output/data/validation"
-  shuffled_fasta:     "output/data/raw/uniprot_sprot_shuffled.fasta"
-  filtered_fasta:     "output/data/filter/uniprot_sprot_filtered.fasta"
-  splitted_fasta_dir: "output/data/split"
-  output_dir:         "output/data/pretrain_data"   # pretrain.yaml's dataset_dir points here
-
-data_params:
-  seqs_num: 20000            # -1 keeps every sequence; start small and scale up once the loop works
-  min_seq_len: 20            # fragments below this teach the model nothing
-  max_seq_len: 512           # truncation length AND the length pretraining does its token math with
-  val_ratio: 0.1
-  shuffle: true
-  shuffle_seed: 24           # same seed, same split: so two runs stay comparable
-  drop_invalid_sequences: false   # false = an invalid sequence FAILS the run instead of vanishing
-
-  samples_per_shard: 2000    # more, smaller shards give the dataloader more to parallelise over
-  max_workers: 2             # -1 uses every core; tokenization is the slow stage
-  register_tokens: 0         # 0-2 learnable scratch tokens after EOS; recorded in the manifest
+sources:
+  mine:
+    fasta: my_proteins.fasta   # or .fasta.gz
 ```
 
-## Choosing a source
+`fasta` accepts three kinds of value:
 
-Set **exactly one** of `url` or `local_fasta`. Setting both, or neither, is an error:
+- a shortcut for a UniProt file, from the table below;
+- a URL (`http://`, `https://` or `ftp://`), downloaded once into `output_dir/downloads/`;
+- a local `.fasta` or `.fasta.gz` file.
 
-```text title="Output"
-Error: Set either data_dirs.url or data_dirs.local_fasta, not both.
-```
-
-A `local_fasta` is hard-linked rather than copied, so a 200 GB file costs nothing to "download". `compressed_fasta` only matters when the source ends in `.gz`; with a plain `.fasta` the extract step is not even added to the DAG, and the value is ignored.
-
-The scaffold ships the five built-in datasets as commented-out lines. Paste one into `url`:
-
-| Dataset | URL |
+| Shortcut | URL |
 | --- | --- |
 | `swissprot` | `https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz` |
 | `trembl` | `https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_trembl.fasta.gz` |
@@ -109,91 +85,149 @@ The scaffold ships the five built-in datasets as commented-out lines. Paste one 
 | `uniref90` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` |
 | `uniref100` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz` |
 
-Start with SwissProt (about 570k sequences). It downloads in minutes and is enough to prove your pipeline works before you commit to a UniRef-scale run.
+Start with SwissProt (about 570k sequences). It downloads in minutes, so you can test the pipeline on it before a UniRef-scale run.
 
-## The parameters that matter
+To reuse a dataset another `data.yaml` already built, write `prepared: <its output_dir>` instead of `fasta`. `from-yaml` checks that folder's manifest, prints what it holds and builds nothing. With only a `prepared` source, you can leave out `output_dir`.
 
-| Key | Default | What it does |
-| --- | --- | --- |
-| [`seqs_num`](/nanoplm/reference/data/#data-data_params-seqs_num) | `20000` | How many sequences to keep after filtering. `-1` keeps all of them. |
-| [`min_seq_len`](/nanoplm/reference/data/#data-data_params-min_seq_len) | `20` | Sequences shorter than this are dropped. |
-| [`max_seq_len`](/nanoplm/reference/data/#data-data_params-max_seq_len) | `512` | Sequences are truncated to this length. See the callout below. |
-| [`val_ratio`](/nanoplm/reference/data/#data-data_params-val_ratio) | `0.1` | Fraction held out for validation loss. |
-| [`samples_per_shard`](/nanoplm/reference/data/#data-data_params-samples_per_shard) | `2000` | Sequences per `shard_NNNN.bin`. |
-| [`max_workers`](/nanoplm/reference/data/#data-data_params-max_workers) | `2` | Processes used for tokenization. `-1` uses every core. |
-| [`register_tokens`](/nanoplm/reference/data/#data-data_params-register_tokens) | `0` | 0, 1, or 2 learnable scratch tokens appended after EOS. Recorded in the manifest and injected into the model at pretrain time. |
-| [`drop_invalid_sequences`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences) | `false` | Whether a sequence with an unrecognised residue kills the run or gets excluded. See below. |
+To train on one random member of every cluster per epoch (for example UniRef90 sequences under UniRef50 clusters), add a `cluster_subsampling` block to the source. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+
+## The whole config
+
+This is the template with its commented examples left out.
+
+```yaml title="data.yaml"
+output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml's dataset_dir points here
+
+# One entry per FASTA. Several entries make a mix.
+# weight = share of training sequences (not tokens); weights must sum to 1.
+sources:
+  swissprot:
+    fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz
+    weight: 1.0          # 0.2 when mixed with uniref50 below
+    # max_seq_len: 1024  # any data_params field set here overrides it for this source
+
+  # (a commented UniRef50 cluster-subsampling source with weight 0.8 and a
+  #  commented another_source follow)
+
+data_params:
+  max_seqs: 20000        # -1 = all
+  min_seq_len: 20        # shorter sequences are dropped
+  max_seq_len: 512       # longer sequences are dropped
+  val_ratio: 0.1         # share held out for validation loss
+  drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
+
+  # Rarely changed
+  shuffle: true          # shuffle before the train / val split
+  shuffle_seed: 24
+  samples_per_shard: 2000  # sequences per shard file; raised automatically for large cluster datasets
+  max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores
+  register_tokens: 0     # 0, 1 or 2 scratch tokens after EOS
+```
+
+With one source, `weight` must be `1.0` or left out. Two or more sources make a mix, drawn by `weight`: see [Mixing datasets](/nanoplm/guides/mixing/).
+
+`max_seqs`, `min_seq_len`, `max_seq_len` and `val_ratio` are required. You can leave out the other `data_params`. The template's values are the defaults, so deleting one, or writing it out, reruns nothing. The [data.yaml reference](/nanoplm/reference/data/) describes each key.
 
 :::caution[max_seq_len is set here and nowhere else]
-`max_seq_len` is written into `.data_manifest`, and pretraining reads it back to compute gradient accumulation: `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`. There is no `max_seq_len` key in `pretrain.yaml`. If you want longer sequences, change it here and re-run the data stage: the shards themselves have to change.
+`from-yaml` writes `max_seq_len` into `.data_manifest`. Pretraining reads it from there to compute gradient accumulation, `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`, so `pretrain.yaml` has no `max_seq_len` key. To train on longer sequences, change it here and run `from-yaml` again. The shards change too.
 :::
 
-Longer sequences cost quadratically in attention and linearly in memory, so `512` is a deliberate starting point rather than a limitation. Raise it when your proteins genuinely need the context.
+Attention cost grows with the square of the sequence length, so `512` is a cheap place to start. Raise it when your proteins need the context.
+
+## Read the table before the run
+
+Before any stage runs, `from-yaml` prints one row per source and one line saying what will run. Check it. A wrong `fasta`, a forgotten `max_seqs` or an unexpected full rebuild shows up here, before hours of work.
+
+```text
+data.yaml: 1 source -> /work/output/data/pretrain_data
+source  fasta                               max seqs  len     val  clustering
+mine    my_proteins.fasta (local, 66.0 kB)  200       20-512  0.1  off
+Regenerated /work/dvc.yaml
+Rebuild: all (first run)
+```
+
+| Column | Shows |
+| --- | --- |
+| `fasta` | The file the stages read, and where it comes from. `(url)` means it will be downloaded. `(reuse, 40.2 kB, 2026-09-01)` means a file with that name, written on that date, is already in `output_dir/downloads/`. `(local, 66.0 kB)` means a local file. |
+| `max seqs` | `max_seqs`, or `all` for `-1`. A cluster source counts clusters: `all clusters`, `20,000 clusters`. |
+| `len` | `min_seq_len`-`max_seq_len`. |
+| `val` | `val_ratio`. |
+| `clustering` | `off`, or where the clusters come from. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/#read-the-table). |
+
+A `*` after a value means the source sets it itself instead of taking it from `data_params`.
+
+The line under the table is one of:
+
+| Line | Meaning |
+| --- | --- |
+| `Rebuild: all (first run)` | Nothing has been built in this folder yet. |
+| `Up to date: all stages` | Nothing changed since the last run. DVC skips every stage. |
+| `May rerun (DVC skips a stage its run cache already has): filter, split, ... Up to date: check, shuffle.` | Your edit changed the inputs of the listed stages, so they run again. If DVC has already run a stage with exactly these inputs, for example because you changed a value and then changed it back, it restores that output instead. |
+
+`reuse` only means the file exists. DVC reuses a download that an earlier `from-yaml` run in this folder wrote. It does not know about a file you copied into `downloads/` yourself, so it deletes that file and downloads again. To use a FASTA you already have, set `fasta` to its path.
+
+To see the table and the stages that would run without running them, use `nanoplm data from-yaml --dry-run`. Two limits apply:
+
+- `from-yaml` must have run once in this folder first, because `--dry-run` does not set up DVC.
+- The preview stops at the first download that has not happened yet. DVC cannot plan the stages that read a file that does not exist.
 
 ## Invalid sequences will stop you once
 
-Real FASTA files contain residues outside the 20 standard amino acids. The `check` stage finds them, and with the default `drop_invalid_sequences: false` it **fails the pipeline** rather than quietly changing your dataset:
-
-```sh
-nanoplm data from-yaml
-```
+Real FASTA files contain residues outside the 20 standard amino acids. The `check` stage finds them. With the default `drop_invalid_sequences: false` it stops the pipeline, so your dataset never changes without you knowing:
 
 ```text title="Output (trimmed)"
-Running dvc repro (full pipeline)...
-# ...
-Error: Validation found 37 problematic sequence(s).
-  Inspect: output/data/validation/invalid.fasta
-  Summary: output/data/validation/validation.json
+Running stage 'check':
+> nanoplm data check -i my_proteins.fasta -o output/data/pretrain_data/mine/validation --drop-invalid false
+WARNING check: found 2 invalid sequence(s); see output/data/pretrain_data/mine/validation/invalid.fasta
+Error: Validation found 2 problematic sequence(s).
+  Inspect: output/data/pretrain_data/mine/validation/invalid.fasta
+  Summary: output/data/pretrain_data/mine/validation/validation.json
 
 To exclude these sequences and continue the pipeline:
     nanoplm data from-yaml --fix
 ```
 
-Look at `invalid.fasta` first: a large invalid count usually means the file is not what you thought it was. When the sequences are genuinely unusable, take the offer:
+Look at `invalid.fasta` first. A large count usually means the file is not what you thought it was. To drop those sequences and continue:
 
 ```sh
 nanoplm data from-yaml --fix
 ```
 
-```text title="Output (trimmed)"
-Set data.yaml: data_params.drop_invalid_sequences=true
-Regenerated dvc.yaml in <cwd>
-Running dvc repro (full pipeline)...
-# ...
+```text title="Output (first line)"
+Set data.yaml: drop_invalid_sequences=true
 ```
 
-`--fix` rewrites `drop_invalid_sequences: true` in your `data.yaml` **in place** and re-runs. The `filter` stage then excludes the IDs listed in `validation_dir/invalid_ids.txt`. Your config on disk now reflects what actually happened, which is the point: the change is visible in `git diff`, not hidden in a flag you forgot you passed.
+`--fix` sets `drop_invalid_sequences: true` in your `data.yaml`, everywhere it appears, and runs again. The `filter` stage then drops the IDs listed in `<source>/validation/invalid_ids.txt`. The change is in your file, so `git diff` shows it.
 
 ## What you get
 
 <FileTree>
 
-- output/data/
-  - raw/
-    - uniprot_sprot.fasta.gz downloaded
+- output/data/pretrain_data/ point pretraining.dataset_dir here
+  - downloads/
+    - uniprot_sprot.fasta.gz downloaded, one file per URL
+  - swissprot/ this source's intermediate files
     - uniprot_sprot.fasta extracted
-    - uniprot_sprot_shuffled.fasta
-  - validation/
-    - validation.json
-    - invalid.fasta
-    - invalid_ids.txt consumed by `filter --exclude-ids`
-  - filter/
-    - uniprot_sprot_filtered.fasta
-  - split/
-    - train.fasta
-    - val.fasta
-  - **pretrain_data/** point pretraining.dataset_dir here
-    - train/
-      - shard_0000.bin uint8 token ids
-      - shard_0000.idx.npy per-sequence lengths
-      - …
-    - val/
-      - …
-    - .data_manifest
+    - validation/
+      - validation.json
+      - invalid.fasta
+      - invalid_ids.txt read by the filter stage
+    - shuffled.fasta
+    - filtered.fasta
+    - split/
+      - train.fasta
+      - val.fasta
+  - train/
+    - shard_0000.bin uint8 token ids
+    - shard_0000.idx.npy per-sequence lengths
+    - …
+  - val/
+    - …
+  - .data_manifest
 
 </FileTree>
 
-The manifest is the handoff to the next stage:
+The manifest describes the shards. Pretraining reads it:
 
 ```yaml title="output/data/pretrain_data/.data_manifest"
 # This file is AUTO-GENERATED by 'nanoplm data from-yaml'.
@@ -216,10 +250,42 @@ samples_per_shard: 2000
 total_train_tokens: 6392418
 ```
 
-You never edit this file. Pretraining reads `max_seq_len` and `num_register_tokens` out of it, which is exactly why those keys are absent from `pretrain.yaml`.
+Never edit this file. To change a value in it, change `data.yaml` and run `from-yaml` again.
+
+## Disk use and the DVC cache
+
+DVC keeps a cache of every output in `.dvc/cache`, next to `data.yaml`. When `from-yaml` sets up DVC in a new folder, it sets `cache.type hardlink,symlink`, so the cache links to your outputs instead of holding a second copy.
+
+- Linked outputs are read-only. Run `dvc unprotect <path>` before you edit one.
+- If `output_dir` and `.dvc/cache` are on different file systems, DVC uses symlinks and the data itself lives in `.dvc/cache`. Deleting the cache then breaks the dataset.
+- After you change settings, `dvc gc --workspace` deletes the cached versions that the current outputs no longer use.
+- A folder where DVC was set up earlier, by an older nanoPLM or by your own `dvc init`, keeps its own `cache.type`. That is often a copy cache, which stores every output twice. To switch it to links, run `dvc config cache.type hardlink,symlink` and then `dvc checkout --relink` in the folder of `data.yaml`.
+
+## Move an old data.yaml
+
+A `data.yaml` from before the `sources:` layout has a `data_dirs` block with `url` or `local_fasta` and seven paths. It still works. `from-yaml` reads it as one source named `main`, builds the same files in the same places, and prints the new layout to paste in:
+
+```text title="Output"
+Warning: data_dirs is the old data.yaml layout. It still works, read as one source named "main". To switch, replace data_dirs with:
+
+output_dir: "output/data/pretrain_data"
+sources:
+  main:
+    fasta: swissprot
+
+and rename data_params.seqs_num to max_seqs. The new layout keeps intermediate files under output_dir/main/, so the first run after switching rebuilds them.
+To skip the download, set fasta: "output/data/raw/sequences.fasta.gz" (the file already downloaded; it is read where it is, so keep it).
+Then these old files can be deleted: output/data/raw/sequences.fasta, output/data/validation, output/data/raw/sequences_shuffled.fasta, output/data/filter/sequences_filtered.fasta, output/data/split.
+```
+
+To switch:
+
+1. Delete the `data_dirs` block and paste the printed `output_dir` and `sources` in its place. A file with both layouts is an error.
+2. Rename `seqs_num` to `max_seqs` under `data_params`. The old name still works, with a warning.
+3. Run `from-yaml`. The first run rebuilds the intermediate files under `output_dir/main/`, then the shards.
+
+If the folder's DVC cache stores every output twice, see [Disk use and the DVC cache](#disk-use-and-the-dvc-cache).
 
 ## Next
 
-The manifest exists, so the pretraining stage now has everything it needs about your data. Move on to [2. Pretrain](/nanoplm/pipeline/pretrain/), and point `pretraining.dataset_dir` at the `output_dir` above.
-
-Every key in `data.yaml`, with its type and default, is in the [data.yaml reference](/nanoplm/reference/data/).
+Go to [2. Pretrain](/nanoplm/pipeline/pretrain/) and set `pretraining.dataset_dir` to your `output_dir`. If `from-yaml` stops with an error, see [Troubleshooting](/nanoplm/troubleshooting/#data-pipeline).

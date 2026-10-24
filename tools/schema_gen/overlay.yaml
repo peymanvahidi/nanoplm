@@ -3,8 +3,10 @@
 #
 # Two namespaces live in this file:
 #
-#  1. Flat field annotations, keyed "<section>.<field>". Any of:
-#     enum, minimum, maximum, backend, advanced, auto_computed, type, items.
+#  1. Flat field annotations, keyed "<section>.<field>" (a bare "<field>" for a
+#     top-level scalar or a section itself). Any of: enum, minimum, maximum,
+#     backend, advanced, auto_computed, type, items, group, default, description;
+#     a section may also set `map: true` (see the data block).
 #     A field whose template default is `null` MUST set `type` to a nullable
 #     union (e.g. `type: [integer, "null"]`); emit.py refuses to guess one.
 #     Every enum below is transcribed from the authoritative validator: the
@@ -20,6 +22,8 @@
 # click.Choice --optimizer
 pretraining.optimizer:
   enum: [adamw, stable_adamw, muon, normuon, nordion2]
+# PretrainingConfig.eval_sources: "all" or a list of mixture source names
+pretraining.eval_sources: { type: [string, array], items: { type: string } }
 # click.Choice --lr-schedule + _validate_duration_config's `valid` set
 pretraining.lr_schedule:
   enum: [wsd, warmup_stable, cosine, linear]
@@ -156,7 +160,34 @@ model.loopie_loop_count: { backend: [pure_torch], advanced: true }
 model.loopie_bptt: { type: [integer, "null"], minimum: 1, backend: [pure_torch], advanced: true }
 
 # ----------------------------------------------------------------------- data
-data_dirs.local_fasta: { type: [string, "null"] }
+# A bare key annotates a top-level entry of the file. `map: true` marks a
+# section whose keys are names the user picks, each holding a spec: the
+# template's fields under its example entry (`swissprot:`) describe every entry,
+# and are emitted as the section's additionalProperties.
+# A column-0 `key: value` is documented only when marked top_level here.
+output_dir: { top_level: true }
+sources:
+  map: true
+  description: >-
+    One entry per source, keyed by a name you pick (letters, digits and _). Each
+    names a fasta to build from or a prepared folder. Any data_params field set on
+    a source overrides the default for that source. Several sources make a mix:
+    each is built on its own and training draws from them by weight.
+# data_config._weight: optional with one source (then 1); required in a mix
+sources.weight:
+  default: 1.0
+  description: >-
+    Share of training sequences (not tokens) drawn from this source. Weights must
+    sum to 1 (within 1e-6); with one source it is 1 or left out. Changing only the
+    weights rebuilds only the mixture manifest. A cluster source counts one sample
+    per cluster visit.
+# data_config.PARAM_FIELDS order; the template's plain `# Rarely changed`
+# heading opens this block.
+data_params.shuffle: { group: Rarely changed }
+data_params.shuffle_seed: { group: Rarely changed }
+data_params.samples_per_shard: { group: Rarely changed }
+data_params.max_workers: { group: Rarely changed }
+data_params.register_tokens: { group: Rarely changed }
 
 # --------------------------------------------------------------- distillation
 # Optional[int]; null = MHA. The flat key also matches the pretrain template's
@@ -413,6 +444,52 @@ x-extra-fields:
           additional anneal optimizer steps to run from the checkpoint. Set
           exactly one of decay_tokens or decay_steps, never both. mode: continue
           accepts no decay_* field at all.
+  # The source keys the data template ships commented out
+  # (data_config.SOURCE_KEYS).
+  data:
+    sources:
+      prepared:
+        type: string
+        description: >-
+          A folder another data.yaml built, used as it is. Set fasta or prepared,
+          not both. A prepared source takes no data_params overrides and no
+          cluster_subsampling.
+      cluster_subsampling:
+        type: object
+        description: >-
+          Turns on cluster subsampling for this source: each epoch trains on one
+          random member of every cluster. The block being present turns it on;
+          delete or comment it out to turn it off. max_seqs and val_ratio then
+          count clusters, not sequences.
+        properties:
+          # cluster_config.resolve_cluster_plan: null = this source's fasta.
+          # Required: the block needs members (data_config._cluster_block).
+          members:
+            type: [string, "null"]
+            description: >-
+              uniref90, uniref100, a UniRef90/100 FASTA URL/path, or null (= this
+              source's fasta). Required.
+          # cluster_config.CLUSTERINGS
+          clustering:
+            type: string
+            default: auto
+            enum: [auto, uniprot, mmseqs2]
+            description: >-
+              auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or
+              uniprot, mmseqs2
+          # cluster_config._fraction: a number in (0, 1]; 0 itself is rejected
+          identity:
+            type: number
+            default: 0.5
+            exclusiveMinimum: 0
+            maximum: 1
+            description: "mmseqs2 only: min sequence identity within a cluster"
+          coverage:
+            type: number
+            default: 0.8
+            exclusiveMinimum: 0
+            maximum: 1
+            description: "mmseqs2 only: min alignment coverage"
   distill:
     distillation:
       adam_beta1:

@@ -75,23 +75,21 @@ uv pip install "biotrainer==2.1.1" "biotrainer-core==2.1.1"
 nanoplm data get-yaml
 ```
 
->You'll get [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) and a dvc.yaml files. Just edit the params.yaml if you want.
-
-> We're using DVC under the hood, so you can track your data version.
+> You'll get [data.yaml](https://peymanvahidi.github.io/nanoplm/reference/data/) and `dvc.yaml`. The template builds 20,000 SwissProt sequences. To use your own sequences, set `fasta:` under `sources` to a local `.fasta` or `.fasta.gz` file. Don't edit `dvc.yaml`. `from-yaml` rewrites it from `data.yaml` on every run, and [DVC](https://dvc.org/) uses it to skip the steps whose inputs have not changed.
 
 ### 2. Prepare your data
 
-Use the command below to prepare your data for pLM pretraining (you'll get train and val FASTAs)
+This tokenizes the sequences into train and val shards, and writes a `.data_manifest` that describes them, all under `output_dir`:
 
 ```bash
 nanoplm data from-yaml
 ```
 
-> By default, this picks up `data.yaml` in your current directory. You can optionally specify a different path argument (relative or absolute) if needed.
-Like: `nanoplm data from-yaml <path/to/data.yaml>`
+> This reads `data.yaml` in your current directory. To use another file, pass its path: `nanoplm data from-yaml <path/to/data.yaml>`.
 
+> [Prepare data](https://peymanvahidi.github.io/nanoplm/pipeline/data/) covers the pre-run table, invalid sequences and moving an old `data_dirs` config. [Cluster subsampling](https://peymanvahidi.github.io/nanoplm/guides/cluster-subsampling/) trains on one random member of every cluster each epoch, for example a UniRef90 sequence from each UniRef50 cluster.
 
-📊 Now your data is ready! Let's start the training.
+Now your data is ready. Let's start the training.
 
 ### 3. Get a pretrain YAML file
 
