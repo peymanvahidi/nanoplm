@@ -149,7 +149,7 @@ def _pre_fwd7_kernel(
             cute.arch.mbarrier_init(bar + (B_XREADY + i), 1)
             cute.arch.mbarrier_init(bar + (B_XFREE + i), 1)
         for i in cutlass.range_constexpr(2):
-            cute.arch.mbarrier_init(bar + (B_HPF + i), 1)
+            cute.arch.mbarrier_init(bar + (B_HPF + i), BT * 4)
             cute.arch.mbarrier_init(bar + (B_HPE + i), 1)
         cute.arch.mbarrier_init_fence()
         cute.arch.mbarrier_arrive_and_expect_tx(bar + B_FULL, TXB)
@@ -281,8 +281,8 @@ def _pre_fwd7_kernel(
             if ctid < BT * 4:
                 z = hv * cute.math.rsqrt(hfs / K + eps) * sCo[NO] + sCo[hj]
                 sHp[sl, ht, hj] = 1.0 / (1.0 + cute.math.exp(-z))
-            cute.arch.barrier(barrier_id=4, number_of_threads=NPR)
-            if ctid == 0:
+                # each writer releases its own store (no named barrier + single arrive,
+                # an ordering compute-sanitizer's racecheck cannot follow)
                 cute.arch.mbarrier_arrive(bar + (B_HPF + sl))
             # 3) the owned tokens' full coefficient sets: global outputs only
             _coeffs_from(ov, ofs, sCo, mProj, mHm, mHpre, mHpost, mRinv, psrc, t0 + tto, lane, eps, merge)
