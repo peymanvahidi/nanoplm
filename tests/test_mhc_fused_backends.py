@@ -22,7 +22,7 @@ def _is_sm90():
 
 
 def _backends():
-    out = [("pytorch", None, False), ("triton", "triton", True), ("v2", "v2", True)]
+    out = [("pytorch", None, False), ("v2", "v2", True)]
     if _is_sm90():
         out.append(("cute", "cute", True))
     return out
@@ -103,7 +103,7 @@ def test_block_backends_vs_fp32_reference(merge, backend_env):
         ga = torch.cat([blk.alpha_pre.grad, blk.alpha_post.grad, blk.alpha_res.grad])
         errs = dict(out=_rel(y, yr), gx=_rel(x.grad, xr.grad), gW=_rel(blk.W_all.weight.grad, Wr.grad),
                     galpha=_rel(ga, ar.grad), gbias=_rel(blk.W_all.bias.grad, br.grad))
-        # the pytorch / per-op triton paths compute the coefficients in bf16
+        # the pytorch path computes the coefficients in bf16
         tol = 1e-2 if name in ("v2", "cute") else 4e-2
         assert all(v < tol for v in errs.values()), (name, merge, errs)
 

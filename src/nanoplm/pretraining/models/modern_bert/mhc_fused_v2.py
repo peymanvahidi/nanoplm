@@ -18,7 +18,7 @@ Backward
 gx_post reaches pre_bwd as the gradient of an alias of x that pre returns and
 post consumes, so autograd never materialises a separate gx sum.
 
-Math matches MHCLiteBlock with triton_fused=True (RMSNorm eps 1e-6).
+Math matches MHCLiteBlock's PyTorch path (RMSNorm eps 1e-6).
 """
 import itertools
 
@@ -53,7 +53,7 @@ def _coeffs(proj, o, P_ptr, alpha_ptr, bias_ptr, MERGE: tl.constexpr):
     zr = tl.where(is_res[None, :], z, float("-inf"))
     m = tl.max(zr, axis=1)
     e = tl.where(is_res[None, :], tl.exp(zr - m[:, None]), 0.0)
-    a = e / tl.sum(e, axis=1)[:, None]
+    a = tl.where(is_res[None, :], e / tl.sum(e, axis=1)[:, None], 0.0)
     q = tl.arange(0, 16)
     pp = tl.load(P_ptr + o[:, None] * 16 + q[None, :])
     Hres = tl.dot(a, pp, input_precision="ieee")
@@ -77,7 +77,7 @@ def _coeffs(proj, o, P_ptr, alpha_ptr, bias_ptr, MERGE: tl.constexpr):
     else:
         Hm = Hres
     return (alpha_vec, sig, a, pp, q, Hm, hpre_q, hpost_q,
-            hpre0, hpre1, hpre2, hpre3, hpo0, hpo1, hpo2, hpo3)
+            hpre0, hpre1, hpre2, hpre3, hpo0, hpo1, hpo2, hpo3, is_res)
 
 
 @triton.jit
@@ -104,7 +104,7 @@ def _pre_fwd_kernel(x_ptr, W_ptr, P_ptr, alpha_ptr, bias_ptr,
     tl.store(proj_ptr + t[:, None] * 32 + o[None, :], proj, mask=tm[:, None])
     tl.store(rinv_ptr + t, r, mask=tm)
     (alpha_vec, sig, a, pp, q, Hm, hpre_q, hpost_q,
-     hpre0, hpre1, hpre2, hpre3, hpo0, hpo1, hpo2, hpo3) = _coeffs(proj, o, P_ptr, alpha_ptr, bias_ptr, MERGE)
+     hpre0, hpre1, hpre2, hpre3, hpo0, hpo1, hpo2, hpo3, is_res) = _coeffs(proj, o, P_ptr, alpha_ptr, bias_ptr, MERGE)
     tl.store(hm_ptr + t[:, None] * 16 + q[None, :], Hm, mask=tm[:, None])
     tl.store(hpost_ptr + t * 4 + 0, hpo0, mask=tm)
     tl.store(hpost_ptr + t * 4 + 1, hpo1, mask=tm)
@@ -139,7 +139,7 @@ def _post_fwd_kernel(x_ptr, lo_ptr, hm_ptr, hp_ptr, out_ptr, T,
     t = tl.program_id(0) * BT + tl.arange(0, BT)
     cc = tl.program_id(1) * BC + tl.arange(0, BC)
     tm = t < T
-    m2 = tm[:, None]
+    m2 = tm[:, None] & (cc < C)[None, :]
     base = x_ptr + t[:, None] * K + cc[None, :]
     x0 = tl.load(base + 0 * C, mask=m2, other=0.0).to(tl.float32)
     x1 = tl.load(base + 1 * C, mask=m2, other=0.0).to(tl.float32)
@@ -229,7 +229,7 @@ def _pre_bwd_coef_kernel(gli_ptr, x_ptr, ghm_ptr, ghp_ptr, proj_ptr, rinv_ptr,
     proj = tl.load(proj_ptr + t[:, None] * 32 + o[None, :], mask=m2, other=0.0)
     r = tl.load(rinv_ptr + t, mask=tm, other=0.0)
     (alpha_vec, sig, a, pp, q, Hm, hpre_q, hpost_q,
-     hpre0, hpre1, hpre2, hpre3, hpo0, hpo1, hpo2, hpo3) = _coeffs(proj, o, P_ptr, alpha_ptr, bias_ptr, MERGE)
+     hpre0, hpre1, hpre2, hpre3, hpo0, hpo1, hpo2, hpo3, is_res) = _coeffs(proj, o, P_ptr, alpha_ptr, bias_ptr, MERGE)
     # phase 1: g_hpre_j (pre-map part) = <g_li, x_j>
     gm0 = tl.zeros((BT,), tl.float32)
     gm1 = tl.zeros((BT,), tl.float32)
@@ -262,7 +262,10 @@ def _pre_bwd_coef_kernel(gli_ptr, x_ptr, ghm_ptr, ghp_ptr, proj_ptr, rinv_ptr,
     ghpo2 = tl.load(ghp_ptr + t * 4 + 2, mask=tm, other=0.0) - tl.sum(tl.where(qi[None, :] == 2, t2, 0.0), axis=1)
     ghpo3 = tl.load(ghp_ptr + t * 4 + 3, mask=tm, other=0.0) - tl.sum(tl.where(qi[None, :] == 3, t2, 0.0), axis=1)
     g_a = tl.dot(gHm, tl.trans(pp), input_precision="ieee")
-    g_zres = a * (g_a - tl.sum(a * g_a, axis=1)[:, None])
+    # softmax backward over the 24 permutation lanes only: P's zero rows make g_a
+    # 0 * gHm on the other 8, which is NaN once gHm is, and must not reach h_pre / h_post
+    ag = tl.where(is_res[None, :], a * g_a, 0.0)
+    g_zres = tl.where(is_res[None, :], ag - a * tl.sum(ag, axis=1)[:, None], 0.0)
     g_h = tl.where(o[None, :] == 0, ghpre0[:, None], tl.where(o[None, :] == 1, ghpre1[:, None],
           tl.where(o[None, :] == 2, ghpre2[:, None], tl.where(o[None, :] == 3, ghpre3[:, None],
           tl.where(o[None, :] == 4, 2.0 * ghpo0[:, None], tl.where(o[None, :] == 5, 2.0 * ghpo1[:, None],
@@ -412,7 +415,7 @@ class MHCPostFused(torch.autograd.Function):
         lo = lo.contiguous()
         out = torch.empty_like(x)
         BT, BC, nw = CFG["post_fwd"]
-        _post_fwd_kernel[(triton.cdiv(T, BT), C // BC)](x, lo, Hm, hpost, out, T, C=C, BT=BT, BC=BC,
+        _post_fwd_kernel[(triton.cdiv(T, BT), triton.cdiv(C, BC))](x, lo, Hm, hpost, out, T, C=C, BT=BT, BC=BC,
                                                         num_warps=nw)
         ctx.save_for_backward(x, lo, hpost)
         return out
@@ -431,9 +434,18 @@ class MHCPostFused(torch.autograd.Function):
         return go, None, glo, gHm, ghp
 
 
+def supports(x: torch.Tensor) -> bool:
+    """Shapes these kernels handle: (T, 4, C) with C a multiple of the 128-wide
+    channel tiles, and 32-bit element offsets (T * 4 * C < 2^31)."""
+    return x.dim() == 3 and x.shape[1] == 4 and x.shape[2] % 128 == 0 and x.numel() < 2 ** 31
+
+
 def mhc_fused_block(x, layer, W, alpha3, bias, P, eps=1e-6, merge=True, **kw):
     """merge=True: layer returns li + f and Hm = H_res - h_post h_pre^T cancels the li;
     merge=False: layer returns f and Hm = H_res (the mHC paper / DeepSeek-V4 form)."""
+    assert supports(x), f"mhc_fused_v2: unsupported x of shape {tuple(x.shape)}"
+    # the kernels index x densely: pre and post must see the same dense copy
+    x = x.contiguous()
     li, Hm, hpost, tok = MHCPreFused.apply(x, W, alpha3, bias, P, eps, merge)
     lo = layer(li, **kw)
     return MHCPostFused.apply(tok, x, lo, Hm, hpost)

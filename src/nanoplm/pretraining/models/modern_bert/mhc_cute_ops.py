@@ -9,7 +9,7 @@ import torch
 
 from . import mhc_cute_fwd as _FK
 from . import mhc_cute_bwd as _BK
-from .mhc_fused_v2 import MHCPostFused, mhc_fused_block as _v2_block
+from .mhc_fused_v2 import MHCPostFused, mhc_fused_block as _v2_block, supports as _v2_supports
 
 _EPS = 1e-6
 _DEBUG = None
@@ -74,7 +74,12 @@ class MHCPreCute(torch.autograd.Function):
 
 def mhc_cute_block(x, layer, W, alpha3, bias, P, merge=True, **kw):
     """merge: see mhc_fused_v2.mhc_fused_block."""
-    if x.shape[0] % 16 != 0:
+    assert x.shape[1:] == (_NS, _C) and _v2_supports(x), f"mhc_cute: unsupported x of shape {tuple(x.shape)}"
+    # the kernels index x densely: pre and post must see the same dense copy
+    x = x.contiguous()
+    # TMA needs whole 16-token tiles and a 16-byte aligned base (allocations are
+    # 512-byte aligned, so only a view's offset can break it); v2 takes the rest
+    if x.shape[0] == 0 or x.shape[0] % 16 != 0 or x.storage_offset() % 8 != 0:
         return _v2_block(x, layer, W, alpha3, bias, P, merge=merge, **kw)
     li, Hm, hpost, tok = MHCPreCute.apply(x, W, alpha3, bias, merge)
     lo = layer(li, **kw)

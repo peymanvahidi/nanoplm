@@ -8,11 +8,9 @@ from __future__ import annotations
 
 import torch
 
-# -- Canon / mHC Triton op registration (side-effect imports) ----------------
+# -- Canon Triton op registration (side-effect imports) ----------------------
 
 if torch.cuda.is_available():
-    # Registers torch.ops.nanoplm_mhc::* used by MHCLiteBlock's Triton path.
-    from . import mhc_triton_ops as _mhc_triton_ops  # noqa: F401
     # Registers torch.ops.nanoplm_canon::* — Triton varlen depthwise conv.
     from . import canon_ops as _canon_ops
     from .canon_ops import varlen_canon_conv as _varlen_canon_conv
@@ -36,7 +34,6 @@ if torch.cuda.is_available():
                 raise
             _canon_cute_ops = None
 else:
-    _mhc_triton_ops = None  # type: ignore[assignment]
     _canon_ops = None  # type: ignore[assignment]
     _canon_cute_ops = None  # type: ignore[assignment]
     _CANON_BACKEND = "triton"

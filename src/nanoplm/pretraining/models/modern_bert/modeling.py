@@ -9,7 +9,7 @@ The model is intentionally small and readable:
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 import functools
 import math
 import os
@@ -28,7 +28,6 @@ from ._globals import (  # noqa: E402 — flags must load after _globals side-ef
     USE_ACTIVATION_CHECKPOINTING_CANON,
     USE_ACTIVATION_CHECKPOINTING_MHC,
     USE_TRITON_SRELU,
-    _mhc_triton_ops,
     _canon_ops,
     _varlen_canon_conv,
     _varlen_ln_canon_conv,
@@ -1419,6 +1418,10 @@ class ModernBertMLPResidual(nn.Module):
         return out
 
 
+# RMSNorm eps of the mHC-lite coefficient path, shared by every backend
+_MHC_EPS = 1e-6
+
+
 @functools.lru_cache(maxsize=None)
 def _cute_available() -> bool:
     """CuTeDSL (nvidia-cutlass-dsl) importable: the CuTe mHC kernels can be built."""
@@ -1451,7 +1454,8 @@ class MHCLiteBlock(nn.Module):
     where f is the wrapped transformer layer (without residual).
 
     Optimized I/O: fused projection, merged H_res-h_post application.
-    Optional Triton kernels for further fusion (set triton_fused=True).
+    triton_fused=True runs n=4 bf16 (T, n, C) inputs through the fused kernels
+    (see _backend); everything else takes the PyTorch path.
     """
 
     def __init__(
@@ -1507,13 +1511,16 @@ class MHCLiteBlock(nn.Module):
 
     def _backend(self, x_streams: torch.Tensor) -> str:
         """Kernel set for a triton_fused block: "cute" (CuTeDSL pre kernels + v2 post,
-        n=4, C=1024, sm90), "v2" (fused Triton pre + post, n=4) or "triton" (the
-        per-op Triton kernels). NANOPLM_MHC_BACKEND=cute|v2|triton forces one, for A/Bs."""
+        n=4, C=1024, sm90), "v2" (fused Triton pre + post, n=4, C % 128 == 0) or
+        "pytorch". Inputs past 2^31 elements take the PyTorch path (the fused
+        kernels use 32-bit offsets). NANOPLM_MHC_BACKEND=cute|v2|pytorch forces one, for A/Bs."""
+        from .mhc_fused_v2 import supports as _v2_supports
+
+        if self.n != 4 or not _v2_supports(x_streams):
+            return "pytorch"
         forced = os.environ.get("NANOPLM_MHC_BACKEND", "").strip().lower()
-        if forced in ("cute", "v2", "triton"):
-            return forced if (forced == "triton" or self.n == 4) else "triton"
-        if self.n != 4:
-            return "triton"
+        if forced in ("cute", "v2", "pytorch"):
+            return forced
         if self.C == 1024 and torch.cuda.get_device_capability(x_streams.device) == (9, 0) and _cute_available():
             return "cute"
         return "v2"
@@ -1526,7 +1533,7 @@ class MHCLiteBlock(nn.Module):
         dt = x_streams.dtype
 
         x_flat = x_streams.reshape(*x_streams.shape[:-2], self.nC)
-        x_norm = F.rms_norm(x_flat, (self.nC,))
+        x_norm = F.rms_norm(x_flat, (self.nC,), eps=_MHC_EPS)
 
         all_proj = F.linear(x_norm, self.W_all.weight.to(dt), None)
         pre_proj, post_proj, res_proj = all_proj.split([n, n, self.n_fact], dim=-1)
@@ -1605,138 +1612,28 @@ class MHCLiteBlock(nn.Module):
             )
         return post_res(x_streams, layer_output, H_merged, h_post)
 
-    def _mhc_coeffs_triton(
-        self, x_streams: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute h_pre/h_post/H_merged using fused K1 + PyTorch tiny ops."""
-        n = self.n
-        T = x_streams.shape[0]
-        dt = x_streams.dtype
-
-        x_flat = x_streams.reshape(T, self.nC)
-        all_proj, _inv_rms = torch.ops.nanoplm_mhc.fused_rmsnorm_project(
-            x_flat, self.W_all.weight.to(dt)
-        )
-
-        pre_proj, post_proj, res_proj = all_proj.split([n, n, self.n_fact], dim=-1)
-
-        bias = self.W_all.bias.to(dt)
-        h_pre = torch.sigmoid(self.alpha_pre.to(dt) * pre_proj + bias[:n])
-        h_post = 2.0 * torch.sigmoid(
-            self.alpha_post.to(dt) * post_proj + bias[n : 2 * n]
-        )
-        a_res = F.softmax(self.alpha_res.to(dt) * res_proj + bias[2 * n :], dim=-1)
-
-        H_res = torch.matmul(a_res, self.perm_mat.to(dt)).unflatten(-1, (n, n))
-        if not self.merge_residual:
-            return h_pre, h_post, H_res
-        H_merged = H_res - h_post.unsqueeze(-1) * h_pre.unsqueeze(-2)
-        return h_pre, h_post, H_merged
-
-    def _mhc_pre_map_triton(
-        self, x_streams: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pre-map bundle for Triton path: layer_input + post-res coefficients."""
-        h_pre, h_post, H_merged = self._mhc_coeffs_triton(x_streams)
-        layer_input = torch.ops.nanoplm_mhc.fused_pre_map(x_streams, h_pre.float())
-        return layer_input, H_merged.float(), h_post.float()
-
-    def _mhc_post_res_triton(
-        self,
-        x_streams: torch.Tensor,
-        layer_output: torch.Tensor,
-        H_merged: torch.Tensor,
-        h_post: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.ops.nanoplm_mhc.fused_post_res(
-            x_streams, layer_output, H_merged, h_post
-        )
-
-    def _forward_triton(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Triton-fused forward path. Requires (T, n, C) bf16 on CUDA.
-
-        Uses Triton for the memory-heavy stream operations (K3: pre-map,
-        K4: post-res) and PyTorch for the coefficient computation (tiny ops).
-        """
-        pre_map = (
-            self._compiled_mhc_pre_map_triton
-            if self.training and hasattr(self, "_compiled_mhc_pre_map_triton")
-            else self._mhc_pre_map_triton
-        )
-        post_res = (
-            self._compiled_mhc_post_res_triton
-            if self.training and hasattr(self, "_compiled_mhc_post_res_triton")
-            else self._mhc_post_res_triton
-        )
-        use_ckpt = (
-            USE_ACTIVATION_CHECKPOINTING_MHC
-            and self.training
-            and torch.is_grad_enabled()
-            and x_streams.requires_grad
-        )
-        # Eval/inference should avoid autotune warmup latency.
-        autotune_ctx = (
-            nullcontext()
-            if self.training
-            else _mhc_triton_ops.disable_autotune_temporarily()
-        )
-
-        with autotune_ctx:
-            if use_ckpt:
-                layer_input, H_merged, h_post = _checkpoint(
-                    lambda x_: pre_map(x_),
-                    x_streams,
-                    use_reentrant=False,
-                )
-            else:
-                layer_input, H_merged, h_post = pre_map(x_streams)
-
-            # Transformer layer
-            layer_output = self.layer(layer_input, **kwargs)
-
-            # K4: Triton fused post-res (H_merged @ x + h_post * layer_output)
-            if use_ckpt:
-                return _checkpoint(
-                    lambda x_, lo_, H_, hp_: post_res(x_, lo_, H_, hp_),
-                    x_streams,
-                    layer_output,
-                    H_merged,
-                    h_post,
-                    use_reentrant=False,
-                )
-            return post_res(x_streams, layer_output, H_merged, h_post)
-
     def forward(self, x_streams: torch.Tensor, **kwargs) -> torch.Tensor:
         """x_streams: (..., n, C).  Returns (..., n, C)."""
-        # Use Triton path when: triton_fused=True, CUDA, bf16, 2D token dim
-        use_triton = (
+        # the fused kernels take (T, n, C) bf16 on CUDA, no batch dim
+        fused = (
             self.triton_fused
             and x_streams.is_cuda
             and x_streams.dtype == torch.bfloat16
-            and x_streams.dim() == 3  # (T, n, C) — no batch dim
+            and x_streams.dim() == 3
         )
-
-        backend = self._backend(x_streams) if use_triton else None
-        if backend == "cute":
-            from .mhc_cute_ops import mhc_cute_block
-
-            alpha3 = torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res]).float()
-            return mhc_cute_block(
-                x_streams, self.layer, self.W_all.weight, alpha3,
-                self.W_all.bias.float(), self.perm_mat_pad.float(), merge=self.merge_residual, **kwargs,
-            )
-        if backend == "v2":
-            from .mhc_fused_v2 import mhc_fused_block
-
-            alpha3 = torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res]).float()
-            return mhc_fused_block(
-                x_streams, self.layer, self.W_all.weight, alpha3,
-                self.W_all.bias.float(), self.perm_mat_pad.float(), merge=self.merge_residual, **kwargs,
-            )
-        if use_triton:
-            out = self._forward_triton(x_streams, **kwargs)
-        else:
+        backend = self._backend(x_streams) if fused else "pytorch"
+        if backend == "pytorch":
             out = self._forward_pytorch(x_streams, **kwargs)
+        else:
+            if backend == "cute":
+                from .mhc_cute_ops import mhc_cute_block as block
+            else:
+                from .mhc_fused_v2 import mhc_fused_block as block
+            alpha3 = torch.cat([self.alpha_pre, self.alpha_post, self.alpha_res]).float()
+            out = block(
+                x_streams, self.layer, self.W_all.weight, alpha3,
+                self.W_all.bias.float(), self.perm_mat_pad.float(), merge=self.merge_residual, **kwargs,
+            )
         return self.repeat_tap(out, 0)
 
 

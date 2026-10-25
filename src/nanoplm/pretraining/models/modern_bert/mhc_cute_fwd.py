@@ -262,9 +262,11 @@ def _pre_fwd7_kernel(
             t0 = (cl + n * ncl) * BT
             cute.arch.mbarrier_wait(bar + (B_FULL + sl), (n // 2) % 2)
             # 1) everything this tile needs from the receive slot, into registers; then free the slot
-            ht = ctid // 4
+            # h_pre inputs: only ctid < BT * 4 use them; the rest read an in-bounds
+            # duplicate rather than tokens BT..2BT-1, past the slot (into sRed)
+            ht = (ctid // 4) % BT
             hj = ctid % 4
-            hv, hfs = _recv_sum(sRecv, sl, ht, 0, hj, NQ)          # h_pre inputs (lanes < 64 used)
+            hv, hfs = _recv_sum(sRecv, sl, ht, 0, hj, NQ)
             tto = NQ * cw + q                                          # the owned token of this warp
             ov, ofs = _recv_sum(sRecv, sl, tto, lane // 4, lane % 4, NQ)
             cute.arch.barrier(barrier_id=2, number_of_threads=NPR)
