@@ -1711,6 +1711,21 @@ def _block_owns_layer_checkpoint(block: nn.Module, loop_count=None) -> bool:
 MHC_INIT_STD = 0.02  # DeepSeek-V4 initializer_range for the mHC projections
 
 
+def check_mhc_checkpoint(model: nn.Module, state_dict: dict) -> None:
+    """Refuse an mHC checkpoint saved before the mhc_head readout existed: its
+    streams were mixed differently, so even a non-strict load computes another
+    function. Call before load_state_dict, which would only report missing keys."""
+    if not any("mhc_head." in n for n, _ in model.named_parameters()):
+        return
+    if any("mhc_head." in k for k in state_dict):
+        return
+    if any(".W_all." in k for k in state_dict):
+        raise RuntimeError(
+            "mHC checkpoint predates the mHC rework in #167 (no mhc_head.* weights); "
+            "incompatible with this code: retrain, or load it with the pre-#167 code"
+        )
+
+
 class MHCHyperHead(nn.Module):
     """Final collapse of the n residual streams (DeepseekV4HyperHead): a learned,
     per-token sigmoid weighting of the streams from the RMS-normalised n*C row,

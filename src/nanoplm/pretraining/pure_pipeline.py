@@ -80,6 +80,7 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     MHCLiteBlock,
     MHCLiteSublayersLayer,
     ModernBertEncoderLayer,
+    check_mhc_checkpoint,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import (
@@ -2160,6 +2161,7 @@ def _load_checkpoint(
     mode_mismatch = checkpoint_mode is not None and checkpoint_mode != current_mode
 
     model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
+    check_mhc_checkpoint(model, model_sd)
     if distributed and _is_fsdp(distributed_mode):
         set_model_state_dict(model, model_sd, options=StateDictOptions(full_state_dict=True))
     else:
