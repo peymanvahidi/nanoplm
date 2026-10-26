@@ -8,11 +8,13 @@ SPEC keys: dataset_dir, ckp_dir, out (per-rank JSON path prefix), micro, ga,
 steps, bwarm, mode ("single" | "dist"), resume (checkpoint dir or null),
 dist_mode (pipeline distributed_mode; default "ddp" for "dist" and "fsdp" for
 "single", since the pipeline rejects ddp without multi_gpu), len_overreport
-(add this to the train loader length the pipeline syncs; default 0).
+(add this to the train loader length the pipeline syncs; default 0),
+eval_steps / logging_steps (default: never), max_wallclock_hours (default unset).
 
 Forces CPU and makes torch.compile the identity. Records, for every training
 sub-batch the loop moves to the device, (global_step, epoch, micro_step,
-sub_batch_idx, original token rows). Eval batches are not recorded.
+sub_batch_idx, original token rows). Eval batches are not recorded. Also
+records the order of _evaluate and _save_checkpoint calls as ("eval"|"save", step).
 """
 
 import json
@@ -97,7 +99,9 @@ def run_phase(spec: dict) -> None:
         global_batch_warmup_steps=spec.get("bwarm", 0),
         bf16=False, tf32=False, fp8=False, use_packing=False, use_static_inp_size=False,
         multi_gpu=dist_mode, world_size=world, num_workers=0,
-        eval_steps=10_000_000, save_steps=10_000_000, logging_steps=10_000_000,
+        eval_steps=spec.get("eval_steps", 10_000_000), save_steps=10_000_000,
+        logging_steps=spec.get("logging_steps", 10_000_000),
+        max_wallclock_hours=spec.get("max_wallclock_hours"),
         seed=SEED, optimizer="adamw", distributed_mode=spec.get("dist_mode", "ddp" if dist_mode else "fsdp"),
     )
     _populate_batch_setup(cfg)
@@ -129,6 +133,19 @@ def run_phase(spec: dict) -> None:
 
     pp._move_batch_to_device = _hook
 
+    events = []
+    orig_eval, orig_save = pp._evaluate, pp._save_checkpoint
+
+    def _eval_hook(*a, **k):
+        events.append(["eval", sys._getframe(1).f_locals["global_step"]])
+        return orig_eval(*a, **k)
+
+    def _save_hook(*a, **k):
+        events.append(["save", a[3]])  # (model, optimizer, scheduler, global_step, ...)
+        return orig_save(*a, **k)
+
+    pp._evaluate, pp._save_checkpoint = _eval_hook, _save_hook
+
     class _H(logging.Handler):
         def emit(self, record):
             msgs.append(record.getMessage())
@@ -143,7 +160,8 @@ def run_phase(spec: dict) -> None:
     resume_lines = [m for m in msgs if m.startswith("Resume continue:")]
     pass_lines = [m for m in msgs if m.startswith("Data pass ")]  # rank 0 only
     Path(f"{spec['out']}.rank{rank}.json").write_text(json.dumps(
-        {"log": log, "resume_lines": resume_lines, "pass_lines": pass_lines}))
+        {"log": log, "resume_lines": resume_lines, "pass_lines": pass_lines,
+         "events": events}))
 
 
 if __name__ == "__main__":
