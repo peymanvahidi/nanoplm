@@ -300,7 +300,7 @@
           "type": "boolean",
           "default": true,
           "x-nanoplm-group": "mHC-lite (pure_torch only)",
-          "description": "fused Triton stream ops; first run slow (autotune)",
+          "description": "fused mHC kernels (CuTe on GH200 at C=1024 with cutlass-dsl >= 4.5, else Triton v2)",
           "x-nanoplm-visible-when": {
             "field": "use_mhc_lite",
             "op": "==",
