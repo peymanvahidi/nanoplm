@@ -92,7 +92,7 @@ model:
   use_mhc_lite: false
   mhc_n_streams: 4                      # residual streams (n! permutation matrices)
   mhc_lite_wrapping_level: "layer"      # layer | sublayers
-  mhc_triton_fused: true                # fused mHC kernels (CuTe on GH200 at C=1024, else Triton v2)
+  mhc_triton_fused: true                # fused mHC kernels (CuTe on GH200 at C=1024 with cutlass-dsl >= 4.5, else Triton v2)
 
   # ── Differential attention & paired heads (pure_torch only) ───────────────
 
