@@ -80,6 +80,7 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     MHCLiteBlock,
     MHCLiteSublayersLayer,
     ModernBertEncoderLayer,
+    check_mhc_checkpoint,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import (
@@ -127,10 +128,14 @@ _WALLCLOCK_WARMUP_STEPS = 2
 # Seconds of a SLURM job's remaining time to leave unused when the wall-clock
 # deadline is defaulted from the environment. Measured on job 1684851 (16 ranks,
 # 4 nodes, 650M params): a checkpoint write costs 6.8-26.4s (median 22.8s over 21
-# writes), an eval 1.9-6.4s, and the median optimizer step is 200ms, so the tail
-# after a deadline trips is under a minute. 300s is 5x that, and _save_checkpoint
-# writes straight into the final checkpoint-N/ directory with no temp-and-rename,
-# so a SIGKILL mid-write would leave a partial directory that looks complete.
+# writes) and the median optimizer step is 200ms. A deadline save has taken 41s
+# (job 2075923), and the stop step also runs the in-loop eval: 1.9-6.4s for one
+# loop count, but 88s for a 5-value recycling sweep (job 2033235) and an
+# estimated 120-150s for the 7-value sweeps. The worst tail is then ~200s, only
+# ~1.5x inside 300s, which is why a wall-clock stop writes its checkpoint before
+# that eval. _save_checkpoint writes straight into the final checkpoint-N/
+# directory with no temp-and-rename, so a SIGKILL mid-write would leave a
+# partial directory that looks complete.
 _SLURM_DEADLINE_MARGIN_SEC = 300.0
 
 
@@ -923,6 +928,25 @@ def _nonfinite_check_tensor(tensors: list[torch.Tensor]) -> torch.Tensor | None:
         return ~torch.isfinite(torch.stack(list(norms))).all()
     except (RuntimeError, TypeError):
         return ~torch.stack([torch.isfinite(t).all() for t in local_tensors]).all()
+
+
+def _moe_nan_guard_active(model) -> bool:
+    """True when any MoE router clamps NaN rows (moe_nan_guard). Scans every
+    Router, not just the bias-correction layer list, which is empty when
+    moe_use_bias_correction is off."""
+    from nanoplm.pretraining.models.modern_bert.moe import Router
+
+    return any(
+        getattr(m, "nan_guard", False) for m in model.modules() if isinstance(m, Router)
+    )
+
+
+def _guard_checks_grad_norm(guard_active: bool, scaler) -> bool:
+    """Whether moe_nan_guard runs its own gradient-norm skip. An enabled fp16
+    GradScaler already skips non-finite steps and backs off its scale; the
+    guard's skip would bypass scaler.update() after unscale_() and break the
+    next step, so the scaler keeps that job."""
+    return guard_active and not (scaler is not None and scaler.is_enabled())
 
 
 class _DeferredFiniteCheck:
@@ -2137,6 +2161,7 @@ def _load_checkpoint(
     mode_mismatch = checkpoint_mode is not None and checkpoint_mode != current_mode
 
     model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
+    check_mhc_checkpoint(model, model_sd)
     if distributed and _is_fsdp(distributed_mode):
         set_model_state_dict(model, model_sd, options=StateDictOptions(full_state_dict=True))
     else:
@@ -3052,6 +3077,12 @@ def run_pure_pretraining(
             orig_model, optimizer, scheduler, resume_config.checkpoint_dir,
             device, distributed, load_scheduler=False, distributed_mode=distributed_mode,
         )
+        if device.type == "cuda":
+            # _load_checkpoint put the full (unsharded) model and optimizer state
+            # dicts on the GPU. Hand their cached blocks back to the driver so
+            # NCCL's own allocations still fit in runs that train within a few
+            # GB of the device limit.
+            torch.cuda.empty_cache()
         logger.info(f"Resumed at global_step={start_step}, epoch={start_epoch}")
 
         # Detect dataset change: if the current dataset differs from the
@@ -3105,10 +3136,8 @@ def run_pure_pretraining(
                 )
             if is_main:
                 logger.info(
-                    "Resume decay anneals the trunk over %d steps. NOTE: the decay phase "
-                    "restarts the dataloader from the start of a pass, so weight "
-                    "equivalence with a single-run wsd decay holds only when the "
-                    "stable->decay boundary is data-pass aligned (spec sections 7/13).",
+                    "Resume decay anneals the trunk over %d steps, continuing the data "
+                    "from the trunk's saved position.",
                     resume_decay_steps,
                 )
             scheduler = _rebuild_scheduler_for_resume(
@@ -3125,18 +3154,12 @@ def run_pure_pretraining(
             total_steps = resume_decay_steps
             warmup_steps = 0
             start_step = 0
-            start_epoch = 0
             horizon = StepHorizon(total_steps=resume_decay_steps)
             resume_force_final = True
             # Re-clamp logging/eval/save to the (shorter) decay horizon.
             logging_steps = max(1, min(total_steps, logging_steps))
             eval_steps = max(1, min(total_steps, eval_steps))
             save_steps = max(1, min(total_steps, save_steps))
-            # Fresh phase: no dataloader fast-forward.
-            resume_epoch = 0
-            resume_data_step = 0
-            resume_sub_batch_step = 0
-            resume_batch_split_divisor = 1
             if is_main:
                 logger.info(
                     "Resume decay: total_steps=%d (decay), peak LR from checkpoint, "
@@ -3157,44 +3180,48 @@ def run_pure_pretraining(
                 decay_steps=horizon.decay_steps,
                 is_main=is_main,
             )
-            resume_epoch = start_epoch
-            if (
-                not _dataset_changed
-                and _ckp_state is not None
-                and "epoch_data_step" in _ckp_state
-            ):
-                # Restore the exact within-pass position saved at checkpoint time.
-                # (Every save, terminal included, persists epoch_data_step/
-                # sub_batch/divisor; the dataloader fast-forwards to this point.)
-                resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
-                resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
-                resume_batch_split_divisor = max(
-                    1, int(_ckp_state.get("batch_split_divisor", 1))
-                )
-            else:
-                # Dataset changed, or a checkpoint written before the position
-                # was saved (terminal/role checkpoints only carry it since
-                # #154): replay the DataLoader from the top of the current pass
-                # (spec §11 honest fallback). The LR schedule still fast-forwards
-                # via global_step.
-                resume_data_step = 0
-                resume_sub_batch_step = 0
-                resume_batch_split_divisor = 1
-            if resume_data_step >= synced_len:
-                # Saved position lands at/after the end of a pass; start the next
-                # pass cleanly from the top.
-                resume_data_step = 0
-                resume_sub_batch_step = 0
-                resume_batch_split_divisor = 1
-                resume_epoch = start_epoch + 1
-                start_epoch = resume_epoch
-            if is_main:
-                logger.info(
-                    "Resume continue: total_steps=%d, start_step=%d, "
-                    "fast-forward to epoch=%d data_step=%d sub_batch=%d divisor=%d",
-                    total_steps, start_step, resume_epoch, resume_data_step,
-                    resume_sub_batch_step, resume_batch_split_divisor,
-                )
+        # Both modes continue the data where the checkpoint stopped. A decay
+        # that restarted the pass would re-train on data the trunk has already
+        # seen, and arms branching from one trunk step would only share their
+        # cooldown data if that step happened to be pass-aligned.
+        resume_epoch = start_epoch
+        if (
+            not _dataset_changed
+            and _ckp_state is not None
+            and "epoch_data_step" in _ckp_state
+        ):
+            # Restore the exact within-pass position saved at checkpoint time.
+            # (Every save, terminal included, persists epoch_data_step/
+            # sub_batch/divisor; the dataloader fast-forwards to this point.)
+            resume_data_step = int(_ckp_state.get("epoch_data_step", 0))
+            resume_sub_batch_step = int(_ckp_state.get("epoch_sub_batch_step", 0))
+            resume_batch_split_divisor = max(
+                1, int(_ckp_state.get("batch_split_divisor", 1))
+            )
+        else:
+            # Dataset changed, or a checkpoint written before the position
+            # was saved (terminal/role checkpoints only carry it since
+            # #154): replay the DataLoader from the top of the current pass
+            # (spec §11 honest fallback). The LR schedule still fast-forwards
+            # via global_step.
+            resume_data_step = 0
+            resume_sub_batch_step = 0
+            resume_batch_split_divisor = 1
+        if resume_data_step >= synced_len:
+            # Saved position lands at/after the end of a pass; start the next
+            # pass cleanly from the top.
+            resume_data_step = 0
+            resume_sub_batch_step = 0
+            resume_batch_split_divisor = 1
+            resume_epoch = start_epoch + 1
+            start_epoch = resume_epoch
+        if is_main:
+            logger.info(
+                "Resume %s: total_steps=%d, start_step=%d, "
+                "fast-forward to epoch=%d data_step=%d sub_batch=%d divisor=%d",
+                _resume_mode, total_steps, start_step, resume_epoch, resume_data_step,
+                resume_sub_batch_step, resume_batch_split_divisor,
+            )
 
     # ---- W&B ----
     wandb_enabled = False
@@ -3395,8 +3422,26 @@ def run_pure_pretraining(
     first_step_of_run = True
     consecutive_nonfinite_skips = 0
     debug_non_finite_params = bool(getattr(pretrain_config, "debug_non_finite_params", True))
-    loss_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
+    # moe_nan_guard clamps the router index so a NaN forward finishes instead of
+    # aborting. That is only safe with the skip path below behind it, so the
+    # guard switches the non-finite loss check on by itself, plus a gradient-norm
+    # check of its own. Read from the constructed routers rather than the config,
+    # so the two cannot disagree.
+    moe_nan_guard_active = _moe_nan_guard_active(orig_model)
+    loss_finite_check = (
+        _DeferredFiniteCheck(device)
+        if debug_non_finite_params or moe_nan_guard_active
+        else None
+    )
+    moe_grad_norm_check = _guard_checks_grad_norm(moe_nan_guard_active, scaler)
     param_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
+    nonfinite_loss_skips = 0
+    nonfinite_grad_skips = 0
+    if moe_nan_guard_active and is_main:
+        logger.info(
+            "moe_nan_guard on: router index clamped in training; steps with a "
+            "non-finite loss or gradient norm are skipped and logged"
+        )
 
     def _raise_on_nonfinite_params(context: str) -> None:
         # Consumes the async verdict submitted after the previous optimizer
@@ -3798,6 +3843,7 @@ def run_pure_pretraining(
                                 loss_nonfinite = bool(_lf.item() > 0)
                     if loss_nonfinite:
                         consecutive_nonfinite_skips += 1
+                        nonfinite_loss_skips += 1
                         rank = dist.get_rank() if distributed and dist.is_initialized() else 0
                         logger.error(
                             "Skipping optimizer step %d due to non-finite loss on rank %d "
@@ -3870,7 +3916,38 @@ def run_pure_pretraining(
                     )
 
                     step_skipped = False
-                    if scaler is not None and scaler.is_enabled():
+                    grad_nonfinite = False
+                    if moe_grad_norm_check:
+                        # A NaN that reaches the gradients but not the loss (one
+                        # born after the last router, say) would make
+                        # clip_grad_norm_ scale every gradient by NaN. Decide
+                        # globally so no rank steps while another skips. This is
+                        # one host sync per step, so only the guard pays it.
+                        _gn = grad_norm.full_tensor() if hasattr(grad_norm, "full_tensor") else grad_norm
+                        _gf = (~torch.isfinite(_gn.detach().float())).float().reshape(1)
+                        if distributed and dist.is_initialized():
+                            dist.all_reduce(_gf, op=dist.ReduceOp.MAX)
+                        grad_nonfinite = bool(_gf.item() > 0)
+                    if grad_nonfinite:
+                        # Reuses the scaler's skipped-step path below: no LR
+                        # schedule step, no MoE bias update from this window.
+                        step_skipped = True
+                        consecutive_nonfinite_skips += 1
+                        nonfinite_grad_skips += 1
+                        _rank = dist.get_rank() if distributed and dist.is_initialized() else 0
+                        logger.error(
+                            "Skipping optimizer step %d due to non-finite gradient norm on "
+                            "rank %d (consecutive=%d, total grad skips=%d).",
+                            upcoming_step, _rank, consecutive_nonfinite_skips,
+                            nonfinite_grad_skips,
+                        )
+                        if consecutive_nonfinite_skips >= _MAX_CONSECUTIVE_NONFINITE_SKIPS:
+                            raise RuntimeError(
+                                f"Aborting at step {upcoming_step}: "
+                                f"{consecutive_nonfinite_skips} consecutive non-finite skips "
+                                "(not recovering)."
+                            )
+                    elif scaler is not None and scaler.is_enabled():
                         old_scale = scaler.get_scale()
                         if isinstance(optimizer, MuonAdamWGroup):
                             scaler.step(optimizer.muon)
@@ -3941,7 +4018,8 @@ def run_pure_pretraining(
                                 ])
                         _moe_count_accum.zero_()
 
-                    consecutive_nonfinite_skips = 0
+                    if not grad_nonfinite:
+                        consecutive_nonfinite_skips = 0
                     global_step += 1
                     tokens_seen += int(achieved_global_batch_tokens)
                     profiler_step_cb(global_step)
@@ -4097,11 +4175,15 @@ def run_pure_pretraining(
                             f"dt={avg_step_ms:.2f}ms eta={eta_hours:.2f}h "
                             f"wall={wall_elapsed:.1f}s waste={waste:.1f}% "
                             f"h100_mfu={mfu:.2%} {moe_str}{vram_log}"
+                            + (f" nonfinite_skips=loss:{nonfinite_loss_skips},grad:{nonfinite_grad_skips}"
+                               if moe_nan_guard_active else "")
                         )
                         payload = {
                             "train/global_step": global_step,
                             "train/loss": avg_loss,
                             "train/grad_norm": grad_norm_val,
+                            "train/nonfinite_loss_skips": nonfinite_loss_skips,
+                            "train/nonfinite_grad_skips": nonfinite_grad_skips,
                             "train/learning_rate": learning_rate,
                             "train/epoch": epoch_progress,
                             "train/tokens_per_sec": tps,
@@ -4205,7 +4287,47 @@ def run_pure_pretraining(
                             dist.all_reduce(_wc, op=dist.ReduceOp.MAX)
                             hit_wallclock = bool(_wc.item() > 0)
 
-                    if global_step % eval_steps == 0 or at_wsd_stable_end:
+                    # Computed every step, not only when saving, because the
+                    # terminal save happens after both loops have exited and has
+                    # no other way to know where the data stream stood. When the
+                    # pass ends exactly on the terminal step this records
+                    # epoch_data_step == synced_len, which the resume path reads
+                    # as "start the next pass from the top" -- keep that guard.
+                    next_data_step = micro_step
+                    next_sub_batch_step = sub_batch_idx + 1
+                    next_batch_split_divisor = batch_split_divisor
+                    if next_sub_batch_step >= total_sub_batches:
+                        next_data_step = micro_step + 1
+                        next_sub_batch_step = 0
+                        next_batch_split_divisor = mbs_divisor
+                    _pos = dict(
+                        epoch_data_step=next_data_step,
+                        epoch_sub_batch_step=next_sub_batch_step,
+                        batch_split_divisor=next_batch_split_divisor,
+                    )
+                    latest_data_pos = _pos
+
+                    # A wall-clock stop off the eval cadence writes its checkpoint
+                    # before the eval below: the eval can take minutes (a multi-r
+                    # sweep) and must not eat the SLURM margin the save needs, and
+                    # with eval_mask_seed unset it draws masks from the global RNG,
+                    # so a checkpoint taken after it would resume on a different
+                    # RNG stream than an uninterrupted run. Every term is global
+                    # (hit_wallclock is all-reduced), so all ranks agree.
+                    wc_only = hit_wallclock and not (
+                        global_step % eval_steps == 0 or at_wsd_stable_end or at_terminal
+                    )
+                    if wc_only:
+                        _raise_on_nonfinite_params(f"before checkpoint at step {global_step}")
+                        _phase = "periodic"
+                        _save(_phase, **_pos)
+
+                    # Also evaluate on the last step a run takes (the terminal step
+                    # and a wall-clock stop), so a checkpoint written off the eval
+                    # cadence still has an eval loss at its own step. At the
+                    # terminal and stable-end steps the eval stays before the save,
+                    # so a decay resumes from the state an uninterrupted run has.
+                    if global_step % eval_steps == 0 or at_wsd_stable_end or at_terminal or hit_wallclock:
                         _raise_on_nonfinite_params(f"before eval at step {global_step}")
                         if recycling_scheduler is not None and pretrain_config.recycling_pretraining_eval_loop_counts:
                             eval_loop_counts = pretrain_config.recycling_pretraining_eval_loop_counts
@@ -4250,32 +4372,14 @@ def run_pure_pretraining(
                                         logger.warning(f"W&B log failed; disabling. Error: {exc}")
                         model.train()
 
-                    # Computed every step, not only when saving, because the
-                    # terminal save happens after both loops have exited and has
-                    # no other way to know where the data stream stood. When the
-                    # pass ends exactly on the terminal step this records
-                    # epoch_data_step == synced_len, which the resume path reads
-                    # as "start the next pass from the top" -- keep that guard.
-                    next_data_step = micro_step
-                    next_sub_batch_step = sub_batch_idx + 1
-                    next_batch_split_divisor = batch_split_divisor
-                    if next_sub_batch_step >= total_sub_batches:
-                        next_data_step = micro_step + 1
-                        next_sub_batch_step = 0
-                        next_batch_split_divisor = mbs_divisor
-                    _pos = dict(
-                        epoch_data_step=next_data_step,
-                        epoch_sub_batch_step=next_sub_batch_step,
-                        batch_split_divisor=next_batch_split_divisor,
-                    )
-                    latest_data_pos = _pos
-
                     # In-loop saves: the forced wsd stable-end boundary, the
                     # wall-clock deadline, and the periodic save_steps cadence.
                     # Skip the periodic save at the terminal step -- the post-loop
                     # save writes the role-named terminal checkpoint there for
-                    # every schedule.
-                    if at_wsd_stable_end or hit_wallclock or (do_periodic and not at_terminal):
+                    # every schedule. A wall-clock-only stop already saved above.
+                    if not wc_only and (
+                        at_wsd_stable_end or hit_wallclock or (do_periodic and not at_terminal)
+                    ):
                         _raise_on_nonfinite_params(f"before checkpoint at step {global_step}")
                         _phase = "stable-end" if at_wsd_stable_end else "periodic"
                         _save(_phase, **_pos)
@@ -4285,9 +4389,10 @@ def run_pure_pretraining(
                         if at_wsd_stable_end and do_periodic:
                             _save("periodic", **_pos)
 
-                    # Leave immediately after the save so the checkpoint on disk
-                    # matches the final in-memory state: later sub-batches in this
-                    # macro-batch would otherwise take further optimizer steps.
+                    # Leave right after the save (and the eval, which takes no
+                    # optimizer step) so the checkpoint on disk matches the final
+                    # in-memory state: later sub-batches in this macro-batch would
+                    # otherwise take further optimizer steps.
                     if hit_wallclock:
                         wallclock_stop = True
                         wallclock_stop_ckpt = _checkpoint_dir_name(global_step, _phase)

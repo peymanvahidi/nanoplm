@@ -22,16 +22,15 @@ Determinism notes (so the assertion is meaningful)
 * The model is re-seeded *immediately before* construction in ``_fresh_model`` so
   both runs start from identical random initialization (``run_pure_pretraining``
   only seeds the data/training RNG, not the already-constructed model weights).
-* The stable budget is chosen so the stable->decay boundary lands on a *data-pass
-  (epoch) boundary*. The resume-``decay`` path does NOT fast-forward the
-  dataloader (it starts a fresh pass from data_step 0); aligning the boundary to a
-  pass boundary makes Run A's decay phase and Run B2's decay phase consume the same
-  data order and the same MLM masking, so the equivalence is exact. Empirically a
-  *mid-pass* boundary leaves a ~1e-4 resume-determinism gap (the data/masking RNG
-  across the process boundary drifts by a small offset) -- this matches the spec's
-  caveat (section 13: the invariant holds "only as well as existing crash-resume
-  reproducibility"). A boundary-aligned budget is the clean, fairness-correct
-  configuration the feature targets.
+* The resume-``decay`` path fast-forwards the dataloader to the trunk's saved
+  position, exactly like ``continue``, so Run B2's decay consumes the data Run A's
+  decay does and both finish at the same data position. The test runs twice:
+  with the stable->decay boundary on a data-pass (epoch) boundary, and mid-pass,
+  where a decay that restarted the pass would end somewhere else in the data.
+* Final weights are compared only for the pass-aligned boundary. Mid-pass, the
+  MLM masking RNG is not restored across the process boundary, which leaves a
+  ~2e-4 gap even when both decays see the same sequences (spec section 13: the
+  invariant holds "only as well as existing crash-resume reproducibility").
 
 GPU requirement
 ---------------
@@ -64,10 +63,10 @@ _GRAD_ACCUM = 2
 _GBT = _MICRO * _MAX_LEN * _GRAD_ACCUM          # tokens per optimizer step
 # 8 train sequences / (micro=2) = 4 micro-batches/pass / (grad_accum=2)
 #   = 2 optimizer steps per data pass.
-# stable=4 steps == 2 full passes (boundary-aligned); decay=2 steps == 1 pass.
-_STABLE_STEPS = 4
+# decay=2 steps == 1 pass. The stable budget is a test parameter: 4 steps == 2
+# full passes (boundary-aligned), 3 steps ends half-way through the second pass.
+_STEPS_PER_PASS = 2
 _DECAY_STEPS = 2
-_STABLE_TOKENS = _GBT * _STABLE_STEPS
 _DECAY_TOKENS = _GBT * _DECAY_STEPS
 
 _AA = "ACDEFGHIKLMNPQRSTVWY"
@@ -152,7 +151,7 @@ def _fresh_model(tokenizer):
     )
 
 
-def _base_config(ckp_dir: Path, dataset_dir: Path, **overrides):
+def _base_config(ckp_dir: Path, dataset_dir: Path, stable_steps: int, **overrides):
     from nanoplm.pretraining.config import PretrainingConfig
     from nanoplm.cli.pretrain import _populate_batch_setup
 
@@ -176,7 +175,7 @@ def _base_config(ckp_dir: Path, dataset_dir: Path, **overrides):
         num_workers=0,
         # eval fires at the stable boundary in both Run A (forced) and Run B1
         # (terminal at stable_steps); keep save/log out of the way.
-        eval_steps=_STABLE_STEPS,
+        eval_steps=stable_steps,
         save_steps=10_000_000,
         logging_steps=10_000_000,
         seed=_SEED,
@@ -196,6 +195,16 @@ def _find_checkpoint(ckp_dir: Path, role: str) -> Path:
     return hits[0]
 
 
+def _data_position(checkpoint_dir: Path):
+    import json
+
+    state = json.loads((checkpoint_dir / "training_state.json").read_text())
+    return {
+        k: state.get(k)
+        for k in ("epoch", "epoch_data_step", "epoch_sub_batch_step")
+    }
+
+
 def _load_final_weights(checkpoint_dir: Path):
     # _save_checkpoint writes the model weights as pytorch_model.bin (verified
     # against pure_pipeline._save_checkpoint).
@@ -204,7 +213,8 @@ def _load_final_weights(checkpoint_dir: Path):
     )
 
 
-def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stable_steps", [4, 3], ids=["pass-aligned", "mid-pass"])
+def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch, stable_steps):
     """Run A (single-run wsd) and Run B (warmup_stable trunk + resume decay)
     must produce the same final weights within resume determinism."""
     if not torch.cuda.is_available():
@@ -219,11 +229,16 @@ def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch):
     # Keep W&B fully offline/quiet and pin to a single visible GPU.
     monkeypatch.setenv("WANDB_MODE", "disabled")
     monkeypatch.chdir(tmp_path)
+    # The comparison runs in fp32, which FlashAttention rejects; take the SDPA
+    # path even on hosts that have flash_attn_interface installed.
+    from nanoplm.pretraining.models.modern_bert import modeling
+    monkeypatch.setattr(modeling, "_HAS_FLASH_VARLEN", False)
 
     from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
     from nanoplm.pretraining.config import ResumeConfig
     from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 
+    stable_tokens = _GBT * stable_steps
     tokenizer = ProtModernBertTokenizer()
     dataset_dir = tmp_path / "dataset"
     dataset_dir.mkdir()
@@ -234,8 +249,9 @@ def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch):
     cfg_a = _base_config(
         run_a_dir,
         dataset_dir,
+        stable_steps,
         lr_schedule="wsd",
-        stable_tokens=_STABLE_TOKENS,
+        stable_tokens=stable_tokens,
         decay_tokens=_DECAY_TOKENS,
     )
     run_pure_pretraining(_fresh_model(tokenizer), cfg_a, manifest)
@@ -245,8 +261,9 @@ def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch):
     cfg_b1 = _base_config(
         run_b_dir,
         dataset_dir,
+        stable_steps,
         lr_schedule="warmup_stable",
-        train_tokens=_STABLE_TOKENS,
+        train_tokens=stable_tokens,
     )
     run_pure_pretraining(_fresh_model(tokenizer), cfg_b1, manifest)
 
@@ -267,8 +284,9 @@ def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch):
     cfg_b2 = _base_config(
         run_b_dir,
         dataset_dir,
+        stable_steps,
         lr_schedule="warmup_stable",  # ignored on decay resume; trunk's config governs
-        train_tokens=_STABLE_TOKENS,
+        train_tokens=stable_tokens,
     )
     resume = ResumeConfig(
         is_resume=True,
@@ -281,6 +299,13 @@ def test_single_run_wsd_decay_equals_resume_decay(tmp_path, monkeypatch):
     run_pure_pretraining(_fresh_model(tokenizer), cfg_b2, manifest, resume_config=resume)
 
     # ---- Compare the two post-decay checkpoints ----
+    # Both decays must end at the same place in the data: the resume continued
+    # from the trunk's position instead of restarting the pass.
+    assert _data_position(_find_checkpoint(run_b_dir, "final")) == _data_position(
+        _find_checkpoint(run_a_dir, "final")
+    )
+    if stable_steps % _STEPS_PER_PASS:
+        return  # mid-pass: weights differ by the masking-RNG gap noted above
     a = _load_final_weights(_find_checkpoint(run_a_dir, "final"))
     b = _load_final_weights(_find_checkpoint(run_b_dir, "final"))
     assert len(a) > 0, "final checkpoint has no weights"

@@ -14,7 +14,7 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 
 
 def _model(**overrides):
-    config = ModernBertConfig(
+    kwargs = dict(
         vocab_size=64,
         hidden_size=64,
         intermediate_size=128,
@@ -25,8 +25,8 @@ def _model(**overrides):
         use_qk_norm=True,
         norm_type="rmsnorm",
         mlp_activation="swiglu",
-        **overrides,
     )
+    config = ModernBertConfig(**{**kwargs, **overrides})
     torch.manual_seed(0)
     model = ModernBertModel(config).eval()
     return model, config
@@ -289,3 +289,120 @@ def test_probs_are_autocast_invariant():
 
     assert outside.dtype == torch.float32
     torch.testing.assert_close(inside, outside, atol=0, rtol=0)
+
+
+# (num_attention_heads, num_kv_heads) for the paired-head tests, GQA included
+_PAIRED_HEADS = [(4, None), (4, 2), (8, 4)]
+
+
+@pytest.mark.parametrize("heads", [4, 8])
+def test_unpair_attention_probs_indexing(heads):
+    """Channel h of the unpaired map is head h, by the real `_pair_sdpa_qkv` layout.
+
+    The head and token ids are read off a marker q pushed through the model's
+    own pairing reshape (RoPE set to the identity), not a hand-written layout.
+    """
+    from nanoplm.pretraining.models.modern_bert.modeling import (
+        ModernBertAttention,
+        _unpair_attention_probs,
+    )
+
+    model, config = _model(use_paired_head_attention=True, num_attention_heads=heads)
+    attn = next(m for m in model.modules() if isinstance(m, ModernBertAttention))
+    b, s, d = 2, 5, config.head_dim
+    marker = torch.zeros(b, heads, s, d)
+    marker[..., 0] = torch.arange(heads, dtype=torch.float)[:, None]
+    marker[..., 1] = torch.arange(s, dtype=torch.float)
+    identity = (torch.ones(1, s, 2 * d), torch.zeros(1, s, 2 * d))
+    pq, _, _ = attn._pair_sdpa_qkv(marker, marker, marker, identity)
+    head_of = pq[0, ..., 0].long()  # (H/2, 2S): head at pair p, position t
+    tok_of = pq[0, ..., 1].long()
+
+    torch.manual_seed(0)
+    maps = torch.softmax(torch.randn(b, heads, s, s), dim=-1)
+    w = torch.tensor([0.3, 0.7])  # unequal key-slot split: both slots must be summed
+    paired = torch.zeros(b, heads // 2, 2 * s, 2 * s)
+    for p in range(heads // 2):
+        for t in range(2 * s):
+            for u in range(2 * s):
+                slot = u - 2 * tok_of[p, u]
+                paired[:, p, t, u] = maps[:, head_of[p, t], tok_of[p, t], tok_of[p, u]] * w[slot]
+    assert torch.allclose(_unpair_attention_probs(paired), maps, atol=1e-6)
+
+
+@pytest.mark.parametrize("heads,num_kv_heads", _PAIRED_HEADS)
+def test_paired_head_probs_reproduce_the_sdpa_output(monkeypatch, heads, num_kv_heads):
+    """The pair-space probabilities must reproduce SDPA, and the captured maps
+    must be their per-head reduction (rows summing to 1 on real tokens)."""
+    from nanoplm.pretraining.models.modern_bert import modeling
+
+    model, config = _model(
+        use_paired_head_attention=True,
+        num_attention_heads=heads,
+        num_kv_heads=num_kv_heads,
+    )
+    input_ids, attention_mask = _padded_batch(config)
+    paired_probs, captured = [], []
+    real_unpair, real_sdpa = modeling._unpair_attention_probs, F.scaled_dot_product_attention
+
+    def _unpair(p):
+        paired_probs.append(p.detach())
+        return real_unpair(p)
+
+    def _spy(q, k, v, **kwargs):
+        out = real_sdpa(q, k, v, **kwargs)
+        captured.append((v.detach(), out.detach()))
+        return out
+
+    monkeypatch.setattr(modeling, "_unpair_attention_probs", _unpair)
+    monkeypatch.setattr(F, "scaled_dot_product_attention", _spy)
+    with torch.no_grad(), collect_attention_probs(model, dtype=torch.float32) as probs:
+        model(input_ids=input_ids, attention_mask=attention_mask)
+
+    assert len(probs) == len(paired_probs) == len(captured) == config.num_hidden_layers
+    real = attention_mask.bool()
+    real2 = real.repeat_interleave(2, dim=-1)
+    for layer, (p, pp, (v, out)) in enumerate(zip(probs, paired_probs, captured)):
+        assert p.shape == (input_ids.shape[0], config.num_attention_heads) + input_ids.shape[1:] * 2
+        if v.shape[1] != pp.shape[1]:  # GQA: SDPA broadcasts v across the group
+            v = v.repeat_interleave(pp.shape[1] // v.shape[1], dim=1)
+        recomputed = torch.matmul(pp.float(), v.float())
+        keep = real2[:, None, :, None].expand_as(recomputed)
+        assert torch.allclose(recomputed[keep], out.float()[keep], atol=1e-5), layer
+        rows = p.sum(-1)[real[:, None, :].expand(-1, p.shape[1], -1)]
+        assert torch.allclose(rows, torch.ones_like(rows), atol=1e-5), layer
+
+
+@pytest.mark.parametrize("heads,num_kv_heads", _PAIRED_HEADS)
+def test_paired_head_channel_is_the_model_head(heads, num_kv_heads):
+    """Zeroing head h's query rows makes captured channel h, and only it, uniform.
+
+    Ties the channel order to the real model rather than to any layout written
+    out in the test: a zero query gives equal logits over every allowed key.
+    """
+    from nanoplm.pretraining.models.modern_bert.modeling import ModernBertAttention
+
+    for head in range(heads):
+        model, config = _model(
+            use_paired_head_attention=True,
+            num_attention_heads=heads,
+            num_kv_heads=num_kv_heads,
+        )
+        d = config.head_dim
+        with torch.no_grad():
+            for m in model.modules():
+                if isinstance(m, ModernBertAttention):
+                    w = m.Wqkv.weight if m.fused_qkv else m.Wq.weight
+                    w[head * d:(head + 1) * d] = 0
+        input_ids, attention_mask = _padded_batch(config, lengths=(17, 17))
+        with torch.no_grad(), collect_attention_probs(model, dtype=torch.float32) as probs:
+            model(input_ids=input_ids, attention_mask=attention_mask)
+
+        for layer, p in enumerate(probs):
+            nz = p > 0
+            spread = (
+                p.masked_fill(~nz, float("-inf")).amax(-1)
+                - p.masked_fill(~nz, float("inf")).amin(-1)
+            ).amax(dim=(0, 2))  # (H,): 0 for a uniform channel
+            uniform = (spread < 1e-6).nonzero().flatten().tolist()
+            assert uniform == [head], (layer, head, spread)

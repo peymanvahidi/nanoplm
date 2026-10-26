@@ -245,3 +245,31 @@ def test_pass_shorter_than_one_window_is_rejected(tmp_path):
                        _child_env(WANDB_MODE="disabled", OMP_NUM_THREADS="1"))
     assert rc != 0
     assert "fewer than grad_accum=3" in err, err[-4000:]
+
+
+# ("eval"|"save", global_step) in call order. Without eval_steps the cadence
+# never fires, so any eval is the stop step's own.
+_STOP_EVENTS = {
+    # Terminal step: one eval, then the post-loop terminal save.
+    "terminal": (dict(steps=3), [["eval", 3], ["save", 3]]),
+    # Terminal step on the eval cadence: still one eval, not two.
+    "terminal_on_cadence": (dict(steps=3, eval_steps=3), [["eval", 3], ["save", 3]]),
+    # Wall-clock-only stop: the clock arms at step 2 and trips on the next log
+    # step. The checkpoint is written before the eval.
+    "wallclock_only": (dict(steps=8, logging_steps=1, max_wallclock_hours=1e-9),
+                       [["save", 3], ["eval", 3]]),
+    # Wall-clock stop on the eval cadence: the cadence order (eval, then save).
+    "wallclock_on_cadence": (dict(steps=8, logging_steps=1, max_wallclock_hours=1e-9,
+                                  eval_steps=3),
+                             [["eval", 3], ["save", 3]]),
+}
+
+
+@pytest.mark.parametrize("case", list(_STOP_EVENTS))
+def test_stop_step_evaluates_once(tmp_path, case):
+    """The terminal and wall-clock stop steps run exactly one eval; a stop off
+    the eval cadence saves first. Two ranks must take the same branch."""
+    over, expected = _STOP_EVENTS[case]
+    base = _setup(tmp_path, _SCENARIOS["mid_pass"], 2, "dist")
+    out = _run(tmp_path, "a", dict(base, ckp_dir=str(tmp_path / "ck"), **over), 2)
+    assert out[0]["events"] == out[1]["events"] == expected, [o["events"] for o in out]

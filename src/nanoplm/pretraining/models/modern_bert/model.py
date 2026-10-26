@@ -105,6 +105,7 @@ class ProtModernBertMLMConfig:
     moe_bias_update_rate: float = 1e-3  # Ling-style expert-bias update rate
     moe_leading_dense_layers: int = 0
     moe_kernel_backend: str = "cutlass"  # cutlass | sonicmoe (routed-expert compute)
+    moe_nan_guard: bool = False  # skip-and-log a NaN step instead of crashing (see ModernBertConfig)
     # Huginn-style recycling (pure-torch path only). See ModernBertConfig for field semantics.
     use_huginn_looping: bool = False
     recycling_num_prelude_layers: int = 0

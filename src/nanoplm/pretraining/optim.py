@@ -102,11 +102,14 @@ def _is_zero_init_fragile_param(name: str) -> bool:
 
     Currently matches:
       - mHC-lite W_all.weight  (32×3072, 75% of rows intentionally suppressed)
+      - mHC hyper-head hc_fn   (n×n·C stream-mixing weights, kept on AdamW like W_all)
       - RePO W_z.weight        (8×96, zero-init with per-head rows)
       - DiffAttnV2 lambda_proj.weight (num_heads×hidden, zero-init, very few rows)
     """
     parts = name.split(".")
     if len(parts) >= 2 and parts[-2] == "W_all" and parts[-1] == "weight":
+        return True
+    if len(parts) >= 2 and parts[-2] == "mhc_head" and parts[-1] == "hc_fn":
         return True
     if len(parts) >= 2 and parts[-2] == "W_z" and parts[-1] == "weight":
         return True
