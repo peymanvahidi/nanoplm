@@ -389,7 +389,9 @@ resume:
   #   mode: decay.
   #   NOTE: decay continues the dataloader from the trunk's saved position,
   #   so it sees the data a single-run wsd decay would; keep
-  #   global_batch_tokens / world_size identical to the trunk's run.
+  #   global_batch_tokens / world_size identical to the trunk's run. The
+  #   masking RNG is not restored, so weights match a single-run wsd decay
+  #   bit-for-bit only when the trunk's stable->decay boundary is pass-aligned.
   mode: "decay"                         # continue | decay
 
   # ── Decay-mode fields (omit / null for mode: continue) ────────────────────
