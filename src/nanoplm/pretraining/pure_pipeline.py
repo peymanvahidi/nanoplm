@@ -929,6 +929,17 @@ def _nonfinite_check_tensor(tensors: list[torch.Tensor]) -> torch.Tensor | None:
         return ~torch.stack([torch.isfinite(t).all() for t in local_tensors]).all()
 
 
+def _moe_nan_guard_active(model) -> bool:
+    """True when any MoE router clamps NaN rows (moe_nan_guard). Scans every
+    Router, not just the bias-correction layer list, which is empty when
+    moe_use_bias_correction is off."""
+    from nanoplm.pretraining.models.modern_bert.moe import Router
+
+    return any(
+        getattr(m, "nan_guard", False) for m in model.modules() if isinstance(m, Router)
+    )
+
+
 class _DeferredFiniteCheck:
     """Non-finite tripwire that avoids blocking the host on the full stream.
 
@@ -3406,9 +3417,7 @@ def run_pure_pretraining(
     # guard switches the non-finite loss check on by itself, plus a gradient-norm
     # check of its own. Read from the constructed routers rather than the config,
     # so the two cannot disagree.
-    moe_nan_guard_active = any(
-        getattr(m.router, "nan_guard", False) for m in _moe_layers
-    )
+    moe_nan_guard_active = _moe_nan_guard_active(orig_model)
     loss_finite_check = (
         _DeferredFiniteCheck(device)
         if debug_non_finite_params or moe_nan_guard_active

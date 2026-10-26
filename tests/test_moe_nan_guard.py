@@ -125,12 +125,40 @@ def test_config_reaches_every_router():
     assert not any(r.nan_guard for r in off)
 
 
+@pytest.mark.parametrize("bias_correction", [True, False])
+@pytest.mark.parametrize("guard", [True, False])
+def test_pipeline_sees_the_guard(guard, bias_correction):
+    # The pipeline arms its loss and gradient-norm skip checks off this flag.
+    # It must not depend on moe_use_bias_correction: the routers clamp either
+    # way, and a clamp with no skip behind it lets a NaN step reach the weights.
+    from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
+    from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
+    from nanoplm.pretraining.pure_pipeline import _moe_nan_guard_active
+
+    model = PureProtModernBertMLM(ProtModernBertMLMConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=3,
+        num_attention_heads=2,
+        vocab_size=32,
+        use_moe=True,
+        moe_num_experts=4,
+        moe_top_k=2,
+        moe_leading_dense_layers=1,
+        moe_kernel_backend="cutlass",
+        moe_nan_guard=guard,
+        moe_use_bias_correction=bias_correction,
+    ))
+    assert _moe_nan_guard_active(model) is guard
+
+
 # ── end to end: a poisoned gradient is skipped, not stepped ─────────────────
 
 
 @pytest.mark.slow
 @pytest.mark.gpu
-def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
+@pytest.mark.parametrize("bias_correction", [True, False])
+def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch, bias_correction):
     """One NaN gradient element mid-run: that step is skipped and logged, the
     run finishes its budget, and the final weights are finite."""
     if not torch.cuda.is_available():
@@ -173,6 +201,7 @@ def test_nonfinite_grad_step_is_skipped(tmp_path, monkeypatch):
         moe_leading_dense_layers=1,
         moe_kernel_backend="cutlass",
         moe_nan_guard=True,
+        moe_use_bias_correction=bias_correction,
     ))
 
     # Poison one gradient element right before the second optimizer step's
