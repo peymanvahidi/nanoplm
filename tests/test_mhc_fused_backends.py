@@ -21,9 +21,15 @@ def _is_sm90():
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
 
 
+def _cute_runs():
+    from nanoplm.pretraining.models.modern_bert.modeling import _cute_available
+
+    return _is_sm90() and _cute_available()
+
+
 def _backends():
     out = [("pytorch", None, False), ("v2", "v2", True)]
-    if _is_sm90():
+    if _cute_runs():
         out.append(("cute", "cute", True))
     return out
 
@@ -106,6 +112,126 @@ def test_block_backends_vs_fp32_reference(merge, backend_env):
         # the pytorch path computes the coefficients in bf16
         tol = 1e-2 if name in ("v2", "cute") else 4e-2
         assert all(v < tol for v in errs.values()), (name, merge, errs)
+
+
+def _ref_block(x, W, a3, b, P, layer, merge, eps=1e-6):
+    """fp64 oracle of an MHCLiteBlock for any (T, 4, C); W, li and the layer output
+    are rounded to bf16 as the kernels' projection GEMM and the layer see them."""
+    bf = lambda t: t.to(torch.bfloat16).to(t.dtype)
+    T, _, C = x.shape
+    xf = x.reshape(T, 4 * C)
+    r = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    proj = (xf * r) @ bf(W).t()
+    av = torch.cat([a3[0].expand(4), a3[1].expand(4), a3[2].expand(24)])
+    z = proj * av + b
+    hpre, hpost = torch.sigmoid(z[:, :4]), 2 * torch.sigmoid(z[:, 4:8])
+    H = (torch.softmax(z[:, 8:], -1) @ P[8:]).view(T, 4, 4)
+    if merge:
+        H = H - hpost[:, :, None] * hpre[:, None, :]
+    lo = bf(layer(bf((hpre[:, :, None] * x).sum(1))))
+    return H @ x + hpost[:, :, None] * lo[:, None, :]
+
+
+def _row_err(a, b):
+    """Worst per-token max error over the global scale: one wrong tile can hide in a norm."""
+    return ((a.double() - b.double()).abs().flatten(1).amax(1).max() / b.double().abs().max()).item()
+
+
+def _view(x, layout):
+    """x as the block sees it, still differentiable back to the leaf x."""
+    if layout == "misaligned":  # dense, but 2 bytes past an aligned base
+        return torch.cat([x.new_zeros(1), x.flatten()])[1:].view(x.shape)
+    if layout == "strided":  # a channel slice of a wider tensor
+        return torch.cat([x, torch.zeros_like(x)], -1)[..., : x.shape[-1]]
+    return x
+
+
+def _check_block(T, C, name, merge=True, layout="dense", ignore_li=False, device="cuda"):
+    from nanoplm.pretraining.models.modern_bert import modeling as mod
+    from nanoplm.pretraining.models.modern_bert.mhc_fused_v2 import perm_matrix_padded
+
+    _set_backend(name)
+    torch.manual_seed(0)
+    K = 4 * C
+    P = perm_matrix_padded(device=device)
+    Wl = torch.randn(C, C, device=device, dtype=torch.float64) / C ** 0.5
+    const = torch.randn(T, C, device=device, dtype=torch.float64)
+
+    def lo_of(li):  # ignore_li: li gets no gradient, the backward sees a zero g_li
+        return const if ignore_li else li.double() @ Wl
+
+    class Lin(nn.Module):
+        def forward(self, li, **kw):
+            return lo_of(li).to(torch.bfloat16)
+
+    x0 = torch.randn(T, 4, C, device=device).bfloat16()
+    g = torch.randn_like(x0)
+    W0 = torch.randn(32, K, device=device) * 0.02
+    b0 = torch.randn(32, device=device) * 0.1
+    xr, Wr = x0.double().requires_grad_(True), W0.double().requires_grad_(True)
+    ar = torch.tensor([0.5, 0.6, 0.7], device=device, dtype=torch.float64, requires_grad=True)
+    br = b0.double().requires_grad_(True)
+    yr = _ref_block(xr, Wr, ar, br, P.double(), lo_of, merge)
+    yr.backward(g.double())
+
+    blk = mod.MHCLiteBlock(4, C, Lin(), triton_fused=True, merge_residual=merge).to(device)
+    with torch.no_grad():
+        blk.W_all.weight.copy_(W0)
+        blk.W_all.bias.copy_(b0)
+        blk.alpha_pre.fill_(0.5)
+        blk.alpha_post.fill_(0.6)
+        blk.alpha_res.fill_(0.7)
+    x = x0.clone().requires_grad_(True)
+    xv = _view(x, layout)
+    assert blk._backend(xv) == name
+    y = blk(xv)
+    y.backward(g)
+    ga = torch.cat([blk.alpha_pre.grad, blk.alpha_post.grad, blk.alpha_res.grad])
+    errs = dict(out=_rel(y, yr), gx=_rel(x.grad, xr.grad), gW=_rel(blk.W_all.weight.grad, Wr.grad),
+                galpha=_rel(ga, ar.grad), gbias=_rel(blk.W_all.bias.grad, br.grad),
+                out_row=_row_err(y, yr), gx_row=_row_err(x.grad, xr.grad))
+    assert all(torch.isfinite(t).all() for t in (y, x.grad, blk.W_all.weight.grad)), (name, T, C)
+    # galpha is 3 sums over few tokens at small T: bf16-level noise cancels less
+    tol = dict(out_row=3e-2, gx_row=3e-2, galpha=5e-2)
+    assert all(v < tol.get(k, 1e-2) for k, v in errs.items()), (name, T, C, errs)
+    return errs
+
+
+# 16-token tile edges (T % 16, the CuTe cluster counts ntl in {1, 2}), the v2
+# channel mask (C < 1024) and a single token
+_SHAPES = [(16, 1024), (32, 1024), (48, 1024), (4104, 1024), (4112, 1024), (37, 384), (129, 256), (1, 128)]
+
+
+def _shape_cases():
+    for T, C in _SHAPES:
+        yield pytest.param(T, C, "v2", id=f"v2-{T}x{C}")
+        if C == 1024 and T % 16 == 0:
+            yield pytest.param(T, C, "cute", id=f"cute-{T}x{C}")
+
+
+def _skip_unrunnable(name):
+    if name == "cute" and not _cute_runs():
+        pytest.skip("CuTe mHC needs sm90 and nvidia-cutlass-dsl >= 4.5")
+
+
+@pytest.mark.parametrize("merge", [True, False])
+@pytest.mark.parametrize("T,C,name", list(_shape_cases()))
+def test_block_shapes_vs_fp64_reference(T, C, name, merge, backend_env):
+    _skip_unrunnable(name)
+    _check_block(T, C, name, merge=merge)
+
+
+@pytest.mark.parametrize("layout", ["misaligned", "strided"])
+@pytest.mark.parametrize("name", ["v2", "cute"])
+def test_block_view_inputs(name, layout, backend_env):
+    _skip_unrunnable(name)
+    _check_block(48, 1024, name, layout=layout)
+
+
+@pytest.mark.parametrize("name", ["v2", "cute"])
+def test_block_layer_ignores_li(name, backend_env):
+    _skip_unrunnable(name)
+    _check_block(32, 1024, name, ignore_li=True)
 
 
 def _model(backend, seed=0):
