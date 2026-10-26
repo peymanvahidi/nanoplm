@@ -1424,12 +1424,14 @@ _MHC_EPS = 1e-6
 
 @functools.lru_cache(maxsize=None)
 def _cute_available() -> bool:
-    """CuTeDSL (nvidia-cutlass-dsl) importable: the CuTe mHC kernels can be built."""
+    """CuTeDSL (nvidia-cutlass-dsl >= 4.5, for cute.arch.map_dsmem_ptr) and tvm_ffi
+    importable: the CuTe mHC kernels can be built. Older DSLs take the v2 kernels."""
     try:
-        import cutlass.cute  # noqa: F401
+        import cutlass.cute as cute
+        import tvm_ffi  # noqa: F401
     except Exception:
         return False
-    return True
+    return hasattr(getattr(cute, "arch", None), "map_dsmem_ptr")
 
 
 def _build_permutation_matrices(n: int) -> tuple[torch.Tensor, int]:
