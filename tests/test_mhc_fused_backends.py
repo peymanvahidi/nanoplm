@@ -146,7 +146,7 @@ def _view(x, layout):
     return x
 
 
-def _check_block(T, C, name, merge=True, layout="dense", ignore_li=False, device="cuda"):
+def _check_block(T, C, name, merge=True, layout="dense", grad_layout="dense", ignore_li=False, device="cuda"):
     from nanoplm.pretraining.models.modern_bert import modeling as mod
     from nanoplm.pretraining.models.modern_bert.mhc_fused_v2 import perm_matrix_padded
 
@@ -185,7 +185,7 @@ def _check_block(T, C, name, merge=True, layout="dense", ignore_li=False, device
     xv = _view(x, layout)
     assert blk._backend(xv) == name
     y = blk(xv)
-    y.backward(g)
+    y.backward(_view(g, grad_layout))
     ga = torch.cat([blk.alpha_pre.grad, blk.alpha_post.grad, blk.alpha_res.grad])
     errs = dict(out=_rel(y, yr), gx=_rel(x.grad, xr.grad), gW=_rel(blk.W_all.weight.grad, Wr.grad),
                 galpha=_rel(ga, ar.grad), gbias=_rel(blk.W_all.bias.grad, br.grad),
@@ -226,6 +226,13 @@ def test_block_shapes_vs_fp64_reference(T, C, name, merge, backend_env):
 def test_block_view_inputs(name, layout, backend_env):
     _skip_unrunnable(name)
     _check_block(48, 1024, name, layout=layout)
+
+
+@pytest.mark.parametrize("name", ["v2", "cute"])
+def test_block_misaligned_grad(name, backend_env):
+    # aligned x keeps cute on its own kernels; the output grad reaches its backward unaligned
+    _skip_unrunnable(name)
+    _check_block(48, 1024, name, grad_layout="misaligned")
 
 
 @pytest.mark.parametrize("name", ["v2", "cute"])
