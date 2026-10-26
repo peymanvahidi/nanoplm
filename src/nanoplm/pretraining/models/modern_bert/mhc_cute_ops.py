@@ -45,6 +45,12 @@ def _(x, go, g_li, W, alpha3, bias, proj, rinv, Hm, hpre, g_Hm, g_hpost, merge):
             torch.empty(35, device=x.device, dtype=torch.float32))
 
 
+def _tma_ready(t):
+    """Dense bf16 with a 16-byte aligned base, as the backward TMA loads need."""
+    t = t.contiguous()
+    return t if t.storage_offset() % 8 == 0 else t.clone()
+
+
 class MHCPreCute(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, W, alpha3, bias, merge):
@@ -59,11 +65,11 @@ class MHCPreCute(torch.autograd.Function):
     def backward(ctx, g_li, g_Hm, g_hpost, go):
         x, W, alpha3, bias, proj, rinv, Hm, hpre = ctx.saved_tensors
         T = x.shape[0]
-        g_li = torch.zeros(T, _C, device=x.device, dtype=torch.bfloat16) if g_li is None else g_li.contiguous()
+        g_li = torch.zeros(T, _C, device=x.device, dtype=torch.bfloat16) if g_li is None else _tma_ready(g_li)
         g_Hm = torch.zeros(T, 16, device=x.device, dtype=torch.float32) if g_Hm is None else g_Hm.float().contiguous()
         g_hpost = (torch.zeros(T, _NS, device=x.device, dtype=torch.float32) if g_hpost is None
                    else g_hpost.float().contiguous())
-        go = torch.zeros_like(x) if go is None else go.contiguous()
+        go = torch.zeros_like(x) if go is None else _tma_ready(go)
         gx, gpr, gab = pre_bwd_op(x, go, g_li, W, alpha3, bias, proj, rinv, Hm, hpre, g_Hm, g_hpost, ctx.merge)
         if _DEBUG is not None:
             _DEBUG.append(dict(x=x, go=go, g_li=g_li, W=W, alpha3=alpha3, bias=bias, proj=proj, rinv=rinv, Hm=Hm,
