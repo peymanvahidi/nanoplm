@@ -152,6 +152,32 @@ def test_pipeline_sees_the_guard(guard, bias_correction):
     assert _moe_nan_guard_active(model) is guard
 
 
+def test_fp16_scaler_owns_nonfinite_grads():
+    # The guard's gradient skip runs after scaler.unscale_() and bypasses
+    # scaler.update(), which makes the next unscale_() raise. With an enabled
+    # scaler the guard leaves inf/NaN gradients to it.
+    from nanoplm.pretraining.pure_pipeline import _guard_checks_grad_norm
+
+    scaler = torch.amp.GradScaler("cpu", enabled=True)
+    assert not _guard_checks_grad_norm(True, scaler)
+    assert _guard_checks_grad_norm(True, torch.amp.GradScaler("cpu", enabled=False))
+    assert _guard_checks_grad_norm(True, None)
+    assert not _guard_checks_grad_norm(False, None)
+
+    # The scaler's own path survives a non-finite step and the step after it.
+    p = torch.nn.Parameter(torch.ones(3))
+    opt = torch.optim.SGD([p], lr=0.1)
+    for poison in (True, False):
+        scaler.scale(p.sum()).backward()
+        if poison:
+            p.grad[0] = float("nan")
+        scaler.unscale_(opt)
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
+    assert torch.isfinite(p).all()
+
+
 # ── end to end: a poisoned gradient is skipped, not stepped ─────────────────
 
 

@@ -940,6 +940,14 @@ def _moe_nan_guard_active(model) -> bool:
     )
 
 
+def _guard_checks_grad_norm(guard_active: bool, scaler) -> bool:
+    """Whether moe_nan_guard runs its own gradient-norm skip. An enabled fp16
+    GradScaler already skips non-finite steps and backs off its scale; the
+    guard's skip would bypass scaler.update() after unscale_() and break the
+    next step, so the scaler keeps that job."""
+    return guard_active and not (scaler is not None and scaler.is_enabled())
+
+
 class _DeferredFiniteCheck:
     """Non-finite tripwire that avoids blocking the host on the full stream.
 
@@ -3423,6 +3431,7 @@ def run_pure_pretraining(
         if debug_non_finite_params or moe_nan_guard_active
         else None
     )
+    moe_grad_norm_check = _guard_checks_grad_norm(moe_nan_guard_active, scaler)
     param_finite_check = _DeferredFiniteCheck(device) if debug_non_finite_params else None
     nonfinite_loss_skips = 0
     nonfinite_grad_skips = 0
@@ -3906,7 +3915,7 @@ def run_pure_pretraining(
 
                     step_skipped = False
                     grad_nonfinite = False
-                    if moe_nan_guard_active:
+                    if moe_grad_norm_check:
                         # A NaN that reaches the gradients but not the loss (one
                         # born after the last router, say) would make
                         # clip_grad_norm_ scale every gradient by NaN. Decide
