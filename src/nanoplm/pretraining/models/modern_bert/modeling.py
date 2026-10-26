@@ -844,15 +844,17 @@ class ModernBertAttention(nn.Module):
 def _unpair_attention_probs(probs: torch.Tensor) -> torch.Tensor:
     """Paired-head probabilities (B, H/2, 2S, 2S) -> per-head maps (B, H, S, S).
 
-    A pair attends over 2S interleaved positions, 2i + a = token i in head slot
-    a (see `_pair_sdpa_qkv`). Head 2p + a's map is the rows of slot a, with the
-    mass on both slots of key token j summed, so every row still sums to 1 and
-    the probe sees as many maps per layer as in a plain model.
+    A pair attends over 2S interleaved positions, 2i + a = token i in slot a.
+    `_pair_sdpa_qkv` reshapes (B, S, H/2, 2D) to (B, 2S, H/2, D), so pair p,
+    slot a is head a * H/2 + p, not 2p + a. That head's map is the rows of slot
+    a, with the mass on both slots of key token j summed, so every row still
+    sums to 1 and the probe sees as many maps per layer as in a plain model.
+    Output channels are in the model's own head order.
     """
     b, half, s2, _ = probs.shape
     s = s2 // 2
-    probs = probs.view(b, half, s, 2, s, 2).sum(-1)
-    return probs.permute(0, 1, 3, 2, 4).reshape(b, 2 * half, s, s)
+    probs = probs.view(b, half, s, 2, s, 2).sum(-1)  # (B, pair, S, slot, S)
+    return probs.permute(0, 3, 1, 2, 4).reshape(b, 2 * half, s, s)
 
 
 @contextmanager
