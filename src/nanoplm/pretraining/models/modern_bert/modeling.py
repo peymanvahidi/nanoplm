@@ -1434,6 +1434,12 @@ def _cute_available() -> bool:
     return hasattr(getattr(cute, "arch", None), "map_dsmem_ptr")
 
 
+@functools.lru_cache(maxsize=None)
+def _warn_cute_fallback(reason: str) -> None:
+    from nanoplm.utils.logger import logger
+    logger.warning(f"NANOPLM_MHC_BACKEND=cute ignored ({reason}): using the v2 Triton kernels")
+
+
 def _build_permutation_matrices(n: int) -> tuple[torch.Tensor, int]:
     """Pre-compute all n! permutation matrices (flattened) and identity index."""
     from itertools import permutations
@@ -1515,16 +1521,20 @@ class MHCLiteBlock(nn.Module):
         """Kernel set for a triton_fused block: "cute" (CuTeDSL pre kernels + v2 post,
         n=4, C=1024, sm90), "v2" (fused Triton pre + post, n=4, C % 128 == 0) or
         "pytorch". Inputs past 2^31 elements take the PyTorch path (the fused
-        kernels use 32-bit offsets). NANOPLM_MHC_BACKEND=cute|v2|pytorch forces one, for A/Bs."""
+        kernels use 32-bit offsets). NANOPLM_MHC_BACKEND=cute|v2|pytorch forces one, for A/Bs
+        (cute only where it can run, else v2 with a warning)."""
         from .mhc_fused_v2 import supports as _v2_supports
 
         if self.n != 4 or not _v2_supports(x_streams):
             return "pytorch"
         forced = os.environ.get("NANOPLM_MHC_BACKEND", "").strip().lower()
-        if forced in ("cute", "v2", "pytorch"):
+        if forced in ("v2", "pytorch"):
             return forced
-        if self.C == 1024 and torch.cuda.get_device_capability(x_streams.device) == (9, 0) and _cute_available():
+        cute_ok = self.C == 1024 and torch.cuda.get_device_capability(x_streams.device) == (9, 0)
+        if cute_ok and _cute_available():
             return "cute"
+        if forced == "cute":
+            _warn_cute_fallback("needs C=1024 on sm90" if not cute_ok else "needs nvidia-cutlass-dsl >= 4.5")
         return "v2"
 
     def _mhc_coeffs_pytorch(

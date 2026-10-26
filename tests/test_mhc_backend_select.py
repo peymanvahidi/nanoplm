@@ -39,3 +39,39 @@ def test_cute_needs_map_dsmem_ptr(sm90):
 def test_cute_unavailable_without_dsl(sm90):
     sm90.setattr(mod, "_cute_available", lambda: False)
     assert _select() == "v2"
+
+
+@pytest.fixture
+def forced_cute(sm90):
+    from nanoplm.utils.logger import logger
+
+    warned = []
+    sm90.setenv("NANOPLM_MHC_BACKEND", "cute")
+    sm90.setattr(logger, "warning", lambda msg, *a, **k: warned.append(msg))
+    mod._warn_cute_fallback.cache_clear()
+    yield sm90, warned
+    mod._warn_cute_fallback.cache_clear()
+
+
+@pytest.mark.parametrize("case", ["C=384", "sm100", "no-dsl"])
+def test_forced_cute_falls_back_to_v2(forced_cute, case):
+    mp, warned = forced_cute
+    mp.setattr(mod, "_cute_available", lambda: case != "no-dsl")
+    if case == "sm100":
+        mp.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
+    C = 384 if case == "C=384" else 1024
+    assert _select(C) == "v2"
+    assert _select(C) == "v2"
+    assert len(warned) == 1 and "NANOPLM_MHC_BACKEND=cute" in warned[0]
+
+
+def test_forced_cute_where_it_runs(forced_cute):
+    mp, warned = forced_cute
+    mp.setattr(mod, "_cute_available", lambda: True)
+    assert _select() == "cute" and not warned
+
+
+@pytest.mark.parametrize("forced", ["v2", "pytorch"])
+def test_forced_other_backends(sm90, forced):
+    sm90.setenv("NANOPLM_MHC_BACKEND", forced)
+    assert _select() == forced
