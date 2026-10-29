@@ -288,19 +288,21 @@ def test_v1_checkpoint_is_rejected_with_the_conversion_recipe():
 
 def test_convert_v1_to_v2_preserves_the_function_and_loads():
     from nanoplm.pretraining.models.modern_bert.moe import (
-        MoELayer, convert_wi_state_dict_v1_to_v2,
+        MoELayer, convert_expert_layout_v1_to_v2, convert_wi_state_dict_v1_to_v2,
     )
     import torch.nn.functional as F
 
     layer = MoELayer(_moe_cfg())
-    E, H, two_i = layer.Wi.shape
+    E, two_i, H = layer.Wi.shape
     half = two_i // 2
     torch.manual_seed(0)
+    # A gate/up-v1 checkpoint predates expert layout 2, so it is (E, H, 2I).
     wi_v1 = torch.randn(E, H, two_i)
 
     v1_sd = {k: v for k, v in layer.state_dict().items()
-             if k != "_wi_gated_layout_version"}
+             if k not in ("_wi_gated_layout_version", "_expert_layout_version")}
     v1_sd["Wi"] = wi_v1
+    v1_sd["Wo"] = layer.Wo.detach().transpose(-1, -2).contiguous()
     # Optimizer state carries the same column order and must be permuted too.
     momentum = torch.randn_like(wi_v1)
     opt_sd = {"state": {"Wi": {"momentum_buffer": momentum,
@@ -308,10 +310,18 @@ def test_convert_v1_to_v2_preserves_the_function_and_loads():
 
     converted = convert_wi_state_dict_v1_to_v2(v1_sd, opt_sd)
     assert converted == ["Wi"]
+    # Gate/up is fixed; the expert storage is still version 1 and still refused.
+    with pytest.raises(RuntimeError, match="convert_expert_layout_v1_to_v2"):
+        layer.load_state_dict(v1_sd)
+    gated_v2_wi = v1_sd["Wi"].clone()
+    gated_v2_mom = opt_sd["state"]["Wi"]["momentum_buffer"].clone()
+    convert_expert_layout_v1_to_v2(v1_sd, opt_sd)
     layer.load_state_dict(v1_sd)  # no longer raises
+    assert torch.equal(layer.Wi.detach(), gated_v2_wi.transpose(-1, -2))
+    assert torch.equal(opt_sd["state"]["Wi"]["momentum_buffer"],
+                       gated_v2_mom.transpose(-1, -2))
 
-    for W_v1, W_v2 in ((wi_v1, layer.Wi.detach()),
-                       (momentum, opt_sd["state"]["Wi"]["momentum_buffer"])):
+    for W_v1, W_v2 in ((wi_v1, gated_v2_wi), (momentum, gated_v2_mom)):
         # gate: v1 second half -> v2 even columns; up: v1 first half -> odd.
         assert torch.equal(W_v2[..., 0::2], W_v1[..., half:])
         assert torch.equal(W_v2[..., 1::2], W_v1[..., :half])
@@ -337,3 +347,115 @@ def test_convert_v1_to_v2_leaves_srelu_alone():
     sd = MoELayer(_moe_cfg(mlp_activation="srelu")).state_dict()
     with pytest.raises(ValueError, match="no gated MoE routed-expert"):
         convert_wi_state_dict_v1_to_v2(dict(sd))
+
+
+# ── routed-expert storage layout version ─────────────────────────────────────
+#
+# Experts are stacked nn.Linear weights (E, out, in) (expert layout 2). Version 1
+# stored (E, in, out), which Muon/NorMuon read with fan_in/fan_out swapped. Same
+# function, different optimizer: a version-1 checkpoint must be converted, never
+# loaded by shape coincidence.
+
+
+@pytest.mark.parametrize("act", ["swiglu", "srelu"])
+def test_expert_weights_are_stacked_linear_and_carry_a_marker(act):
+    from nanoplm.pretraining.models.modern_bert.moe import (
+        EXPERT_LAYOUT_VERSION, MoELayer,
+    )
+
+    cfg = _moe_cfg(mlp_activation=act)
+    layer = MoELayer(cfg)
+    i_out = cfg.intermediate_size * (1 if act == "srelu" else 2)
+    assert layer.Wi.shape == (cfg.moe_num_experts, i_out, cfg.hidden_size)
+    assert layer.Wo.shape == (cfg.moe_num_experts, cfg.hidden_size, cfg.intermediate_size)
+    sd = layer.state_dict()
+    assert int(sd["_expert_layout_version"][0]) == EXPERT_LAYOUT_VERSION == 2
+    assert sd["_expert_layout_version"].ndim == 1
+    layer.load_state_dict(sd)
+
+
+@pytest.mark.parametrize("act", ["swiglu", "srelu"])
+def test_expert_layout_v1_is_rejected_with_the_conversion_recipe(act):
+    from nanoplm.pretraining.models.modern_bert.moe import MoELayer
+
+    layer = MoELayer(_moe_cfg(mlp_activation=act))
+    v1_sd = {k: v for k, v in layer.state_dict().items() if k != "_expert_layout_version"}
+    v1_sd["Wi"] = v1_sd["Wi"].transpose(-1, -2).contiguous()
+    v1_sd["Wo"] = v1_sd["Wo"].transpose(-1, -2).contiguous()
+    for strict in (True, False):
+        with pytest.raises(RuntimeError) as exc:
+            layer.load_state_dict(v1_sd, strict=strict)
+        assert "expert layout version 1" in str(exc.value)
+        assert "convert_expert_layout_v1_to_v2" in str(exc.value)
+
+
+def test_expert_layout_v1_is_rejected_even_when_shapes_coincide():
+    """Square experts (out == in) load by shape alone; the marker must catch it."""
+    from nanoplm.pretraining.models.modern_bert.moe import MoELayer
+
+    layer = MoELayer(_moe_cfg(mlp_activation="srelu", intermediate_size=64))
+    assert layer.Wi.shape[-1] == layer.Wi.shape[-2]
+    v1_sd = {k: v for k, v in layer.state_dict().items() if k != "_expert_layout_version"}
+    with pytest.raises(RuntimeError, match="expert layout version 1"):
+        layer.load_state_dict(v1_sd)
+
+
+@pytest.mark.parametrize("act", ["swiglu", "srelu"])
+def test_convert_expert_layout_preserves_function_and_optimizer_state(act):
+    from nanoplm.pretraining.models.modern_bert.moe import (
+        MoELayer, convert_expert_layout_v1_to_v2,
+    )
+
+    layer = MoELayer(_moe_cfg(mlp_activation=act))
+    E, i_out, H = layer.Wi.shape
+    I = layer.Wo.shape[-1]
+    torch.manual_seed(0)
+    wi_v1, wo_v1 = torch.randn(E, H, i_out), torch.randn(E, I, H)
+    v1_sd = {k: v for k, v in layer.state_dict().items() if k != "_expert_layout_version"}
+    v1_sd["Wi"], v1_sd["Wo"] = wi_v1, wo_v1
+    # nanoplm's MuonAdamWGroup layout: NorMuon state under "muon".
+    opt_sd = {"muon": {"state": {
+        "Wi": {"momentum": torch.randn_like(wi_v1), "variance_neuron": torch.rand(E, H, 1)},
+        "Wo": {"momentum": torch.randn_like(wo_v1), "variance_neuron": torch.rand(E, I, 1)},
+    }, "param_groups": []}, "adamw": {"state": {}, "param_groups": []}}
+    mom_wi = opt_sd["muon"]["state"]["Wi"]["momentum"].clone()
+
+    converted = convert_expert_layout_v1_to_v2(v1_sd, opt_sd)
+    assert sorted(converted) == ["Wi", "Wo"]
+    layer.load_state_dict(v1_sd)
+
+    # Same function: x @ W_v1[e] == x @ W_v2[e].T for every expert.
+    x = torch.randn(5, H)
+    for e in (0, E - 1):
+        assert torch.equal(x @ wi_v1[e], x @ layer.Wi.detach()[e].T)
+        h = torch.randn(5, I)
+        assert torch.equal(h @ wo_v1[e], h @ layer.Wo.detach()[e].T)
+    st = opt_sd["muon"]["state"]
+    assert torch.equal(st["Wi"]["momentum"], mom_wi.transpose(-1, -2))
+    # variance_neuron is per *row*; the old rows were input units, so it resets
+    # to zeros of the new row count.
+    assert st["Wi"]["variance_neuron"].shape == (E, i_out, 1)
+    assert st["Wo"]["variance_neuron"].shape == (E, H, 1)
+    assert not st["Wi"]["variance_neuron"].any() and not st["Wo"]["variance_neuron"].any()
+
+
+def test_convert_expert_layout_refuses_non_moe_state_dicts():
+    from nanoplm.pretraining.models.modern_bert.moe import convert_expert_layout_v1_to_v2
+
+    with pytest.raises(ValueError, match="no MoE routed-expert"):
+        convert_expert_layout_v1_to_v2({"Wi": torch.randn(8, 4), "Wo": torch.randn(4, 8)})
+
+
+def test_normuon_reads_expert_rows_as_output_neurons():
+    """The point of the layout: dion's shape-based scaling sees (fan_out, fan_in)
+    of an expert exactly as it sees a dense nn.Linear of the same shape."""
+    dion = pytest.importorskip("dion")
+    from dion.megabatch_base import adjust_lr_spectral_norm
+    from nanoplm.pretraining.models.modern_bert.moe import MoELayer
+
+    cfg = _moe_cfg()
+    layer = MoELayer(cfg)
+    dense_wo = torch.nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
+    assert layer.Wo.shape[-2:] == dense_wo.weight.shape
+    assert adjust_lr_spectral_norm(1.0, layer.Wo.shape, flatten=False) == \
+        adjust_lr_spectral_norm(1.0, dense_wo.weight.shape, flatten=False)
