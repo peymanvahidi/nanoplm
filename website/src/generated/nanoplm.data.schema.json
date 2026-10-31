@@ -23,7 +23,7 @@
           "weight": {
             "type": "number",
             "default": 1.0,
-            "description": "Share of training sequences (not tokens) drawn from this source. Weights must sum to 1 (within 1e-6); with one source it is 1 or left out. The weights also share out the validation split, so changing them redraws it and rebuilds the mixture manifest, but does not filter or tokenize again. A cluster source counts one sample per cluster visit."
+            "description": "Share of training sequences (not tokens) drawn from this source. Weights must sum to 1 (within 1e-6); with one source it is 1 or left out. The weights also share out the validation split, so changing them redraws it: a plain source splits and tokenizes again, a cluster source rebuilds only its index. A cluster source counts one sample per cluster visit."
           },
           "prepared": {
             "type": "string",

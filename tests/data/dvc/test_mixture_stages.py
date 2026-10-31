@@ -215,6 +215,7 @@ def test_from_yaml_builds_a_two_source_mix_with_one_val_split_by_weight(tmp_path
     assert "Running stage 'clus-cluster_index'" in r.stdout
     assert "Running stage 'clus-cluster_pool'" not in r.stdout
     assert "Running stage 'plain-split'" in r.stdout and "Running stage 'plain-filter'" not in r.stdout
+    assert "Running stage 'plain-pre-tokenize@train'" in r.stdout
     m = read_manifest(out)
     assert [s["weight"] for s in m.sources] == [0.6, 0.4]
     assert {s["name"]: s["val_sequences"] for s in m.sources} == split_by_weight(

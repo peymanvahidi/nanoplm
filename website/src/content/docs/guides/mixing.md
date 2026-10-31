@@ -120,7 +120,7 @@ Setting `val_ratio` or `val_size` on a source is an error. So is setting both. E
 Error: sources.swissprot would need 669,400 val sequences but has 570,000; lower data_params.val_ratio or use data_params.val_size
 ```
 
-Each source's share depends on the size of every source, so `from-yaml` counts each source after its filter (a `count` stage), then a `val_split` stage works out the shares. A source's split reruns only when its share changes. Changing a weight changes the shares, so it reruns `val_split`, the split of each source whose share moved (for a cluster source only `cluster_index`, not the tokenized members), and the mixture.
+Each source's share depends on the size of every source, so `from-yaml` counts each source after its filter (a `count` stage), then a `val_split` stage works out the shares. A source's split reruns only when its share changes. Changing a weight changes the shares, so it reruns `val_split`, the mixture and each source whose share moved. Nothing is downloaded or filtered again. A plain source splits and tokenizes again; a cluster source rebuilds only `cluster_index`, not its tokenized members. The `Rebuild:` line before the run cannot see this yet: it says the sources are up to date.
 
 A [prepared](#compare-several-ratios) source keeps the validation sequences it was built with and is not in the pool. The other sources share `val_ratio` or `val_size` by their weights, scaled to sum to 1.
 
@@ -150,7 +150,7 @@ The listed sources get all the eval batches, and `eval/loss` averages over them 
 
 ## Compare several ratios
 
-If you change only the weights and rerun `from-yaml`, it does not filter or tokenize the sources again, but it does redraw the validation split (see [Validation](#validation)):
+If you change only the weights and rerun `from-yaml`, it redraws the validation split (see [Validation](#validation)). A plain source then splits and tokenizes again; a cluster source keeps its tokenized members. The line before the run only shows the first stages:
 
 ```text
 Rebuild: swissprot: up to date; uniref50: up to date; val_split: may rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)
