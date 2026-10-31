@@ -92,11 +92,11 @@ def test_a_directory_is_not_a_fasta(tmp_path):
 
 
 def test_overrides_are_keyed_where_they_are_set():
-    src = _parse(_with_source({"fasta": "swissprot", "max_seq_len": 1024, "val_ratio": 0.2})).source
-    assert src.params["max_seq_len"] == 1024 and src.params["min_seq_len"] == 20
+    src = _parse(_with_source({"fasta": "swissprot", "max_seq_len": 1024, "min_seq_len": 5})).source
+    assert src.params["max_seq_len"] == 1024 and src.params["min_seq_len"] == 5
     assert src.key("max_seq_len") == "sources.src.max_seq_len"
-    assert src.key("min_seq_len") == "data_params.min_seq_len"
-    assert src.overrides == ("max_seq_len", "val_ratio")
+    assert src.key("max_seqs") == "data_params.max_seqs"
+    assert src.overrides == ("min_seq_len", "max_seq_len")
 
 
 # ------------------------------------------------------------------ max_seqs / seqs_num

@@ -1,6 +1,7 @@
 """dvc.yaml and `nanoplm data from-yaml` for a data.yaml with several sources (a mix)."""
 from __future__ import annotations
 
+import json
 import shutil
 
 import pytest
@@ -9,6 +10,7 @@ import yaml
 from nanoplm.cli._dvc_yaml_gen import _NANOPLM_PKG_DIR, generate_dvc_yaml
 from nanoplm.cli.templates import load_template
 from nanoplm.data.preparation.data_config import DataConfigError
+from nanoplm.data.preparation.val_split import split_by_weight
 
 from tests.data.dvc.test_cluster_stages import _from_yaml, _project, _status
 
@@ -66,10 +68,19 @@ def test_three_sources_one_download_per_url_and_a_mixture_stage():
     assert mix["deps"][:3] == [f"out/{n}/.data_manifest" for n in THREE]
     assert _params(mix) == [f"sources.{n}.weight" for n in THREE]
     assert "--source u90 out/u90 ${sources.u90.weight}" in mix["cmd"]
-    # the weights are a param of the mixture stage only
+    # the weights are a param of the mixture and the val split only
+    vsplit = st["val_split"]
+    assert _params(vsplit) == ["data_params.val_ratio"] + [f"sources.{n}.weight" for n in THREE]
+    assert vsplit["outs"] == [f"out/{n}/val_count.json" for n in THREE]
+    assert vsplit["deps"][:3] == [f"out/{n}/pool_units.json" for n in THREE]
+    assert "--members-tsv out/uniref50/cluster_index/members.tsv" in \
+        st["uniref50-count"]["cmd"] and "--members-tsv" not in st["u90-count"]["cmd"]
+    for name in ("swissprot-split", "uniref50-cluster_index"):
+        assert f"--val-count-file out/{name.split('-')[0]}/val_count.json" in st[name]["cmd"]
+        assert "val_ratio" not in st[name]["cmd"] and "val_ratio" not in str(_params(st[name]))
     for name, stage in st.items():
         stage = stage.get("do", stage)
-        if name != "mixture":
+        if name not in ("mixture", "val_split"):
             assert not any("weight" in k for k in _params(stage)), name
 
 
@@ -142,9 +153,10 @@ def _two_source_project(tmp_path):
     cfg = yaml.safe_load((tmp_path / "data.yaml").read_text())
     cfg["sources"] = {
         "plain": {"fasta": str(plain), "weight": 0.3},
-        "clus": {"fasta": str(rel.fasta90), "weight": 0.7, "val_ratio": 0.05,
+        "clus": {"fasta": str(rel.fasta90), "weight": 0.7,
                  "cluster_subsampling": {"members": None}},
     }
+    cfg["data_params"]["val_ratio"] = 0.05
     cfg["output_dir"] = "out"
     (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     (tmp_path / "out/downloads").mkdir(parents=True)
@@ -159,7 +171,7 @@ def _set_weights(tmp_path, **w):
     (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
 
 
-def test_from_yaml_builds_a_two_source_mix_and_a_weight_change_reruns_only_the_mix(tmp_path):
+def test_from_yaml_builds_a_two_source_mix_with_one_val_split_by_weight(tmp_path):
     from nanoplm.data.datasets import open_train_dataset
     from nanoplm.data.datasets.mixture import MixtureDataset
     from nanoplm.data.infra.manifest import read_manifest
@@ -182,18 +194,31 @@ def test_from_yaml_builds_a_two_source_mix_and_a_weight_change_reruns_only_the_m
     ds = open_train_dataset(out, m, seed=1)
     assert isinstance(ds, MixtureDataset) and ds.counts[0] == round(0.3 * len(ds))
     assert _status(tmp_path, env) == set()
+    # one val split: 0.05 of the pool (plain sequences + clus clusters), shared 0.3 / 0.7
+    units = {n: json.loads((out / n / "pool_units.json").read_text()) for n in rows}
+    assert units["plain"]["kind"] == "sequences" and units["clus"]["kind"] == "clusters"
+    pool = units["plain"]["units"] + units["clus"]["units"]
+    assert rows["clus"]["train_sequences"] + rows["clus"]["val_sequences"] == \
+        units["clus"]["units"]
+    val = {n: rows[n]["val_sequences"] for n in rows}
+    assert sum(val.values()) == round(0.05 * pool)
+    assert val == split_by_weight(round(0.05 * pool), {"plain": 0.3, "clus": 0.7})
 
     _set_weights(tmp_path, plain=0.6, clus=0.4)
     (tmp_path / "dvc.yaml").write_text(generate_dvc_yaml(
         yaml.safe_load((tmp_path / "data.yaml").read_text()), "pretrain", "data.yaml",
         base_dir=tmp_path))
-    assert _status(tmp_path, env) == {"mixture"}
+    assert _status(tmp_path, env) == {"val_split", "mixture"}
     r = _from_yaml(tmp_path, env)
-    assert ("Rebuild: downloads: up to date; plain: up to date; clus: up to date; mixture: "
-            "may rerun. (DVC skips a "
-            "stage its run cache already has.)") in r.stdout
-    assert r.stdout.count("Running stage") == 1 and "Running stage 'mixture'" in r.stdout
-    assert [s["weight"] for s in read_manifest(out).sources] == [0.6, 0.4]
+    # the val counts move with the weights, so both sources split again (not the pool)
+    assert "Running stage 'val_split'" in r.stdout and "Running stage 'mixture'" in r.stdout
+    assert "Running stage 'clus-cluster_index'" in r.stdout
+    assert "Running stage 'clus-cluster_pool'" not in r.stdout
+    assert "Running stage 'plain-split'" in r.stdout and "Running stage 'plain-filter'" not in r.stdout
+    m = read_manifest(out)
+    assert [s["weight"] for s in m.sources] == [0.6, 0.4]
+    assert {s["name"]: s["val_sequences"] for s in m.sources} == split_by_weight(
+        round(0.05 * pool), {"plain": 0.6, "clus": 0.4})
 
     _set_weights(tmp_path, plain=0.6, clus=0.5)
     from click.testing import CliRunner
@@ -341,7 +366,7 @@ def test_removing_or_renaming_a_source_names_its_outputs(tmp_path):
 
 
 def test_dropping_a_cluster_block_names_its_index_and_the_xml(tmp_path):
-    u = {"fasta": "uniref50", "weight": 0.5, "max_seqs": -1, "val_ratio": 0.0044,
+    u = {"fasta": "uniref50", "weight": 0.5, "max_seqs": -1,
          "cluster_subsampling": {"members": "uniref90"}}
     _lock_from(tmp_path, _mix(a=A, u=u))
     assert _orphans(tmp_path, _mix(a=A, u=u)) == []
@@ -372,3 +397,81 @@ def test_the_rebuild_line_of_a_mix_is_one_summary_per_source():
     assert _rebuild_summary(names, changed, ["swissprot", "uniref50"]) == (
         "Rebuild: downloads: up to date; swissprot: up to date; uniref50: 2 of 3 stages may "
         "rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)")
+
+
+# ------------------------------------------------------------------ one val split
+
+
+def test_a_prepared_source_keeps_its_val_and_is_not_in_the_val_split():
+    st = _stages(_mix(own={"prepared": "../built", "weight": 0.4},
+                      swissprot={"fasta": "swissprot", "weight": 0.6}))
+    vsplit = st["val_split"]
+    assert vsplit["outs"] == ["out/swissprot/val_count.json"]
+    assert "--source own" not in vsplit["cmd"]
+    assert _params(vsplit) == ["data_params.val_ratio", "sources.swissprot.weight"]
+
+
+def test_one_source_with_val_size_uses_the_val_split_stages():
+    cfg = _one(a=A)
+    del cfg["data_params"]["val_ratio"]
+    cfg["data_params"]["val_size"] = 500
+    st = _stages(cfg)
+    assert st["val_split"]["cmd"] == ("nanoplm data val-split --val-size "
+                                      "${data_params.val_size} --source a "
+                                      "out/a/pool_units.json 1 out/a/val_count.json")
+    assert st["count"]["outs"] == ["out/a/pool_units.json"]
+    assert "--val-count-file out/a/val_count.json" in st["split"]["cmd"]
+    assert "--val-ratio" not in st["write_manifest"]["cmd"]
+    assert "val_ratio" not in yaml.safe_dump(st)
+
+
+def test_one_source_with_val_ratio_has_no_val_split_stages():
+    st = _stages(_one(a=A))
+    assert "val_split" not in st and "count" not in st
+    assert "--val-ratio ${data_params.val_ratio}" in st["split"]["cmd"]
+
+
+def test_split_and_val_split_commands_hit_the_count(tmp_path):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    fasta = tmp_path / "f.fasta"
+    fasta.write_text("".join(f">s{i}\nMKV\n" for i in range(97)))
+    run = CliRunner().invoke
+    r = run(data, ["count-units", "-i", str(fasta), "-o", str(tmp_path / "u.json")])
+    assert r.exit_code == 0, r.output
+    r = run(data, ["val-split", "--val-size", "13", "--source", "a", str(tmp_path / "u.json"),
+                   "1", str(tmp_path / "v.json")])
+    assert r.exit_code == 0, r.output
+    assert json.loads((tmp_path / "v.json").read_text()) == {
+        "val": 13, "units": 97, "kind": "sequences"}
+    r = run(data, ["split", "-i", str(fasta), "-o", str(tmp_path / "split"),
+                   "--val-count-file", str(tmp_path / "v.json")])
+    assert r.exit_code == 0, r.output
+    assert (tmp_path / "split/val.fasta").read_text().count(">") == 13
+    r = run(data, ["val-split", "--val-size", "97", "--source", "a", str(tmp_path / "u.json"),
+                   "1", str(tmp_path / "v.json")])
+    assert r.exit_code != 0
+    assert "sources.a would need 97 val sequences but has 97; lower data_params.val_size" \
+        in r.output
+
+
+def test_from_yaml_one_cluster_source_with_val_size(tmp_path):
+    """val_size on one cluster source: the count and val_split stages, then exactly that
+    many held-out clusters."""
+    from nanoplm.data.infra.manifest import read_manifest
+    from tests.data.preparation.uniref_fixture import make_release
+    rel = make_release(tmp_path / "src", n_clusters=120)
+    env = _project(tmp_path, {"members": None}, str(rel.fasta90), val_size=7)
+    cfg = yaml.safe_load((tmp_path / "data.yaml").read_text())
+    del cfg["data_params"]["val_ratio"]
+    (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    out = tmp_path / cfg["output_dir"]
+    (out / "downloads").mkdir(parents=True)
+    shutil.copy(rel.xml, out / "downloads/uniref50.xml.gz")
+    r = _from_yaml(tmp_path, env)
+    assert "val = data_params.val_size: 7 sequences / clusters, shared out by weight" in r.stdout
+    m = read_manifest(out)
+    assert m.val_sequences == 7 and m.is_cluster_sampled
+    units = json.loads((out / "src/pool_units.json").read_text())
+    assert units["kind"] == "clusters" and m.train_sequences + 7 == units["units"]
+    assert m.val_ratio == round(7 / units["units"], 6)

@@ -196,18 +196,20 @@ def test_template_data_params_warn_at_config_time():
     w = _plan(cfg).warnings
     assert ("sources.src: max_seqs=20000 (from data_params) trains on at most 20,000 "
             "clusters; set sources.src.max_seqs: -1 to use all of them") in w
-    assert ("sources.src: val_ratio=0.1 (from data_params) holds out 10.0% of the clusters "
-            "for validation; the UniRef90 experiment used sources.src.val_ratio: 0.0044") in w
+    assert ("sources.src: val_ratio=0.1 (from data_params) holds out about 10.0% of the "
+            "clusters for validation; the UniRef90 experiment used data_params.val_ratio: "
+            "0.0044") in w
 
 
 def test_cluster_warnings_name_the_source_and_its_own_override(tmp_path):
     """A mix shares data_params, so every warning says which source it is about and
     the fix is set on that source; the 0.0044 hint is for UniProt clusters only."""
     cfg = _config(local=_own(tmp_path))
-    cfg["sources"]["src"]["val_ratio"] = 0.2
+    cfg["data_params"]["val_ratio"] = 0.2
     w = _plan(cfg).warnings
-    assert ("sources.src: val_ratio=0.2 holds out 20.0% of the clusters for validation; "
-            "set sources.src.val_ratio lower to train on more of them") in w
+    assert ("sources.src: val_ratio=0.2 (from data_params) holds out about 20.0% of the "
+            "clusters for validation; set data_params.val_ratio lower to train on more of "
+            "them") in w
     assert not any("0.0044" in x for x in w)
     p = _plan(_config(url=U50, members="uniref90", identity=0.3))
     assert any(x.startswith("sources.src: ") and

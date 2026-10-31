@@ -12,7 +12,13 @@ ${sources.<name>.X} for a per-source override.
 Several sources (a mix) give one dvc.yaml: each source's stages named
 ``<source>-<stage>``; one ``download-<file>``, ``extract-<file>`` and ``check-<file>``
 stage per file in downloads/ however many sources read it; and a last ``mixture`` stage that writes output_dir/.data_manifest from the source
-manifests. Only that stage reads the weights, so changing them reruns it alone.
+manifests.
+
+A mix, or one source with data_params.val_size, draws one val split for all of its
+sources (data.preparation.val_split): a ``count`` stage per source, one ``val_split``
+stage that reads the counts and the weights, and each source's split reads its own
+val_count.json. A weight change reruns val_split, the mixture and the sources whose
+val count it changed.
 """
 import os
 import re
@@ -24,6 +30,7 @@ from pathlib import Path as _Path
 from nanoplm.data.preparation.data_config import (
     DataConfigError, Source, _join, file_name, is_url, legacy_source, parse_data_config,
 )
+from nanoplm.data.preparation.val_split import POOL_UNITS, VAL_COUNT
 
 
 _NANOPLM_PKG_DIR = _Path(_nanoplm.__file__).resolve().parent
@@ -62,7 +69,8 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str, base_dir=No
         stages = _mixture_stages(parse_data_config(config, base_dir, params_filename),
                                  params_filename, base_dir)
     else:
-        src = parse_data_config(config, base_dir, params_filename).source
+        cfg = parse_data_config(config, base_dir, params_filename)
+        src = cfg.source
         if src.prepared:
             raise DataConfigError(f"sources.{src.name} is prepared ({src.prepared}): there is "
                                   "nothing to build")
@@ -70,6 +78,8 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str, base_dir=No
         plan = None if src.legacy else resolve_cluster_plan(src, base_dir)
         stages = (_cluster_stages(src, plan, params_filename) if plan is not None
                   else _plain_stages(src, kind, params_filename))
+        if src.val_from_split:
+            stages["val_split"] = _val_split_stage(cfg, params_filename)
     doc = {"vars": [params_filename], "stages": stages}
     body = yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
     return _HEADER + body
@@ -189,19 +199,21 @@ def _plain_stages(src: Source, kind: str, params_filename: str) -> dict:
         "outs": [p("filtered_fasta")],
     }
 
+    if src.val_from_split:
+        stages["count"] = _count_stage(src, [p("filtered_fasta")], "")
     stages["split"] = {
         "cmd": (
             f"nanoplm data split -i {p('filtered_fasta')} "
             f"-o {p('splitted_fasta_dir')} "
-            f"--val-ratio {ref('val_ratio')}"
+            + _val_arg(src)
         ),
         "deps": [
             p("filtered_fasta"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/splitor.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/_native_ops.py"),
             _resolve_pkg_dep("src/nanoplm/data/preparation/csrc/fast_fasta_ops.c"),
-        ],
-        **_params(params_filename, src.path_params("splitted_fasta_dir") + [key("val_ratio")]),
+        ] + _val_deps(src),
+        **_params(params_filename, src.path_params("splitted_fasta_dir") + _val_key(src)),
         "outs": [p("splitted_fasta_dir")],
     }
 
@@ -238,7 +250,7 @@ def _plain_stages(src: Source, kind: str, params_filename: str) -> dict:
                 f"-o {out} "
                 f"--min-seq-len {ref('min_seq_len')} "
                 f"--max-seq-len {ref('max_seq_len')} "
-                f"--val-ratio {ref('val_ratio')} "
+                + _manifest_val_arg(src) +
                 f"--samples-per-shard {ref('samples_per_shard')} "
                 f"--register-tokens {ref('register_tokens')}"
             ),
@@ -248,7 +260,7 @@ def _plain_stages(src: Source, kind: str, params_filename: str) -> dict:
                 _resolve_pkg_dep("src/nanoplm/data/infra/manifest.py"),
             ],
             **_params(params_filename, [
-                key("min_seq_len"), key("max_seq_len"), key("val_ratio"),
+                key("min_seq_len"), key("max_seq_len"), *_val_key(src),
                 key("samples_per_shard"), key("register_tokens"),
             ]),
             "outs": [f"{out}/.data_manifest"],
@@ -297,6 +309,64 @@ def _plain_stages(src: Source, kind: str, params_filename: str) -> dict:
             "outs": [f"{out}/.data_manifest"],
         }
     return stages
+
+
+def _val_arg(src: Source) -> str:
+    """How split / cluster-index get the val size: the source's val_ratio, or its count
+    from the val_split stage."""
+    if src.val_from_split:
+        return f"--val-count-file {_join(src.work_dir, VAL_COUNT)}"
+    return f"--val-ratio {src.ref('val_ratio')}"
+
+
+def _val_deps(src: Source) -> list:
+    return [_join(src.work_dir, VAL_COUNT)] if src.val_from_split else []
+
+
+def _val_key(src: Source) -> list:
+    return [] if src.val_from_split else [src.param_key("val_ratio")]
+
+
+def _manifest_val_arg(src: Source) -> str:
+    """write-manifest takes the val ratio as set, or works it out from the built val."""
+    return "" if src.val_from_split else f"--val-ratio {src.ref('val_ratio')} "
+
+
+def _count_stage(src: Source, deps: list, extra: str, params: list = (),
+                 params_filename: str = "") -> dict:
+    """Count the source's units (sequences, or clusters with --members-tsv) for val_split."""
+    units = _join(src.work_dir, POOL_UNITS)
+    return {
+        "cmd": f"nanoplm data count-units -i {src.paths['filtered_fasta']} -o {units}{extra}",
+        "deps": deps + [_resolve_pkg_dep("src/nanoplm/data/preparation/val_split.py")],
+        **_params(params_filename, list(params)),
+        "outs": [units],
+    }
+
+
+def _val_split_stage(cfg, params_filename: str) -> dict:
+    """Share data_params.val_ratio / val_size out over the built sources by weight. Each
+    source's count goes into its own file, so a source whose count stays the same does
+    not rerun."""
+    field = cfg.val[0]
+    cmd = [f"nanoplm data val-split --{field.replace('_', '-')} ${{data_params.{field}}}"]
+    deps, outs, params = [], [], [f"data_params.{field}"]
+    for src in cfg.sources.values():
+        if src.prepared:
+            continue
+        units, out = _join(src.work_dir, POOL_UNITS), _join(src.work_dir, VAL_COUNT)
+        weight = f"${{sources.{src.name}.weight}}" if cfg.is_mixture else "1"
+        if cfg.is_mixture:
+            params.append(f"sources.{src.name}.weight")
+        cmd.append(f"--source {src.name} {units} {weight} {out}")
+        deps.append(units)
+        outs.append(out)
+    return {
+        "cmd": " ".join(cmd),
+        "deps": deps + [_resolve_pkg_dep("src/nanoplm/data/preparation/val_split.py")],
+        **_params(params_filename, params),
+        "outs": outs,
+    }
 
 
 def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
@@ -401,12 +471,19 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     stages["cluster_members"] = {"cmd": cmd, "deps": members_deps, "outs": [tsv, info]}
     if members_params:
         stages["cluster_members"]["params"] = [{params_filename: members_params}]
+    if src.val_from_split:
+        stages["count"] = _count_stage(
+            src, [tsv, filtered, dep("src/nanoplm/data/preparation/cluster_index.py"),
+                  dep("src/nanoplm/data/preparation/cluster_table.py"),
+                  dep("src/nanoplm/data/preparation/uniref_hierarchy.py")],
+            f" --members-tsv {tsv} --max-clusters {ref('max_seqs')}",
+            [key("max_seqs")], params_filename)
     index_dir = str(plan.index_dir)
     stages["cluster_index"] = {
         "cmd": (f"nanoplm data cluster-index --members-tsv {tsv} "
                 f"--fasta {filtered} --pool {out}/train "
                 f"--index-dir {index_dir} --val-dir {out}/val "
-                f"--max-seq-len {ref('max_seq_len')} --val-ratio {ref('val_ratio')} "
+                f"--max-seq-len {ref('max_seq_len')} {_val_arg(src)} "
                 f"--samples-per-shard {ref('samples_per_shard')} "
                 f"--seqs-num {ref('max_seqs')} "
                 f"--register-tokens {ref('register_tokens')}"
@@ -417,8 +494,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                  dep("src/nanoplm/data/preparation/cluster_pipeline.py"),
                  dep("src/nanoplm/data/preparation/cluster_index.py"),
                  dep("src/nanoplm/data/preparation/cluster_table.py"),
-                 dep("src/nanoplm/data/preparation/uniref_hierarchy.py")],
-        **_params(params_filename, [key("max_seq_len"), key("val_ratio"),
+                 dep("src/nanoplm/data/preparation/uniref_hierarchy.py")] + _val_deps(src),
+        **_params(params_filename, [key("max_seq_len"), *_val_key(src),
                                       key("samples_per_shard"), key("max_seqs"),
                                       key("register_tokens")]),
         "outs": [index_dir, f"{out}/val"],
@@ -427,13 +504,13 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
         "cmd": ("nanoplm data write-manifest --kind pretrain --cluster-index "
                 f"-o {out} --min-seq-len {ref('min_seq_len')} "
                 f"--max-seq-len {ref('max_seq_len')} "
-                f"--val-ratio {ref('val_ratio')} "
+                + _manifest_val_arg(src) +
                 f"--samples-per-shard {ref('samples_per_shard')} "
                 f"--register-tokens {ref('register_tokens')}"),
         "deps": [index_dir, f"{out}/val", dep("src/nanoplm/data/infra/manifest.py"),
                  dep("src/nanoplm/data/preparation/cluster_pipeline.py")],
         **_params(params_filename, [key("min_seq_len"), key("max_seq_len"),
-                                      key("val_ratio"), key("samples_per_shard"),
+                                      *_val_key(src), key("samples_per_shard"),
                                       key("register_tokens")]),
         "outs": [f"{out}/.data_manifest"],
     }
@@ -506,6 +583,8 @@ def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
             shared[out] = (step, stage, src.name)
     stages = {step: stage for step, stage, _ in shared.values()}
     stages.update(per_source)
+    if cfg.val_from_split:
+        stages["val_split"] = _val_split_stage(cfg, params_filename)
     cmd = [f"nanoplm data write-mixture -o {cfg.output_dir}"]
     deps, params = [], []
     for src in cfg.sources.values():

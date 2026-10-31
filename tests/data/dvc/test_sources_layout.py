@@ -142,15 +142,16 @@ def test_a_dry_run_previews_up_to_a_pending_download(tmp_path, monkeypatch):
 
 def test_summary_for_a_uniref_cluster_source_marks_overrides(tmp_path, monkeypatch):
     cfg = yaml.safe_load(load_template("data_pretrain"))
-    cfg["sources"] = {"uniref50": {"fasta": "uniref50", "max_seqs": -1, "val_ratio": 0.0044,
+    cfg["sources"] = {"uniref50": {"fasta": "uniref50", "max_seqs": -1,
                                    "cluster_subsampling": {"members": "uniref90"}}}
+    cfg["data_params"]["val_ratio"] = 0.0044
     out, _ = _dry(tmp_path, monkeypatch, cfg)
     table = out[out.index("data.yaml: 1 source"):out.index("Regenerated")]
     assert table == (
         f"data.yaml: 1 source -> {tmp_path}/output/data/pretrain_data\n"
-        "source    fasta                                            max seqs       len     val      "
+        "source    fasta                                            max seqs       len     val     "
         "clustering\n"
-        "uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all clusters*  20-512  0.0044*  "
+        "uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all clusters*  20-512  0.0044  "
         "UniProt uniref50.xml.gz (members: UniRef90)\n"
         "* = set on this source\n")
 
@@ -290,10 +291,14 @@ def test_from_yaml_errors_before_dvc(tmp_path, monkeypatch, text, message):
 def test_a_bad_override_names_the_source(tmp_path, monkeypatch):
     _no_dvc(monkeypatch)
     cfg = yaml.safe_load(load_template("data_pretrain"))
-    cfg["sources"]["swissprot"]["val_ratio"] = 2
+    cfg["sources"]["swissprot"]["max_seq_len"] = -2
     r = _run(_write(tmp_path, cfg))
-    assert r.exit_code != 0 and ("sources.swissprot.val_ratio has an invalid value: 2 (expected a number between 0 and "
-            "1, both excluded)") in " ".join(r.output.split())
+    assert r.exit_code != 0 and "sources.swissprot.max_seq_len has an invalid value: -2" \
+        in " ".join(r.output.split())
+    cfg["sources"]["swissprot"] = {"fasta": "swissprot", "val_ratio": 0.2}
+    r = _run(_write(tmp_path, cfg))
+    assert r.exit_code != 0 and "sources.swissprot.val_ratio: move it to data_params" \
+        in " ".join(r.output.split())
 
 
 def _built(folder, **extra):

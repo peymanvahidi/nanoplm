@@ -248,11 +248,12 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
     val_ratio = params.get("val_ratio")
     if isinstance(val_ratio, (int, float)) and val_ratio > MAX_QUIET_VAL_RATIO:
         # the experiment's holdout is a share of UniProt's UniRef50 clusters
-        fix = (f"the UniRef90 experiment used {on}.val_ratio: {EXPERIMENT_VAL_RATIO}"
+        # (in a mix, val_ratio is a share of the whole pool, which counts these clusters)
+        fix = (f"the UniRef90 experiment used data_params.val_ratio: {EXPERIMENT_VAL_RATIO}"
                if cluster_source == "uniref_xml"
-               else f"set {on}.val_ratio lower to train on more of them")
-        warnings.append(f"{on}: {_setting(src, 'val_ratio')} holds out {val_ratio:.1%} of the "
-                        f"clusters for validation; {fix}")
+               else "set data_params.val_ratio lower to train on more of them")
+        warnings.append(f"{on}: {_setting(src, 'val_ratio')} holds out about {val_ratio:.1%} of "
+                        f"the clusters for validation; {fix}")
     if cluster_source == "mmseqs" and source_level == "uniref50" and clustering == "auto":
         warnings.append(f"{on}: fasta is UniRef50 and members is null, so MMseqs2 will "
                         "cluster all ~60M UniRef50 sequences (hours). To train on the members "

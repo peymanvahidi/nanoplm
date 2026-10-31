@@ -23,7 +23,7 @@
           "weight": {
             "type": "number",
             "default": 1.0,
-            "description": "Share of training sequences (not tokens) drawn from this source. Weights must sum to 1 (within 1e-6); with one source it is 1 or left out. Changing only the weights rebuilds only the mixture manifest. A cluster source counts one sample per cluster visit."
+            "description": "Share of training sequences (not tokens) drawn from this source. Weights must sum to 1 (within 1e-6); with one source it is 1 or left out. The weights also share out the validation split, so changing them redraws it and rebuilds the mixture manifest, but does not filter or tokenize again. A cluster source counts one sample per cluster visit."
           },
           "prepared": {
             "type": "string",
@@ -68,7 +68,7 @@
           }
         }
       },
-      "description": "One entry per source, keyed by a name you pick (letters, digits and _). Each names a fasta to build from or a prepared folder. Any data_params field set on a source overrides the default for that source. Several sources make a mix: each is built on its own and training draws from them by weight."
+      "description": "One entry per source, keyed by a name you pick (letters, digits and _). Each names a fasta to build from or a prepared folder. Any data_params field but val_ratio / val_size set on a source overrides the default for that source. Several sources make a mix: each is built on its own and training draws from them by weight."
     },
     "data_params": {
       "type": "object",
@@ -91,12 +91,18 @@
         "val_ratio": {
           "type": "number",
           "default": 0.1,
-          "description": "share held out for validation loss"
+          "description": "share of the mix held out for validation"
         },
         "drop_invalid_sequences": {
           "type": "boolean",
           "default": false,
           "description": "true: drop sequences with unknown residues instead of stopping"
+        },
+        "val_size": {
+          "type": "integer",
+          "default": null,
+          "minimum": 1,
+          "description": "A fixed number of validation sequences (clusters, for a cluster source) for the whole mix, instead of val_ratio. Set only one of the two. In a mix it is shared out by the source weights."
         },
         "shuffle": {
           "type": "boolean",

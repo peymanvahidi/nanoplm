@@ -6,13 +6,12 @@ sources:
   swissprot:
     fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz
     weight: 1.0          # 0.2 when mixed with uniref50 below
-    # max_seq_len: 1024  # any data_params field set here overrides it for this source
+    # max_seq_len: 1024  # a data_params field set here overrides it (not val_ratio / val_size)
 
   # uniref50:
   #   fasta: uniref50
   #   weight: 0.8
   #   max_seqs: -1         # counts clusters here: all of them
-  #   val_ratio: 0.0044    # share of clusters held out for validation (145k of 32.9M)
   #   # Cluster subsampling: each epoch trains on one random member of every cluster.
   #   # members: uniref90 uses UniProt's UniRef50 clusters and trains on their UniRef90
   #   # members; the UniRef50 FASTA itself is never downloaded.
@@ -32,7 +31,8 @@ data_params:
   max_seqs: 20000        # -1 = all
   min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
-  val_ratio: 0.1         # share held out for validation loss
+  val_ratio: 0.1         # share of the mix held out for validation
+  # val_size: 150000     # or a fixed number of val sequences; set only one of the two
   drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
 
   # Rarely changed

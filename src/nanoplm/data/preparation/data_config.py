@@ -5,7 +5,8 @@ Two layouts are accepted:
   sources layout   ``output_dir`` + ``sources: {name: spec}`` + ``data_params`` defaults.
                    Each source names a ``fasta`` (a UniProt shortcut, a URL that is
                    downloaded, or a local file read in place) or a ``prepared`` folder.
-                   Any data_params field may be set on a source to override the default.
+                   Any data_params field but val_ratio / val_size may be set on a source
+                   to override the default; the val size is set once (val_split).
   data_dirs layout the old one: ``data_dirs.url`` / ``local_fasta`` and nine paths. It is
                    read as one source named "main" and every stage keeps its old shape.
 
@@ -43,9 +44,13 @@ from nanoplm.data.infra.mixture import WEIGHT_TOLERANCE, weights_error
 FASTA_SHORTCUTS = {k: DATASET_URLS[k]
                    for k in ("swissprot", "trembl", "uniref50", "uniref90", "uniref100")}
 URL_SCHEMES = ("http://", "https://", "ftp://")
-# data_params fields of a pretraining run, in template order
+# data_params fields of a pretraining run, in docs-schema order: the template's, with
+# val_size (shipped commented out) where the schema adds it, before "Rarely changed"
 PARAM_FIELDS = ("max_seqs", "min_seq_len", "max_seq_len", "val_ratio", "drop_invalid_sequences",
-                "shuffle", "shuffle_seed", "samples_per_shard", "max_workers", "register_tokens")
+                "val_size", "shuffle", "shuffle_seed", "samples_per_shard", "max_workers",
+                "register_tokens")
+# the val size: data_params sets exactly one of them, for the whole data.yaml
+VAL_FIELDS = ("val_ratio", "val_size")
 # the "rarely changed" fields may be left out (master's template values). In the sources
 # layout a field at its default goes into dvc.yaml as a value, not a DVC param, so
 # writing it out or deleting it reruns nothing.
@@ -161,6 +166,9 @@ class Source:
     output_dir: str = ""                   # the top-level output_dir (dataset_dir)
     downloads_dir: str = ""
     mixed: bool = False                    # one of several sources
+    # its val count comes from the val_split stage (a mix, or val_size) instead of
+    # its own val_ratio (see val_split)
+    val_from_split: bool = False
 
     @property
     def data_dir(self) -> str:
@@ -214,6 +222,12 @@ class DataConfig:
     legacy: bool = False
     warnings: list = field(default_factory=list)
     raw: dict = field(default_factory=dict)      # data.yaml as parsed
+    val: tuple = ()                              # ("val_ratio", 0.1) or ("val_size", n)
+
+    @property
+    def val_from_split(self) -> bool:
+        """The val counts come from the val_split stage (see val_split)."""
+        return any(s.val_from_split for s in self.sources.values())
 
     @property
     def source(self) -> Source:
@@ -323,6 +337,7 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
         raise DataConfigError(f"{name_of}: data_params must be a mapping")
     _check_keys("data_params", [OLD_PARAM_NAMES.get(k, k) for k in defaults_raw], PARAM_FIELDS)
     defaults = _params(defaults_raw, "data_params", warnings)
+    val = _val_setting(defaults, name_of)
 
     out = {}
     for name, spec in sources.items():
@@ -347,6 +362,11 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
         elif not single:
             raise DataConfigError(f"{where} needs a weight (its share of training sequences; "
                                   "the weights must sum to 1)")
+        per_source_val = [f for f in VAL_FIELDS if f in over]
+        if per_source_val:
+            raise DataConfigError(
+                f"{where}.{per_source_val[0]}: move it to data_params. The val split is set "
+                "once for the whole data.yaml and shared out by the source weights")
         shared = [f for f in SHARED_FIELDS if f in over]
         if shared and not single:
             raise DataConfigError(f"{where}.{shared[0]}: set it in data_params; it applies to "
@@ -370,10 +390,14 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
         if "cluster_subsampling" in spec:
             src.cluster = _cluster_block(spec["cluster_subsampling"], where)
         merged = {**defaults, **over}
-        missing = [f for f in PARAM_FIELDS if f not in merged and f not in PARAM_DEFAULTS]
+        missing = [f for f in PARAM_FIELDS
+                   if f not in merged and f not in PARAM_DEFAULTS and f not in VAL_FIELDS]
         if missing:
             raise DataConfigError(f"{name_of}: data_params.{missing[0]} is required")
-        src.params = {f: merged[f][0] if f in merged else PARAM_DEFAULTS[f]
+        if not val:
+            raise DataConfigError(f"{name_of}: data_params.val_ratio is required (or val_size, "
+                                  "a number of val sequences)")
+        src.params = {f: merged[f][0] if f in merged else PARAM_DEFAULTS.get(f)
                       for f in PARAM_FIELDS}
         src.keys = {f: merged[f][1] if f in merged else f"data_params.{f}"
                     for f in PARAM_FIELDS}
@@ -381,7 +405,8 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
                                   if is_default(src.params[f], d))
         src.overrides = tuple(f for f in PARAM_FIELDS if f in over)
         src.paths = _source_paths(src)
-        if src.cluster is not None:
+        src.val_from_split = not single or val[0] == "val_size"
+        if src.cluster is not None and not src.val_from_split:
             _check_cluster_holdout(src)
         out[name] = src
     if not single:
@@ -389,7 +414,24 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
     if defaults_raw and all(s.prepared for s in out.values()):
         raise DataConfigError(f"{name_of}: data_params has no effect on prepared sources (they "
                               "are used as they were built); remove data_params")
-    return DataConfig(output_dir=output_dir, sources=out, warnings=warnings)
+    return DataConfig(output_dir=output_dir, sources=out, warnings=warnings, val=val)
+
+
+def _val_setting(defaults: dict, name_of: str) -> tuple:
+    """("val_ratio", r) or ("val_size", n): data_params sets at most one of them (a
+    built source needs one: _parse_sources)."""
+    got = [f for f in VAL_FIELDS if f in defaults]
+    if len(got) == 2:
+        raise DataConfigError(f"{name_of}: set data_params.val_ratio or data_params.val_size, "
+                              "not both")
+    if not got:
+        return ()
+    value = defaults[got[0]][0]
+    if got[0] == "val_size" and (isinstance(value, bool) or not isinstance(value, int)
+                                 or value < 1):
+        raise DataConfigError(f"{name_of}: data_params.val_size must be a whole number of val "
+                              f"sequences, at least 1, got {value!r}")
+    return got[0], value
 
 
 def _check_cluster_holdout(src: Source) -> None:
@@ -404,7 +446,7 @@ def _check_cluster_holdout(src: Source) -> None:
         raise DataConfigError(
             f"sources.{src.name}: {src.key('val_ratio')}={ratio:g} of at most {n:,} clusters "
             f"({src.key('max_seqs')}) holds out {held}; cluster subsampling needs at least one "
-            f"train and one val cluster. Set sources.{src.name}.val_ratio "
+            f"train and one val cluster. Set data_params.val_ratio "
             + (f"to at least {1 / n:.2g}" if held == 0 else f"below {1 - 1 / n:.2g}")
             + f", or sources.{src.name}.max_seqs: -1")
 
@@ -527,6 +569,9 @@ def parse_data_config(config: dict, base_dir=None, name_of: str = "data.yaml") -
         params = config.get("data_params") or {}
         _check_keys("data_params", [OLD_PARAM_NAMES.get(k, k) for k in params],
                     PARAM_FIELDS + LEGACY_IGNORED)
+        if "val_size" in params:
+            raise DataConfigError(f"{name_of}: data_params.val_size needs the sources layout; "
+                                  "use val_ratio with data_dirs")
         src = legacy_source(config)
         warnings = [migration_hint(config)]
         warnings += [f"data_params.{k} is no longer used and is ignored; remove it"

@@ -104,7 +104,7 @@ sources:
   swissprot:
     fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz
     weight: 1.0          # 0.2 when mixed with uniref50 below
-    # max_seq_len: 1024  # any data_params field set here overrides it for this source
+    # max_seq_len: 1024  # a data_params field set here overrides it (not val_ratio / val_size)
 
   # (a commented UniRef50 cluster-subsampling source with weight 0.8 and a
   #  commented another_source follow)
@@ -113,7 +113,8 @@ data_params:
   max_seqs: 20000        # -1 = all
   min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
-  val_ratio: 0.1         # share held out for validation loss
+  val_ratio: 0.1         # share of the mix held out for validation
+  # val_size: 150000     # or a fixed number of val sequences; set only one of the two
   drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
 
   # Rarely changed
@@ -126,7 +127,7 @@ data_params:
 
 With one source, `weight` must be `1.0` or left out. Two or more sources make a mix, drawn by `weight`: see [Mixing datasets](/nanoplm/guides/mixing/).
 
-`max_seqs`, `min_seq_len`, `max_seq_len` and `val_ratio` are required. You can leave out the other `data_params`. The template's values are the defaults, so deleting one, or writing it out, reruns nothing. The [data.yaml reference](/nanoplm/reference/data/) describes each key.
+`max_seqs`, `min_seq_len`, `max_seq_len` and one of `val_ratio` or `val_size` are required. `val_ratio` is the share of the sequences held out for validation; `val_size` is a number of them. Set either one only in `data_params`, not on a source. In a mix it sets the validation sequences of the whole mix: see [Mixing datasets](/nanoplm/guides/mixing/#validation). You can leave out the other `data_params`. The template's values are the defaults, so deleting one, or writing it out, reruns nothing. The [data.yaml reference](/nanoplm/reference/data/) describes each key.
 
 :::caution[max_seq_len is set here and nowhere else]
 `from-yaml` writes `max_seq_len` into `.data_manifest`. Pretraining reads it from there to compute gradient accumulation, `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`, so `pretrain.yaml` has no `max_seq_len` key. To train on longer sequences, change it here and run `from-yaml` again. The shards change too.
@@ -151,7 +152,7 @@ Rebuild: all (first run)
 | `fasta` | The file the stages read, and where it comes from. `(url)` means it will be downloaded. `(reuse, 40.2 kB, 2026-09-01)` means a file with that name, written on that date, is already in `output_dir/downloads/`. `(local, 66.0 kB)` means a local file. |
 | `max seqs` | `max_seqs`, or `all` for `-1`. A cluster source counts clusters: `all clusters`, `20,000 clusters`. |
 | `len` | `min_seq_len`-`max_seq_len`. |
-| `val` | `val_ratio`. |
+| `val` | `val_ratio`. In a mix, or with `val_size`, `by weight`, and a line under the table gives the size of the whole mix's validation split. |
 | `clustering` | `off`, or where the clusters come from. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/#read-the-table). |
 
 A `*` after a value means the source sets it itself instead of taking it from `data_params`.

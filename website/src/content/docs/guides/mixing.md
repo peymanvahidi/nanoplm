@@ -18,7 +18,7 @@ A mix trains on two or more FASTA files at once. You list each file under `sourc
      uniref50:
        fasta: "uniref50_3000.fasta"
        weight: 0.8
-   data_params:            # defaults for every source; a source may override any of them
+   data_params:            # defaults for every source; a source may override them, but not val_ratio
      max_seqs: -1
      min_seq_len: 20
      max_seq_len: 512
@@ -36,14 +36,15 @@ A mix trains on two or more FASTA files at once. You list each file under `sourc
    ```text title="Output (trimmed)"
    data.yaml: 2 sources -> <cwd>/output/data/pretrain_data
    weight = share of training sequences
-   source     weight  fasta                                  max seqs  len     val   clustering
-   swissprot  0.2     swissprot_300.fasta (local, 37.0 kB)   all       20-512  0.05  off
-   uniref50   0.8     uniref50_3000.fasta (local, 662.8 kB)  all       20-512  0.05  off
+   source     weight  fasta                                  max seqs  len     val        clustering
+   swissprot  0.2     swissprot_300.fasta (local, 37.0 kB)   all       20-512  by weight  off
+   uniref50   0.8     uniref50_3000.fasta (local, 662.8 kB)  all       20-512  by weight  off
+   val = data_params.val_ratio: 0.05 of the pool, shared out by weight
    ...
    Pretraining data mixture complete (2 sources; train and val count clusters for a cluster source).
      source     weight  kind   train  val
-     swissprot  0.2     plain  285    15
-     uniref50   0.8     plain  2,850  150
+     swissprot  0.2     plain  267    33
+     uniref50   0.8     plain  2,868  132
      Manifest:  <cwd>/output/data/pretrain_data/.data_manifest
      Set pretrain.yaml's dataset_dir to <cwd>/output/data/pretrain_data.
    ```
@@ -78,9 +79,10 @@ sources:
     fasta: uniref50
     weight: 0.8
     max_seqs: -1         # counts clusters here: all of them
-    val_ratio: 0.0044    # share of clusters held out, as in the UniRef90 experiment
     cluster_subsampling:
       members: uniref90
+data_params:
+  val_ratio: 0.0044      # 147k val: 29k swissprot sequences + 118k uniref50 clusters
 ```
 
 SwissProt sequences are also UniRef90 members, so the two sources overlap. A SwissProt validation sequence can be a UniRef50 training sequence, and nothing removes it. Keep that in mind when you compare `eval/loss/swissprot` and `eval/loss/uniref50`.
@@ -105,7 +107,24 @@ A source with `epochs` below 1 trains on a part of itself, spread over the whole
 
 ## Validation
 
-Each source keeps its own validation sequences, held out by that source's `val_ratio`. Each eval logs:
+`data_params` sets the validation split of the whole mix once, with one of:
+
+- `val_ratio`, a share of the pool. The pool adds up every source: its sequences for a plain source, its clusters for a [cluster source](/nanoplm/guides/cluster-subsampling/), after `max_seqs`.
+- `val_size`, a number of validation sequences (clusters, for a cluster source).
+
+The validation sequences are then shared out by `weight`. In the example above the pool is 300 + 3,000 sequences, so `val_ratio: 0.05` holds out 165: 33 from SwissProt (0.2) and 132 from UniRef50 (0.8). With the full SwissProt (570k sequences) and the UniRef50 clusters (32.9M), `val_ratio: 0.0044` holds out 147k: 29k SwissProt sequences and 118k UniRef50 clusters.
+
+Setting `val_ratio` or `val_size` on a source is an error. So is setting both. Every source needs at least one validation sequence and keeps at least one training sequence. If a source is too small for its share, `from-yaml` stops:
+
+```text
+Error: sources.swissprot would need 669,400 val sequences but has 570,000; lower data_params.val_ratio or use data_params.val_size
+```
+
+Each source's share depends on the size of every source, so `from-yaml` counts each source after its filter (a `count` stage), then a `val_split` stage works out the shares. A source's split reruns only when its share changes. Changing a weight changes the shares, so it reruns `val_split`, the split of each source whose share moved (for a cluster source only `cluster_index`, not the tokenized members), and the mixture.
+
+A [prepared](#compare-several-ratios) source keeps the validation sequences it was built with and is not in the pool. The other sources share `val_ratio` or `val_size` by their weights, scaled to sum to 1.
+
+Each eval logs:
 
 | Key | Value |
 | --- | --- |
@@ -114,10 +133,10 @@ Each source keeps its own validation sequences, held out by that source's `val_r
 
 With a [recycling](/nanoplm/guides/recycling/) eval sweep, each loop count `k` adds `eval/loss/<source>/r<k>`.
 
-An eval runs as many batches as one combined validation set would, split evenly over the sources. Here 165 sequences at `micro_batch_seqs: 4` make 42 batches, so each source gets 21 batches, up to 84 sequences. SwissProt has only 15 and uses all of them. Its unused part does not go to UniRef50, which uses 84 of its 150, spread over the whole set. Training logs the split at the start:
+An eval runs as many batches as one combined validation set would, split evenly over the sources. Here 165 sequences at `micro_batch_seqs: 4` make 42 batches, so each source gets 21 batches, up to 84 sequences. SwissProt has only 33 and uses all of them. Its unused part does not go to UniRef50, which uses 84 of its 132, spread over the whole set. Training logs the split at the start:
 
 ```text
-Mixture eval: swissprot 15 of 15 val seqs, uniref50 84 of 150 val seqs
+Mixture eval: swissprot 33 of 33 val seqs, uniref50 84 of 132 val seqs
 ```
 
 To evaluate only some sources, list them in `pretrain.yaml`:
@@ -131,13 +150,13 @@ The listed sources get all the eval batches, and `eval/loss` averages over them 
 
 ## Compare several ratios
 
-Only the last stage of the build, `mixture`, reads the weights. If you change only the weights and rerun `from-yaml`, it rebuilds no source:
+If you change only the weights and rerun `from-yaml`, it does not filter or tokenize the sources again, but it does redraw the validation split (see [Validation](#validation)):
 
 ```text
-Rebuild: swissprot: up to date; uniref50: up to date; mixture: may rerun. (DVC skips a stage its run cache already has.)
+Rebuild: swissprot: up to date; uniref50: up to date; val_split: may rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)
 ```
 
-That replaces the mix in `output_dir`. To keep several ratios side by side, give each ratio its own folder that reuses the built sources:
+That replaces the mix in `output_dir`. To keep several ratios side by side, with the same validation sequences in each, give each ratio its own folder that reuses the built sources:
 
 1. Make a folder next to the one you built, say `sweep_50_50/` next to `base/`.
 2. In it, write a `data.yaml` that names each built source folder with `prepared:` instead of `fasta:`:
@@ -159,7 +178,7 @@ That replaces the mix in `output_dir`. To keep several ratios side by side, give
 What `prepared:` accepts and what can break it:
 
 - It takes a source folder of a mix, `<output_dir>/<source>`, or the `output_dir` of a single-source `data.yaml`. It refuses a mix's own `output_dir` with `is a mixture; list its sources here instead`.
-- A prepared source is used as it was built. You cannot set `data_params` on it.
+- A prepared source is used as it was built, its validation sequences included. You cannot set `data_params` on it.
 - If you rebuild a source in `base/`, every sweep that uses it is out of date. Training stops and says the source's manifest `changed after the mixture was written`. Rerun `from-yaml` in each sweep folder.
 - The sweep's manifest stores each `prepared:` folder outside its `output_dir` as an absolute path. If you move `base/`, fix the `prepared:` paths if they changed, then run `nanoplm data from-yaml sweep_50_50/data.yaml --force --target mixture`. A plain rerun skips the `mixture` stage and keeps the old paths.
 

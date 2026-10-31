@@ -444,11 +444,14 @@ def check(input: str, output: str, drop_invalid: str):
     type=float,
     help="Validation ratio",
 )
+@click.option("--val-count-file", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Take the val count from this val_split file instead of --val-ratio.")
 @click.help_option("--help", "-h")
 def split(
     input: str,
     output: str,
     val_ratio: float,
+    val_count_file: str = None,
 ):
     """Split a filtered FASTA into train/val sets."""
     input_path = Path(input)
@@ -462,6 +465,10 @@ def split(
     train_file_path = output_path / "train.fasta"
     val_file_path = output_path / "val.fasta"
 
+    want = _read_val_count(val_count_file) if val_count_file else None
+    if want is not None:
+        # the native split takes int(total * ratio) records; aim halfway past the count
+        val_ratio = min(1.0, (want["val"] + 0.5) / max(1, want["units"]))
     splitor = Splitor(
         input_file=input_path,
         train_file=train_file_path,
@@ -469,6 +476,11 @@ def split(
         val_ratio=val_ratio,
     )
     train_size, val_size = splitor.split()
+    if want is not None and (val_size, train_size + val_size) != (want["val"], want["units"]):
+        raise click.ClickException(
+            f"split: {input_path} has {train_size + val_size:,} sequences and gave {val_size:,} "
+            f"val; {val_count_file} expects {want['units']:,} and {want['val']:,}. Run "
+            "`nanoplm data from-yaml` again")
     click.echo(
         f"Splitting completed successfully.\nTrain file: {train_file_path}\nVal file: {val_file_path}\nTrain size: {train_size}, Val size: {val_size}"
     )
@@ -807,23 +819,85 @@ def cluster_pool(input, output, max_seq_len, samples_per_shard, register_tokens,
 @click.option("--index-dir", required=True, type=click.Path(file_okay=False))
 @click.option("--val-dir", required=True, type=click.Path(file_okay=False))
 @click.option("--max-seq-len", required=True, type=int)
-@click.option("--val-ratio", required=True, type=float)
+@click.option("--val-ratio", type=float, default=None)
+@click.option("--val-count-file", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Take the val cluster count from this val_split file instead of --val-ratio.")
 @click.option("--samples-per-shard", required=True, type=int)
 @click.option("--seqs-num", type=int, default=-1)
 @click.option("--register-tokens", type=int, default=0)
 @click.option("--cluster-xml", type=click.Path(dir_okay=False), default=None,
               help="The UniProt XML members.tsv came from, named in a release-mismatch error.")
 def cluster_index_cmd(members_tsv, fasta, pool, index_dir, val_dir, max_seq_len, val_ratio,
-                      samples_per_shard, seqs_num, register_tokens, cluster_xml):
+                      val_count_file, samples_per_shard, seqs_num, register_tokens, cluster_xml):
     """Internal: build the cluster index and the validation gathers."""
     from nanoplm.data.preparation.cluster_pipeline import build_index_and_val
+    if (val_ratio is None) == (val_count_file is None):
+        raise click.ClickException("cluster-index: give --val-ratio or --val-count-file")
+    want = _read_val_count(val_count_file) if val_count_file else None
+    if want is not None:
+        # draw_val_clusters holds out round(clusters * ratio): exactly the count
+        val_ratio = want["val"] / want["units"]
     man = build_index_and_val(Path(fasta), Path(pool), Path(members_tsv), Path(index_dir),
                               Path(val_dir), max_seq_len, val_ratio, samples_per_shard,
                               seqs_num, register_tokens,
                               cluster_xml=Path(cluster_xml) if cluster_xml else None)
     c = man["counts"]
+    if want is not None and (c["val_clusters"], c["clusters_in_universe"]) != (
+            want["val"], want["units"]):
+        raise click.ClickException(
+            f"cluster-index: {c['clusters_in_universe']:,} clusters and {c['val_clusters']:,} "
+            f"val; {val_count_file} expects {want['units']:,} and {want['val']:,}. Run "
+            "`nanoplm data from-yaml` again")
     click.echo(f"Cluster index: {c['train_clusters']:,} train / {c['val_clusters']:,} val "
                f"clusters over {c['pool_rows']:,} pool sequences")
+
+
+def _read_val_count(path) -> dict:
+    from nanoplm.data.preparation.val_split import read_json
+    got = read_json(path)
+    if not (isinstance(got.get("val"), int) and isinstance(got.get("units"), int)
+            and 0 <= got["val"] <= got["units"]):
+        raise click.ClickException(f"{path}: not a val_split count file; run "
+                                   "`nanoplm data from-yaml` again")
+    return got
+
+
+@data.command("count-units", hidden=True)
+@click.option("--input", "-i", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--output", "-o", required=True, type=click.Path(dir_okay=False))
+@click.option("--members-tsv", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Count the clusters of this table the FASTA holds, not its sequences.")
+@click.option("--max-clusters", type=int, default=-1, help="Cap on the cluster count; -1 = none.")
+def count_units_cmd(input, output, members_tsv, max_clusters):
+    """Internal: count a source's sequences or clusters for the val split."""
+    from nanoplm.data.preparation import val_split as vs
+    if members_tsv:
+        n, kind = vs.count_universe_clusters(input, members_tsv, max_clusters), vs.CLUSTER
+    else:
+        n, kind = vs.count_fasta_records(input), vs.PLAIN
+    vs.write_units(output, n, kind)
+    click.echo(f"{input}: {n:,} {kind}")
+
+
+@data.command("val-split", hidden=True)
+@click.option("--val-ratio", type=float, default=None)
+@click.option("--val-size", type=int, default=None)
+@click.option("--source", "sources", multiple=True, required=True, type=(str, str, float, str),
+              help="NAME UNITS_JSON WEIGHT OUT_JSON, once per built source.")
+def val_split_cmd(val_ratio, val_size, sources):
+    """Internal: share the val size out over the sources by weight."""
+    from nanoplm.data.preparation import val_split as vs
+    pool = {}
+    for name, units, weight, _ in sources:
+        got = vs.read_json(units)
+        pool[name] = (int(got["units"]), got["kind"], weight)
+    try:
+        counts = vs.val_counts(pool, val_ratio, val_size)
+    except vs.ValSplitError as e:
+        raise click.ClickException(str(e)) from None
+    for name, units, _, out in sources:
+        vs.write_val_count(out, counts[name], *pool[name][:2])
+        click.echo(f"{name}: {counts[name]:,} of {pool[name][0]:,} {pool[name][1]} for val")
 
 
 @data.command("get-yaml")
@@ -1294,6 +1368,8 @@ def _validate_source_params(src, config_path: Path) -> None:
         if field not in src.params:
             raise click.ClickException(f"{config_path.name}: data_params.{field} is required.")
         value = src.params[field]
+        if field == "val_ratio" and value is None:      # val_size is set instead
+            continue
         if not is_valid(value):
             raise click.ClickException(
                 f"{config_path.name}: {src.key(field)} has an invalid value: {value!r} "
@@ -1585,7 +1661,7 @@ def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
             rows.append(_prepared_row(src, plan))
             continue
         over = set(src.overrides)
-        starred |= bool(over & {"max_seqs", "min_seq_len", "max_seq_len", "val_ratio"})
+        starred |= bool(over & {"max_seqs", "min_seq_len", "max_seq_len"})
 
         def mark(text, *fields):
             return text + ("*" if over & set(fields) else "")
@@ -1595,7 +1671,7 @@ def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
         rows.append((src.name,) + ((f"{src.weight:g}",) if mix else ()) + (
             _fasta_cell(src, plan, cwd, shared), mark(seqs, "max_seqs"),
             mark(f"{p['min_seq_len']}-{p['max_seq_len']}", "min_seq_len", "max_seq_len"),
-            mark(f"{p['val_ratio']:g}", "val_ratio"),
+            "by weight" if src.val_from_split else f"{p['val_ratio']:g}",
             plan.source_line() if plan is not None else "off",
         ))
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
@@ -1603,6 +1679,13 @@ def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
         lines.append("  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[-1])
     if starred:
         lines.append("* = set on this source")
+    if cfg.val_from_split:
+        field, value = cfg.val
+        what = (f"{value:g} of the pool" if field == "val_ratio"
+                else f"{value:,} sequences / clusters")
+        prepared = " (prepared sources keep their own)" if any(
+            s.prepared for s in cfg.sources.values()) else ""
+        lines.append(f"val = data_params.{field}: {what}, shared out by weight{prepared}")
     return "\n".join(lines)
 
 
@@ -1725,10 +1808,10 @@ def _rebuild_summary(names: list, changed: set, sources) -> str:
     groups: dict = {}
     for n in names:
         head = n.split("-", 1)[0]
-        group = n if n == "mixture" else head if head in sources else "downloads"
+        group = n if n in ("val_split", "mixture") else head if head in sources else "downloads"
         groups.setdefault(group, []).append(n)
     order = (["downloads"] if "downloads" in groups else []) + \
-        [s for s in sources if s in groups] + ["mixture"]
+        [s for s in sources if s in groups] + ["val_split", "mixture"]
     parts = []
     for g in order:
         stages = groups.get(g, [])
@@ -1838,7 +1921,8 @@ def _print_mixture_summary(cwd: Path, cfg) -> None:
 @click.option("--output", "-o", required=True, type=click.Path(file_okay=False))
 @click.option("--min-seq-len", required=True, type=int)
 @click.option("--max-seq-len", required=True, type=int)
-@click.option("--val-ratio", required=True, type=float)
+@click.option("--val-ratio", type=float, default=None,
+              help="The val ratio to record; left out, the built val share.")
 @click.option("--samples-per-shard", required=True, type=int)
 @click.option("--register-tokens", type=int, default=0)
 @click.option("--teacher-model", type=str, default=None)
@@ -1851,6 +1935,12 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
     output_dir = Path(output)
     if cluster_index:
         from nanoplm.data.preparation.cluster_pipeline import write_cluster_manifest
+        if val_ratio is None:
+            import json
+            from nanoplm.data.datasets.cluster_sampled import INDEX_MANIFEST
+            from nanoplm.data.preparation.cluster_config import CLUSTER_INDEX_DIR
+            c = json.loads((output_dir / CLUSTER_INDEX_DIR / INDEX_MANIFEST).read_text())["counts"]
+            val_ratio = round(c["val_clusters"] / max(1, c["clusters_in_universe"]), 6)
         write_cluster_manifest(output_dir, min_seq_len, max_seq_len, val_ratio,
                                samples_per_shard, register_tokens)
         click.echo(f"Wrote manifest: {output_dir / '.data_manifest'}")
@@ -1870,6 +1960,8 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
     else:
         train_count = _count_distill_h5_sequences(train_dir)
         val_count = _count_distill_h5_sequences(val_dir)
+    if val_ratio is None:
+        val_ratio = round(val_count / max(1, train_count + val_count), 6)
 
     if kind == "pretrain":
         manifest = PretrainManifest(

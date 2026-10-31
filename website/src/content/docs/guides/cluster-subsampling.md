@@ -29,7 +29,6 @@ sources:
   uniref50:
     fasta: uniref50
     max_seqs: -1         # counts clusters here: all of them
-    val_ratio: 0.0044    # share of clusters held out for validation (145k of 32.9M)
     cluster_subsampling:
       members: uniref90  # uniref90, uniref100, a UniRef90/100 FASTA URL/path, or null (= this fasta)
       clustering: auto   # auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or uniprot, mmseqs2
@@ -43,12 +42,14 @@ This trains on UniRef90 sequences under UniProt's UniRef50 clusters. nanoPLM dow
 - [`clustering`](/nanoplm/reference/data/#data-cluster_subsampling-clustering) picks where the clusters come from. See [When MMseqs2 runs](#when-mmseqs2-runs).
 - [`identity`](/nanoplm/reference/data/#data-cluster_subsampling-identity) and [`coverage`](/nanoplm/reference/data/#data-cluster_subsampling-coverage) only apply when MMseqs2 makes the clusters.
 
-Here `max_seqs` and `val_ratio` count clusters, not sequences, so set them on the source as above. If you leave the template's `data_params` values (`max_seqs: 20000`, `val_ratio: 0.1`), training sees at most 20,000 clusters and holds out 10% of them. `from-yaml` warns about both before any stage runs:
+Here `max_seqs`, `val_ratio` and `val_size` count clusters, not sequences. Set `max_seqs` on the source as above. `val_ratio` is set once, in `data_params`; the UniRef90 experiment used `val_ratio: 0.0044` (145k of 32.9M clusters). If you leave the template's values (`max_seqs: 20000`, `val_ratio: 0.1`), training sees at most 20,000 clusters and holds out 10% of them. `from-yaml` warns about both before any stage runs:
 
 ```text
-Warning: sources.uniref50: max_seqs=20000 trains on at most 20,000 clusters; set sources.uniref50.max_seqs: -1 to use all of them
-Warning: sources.uniref50: val_ratio=0.1 holds out 10.0% of the clusters for validation; the UniRef90 experiment used sources.uniref50.val_ratio: 0.0044
+Warning: sources.uniref50: max_seqs=20000 (from data_params) trains on at most 20,000 clusters; set sources.uniref50.max_seqs: -1 to use all of them
+Warning: sources.uniref50: val_ratio=0.1 (from data_params) holds out about 10.0% of the clusters for validation; the UniRef90 experiment used data_params.val_ratio: 0.0044
 ```
+
+One `uniref50` source with `val_ratio: 0.0044` holds out the same clusters as the experiment. In a [mix](/nanoplm/guides/mixing/#validation), the validation split is shared out by weight, so UniRef50 gets a different number of clusters and they are a different set.
 
 You do not need to change `samples_per_shard`. If the tokenized members would need more than 9,999 shards, nanoPLM raises it and logs the value it used.
 
@@ -145,7 +146,7 @@ nanoPLM downloads `uniref50.xml.gz` once into `output_dir/downloads/` and keeps 
 | `...members (...) is not a UniRef set and differs from sources.<name>.fasta. Put that FASTA in fasta and set members: null.` | Your own FASTA goes in `fasta`, with `members: null`. |
 | `...clustering: uniprot: UniProt clusters need UniRef data` | Use one of the UniProt rows in [When MMseqs2 runs](#when-mmseqs2-runs), or `clustering: auto`. |
 | `sources.<name>: these members are clustered with MMseqs2, but mmseqs was not found` | `nanoplm deps install --mmseqs-only`, a release binary on `PATH`, or `NANOPLM_MMSEQS=/path/to/mmseqs`. |
-| `...val_ratio=... of at most ... clusters (max_seqs) holds out 0; cluster subsampling needs at least one train and one val cluster` | Raise `val_ratio` to the value the message names, or set `max_seqs: -1`. |
+| `...val_ratio=... of at most ... clusters (max_seqs) holds out 0; cluster subsampling needs at least one train and one val cluster` | Raise `data_params.val_ratio` to the value the message names, or set `max_seqs: -1`. |
 | `... is a cluster-sampled dataset, which needs use_packing=true.` (at pretraining start) | Set `use_packing: true` in `pretrain.yaml`. |
 | `... was built by the data-sampler experiment scripts ...` (at pretraining start) | `dataset_dir` is a folder from the old experiment scripts. Rebuild it with `nanoplm data from-yaml`. |
 | Warning: `max_seqs=... trains on at most ... clusters` / `val_ratio=... holds out ...% of the clusters` | See [Turn it on](#turn-it-on). |
@@ -171,7 +172,7 @@ Each stage reruns only when its own inputs change:
 | You change | What reruns |
 | --- | --- |
 | `clustering`, `identity`, `coverage` | `cluster_members` and later. The tokenized members are kept. |
-| `val_ratio`, `max_seqs` | `cluster_index` and the manifest. |
+| `val_ratio`, `val_size`, `max_seqs`, a weight in a mix | `cluster_index` and the manifest (in a mix, only when the source's share of the validation split changes). |
 | `max_workers` | Nothing. |
 | Remove the block from a `fasta: uniref50`, `members: uniref90` source | The normal pipeline runs, starting with downloading `uniref50.fasta.gz`, which the cluster run never fetched. |
 
