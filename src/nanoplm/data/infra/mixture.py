@@ -1,7 +1,7 @@
-"""The mixture manifest: several prepared pretraining datasets and their weights.
+"""The mixture manifest: several built pretraining datasets and their weights.
 
 ``nanoplm data from-yaml`` builds each source of a data.yaml with more than one source
-into ``<output_dir>/<name>/`` (or reads a ``prepared`` folder as it is) and then writes
+into ``<output_dir>/<name>/`` and then writes
 ``<output_dir>/.data_manifest`` with ``write_mixture``. That file is a MixtureManifest:
 per source the folder (relative to output_dir), the weight, the kind and counts, and the
 sha256 of the source's own .data_manifest at the time the mix was written.
@@ -73,7 +73,7 @@ def _source_manifest(name: str, folder: Path) -> PretrainManifest:
 
 def write_mixture(output_dir: Union[str, Path], entries: Sequence[tuple]) -> Path:
     """Write the mixture manifest. ``entries`` holds (name, folder, weight, fasta) per
-    source; fasta is the URL or path it was built from, or the prepared folder."""
+    source; fasta is the URL or path it was built from."""
     out = Path(output_dir)
     if len(entries) < 2:
         raise MixtureError("a mixture needs at least two sources")

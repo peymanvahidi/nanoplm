@@ -71,9 +71,6 @@ def generate_dvc_yaml(config: dict, kind: str, params_filename: str, base_dir=No
     else:
         cfg = parse_data_config(config, base_dir, params_filename)
         src = cfg.source
-        if src.prepared:
-            raise DataConfigError(f"sources.{src.name} is prepared ({src.prepared}): there is "
-                                  "nothing to build")
         from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
         plan = None if src.legacy else resolve_cluster_plan(src, base_dir)
         stages = (_cluster_stages(src, plan, params_filename) if plan is not None
@@ -352,8 +349,6 @@ def _val_split_stage(cfg, params_filename: str) -> dict:
     cmd = [f"nanoplm data val-split --{field.replace('_', '-')} ${{data_params.{field}}}"]
     deps, outs, params = [], [], [f"data_params.{field}"]
     for src in cfg.sources.values():
-        if src.prepared:
-            continue
         units, out = _join(src.work_dir, POOL_UNITS), _join(src.work_dir, VAL_COUNT)
         weight = f"${{sources.{src.name}.weight}}" if cfg.is_mixture else "1"
         if cfg.is_mixture:
@@ -574,8 +569,6 @@ def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
     shared: dict[str, tuple] = {}               # out path -> (stage name, stage, source)
     per_source: dict[str, Any] = {}
     for src in cfg.sources.values():
-        if src.prepared:
-            continue
         plan = resolve_cluster_plan(src, base_dir)
         _share_check(src, plan)
         stages = (_cluster_stages(src, plan, params_filename) if plan is not None
@@ -609,9 +602,8 @@ def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
     cmd = [f"nanoplm data write-mixture -o {cfg.output_dir}"]
     deps, params = [], []
     for src in cfg.sources.values():
-        folder = src.prepared.rstrip("/") if src.prepared else src.data_dir
-        fasta = f'"{src.fasta}"' if src.fasta else "-"
-        cmd.append(f"--source {src.name} {folder} ${{sources.{src.name}.weight}} {fasta}")
+        folder = src.data_dir
+        cmd.append(f'--source {src.name} {folder} ${{sources.{src.name}.weight}} "{src.fasta}"')
         deps.append(f"{folder}/.data_manifest")
         params.append(f"sources.{src.name}.weight")
     stages["mixture"] = {

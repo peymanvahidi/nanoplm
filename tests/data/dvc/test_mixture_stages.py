@@ -143,12 +143,12 @@ def test_two_local_gz_with_one_file_name_are_refused():
         _stages(cfg)
 
 
-def test_a_prepared_source_has_no_stages_and_feeds_the_mixture():
-    st = _stages(_mix(own={"prepared": "../built/", "weight": 0.4},
+def test_the_mixture_stage_reads_every_source_manifest():
+    st = _stages(_mix(own={"fasta": "x/own.fasta", "weight": 0.4},
                       swissprot={"fasta": "swissprot", "weight": 0.6}))
-    assert not any(n.startswith("own-") for n in st)
-    assert st["mixture"]["deps"][0] == "../built/.data_manifest"
-    assert "--source own ../built ${sources.own.weight} -" in st["mixture"]["cmd"]
+    assert st["mixture"]["deps"][:2] == ["out/own/.data_manifest",
+                                         "out/swissprot/.data_manifest"]
+    assert '--source own out/own ${sources.own.weight} "x/own.fasta"' in st["mixture"]["cmd"]
 
 
 def test_a_single_source_keeps_its_stage_names():
@@ -246,32 +246,6 @@ def test_from_yaml_builds_a_two_source_mix_with_one_val_split_by_weight(tmp_path
     assert "0.6 (plain) + 0.5 (clus) = 1.1" in res.output
 
 
-def test_from_yaml_mixes_a_prepared_source_with_a_built_one(tmp_path):
-    from nanoplm.data.infra.manifest import read_manifest
-    from tests.data.datasets.mixture_sources import plain_source
-    built = plain_source(tmp_path / "elsewhere/built", 60, tag=5)
-    proj = tmp_path / "proj"
-    proj.mkdir()
-    env = _project(proj, None, "x.fasta")
-    (proj / "local.fasta").write_text("".join(f">s{i}\n{'MKV' * (8 + i % 9)}\n"
-                                              for i in range(80)))
-    cfg = yaml.safe_load((proj / "data.yaml").read_text())
-    cfg["output_dir"] = "out"
-    cfg["sources"] = {"mine": {"prepared": "../elsewhere/built", "weight": 0.25},
-                      "local": {"fasta": "local.fasta", "weight": 0.75}}
-    (proj / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
-    r = _from_yaml(proj, env)
-    assert "../elsewhere/built (prepared)" in r.stdout
-    row = next(ln for ln in r.stdout.splitlines() if ln.startswith("mine "))
-    assert "60 (built)" in row                        # a count, not a max_seqs cap
-    assert "Running stage 'mine-" not in r.stdout
-    m = read_manifest(proj / "out")
-    assert m.sources[0]["dir"] == str(built.resolve()) and m.sources[0]["fasta"] is None
-    assert _status(proj, env) == set()
-    plain_source(built, 61, tag=5)                    # the prepared folder is rebuilt
-    assert _status(proj, env) == {"mixture"}
-
-
 def test_the_table_has_a_weight_column_and_lists_a_shared_download_once(tmp_path):
     from nanoplm.cli.data import plan_table
     from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
@@ -285,21 +259,6 @@ def test_the_table_has_a_weight_column_and_lists_a_shared_download_once(tmp_path
     assert rows["uniref50"].split()[1] == "0.7"
     assert "uniref90.fasta.gz (url) + uniref50.xml.gz (url)" in rows["uniref50"]
     assert "uniref90.fasta.gz (same download as uniref50)" in rows["u90"]
-
-
-def test_a_prepared_source_with_other_register_tokens_fails_before_dvc(tmp_path, monkeypatch):
-    from click.testing import CliRunner
-    from nanoplm.cli.data import data
-    from tests.data.datasets.mixture_sources import plain_source
-    plain_source(tmp_path / "built", 20, tag=5, register_tokens=1)
-    cfg = _mix(mine={"prepared": "built", "weight": 0.5},
-               swissprot={"fasta": "swissprot", "weight": 0.5})
-    (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg))
-    monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("DVC must not run"))
-    r = CliRunner().invoke(data, ["from-yaml", str(tmp_path / "data.yaml")])
-    assert r.exit_code != 0
-    assert "the sources of a mix must use the same register_tokens; got mine 1, swissprot 0" \
-        in r.output
 
 
 def test_built_sources_with_other_register_tokens_fail_before_dvc(tmp_path, monkeypatch):
@@ -327,10 +286,10 @@ def _lock_from(tmp_path, cfg):
             p.touch() if "." in p.name else p.mkdir(exist_ok=True)
 
 
-def _orphans(tmp_path, cfg, keep=()):
+def _orphans(tmp_path, cfg):
     from nanoplm.cli.data import orphaned_outputs
     found = orphaned_outputs(tmp_path, generate_dvc_yaml(cfg, "pretrain", "data.yaml",
-                                                         tmp_path), cfg, keep)
+                                                         tmp_path), cfg)
     return [str(p.relative_to(tmp_path / "out")) for p in found]
 
 
@@ -395,13 +354,6 @@ def test_dropping_a_cluster_block_names_its_index_and_the_xml(tmp_path):
     assert (tmp_path / "out/downloads/uniref50.xml.gz").exists()
 
 
-def test_a_prepared_source_keeps_the_folder_it_points_at(tmp_path):
-    _lock_from(tmp_path, _mix(a=A, b={"fasta": "trembl", "weight": 0.5}))
-    mix = _mix(a=A, b2={"prepared": "out/b", "weight": 0.5})
-    assert not any(p.startswith("b/") for p in _orphans(tmp_path, mix, keep=["out/b"]))
-    assert any(p.startswith("b/") for p in _orphans(tmp_path, mix))
-
-
 def test_no_dvc_lock_no_orphans(tmp_path):
     (tmp_path / "out/b/train").mkdir(parents=True)
     assert _orphans(tmp_path, _mix(a=A, c={"fasta": "trembl", "weight": 0.5})) == []
@@ -418,15 +370,6 @@ def test_the_rebuild_line_of_a_mix_is_one_summary_per_source():
 
 
 # ------------------------------------------------------------------ one val split
-
-
-def test_a_prepared_source_keeps_its_val_and_is_not_in_the_val_split():
-    st = _stages(_mix(own={"prepared": "../built", "weight": 0.4},
-                      swissprot={"fasta": "swissprot", "weight": 0.6}))
-    vsplit = st["val_split"]
-    assert vsplit["outs"] == ["out/swissprot/val_count.json"]
-    assert "--source own" not in vsplit["cmd"]
-    assert _params(vsplit) == ["data_params.val_ratio", "sources.swissprot.weight"]
 
 
 def test_one_source_with_val_size_uses_the_val_split_stages():

@@ -302,53 +302,18 @@ def test_a_bad_override_names_the_source(tmp_path, monkeypatch):
         in " ".join(r.output.split())
 
 
-def _built(folder, **extra):
-    folder.mkdir(parents=True)
-    (folder / ".data_manifest").write_text(yaml.safe_dump({
-        "pipeline_mode": "pretrain", "seqs_num": 42, "min_seq_len": 20, "max_seq_len": 512,
-        "val_ratio": 0.1, "train_dir": "train", "val_dir": "val", "train_sequences": 38,
-        "val_sequences": 4, "sharded": True, "samples_per_shard": 2000, **extra}))
-
-
-@pytest.mark.parametrize("top", [{"output_dir": "out"}, {}])
-def test_a_prepared_source_is_checked_and_nothing_is_built(tmp_path, monkeypatch, top):
-    """output_dir may be left out: a prepared folder is used where it is."""
-    _no_dvc(monkeypatch)
-    _built(tmp_path / "other/out")
-    cfg = {**top, "sources": {"mine": {"prepared": "other/out"}}}
-    r = _run(_write(tmp_path, cfg))
-    assert r.exit_code == 0, r.output
-    folder = (tmp_path / "other/out").resolve()
-    assert r.output == (f"sources.mine: prepared {folder}\n"
-                        "  38 train / 4 val sequences, max_seq_len 512\n"
-                        f"Nothing to build. Set pretrain.yaml's dataset_dir to {folder}.\n")
-    assert not (tmp_path / "dvc.yaml").exists() and not (tmp_path / ".dvc").exists()
-
-
-def test_a_prepared_source_names_an_earlier_build_left_in_output_dir(tmp_path, monkeypatch):
-    """output_dir/.data_manifest of an earlier build is not the prepared data."""
-    _no_dvc(monkeypatch)
-    _built(tmp_path / "other")
-    _built(tmp_path / "out")
-    cfg = {"output_dir": "out", "sources": {"mine": {"prepared": "other"}}}
-    r = _run(_write(tmp_path, cfg))
-    assert r.exit_code == 0, r.output
-    assert (f"Warning: output_dir {(tmp_path / 'out').resolve()} still holds an earlier "
-            "build") in r.output
-    assert f"Point dataset_dir at {(tmp_path / 'other').resolve()}" in r.output
-    cfg["output_dir"] = "other"                      # the prepared folder itself: no warning
-    assert "Warning" not in _run(_write(tmp_path, cfg)).output
-
-
-@pytest.mark.parametrize("setup, message", [
-    (lambda p: None, "is not a folder"),
-    (lambda p: p.mkdir(parents=True), "is not a built dataset"),
+@pytest.mark.parametrize("cfg", [
+    {"sources": {"mine": {"prepared": "other/out"}}},
+    {"output_dir": "out", "sources": {"mine": {"prepared": "other/out", "weight": 0.5},
+                                      "sp": {"fasta": "swissprot", "weight": 0.5}}},
 ])
-def test_a_prepared_source_must_be_a_built_folder(tmp_path, monkeypatch, setup, message):
+def test_prepared_was_removed(tmp_path, monkeypatch, cfg):
     _no_dvc(monkeypatch)
-    setup(tmp_path / "other")
-    r = _run(_write(tmp_path, {"output_dir": "out", "sources": {"m": {"prepared": "other"}}}))
-    assert r.exit_code != 0 and message in r.output
+    r = _run(_write(tmp_path, cfg))
+    assert r.exit_code != 0
+    assert ("data.yaml: sources.mine.prepared was removed; build the source from its fasta"
+            in r.output)
+    assert not (tmp_path / "dvc.yaml").exists()
 
 
 def test_fix_flips_an_override_too(tmp_path, monkeypatch):

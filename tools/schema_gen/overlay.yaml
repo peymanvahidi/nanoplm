@@ -170,7 +170,7 @@ sources:
   map: true
   description: >-
     One entry per source, keyed by a name you pick (letters, digits and _). Each
-    names a fasta to build from or a prepared folder. Any data_params field but
+    names a fasta to build from. Any data_params field but
     val_ratio / val_size set on a source overrides the default for that source.
     Several sources make a mix: each is built on its own and training draws from
     them by weight.
@@ -450,12 +450,6 @@ x-extra-fields:
   # (data_config.SOURCE_KEYS).
   data:
     sources:
-      prepared:
-        type: string
-        description: >-
-          A folder another data.yaml built, used as it is. Set fasta or prepared,
-          not both. A prepared source takes no data_params overrides and no
-          cluster_subsampling.
       cluster_subsampling:
         type: [boolean, object]
         default: false

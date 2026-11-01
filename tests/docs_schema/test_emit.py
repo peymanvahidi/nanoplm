@@ -185,7 +185,7 @@ def test_data_schema_nests_source_specs_under_sources():
     assert "uniref90" in spec["fasta"]["description"]
     assert spec["weight"]["type"] == "number" and spec["weight"]["default"] == 1.0
     assert "not tokens" in spec["weight"]["description"]
-    assert spec["prepared"]["type"] == "string"
+    assert "prepared" not in spec          # removed: a source is built from its fasta
     assert spec["cluster_subsampling"]["type"] == ["boolean", "object"]
     assert spec["cluster_subsampling"]["default"] is False
 

@@ -3,8 +3,8 @@
 Two layouts are accepted:
 
   sources layout   ``output_dir`` + ``sources: {name: spec}`` + ``data_params`` defaults.
-                   Each source names a ``fasta`` (a UniProt shortcut, a URL that is
-                   downloaded, or a local file read in place) or a ``prepared`` folder.
+                   Each source names a ``fasta``: a UniProt shortcut, a URL that is
+                   downloaded, or a local file read in place.
                    Any data_params field but val_ratio / val_size may be set on a source
                    to override the default; the val size is set once (val_split).
   data_dirs layout the old one: ``data_dirs.url`` / ``local_fasta`` and nine paths. It is
@@ -59,7 +59,9 @@ VAL_FIELDS = ("val_ratio", "val_size")
 PARAM_DEFAULTS = {"drop_invalid_sequences": False, "shuffle": True, "shuffle_seed": 24,
                   "samples_per_shard": 2000, "max_workers": 2, "register_tokens": 0}
 OLD_PARAM_NAMES = {"seqs_num": "max_seqs"}
-SOURCE_KEYS = ("fasta", "prepared", "weight", "cluster_subsampling")
+SOURCE_KEYS = ("fasta", "weight", "cluster_subsampling")
+# source keys that are gone, and what to do instead
+REMOVED_SOURCE_KEYS = {"prepared": "build the source from its fasta"}
 CLUSTER_KEYS = ("members", "clusters", "identity", "coverage")
 OLD_CLUSTER_KEYS = {"clustering": "clusters"}
 TOP_KEYS = ("output_dir", "sources", "data_params")
@@ -182,7 +184,6 @@ class Source:
     name: str
     legacy: bool = False
     fasta: Optional[str] = None            # URL or path; a shortcut is expanded
-    prepared: Optional[str] = None
     weight: Optional[float] = None
     params: dict = field(default_factory=dict)
     keys: dict = field(default_factory=dict)
@@ -362,14 +363,14 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
     if not isinstance(sources, dict) or not sources:
         raise DataConfigError(f"{name_of}: sources needs one entry, e.g. "
                               "sources: {swissprot: {fasta: swissprot}}")
+    # a removed key first: a config that used it may also lack what replaced it
+    for name, spec in sources.items():
+        gone = [k for k in REMOVED_SOURCE_KEYS if isinstance(spec, dict) and k in spec]
+        if gone:
+            raise DataConfigError(f"sources.{name}.{gone[0]} was removed; "
+                                  f"{REMOVED_SOURCE_KEYS[gone[0]]}")
     output_dir = config.get("output_dir")
-    # a prepared source is used where it is, so one prepared source builds nothing; a
-    # mix of them still writes the mixture manifest into output_dir
-    only_prepared = len(sources) == 1 and all(isinstance(s, dict) and s.get("prepared")
-                                              is not None for s in sources.values())
-    if output_dir is None and only_prepared:
-        output_dir = ""
-    elif not isinstance(output_dir, str) or not output_dir:
+    if not isinstance(output_dir, str) or not output_dir:
         raise DataConfigError(f"{name_of}: output_dir is required (the folder pretrain.yaml's "
                               "dataset_dir points at)")
     else:
@@ -394,7 +395,7 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
             raise DataConfigError(f"{where}: {name} is a folder name under output_dir; pick "
                                   "another source name")
         if not isinstance(spec, dict):
-            raise DataConfigError(f"{where} must be a mapping with fasta or prepared")
+            raise DataConfigError(f"{where} must be a mapping with fasta")
         allowed = SOURCE_KEYS + PARAM_FIELDS
         _check_keys(where, [OLD_PARAM_NAMES.get(k, k) for k in spec], allowed)
         src = Source(name=name, output_dir=output_dir, mixed=not single,
@@ -414,21 +415,8 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
         if shared and not single:
             raise DataConfigError(f"{where}.{shared[0]}: set it in data_params; it applies to "
                                   "every source of a mix")
-        has_fasta, has_prepared = spec.get("fasta") is not None, spec.get("prepared") is not None
-        if has_fasta == has_prepared:
-            raise DataConfigError(f"{where}: set fasta (a FASTA to build from) or prepared (a "
-                                  "folder another data.yaml built), not both"
-                                  if has_fasta else f"{where} needs fasta or prepared")
-        if has_prepared:
-            if over or "cluster_subsampling" in spec:
-                extra = sorted(set(over) | ({"cluster_subsampling"} & set(spec)))
-                raise DataConfigError(f"{where}: a prepared source is used as it was built; "
-                                      f"remove {', '.join(extra)}")
-            if not isinstance(spec["prepared"], str):
-                raise DataConfigError(f"{where}.prepared must be a folder path")
-            src.prepared = spec["prepared"]
-            out[name] = src
-            continue
+        if spec.get("fasta") is None:
+            raise DataConfigError(f"{where} needs fasta (a FASTA to build from)")
         src.fasta = _fasta(spec["fasta"], where, base_dir)
         if "cluster_subsampling" in spec:
             src.cluster, src.cluster_keys = _cluster_block(spec["cluster_subsampling"], where,
@@ -455,9 +443,6 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
         out[name] = src
     if not single:
         _check_mix(out, name_of)
-    if defaults_raw and all(s.prepared for s in out.values()):
-        raise DataConfigError(f"{name_of}: data_params has no effect on prepared sources (they "
-                              "are used as they were built); remove data_params")
     return DataConfig(output_dir=output_dir, sources=out, warnings=warnings, val=val)
 
 
@@ -497,8 +482,7 @@ def _check_cluster_holdout(src: Source) -> None:
 
 def _check_mix(sources: dict, name_of: str) -> None:
     """The weights of several sources sum to 1. One register_tokens for all of them is
-    checked by `nanoplm data from-yaml` (it reads the prepared manifests too) and again
-    by write_mixture."""
+    checked by `nanoplm data from-yaml` and again by write_mixture."""
     err = weights_error({n: s.weight for n, s in sources.items()})
     if err:
         raise DataConfigError(f"{name_of}: {err}")

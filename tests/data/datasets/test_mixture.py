@@ -112,7 +112,7 @@ def test_training_refuses_a_source_rebuilt_after_the_mix(tmp_path):
             call()
 
 
-def test_prepared_source_outside_the_mix_is_stored_absolute(built, tmp_path):
+def test_a_source_folder_outside_the_mix_is_stored_absolute(built, tmp_path):
     _, folders, _ = built
     m = _write(tmp_path, folders, {"a": 0.5, "b": 0.5})
     assert m.sources[0]["dir"] == str(folders["a"].resolve())

@@ -1085,10 +1085,6 @@ def from_yaml(
     if kind == "pretrain":
         cfg = _read_pretrain_config(config_path)
         params = cfg.raw
-        if not cfg.is_mixture and cfg.source.prepared:
-            # one prepared source: nothing to build or mix
-            _show_prepared(cfg.source, cwd, config_path, cfg.output_dir)
-            return
         plans = _validate_sources(cfg, cwd, config_path)
     else:
         _validate_source_fields(params.get("data_dirs", {}))
@@ -1107,9 +1103,8 @@ def from_yaml(
 
     if kind == "pretrain":
         _print_plan(cfg, plans, cwd, config_path)
-        built = [s for s in cfg.sources.values() if not s.prepared]
         # one value for every source: a mix refuses a per-source max_workers
-        max_workers = built[0].params.get("max_workers") if built else None
+        max_workers = next(iter(cfg.sources.values())).params.get("max_workers")
     else:
         max_workers = data_params.get("max_workers")
 
@@ -1121,8 +1116,7 @@ def from_yaml(
         params_filename=config_path.name,
         base_dir=cwd,
     )
-    prepared = [s.prepared for s in cfg.sources.values() if s.prepared] if cfg else []
-    _warn_orphaned_outputs(cwd, dvc_content, params, prepared)
+    _warn_orphaned_outputs(cwd, dvc_content, params)
     dvc_yaml_path.write_text(dvc_content, encoding="utf-8")
     # click.echo, not logger.info: this must still print at --log-level error.
     click.echo(f"Regenerated {dvc_yaml_path}")
@@ -1449,8 +1443,6 @@ def _read_pretrain_config(config_path: Path, quiet: bool = False):
         _validate_source_fields(raw.get("data_dirs", {}))
         _validate_pipeline_fields(raw.get("data_dirs", {}), {}, "none", config_path)
     for src in cfg.sources.values():
-        if src.prepared:
-            continue
         _validate_source_params(src, config_path)
         if not cfg.legacy and not src.is_url:
             local = _resolve_path(src.fasta, config_path.parent)
@@ -1461,12 +1453,11 @@ def _read_pretrain_config(config_path: Path, quiet: bool = False):
     return cfg
 
 
-def orphaned_outputs(cwd: Path, dvc_content: str, params: dict, keep=()) -> list:
+def orphaned_outputs(cwd: Path, dvc_content: str, params: dict) -> list:
     """Outputs of an earlier build that this dvc.yaml no longer writes or reads, still on
     disk: what dvc.lock records (DVC keeps a removed stage's entry) minus every path of
     the new stages. Covers a removed or renamed source, a dropped cluster block, a
-    members switch and the move between one source and a mix. ``keep`` (a prepared
-    folder) is never listed. Nothing is deleted."""
+    members switch and the move between one source and a mix. Nothing is deleted."""
     import yaml as _yaml
     lock = cwd / "dvc.lock"
     if not lock.is_file():
@@ -1477,7 +1468,6 @@ def orphaned_outputs(cwd: Path, dvc_content: str, params: dict, keep=()) -> list
         return []
     graph = _stage_graph(dvc_content, params)
     used = [str(_resolve_path(p, cwd)) for deps, outs in graph.values() for p in deps + outs]
-    used += [str(_resolve_path(k, cwd)) for k in keep]
     found = []
     for stage in stages.values():
         for out in (stage or {}).get("outs") or []:
@@ -1488,8 +1478,8 @@ def orphaned_outputs(cwd: Path, dvc_content: str, params: dict, keep=()) -> list
     return found
 
 
-def _warn_orphaned_outputs(cwd: Path, dvc_content: str, params: dict, keep=()) -> None:
-    paths = orphaned_outputs(cwd, dvc_content, params, keep)
+def _warn_orphaned_outputs(cwd: Path, dvc_content: str, params: dict) -> None:
+    paths = orphaned_outputs(cwd, dvc_content, params)
     if not paths:
         return
     # the .gitignore lines DVC wrote for these paths (one per output, "/<name>")
@@ -1508,58 +1498,14 @@ def _warn_orphaned_outputs(cwd: Path, dvc_content: str, params: dict, keep=()) -
 
 
 def _validate_sources(cfg, cwd: Path, config_path: Path) -> dict:
-    """Check every source before DVC runs: {name: cluster plan, or None; for a prepared
-    source its manifest}."""
-    out = {}
-    for src in cfg.sources.values():
-        out[src.name] = (_prepared_manifest(src, cwd, config_path)[1] if src.prepared
-                         else _validate_cluster_block(src, config_path))
-    regs = {s.name: out[s.name].num_register_tokens if s.prepared
-            else s.params["register_tokens"] for s in cfg.sources.values()}
+    """Check every source before DVC runs: {name: its cluster plan, or None}."""
+    out = {src.name: _validate_cluster_block(src, config_path) for src in cfg.sources.values()}
+    regs = {s.name: s.params["register_tokens"] for s in cfg.sources.values()}
     if cfg.is_mixture and len(set(regs.values())) > 1:
         got = ", ".join(f"{n} {v}" for n, v in regs.items())
         raise click.ClickException(f"{config_path.name}: the sources of a mix must use the "
                                    f"same register_tokens; got {got}")
     return out
-
-
-def _prepared_manifest(src, cwd: Path, config_path: Path):
-    """(folder, manifest) of a prepared source, checked to be a built pretraining set."""
-    from nanoplm.data.infra.manifest import read_manifest
-    folder = _resolve_path(src.prepared, cwd)
-    where = f"{config_path.name}: sources.{src.name}.prepared"
-    if not folder.is_dir():
-        raise click.ClickException(f"{where}: {folder} is not a folder")
-    try:
-        m = read_manifest(folder)
-    except (FileNotFoundError, ValueError) as e:
-        raise click.ClickException(f"{where}: {folder} is not a built dataset ({e})") from e
-    kind = getattr(m, "pipeline_mode", None)
-    if kind != "pretrain":
-        raise click.ClickException(f"{where}: {folder} holds {kind} data, not pretraining data")
-    if m.is_mixture:
-        raise click.ClickException(f"{where}: {folder} is a mixture; list its sources here "
-                                   "instead")
-    return folder, m
-
-
-def _show_prepared(src, cwd: Path, config_path: Path, output_dir: str = "") -> None:
-    """Check a prepared folder's manifest and say what it holds; nothing is built. An
-    output_dir that still holds an earlier build is named: its data is not this one."""
-    folder, m = _prepared_manifest(src, cwd, config_path)
-    if m.cluster_index_dir:
-        what = (f"cluster subsampling ({m.cluster_level}): {m.train_sequences:,} train / "
-                f"{m.val_sequences:,} val clusters over {m.pool_sequences:,} sequences")
-    else:
-        what = f"{m.train_sequences:,} train / {m.val_sequences:,} val sequences"
-    click.echo(f"sources.{src.name}: prepared {folder}\n"
-               f"  {what}, max_seq_len {m.max_seq_len}\n"
-               f"Nothing to build. Set pretrain.yaml's dataset_dir to {folder}.")
-    out = _resolve_path(output_dir, cwd) if output_dir else None
-    if out is not None and out != folder and (out / ".data_manifest").is_file():
-        click.echo(f"Warning: output_dir {out} still holds an earlier build; training on it "
-                   f"would read that old data. Point dataset_dir at {folder}, not at "
-                   "output_dir.", err=True)
 
 
 def _validate_cluster_block(src, config_path: Path):
@@ -1691,18 +1637,10 @@ def _max_seqs_cell(max_seqs: int, clusters: bool) -> str:
     return f"{cap} clusters" if clusters else cap
 
 
-def _prepared_row(src, m) -> tuple:
-    """A prepared source's row: what it holds (a count, not a cap; built already)."""
-    what = f"cluster ({m.cluster_level})" if m.cluster_index_dir else "off"
-    count = f"{m.train_sequences:,}" + (" clusters" if m.cluster_index_dir else "")
-    return (src.name, f"{src.weight:g}", f"{src.prepared} (prepared)",
-            f"{count} (built)", f"{m.min_seq_len}-{m.max_seq_len}", f"{m.val_ratio:g}", what)
-
-
 def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
     """The pre-run summary: one row per source, before any DVC call. ``plans`` maps
-    each source to its cluster plan (None = off), or a prepared source to its manifest.
-    A mix adds the weight column and lists a download shared by sources once."""
+    each source to its cluster plan (None = off). A mix adds the weight column and lists
+    a download shared by sources once."""
     out = _resolve_path(cfg.output_dir, cwd)
     n = len(cfg.sources)
     mix = cfg.is_mixture
@@ -1715,9 +1653,6 @@ def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
     shared = {} if mix else None
     for src in cfg.sources.values():
         plan = plans.get(src.name)
-        if src.prepared:
-            rows.append(_prepared_row(src, plan))
-            continue
         over = set(src.overrides)
         starred |= bool(over & {"max_seqs", "min_seq_len", "max_seq_len"})
 
@@ -1741,9 +1676,7 @@ def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
         field, value = cfg.val
         what = (f"{value:g} of the pool" if field == "val_ratio"
                 else f"{value:,} sequences / clusters")
-        prepared = " (prepared sources keep their own)" if any(
-            s.prepared for s in cfg.sources.values()) else ""
-        lines.append(f"val = data_params.{field}: {what}, shared out by weight{prepared}")
+        lines.append(f"val = data_params.{field}: {what}, shared out by weight")
     return "\n".join(lines)
 
 
@@ -2074,12 +2007,12 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
 @click.option("--output", "-o", required=True, type=click.Path(file_okay=False))
 @click.option("--source", "sources", multiple=True, required=True,
               type=(str, click.Path(file_okay=False), float, str),
-              help="NAME FOLDER WEIGHT FASTA ('-' for a prepared folder); once per source.")
+              help="NAME FOLDER WEIGHT FASTA, once per source.")
 @click.help_option("--help", "-h")
 def write_mixture_cmd(output, sources):
     """Internal: write the mixture manifest of a data.yaml with several sources."""
     from nanoplm.data.infra.mixture import MixtureError, write_mixture
-    entries = [(n, Path(d), w, None if f == "-" else f) for n, d, w, f in sources]
+    entries = [(n, Path(d), w, f) for n, d, w, f in sources]
     try:
         path = write_mixture(Path(output), entries)
     except MixtureError as e:

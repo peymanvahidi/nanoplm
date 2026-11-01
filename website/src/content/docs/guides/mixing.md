@@ -122,8 +122,6 @@ Error: sources.swissprot would need 669,400 val sequences but has 570,000; lower
 
 Each source's share depends on the size of every source, so `from-yaml` counts each source after its filter (a `count` stage), then a `val_split` stage works out the shares. A source's split reruns only when its share changes. Changing a weight changes the shares, so it reruns `val_split`, the mixture and each source whose share moved. Nothing is downloaded or filtered again. A plain source splits and tokenizes again; a cluster source rebuilds only `cluster_index`, not its tokenized members. The `Rebuild:` line before the run cannot see this yet: it says the sources are up to date.
 
-A [prepared](#compare-several-ratios) source keeps the validation sequences it was built with and is not in the pool. The other sources share `val_ratio` or `val_size` by their weights, scaled to sum to 1.
-
 Each eval logs:
 
 | Key | Value |
@@ -156,31 +154,7 @@ If you change only the weights and rerun `from-yaml`, it redraws the validation 
 Rebuild: swissprot: up to date; uniref50: up to date; val_split: may rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)
 ```
 
-That replaces the mix in `output_dir`. To keep several ratios side by side, with the same validation sequences in each, give each ratio its own folder that reuses the built sources:
-
-1. Make a folder next to the one you built, say `sweep_50_50/` next to `base/`.
-2. In it, write a `data.yaml` that names each built source folder with `prepared:` instead of `fasta:`:
-
-   ```yaml title="sweep_50_50/data.yaml"
-   output_dir: "output/mix"
-   sources:
-     swissprot:
-       prepared: "../base/output/data/pretrain_data/swissprot"
-       weight: 0.5
-     uniref50:
-       prepared: "../base/output/data/pretrain_data/uniref50"
-       weight: 0.5
-   ```
-
-3. Run `nanoplm data from-yaml sweep_50_50/data.yaml`. It runs only the `mixture` stage and does not touch `base/`. `sweep_50_50/output/mix/` holds just the 1 kB `.data_manifest`.
-4. Set `dataset_dir` to `sweep_50_50/output/mix`.
-
-What `prepared:` accepts and what can break it:
-
-- It takes a source folder of a mix, `<output_dir>/<source>`, or the `output_dir` of a single-source `data.yaml`. It refuses a mix's own `output_dir` with `is a mixture; list its sources here instead`.
-- A prepared source is used as it was built, its validation sequences included. You cannot set `data_params` on it.
-- If you rebuild a source in `base/`, every sweep that uses it is out of date. Training stops and says the source's manifest `changed after the mixture was written`. Rerun `from-yaml` in each sweep folder.
-- The sweep's manifest stores each `prepared:` folder outside its `output_dir` as an absolute path. If you move `base/`, fix the `prepared:` paths if they changed, then run `nanoplm data from-yaml sweep_50_50/data.yaml --force --target mixture`. A plain rerun skips the `mixture` stage and keeps the old paths.
+That replaces the mix in `output_dir`. To keep several ratios side by side, give each ratio its own folder with its own `data.yaml`; each one builds its sources again. To skip the downloads, set each `fasta` to the file the first build downloaded, for example `../base/output/data/pretrain_data/downloads/uniprot_sprot.fasta.gz`. A local file is read where it is. Each ratio shares the validation split out by its own weights, so the ratios hold out different sequences.
 
 ## Add, remove or rename a source
 
@@ -211,4 +185,4 @@ rm -rf output/data/pretrain_data/pdb
 dvc gc --workspace      # asks y/n first; -f skips the question
 ```
 
-`dvc gc` also removes older mixture manifests. Before you delete a source folder, check that no sweep uses it as `prepared:`.
+`dvc gc` also removes older mixture manifests.

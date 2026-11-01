@@ -250,7 +250,8 @@ describe('toRows', () => {
     expect(toRows(d).map((r) => r.key)).toEqual(['output_dir']);
     // `sources` is a name -> spec map; its rows are the spec's fields.
     const spec = toRows(d, 'sources').map((r) => r.key);
-    expect(spec).toEqual(expect.arrayContaining(['fasta', 'prepared', 'weight']));
+    expect(spec).toEqual(expect.arrayContaining(['fasta', 'weight', 'cluster_subsampling']));
+    expect(spec).not.toContain('prepared');
     const cluster = toRows(d, 'sources.cluster_subsampling');
     // clusters also takes a .tsv path, so it has a default but no enum
     expect(cluster.find((r) => r.key === 'clusters')?.default).toBe('auto');

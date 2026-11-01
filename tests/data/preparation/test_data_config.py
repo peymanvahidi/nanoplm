@@ -36,7 +36,7 @@ def test_the_template_is_one_plain_swissprot_source():
     assert not cfg.legacy and list(cfg.sources) == ["swissprot"]
     src = cfg.source
     assert src.fasta == SPROT and src.weight == 1.0
-    assert src.cluster is None and src.prepared is None and src.overrides == ()
+    assert src.cluster is None and src.overrides == ()
     assert src.params["max_seqs"] == 20000 and src.key("max_seqs") == "data_params.max_seqs"
     out = "output/data/pretrain_data"
     assert cfg.output_dir == out
@@ -233,25 +233,12 @@ def test_mix_weights_not_summing_to_1_name_each_weight_and_the_sum():
     ({"fasta": "trembl", "weight": "0.5"}, "sources.b.weight must be a number"),
     ({"fasta": "trembl", "weight": 0.5, "max_workers": 4},
      "sources.b.max_workers: set it in data_params"),
-    ({"prepared": "../x", "weight": 0.5, "max_seq_len": 9},
-     "a prepared source is used as it was built; remove max_seq_len"),
+    ({"prepared": "../x", "weight": 0.5},
+     "sources.b.prepared was removed; build the source from its fasta"),
 ])
 def test_mix_errors(spec, match):
     with pytest.raises(dc.DataConfigError, match=match):
         _parse(_mix(a={"fasta": "swissprot", "weight": 0.5}, b=spec))
-
-
-def test_a_mix_with_a_prepared_source_needs_output_dir():
-    cfg = _mix(a={"prepared": "../x", "weight": 0.5}, b={"prepared": "../y", "weight": 0.5})
-    del cfg["output_dir"]
-    with pytest.raises(dc.DataConfigError, match="output_dir is required"):
-        _parse(cfg)
-    cfg["output_dir"] = "mix"
-    with pytest.raises(dc.DataConfigError, match="data_params has no effect on prepared"):
-        _parse(cfg)                               # nothing is built from data_params
-    del cfg["data_params"]
-    got = _parse(cfg)
-    assert [s.prepared for s in got.sources.values()] == ["../x", "../y"]
 
 
 def test_a_source_name_written_twice_is_refused(tmp_path):
@@ -266,9 +253,10 @@ def test_a_source_name_written_twice_is_refused(tmp_path):
     (lambda c: c.pop("sources"), "sources needs one entry"),
     (lambda c: c.update(sources={}), "sources needs one entry"),
     (lambda c: c.pop("output_dir"), "output_dir is required"),
-    (lambda c: c.update(sources={"src": {}}), "sources.src needs fasta or prepared"),
+    (lambda c: c.update(sources={"src": {}}), r"sources.src needs fasta \(a FASTA to build "
+                                              r"from\)"),
     (lambda c: c.update(sources={"src": {"fasta": "swissprot", "prepared": "x"}}),
-     "set fasta .* or prepared .*, not both"),
+     "sources.src.prepared was removed; build the source from its fasta"),
     (lambda c: c.update(sources={"src": {"fasta": "x.txt"}}),
      r"ends with .fasta or .fa \(optionally .gz or .zst\), got: x.txt"),
     (lambda c: c.update(sources={"src": {"fasta": "swisprot"}}),
@@ -381,33 +369,17 @@ def test_a_top_level_cluster_block_is_an_unknown_key():
         _parse(cfg)
 
 
-# ------------------------------------------------------------------ prepared
+# ------------------------------------------------------------------ prepared (removed)
 
 
-def test_output_dir_is_optional_only_without_a_fasta():
-    cfg = _parse({"sources": {"mine": {"prepared": "../built"}}})
-    assert cfg.source.prepared == "../built" and cfg.output_dir == ""
+@pytest.mark.parametrize("spec", [{"prepared": "../built"},
+                                  {"prepared": "../built", "fasta": "swissprot"}])
+def test_prepared_was_removed(spec):
+    with pytest.raises(dc.DataConfigError, match=r"^sources.src.prepared was removed; build "
+                                                 r"the source from its fasta$"):
+        _parse(_with_source(spec))
     with pytest.raises(dc.DataConfigError, match="output_dir is required"):
         _parse({"sources": {"mine": {"fasta": "swissprot"}}})
-
-
-def test_prepared_takes_no_build_settings():
-    src = _parse(_with_source({"prepared": "../built"}, data_params=None)).source
-    assert src.prepared == "../built" and src.fasta is None
-    with pytest.raises(dc.DataConfigError, match="prepared source is used as it was built; "
-                                                  "remove max_seq_len"):
-        _parse(_with_source({"prepared": "../built", "max_seq_len": 5}, data_params=None))
-    with pytest.raises(dc.DataConfigError, match="remove cluster_subsampling"):
-        _parse(_with_source({"prepared": "../built", "cluster_subsampling": {"members": None}},
-                            data_params=None))
-
-
-def test_data_params_with_only_prepared_sources_is_an_error():
-    """Nothing is built, so data_params would be silently ignored."""
-    with pytest.raises(dc.DataConfigError,
-                       match="data_params has no effect on prepared sources"):
-        _parse(_with_source({"prepared": "../built"}))
-    _parse(_with_source({"prepared": "../built"}, data_params={}))     # empty is fine
 
 
 @pytest.mark.parametrize("max_seqs, val_ratio", [(100, 0.001), (3, 0.9)])

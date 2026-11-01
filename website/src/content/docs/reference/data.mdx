@@ -21,7 +21,7 @@ The fields below are generated from the `get-yaml` template, so they match the t
 <ReferenceFields surface="data" />
 
 ## sources
-Each key under `sources` is a name you pick, using letters, digits and `_`. The template's is `swissprot`. It also names the folder under `output_dir` that holds this source's intermediate files. Set exactly one of `fasta` and `prepared`. A local or downloaded `fasta` ends in `.fasta` or `.fa`, optionally `.gz` or `.zst`; a stop codon `*` at the end of a sequence is removed. A [`data_params`](#data_params) field set on a source, such as `max_seq_len: 1024`, overrides the default for that source. `val_ratio` and `val_size` are the exception: they are set once, in `data_params`, for all sources.
+Each key under `sources` is a name you pick, using letters, digits and `_`. The template's is `swissprot`. It also names the folder under `output_dir` that holds this source's intermediate files. Each source needs a `fasta`. A local or downloaded `fasta` ends in `.fasta` or `.fa`, optionally `.gz` or `.zst`; a stop codon `*` at the end of a sequence is removed. A [`data_params`](#data_params) field set on a source, such as `max_seq_len: 1024`, overrides the default for that source. `val_ratio` and `val_size` are the exception: they are set once, in `data_params`, for all sources.
 
 <ReferenceFields surface="data" section="sources" />
 

@@ -11,8 +11,7 @@ depends on every source's pool. ``nanoplm data from-yaml`` runs it as DVC stages
   <source>-split   split / cluster-index read their own val_count.json
 
 A rerun of val_split that writes the same count for a source reruns nothing of that
-source. A prepared source keeps the val split it was built with and is not in the pool;
-the built sources share the val sequences by their weights scaled to sum to 1.
+source.
 
 One source with val_ratio does not use these stages: split and cluster-index take the
 ratio itself, as before.
