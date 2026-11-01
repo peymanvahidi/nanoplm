@@ -170,6 +170,9 @@ const AFFILIATIONS = [
         <div class="hero-glow" aria-hidden="true"></div>
         <div class="shell hero-grid">
           <div class="hero-copy">
+            <div class="hero-logo" id="hero-logo">
+              <Image src={logo} alt="nanoPLM" height={84} densities={[1, 2]} loading="eager" />
+            </div>
             {/* Broken by hand into three lines. Left to wrap on its own the
                 article "a" ends up orphaned on a line of its own, and the
                 headline is short enough that these breaks hold down to 320px. */}
@@ -511,6 +514,17 @@ const AFFILIATIONS = [
     </footer>
 
     <script>
+      // Show the nav logo only once the hero logo has scrolled out of view.
+      const heroLogo = document.getElementById('hero-logo');
+      const brand = document.querySelector('.brand');
+      if (heroLogo && brand && 'IntersectionObserver' in window) {
+        new IntersectionObserver(([entry]) => {
+          brand.classList.toggle('shown', !entry.isIntersecting);
+        }).observe(heroLogo);
+      } else {
+        brand?.classList.add('shown');
+      }
+
       // Theme toggle, writing the key Starlight reads so the choice carries
       // over to the docs and back.
       const toggle = document.getElementById('theme-toggle');
@@ -745,6 +759,24 @@ const AFFILIATIONS = [
         align-items: center;
         flex-shrink: 0;
       }
+      /* The hero carries the full-size logo, so the nav copy stays out of the way
+         until the hero logo scrolls off screen (see the script at the bottom). */
+      .brand {
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.25s ease;
+      }
+      .brand.shown {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      .hero-logo {
+        margin-bottom: 1.25rem;
+      }
+      .hero-logo :global(img) {
+        width: min(100%, 30rem);
+        height: auto;
+      }
       .nav-links {
         display: none;
         gap: 1.75rem;
@@ -950,10 +982,9 @@ const AFFILIATIONS = [
       }
 
       h1 {
-        /* The lower bound is set by "Foundation Model", the longest of the three
-           hand-broken lines: at 2.25rem it fills a 320px screen to the pixel, so
-           any font-metric difference would wrap it and strand a word. */
-        font-size: clamp(2.05rem, 6.2vw, 3.65rem);
+        /* A subtitle under the hero logo, so it is sized well below a headline.
+           The three hand-broken lines fit a 320px screen with room to spare. */
+        font-size: clamp(1.4rem, 3.2vw, 2rem);
         line-height: 1.06;
         letter-spacing: -0.033em;
         font-weight: 700;
