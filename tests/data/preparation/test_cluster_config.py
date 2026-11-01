@@ -311,3 +311,60 @@ def test_members_are_read_in_place_or_downloaded(tmp_path):
     plain.write_text(">UniRef90_A x\nMKV\n")
     p = _plan(_config(url=U50, members=str(plain)))
     assert p.members_compressed is None and p.members_fasta == plain
+
+
+# ------------------------------------------------------------------ .zst / .fa sources
+
+
+UNIREF90_TEXT = b"".join(b">UniRef90_P%05d n=1\n%s\n" % (i, b"MAGVKLLW" * 20) for i in range(50))
+
+
+def _long31_zst(path: Path) -> Path:
+    """A .zst as `zstd --long=31` writes it: a 2 GiB window, more than the 128 MiB a
+    decoder accepts by default."""
+    import zstandard
+    params = zstandard.ZstdCompressionParameters.from_level(
+        3, window_log=31, enable_ldm=True, write_content_size=False)
+    obj = zstandard.ZstdCompressor(compression_params=params).compressobj()
+    path.write_bytes(obj.compress(UNIREF90_TEXT) + obj.flush())
+    assert zstandard.get_frame_parameters(path.read_bytes()).window_size > 1 << 27
+    return path
+
+
+def test_a_long31_uniref90_zst_gets_uniprot_clusters(tmp_path):
+    """A local UniRef90 .fasta.zst made with --long=31 is UniRef90 by its headers, so
+    clustering: auto uses UniProt's clusters, not MMseqs2."""
+    local = _long31_zst(tmp_path / "seqs.fasta.zst")
+    assert cc.level_of(str(local)) == "uniref90"
+    p = _plan(_config(local=str(local)))
+    assert p.cluster_source == "uniref_xml" and p.members_level == "uniref90"
+
+
+@pytest.mark.parametrize("name, level", [
+    ("uniref90.fasta", "uniref90"), ("uniref90.fasta.gz", "uniref90"),
+    ("uniref90.fa", "uniref90"), ("uniref50.fa.zst", "uniref50"),
+    ("UniRef100.fasta.zst", "uniref100"), ("my_uniref90.fasta", None),
+    ("uniref90.faa", None), ("uniref90.fasta.bz2", None)])
+def test_the_level_by_file_name_takes_fa_and_zst(name, level):
+    assert cc.level_of(f"https://example.org/{name}") == level
+    assert cc.level_of(f"not/on/disk/{name}") == level
+
+
+def test_zst_headers_without_zstandard_use_the_zstd_tool(tmp_path, monkeypatch):
+    import shutil
+    import sys
+    if not shutil.which("zstd"):
+        pytest.skip("zstd not installed in test environment")
+    local = _long31_zst(tmp_path / "seqs.fa.zst")
+    monkeypatch.setitem(sys.modules, "zstandard", None)
+    assert cc.level_of(str(local)) == "uniref90"
+
+
+def test_zst_headers_without_zstandard_or_zstd_say_what_to_install(tmp_path, monkeypatch):
+    import sys
+    local = _long31_zst(tmp_path / "seqs.fa.zst")
+    monkeypatch.setitem(sys.modules, "zstandard", None)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(cc.ClusterConfigError, match="pip install zstandard") as e:
+        _plan(_config(local=str(local)))
+    assert str(local) in str(e.value) and "zstd" in str(e.value)

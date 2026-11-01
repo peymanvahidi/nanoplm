@@ -114,6 +114,25 @@ class _GroupedDataCommand(click.Group):
             ) from e
 
 
+def _refuse_overwriting(input_path: Path, output_path: Path) -> None:
+    """Stop when the output names the input: the stage would replace or delete it."""
+    def entry(p: Path) -> Path:         # the directory entry; a symlink there is not followed
+        return Path(os.path.realpath(p.parent)) / p.name
+    if entry(output_path) == entry(input_path):
+        raise click.ClickException(f"-o {output_path} is the input file; give -o another file "
+                                   "name or a directory.")
+
+
+def _output_file(input_path: Path, output_path: Path, suffix: str) -> Path:
+    """``output_path``, or in that directory the input's name with ``suffix`` in place of
+    its .fasta/.fa(.gz/.zst) ending (x.fa -> x_filtered.fasta); never the input itself."""
+    from nanoplm.data.preparation.data_config import fasta_stem
+    if output_path.is_dir():
+        output_path = output_path / f"{fasta_stem(input_path.name)}{suffix}"
+    _refuse_overwriting(input_path, output_path)
+    return output_path
+
+
 @click.group(name="data", cls=_GroupedDataCommand)
 @click.help_option("--help", "-h")
 def data():
@@ -183,6 +202,8 @@ def get_file(dataset, url, local_fasta, output, force):
         else:
             chosen_url = DATASET_URLS[dataset] if dataset else url
             output_path = output_path / Path(chosen_url).name
+    if local_fasta:
+        _refuse_overwriting(Path(local_fasta), output_path)
     if output_path.exists() and not force:
         click.echo(f"File already exists: {output_path}. Use --force to overwrite.")
         return
@@ -226,16 +247,19 @@ def get_file(dataset, url, local_fasta, output, force):
 @click.help_option("--help", "-h")
 def extract(input: str, output: str, force: bool):
     """Extract a .gz or .zst file"""
-    from nanoplm.data.preparation.data_config import strip_compressed
+    from nanoplm.data.preparation.data_config import is_compressed, strip_compressed
 
     input_path = Path(input)
     output_path = Path(output)
+    if not is_compressed(input):
+        raise click.ClickException(f"Input must be a .gz or .zst file, got: {input}")
 
     create_dirs(output_path)
 
     # Resolve output file path
     if output_path.is_dir():
         output_path = output_path / strip_compressed(input_path.name)
+    _refuse_overwriting(input_path, output_path)
 
     # Check if output file already exists
     if output_path.exists():
@@ -295,9 +319,7 @@ def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str)
 
     create_dirs(output_path)
 
-    if output_path.is_dir():
-        # x.fasta / x.fa -> x_shuffled.fasta
-        output_path = output_path / f"{input_path.stem}_shuffled.fasta"
+    output_path = _output_file(input_path, output_path, "_shuffled.fasta")
 
     do_shuffle = shuffle_flag.lower() == "true"
 
@@ -371,8 +393,7 @@ def filter(
 
     create_dirs(output_path)
 
-    if output_path.is_dir():
-        output_path = output_path / input_path.name.replace(".fasta", "_filtered.fasta")
+    output_path = _output_file(input_path, output_path, "_filtered.fasta")
 
     filterer = Filterer(
         input_path=input_path,
@@ -575,11 +596,9 @@ def kd_embed(
 
     create_dirs(output_path)
 
-    if output_path.is_dir():
-        output_path = output_path / input_path.name.replace(".fasta", "_kd_dataset.h5")
-    else:
-        if not str(output_path).endswith(".h5"):
-            raise click.ClickException("Output must end with .h5 or be a directory")
+    if not output_path.is_dir() and not str(output_path).endswith(".h5"):
+        raise click.ClickException("Output must end with .h5 or be a directory")
+    output_path = _output_file(input_path, output_path, "_kd_dataset.h5")
 
     if teacher_model == "prott5":
         selected_teacher_model = ProtT5()
@@ -1224,10 +1243,12 @@ def _validate_source_fields(data_dirs: dict) -> None:
     - Exactly one of url / local_fasta must be set.
     - The chosen source must end with .fasta or .fa, optionally .gz or .zst.
     - extracted_fasta is always required.
-    - compressed_fasta is required only when the source is compressed.
+    - compressed_fasta is required only when the source is compressed, and then ends with
+      the source's .gz / .zst (extract picks the decompressor by that name).
       In plain-.fasta mode it is optional; warn if it's set anyway.
     """
-    from nanoplm.data.preparation.data_config import is_compressed, is_fasta_name
+    from nanoplm.data.preparation.data_config import (compression_suffix, is_compressed,
+                                                      is_fasta_name, strip_compressed)
 
     url = data_dirs.get("url") or None
     local_fasta = data_dirs.get("local_fasta") or None
@@ -1257,6 +1278,14 @@ def _validate_source_fields(data_dirs: dict) -> None:
     if compressed_source and not compressed:
         raise click.ClickException(
             "data_dirs.compressed_fasta is required when source is a .gz or .zst file."
+        )
+    suffix = compression_suffix(source)
+    if compressed_source and not str(compressed).endswith(suffix):
+        key = "url" if url else "local_fasta"
+        raise click.ClickException(
+            f"data_dirs.compressed_fasta must end with {suffix} like data_dirs.{key} "
+            f"({source}): the extract stage picks the decompressor by this name. Set "
+            f'compressed_fasta: "{strip_compressed(str(compressed)) + suffix}"'
         )
     if (not compressed_source) and compressed:
         click.echo("Warning: data_dirs.compressed_fasta is unused when the source is a plain "

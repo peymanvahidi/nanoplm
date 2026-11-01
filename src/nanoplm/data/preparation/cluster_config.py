@@ -20,15 +20,18 @@ identity, -c coverage, --cov-mode 0).
 """
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
-import re
+import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from nanoplm.data.preparation.data_config import (file_name as _name, is_compressed, is_url,
-                                                  strip_compressed)
+from nanoplm.data.preparation.data_config import (fasta_stem, file_name as _name, is_compressed,
+                                                  is_fasta_name, is_url, strip_compressed)
+from nanoplm.data.preparation.extractor import ZSTD_MAX_WINDOW, ZSTD_MISSING
 
 UNIREF_BASE = "https://ftp.uniprot.org/pub/databases/uniprot/uniref"
 UNIPROT_FASTA = {lvl: f"{UNIREF_BASE}/{lvl}/{lvl}.fasta.gz"
@@ -57,19 +60,41 @@ class ClusterConfigError(ValueError):
     """A cluster_subsampling block cannot be resolved."""
 
 
+@contextlib.contextmanager
 def _open_fasta(path: Path):
-    """A FASTA for reading in binary, decompressed when it is .gz or .zst."""
-    if str(path).endswith(".zst"):
+    """A FASTA for reading in binary, decompressed when it is .gz or .zst. A .zst is read
+    with the zstandard package, else with the zstd tool; a bad .zst raises OSError."""
+    if not str(path).endswith(".zst"):
+        with (gzip.open if str(path).endswith(".gz") else open)(path, "rb") as f:
+            yield f
+        return
+    try:
         import zstandard
-        return io.BufferedReader(zstandard.open(path, "rb"))
-    return (gzip.open if str(path).endswith(".gz") else open)(path, "rb")
+    except ImportError:
+        zstandard = None
+    if zstandard is not None:
+        # the extractor's window limit: a --long=31 file needs more than the 128 MiB default
+        dctx = zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW)
+        with io.BufferedReader(zstandard.open(path, "rb", dctx=dctx)) as f:
+            try:
+                yield f
+            except zstandard.ZstdError as e:
+                raise OSError(f"{path}: {e}") from e
+        return
+    zstd = shutil.which("zstd")
+    if zstd is None:
+        raise ClusterConfigError(f"Reading the headers of {path} {ZSTD_MISSING}")
+    proc = subprocess.Popen([zstd, "-dcq", "--memory=2048MB", str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        yield proc.stdout
+    finally:
+        proc.kill()
+        proc.stdout.close()
+        proc.wait()
 
 
 def _header_level(path: Path) -> Optional[str]:
-    errors = (OSError, EOFError)
-    if str(path).endswith(".zst"):
-        from zstandard import ZstdError
-        errors += (ZstdError,)
     try:
         with _open_fasta(path) as f:
             for line in f:
@@ -78,7 +103,7 @@ def _header_level(path: Path) -> Optional[str]:
                         if line.startswith(b">UniRef" + lvl[6:].encode() + b"_"):
                             return lvl
                     return None
-    except errors:
+    except (OSError, EOFError):
         return None
     return None
 
@@ -94,8 +119,9 @@ def level_of(source: str, base_dir=None) -> Optional[str]:
     """'uniref50' / 'uniref90' / 'uniref100', or None for any other sequence set."""
     if not is_url(source) and on_disk(source, base_dir).is_file():
         return _header_level(on_disk(source, base_dir))
-    m = re.match(r"uniref(50|90|100)\.fasta(\.gz)?$", _name(source).lower())
-    return f"uniref{m.group(1)}" if m else None
+    name = _name(source).lower()
+    stem = fasta_stem(name) if is_fasta_name(name) else None
+    return stem if stem in ("uniref50", "uniref90", "uniref100") else None
 
 
 @dataclass

@@ -84,7 +84,7 @@ def test_extracts_zst_with_zstd_when_present(tmp_path):
 
 
 @pytest.mark.parametrize("zstd_on_path", [False, True])
-@pytest.mark.parametrize("damage", ["truncated", "corrupt"])
+@pytest.mark.parametrize("damage", ["truncated", "corrupt", "empty"])
 def test_a_broken_zst_raises_and_leaves_no_output(tmp_path, monkeypatch, zstd_on_path, damage):
     if zstd_on_path and not shutil.which("zstd"):
         pytest.skip("zstd not installed in test environment")
@@ -92,7 +92,8 @@ def test_a_broken_zst_raises_and_leaves_no_output(tmp_path, monkeypatch, zstd_on
         monkeypatch.setenv("PATH", str(tmp_path))
     whole = zstandard.ZstdCompressor().compress(bytes(range(256)) * 400)
     src = tmp_path / "bad.fa.zst"
-    src.write_bytes(whole[:-3] if damage == "truncated" else b"not a real zstd file")
+    src.write_bytes({"truncated": whole[:-3], "corrupt": b"not a real zstd file",
+                     "empty": b""}[damage])
     dst = tmp_path / "out.fa"
     with pytest.raises(ExtractionError):
         Extractor(input_path=src, output_path=dst).extract()
@@ -104,3 +105,26 @@ def test_other_suffixes_are_refused(tmp_path):
     src.write_bytes(b"x")
     with pytest.raises(ExtractionError, match=r"\.gz or \.zst"):
         Extractor(input_path=src, output_path=tmp_path / "out.fa").extract()
+
+
+def test_an_empty_gz_raises_without_pigz_too(tmp_path, monkeypatch):
+    """pigz refuses a 0-byte .gz; isal would write an empty FASTA."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    src = tmp_path / "empty.fasta.gz"
+    src.write_bytes(b"")
+    dst = tmp_path / "out.fasta"
+    with pytest.raises(ExtractionError, match=r"is empty \(0 bytes\)"):
+        Extractor(input_path=src, output_path=dst).extract()
+    assert not dst.exists()
+
+
+def test_a_zst_without_zstd_or_zstandard_says_what_to_install(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setenv("PATH", str(tmp_path))               # no zstd tool
+    monkeypatch.setitem(sys.modules, "zstandard", None)     # import zstandard fails
+    src, _ = _make_zst(tmp_path)
+    dst = tmp_path / "out.fa"
+    with pytest.raises(ExtractionError, match="pip install zstandard") as e:
+        Extractor(input_path=src, output_path=dst).extract()
+    assert "zstd" in str(e.value) and str(src) in str(e.value)
+    assert not dst.exists()

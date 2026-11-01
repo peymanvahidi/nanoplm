@@ -126,14 +126,29 @@ def file_name(value: str) -> str:
     return Path(urlparse(value).path if "://" in value else value).name
 
 
+def compression_suffix(value: str) -> str:
+    """``.gz`` or ``.zst`` for a URL or path of a compressed file, else ``""``."""
+    name = file_name(value)
+    return next((s for s in COMPRESSED_SUFFIXES if name.endswith(s)), "")
+
+
 def is_compressed(value: str) -> bool:
     """Whether a URL or path names a .gz or .zst file (by its extension only)."""
-    return file_name(value).endswith(COMPRESSED_SUFFIXES)
+    return bool(compression_suffix(value))
 
 
 def strip_compressed(name: str) -> str:
     """The file name once extracted: ``x.fa.zst`` -> ``x.fa``."""
     for suffix in COMPRESSED_SUFFIXES:
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+def fasta_stem(name: str) -> str:
+    """The file name without its FASTA and compression suffixes: ``x.fa.zst`` -> ``x``."""
+    name = strip_compressed(name)
+    for suffix in FASTA_SUFFIXES:
         if name.endswith(suffix):
             return name[:-len(suffix)]
     return name

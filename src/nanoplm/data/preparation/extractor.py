@@ -8,7 +8,10 @@ from nanoplm.utils.common import run_with_heartbeat
 
 _CHUNK_BYTES = 8 * 1024 * 1024
 # zstd --long=31 files need a 2 GB window; decoders refuse more than 128 MB by default
-_ZSTD_MAX_WINDOW = 1 << 31
+ZSTD_MAX_WINDOW = 1 << 31
+ZSTD_MISSING = ("needs the zstandard Python package or the zstd tool, and neither is "
+                "installed: run `pip install zstandard`, or put zstd on PATH "
+                "(e.g. `apt install zstd`)")
 
 
 class ExtractionError(Exception):
@@ -90,12 +93,15 @@ class Extractor:
         self._copy("isal", chunks, (IsalError, EOFError, OSError))
 
     def _extract_zstandard(self) -> None:
-        import zstandard
+        try:
+            import zstandard
+        except ImportError:
+            raise ExtractionError(f"Extracting {self.input_path} {ZSTD_MISSING}") from None
 
         def chunks(raw):
             # Frame by frame with decompressobj: stream_reader returns a truncated file
             # without an error, decompressobj leaves eof unset.
-            dctx = zstandard.ZstdDecompressor(max_window_size=_ZSTD_MAX_WINDOW)
+            dctx = zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW)
             dobj, in_frame = dctx.decompressobj(), False
             while data := raw.read(_CHUNK_BYTES):
                 while data:
@@ -114,6 +120,10 @@ class Extractor:
         """Write what ``chunks(reader)`` decompresses, logging progress against the
         compressed bytes read."""
         compressed_size = self.input_path.stat().st_size
+        if compressed_size == 0:
+            # pigz and zstd refuse an empty file; isal and zstandard would write an empty FASTA
+            raise ExtractionError(f"{tool} extraction failed: {self.input_path} is empty "
+                                  "(0 bytes)")
         last_percent = -1
 
         def _copy() -> None:

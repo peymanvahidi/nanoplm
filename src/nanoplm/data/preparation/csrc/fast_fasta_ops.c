@@ -1117,6 +1117,8 @@ API_EXPORT int nanoplm_shuffle_fasta(
  *     (e.g. 'a' is treated the same as 'A').
  *   - Whitespace inside AA lines is silently stripped: a line
  *     containing "MA G V" is treated as "MAGV".
+ *   - Headers and sequence lines are read with the filter's helpers, so a
+ *     header like "> b" has the id "b" here and in the filter.
  *
  * Return codes:
  *   0              success
@@ -1153,12 +1155,17 @@ static uint64_t fnv1a(const char *s) {
 }
 
 /* Extract the sequence id from a header string (after '>').
- * id = bytes up to first whitespace or '\0'.
+ * id = the first whitespace-separated word, like Python's header.split()[0]
+ * in cluster_table / cluster_index. The validator and the filter both call it
+ * on a header stored by dynbuf_set_header_from_line, so an id written to
+ * invalid_ids.txt is the id the filter looks up.
  * Caller must free the returned string. Returns NULL on alloc failure. */
 static char *extract_seq_id(const char *header) {
+    while (*header && is_whitespace((unsigned char)*header)) {
+        header++;
+    }
     size_t n = 0;
-    while (header[n] && header[n] != ' ' && header[n] != '\t' &&
-           header[n] != '\r' && header[n] != '\n') {
+    while (header[n] && !is_whitespace((unsigned char)header[n])) {
         n++;
     }
     char *id = (char *)malloc(n + 1);
@@ -1336,37 +1343,23 @@ API_EXPORT int validate_fasta_native(
             if (have_record) {
                 PROCESS_RECORD();
             }
-            /* Store new header (strip '>' and trailing whitespace) */
-            const char *hstart = linebuf + 1;
-            ssize_t hlen = linelen - 1;
-            while (hlen > 0 && (linebuf[hlen] == '\n' || linebuf[hlen] == '\r' ||
-                                 linebuf[hlen] == ' '  || linebuf[hlen] == '\t')) {
-                hlen--;
-            }
-            if (dynbuf_reserve(&cur_header, (size_t)hlen + 1) != 0) {
+            /* Store the header and read the sequence the way the filter does
+             * (same helpers), so both see the same record and the same id. */
+            if (dynbuf_set_header_from_line(&cur_header, linebuf + 1,
+                                            (size_t)(linelen - 1)) != 0) {
                 set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
                 rc = 1;
                 goto cleanup;
             }
-            if (hlen > 0) memcpy(cur_header.data, hstart, (size_t)hlen);
-            cur_header.len = (size_t)hlen;
-            cur_header.data[cur_header.len] = '\0';
             /* Reset sequence buffer */
             cur_seq.len = 0;
             if (cur_seq.data) cur_seq.data[0] = '\0';
             have_record = 1;
         } else if (have_record) {
-            /* Sequence line — accumulate (skip whitespace) */
-            for (ssize_t _i = 0; _i < linelen; _i++) {
-                unsigned char _c = (unsigned char)linebuf[_i];
-                if (_c == '\n' || _c == '\r' || _c == ' ' || _c == '\t') continue;
-                if (dynbuf_reserve(&cur_seq, cur_seq.len + 2) != 0) {
-                    set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
-                    rc = 1;
-                    goto cleanup;
-                }
-                cur_seq.data[cur_seq.len++] = (char)_c;
-                cur_seq.data[cur_seq.len]   = '\0';
+            if (dynbuf_append_seq_line(&cur_seq, linebuf, (size_t)linelen) != 0) {
+                set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
+                rc = 1;
+                goto cleanup;
             }
         }
     }

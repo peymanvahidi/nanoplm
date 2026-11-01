@@ -455,12 +455,30 @@ def test_the_old_layout_takes_fa_and_zst_too(source, ok):
     import click
     from nanoplm.cli.data import _validate_source_fields
     dirs = {"url" if source.startswith("http") else "local_fasta": source,
-            "extracted_fasta": "x.fa", "compressed_fasta": "x.fa.zst"}
+            "extracted_fasta": "x.fa", "compressed_fasta": "x.fa." + source.rsplit(".", 1)[1]}
     if ok:
         _validate_source_fields(dirs)
         return
     with pytest.raises(click.ClickException, match=r"\.fasta or \.fa \(optionally \.gz or \.zst\)"):
         _validate_source_fields(dirs)
+
+
+@pytest.mark.parametrize("key, source, compressed, fix", [
+    ("local_fasta", "/data/a.fa.zst", "out/raw/x.fasta.gz", "out/raw/x.fasta.zst"),
+    ("url", "https://x.org/a.fasta.gz", "out/raw/x.fa.zst", "out/raw/x.fa.gz"),
+    ("url", "https://x.org/a.fasta.gz", "out/raw/x.fasta", "out/raw/x.fasta.gz")])
+def test_the_old_layout_compressed_fasta_ends_like_the_source(key, source, compressed, fix):
+    """extract picks the decompressor by compressed_fasta's name: zstd bytes saved as .gz
+    would fail mid-run in pigz, so the config is refused up front with the value to set."""
+    import click
+    from nanoplm.cli.data import _validate_source_fields
+    dirs = {key: source, "extracted_fasta": "x.fa", "compressed_fasta": compressed}
+    with pytest.raises(click.ClickException) as e:
+        _validate_source_fields(dirs)
+    assert f"data_dirs.compressed_fasta must end with {source[source.rindex('.'):]}" in str(e.value)
+    assert f"data_dirs.{key} ({source})" in str(e.value)
+    assert f'Set compressed_fasta: "{fix}"' in str(e.value)
+    _validate_source_fields({**dirs, "compressed_fasta": fix})
 
 
 def test_from_yaml_builds_a_prodigal_fa_zst_without_stop_codons(tmp_path):
