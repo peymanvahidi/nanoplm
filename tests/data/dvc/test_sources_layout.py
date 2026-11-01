@@ -114,7 +114,7 @@ def test_summary_for_a_plain_source(tmp_path, monkeypatch):
     table = out[:out.index("Regenerated")]
     assert table == (
         f"data.yaml: 1 source -> {tmp_path}/output/data/pretrain_data\n"
-        "source     fasta                         max seqs  len     val  clustering\n"
+        "source     fasta                         max seqs  len     val  cluster subsampling\n"
         "swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off\n")
     assert "Rebuild: all (first run)" in out
     assert out.index("Rebuild:") < out.index("Running dvc repro")
@@ -150,9 +150,9 @@ def test_summary_for_a_uniref_cluster_source_marks_overrides(tmp_path, monkeypat
     assert table == (
         f"data.yaml: 1 source -> {tmp_path}/output/data/pretrain_data\n"
         "source    fasta                                            max seqs       len     val     "
-        "clustering\n"
+        "cluster subsampling\n"
         "uniref50  uniref90.fasta.gz (url) + uniref50.xml.gz (url)  all clusters*  20-512  0.0044  "
-        "UniProt uniref50.xml.gz (members: UniRef90)\n"
+        "clusters: UniProt uniref50.xml.gz | trains on: UniRef90 members\n"
         "* = set on this source\n")
 
 
@@ -276,10 +276,11 @@ def test_dvc_init_links_the_cache_for_the_sources_layout_only(tmp_path, monkeypa
      "max_workers: 1, register_tokens: 0}\n",
      "data.yaml: sources.a.fasta: missing.fasta not found"),
     ("output_dir: out\nsources:\n  a:\n    fasta: uniref50\n    cluster_subsampling:\n",
-     "sources.a.cluster_subsampling is empty. It needs members (null = this fasta)"),
+     "sources.a.cluster_subsampling is empty. Write cluster_subsampling: true to turn it on"),
     ("output_dir: out\nsources:\n  a:\n    fasta: uniref50\n    cluster_subsampling:\n"
      "      enabled: true\n      members: uniref90\n",
-     "remove enabled; the block being present turns it on"),
+     "remove enabled; cluster_subsampling: true turns it on, false (or no block) turns it "
+     "off"),
 ])
 def test_from_yaml_errors_before_dvc(tmp_path, monkeypatch, text, message):
     _no_dvc(monkeypatch)

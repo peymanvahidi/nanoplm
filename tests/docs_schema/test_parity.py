@@ -61,5 +61,11 @@ def test_data_surface_matches_data_config():
     assert set(spec) == set(_module_tuple(prep / "data_config.py", "SOURCE_KEYS"))
     assert set(spec["cluster_subsampling"]["properties"]) == set(
         _module_tuple(prep / "data_config.py", "CLUSTER_KEYS"))
-    assert spec["cluster_subsampling"]["properties"]["clustering"]["enum"] == list(
-        _module_tuple(prep / "cluster_config.py", "CLUSTERINGS"))
+    # clusters also takes a .tsv path, so it has no enum: the description names every
+    # word value
+    words = _module_tuple(prep / "cluster_config.py", "CLUSTERS")
+    text = spec["cluster_subsampling"]["properties"]["clusters"]["description"]
+    assert "enum" not in spec["cluster_subsampling"]["properties"]["clusters"]
+    assert all(w in text for w in words), (words, text)
+    for suffix in _module_tuple(prep / "cluster_config.py", "TSV_SUFFIXES"):
+        assert suffix in text

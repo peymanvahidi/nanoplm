@@ -107,7 +107,7 @@ nanoplm data from-yaml
 
 ```
 data.yaml: 1 source -> <cwd>/output/data/pretrain_data
-source     fasta                         max seqs  len     val  clustering
+source     fasta                         max seqs  len     val  cluster subsampling
 swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
 Regenerated <cwd>/dvc.yaml
 Initialized DVC repository in: <cwd> (cache.type hardlink,symlink)

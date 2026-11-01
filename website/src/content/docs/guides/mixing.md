@@ -36,7 +36,7 @@ A mix trains on two or more FASTA files at once. You list each file under `sourc
    ```text title="Output (trimmed)"
    data.yaml: 2 sources -> <cwd>/output/data/pretrain_data
    weight = share of training sequences
-   source     weight  fasta                                  max seqs  len     val        clustering
+   source     weight  fasta                                  max seqs  len     val        cluster subsampling
    swissprot  0.2     swissprot_300.fasta (local, 37.0 kB)   all       20-512  by weight  off
    uniref50   0.8     uniref50_3000.fasta (local, 662.8 kB)  all       20-512  by weight  off
    val = data_params.val_ratio: 0.05 of the pool, shared out by weight

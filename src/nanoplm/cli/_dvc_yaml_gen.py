@@ -372,7 +372,7 @@ def _val_split_stage(cfg, params_filename: str) -> dict:
 def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     """Stages for a source with a cluster_subsampling block (see cluster_pipeline's docstring).
 
-    Each stage lists only the params it reads, so changing clustering / identity /
+    Each stage lists only the params it reads, so changing clusters / identity /
     coverage reruns cluster_members and what follows it, never the pool. max_workers
     reaches cluster-pool and cluster-members through $NANOPLM_MAX_WORKERS, as for
     pre-tokenize, so a different core count reruns nothing.
@@ -438,13 +438,33 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     # and goes into the command as a value, so writing the default out reruns nothing.
     # Any other value was written in the block, so the ${...} reference resolves.
     block_key = f"sources.{src.name}.cluster_subsampling"
-    defaults = {"clustering": "auto", "identity": DEFAULT_IDENTITY, "coverage": DEFAULT_COVERAGE}
+    defaults = {"identity": DEFAULT_IDENTITY, "coverage": DEFAULT_COVERAGE}
 
     def changed(k):
         return getattr(plan, k) != defaults[k]
 
-    members_params = [f"{block_key}.clustering"] if changed("clustering") else []
-    if plan.cluster_source == "uniref_xml":
+    # The command names the cluster source, so `clusters` is no DVC param. The old key
+    # `clustering` set to uniprot or mmseqs2 stays one, so its dvc.lock stays valid.
+    old_key = f"{block_key}.clustering"
+    members_params = [old_key] if plan.clusters_key == old_key and plan.clusters != "auto" \
+        else []
+    if plan.cluster_source in ("tsv", "headers"):
+        # cluster_import checks the cluster file against every record before the length
+        # filter, so a min/max_seq_len change does not rerun it
+        members_deps = [members_fasta]
+        cmd = (f"nanoplm data cluster-members --source {plan.cluster_source} "
+               f"--fasta {members_fasta} ")
+        if plan.cluster_source == "tsv":
+            cluster_file = str(plan.tsv_path)
+            if plan.tsv_url:
+                stages["get_cluster_tsv"] = _download_stage(plan.tsv_url, cluster_file)
+            cmd += f"--tsv {cluster_file} "
+            members_deps.append(cluster_file)
+        cmd += f"-o {tsv}"
+        members_deps += [dep("src/nanoplm/data/preparation/cluster_import.py"),
+                         dep("src/nanoplm/data/preparation/cluster_table.py"),
+                         dep("src/nanoplm/data/preparation/uniref_hierarchy.py")]
+    elif plan.cluster_source == "uniref_xml":
         xml = str(plan.xml_path)
         stages["get_cluster_xml"] = {
             # like _download_stage, only the URL: no package path to rerun it
@@ -520,7 +540,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
 # stages a mix runs once per output path, whichever sources need them: fetching a URL,
 # extracting a .gz and checking the result, all in downloads/
 _SHARED_STAGES = {"get_file": "download", "get_members_fasta": "download",
-                  "get_cluster_xml": "download", "extract": "extract",
+                  "get_cluster_xml": "download", "get_cluster_tsv": "download",
+                  "extract": "extract",
                   "extract_members": "extract", "check": "check"}
 
 

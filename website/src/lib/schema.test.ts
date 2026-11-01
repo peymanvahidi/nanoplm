@@ -252,7 +252,8 @@ describe('toRows', () => {
     const spec = toRows(d, 'sources').map((r) => r.key);
     expect(spec).toEqual(expect.arrayContaining(['fasta', 'prepared', 'weight']));
     const cluster = toRows(d, 'sources.cluster_subsampling');
-    expect(cluster.find((r) => r.key === 'clustering')?.enum).toContain('mmseqs2');
+    // clusters also takes a .tsv path, so it has a default but no enum
+    expect(cluster.find((r) => r.key === 'clusters')?.default).toBe('auto');
     // Nested blocks are named by their last segment, so guide links keep resolving.
     expect(sectionPrefix(d, 'sources.cluster_subsampling')).toBe('data-cluster_subsampling');
     expect(toRows(d, 'no.such.block')).toEqual([]);

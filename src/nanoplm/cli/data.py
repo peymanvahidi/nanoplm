@@ -793,19 +793,33 @@ def get_cluster_xml(url: str, output: str):
 
 
 @data.command("cluster-members", hidden=True)
-@click.option("--source", required=True, type=click.Choice(["uniref_xml", "mmseqs"]))
+@click.option("--source", required=True,
+              type=click.Choice(["uniref_xml", "mmseqs", "tsv", "headers"]))
 @click.option("--fasta", required=True, type=click.Path(exists=True, dir_okay=False))
 @click.option("--output", "-o", required=True, type=click.Path(dir_okay=False))
 @click.option("--level", type=click.Choice(["uniref90", "uniref100"]), default=None)
 @click.option("--xml", type=click.Path(exists=True, dir_okay=False), default=None)
+@click.option("--tsv", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="The representative<TAB>member file (--source tsv).")
 @click.option("--identity", type=float, default=0.5)
 @click.option("--coverage", type=float, default=0.8)
 @click.option("--tmp-dir", type=click.Path(file_okay=False), default=None)
 @click.option("--threads", type=int,
               default=lambda: int(os.environ.get("NANOPLM_MAX_WORKERS", "2")),
               show_default="$NANOPLM_MAX_WORKERS or 2")
-def cluster_members(source, fasta, output, level, xml, identity, coverage, tmp_dir, threads):
+def cluster_members(source, fasta, output, level, xml, tsv, identity, coverage, tmp_dir,
+                    threads):
     """Internal: write the canonical cluster table (cluster_id<TAB>sequence_id)."""
+    if source in ("tsv", "headers"):
+        from nanoplm.data.preparation.cluster_import import (ClusterImportError,
+                                                             import_members_table)
+        try:
+            stats = import_members_table(source, Path(output), fasta=Path(fasta), tsv=tsv)
+        except (ClusterImportError, OSError) as e:
+            raise click.ClickException(str(e)) from None
+        click.echo(f"Wrote {output}: {stats['clusters']:,} clusters, "
+                   f"{stats['members']:,} sequences")
+        return
     from nanoplm.data.preparation.cluster_table import build_members_table
     stats = build_members_table(source, Path(output), fasta=Path(fasta), level=level,
                                 xml=Path(xml) if xml else None, identity=identity,
@@ -1565,9 +1579,11 @@ def _validate_cluster_block(src, config_path: Path):
     for w in plan.warnings:
         click.echo(f"Warning: {w}", err=True)
     if plan.cluster_source == "mmseqs" and find_mmseqs() is None:
-        uniprot = (f" Or set sources.{src.name}.cluster_subsampling.clustering: auto to use "
+        uniprot = (f" Or set sources.{src.name}.cluster_subsampling.clusters: auto to use "
                    "UniProt's clusters, which need no MMseqs2."
-                   if plan.members_level in ("uniref90", "uniref100") else "")
+                   if plan.members_level in ("uniref90", "uniref100") else
+                   " Or give the clusters yourself: clusters: <file>.tsv of "
+                   "representative<TAB>member lines.")
         raise click.ClickException(
             f"{config_path.name}: sources.{src.name}: these members are clustered with "
             f"MMseqs2, but `mmseqs` was not found. {MMSEQS_INSTALL_HINT}{uniprot}")
@@ -1656,6 +1672,10 @@ def _fasta_cell(src, plan, cwd: Path, shared=None) -> str:
                           cwd, shared, src.name)
     if plan is not None and plan.xml_url:
         cell += " + " + _file_cell(plan.xml_url, str(plan.xml_path), cwd, shared, src.name)
+    if plan is not None and plan.tsv_path:
+        cell += " + " + _file_cell(plan.tsv_url or plan.clusters,
+                                   str(plan.tsv_path) if plan.tsv_url else None, cwd, shared,
+                                   src.name)
     return cell
 
 
@@ -1684,7 +1704,7 @@ def plan_table(cfg, plans: dict, cwd: Path, config_path: Path) -> str:
     if mix:
         lines.append("weight = share of training sequences")
     rows = [("source",) + (("weight",) if mix else ())
-            + ("fasta", "max seqs", "len", "val", "clustering")]
+            + ("fasta", "max seqs", "len", "val", "cluster subsampling")]
     starred = False
     shared = {} if mix else None
     for src in cfg.sources.values():
@@ -1889,7 +1909,7 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
     if m.get("cluster_index_dir"):
         from nanoplm.data.preparation.cluster_config import resolve_cluster_plan
         plan = resolve_cluster_plan(cfg.source, cwd) if cfg is not None else None
-        source = f"  Cluster source:  {plan.source_line()}\n" if plan else ""
+        source = f"  Cluster source:  {plan.clusters_text()}\n" if plan else ""
         click.echo(
             f"\n{title} data pipeline complete (cluster subsampling).\n\n"
             f"  Members:         {plan.members if plan else src_value}\n"
@@ -1914,11 +1934,15 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
 
 
 def _clusters_line(m: dict) -> str:
-    """'UniRef50 clusters: 265 (members from UniRef90)', or 'MMseqs2 clusters: 40'."""
+    """'UniRef50 clusters: 265 (members from UniRef90)', 'MMseqs2 clusters: 40', or
+    'Clusters: 40 (from the CL: tags)'."""
     level = m.get("cluster_level")
     if level in ("uniref90", "uniref100"):
         return (f"UniRef50 clusters: {m.get('seqs_num')} "
                 f"(members from UniRef{level[len('uniref'):]})")
+    if level in ("tsv", "headers"):
+        what = "the cluster file" if level == "tsv" else "the CL: tags"
+        return f"Clusters:        {m.get('seqs_num')} (from {what})"
     return f"MMseqs2 clusters:  {m.get('seqs_num')}"
 
 

@@ -32,7 +32,7 @@ This step turns a FASTA file into what pretraining reads: tokenized sequences in
 
    ```text title="Output (trimmed)"
    data.yaml: 1 source -> <cwd>/output/data/pretrain_data
-   source     fasta                         max seqs  len     val  clustering
+   source     fasta                         max seqs  len     val  cluster subsampling
    swissprot  uniprot_sprot.fasta.gz (url)  20,000    20-512  0.1  off
    Regenerated <cwd>/dvc.yaml
    Initialized DVC repository in: <cwd> (cache.type hardlink,symlink)
@@ -91,7 +91,7 @@ Start with SwissProt (about 570k sequences). It downloads in minutes, so you can
 
 To reuse a dataset another `data.yaml` already built, write `prepared: <its output_dir>` instead of `fasta`. `from-yaml` checks that folder's manifest, prints what it holds and builds nothing. With only a `prepared` source, you can leave out `output_dir`.
 
-To train on one random member of every cluster per epoch (for example UniRef90 sequences under UniRef50 clusters), add a `cluster_subsampling` block to the source. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+To train on one random member of every cluster per epoch (for example UniRef90 sequences under UniRef50 clusters), set `cluster_subsampling: true` on the source, or a block with `members` or `clusters`. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 
 ## The whole config
 
@@ -143,7 +143,7 @@ Before any stage runs, `from-yaml` prints one row per source and one line saying
 
 ```text
 data.yaml: 1 source -> /work/output/data/pretrain_data
-source  fasta                               max seqs  len     val  clustering
+source  fasta                               max seqs  len     val  cluster subsampling
 mine    my_proteins.fasta (local, 66.0 kB)  200       20-512  0.1  off
 Regenerated /work/dvc.yaml
 Rebuild: all (first run)
@@ -155,7 +155,7 @@ Rebuild: all (first run)
 | `max seqs` | `max_seqs`, or `all` for `-1`. A cluster source counts clusters: `all clusters`, `20,000 clusters`. |
 | `len` | `min_seq_len`-`max_seq_len`. |
 | `val` | `val_ratio`. In a mix, or with `val_size`, `by weight`, and a line under the table gives the size of the whole mix's validation split. |
-| `clustering` | `off`, or where the clusters come from. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/#read-the-table). |
+| `cluster subsampling` | `off`, or where the clusters come from and what the source trains on. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/#read-the-table). |
 
 A `*` after a value means the source sets it itself instead of taking it from `data_params`.
 

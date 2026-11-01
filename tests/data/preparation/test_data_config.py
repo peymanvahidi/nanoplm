@@ -312,14 +312,36 @@ def test_the_block_being_present_turns_it_on():
     assert src.cluster == {"members": "uniref90"}
 
 
+@pytest.mark.parametrize("block, on", [(True, {}), (False, None), ({}, {})])
+def test_true_turns_it_on_with_every_field_left_out(block, on):
+    cfg = _parse(_with_source({"fasta": "uniref90", "cluster_subsampling": block}))
+    assert cfg.source.cluster == on and cfg.source.cluster_keys == {} and cfg.warnings == []
+
+
+def test_the_old_clustering_key_still_works_with_a_hint():
+    cfg = _parse(_with_source({"fasta": "uniref90",
+                               "cluster_subsampling": {"clustering": "mmseqs2"}}))
+    assert cfg.source.cluster == {"clusters": "mmseqs2"}
+    assert cfg.source.cluster_keys == {
+        "clusters": "sources.src.cluster_subsampling.clustering"}
+    assert cfg.warnings == ["sources.src.cluster_subsampling.clustering is now called "
+                            "clusters; the old name still works; renaming it reruns the "
+                            "cluster_members stage once"]
+    # auto: renaming it changes nothing in dvc.yaml, so the hint does not mention a rerun
+    cfg = _parse(_with_source({"fasta": "uniref90",
+                               "cluster_subsampling": {"clustering": "auto"}}))
+    assert cfg.warnings == ["sources.src.cluster_subsampling.clustering is now called "
+                            "clusters; the old name still works"]
+
+
 @pytest.mark.parametrize("block, match", [
-    (None, "cluster_subsampling is empty. It needs members"),          # bare `key:` / all commented
-    ({}, "cluster_subsampling needs members"),
-    ({"clustering": "auto"}, "cluster_subsampling needs members"),
+    (None, "cluster_subsampling is empty. Write cluster_subsampling: true to turn it on"),
     ({"members": None, "enabled": True},
-     "remove enabled; the block being present turns it on"),
-    ({"enabled": False}, "remove enabled; the block being present turns it on"),
-    ("yes", "must be a mapping"),
+     "remove enabled; cluster_subsampling: true turns it on, false"),
+    ({"enabled": False}, "remove enabled; cluster_subsampling: true turns it on"),
+    ("yes", "must be true, false or a mapping, got 'yes'"),
+    ({"clusters": "auto", "clustering": "auto"}, "set clusters or clustering, not both"),
+    ({"cluster": "auto"}, "unknown key cluster .allowed: members, clusters, identity, coverage"),
 ])
 def test_cluster_block_errors(block, match):
     with pytest.raises(dc.DataConfigError, match=match):

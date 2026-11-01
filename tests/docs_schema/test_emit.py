@@ -163,8 +163,8 @@ def test_cluster_fractions_exclude_zero():
         assert block[key]["exclusiveMinimum"] == 0 and "minimum" not in block[key]
         assert block[key]["maximum"] == 1
     assert block["identity"]["default"] == 0.5 and block["coverage"]["default"] == 0.8
-    assert block["clustering"]["enum"] == ["auto", "uniprot", "mmseqs2"]
-    assert "default" not in block["members"]  # the block needs members
+    assert block["clusters"]["default"] == "auto" and "enum" not in block["clusters"]
+    assert block["members"]["default"] is None   # left out: this source's fasta
 
 
 def test_data_schema_nests_source_specs_under_sources():
@@ -186,7 +186,8 @@ def test_data_schema_nests_source_specs_under_sources():
     assert spec["weight"]["type"] == "number" and spec["weight"]["default"] == 1.0
     assert "not tokens" in spec["weight"]["description"]
     assert spec["prepared"]["type"] == "string"
-    assert spec["cluster_subsampling"]["type"] == "object"
+    assert spec["cluster_subsampling"]["type"] == ["boolean", "object"]
+    assert spec["cluster_subsampling"]["default"] is False
 
 
 def test_data_params_rarely_changed_group():

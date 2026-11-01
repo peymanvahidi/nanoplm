@@ -457,28 +457,32 @@ x-extra-fields:
           not both. A prepared source takes no data_params overrides and no
           cluster_subsampling.
       cluster_subsampling:
-        type: object
+        type: [boolean, object]
+        default: false
         description: >-
           Turns on cluster subsampling for this source: each epoch trains on one
-          random member of every cluster. The block being present turns it on;
-          delete or comment it out to turn it off. max_seqs and val_ratio then
-          count clusters, not sequences.
+          random member of every cluster. true turns it on and finds the clusters
+          from the data; a mapping sets the fields below. false, or no key, turns it
+          off. max_seqs and val_ratio then count clusters, not sequences.
         properties:
-          # cluster_config.resolve_cluster_plan: null = this source's fasta.
-          # Required: the block needs members (data_config._cluster_block).
+          # cluster_config.resolve_cluster_plan: left out or null = this source's fasta.
           members:
             type: [string, "null"]
+            default: null
             description: >-
-              uniref90, uniref100, a UniRef90/100 FASTA URL/path, or null (= this
-              source's fasta). Required.
-          # cluster_config.CLUSTERINGS
-          clustering:
+              The sequences training draws from: uniref90, uniref100, or a UniRef90/100
+              FASTA URL/path. Leave it out to use this source's fasta.
+          # cluster_config.CLUSTERS, or a cluster file (cluster_config.TSV_SUFFIXES);
+          # the old name `clustering` still works (data_config.OLD_CLUSTER_KEYS)
+          clusters:
             type: string
             default: auto
-            enum: [auto, uniprot, mmseqs2]
             description: >-
-              auto: UniProt clusters for UniRef data, MMseqs2 otherwise; or
-              uniprot, mmseqs2
+              Where the clusters come from. auto: UniProt's clusters for UniRef data,
+              else CL:<cluster id> tags in the FASTA headers, else MMseqs2 (up to 20 GB
+              of FASTA; above that, set mmseqs2). Or mmseqs2, uniprot, headers, or a
+              .tsv / .tsv.gz / .tsv.zst file of representative<TAB>member lines (a path
+              or a URL). Called clustering before.
           # cluster_config._fraction: a number in (0, 1]; 0 itself is rejected
           identity:
             type: number

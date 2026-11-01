@@ -26,7 +26,7 @@ Each key under `sources` is a name you pick, using letters, digits and `_`. The 
 <ReferenceFields surface="data" section="sources" />
 
 ### cluster_subsampling
-The template has this block commented out. Writing it under a source turns cluster subsampling on. There is no `enabled` key. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+`cluster_subsampling: true` under a source turns cluster subsampling on, and nanoPLM finds the clusters from the data. Write a mapping with the fields below instead only to set one of them. `false`, or no key, turns it off. The template has an example, commented out. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 
 <ReferenceFields surface="data" section="sources.cluster_subsampling" />
 

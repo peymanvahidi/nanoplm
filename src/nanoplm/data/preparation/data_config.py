@@ -60,7 +60,8 @@ PARAM_DEFAULTS = {"drop_invalid_sequences": False, "shuffle": True, "shuffle_see
                   "samples_per_shard": 2000, "max_workers": 2, "register_tokens": 0}
 OLD_PARAM_NAMES = {"seqs_num": "max_seqs"}
 SOURCE_KEYS = ("fasta", "prepared", "weight", "cluster_subsampling")
-CLUSTER_KEYS = ("members", "clustering", "identity", "coverage")
+CLUSTER_KEYS = ("members", "clusters", "identity", "coverage")
+OLD_CLUSTER_KEYS = {"clustering": "clusters"}
 TOP_KEYS = ("output_dir", "sources", "data_params")
 DATA_DIRS_KEYS = ("url", "local_fasta", "compressed_fasta", "extracted_fasta", "validation_dir",
                   "shuffled_fasta", "filtered_fasta", "splitted_fasta_dir", "output_dir")
@@ -188,6 +189,7 @@ class Source:
     overrides: tuple = ()                  # data_params fields set on this source
     defaulted: frozenset = frozenset()     # fields at their PARAM_DEFAULTS value
     cluster: Optional[dict] = None         # the cluster_subsampling block, None = off
+    cluster_keys: dict = field(default_factory=dict)   # block field -> where data.yaml sets it
     paths: dict = field(default_factory=dict)
     output_dir: str = ""                   # the top-level output_dir (dataset_dir)
     downloads_dir: str = ""
@@ -310,21 +312,35 @@ def _fasta(value, where: str, base_dir) -> str:
     return fasta
 
 
-def _cluster_block(block, where: str) -> Optional[dict]:
+def _cluster_block(block, where: str, warnings: list) -> tuple:
+    """(the block's fields under their new names, {field: where data.yaml sets it}), or
+    (None, {}) when it is off. ``true`` turns it on with every field left out."""
     where = f"{where}.cluster_subsampling"
+    if block is True or block is False:
+        return ({} if block else None), {}
     if block is None:
-        raise DataConfigError(f"{where} is empty. It needs members (null = this fasta); "
-                              "delete the block to turn cluster subsampling off")
+        raise DataConfigError(f"{where} is empty. Write cluster_subsampling: true to turn it "
+                              "on (everything else is found from the data), or delete it to "
+                              "turn it off")
     if not isinstance(block, dict):
-        raise DataConfigError(f"{where} must be a mapping, got {block!r}")
+        raise DataConfigError(f"{where} must be true, false or a mapping, got {block!r}")
     if "enabled" in block:
-        raise DataConfigError(f"{where}: remove enabled; the block being present turns it on "
-                              "(delete or comment out the block to turn it off)")
-    _check_keys(where, block, CLUSTER_KEYS)
-    if "members" not in block:
-        raise DataConfigError(f"{where} needs members (null = this fasta); delete the block "
-                              "to turn cluster subsampling off")
-    return dict(block)
+        raise DataConfigError(f"{where}: remove enabled; cluster_subsampling: true turns it on, "
+                              "false (or no block) turns it off")
+    _check_keys(where, [OLD_CLUSTER_KEYS.get(k, k) for k in block], CLUSTER_KEYS)
+    out, keys = {}, {}
+    for k, v in block.items():
+        new = OLD_CLUSTER_KEYS.get(k, k)
+        if new != k:
+            if new in block:
+                raise DataConfigError(f"{where}: set {new} or {k}, not both ({k} is the old "
+                                      "name)")
+            rerun = ("" if v in (None, "auto") else
+                     "; renaming it reruns the cluster_members stage once")
+            warnings.append(f"{where}.{k} is now called {new}; the old name still works{rerun}")
+        out[new] = v
+        keys[new] = f"{where}.{k}"
+    return out, keys
 
 
 def _weight(value, where: str, single: bool) -> float:
@@ -369,7 +385,7 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
     out = {}
     for name, spec in sources.items():
         where = f"sources.{name}"
-        if name in CLUSTER_KEYS + ("cluster_subsampling",) + SOURCE_KEYS:
+        if name in (*CLUSTER_KEYS, *OLD_CLUSTER_KEYS, "cluster_subsampling", *SOURCE_KEYS):
             raise DataConfigError(f"{where}: {name} is not a source name; indent it under one")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise DataConfigError(f"{where}: a source name is letters, digits and _ (not "
@@ -415,7 +431,8 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
             continue
         src.fasta = _fasta(spec["fasta"], where, base_dir)
         if "cluster_subsampling" in spec:
-            src.cluster = _cluster_block(spec["cluster_subsampling"], where)
+            src.cluster, src.cluster_keys = _cluster_block(spec["cluster_subsampling"], where,
+                                                           warnings)
         merged = {**defaults, **over}
         missing = [f for f in PARAM_FIELDS
                    if f not in merged and f not in PARAM_DEFAULTS and f not in VAL_FIELDS]
