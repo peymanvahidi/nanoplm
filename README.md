@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="https://github.com/user-attachments/assets/dd520214-1f12-44c6-a6da-716934e4e981" alt="logo" width="600"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/nanoplm-logo-dark.png">
+  <img src=".github/assets/nanoplm-logo-light.png" alt="nanoPLM" width="600">
+</picture>
 
 **F**rom **F**ASTA to **F**oundation model - **F**ast.
 
