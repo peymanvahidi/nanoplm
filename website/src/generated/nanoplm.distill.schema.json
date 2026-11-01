@@ -181,6 +181,7 @@
           "enum": [
             "layer",
             "attn",
+            "attn_minimal",
             "attn+mlp"
           ]
         }

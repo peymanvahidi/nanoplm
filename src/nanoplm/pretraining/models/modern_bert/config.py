@@ -120,7 +120,7 @@ class ModernBertConfig:
     use_prores: bool = False
     prores_T: int = 1000
     activation_checkpointing: bool = False
-    activation_checkpointing_mode: Literal["layer", "attn", "attn+mlp"] = "layer"
+    activation_checkpointing_mode: Literal["layer", "attn", "attn_minimal", "attn+mlp"] = "layer"
     use_mhc_lite: bool = False
     mhc_n_streams: int = 4
     mhc_triton_fused: bool = False
@@ -498,7 +498,7 @@ class ModernBertConfig:
             ):
                 raise ValueError(
                     "MoE is not compatible with activation_checkpointing_mode='attn+mlp'. "
-                    "Use 'attn' or 'layer' mode instead."
+                    "Use 'attn', 'attn_minimal' or 'layer' mode instead."
                 )
             # Dense layers in MoE mode use the full active intermediate size
             # so they match the per-token compute of MoE layers.

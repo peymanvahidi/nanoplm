@@ -404,9 +404,10 @@
           "enum": [
             "layer",
             "attn",
+            "attn_minimal",
             "attn+mlp"
           ],
-          "description": "layer | attn | attn+mlp   (attn = highest ROI)"
+          "description": "layer | attn | attn_minimal | attn+mlp   (attn = highest ROI; attn_minimal = attn that keeps matmul + FA outputs: faster, more memory)"
         },
         "use_moe": {
           "type": "boolean",
