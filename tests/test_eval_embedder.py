@@ -13,8 +13,8 @@ import click
 import pytest
 import torch
 
-pytest.importorskip("biotrainer", reason="requires the nanoplm[eval] extra")
-pytest.importorskip("biotrainer_core", reason="requires the nanoplm[eval] extra")
+pytest.importorskip("biotrainer", reason="requires biotrainer")
+pytest.importorskip("biotrainer_core", reason="requires biotrainer")
 
 from nanoplm.cli.eval import _validate_frameworks  # noqa: E402
 from nanoplm.eval import embedder as embedder_module  # noqa: E402

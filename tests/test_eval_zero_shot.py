@@ -13,8 +13,8 @@ They are skipped unless the ``eval`` extra (biotrainer 2.x) is installed.
 import pytest
 import torch
 
-pytest.importorskip("biotrainer", reason="requires the nanoplm[eval] extra")
-pytest.importorskip("biotrainer_core", reason="requires the nanoplm[eval] extra")
+pytest.importorskip("biotrainer", reason="requires biotrainer")
+pytest.importorskip("biotrainer_core", reason="requires biotrainer")
 
 from nanoplm.eval.pipeline import _load_biotrainer_symbols  # noqa: E402
 from nanoplm.eval.zero_shot import (  # noqa: E402

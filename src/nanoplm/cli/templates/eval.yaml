@@ -1,7 +1,7 @@
 # Evaluation configuration for nanoPLM
 #
 # Runs biotrainer's autoeval pipeline on a pure-torch nanoPLM checkpoint.
-# Requires:  pip install nanoplm[eval]   (biotrainer 2.1.1)
+# Uses biotrainer 2.1.1, installed with nanoplm.
 #
 # The model config is loaded from <checkpoint_dir>/model_config.yaml.
 # Checkpoints without that file are not supported.

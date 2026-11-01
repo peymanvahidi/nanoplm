@@ -65,11 +65,10 @@ nanoplm deps install
 
 nanoplm data get-yaml && nanoplm data from-yaml
 nanoplm pretrain get-yaml && nanoplm pretrain from-yaml
-# optional: uv pip install -e ".[eval]"   (or the GitHub form)
 nanoplm eval get-yaml && nanoplm eval from-yaml
 ```
 
-Full install details (clusters, verify, the `eval` extra): [Install](/nanoplm/start/install/).
+Full install details (clusters, verify, benchmarking): [Install](/nanoplm/start/install/).
 
 The defaults are wired to chain: `data.yaml` writes shards to `output/data/pretrain_data/`, which
 is exactly where `pretrain.yaml` looks for them. The one value the defaults cannot guess is

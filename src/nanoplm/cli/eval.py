@@ -29,14 +29,14 @@ _REMOVED_FRAMEWORKS = {"pbc", "flip"}
 
 
 def _check_biotrainer_available() -> None:
-    """Abort early when biotrainer is requested but the extra is not installed."""
+    """Abort early when biotrainer is requested but not installed."""
     try:
         import biotrainer.autoeval  # noqa: F401
         import biotrainer_core.data_classes  # noqa: F401
     except ImportError:
         raise click.ClickException(
             "biotrainer 2.1.1 is required for nanoplm eval but is not installed.\n"
-            "Install it with:  pip install nanoplm[eval]"
+            "Reinstall nanoplm to pull it in."
         )
 
 
