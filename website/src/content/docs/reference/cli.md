@@ -72,6 +72,7 @@ Writes `data.yaml` and a matching `dvc.yaml`, the stage list DVC runs. `OUTPUT` 
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--distillation` | Write `distillation_data.yaml` instead of `data.yaml` | off |
+| `--subsampling` | Write a `data.yaml` set up for [cluster subsampling](/nanoplm/guides/cluster-subsampling/): UniRef50 clusters with UniRef90 members, plus commented examples for your own FASTA. Not with `--distillation` | off |
 | `--force` | Overwrite existing files | off |
 
 ```bash

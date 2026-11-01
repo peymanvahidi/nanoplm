@@ -95,28 +95,33 @@ To train on one random member of every cluster per epoch (for example UniRef90 s
 
 ## The whole config
 
-This is the template with its commented examples left out.
+This is the template `nanoplm data get-yaml` writes. `nanoplm data get-yaml --subsampling` writes one set up for [cluster subsampling](/nanoplm/guides/cluster-subsampling/) instead.
 
 ```yaml title="data.yaml"
 output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml's dataset_dir points here
 
-# One entry per FASTA. Several entries make a mix.
+# Multi-source dataset training: https://peymanvahidi.github.io/nanoplm/guides/mixing/
+# Cluster aware subsampling: https://peymanvahidi.github.io/nanoplm/guides/cluster-subsampling/
+#   or start from a ready-made file: nanoplm data get-yaml --subsampling (add --force to replace this file)
+
 # weight = share of training sequences (not tokens); weights must sum to 1.
 sources:
   swissprot:
     fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa (.gz/.zst)
-    weight: 1.0          # 0.2 when mixed with uniref50 below
-    # max_seq_len: 1024  # a data_params field set here overrides it (not val_ratio / val_size)
+    weight: 1.0
+    # max_seq_len: 1024  # overrides data_params.max_seq_len for this source only
 
-  # (a commented UniRef50 cluster-subsampling source with weight 0.8 and a
-  #  commented another_source follow)
+  # another_source:
+  #   fasta: "data/my_proteins.fasta"
+  #   weight: 0.1        # then lower the other weights so they sum to 1
 
 data_params:
   max_seqs: 20000        # -1 = all
   min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
   val_ratio: 0.1         # share of the mix held out for validation
-  # val_size: 150000     # or a fixed number of val sequences; set only one of the two
+  # OR (together you'll get error, comment one out)
+  # val_size: 150000
   drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
 
   # Rarely changed

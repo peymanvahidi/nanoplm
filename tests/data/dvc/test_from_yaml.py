@@ -112,8 +112,8 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
     cfg.write_text(load_template("data_pretrain"))
-    # data_pretrain.yaml has a commented-out source example starting with "# uniref50:"
-    assert "# uniref50:" in cfg.read_text()
+    # data_pretrain.yaml has a commented-out source example starting with "# another_source:"
+    assert "# another_source:" in cfg.read_text()
     (tmp_path / ".dvc").mkdir(exist_ok=True)
 
     # Stub dvc subprocess
@@ -130,7 +130,7 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     assert result.exit_code == 0, result.output
     # Comments preserved + key flipped
     after = cfg.read_text()
-    assert "# uniref50:" in after
+    assert "# another_source:" in after
     assert "drop_invalid_sequences: true" in after
 
 

@@ -940,15 +940,20 @@ def val_split_cmd(val_ratio, val_size, sources):
                 type=click.Path(file_okay=False, writable=True, resolve_path=True))
 @click.option("--distillation", is_flag=True, default=False,
               help="Emit distillation_data.yaml instead of data.yaml")
+@click.option("--subsampling", is_flag=True, default=False,
+              help="Emit a data.yaml set up for cluster subsampling")
 @click.option("--force", is_flag=True, default=False,
               help="Overwrite existing files")
 @click.help_option("--help", "-h")
-def get_yaml(output, distillation, force):
+def get_yaml(output, distillation, subsampling, force):
     """Generate template data.yaml + dvc.yaml for the data pipeline."""
     from nanoplm.cli.templates import load_template
     from nanoplm.cli._dvc_yaml_gen import generate_dvc_yaml
     import yaml
 
+    if distillation and subsampling:
+        raise click.UsageError("--subsampling and --distillation cannot be used together: "
+                               "cluster subsampling is for pretraining data. Pick one")
     output_path = Path(output) if output else Path.cwd()
     create_dirs(output_path)
 
@@ -958,7 +963,8 @@ def get_yaml(output, distillation, force):
         kind = "distillation"
     else:
         params_filename = "data.yaml"
-        params_content = load_template("data_pretrain")
+        params_content = load_template("data_pretrain_subsampling" if subsampling
+                                       else "data_pretrain")
         kind = "pretrain"
 
     params_path = output_path / params_filename

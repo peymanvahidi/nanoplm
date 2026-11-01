@@ -1,0 +1,44 @@
+output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml's dataset_dir points here
+
+# Multi-source dataset training: https://peymanvahidi.github.io/nanoplm/guides/mixing/
+# Cluster aware subsampling: https://peymanvahidi.github.io/nanoplm/guides/cluster-subsampling/
+
+# weight = share of training sequences (not tokens); weights must sum to 1.
+sources:
+  uniref50:
+    fasta: uniref50
+    weight: 1.0
+    cluster_subsampling:
+      members: uniref90  # train on these sequences; leave out to use this fasta
+      # clusters: auto   # auto (found from the data), mmseqs2, or a .tsv of representative<TAB>member
+
+  # Your own FASTA with a cluster file:
+  # my_data:
+  #   fasta: data/my_proteins.fasta
+  #   weight: 0.5        # then lower the other weights so they sum to 1
+  #   cluster_subsampling:
+  #     clusters: data/my_clusters.tsv   # representative<TAB>member, e.g. MMseqs2 output
+
+  # Your own FASTA without clusters (clustered with MMseqs2):
+  # my_other:
+  #   fasta: data/other_proteins.fasta
+  #   weight: 0.5
+  #   cluster_subsampling:
+  #     identity: 0.5    # min sequence identity within a cluster
+  #     coverage: 0.8    # min alignment coverage
+
+data_params:
+  max_seqs: -1           # counts clusters here: -1 = all
+  min_seq_len: 20        # shorter sequences are dropped
+  max_seq_len: 512       # longer sequences are dropped
+  val_ratio: 0.0044      # share of clusters held out for validation (the UniRef50 experiment)
+  # OR (together you'll get error, comment one out)
+  # val_size: 150000
+  drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
+
+  # Rarely changed
+  shuffle: true          # shuffle before the train / val split
+  shuffle_seed: 24
+  samples_per_shard: 2000  # sequences per shard file; raised automatically for large cluster datasets
+  max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores
+  register_tokens: 0     # 0, 1 or 2 scratch tokens after EOS

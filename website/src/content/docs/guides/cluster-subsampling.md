@@ -31,7 +31,7 @@ sources:
     cluster_subsampling: true
 ```
 
-Write a mapping instead of `true` only when you need to set something. This example trains on UniRef90 sequences under UniProt's UniRef50 clusters:
+Write a mapping instead of `true` only when you need to set something. This example, from `nanoplm data get-yaml --subsampling`, trains on UniRef90 sequences under UniProt's UniRef50 clusters:
 
 ```yaml title="data.yaml"
 sources:

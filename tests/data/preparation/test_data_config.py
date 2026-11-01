@@ -56,8 +56,12 @@ def test_the_template_comments_say_what_the_design_asks():
     assert "weight = share of training sequences (not tokens); weights must sum to 1" in text
     assert "max_seqs: 20000        # -1 = all" in text
     assert "# Rarely changed" in text
-    assert "#   cluster_subsampling:" in text and "# prepared:" in text
-    assert "enabled" not in text and "data_dirs" not in text
+    assert "nanoplm data get-yaml --subsampling" in text
+    assert "cluster_subsampling:" not in text and "prepared" not in text
+    sub = load_template("data_pretrain_subsampling")
+    assert "    cluster_subsampling:\n      members: uniref90" in sub
+    for t in (text, sub):
+        assert "enabled" not in t and "data_dirs" not in t
 
 
 @pytest.mark.parametrize("name", list(dc.FASTA_SHORTCUTS))
@@ -174,22 +178,38 @@ def _mix(**sources):
     return cfg
 
 
+def _uncomment(text: str, start: str, end: str) -> str:
+    block = text[text.index(start):text.index(end) if end else len(text)]
+    lines = [ln.replace("  # ", "  ", 1) for ln in block.splitlines()
+             if not ln.lstrip().startswith("# Your own")]
+    return text.replace(block, "\n".join(lines) + "\n")
+
+
 def test_the_templates_commented_mix_parses():
-    """Uncommenting uniref50 and setting swissprot to 0.2 gives the design's mix."""
-    text = load_template("data_pretrain")
-    block = text[text.index("  # uniref50:"):text.index("  # another_source:")]
-    uncommented = "\n".join(ln.replace("  # ", "  ", 1) for ln in block.splitlines())
-    cfg = yaml.safe_load(text.replace(block, uncommented + "\n")
-                         .replace("weight: 1.0 ", "weight: 0.2 "))
-    got = _parse(cfg)
+    """Uncommenting another_source and lowering swissprot's weight gives a mix."""
+    text = _uncomment(load_template("data_pretrain"), "  # another_source:", "data_params:")
+    got = _parse(yaml.safe_load(text.replace("weight: 1.0", "weight: 0.9")))
     assert got.is_mixture and {n: s.weight for n, s in got.sources.items()} == {
-        "swissprot": 0.2, "uniref50": 0.8}
-    assert got.sources["uniref50"].cluster["members"] == "uniref90"
+        "swissprot": 0.9, "another_source": 0.1}
+    assert got.sources["another_source"].fasta == "data/my_proteins.fasta"
     out = "output/data/pretrain_data"
-    assert got.sources["uniref50"].data_dir == f"{out}/uniref50"
     assert got.sources["swissprot"].paths["output_dir"] == f"{out}/swissprot"
     with pytest.raises(dc.DataConfigError, match="2 sources; use cfg.sources"):
         got.source
+
+
+def test_the_subsampling_templates_commented_sources_parse():
+    """Its two commented sources: a cluster file, and MMseqs2 with identity / coverage."""
+    text = _uncomment(load_template("data_pretrain_subsampling"), "  # Your own FASTA with",
+                      "data_params:")
+    cfg = yaml.safe_load(text)
+    cfg["sources"]["uniref50"]["weight"] = 0.2
+    cfg["sources"]["my_data"]["weight"] = cfg["sources"]["my_other"]["weight"] = 0.4
+    got = _parse(cfg)
+    assert got.sources["uniref50"].cluster == {"members": "uniref90"}
+    assert got.sources["my_data"].cluster == {"clusters": "data/my_clusters.tsv"}
+    assert got.sources["my_other"].cluster == {"identity": 0.5, "coverage": 0.8}
+    assert got.warnings == []
 
 
 @pytest.mark.parametrize("weights", [(0.1, 0.2, 0.7), (0.3333333, 0.3333333, 0.3333334)])
