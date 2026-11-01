@@ -57,8 +57,6 @@ nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
 nanoplm-eval = "nanoplm.cli.eval:eval"
 
 [project.optional-dependencies]
-# Kept so older `nanoplm[eval]` installs still resolve; biotrainer is now a core dependency.
-eval = []
 docs = ["pyyaml>=6"]
 
 [project.urls]
