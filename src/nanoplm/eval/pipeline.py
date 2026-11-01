@@ -54,7 +54,7 @@ def _load_biotrainer_symbols() -> dict[str, Any]:
     except ImportError as e:
         raise ImportError(
             "biotrainer 2.1.1 is required for nanoplm eval but is not installed "
-            f"or has an incompatible API. Install with: pip install nanoplm[eval]. "
+            f"or has an incompatible API. Reinstall nanoplm to pull it in. "
             f"Original error: {e}"
         ) from e
 

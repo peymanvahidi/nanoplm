@@ -9,8 +9,6 @@ import ReferenceFields from '../../../components/ReferenceFields.astro';
 
 The surface is flat (a single `eval:` block) and it is short because a checkpoint is self-describing. It carries its own `model_config.yaml`, so the one field you must supply is [`checkpoint_dir`](#eval-checkpoint_dir), which accepts either a `checkpoint-*` directory or a `run-*` directory (in which case the newest checkpoint inside it is used). Required fields carry a teal asterisk.
 
-Two constraints are worth knowing before you run it. Evaluation needs the `eval` extra
-(`uv pip install -e ".[eval]"` or the GitHub form in [Install](/nanoplm/start/install/)), and it
-loads **pure-torch checkpoints only**.
+One constraint is worth knowing before you run it: evaluation loads **pure-torch checkpoints only**.
 
 <ReferenceFields surface="eval" />

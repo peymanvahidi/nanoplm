@@ -310,7 +310,7 @@ Flag-driven pretraining without a YAML file. `--dataset-dir` is the only require
 
 ## eval
 
-`nanoplm eval` scores a checkpoint on zero-shot and supervised probe benchmarks through biotrainer 2.1.1's autoeval. It needs the `eval` extra (`uv pip install -e ".[eval]"` or the GitHub equivalent; see [Install](/nanoplm/start/install/)), and it loads **pure-torch checkpoints only**. Fields are documented in the [eval.yaml reference](/nanoplm/reference/eval/). The old probe suites (`pbc`, `flip`) were dropped in the biotrainer 2.0.0 migration; passing them fails with a message naming the supported frameworks.
+`nanoplm eval` scores a checkpoint on zero-shot and supervised probe benchmarks through biotrainer 2.1.1's autoeval. It loads **pure-torch checkpoints only**. Fields are documented in the [eval.yaml reference](/nanoplm/reference/eval/). The old probe suites (`pbc`, `flip`) were dropped in the biotrainer 2.0.0 migration; passing them fails with a message naming the supported frameworks.
 
 ### eval get-yaml
 

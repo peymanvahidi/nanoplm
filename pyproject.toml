@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Make your own protein language model, faster than ever."
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 authors = [
     {name = "Peyman Vahidi", email = "peyman.vahidi@helmholtz-munich.de"},
 ]
@@ -30,6 +30,8 @@ keywords = ["bioinformatics", "protein-language-model", "large-language-models"]
 dependencies = [
     "accelerate>=1.7.0",
     "biopython>=1.85",
+    "biotrainer==2.1.1",
+    "biotrainer-core==2.1.1",
     "click>=8.1.8",
     "dvc>=3.59.1",
     "h5py>=3.13.0",
@@ -55,7 +57,8 @@ nanoplm-pretrain = "nanoplm.cli.pretrain:pretrain"
 nanoplm-eval = "nanoplm.cli.eval:eval"
 
 [project.optional-dependencies]
-eval = ["biotrainer==2.1.1", "biotrainer-core==2.1.1"]
+# Kept so older `nanoplm[eval]` installs still resolve; biotrainer is now a core dependency.
+eval = []
 docs = ["pyyaml>=6"]
 
 [project.urls]
