@@ -28,42 +28,6 @@ const description =
   'nanoPLM pretrains a protein language model from a FASTA file. Three YAML files, six commands, and reproducible artifacts that flow between them.';
 const ogImage = new URL(logo.src, Astro.site).href;
 
-// The quickstart, split so each block gets its own copy button. These are the
-// same commands as the install docs; the section links there for the full story
-// (clusters, verification, the eval extra) rather than duplicating it.
-const STEPS = [
-  {
-    n: '01',
-    title: 'Install',
-    body: 'One pinned GPU stack: torch, Transformer Engine, FlashAttention-3, SonicMoE and Dion.',
-    code: `uv venv && source .venv/bin/activate
-uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \\
-    --extra-index-url https://download.pytorch.org/whl/cu130
-nanoplm deps install`,
-  },
-  {
-    n: '02',
-    title: 'Prepare data',
-    body: 'FASTA in, tokenized shards out, tracked by DVC and described by a manifest.',
-    code: `nanoplm data get-yaml
-nanoplm data from-yaml`,
-  },
-  {
-    n: '03',
-    title: 'Pretrain',
-    body: 'Shards in, a checkpoint out. The manifest tells pretraining what the data stage decided.',
-    code: `nanoplm pretrain get-yaml
-nanoplm pretrain from-yaml`,
-  },
-  {
-    n: '04',
-    title: 'Evaluate',
-    body: 'A checkpoint in, benchmark scores out, via biotrainer’s autoeval pipeline.',
-    code: `nanoplm eval get-yaml
-nanoplm eval from-yaml`,
-  },
-];
-
 // `hue` walks the logo left to right, so the six cards together replay the
 // wordmark's own sweep rather than repeating one accent six times.
 const FEATURES = [
@@ -238,22 +202,9 @@ const AFFILIATIONS = [
               </a>
             </div>
 
-            <div class="install-line">
+            <div class="install-line soon" aria-disabled="true">
               <code>uv pip install nanoplm &amp;&amp; nanoplm deps install</code>
-              <button
-                class="copy"
-                type="button"
-                data-copy="uv pip install nanoplm && nanoplm deps install"
-                aria-label="Copy install command"
-              >
-                <svg class="i-copy" viewBox="0 0 24 24" aria-hidden="true"
-                  ><rect width="14" height="14" x="8" y="8" rx="2"></rect><path
-                    d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></svg
-                >
-                <svg class="i-check" viewBox="0 0 24 24" aria-hidden="true"
-                  ><path d="M20 6 9 17l-5-5"></path></svg
-                >
-              </button>
+              <span class="soon-tag">Soon on PyPI</span>
             </div>
             <p class="fineprint">
               Hopper GPU and CUDA 13 required. <a href={`${base}/start/install/`}>Full install</a>.
@@ -261,7 +212,7 @@ const AFFILIATIONS = [
           </div>
 
           <!-- A real session, not a mockup of one: these are the commands from
-               the quickstart and the log lines the pretrain loop actually
+               the pipeline and the log lines the pretrain loop actually
                prints. The lines fade in one by one on load, and appear at once
                when reduced motion is requested. -->
           <div class="term" data-reveal-seq>
@@ -374,42 +325,6 @@ const AFFILIATIONS = [
         </div>
       </section>
 
-      <!-- ================= THE LOOP ================= -->
-      <section class="band alt" id="loop">
-        <div class="shell">
-          <header class="sec-head" data-reveal>
-            <p class="kicker">The loop</p>
-            <h2>Every stage has the same two verbs</h2>
-            <p class="sub">
-              Learn the loop once and you know the whole tool. <code>get-yaml</code> scaffolds a
-              fully commented config, you edit it, <code>from-yaml</code> runs it. Shown for
-              pretraining; swap in <code>data</code> or <code>eval</code> and the shape is identical.
-            </p>
-          </header>
-
-          <ol class="loop" data-reveal>
-            <li style="--h: var(--c-indigo)">
-              <span class="loop-n">1</span>
-              <h3>Scaffold</h3>
-              <p>A config with every key explained in place, written to your working directory.</p>
-              <code class="loop-code"><i>$</i> nanoplm pretrain get-yaml</code>
-            </li>
-            <li style="--h: var(--c-cyan)">
-              <span class="loop-n">2</span>
-              <h3>Edit</h3>
-              <p>Change what your experiment needs. Every field is commented in place, so you rarely leave the file.</p>
-              <code class="loop-code"><i>#</i> $EDITOR pretrain.yaml</code>
-            </li>
-            <li style="--h: var(--c-violet)">
-              <span class="loop-n">3</span>
-              <h3>Run</h3>
-              <p>The config is the run. Rerunning the same file reproduces the same result.</p>
-              <code class="loop-code"><i>$</i> nanoplm pretrain from-yaml</code>
-            </li>
-          </ol>
-        </div>
-      </section>
-
       <!-- ================= PIPELINE ================= -->
       <section class="band" id="pipeline">
         <div class="shell">
@@ -435,49 +350,6 @@ const AFFILIATIONS = [
               >
             </a>
           </p>
-        </div>
-      </section>
-
-      <!-- ================= QUICKSTART ================= -->
-      <section class="band alt" id="quickstart">
-        <div class="shell">
-          <header class="sec-head" data-reveal>
-            <p class="kicker">Quickstart</p>
-            <h2>Zero to a trained model</h2>
-            <p class="sub">
-              The defaults are wired to chain: <code>data.yaml</code> writes shards exactly where
-              <code>pretrain.yaml</code> looks for them. The one value the defaults cannot guess is
-              <code>eval.checkpoint_dir</code>, so point that at the run you just trained.
-            </p>
-          </header>
-
-          <ol class="steps">
-            {
-              STEPS.map((s) => (
-                <li data-reveal>
-                  <div class="step-head">
-                    <span class="step-n">{s.n}</span>
-                    <div>
-                      <h3>{s.title}</h3>
-                      <p>{s.body}</p>
-                    </div>
-                  </div>
-                  <div class="code-card">
-                    <button class="copy" type="button" data-copy={s.code} aria-label={`Copy the ${s.title.toLowerCase()} commands`}>
-                      <svg class="i-copy" viewBox="0 0 24 24" aria-hidden="true">
-                        <rect width="14" height="14" x="8" y="8" rx="2" />
-                        <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
-                      </svg>
-                      <svg class="i-check" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                    </button>
-                    <pre><code>{s.code}</code></pre>
-                  </div>
-                </li>
-              ))
-            }
-          </ol>
         </div>
       </section>
 
@@ -639,20 +511,6 @@ const AFFILIATIONS = [
     </footer>
 
     <script>
-      // Copy buttons. The button swaps to a check for a moment, which is the
-      // only feedback a copy action can honestly give.
-      document.querySelectorAll<HTMLButtonElement>('button[data-copy]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          try {
-            await navigator.clipboard.writeText(btn.dataset.copy ?? '');
-            btn.classList.add('copied');
-            setTimeout(() => btn.classList.remove('copied'), 1600);
-          } catch {
-            // Clipboard access can be denied; the text is selectable anyway.
-          }
-        });
-      });
-
       // Theme toggle, writing the key Starlight reads so the choice carries
       // over to the docs and back.
       const toggle = document.getElementById('theme-toggle');
@@ -842,8 +700,6 @@ const AFFILIATIONS = [
          that can contain code is allowed to shrink instead, which lets the code
          scroll inside its own box the way it should. */
       .hero-grid > *,
-      .loop li,
-      .steps li,
       .card,
       .install-grid > *,
       .reqs > div,
@@ -1179,50 +1035,20 @@ const AFFILIATIONS = [
         text-underline-offset: 3px;
       }
 
-      /* Copy button: 44px hit area, icon crossfade on success. */
-      .copy {
-        position: relative;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
+      /* Not on PyPI yet: the command is shown greyed out, without a copy button. */
+      .install-line.soon code {
+        color: var(--sl-color-gray-4);
+        user-select: none;
+      }
+      .soon-tag {
         flex-shrink: 0;
-        width: 2.2rem;
-        height: 2.2rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 0.45rem;
-        background: var(--surface-2);
-        color: var(--sl-color-gray-3);
-        cursor: pointer;
-        transition:
-          color 0.18s ease,
-          border-color 0.18s ease;
-      }
-      .copy::after {
-        /* Pads the pointer target out to 44px without moving the visual box. */
-        content: '';
-        position: absolute;
-        inset: -0.6rem;
-      }
-      .copy:hover {
+        padding: 0.2rem 0.6rem;
+        border: 1px solid var(--sl-color-accent);
+        border-radius: 999px;
+        font-size: 0.72rem;
+        font-weight: 500;
+        white-space: nowrap;
         color: var(--sl-color-accent-high);
-        border-color: var(--sl-color-accent);
-      }
-      .copy svg {
-        width: 0.95rem;
-        height: 0.95rem;
-      }
-      .copy .i-check {
-        display: none;
-      }
-      .copy.copied {
-        color: var(--sl-color-accent);
-        border-color: var(--sl-color-accent);
-      }
-      .copy.copied .i-copy {
-        display: none;
-      }
-      .copy.copied .i-check {
-        display: block;
       }
 
       /* --- Terminal --------------------------------------------------------- */
@@ -1552,155 +1378,12 @@ const AFFILIATIONS = [
         transform: translateX(3px);
       }
 
-      /* --- The loop --------------------------------------------------------- */
-      .loop {
-        display: grid;
-        gap: 1rem;
-        counter-reset: loop;
-      }
-      /* Three across only once a card is wide enough for a whole command on one
-         line. Below that the stacked layout wins, because a command clipped
-         mid-word reads as broken in a way a taller card does not. */
-      @media (min-width: 54rem) {
-        .loop {
-          grid-template-columns: repeat(3, 1fr);
-        }
-        .loop-code {
-          font-size: 0.72rem;
-        }
-      }
-      .loop li {
-        position: relative;
-        padding: 1.6rem 1.5rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 0.75rem;
-        background: var(--surface);
-      }
-      /* A connector between the three steps, so they read as one loop rather
-         than three unrelated cards. Wide screens only, where they sit in a row. */
-      @media (min-width: 54rem) {
-        .loop li:not(:last-child)::after {
-          content: '';
-          position: absolute;
-          top: 2.55rem;
-          right: -1rem;
-          width: 1rem;
-          border-top: 1px dashed var(--sl-color-gray-4);
-        }
-      }
-      .loop-n {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 1.7rem;
-        height: 1.7rem;
-        border-radius: 999px;
-        background: color-mix(in srgb, var(--h) 16%, transparent);
-        font-family: var(--sl-font-mono);
-        font-size: 0.78rem;
-        font-weight: 600;
-        color: var(--h);
-      }
-      .loop h3 {
-        margin-top: 0.85rem;
-        font-size: 1.1rem;
-        font-weight: 650;
-        letter-spacing: -0.015em;
-      }
-      .loop p {
-        margin-top: 0.4rem;
-        font-size: 0.9rem;
-        line-height: 1.6;
-        color: var(--sl-color-gray-3);
-      }
-      .loop-code {
-        display: block;
-        margin-top: 1.1rem;
-        padding-top: 0.9rem;
-        border-top: 1px solid var(--sl-color-hairline-shade);
-        font-size: 0.76rem;
-        color: var(--sl-color-gray-2);
-        overflow-x: auto;
-        white-space: nowrap;
-      }
-      .loop-code i {
-        font-style: normal;
-        color: var(--h);
-      }
-
       /* --- Pipeline host ----------------------------------------------------- */
       /* PipelineDiagram is a container-query component sized for the 50rem prose
          column, so it is given exactly that much room and centred here. */
       .pipe-host {
         max-width: 54rem;
         margin-inline: auto;
-      }
-
-      /* --- Quickstart steps -------------------------------------------------- */
-      .steps {
-        display: grid;
-        gap: 1rem;
-      }
-      @media (min-width: 56rem) {
-        .steps {
-          grid-template-columns: repeat(2, 1fr);
-          gap: 1.25rem;
-        }
-      }
-      .steps li {
-        display: flex;
-        flex-direction: column;
-        padding: 1.6rem 1.5rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 0.75rem;
-        background: var(--surface);
-      }
-      .step-head {
-        display: flex;
-        gap: 0.9rem;
-      }
-      .step-n {
-        flex-shrink: 0;
-        font-family: var(--sl-font-mono);
-        font-size: 0.78rem;
-        font-weight: 600;
-        line-height: 1.7;
-        color: var(--sl-color-accent);
-      }
-      .steps h3 {
-        font-size: 1.1rem;
-        font-weight: 650;
-        letter-spacing: -0.015em;
-      }
-      .steps .step-head p {
-        margin-top: 0.35rem;
-        font-size: 0.9rem;
-        line-height: 1.6;
-        color: var(--sl-color-gray-3);
-      }
-      .code-card {
-        position: relative;
-        margin-top: 1.2rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 0.55rem;
-        background: color-mix(in srgb, var(--sl-color-bg) 70%, var(--surface-2));
-      }
-      :global([data-theme='light']) .code-card {
-        background: #f2f6f6;
-      }
-      .code-card .copy {
-        position: absolute;
-        top: 0.5rem;
-        right: 0.5rem;
-        z-index: 1;
-      }
-      .code-card pre {
-        margin: 0;
-        padding: 0.9rem 3rem 0.9rem 1rem;
-        overflow-x: auto;
-        font-size: 0.775rem;
-        line-height: 1.75;
-        color: var(--sl-color-gray-1);
       }
 
       /* --- Feature cards ----------------------------------------------------- */
