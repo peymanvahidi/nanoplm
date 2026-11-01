@@ -9,7 +9,6 @@
 // It still imports the docs stylesheet, so every colour, font and light/dark
 // override comes from the one place that already defines them. Nothing about
 // the palette is restated here; if custom.css changes, this page follows.
-import fs from 'node:fs';
 import { Image } from 'astro:assets';
 import logo from '../assets/nanoplm-logo.png';
 import tumLogo from '../assets/logo-tum.svg';
@@ -23,18 +22,6 @@ import '../styles/custom.css';
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const GITHUB = 'https://github.com/peymanvahidi/nanoplm';
 const PYPI = 'https://pypi.org/project/nanoplm/';
-
-// Read the version from the package metadata instead of hardcoding it. The docs
-// already generate their reference tables from the source of truth so they
-// cannot go stale; the one number on the landing page should not be the
-// exception that quietly rots.
-let version = '';
-try {
-  const pyproject = fs.readFileSync(new URL('../../../pyproject.toml', import.meta.url), 'utf8');
-  version = pyproject.match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? '';
-} catch {
-  // A missing pyproject only costs us the version chip, so render without it.
-}
 
 const title = 'nanoPLM: from FASTA to a protein language model';
 const description =
@@ -219,12 +206,6 @@ const AFFILIATIONS = [
         <div class="hero-glow" aria-hidden="true"></div>
         <div class="shell hero-grid">
           <div class="hero-copy">
-            <p class="eyebrow">
-              <span class="dot" aria-hidden="true"></span>
-              Encoder-only protein language models
-              {version && <span class="ver">v{version}</span>}
-            </p>
-
             {/* Broken by hand into three lines. Left to wrap on its own the
                 article "a" ends up orphaned on a line of its own, and the
                 headline is short enough that these breaks hold down to 320px. */}
@@ -1110,47 +1091,6 @@ const AFFILIATIONS = [
           gap: 3.5rem;
           padding-bottom: 5.5rem;
         }
-      }
-
-      .eyebrow {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        margin-bottom: 1.5rem;
-        padding: 0.3rem 0.75rem 0.3rem 0.6rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 999px;
-        background: var(--surface);
-        font-size: 0.775rem;
-        font-weight: 500;
-        color: var(--sl-color-gray-2);
-      }
-      .dot {
-        width: 0.4rem;
-        height: 0.4rem;
-        border-radius: 999px;
-        background: var(--sl-color-accent);
-      }
-      @media (prefers-reduced-motion: no-preference) {
-        .dot {
-          animation: pulse 2.6s ease-in-out infinite;
-        }
-      }
-      @keyframes pulse {
-        0%,
-        100% {
-          opacity: 1;
-        }
-        50% {
-          opacity: 0.35;
-        }
-      }
-      .ver {
-        padding-left: 0.55rem;
-        border-left: 1px solid var(--sl-color-hairline-shade);
-        font-family: var(--sl-font-mono);
-        font-size: 0.72rem;
-        color: var(--sl-color-accent-high);
       }
 
       h1 {
