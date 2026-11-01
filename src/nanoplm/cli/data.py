@@ -140,7 +140,7 @@ def data():
     required=False,
     type=str,
     default="",
-    help="Local .fasta or .fasta.gz path (empty string treated as null).",
+    help="Local .fasta or .fa path, optionally .gz or .zst (empty string treated as null).",
 )
 @click.option(
     "--output",
@@ -225,7 +225,9 @@ def get_file(dataset, url, local_fasta, output, force):
 )
 @click.help_option("--help", "-h")
 def extract(input: str, output: str, force: bool):
-    """Extract compressed dataset files"""
+    """Extract a .gz or .zst file"""
+    from nanoplm.data.preparation.data_config import strip_compressed
+
     input_path = Path(input)
     output_path = Path(output)
 
@@ -233,7 +235,7 @@ def extract(input: str, output: str, force: bool):
 
     # Resolve output file path
     if output_path.is_dir():
-        output_path = output_path / input_path.name.replace(".gz", "")
+        output_path = output_path / strip_compressed(input_path.name)
 
     # Check if output file already exists
     if output_path.exists():
@@ -284,9 +286,9 @@ def extract(input: str, output: str, force: bool):
 @click.help_option("--help", "-h")
 def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str):
     """Shuffle sequences in a FASTA file."""
-    # Check if the input file is a .fasta file
-    if not input.endswith(".fasta"):
-        raise click.ClickException("Input file must be a .fasta file")
+    # Check if the input file is a .fasta / .fa file
+    if not input.endswith((".fasta", ".fa")):
+        raise click.ClickException("Input file must be a .fasta or .fa file")
 
     input_path = Path(input)
     output_path = Path(output)
@@ -294,8 +296,8 @@ def shuffle(input: str, output: str, backend: str, seed: int, shuffle_flag: str)
     create_dirs(output_path)
 
     if output_path.is_dir():
-        # replace .fasta with _shuffled.fasta
-        output_path = output_path / input_path.name.replace(".fasta", "_shuffled.fasta")
+        # x.fasta / x.fa -> x_shuffled.fasta
+        output_path = output_path / f"{input_path.stem}_shuffled.fasta"
 
     do_shuffle = shuffle_flag.lower() == "true"
 
@@ -1220,12 +1222,12 @@ def _validate_source_fields(data_dirs: dict) -> None:
     """Validate data_dirs source/output fields.
 
     - Exactly one of url / local_fasta must be set.
-    - The chosen source must end with .fasta or .fasta.gz.
+    - The chosen source must end with .fasta or .fa, optionally .gz or .zst.
     - extracted_fasta is always required.
-    - compressed_fasta is required only when the source is gzipped.
+    - compressed_fasta is required only when the source is compressed.
       In plain-.fasta mode it is optional; warn if it's set anyway.
     """
-    from nanoplm.data.preparation.data_config import file_name, is_compressed
+    from nanoplm.data.preparation.data_config import is_compressed, is_fasta_name
 
     url = data_dirs.get("url") or None
     local_fasta = data_dirs.get("local_fasta") or None
@@ -1240,10 +1242,11 @@ def _validate_source_fields(data_dirs: dict) -> None:
 
     source = url if url else local_fasta
     compressed_source = is_compressed(source)
-    # Extension whitelist: must end in .fasta or .fasta.gz (after stripping URL query/fragment).
-    if not file_name(source).endswith((".fasta", ".fasta.gz")):
+    # Extension whitelist (after stripping URL query/fragment).
+    if not is_fasta_name(source):
         raise click.ClickException(
-            f"url/local_fasta must end with .fasta or .fasta.gz, got: {source}"
+            "url/local_fasta must end with .fasta or .fa (optionally .gz or .zst), "
+            f"got: {source}"
         )
 
     extracted = data_dirs.get("extracted_fasta") or None
@@ -1253,7 +1256,7 @@ def _validate_source_fields(data_dirs: dict) -> None:
     compressed = data_dirs.get("compressed_fasta") or None
     if compressed_source and not compressed:
         raise click.ClickException(
-            "data_dirs.compressed_fasta is required when source is a .gz file."
+            "data_dirs.compressed_fasta is required when source is a .gz or .zst file."
         )
     if (not compressed_source) and compressed:
         click.echo("Warning: data_dirs.compressed_fasta is unused when the source is a plain "

@@ -24,8 +24,8 @@ The sources layout puts everything under ``output_dir``:
 
 With several sources, train/ val/ cluster_index/ and .data_manifest of each source go
 into ``<source>/`` (Source.data_dir) and ``output_dir/.data_manifest`` is the mixture
-manifest (nanoplm.data.infra.mixture). A .gz is extracted into downloads/ and checked
-there (``<file>_validation/``), once for all the sources that read it.
+manifest (nanoplm.data.infra.mixture). A .gz or .zst is extracted into downloads/ and
+checked there (``<file>_validation/``), once for all the sources that read it.
 """
 from __future__ import annotations
 
@@ -44,6 +44,8 @@ from nanoplm.data.infra.mixture import WEIGHT_TOLERANCE, weights_error
 FASTA_SHORTCUTS = {k: DATASET_URLS[k]
                    for k in ("swissprot", "trembl", "uniref50", "uniref90", "uniref100")}
 URL_SCHEMES = ("http://", "https://", "ftp://")
+FASTA_SUFFIXES = (".fasta", ".fa")
+COMPRESSED_SUFFIXES = (".gz", ".zst")      # the extract stage unpacks these
 # data_params fields of a pretraining run, in docs-schema order: the template's, with
 # val_size (shipped commented out) where the schema adds it, before "Rarely changed"
 PARAM_FIELDS = ("max_seqs", "min_seq_len", "max_seq_len", "val_ratio", "drop_invalid_sequences",
@@ -125,12 +127,21 @@ def file_name(value: str) -> str:
 
 
 def is_compressed(value: str) -> bool:
-    """Whether a URL or path names a .gz file (by its extension only)."""
-    return file_name(value).endswith(".gz")
+    """Whether a URL or path names a .gz or .zst file (by its extension only)."""
+    return file_name(value).endswith(COMPRESSED_SUFFIXES)
 
 
-def strip_gz(name: str) -> str:
-    return name[:-3] if name.endswith(".gz") else name
+def strip_compressed(name: str) -> str:
+    """The file name once extracted: ``x.fa.zst`` -> ``x.fa``."""
+    for suffix in COMPRESSED_SUFFIXES:
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+def is_fasta_name(value: str) -> bool:
+    """Whether a URL or path ends with .fasta or .fa, optionally .gz or .zst."""
+    return strip_compressed(file_name(value)).endswith(FASTA_SUFFIXES)
 
 
 def literal(value) -> str:
@@ -275,11 +286,12 @@ def _fasta(value, where: str, base_dir) -> str:
         p = Path(fasta)
         on_disk = p if p.is_absolute() or base_dir is None else Path(base_dir) / p
         if on_disk.is_dir():
-            raise DataConfigError(f"{where}.fasta is a directory, not a .fasta/.fasta.gz file: "
+            raise DataConfigError(f"{where}.fasta is a directory, not a .fasta/.fa file: "
                                   f"{fasta}")
-    if not (name.endswith(".fasta") or name.endswith(".fasta.gz")):
+    if not is_fasta_name(name):
         raise DataConfigError(f"{where}.fasta must be a shortcut ({', '.join(FASTA_SHORTCUTS)}) "
-                              f"or a URL or path that ends with .fasta or .fasta.gz, got: {fasta}")
+                              "or a URL or path that ends with .fasta or .fa (optionally .gz or "
+                              f".zst), got: {fasta}")
     return fasta
 
 
@@ -466,10 +478,10 @@ def _source_paths(src: Source) -> dict:
     unpacked = src.downloads_dir if src.mixed else work
     if src.is_url:
         got = src.download_path(src.fasta)
-        compressed, extracted = (got, _join(unpacked, strip_gz(file_name(src.fasta)))) \
+        compressed, extracted = (got, _join(unpacked, strip_compressed(file_name(src.fasta)))) \
             if src.is_compressed else (None, got)
-    elif src.is_compressed:                 # a local .gz is read in place
-        compressed, extracted = src.fasta, _join(unpacked, strip_gz(file_name(src.fasta)))
+    elif src.is_compressed:                 # a local .gz / .zst is read in place
+        compressed, extracted = src.fasta, _join(unpacked, strip_compressed(file_name(src.fasta)))
     else:                                   # a local .fasta is read in place
         compressed, extracted = None, src.fasta
     return {

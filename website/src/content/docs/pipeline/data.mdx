@@ -68,14 +68,14 @@ Point `fasta` at the file. A relative path starts from the folder `data.yaml` is
 ```yaml title="data.yaml"
 sources:
   mine:
-    fasta: my_proteins.fasta   # or .fasta.gz
+    fasta: my_proteins.fasta   # or .fa, and either one as .gz or .zst
 ```
 
 `fasta` accepts three kinds of value:
 
 - a shortcut for a UniProt file, from the table below;
 - a URL (`http://`, `https://` or `ftp://`), downloaded once into `output_dir/downloads/`;
-- a local `.fasta` or `.fasta.gz` file.
+- a local `.fasta` or `.fa` file, optionally compressed as `.gz` or `.zst`.
 
 | Shortcut | URL |
 | --- | --- |
@@ -84,6 +84,8 @@ sources:
 | `uniref50` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref50/uniref50.fasta.gz` |
 | `uniref90` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` |
 | `uniref100` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz` |
+
+A `*` at the end of a sequence is a stop codon (Prodigal writes one). The `filter` stage removes it before the length filter. A `*` anywhere else makes the sequence [invalid](#invalid-sequences-will-stop-you-once).
 
 Start with SwissProt (about 570k sequences). It downloads in minutes, so you can test the pipeline on it before a UniRef-scale run.
 
@@ -102,7 +104,7 @@ output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml'
 # weight = share of training sequences (not tokens); weights must sum to 1.
 sources:
   swissprot:
-    fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz
+    fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa (.gz/.zst)
     weight: 1.0          # 0.2 when mixed with uniref50 below
     # max_seq_len: 1024  # a data_params field set here overrides it (not val_ratio / val_size)
 

@@ -446,3 +446,54 @@ def test_fix_adds_drop_invalid_when_it_is_left_out(tmp_path, indent):
     p.write_text("output_dir: out\nsources:\n  s:\n    fasta: swissprot\n")
     _flip_drop_invalid(p, True)
     assert yaml.safe_load(p.read_text())["data_params"] == {"drop_invalid_sequences": True}
+
+
+@pytest.mark.parametrize("source, ok", [
+    ("https://x.org/a.fa.zst", True), ("/data/a.fasta.zst", True), ("/data/a.fa", True),
+    ("/data/a.fa.gz", True), ("/data/a.faa", False), ("https://x.org/a.fa.bz2", False)])
+def test_the_old_layout_takes_fa_and_zst_too(source, ok):
+    import click
+    from nanoplm.cli.data import _validate_source_fields
+    dirs = {"url" if source.startswith("http") else "local_fasta": source,
+            "extracted_fasta": "x.fa", "compressed_fasta": "x.fa.zst"}
+    if ok:
+        _validate_source_fields(dirs)
+        return
+    with pytest.raises(click.ClickException, match=r"\.fasta or \.fa \(optionally \.gz or \.zst\)"):
+        _validate_source_fields(dirs)
+
+
+def test_from_yaml_builds_a_prodigal_fa_zst_without_stop_codons(tmp_path):
+    """Gene-caller output (Logan, Prodigal) ends each protein with '*': it is extracted from
+    .zst, the '*' is stripped before the length filter and never reaches the tokenizer."""
+    import random
+    import zstandard
+    from nanoplm.data.datasets.pretrain import ShardedDataset
+    from nanoplm.data.infra.manifest import read_manifest
+    from tests.data.dvc.test_cluster_stages import _from_yaml, _project
+    rng = random.Random(0)
+    lengths = [20] + [rng.randint(21, 80) for _ in range(59)]     # 20 + '*' passes min 20
+    lines = []
+    for i, n in enumerate(lengths):
+        lines += [f">ERR1_{i}_1 # 1 # {3 * n + 3} # 1 # ID={i}_1;partial=00;start_type=ATG",
+                  "M" + "".join(rng.choice("ACDEFGHIKLMNPQRSTVWY") for _ in range(n - 1)) + "*"]
+    text = "\n".join(lines) + "\n"
+    (tmp_path / "genes.fa.zst").write_bytes(zstandard.ZstdCompressor().compress(text.encode()))
+    env = _project(tmp_path, None, "genes.fa.zst", max_seqs=-1, min_seq_len=20)
+    _from_yaml(tmp_path, env)
+    out = tmp_path / "output/data/pretrain_data"
+    assert (out / "src/genes.fa").read_text() == text                  # extracted as is
+    filtered = (out / "src/filtered.fasta").read_text()
+    assert "*" not in filtered and filtered.count(">") == 60
+    split = "".join((out / "src/split" / f).read_text() for f in ("train.fasta", "val.fasta"))
+    assert "*" not in split
+    m = read_manifest(out)
+    assert m.train_sequences + m.val_sequences == 60
+    from nanoplm.pretraining.models.modern_bert.tokenizer import ProtModernBertTokenizer
+    tok = ProtModernBertTokenizer()
+    got = []
+    for d in ("train", "val"):
+        ds = ShardedDataset(str(out / d))
+        got += [list(ds[i]["input_ids"]) for i in range(len(ds))]
+    assert sorted(len(ids) - 1 for ids in got) == sorted(lengths)     # residues + EOS
+    assert all(ids[-1] == tok.eos_token_id and tok.unk_token_id not in ids for ids in got)

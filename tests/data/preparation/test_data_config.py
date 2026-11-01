@@ -85,6 +85,35 @@ def test_local_files_are_read_in_place(tmp_path):
     assert src.paths["extracted_fasta"] == "output/data/pretrain_data/src/b.fasta"
 
 
+FASTA_NAMES = [f"a{ext}{comp}" for ext in (".fasta", ".fa") for comp in ("", ".gz", ".zst")]
+
+
+@pytest.mark.parametrize("name", FASTA_NAMES)
+def test_fasta_and_fa_plain_gz_or_zst_are_accepted(name, tmp_path):
+    plain = name.rsplit(".", 1)[0] if name.endswith((".gz", ".zst")) else name
+    url = _parse(_with_source({"fasta": f"https://example.org/p/{name}?x=1"})).source
+    assert url.is_url and url.is_compressed == (name != plain)
+    downloaded = "output/data/pretrain_data/downloads/" + name
+    if url.is_compressed:
+        assert url.paths["compressed_fasta"] == downloaded
+        assert url.paths["extracted_fasta"] == "output/data/pretrain_data/src/" + plain
+    else:
+        assert url.paths["extracted_fasta"] == downloaded
+    (tmp_path / name).write_bytes(b"")
+    local = _parse(_with_source({"fasta": name}), tmp_path).source
+    assert not local.is_url and local.is_compressed == (name != plain)
+    assert local.paths["extracted_fasta"] == (
+        "output/data/pretrain_data/src/" + plain if local.is_compressed else name)
+
+
+@pytest.mark.parametrize("name", ["a.txt", "a.fasta.bz2", "a.faa", "a.fa.xz", "a.zst", "a.gz"])
+def test_other_extensions_are_refused(name):
+    for value in (name, f"https://example.org/{name}"):
+        with pytest.raises(dc.DataConfigError, match=r"sources.src.fasta must be a shortcut .* "
+                           r"ends with .fasta or .fa \(optionally .gz or .zst\)"):
+            _parse(_with_source({"fasta": value}))
+
+
 def test_a_directory_is_not_a_fasta(tmp_path):
     (tmp_path / "seqs.fasta").mkdir()
     with pytest.raises(dc.DataConfigError, match="sources.src.fasta is a directory"):
@@ -220,7 +249,8 @@ def test_a_source_name_written_twice_is_refused(tmp_path):
     (lambda c: c.update(sources={"src": {}}), "sources.src needs fasta or prepared"),
     (lambda c: c.update(sources={"src": {"fasta": "swissprot", "prepared": "x"}}),
      "set fasta .* or prepared .*, not both"),
-    (lambda c: c.update(sources={"src": {"fasta": "x.txt"}}), "ends with .fasta or .fasta.gz"),
+    (lambda c: c.update(sources={"src": {"fasta": "x.txt"}}),
+     r"ends with .fasta or .fa \(optionally .gz or .zst\), got: x.txt"),
     (lambda c: c.update(sources={"src": {"fasta": "swisprot"}}),
      r"must be a shortcut \(swissprot, trembl, uniref50, uniref90, uniref100\) or a URL"),
     (lambda c: c.update(sources={"train": {"fasta": "swissprot"}}), "train is a folder name"),

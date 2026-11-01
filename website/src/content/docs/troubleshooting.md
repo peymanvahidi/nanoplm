@@ -292,7 +292,7 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 
 | Message | Fix |
 | --- | --- |
-| `sources.sp.fasta must be a shortcut (swissprot, trembl, uniref50, uniref90, uniref100) or a URL or path that ends with .fasta or .fasta.gz, got: swisprot` | Fix the spelling, or give a URL or a `.fasta` / `.fasta.gz` path. |
+| `sources.sp.fasta must be a shortcut (swissprot, trembl, uniref50, uniref90, uniref100) or a URL or path that ends with .fasta or .fa (optionally .gz or .zst), got: swisprot` | Fix the spelling, or give a URL or a `.fasta` / `.fa` path (optionally `.gz` / `.zst`). |
 | `sources.sp: unknown key weigth (allowed: fasta, prepared, weight, ...)` | A typo, or a key at the wrong level. The message lists the keys allowed there. |
 | `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name. Indent it as `sources:`, then `sp:`, then `fasta:`. |
 | `output_dir is required (the folder pretrain.yaml's dataset_dir points at)` | Add `output_dir` at the top level. |

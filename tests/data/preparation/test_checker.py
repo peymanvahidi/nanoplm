@@ -36,3 +36,22 @@ def test_drop_invalid_false_leaves_invalid_ids_empty(tmp_path):
     out_dir = tmp_path / "validation"
     Checker(input_path=src, output_dir=out_dir, drop_invalid=False).check()
     assert (out_dir / "invalid_ids.txt").read_text() == ""
+
+
+def test_one_trailing_stop_codon_is_valid(tmp_path):
+    """Prodigal ends each protein with '*'; one at the end is not a residue."""
+    src = tmp_path / "prodigal.fa"
+    src.write_text(">a # 1 # 30 # 1 # ID=1_1\nMAGV*\n>b\nVVA\nGM*\n>c\nMAGV\n")
+    result = Checker(input_path=src, output_dir=tmp_path / "validation").check()
+    assert result.total_sequences == 3 and result.invalid_count == 0
+
+
+def test_a_stop_codon_anywhere_else_is_invalid(tmp_path):
+    src = tmp_path / "stops.fa"
+    src.write_text(">mid\nMA*GV\n>two\nMAGV**\n>first\n*MAGV\n>only\n*\n>ok\nMAGV*\n")
+    out_dir = tmp_path / "validation"
+    result = Checker(input_path=src, output_dir=out_dir).check()
+    assert result.invalid_count == 4 and result.empty_count == 1      # "*" alone is empty
+    ids = (out_dir / "invalid_ids.txt").read_text().split()
+    assert ids == ["mid", "two", "first", "only"]
+    assert ">only\n*\n" in (out_dir / "invalid.fasta").read_text()

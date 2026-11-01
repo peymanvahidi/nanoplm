@@ -372,9 +372,16 @@ static int process_filter_record(
         return 0;
     }
 
-    if ((long long)seq->len >= (long long)min_seq_len &&
-        (long long)seq->len <= (long long)max_seq_len) {
-        if (write_record(out, header, seq) != 0) {
+    /* A trailing '*' is a stop codon (e.g. Prodigal output): drop it before the
+     * length check. A '*' anywhere else is caught by validate_fasta_native. */
+    DynBuf trimmed = *seq;
+    if (trimmed.len > 0 && trimmed.data[trimmed.len - 1] == '*') {
+        trimmed.len--;
+    }
+
+    if ((long long)trimmed.len >= (long long)min_seq_len &&
+        (long long)trimmed.len <= (long long)max_seq_len) {
+        if (write_record(out, header, &trimmed) != 0) {
             set_error(error_msg, error_cap, "Failed writing filtered FASTA record: %s", strerror(errno));
             return -1;
         }
@@ -1094,7 +1101,9 @@ API_EXPORT int nanoplm_shuffle_fasta(
  *
  * Validation rules:
  *   - Allowed AA alphabet: ACDEFGHIKLMNPQRSTVWY (standard 20)
- *                          BJOUXZ (ambiguous) * (stop codon)
+ *                          BJOUXZ (ambiguous)
+ *   - One trailing '*' (stop codon) is allowed and not counted; the
+ *     filter strips it. A '*' anywhere else makes the sequence invalid.
  *   - A sequence is "empty"   if it has no AA characters.
  *   - A sequence is "invalid" if any AA character is outside the
  *     allowed alphabet, OR if the sequence is empty.
@@ -1115,8 +1124,9 @@ API_EXPORT int nanoplm_shuffle_fasta(
  *   other non-zero  error (err_buf populated)
  * ============================================================ */
 
-/* Allowed amino-acid alphabet (27 chars incl. stop codon). */
-static const char VALID_AA_CHARS[] = "ACDEFGHIKLMNPQRSTVWYBJOUXZacdefghiklmnpqrstvwybjouxz*";
+/* Allowed amino-acid alphabet (26 letters, either case). A trailing '*' is
+ * handled in PROCESS_RECORD. */
+static const char VALID_AA_CHARS[] = "ACDEFGHIKLMNPQRSTVWYBJOUXZacdefghiklmnpqrstvwybjouxz";
 
 static int is_valid_aa_char(unsigned char c) {
     /* Use a 256-entry lookup table built once. */
@@ -1275,8 +1285,11 @@ API_EXPORT int validate_fasta_native(
     #define PROCESS_RECORD() do { \
         total_sequences++; \
         seq_checked++; \
+        /* one trailing '*' (stop codon) is not a residue */ \
+        size_t _n = cur_seq.len; \
+        if (_n > 0 && cur_seq.data[_n - 1] == '*') _n--; \
         /* Check for empty sequence */ \
-        if (cur_seq.len == 0) { \
+        if (_n == 0) { \
             empty_count++; \
             invalid_count++; \
             char *_sid3 = extract_seq_id(cur_header.data ? cur_header.data : ""); \
@@ -1293,11 +1306,13 @@ API_EXPORT int validate_fasta_native(
             if (cur_header.data && cur_header.len > 0) \
                 fwrite(cur_header.data, 1, cur_header.len, finv_fa); \
             fputc('\n', finv_fa); \
+            if (cur_seq.len > 0) \
+                fwrite(cur_seq.data, 1, cur_seq.len, finv_fa); \
             fputc('\n', finv_fa); \
         } else { \
             /* Check for invalid AA chars */ \
             int _bad = 0; \
-            for (size_t _i = 0; _i < cur_seq.len; _i++) { \
+            for (size_t _i = 0; _i < _n; _i++) { \
                 if (!is_valid_aa_char((unsigned char)cur_seq.data[_i])) { \
                     _bad = 1; \
                     break; \

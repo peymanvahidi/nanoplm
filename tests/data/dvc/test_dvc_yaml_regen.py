@@ -122,6 +122,10 @@ def test_distillation_uses_distillation_yaml_filename():
     # URLs with fragments
     ("https://example.com/x.fasta.gz#section", True),
     ("https://example.com/x.fasta#section", False),
+    # zstd and the short .fa name
+    ("/path/to/file.fa.zst", True),
+    ("https://example.com/x.fasta.zst?token=abc", True),
+    ("relative/path.fa", False),
 ])
 def test_source_is_compressed(source, expected):
     assert is_compressed(source) is expected

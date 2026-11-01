@@ -21,12 +21,14 @@ identity, -c coverage, --cov-mode 0).
 from __future__ import annotations
 
 import gzip
+import io
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from nanoplm.data.preparation.data_config import file_name as _name, is_url, strip_gz
+from nanoplm.data.preparation.data_config import (file_name as _name, is_compressed, is_url,
+                                                  strip_compressed)
 
 UNIREF_BASE = "https://ftp.uniprot.org/pub/databases/uniprot/uniref"
 UNIPROT_FASTA = {lvl: f"{UNIREF_BASE}/{lvl}/{lvl}.fasta.gz"
@@ -55,17 +57,28 @@ class ClusterConfigError(ValueError):
     """A cluster_subsampling block cannot be resolved."""
 
 
+def _open_fasta(path: Path):
+    """A FASTA for reading in binary, decompressed when it is .gz or .zst."""
+    if str(path).endswith(".zst"):
+        import zstandard
+        return io.BufferedReader(zstandard.open(path, "rb"))
+    return (gzip.open if str(path).endswith(".gz") else open)(path, "rb")
+
+
 def _header_level(path: Path) -> Optional[str]:
-    opener = gzip.open if str(path).endswith(".gz") else open
+    errors = (OSError, EOFError)
+    if str(path).endswith(".zst"):
+        from zstandard import ZstdError
+        errors += (ZstdError,)
     try:
-        with opener(path, "rb") as f:
+        with _open_fasta(path) as f:
             for line in f:
                 if line.startswith(b">"):
                     for lvl in ("uniref100", "uniref90", "uniref50"):
                         if line.startswith(b">UniRef" + lvl[6:].encode() + b"_"):
                             return lvl
                     return None
-    except (OSError, EOFError):
+    except errors:
         return None
     return None
 
@@ -158,9 +171,9 @@ def _members_paths(members: str, src) -> tuple[Optional[Path], Path]:
     unpacked = Path(src.downloads_dir if src.mixed else src.work_dir)
     if is_url(members):
         got = Path(src.download_path(members))
-        return (got, unpacked / strip_gz(name)) if name.endswith(".gz") else (None, got)
-    if name.endswith(".gz"):
-        return Path(members), unpacked / strip_gz(name)
+        return (got, unpacked / strip_compressed(name)) if is_compressed(name) else (None, got)
+    if is_compressed(name):
+        return Path(members), unpacked / strip_compressed(name)
     return None, Path(members)
 
 

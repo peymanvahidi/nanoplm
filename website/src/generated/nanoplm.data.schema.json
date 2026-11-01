@@ -15,7 +15,7 @@
         "properties": {
           "fasta": {
             "type": "string",
-            "description": "swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz",
+            "description": "swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa (.gz/.zst)",
             "examples": [
               "swissprot"
             ]

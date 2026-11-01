@@ -4,7 +4,7 @@ output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml'
 # weight = share of training sequences (not tokens); weights must sum to 1.
 sources:
   swissprot:
-    fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fasta.gz
+    fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa (.gz/.zst)
     weight: 1.0          # 0.2 when mixed with uniref50 below
     # max_seq_len: 1024  # a data_params field set here overrides it (not val_ratio / val_size)
 

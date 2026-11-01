@@ -110,6 +110,23 @@ def test_a_shared_gz_is_extracted_and_checked_once_in_any_source_order():
         {n: st[n] for n in ("extract-prot_fasta", "check-prot_fasta")}
 
 
+def test_a_shared_zst_is_extracted_and_checked_once_like_a_gz():
+    url = "https://s3.amazonaws.com/logan-pub/p/logan50_c1.0_human_complete.fa.zst"
+    st = _stages(_mix(a={"fasta": url, "weight": 0.5},
+                      b={"fasta": url, "weight": 0.3, "max_seq_len": 100},
+                      c={"fasta": "small.fa", "weight": 0.2}))
+    assert [n for n in st if n.startswith(("download", "extract", "check"))] == [
+        "download-logan50_c1_0_human_complete_fa_zst", "extract-logan50_c1_0_human_complete_fa",
+        "check-logan50_c1_0_human_complete_fa"]
+    assert st["extract-logan50_c1_0_human_complete_fa"]["cmd"] == (
+        "nanoplm data extract -i out/downloads/logan50_c1.0_human_complete.fa.zst "
+        "-o out/downloads/logan50_c1.0_human_complete.fa")
+    assert st["a-shuffle"]["deps"][:2] == st["b-shuffle"]["deps"][:2] == [
+        "out/downloads/logan50_c1.0_human_complete.fa",
+        "out/downloads/logan50_c1_0_human_complete_fa_validation"]
+    assert st["c-shuffle"]["cmd"].startswith("nanoplm data shuffle -i small.fa ")
+
+
 def test_a_per_source_drop_invalid_keeps_its_own_check():
     st = _stages(_mix(a={"fasta": "prot.fasta.gz", "weight": 0.5},
                       b={"fasta": "prot.fasta.gz", "weight": 0.5,

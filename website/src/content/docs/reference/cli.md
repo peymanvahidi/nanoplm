@@ -129,7 +129,7 @@ Fetches a FASTA file. Give exactly one of a `DATASET` key (`swissprot`, `trembl`
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--url TEXT` | URL to download | `""` |
-| `--local-fasta TEXT` | Local `.fasta` / `.fasta.gz` to link instead of downloading | `""` |
+| `--local-fasta TEXT` | Local `.fasta` / `.fa` (optionally `.gz` / `.zst`) to link instead of downloading | `""` |
 | `--output`, `-o PATH` | **Required.** Output file or directory | - |
 | `--force`, `-f` | Overwrite existing output | off |
 
@@ -139,7 +139,7 @@ Fetches a FASTA file. Give exactly one of a `DATASET` key (`swissprot`, `trembl`
 nanoplm data extract [OPTIONS]
 ```
 
-Decompresses a `.gz` file. `from-yaml` skips this stage when the source is already a plain `.fasta`.
+Decompresses a `.gz` or `.zst` file. `from-yaml` skips this stage when the source is already a plain `.fasta` or `.fa`.
 
 | Flag | Meaning | Default |
 | --- | --- | --- |
