@@ -61,7 +61,9 @@ PARAM_DEFAULTS = {"drop_invalid_sequences": False, "shuffle": True, "shuffle_see
 OLD_PARAM_NAMES = {"seqs_num": "max_seqs"}
 SOURCE_KEYS = ("fasta", "weight", "cluster_subsampling")
 # source keys that are gone, and what to do instead
-REMOVED_SOURCE_KEYS = {"prepared": "build the source from its fasta"}
+REMOVED_SOURCE_KEYS = {"prepared": "To train on that folder as it is, set pretrain.yaml's "
+                                    "dataset_dir to it; to use it in a mix, set fasta to the "
+                                    "FASTA it was built from."}
 CLUSTER_KEYS = ("members", "clusters", "identity", "coverage")
 OLD_CLUSTER_KEYS = {"clustering": "clusters"}
 # where the clusters come from: cluster_config checks the value
@@ -380,7 +382,7 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
     for name, spec in sources.items():
         gone = [k for k in REMOVED_SOURCE_KEYS if isinstance(spec, dict) and k in spec]
         if gone:
-            raise DataConfigError(f"sources.{name}.{gone[0]} was removed; "
+            raise DataConfigError(f"sources.{name}.{gone[0]} was removed. "
                                   f"{REMOVED_SOURCE_KEYS[gone[0]]}")
     output_dir = config.get("output_dir")
     if not isinstance(output_dir, str) or not output_dir:

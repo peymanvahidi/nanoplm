@@ -1857,6 +1857,7 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
             f"  {_clusters_line(m)}\n"
             f"    Train:         {m.get('train_sequences')}\n"
             f"    Val:           {m.get('val_sequences')}\n"
+            f"{_left_out_line(manifest_path.parent / m['cluster_index_dir'])}"
             f"  Manifest:        {manifest_path}\n"
             f"{_dataset_dir_line(manifest_path, kind)}"
         )
@@ -1884,6 +1885,23 @@ def _clusters_line(m: dict) -> str:
     else:
         label, note = "MMseqs2 clusters:", ""
     return f"{label:<19}{n}{note}"
+
+
+def _left_out_line(index_dir: Path) -> str:
+    """Clusters left out because the filter dropped their representative.
+    Read from pool_manifest.json; empty when none were left out or the file is missing."""
+    import json
+    try:
+        pm = json.loads((index_dir / "pool_manifest.json").read_text())
+        counts, before_cap = pm["counts"], pm["cap"]["clusters_before_cap"]
+        left_out = counts["clusters_total"] - before_cap
+        with_members = counts["clusters_with_any_survivor"] - before_cap
+    except (OSError, ValueError, KeyError, TypeError):
+        return ""
+    if left_out <= 0:
+        return ""
+    return (f"  Left out:        {left_out} clusters, their representative outside "
+            f"min/max_seq_len or invalid ({with_members} of them had in-range members)\n")
 
 
 def _dataset_dir_line(manifest_path: Path, kind: str) -> str:

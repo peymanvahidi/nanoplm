@@ -316,8 +316,9 @@ def test_prepared_was_removed(tmp_path, monkeypatch, cfg):
     _no_dvc(monkeypatch)
     r = _run(_write(tmp_path, cfg))
     assert r.exit_code != 0
-    assert ("data.yaml: sources.mine.prepared was removed; build the source from its fasta"
-            in r.output)
+    assert ("data.yaml: sources.mine.prepared was removed. To train on that folder as it is, "
+            "set pretrain.yaml's dataset_dir to it; to use it in a mix, set fasta to the FASTA "
+            "it was built from." in " ".join(r.output.split()))
     assert not (tmp_path / "dvc.yaml").exists()
 
 

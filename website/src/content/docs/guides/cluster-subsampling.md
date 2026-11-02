@@ -239,7 +239,7 @@ nanoPLM downloads `uniref50.xml.gz` once into `output_dir/downloads/` and keeps 
 
 The `cluster_members` stage checks a cluster file or the `CL:` tags against every record. It stops when a record has no tag or is missing from the file, when an id is in the file but not in the FASTA or is listed twice, or when a cluster has no representative. The message gives the counts and a few ids.
 
-`drop_invalid_sequences` works as in a normal run, on the members. With UniProt clusters, `CL:` tags or a cluster file, the clusters are made before the length filter. If the filter drops a cluster's representative (it is invalid, or shorter than `min_seq_len` or longer than `max_seq_len`), the whole cluster is left out of training. MMseqs2 only clusters sequences that passed the filter, so it never loses a representative.
+`drop_invalid_sequences` works as in a normal run, on the members. With UniProt clusters, `CL:` tags or a cluster file, the clusters are made before the length filter. If the filter drops a cluster's representative (it is invalid, or shorter than `min_seq_len` or longer than `max_seq_len`), the whole cluster is left out of training. The summary at the end of `from-yaml` says how many clusters were left out this way, and how many of them had members that passed the filter. MMseqs2 only clusters sequences that passed the filter, so it never loses a representative.
 
 ## Stages and caching
 

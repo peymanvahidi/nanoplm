@@ -294,7 +294,7 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 | --- | --- |
 | `sources.sp.fasta must be a shortcut (swissprot, trembl, uniref50, uniref90, uniref100) or a URL or path that ends with .fasta or .fa (optionally .gz or .zst), got: swisprot` | Fix the spelling, or give a URL or a `.fasta` / `.fa` path (optionally `.gz` / `.zst`). |
 | `sources.sp: unknown key weigth (allowed: fasta, weight, ...)` | A typo, or a key at the wrong level. The message lists the keys allowed there. |
-| `sources.sp.prepared was removed; build the source from its fasta` | A source can no longer point at a folder another `data.yaml` built. Set `fasta` to the FASTA that folder was built from. To compare weights side by side, see [Mixing datasets](/nanoplm/guides/mixing/#compare-several-ratios). |
+| `sources.sp.prepared was removed. To train on that folder as it is, set pretrain.yaml's dataset_dir to it; ...` | A source can no longer point at a folder another `data.yaml` built. To train on that folder alone, set `dataset_dir` in `pretrain.yaml` to it. To use it in a mix, set `fasta` to the FASTA that folder was built from. To compare weights side by side, see [Mixing datasets](/nanoplm/guides/mixing/#compare-several-ratios). |
 | `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name. Indent it as `sources:`, then `sp:`, then `fasta:`. |
 | `output_dir is required (the folder pretrain.yaml's dataset_dir points at)` | Add `output_dir` at the top level. |
 | `sources.sp needs a weight (its share of training sequences; the weights must sum to 1)` | Every source of a mix needs a `weight`. See [Mixing datasets](/nanoplm/guides/mixing/). |

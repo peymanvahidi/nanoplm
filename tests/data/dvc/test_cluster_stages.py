@@ -381,6 +381,35 @@ def test_summary_counts_clusters_and_names_the_members(tmp_path, capsys):
     assert "UniRef50 clusters: 120 (members from UniRef90)" in text
     assert "Pool sequences:  400" in text
     assert f"Set pretrain.yaml's dataset_dir to {out.resolve()}." in text
+    assert "Left out" not in text                    # no pool_manifest.json
+
+
+@pytest.mark.parametrize("before_cap, line", [
+    (150, "  Left out:        50 clusters, their representative outside min/max_seq_len or "
+          "invalid (30 of them had in-range members)\n"),
+    (200, None),
+])
+def test_summary_counts_clusters_left_out_by_the_filter(tmp_path, capsys, before_cap, line):
+    import json
+    from nanoplm.cli.data import _print_summary
+    from nanoplm.data.preparation.data_config import parse_data_config
+    raw = _source("uniref50", {"members": "uniref90", "clusters": "uniprot"})
+    out = tmp_path / OUT
+    (out / "cluster_index/index").mkdir(parents=True)
+    (out / ".data_manifest").write_text(yaml.safe_dump({
+        "seqs_num": 120, "train_sequences": 108, "val_sequences": 12,
+        "cluster_index_dir": "cluster_index/index", "cluster_level": "uniref90",
+        "pool_sequences": 400}))
+    (out / "cluster_index/index/pool_manifest.json").write_text(json.dumps({
+        "counts": {"clusters_total": 200, "clusters_with_any_survivor": 180},
+        "cap": {"max_clusters": 120, "clusters_before_cap": before_cap}}))
+    _print_summary(tmp_path, raw, "pretrain", tmp_path / "data.yaml",
+                   parse_data_config(raw, tmp_path))
+    text = capsys.readouterr().out
+    if line:
+        assert line in text
+    else:
+        assert "Left out" not in text
 
 
 def test_from_yaml_says_how_to_install_mmseqs(tmp_path, monkeypatch):

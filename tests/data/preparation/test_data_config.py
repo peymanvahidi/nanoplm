@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import textwrap
 
 import pytest
@@ -236,7 +237,7 @@ def test_mix_weights_not_summing_to_1_name_each_weight_and_the_sum():
     ({"fasta": "trembl", "weight": 0.5, "max_workers": 4},
      "sources.b.max_workers: set it in data_params"),
     ({"prepared": "../x", "weight": 0.5},
-     "sources.b.prepared was removed; build the source from its fasta"),
+     "sources.b.prepared was removed. To train on that folder as it is"),
 ])
 def test_mix_errors(spec, match):
     with pytest.raises(dc.DataConfigError, match=match):
@@ -258,7 +259,7 @@ def test_a_source_name_written_twice_is_refused(tmp_path):
     (lambda c: c.update(sources={"src": {}}), r"sources.src needs fasta \(a FASTA to build "
                                               r"from\)"),
     (lambda c: c.update(sources={"src": {"fasta": "swissprot", "prepared": "x"}}),
-     "sources.src.prepared was removed; build the source from its fasta"),
+     "sources.src.prepared was removed. To train on that folder as it is"),
     (lambda c: c.update(sources={"src": {"fasta": "x.txt"}}),
      r"ends with .fasta or .fa \(optionally .gz or .zst\), got: x.txt"),
     (lambda c: c.update(sources={"src": {"fasta": "swisprot"}}),
@@ -401,8 +402,10 @@ def test_a_top_level_cluster_block_is_an_unknown_key():
 @pytest.mark.parametrize("spec", [{"prepared": "../built"},
                                   {"prepared": "../built", "fasta": "swissprot"}])
 def test_prepared_was_removed(spec):
-    with pytest.raises(dc.DataConfigError, match=r"^sources.src.prepared was removed; build "
-                                                 r"the source from its fasta$"):
+    with pytest.raises(dc.DataConfigError, match=re.escape(
+            "sources.src.prepared was removed. To train on that folder as it is, set "
+            "pretrain.yaml's dataset_dir to it; to use it in a mix, set fasta to the FASTA it "
+            "was built from.")):
         _parse(_with_source(spec))
     with pytest.raises(dc.DataConfigError, match="output_dir is required"):
         _parse({"sources": {"mine": {"fasta": "swissprot"}}})
