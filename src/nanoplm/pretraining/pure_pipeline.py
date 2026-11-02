@@ -2623,6 +2623,10 @@ def run_pure_pretraining(
         )
     else:
         logger.info("Using ShardedDataset for pre-tokenized binary shards")
+    # manifest shuffle: false (data.yaml) trains in file order; None means shuffled
+    train_shuffle = getattr(manifest, "shuffle", None) is not False
+    if not train_shuffle:
+        logger.info("Train set is read in file order (manifest shuffle: false)")
     _dataset_fingerprint = train_ds.fingerprint()
     logger.info(f"Train dataset fingerprint: {_dataset_fingerprint}")
 
@@ -2753,7 +2757,8 @@ def run_pure_pretraining(
     max_seqlen_buckets = None
 
     if use_packing:
-        inner_sampler = packing_sampler(train_ds, pretrain_config.seed, distributed)
+        inner_sampler = packing_sampler(train_ds, pretrain_config.seed, distributed,
+                                        shuffle=train_shuffle)
 
         train_ds = TokenPackingDataset(
             train_ds,
@@ -2816,7 +2821,10 @@ def run_pure_pretraining(
             extra_excluded_token_ids=mlm_extra_excluded_token_ids,
             **mlm_masking_kwargs_from_config(pretrain_config),
         )
-        train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
+        if train_shuffle:
+            train_sampler = DistributedSampler(train_ds, shuffle=True, seed=pretrain_config.seed) if distributed else RandomSampler(train_ds)
+        else:
+            train_sampler = DistributedSampler(train_ds, shuffle=False) if distributed else SequentialSampler(train_ds)
 
     # Move parameters to CUDA before optional TE MLP conversion so replacement
     # modules are created on the target device/rank.

@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 import bisect
 import numpy as np
@@ -24,24 +25,30 @@ class ShardedDataset(Dataset):
     metadata (paths + offsets), not the mapped data itself.
     """
 
-    def __init__(self, data_dir: str, pad_token_id: int = 0) -> None:
+    def __init__(self, data_dir: str, pad_token_id: int = 0, shuffle: bool = True) -> None:
         """
         Args:
             data_dir: Directory containing binary shard files (*.bin + *.idx.npy)
             pad_token_id: Token ID used for padding (default 0).
+            shuffle: False when training reads this set in file order (manifest
+                ``shuffle: false``): shards are then ordered by number and the
+                fingerprint says so.
         """
-        self._init_dataset(str(data_dir), pad_token_id=pad_token_id, log=True)
+        self._init_dataset(str(data_dir), pad_token_id=pad_token_id, log=True, shuffle=shuffle)
 
-    def _init_dataset(self, data_dir: str, pad_token_id: int = 0, log: bool = False) -> None:
+    def _init_dataset(self, data_dir: str, pad_token_id: int = 0, log: bool = False,
+                      shuffle: bool = True) -> None:
         """Shared init logic (called from __init__ and __setstate__).
 
         Args:
             data_dir: Path to the shard directory.
             pad_token_id: Token ID used for padding.
             log: Whether to emit log messages (suppressed in DataLoader workers).
+            shuffle: False orders the shards by number (see __init__).
         """
         self.data_dir = Path(data_dir)
         self.pad_token_id = pad_token_id
+        self.shuffle = bool(shuffle)
 
         # Validate directory exists
         if not self.data_dir.exists():
@@ -50,9 +57,13 @@ class ShardedDataset(Dataset):
         if not self.data_dir.is_dir():
             raise ValueError(f"Path is not a directory: {self.data_dir}")
 
-        # Find all shard .bin files — store paths as strings for safe pickling
+        # Find all shard .bin files — store paths as strings for safe pickling.
+        # Shuffled training keeps the name order, so running jobs resume unchanged;
+        # file-order training goes by shard number, since names sort wrong from
+        # shard_10000 on.
+        bins = self.data_dir.glob("*.bin")
         self._bin_paths: List[str] = [
-            str(p) for p in sorted(self.data_dir.glob("*.bin"))
+            str(p) for p in (sorted(bins) if self.shuffle else sorted(bins, key=_shard_number_key))
         ]
 
         if len(self._bin_paths) == 0:
@@ -105,14 +116,16 @@ class ShardedDataset(Dataset):
     # With this, only the directory path is pickled; memmaps are re-created lazily.
 
     def __getstate__(self) -> dict:
-        return {"data_dir": str(self.data_dir), "pad_token_id": self.pad_token_id}
+        return {"data_dir": str(self.data_dir), "pad_token_id": self.pad_token_id,
+                "shuffle": self.shuffle}
 
     def __setstate__(self, state) -> None:
         # Backward compat: old pickles stored just the data_dir string.
         if isinstance(state, str):
             self._init_dataset(state, pad_token_id=0, log=False)
         else:
-            self._init_dataset(state["data_dir"], pad_token_id=state.get("pad_token_id", 0), log=False)
+            self._init_dataset(state["data_dir"], pad_token_id=state.get("pad_token_id", 0),
+                               log=False, shuffle=state.get("shuffle", True))
 
     def __len__(self) -> int:
         return int(self.cum_lengths[-1])
@@ -174,6 +187,11 @@ class ShardedDataset(Dataset):
         for offsets in self._offsets:
             lengths = np.diff(offsets).astype(np.int32)
             h.update(lengths.tobytes())
+        if not getattr(self, "shuffle", True):
+            # only when off, so shuffled fingerprints stay as they were; switching
+            # the setting restarts the pass on resume instead of skipping into
+            # another order
+            h.update(b"unshuffled")
         return h.hexdigest()[:16]
 
     def cleanup(self):
@@ -189,18 +207,26 @@ class ShardedDataset(Dataset):
         return self._total_tokens
 
 
-def packing_sampler(dataset: Dataset, seed: int, distributed: bool) -> torch.utils.data.DistributedSampler:
-    """The shuffling sampler TokenPackingDataset draws its order from.
+def _shard_number_key(path: Path) -> tuple:
+    """Sort key that puts shard_9999 before shard_10000; other names go last, by name."""
+    m = re.search(r"(\d+)$", path.stem)
+    return (0, int(m.group(1)), path.name) if m else (1, 0, path.name)
+
+
+def packing_sampler(dataset: Dataset, seed: int, distributed: bool,
+                    shuffle: bool = True) -> torch.utils.data.DistributedSampler:
+    """The sampler TokenPackingDataset draws its order from.
 
     Always a DistributedSampler, also on one process (num_replicas=1): its order
     is a seeded function of the epoch, so DataLoader workers split one shared
     permutation instead of each drawing their own (a RandomSampler copied into
     every worker covers only about 70% of the items per pass with 4 workers).
+    With ``shuffle=False`` the order is file order, strided over ranks and workers.
     """
     if distributed:
-        return torch.utils.data.DistributedSampler(dataset, shuffle=True, seed=seed)
+        return torch.utils.data.DistributedSampler(dataset, shuffle=shuffle, seed=seed)
     return torch.utils.data.DistributedSampler(dataset, num_replicas=1, rank=0,
-                                               shuffle=True, seed=seed)
+                                               shuffle=shuffle, seed=seed)
 
 
 class TokenPackingDataset(torch.utils.data.IterableDataset):

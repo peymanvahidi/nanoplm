@@ -268,3 +268,41 @@ def test_single_process_resume_replays_the_same_permutation():
     resumed = packed()
     assert resumed.fast_forward(40, epoch=3) == 400
     assert [i for b in resumed for i in _first_ids(b)] == ids[400:]
+
+
+def test_shuffle_off_packs_in_file_order_with_one_and_four_workers():
+    from nanoplm.data.datasets.pretrain import packing_sampler
+    ds = IdDataset()
+    packed = TokenPackingDataset(ds, max_tokens_per_batch=100, drop_last=True,
+                                 sampler=packing_sampler(ds, seed=7, distributed=False,
+                                                         shuffle=False))
+    assert [i for b in packed for i in _first_ids(b)] == list(range(1000))
+    passes = []
+    for epoch in (0, 1):
+        packed.set_epoch(epoch)
+        dl = DataLoader(packed, batch_size=None, num_workers=4, collate_fn=_first_ids,
+                        multiprocessing_context="fork")
+        ids = [i for b in dl for i in b]
+        assert sorted(ids) == list(range(1000))
+        passes.append(ids)
+    # each worker reads its stride in file order; the DataLoader takes batches round-robin
+    first = passes[0][:40]
+    assert first == [w + 4 * k for w in range(4) for k in range(10)]
+    assert passes[0] == passes[1]                 # no reshuffle per epoch
+
+
+def test_shuffle_off_resume_replays_the_same_order():
+    from nanoplm.data.datasets.pretrain import packing_sampler
+    ds = IdDataset()
+
+    def packed():
+        return TokenPackingDataset(ds, max_tokens_per_batch=100, drop_last=True,
+                                   sampler=packing_sampler(ds, seed=7, distributed=False,
+                                                           shuffle=False))
+
+    full = packed()
+    full.set_epoch(2)
+    ids = [i for b in full for i in _first_ids(b)]
+    resumed = packed()
+    assert resumed.fast_forward(40, epoch=2) == 400
+    assert [i for b in resumed for i in _first_ids(b)] == ids[400:] == list(range(400, 1000))

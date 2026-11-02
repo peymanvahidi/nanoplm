@@ -93,15 +93,19 @@ class ClusterSampledDataset(ShardedDataset):
         seed: int,
         pad_token_id: int = 0,
         epoch: int = 0,
+        shuffle: bool = True,
     ) -> None:
         self._cs_init(str(data_dir), str(index_dir), int(seed), int(pad_token_id),
-                      int(epoch), check=True, log=True)
+                      int(epoch), check=True, log=True, shuffle=shuffle)
 
     # ---- init -------------------------------------------------------------------
     def _cs_init(self, data_dir: str, index_dir: str, seed: int, pad_token_id: int,
-                 epoch: int, check: bool, log: bool) -> None:
-        # stock init over the pool shards: _bin_paths, per-shard _offsets, cum_lengths
+                 epoch: int, check: bool, log: bool, shuffle: bool = True) -> None:
+        # stock init over the pool shards: _bin_paths, per-shard _offsets, cum_lengths.
+        # The pool keeps the order the index was built on (checked below) whatever
+        # shuffle is; shuffle only reaches the fingerprint.
         self._init_dataset(data_dir, pad_token_id=pad_token_id, log=log)
+        self.shuffle = bool(shuffle)
         self.index_dir = Path(index_dir)
         self.seed = seed
         self._epoch = epoch
@@ -164,11 +168,13 @@ class ClusterSampledDataset(ShardedDataset):
     # ---- pickling (spawn/forkserver workers; fork does not use it) ---------------
     def __getstate__(self) -> dict:
         return {"data_dir": str(self.data_dir), "pad_token_id": self.pad_token_id,
-                "index_dir": str(self.index_dir), "seed": self.seed, "epoch": self._epoch}
+                "index_dir": str(self.index_dir), "seed": self.seed, "epoch": self._epoch,
+                "shuffle": self.shuffle}
 
     def __setstate__(self, state) -> None:
         self._cs_init(state["data_dir"], state["index_dir"], state["seed"],
-                      state["pad_token_id"], state["epoch"], check=False, log=False)
+                      state["pad_token_id"], state["epoch"], check=False, log=False,
+                      shuffle=state.get("shuffle", True))
 
     # ---- the contract -----------------------------------------------------------
     def __len__(self) -> int:
@@ -272,6 +278,7 @@ class ClusterSampledDataset(ShardedDataset):
     def fingerprint(self) -> str:
         h = hashlib.sha256()
         h.update(_FINGERPRINT_TAG)
+        # carries the "unshuffled" marker when shuffle is off
         h.update(super().fingerprint().encode())
         h.update((int(self.seed) & MASK64).to_bytes(8, "little"))
         for a in range(0, self._n, VEC_CHUNK):
@@ -291,6 +298,7 @@ def open_train_dataset(dataset_dir: Union[str, Path], manifest, seed: int) -> Sh
     training ``seed``, a mixture manifest a MixtureDataset over its sources, any other
     manifest a plain ShardedDataset. Validation sets are
     always plain ShardedDatasets (cluster representatives, never resampled).
+    A manifest with ``shuffle: false`` gives a dataset that reads in file order.
     """
     from nanoplm.data.preparation.cluster_config import check_not_experiment_dir
 
@@ -301,6 +309,8 @@ def open_train_dataset(dataset_dir: Union[str, Path], manifest, seed: int) -> Sh
     check_not_experiment_dir(dataset_dir, manifest)
     train_dir = dataset_dir / manifest.train_dir
     index_dir = getattr(manifest, "cluster_index_dir", None)
+    shuffle = getattr(manifest, "shuffle", None) is not False
     if index_dir:
-        return ClusterSampledDataset(train_dir, dataset_dir / index_dir, seed=int(seed))
-    return ShardedDataset(data_dir=str(train_dir))
+        return ClusterSampledDataset(train_dir, dataset_dir / index_dir, seed=int(seed),
+                                     shuffle=shuffle)
+    return ShardedDataset(data_dir=str(train_dir), shuffle=shuffle)

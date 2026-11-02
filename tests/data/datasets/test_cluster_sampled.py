@@ -388,3 +388,40 @@ def test_manifests_without_the_cluster_fields_still_load(tmp_path):
     assert "cluster_index_dir" not in text   # None fields are not written
     m = read_manifest(tmp_path)
     assert not m.is_cluster_sampled and m.pool_sequences is None
+
+
+def test_shuffle_off_marks_the_fingerprint_and_survives_pickle(ds, pool, stock_pool):
+    off = ClusterSampledDataset(pool.pool_dir, pool.index_dir, seed=SEED, shuffle=False)
+    assert off.fingerprint() != ds.fingerprint()
+    assert off._bin_paths == ds._bin_paths        # the pool keeps the index's shard order
+    assert pickle.loads(pickle.dumps(off)).fingerprint() == off.fingerprint()
+    plain_off = ShardedDataset(data_dir=str(pool.pool_dir), shuffle=False)
+    assert plain_off.fingerprint() != stock_pool.fingerprint()
+    assert pickle.loads(pickle.dumps(plain_off)).fingerprint() == plain_off.fingerprint()
+
+
+def test_manifest_shuffle_false_reaches_the_train_dataset(pool):
+    from nanoplm.data.datasets import open_train_dataset
+    root = pool.pool_dir.parent
+    on = open_train_dataset(root, _manifest(), seed=7)
+    off = open_train_dataset(root, _manifest(shuffle=False), seed=7)
+    assert on.shuffle and not off.shuffle
+    assert on.fingerprint() != off.fingerprint()
+    cl = dict(cluster_index_dir="cluster_index", cluster_level="uniref90",
+              train_sequences=len(pool.train_clusters), pool_sequences=len(pool.lengths))
+    c_on = open_train_dataset(root, _manifest(**cl), seed=7)
+    c_off = open_train_dataset(root, _manifest(shuffle=False, **cl), seed=7)
+    assert not c_off.shuffle and c_on.fingerprint() != c_off.fingerprint()
+    assert c_on.pool_row(3) == c_off.pool_row(3)  # the member draw does not change
+
+
+def test_shuffle_off_orders_shards_by_number(tmp_path):
+    for k in (2, 10000, 9999, 1):
+        np.full(k % 7 + 1, k % 251, dtype=np.uint8).tofile(tmp_path / f"shard_{k:04d}.bin")
+        np.save(tmp_path / f"shard_{k:04d}.idx.npy", np.array([k % 7 + 1], dtype=np.int32))
+    names = lambda d: [os.path.basename(p) for p in d._bin_paths]
+    assert names(ShardedDataset(str(tmp_path), shuffle=False)) == [
+        "shard_0001.bin", "shard_0002.bin", "shard_9999.bin", "shard_10000.bin"]
+    # shuffled training keeps the name order, so running jobs resume unchanged
+    assert names(ShardedDataset(str(tmp_path))) == [
+        "shard_0001.bin", "shard_0002.bin", "shard_10000.bin", "shard_9999.bin"]
