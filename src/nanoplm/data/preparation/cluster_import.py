@@ -63,15 +63,61 @@ class DecompressorMissing(OSError):
 # ------------------------------------------------------------------ reading
 
 
+def _incomplete(path) -> ClusterImportError:
+    return ClusterImportError(
+        f"{path} is incomplete (the compressed data stops early); download it again")
+
+
+class _ZstdReader(io.RawIOBase):
+    """A .zst decompressed as a stream; reading past the end of a cut-off file (one whose
+    last frame never ends) raises ClusterImportError. Reads concatenated frames too."""
+
+    def __init__(self, path, dctx):
+        self._path, self._dctx = path, dctx
+        self._f = open(path, "rb")
+        self._dobj = dctx.decompressobj()
+        self._fed = False  # whether the current frame got any input
+        self._buf = b""
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        while not self._buf:
+            chunk = self._f.read(1 << 20)
+            if not chunk:
+                if self._fed and not self._dobj.eof:
+                    raise _incomplete(self._path)
+                return 0
+            while chunk:
+                if self._dobj.eof:
+                    self._dobj, self._fed = self._dctx.decompressobj(), False
+                self._buf += self._dobj.decompress(chunk)
+                self._fed = True
+                chunk = self._dobj.unused_data if self._dobj.eof else b""
+        n = min(len(b), len(self._buf))
+        b[:n] = self._buf[:n]
+        self._buf = self._buf[n:]
+        return n
+
+    def close(self):
+        self._f.close()
+        super().close()
+
+
 @contextlib.contextmanager
 def open_decompressed(path):
     """A file for reading in binary, decompressed when it is .gz or .zst. A .zst is read
-    with the zstandard package (the extractor's window limit), else with the zstd tool;
-    a bad .zst raises OSError."""
+    with the zstandard package (the extractor's window limit), else with the zstd tool.
+    A cut-off .gz or .zst raises ClusterImportError once it is read to the end; a damaged
+    .zst raises OSError (or ClusterImportError when read with the zstd tool)."""
     path = Path(path)
     if not str(path).endswith(".zst"):
         with (gzip.open if str(path).endswith(".gz") else open)(path, "rb") as f:
-            yield f
+            try:
+                yield f
+            except EOFError as e:
+                raise _incomplete(path) from e
         return
     try:
         import zstandard
@@ -80,7 +126,7 @@ def open_decompressed(path):
     if zstandard is not None:
         # a --long=31 file needs more than the 128 MiB default window
         dctx = zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW)
-        with io.BufferedReader(zstandard.open(path, "rb", dctx=dctx)) as f:
+        with io.BufferedReader(_ZstdReader(path, dctx)) as f:
             try:
                 yield f
             except zstandard.ZstdError as e:
@@ -93,6 +139,9 @@ def open_decompressed(path):
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
         yield proc.stdout
+        # read to the end: a non-zero exit means the data stopped early or is damaged
+        if not proc.stdout.read(1) and proc.wait() != 0:
+            raise _incomplete(path)
     finally:
         proc.kill()
         proc.stdout.close()

@@ -815,7 +815,7 @@ def cluster_members(source, fasta, output, level, xml, tsv, identity, coverage, 
                                                              import_members_table)
         try:
             stats = import_members_table(source, Path(output), fasta=Path(fasta), tsv=tsv)
-        except (ClusterImportError, OSError) as e:
+        except (ClusterImportError, OSError, EOFError) as e:
             raise click.ClickException(str(e)) from None
         click.echo(f"Wrote {output}: {stats['clusters']:,} clusters, "
                    f"{stats['members']:,} sequences")

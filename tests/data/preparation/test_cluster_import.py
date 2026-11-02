@@ -135,3 +135,19 @@ def test_the_cluster_members_command_prints_the_error_not_a_traceback(tmp_path):
     assert r.exit_code == 0, r.output
     assert "3 clusters, 5 sequences" in r.output
     assert Path(tmp_path / "m.tsv").read_text() == TABLE
+
+
+@pytest.mark.parametrize("name,zstd_tool", [("clusters.tsv.gz", False),
+                                            ("clusters.tsv.zst", False),
+                                            ("clusters.tsv.zst", True)])
+def test_a_cut_off_compressed_tsv_names_the_file(tmp_path, monkeypatch, name, zstd_tool):
+    fa, tab = _files(tmp_path, name=name)
+    tab.write_bytes(tab.read_bytes()[:-12])
+    if zstd_tool:
+        import shutil
+        import sys
+        if shutil.which("zstd") is None:
+            pytest.skip("no zstd tool")
+        monkeypatch.setitem(sys.modules, "zstandard", None)  # the import fails
+    with pytest.raises(ci.ClusterImportError, match=f"{name} is incomplete .* download it again"):
+        ci.import_members_table("tsv", tmp_path / "members.tsv", fasta=fa, tsv=tab)
