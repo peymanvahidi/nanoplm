@@ -123,7 +123,7 @@ data_params:
   drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
 
   # Rarely changed
-  shuffle: true          # shuffle before the train / val split
+  shuffle: true          # shuffle before the train / val split; false also trains in file order
   shuffle_seed: 24
   samples_per_shard: 2000  # sequences per shard file; raised automatically for large cluster datasets
   max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores
@@ -133,6 +133,14 @@ data_params:
 With one source, `weight` must be `1.0` or left out. Two or more sources make a mix, drawn by `weight`: see [Mixing datasets](/nanoplm/guides/mixing/).
 
 `max_seqs`, `min_seq_len`, `max_seq_len` and one of `val_ratio` or `val_size` are required. `val_ratio` is the share of the sequences held out for validation; `val_size` is a number of them. Set either one only in `data_params`, not on a source. In a mix it sets the validation sequences of the whole mix: see [Mixing datasets](/nanoplm/guides/mixing/#validation). You can leave out the other `data_params`. The template's values are the defaults, so deleting one, or writing it out, reruns nothing. The [data.yaml reference](/nanoplm/reference/data/) describes each key.
+
+`shuffle` and `shuffle_seed` are also set once, in `data_params`. With `shuffle: true`, the `shuffle` stage shuffles the sequences with `shuffle_seed` before the train / val split, so the validation set is a random sample. With `shuffle: false`:
+
+- the split keeps the file order, and the last sequences of the file become the validation set;
+- training also reads the train set in file order, the same order every epoch;
+- a mix of two or more sources is an error for now.
+
+`shuffle_seed` only sets the shuffle before the split (with cluster subsampling, also which clusters are held out for validation and which are kept under `max_seqs`). The order training reads in comes from `pretrain.yaml`'s `seed`: see [Seeds](/nanoplm/pipeline/pretrain/#seeds).
 
 :::caution[max_seq_len is set here and nowhere else]
 `from-yaml` writes `max_seq_len` into `.data_manifest`. Pretraining reads it from there to compute gradient accumulation, `grad_accum = ceil(global_batch_tokens / (micro_batch_seqs × max_seq_len × world_size))`, so `pretrain.yaml` has no `max_seq_len` key. To train on longer sequences, change it here and run `from-yaml` again. The shards change too.

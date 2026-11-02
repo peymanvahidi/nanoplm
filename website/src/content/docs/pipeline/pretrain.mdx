@@ -186,6 +186,17 @@ The rest of the block is a long tail of `use_*` flags: alternative attention sch
 
 Two keys are conspicuously absent from `model:`, and now you know why: `max_seq_len` and `num_register_tokens` come from `.data_manifest`. The data stage decided them; the model inherits them.
 
+## Seeds
+
+Two seeds take part in a run, one per config file:
+
+| Seed | Sets |
+| --- | --- |
+| `pretrain.yaml`'s `seed` | The order training reads the train set in, the draw between sources in a [mix](/nanoplm/guides/mixing/), which member each cluster gives in [cluster subsampling](/nanoplm/guides/cluster-subsampling/#seeds-and-shuffle), the masking, and the model init. Changing it needs no data rebuild. |
+| `data.yaml`'s `shuffle_seed` | The shuffle before the train / val split, so which sequences are held out for validation. With cluster subsampling, which clusters are held out. Changing it rebuilds part of the data. |
+
+`data.yaml`'s `shuffle: false` turns off the shuffle before the split and makes training read the train set in file order. With cluster subsampling the validation clusters are still a random draw with `shuffle_seed`, and the member draw stays random. The data stage writes it into `.data_manifest`, so `pretrain.yaml` has no key for it. See [the data config](/nanoplm/pipeline/data/#the-whole-config).
+
 ## Resuming
 
 The `resume:` block has its own guide ([Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/)) because "continue an interrupted run" and "anneal a trunk into a finished model" are different jobs that happen to share a block.

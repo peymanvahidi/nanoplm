@@ -25,7 +25,7 @@ data_params:
   drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
 
   # Rarely changed
-  shuffle: true          # shuffle before the train / val split
+  shuffle: true          # shuffle before the train / val split; false also trains in file order
   shuffle_seed: 24
   samples_per_shard: 2000  # sequences per shard file; raised automatically for large cluster datasets
   max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores

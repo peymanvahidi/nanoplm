@@ -16,7 +16,7 @@ For example, with UniRef90 members under UniRef50 clusters, nanoPLM tokenizes th
 How this differs from a normal run:
 
 - An epoch has one sample per training cluster. The manifest's `train_sequences` counts clusters, and `total_train_tokens` is the expected token count of one epoch.
-- Which member a cluster gives depends only on `pretrain.yaml`'s `seed` and the epoch. The number of GPUs, the dataloader workers and resuming do not change it.
+- Which member a cluster gives depends only on `pretrain.yaml`'s `seed` and the epoch. The number of GPUs, the dataloader workers and resuming do not change it. See [Seeds and shuffle](#seeds-and-shuffle).
 - Validation holds out whole clusters and scores each one's representative, the same sequences every epoch. No member of a validation cluster is ever trained on.
 - Pretraining needs `use_packing: true`, which is the template default.
 
@@ -46,7 +46,7 @@ Warning: sources.uniref50: max_seqs=20000 (from data_params) trains on at most 2
 Warning: sources.uniref50: val_ratio=0.1 (from data_params) holds out about 10.0% of the clusters for validation; the UniRef90 experiment used data_params.val_ratio: 0.0044
 ```
 
-One `uniref50` source with `val_ratio: 0.0044` holds out the same clusters as the experiment. In a [mix](/nanoplm/guides/mixing/#validation), the validation split is shared out by weight, so UniRef50 gets a different number of clusters and they are a different set.
+One `uniref50` source with `val_ratio: 0.0044` and `shuffle_seed: 20260918` holds out the same clusters as the experiment; with another `shuffle_seed` it holds out as many clusters, but a different set. In a [mix](/nanoplm/guides/mixing/#validation), the validation split is shared out by weight, so UniRef50 gets a different number of clusters and they are a different set.
 
 You do not need to change `samples_per_shard`. If the tokenized members would need more than 9,999 shards, nanoPLM raises it and logs the value it used.
 
@@ -240,6 +240,19 @@ The `cluster_members` stage checks a cluster file or the `CL:` tags against ever
 
 `drop_invalid_sequences` works as in a normal run, on the members. With UniProt clusters, `CL:` tags or a cluster file, the clusters are made before the length filter. If the filter drops a cluster's representative (it is invalid, or shorter than `min_seq_len` or longer than `max_seq_len`), the whole cluster is left out of training. The summary at the end of `from-yaml` says how many clusters were left out this way, and how many of them had members that passed the filter. MMseqs2 only clusters sequences that passed the filter, so it never loses a representative.
 
+## Seeds and shuffle
+
+Two seeds decide what a cluster run sees:
+
+| Seed | Sets |
+| --- | --- |
+| `data.yaml`'s `shuffle_seed` | Which clusters are held out for validation, and which are kept when `max_seqs` is below the number of clusters. |
+| `pretrain.yaml`'s `seed` | The order training visits the clusters in, and which member each cluster gives in each epoch. It also sets model init and masking. |
+
+`shuffle: false` makes training visit the clusters in the order of the cluster index, the same order every epoch. The member each cluster gives is still a random draw. The validation clusters and the `max_seqs` cap stay a random draw with `shuffle_seed` too: a block of clusters in file order would make a biased validation set.
+
+Builds made before `shuffle_seed` reached the cluster split used a fixed seed, 20260918. Set `shuffle_seed: 20260918` to keep their validation clusters. With the default 24, `cluster_index` reruns once and holds out a different set. Changing `shuffle_seed` reruns `cluster_index` and the stages after it: see [Stages and caching](#stages-and-caching).
+
 ## Stages and caching
 
 With cluster subsampling, `from-yaml` runs these stages instead of `shuffle` and `split`:
@@ -257,6 +270,7 @@ Each stage reruns only when its own inputs change:
 | --- | --- |
 | `clusters`, `identity`, `coverage`, the cluster file | `cluster_members` and later. The tokenized members are kept. |
 | `val_ratio`, `val_size`, `max_seqs`, a weight in a mix | `cluster_index` and the manifest (in a mix, only when the source's share of the validation split changes). |
+| `shuffle_seed` | `cluster_index` and the manifest. In a mix, every plain source also reruns from `shuffle` on, so its split and tokenization are redone. |
 | `max_workers` | Nothing. |
 | Remove the block from a `fasta: uniref50`, `members: uniref90` source | The normal pipeline runs, starting with downloading `uniref50.fasta.gz`, which the cluster run never fetched. |
 

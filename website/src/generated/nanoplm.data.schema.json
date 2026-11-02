@@ -105,7 +105,7 @@
         "shuffle": {
           "type": "boolean",
           "default": true,
-          "description": "shuffle before the train / val split",
+          "description": "shuffle before the train / val split; false also trains in file order",
           "x-nanoplm-group": "Rarely changed"
         },
         "shuffle_seed": {

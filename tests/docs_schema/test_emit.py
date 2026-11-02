@@ -198,7 +198,8 @@ def test_data_params_rarely_changed_group():
     assert "x-nanoplm-group" not in params["max_seq_len"]
     assert params["shuffle"]["x-nanoplm-group"] == "Rarely changed"
     # The heading labels the block; shuffle's description is its own comment.
-    assert params["shuffle"]["description"] == "shuffle before the train / val split"
+    assert params["shuffle"]["description"] == (
+        "shuffle before the train / val split; false also trains in file order")
 
 
 def test_nested_entry_outside_a_map_section_fails_loudly(monkeypatch):
