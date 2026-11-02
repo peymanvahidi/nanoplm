@@ -590,3 +590,10 @@ def test_only_headers_reads_a_url(server):
         with pytest.raises(cc.ClusterConfigError, match=f"UniProt's .* has none"):
             _plan(_on(shortcut, {"clusters": "headers"}))
     assert calls == []
+
+
+@pytest.mark.parametrize("value,ok", [("c.tsv", True), ("c.TSV", True),
+                                      ("https://x.org/c.Tsv.GZ", True), ("c.tsv.ZST", True),
+                                      ("c.fasta", False), ("c.tsv.bz2", False)])
+def test_is_tsv_name_ignores_case(value, ok):
+    assert cc.is_tsv_name(value) is ok

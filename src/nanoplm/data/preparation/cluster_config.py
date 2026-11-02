@@ -306,8 +306,8 @@ def _members_paths(members: str, src) -> tuple[Optional[Path], Path]:
 
 
 def is_tsv_name(value: str) -> bool:
-    """Whether a URL or path names a cluster file: .tsv, .tsv.gz or .tsv.zst."""
-    return _name(value).endswith(TSV_SUFFIXES)
+    """Whether a URL or path names a cluster file: .tsv, .tsv.gz or .tsv.zst, in any case."""
+    return _name(value).lower().endswith(TSV_SUFFIXES)
 
 
 def _clusters_setting(value, key: str, base_dir) -> str:

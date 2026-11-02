@@ -21,16 +21,17 @@ def _files(tmp_path, fasta=FASTA, tsv=TSV, name="clusters.tsv"):
     fa, tab = tmp_path / "m.fasta", tmp_path / name
     fa.write_text(fasta)
     data = tsv.encode()
-    if name.endswith(".gz"):
+    if name.lower().endswith(".gz"):
         data = gzip.compress(data)
-    elif name.endswith(".zst"):
+    elif name.lower().endswith(".zst"):
         import zstandard
         data = zstandard.ZstdCompressor().compress(data)
     tab.write_bytes(data)
     return fa, tab
 
 
-@pytest.mark.parametrize("name", ["clusters.tsv", "clusters.tsv.gz", "clusters.tsv.zst"])
+@pytest.mark.parametrize("name", ["clusters.tsv", "clusters.tsv.gz", "clusters.tsv.zst",
+                                  "clusters.TSV.GZ", "clusters.Tsv.Zst"])
 def test_tsv_to_members_table(tmp_path, name):
     fa, tab = _files(tmp_path, name=name)
     out = tmp_path / "cluster_index/members.tsv"
@@ -118,6 +119,13 @@ def test_headers_errors(tmp_path, fasta, match):
     fa.write_text(fasta)
     with pytest.raises(ci.ClusterImportError, match=match):
         ci.import_members_table("headers", tmp_path / "members.tsv", fasta=fa)
+
+
+def test_a_wrong_source_is_a_cluster_import_error(tmp_path):
+    with pytest.raises(ci.ClusterImportError, match="needs the cluster file"):
+        ci.import_members_table("tsv", tmp_path / "members.tsv", fasta=tmp_path / "m.fa")
+    with pytest.raises(ci.ClusterImportError, match="unknown cluster source 'xml'"):
+        ci.import_members_table("xml", tmp_path / "members.tsv", fasta=tmp_path / "m.fa")
 
 
 def test_the_cluster_members_command_prints_the_error_not_a_traceback(tmp_path):

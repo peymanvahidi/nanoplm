@@ -1873,16 +1873,17 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
 
 
 def _clusters_line(m: dict) -> str:
-    """'UniRef50 clusters: 265 (members from UniRef90)', 'MMseqs2 clusters: 40', or
-    'Clusters: 40 (from the CL: tags)'."""
-    level = m.get("cluster_level")
+    """'UniRef50 clusters: 265 (members from UniRef90)', 'MMseqs2 clusters:  40', or
+    'Clusters:           40 (from the CL: tags)': every label padded to one width."""
+    level, n = m.get("cluster_level"), m.get("seqs_num")
     if level in ("uniref90", "uniref100"):
-        return (f"UniRef50 clusters: {m.get('seqs_num')} "
-                f"(members from UniRef{level[len('uniref'):]})")
-    if level in ("tsv", "headers"):
-        what = "the cluster file" if level == "tsv" else "the CL: tags"
-        return f"Clusters:        {m.get('seqs_num')} (from {what})"
-    return f"MMseqs2 clusters:  {m.get('seqs_num')}"
+        label, note = "UniRef50 clusters:", f" (members from UniRef{level[len('uniref'):]})"
+    elif level in ("tsv", "headers"):
+        label = "Clusters:"
+        note = " (from the cluster file)" if level == "tsv" else " (from the CL: tags)"
+    else:
+        label, note = "MMseqs2 clusters:", ""
+    return f"{label:<19}{n}{note}"
 
 
 def _dataset_dir_line(manifest_path: Path, kind: str) -> str:

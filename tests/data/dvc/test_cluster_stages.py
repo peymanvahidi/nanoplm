@@ -529,6 +529,16 @@ def test_a_mix_downloads_a_cluster_file_once(tmp_path):
         assert "--tsv out/downloads/clu.tsv -o" in st[f"{s}-cluster_members"]["cmd"]
 
 
+def test_cluster_summary_labels_have_one_width():
+    from nanoplm.cli.data import _clusters_line
+    lines = [_clusters_line({"cluster_level": lvl, "seqs_num": 7})
+             for lvl in ("uniref90", "tsv", "headers", None)]
+    assert lines == ["UniRef50 clusters: 7 (members from UniRef90)",
+                     "Clusters:          7 (from the cluster file)",
+                     "Clusters:          7 (from the CL: tags)",
+                     "MMseqs2 clusters:  7"]
+
+
 def test_plan_table_says_where_clusters_come_from_and_what_it_trains_on(tmp_path):
     from nanoplm.cli.data import plan_table
     from nanoplm.data.preparation.data_config import parse_data_config
@@ -599,6 +609,6 @@ def test_from_yaml_end_to_end_with_a_cluster_file_or_cl_tags(tmp_path, how):
     ix = out / "cluster_index/index"
     val, train = np.load(ix / "val_clusters.npy"), np.load(ix / "train_clusters.npy")
     assert len(val) == 4 and not np.isin(val, train).any()
-    assert ("Clusters:        40 (from the " + ("CL: tags" if how == "headers" else
+    assert ("Clusters:          40 (from the " + ("CL: tags" if how == "headers" else
                                                  "cluster file") + ")") in r.stdout
     assert _status(tmp_path, env) == set()

@@ -112,8 +112,9 @@ def open_decompressed(path):
     A cut-off .gz or .zst raises ClusterImportError once it is read to the end; a damaged
     .zst raises OSError (or ClusterImportError when read with the zstd tool)."""
     path = Path(path)
-    if not str(path).endswith(".zst"):
-        with (gzip.open if str(path).endswith(".gz") else open)(path, "rb") as f:
+    suffix = path.suffix.lower()
+    if suffix != ".zst":
+        with (gzip.open if suffix == ".gz" else open)(path, "rb") as f:
             try:
                 yield f
             except EOFError as e:
@@ -414,11 +415,11 @@ def import_members_table(source: str, out_tsv, *, fasta, tsv: Optional[str] = No
     the member FASTA before the length filter."""
     if source == "tsv":
         if tsv is None:
-            raise ValueError("the tsv cluster source needs the cluster file")
+            raise ClusterImportError("the tsv cluster source needs the cluster file")
         stats = tsv_members_tsv(tsv, fasta, out_tsv)
     elif source == "headers":
         stats = headers_members_tsv(fasta, out_tsv)
     else:
-        raise ValueError(f"unknown cluster source {source!r}")
+        raise ClusterImportError(f"unknown cluster source {source!r}")
     _write_info(out_tsv, stats)
     return stats
