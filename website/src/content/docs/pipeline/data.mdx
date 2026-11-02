@@ -89,7 +89,7 @@ A `*` at the end of a sequence is a stop codon (Prodigal writes one). The `filte
 
 Start with SwissProt (about 570k sequences). It downloads in minutes, so you can test the pipeline on it before a UniRef-scale run.
 
-To train on one random member of every cluster per epoch (for example UniRef90 sequences under UniRef50 clusters), set `cluster_subsampling: true` on the source, or a block with `members` or `clusters`. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+To train on one random member of every cluster per epoch (for example UniRef90 sequences under UniRef50 clusters), add a `cluster_subsampling` block to the source that sets `clusters`. See [Cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 
 ## The whole config
 

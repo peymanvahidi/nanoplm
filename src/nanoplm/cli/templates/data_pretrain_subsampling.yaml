@@ -17,7 +17,7 @@ sources:
   #   fasta: data/my_proteins.fasta
   #   weight: 0.5        # then lower the other weights so they sum to 1
   #   cluster_subsampling:
-  #     clusters: data/my_clusters.tsv   # representative<TAB>member, e.g. MMseqs2 output
+  #     clusters: data/my_clusters.tsv   # representative<TAB>member, e.g. MMseqs2 output (plain-id headers)
 
   # Your own FASTA without clusters (clustered with MMseqs2):
   # my_other:
@@ -32,7 +32,7 @@ data_params:
   max_seqs: -1           # counts clusters here: -1 = all
   min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
-  val_ratio: 0.0044      # share of clusters held out for validation (the UniRef50 experiment)
+  val_ratio: 0.0044      # share of the mix's clusters held out for validation
   # OR (together you'll get error, comment one out)
   # val_size: 150000
   drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping

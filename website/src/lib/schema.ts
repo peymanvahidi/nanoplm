@@ -18,6 +18,8 @@ export interface SectionSchema {
   properties: Record<string, FieldSchema>;
   /** A name -> spec map (data's `sources`): the spec every entry follows. */
   additionalProperties?: SectionSchema;
+  /** Fields with no default that must be set (a nested block's, e.g. clusters). */
+  required?: string[];
   /** Banner-intro prose per group, keyed by group title. */
   'x-nanoplm-group-notes'?: Record<string, string>;
 }
@@ -182,7 +184,9 @@ export function toRows(surface: Surface, section?: string): Row[] {
     : Object.fromEntries(
         Object.entries(surface.properties).filter(([, f]) => !isSection(f)),
       ) as Record<string, FieldSchema>;
-  const required = new Set(surface.required ?? []);
+  const required = new Set(
+    (section ? sectionNode(surface, section)?.required : surface.required) ?? [],
+  );
 
   return Object.entries(node).map(([key, field]) => {
     const type = Array.isArray(field.type) ? field.type.join(' | ') : (field.type ?? 'string');

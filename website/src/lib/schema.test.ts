@@ -253,8 +253,12 @@ describe('toRows', () => {
     expect(spec).toEqual(expect.arrayContaining(['fasta', 'weight', 'cluster_subsampling']));
     expect(spec).not.toContain('prepared');
     const cluster = toRows(d, 'sources.cluster_subsampling');
-    // clusters also takes a .tsv path, so it has a default but no enum
-    expect(cluster.find((r) => r.key === 'clusters')?.default).toBe('auto');
+    // clusters is required: no default, and no enum since it also takes a .tsv path
+    const clusters = cluster.find((r) => r.key === 'clusters');
+    expect(clusters?.required).toBe(true);
+    expect(clusters && 'default' in clusters).toBe(false);
+    expect(clusters?.enum).toBeUndefined();
+    expect(cluster.find((r) => r.key === 'members')?.required).toBeUndefined();
     // Nested blocks are named by their last segment, so guide links keep resolving.
     expect(sectionPrefix(d, 'sources.cluster_subsampling')).toBe('data-cluster_subsampling');
     expect(toRows(d, 'no.such.block')).toEqual([]);

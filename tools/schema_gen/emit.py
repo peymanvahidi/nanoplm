@@ -105,6 +105,9 @@ def _extra_field_schema(section: str, key: str, spec: dict, o: dict, vis: dict) 
             sub: _extra_field_schema(f"{section}.{key}", sub, sub_spec or {}, o, vis)
             for sub, sub_spec in spec["properties"].items()
         }
+        required = [sub for sub, f in frag["properties"].items() if "default" not in f]
+        if required:
+            frag["required"] = required
     ov = _overlay.for_field(o, _overlay_key(section, key))
     ov.update({k: v for k, v in spec.items() if k in _ANNOTATION_KEYS})
     return _apply(frag, key, spec.get("description", ""), ov, vis)

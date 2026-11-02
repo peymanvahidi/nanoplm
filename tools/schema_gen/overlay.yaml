@@ -455,9 +455,9 @@ x-extra-fields:
         default: false
         description: >-
           Turns on cluster subsampling for this source: each epoch trains on one
-          random member of every cluster. true turns it on and finds the clusters
-          from the data; a mapping sets the fields below. false, or no key, turns it
-          off. max_seqs and val_ratio then count clusters, not sequences.
+          random member of every cluster. A mapping with clusters turns it on;
+          false, or no key, turns it off. max_seqs and val_ratio then count
+          clusters, not sequences.
         properties:
           # cluster_config.resolve_cluster_plan: left out or null = this source's fasta.
           members:
@@ -467,14 +467,14 @@ x-extra-fields:
               The sequences training draws from: uniref90, uniref100, or a UniRef90/100
               FASTA URL/path. Leave it out to use this source's fasta.
           # cluster_config.CLUSTERS, or a cluster file (cluster_config.TSV_SUFFIXES);
-          # the old name `clustering` still works (data_config.OLD_CLUSTER_KEYS)
+          # the old name `clustering` still works (data_config.OLD_CLUSTER_KEYS).
+          # Required: no default key (emit lists it in the block's `required`).
           clusters:
             type: string
-            default: auto
             description: >-
-              Where the clusters come from. auto: UniProt's clusters for UniRef data,
-              else CL:<cluster id> tags in the FASTA headers, else MMseqs2 (up to 20 GB
-              of FASTA; above that, set mmseqs2). Or mmseqs2, uniprot, headers, or a
+              Where the clusters come from: uniprot (UniProt's UniRef50 clusters, for
+              UniRef90/100 members), headers (CL:<representative> tags in the FASTA
+              headers), mmseqs2 (clusters the sequences; hours on large data), or a
               .tsv / .tsv.gz / .tsv.zst file of representative<TAB>member lines (a path
               or a URL). Called clustering before.
           # cluster_config._fraction: a number in (0, 1]; 0 itself is rejected

@@ -42,8 +42,7 @@
               },
               "clusters": {
                 "type": "string",
-                "default": "auto",
-                "description": "Where the clusters come from. auto: UniProt's clusters for UniRef data, else CL:<cluster id> tags in the FASTA headers, else MMseqs2 (up to 20 GB of FASTA; above that, set mmseqs2). Or mmseqs2, uniprot, headers, or a .tsv / .tsv.gz / .tsv.zst file of representative<TAB>member lines (a path or a URL). Called clustering before."
+                "description": "Where the clusters come from: uniprot (UniProt's UniRef50 clusters, for UniRef90/100 members), headers (CL:<representative> tags in the FASTA headers), mmseqs2 (clusters the sequences; hours on large data), or a .tsv / .tsv.gz / .tsv.zst file of representative<TAB>member lines (a path or a URL). Called clustering before."
               },
               "identity": {
                 "type": "number",
@@ -60,7 +59,10 @@
                 "description": "mmseqs2 only: min alignment coverage"
               }
             },
-            "description": "Turns on cluster subsampling for this source: each epoch trains on one random member of every cluster. true turns it on and finds the clusters from the data; a mapping sets the fields below. false, or no key, turns it off. max_seqs and val_ratio then count clusters, not sequences."
+            "required": [
+              "clusters"
+            ],
+            "description": "Turns on cluster subsampling for this source: each epoch trains on one random member of every cluster. A mapping with clusters turns it on; false, or no key, turns it off. max_seqs and val_ratio then count clusters, not sequences."
           }
         }
       },

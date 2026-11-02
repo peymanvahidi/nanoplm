@@ -81,6 +81,7 @@ sources:
     max_seqs: -1         # counts clusters here: all of them
     cluster_subsampling:
       members: uniref90
+      clusters: uniprot
 data_params:
   val_ratio: 0.0044      # 147k val: 29k swissprot sequences + 118k uniref50 clusters
 ```

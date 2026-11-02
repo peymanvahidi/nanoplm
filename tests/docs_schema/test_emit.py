@@ -163,7 +163,9 @@ def test_cluster_fractions_exclude_zero():
         assert block[key]["exclusiveMinimum"] == 0 and "minimum" not in block[key]
         assert block[key]["maximum"] == 1
     assert block["identity"]["default"] == 0.5 and block["coverage"]["default"] == 0.8
-    assert block["clusters"]["default"] == "auto" and "enum" not in block["clusters"]
+    assert "default" not in block["clusters"] and "enum" not in block["clusters"]
+    cluster = _source_spec()["properties"]["cluster_subsampling"]
+    assert cluster["required"] == ["clusters"]
     assert block["members"]["default"] is None   # left out: this source's fasta
 
 

@@ -22,16 +22,7 @@ How this differs from a normal run:
 
 ## Turn it on
 
-Set `cluster_subsampling: true` under a source in `data.yaml`. nanoPLM then finds where the clusters come from (see [How auto decides](#how-auto-decides)). `false`, or no key, turns it off.
-
-```yaml title="data.yaml"
-sources:
-  mine:
-    fasta: "data/my_proteins.fasta"
-    cluster_subsampling: true
-```
-
-Write a mapping instead of `true` only when you need to set something. This example, from `nanoplm data get-yaml --subsampling`, trains on UniRef90 sequences under UniProt's UniRef50 clusters:
+Add a `cluster_subsampling` block under a source in `data.yaml` and set `clusters` in it, to say where the clusters come from. `false`, or no block, turns it off. This example, from `nanoplm data get-yaml --subsampling`, trains on UniRef90 sequences under UniProt's UniRef50 clusters:
 
 ```yaml title="data.yaml"
 sources:
@@ -39,13 +30,13 @@ sources:
     fasta: uniref50
     cluster_subsampling:
       members: uniref90  # train on these sequences; leave out to use this fasta
-      # clusters: auto   # auto (found from the data), mmseqs2, or a .tsv of representative<TAB>member
+      clusters: uniprot  # uniprot, headers (CL: tags in the FASTA headers), mmseqs2 (slow: hours), or a .tsv of representative<TAB>member
 ```
 
 nanoPLM downloads `uniref90.fasta.gz` and `uniref50.xml.gz`, the file that lists each cluster's members. It never downloads the UniRef50 FASTA itself.
 
 - [`members`](/nanoplm/reference/data/#data-cluster_subsampling-members) names the sequences that training draws from. Leave it out to use the source's own `fasta`. `uniref90` and `uniref100` are shortcuts for UniProt's files. A URL or path must be a UniRef90 or UniRef100 FASTA.
-- [`clusters`](/nanoplm/reference/data/#data-cluster_subsampling-clusters) says where the clusters come from. The default, `auto`, finds out from the data. See [Where the clusters come from](#where-the-clusters-come-from). Older configs call it `clustering`; that still works, and `from-yaml` asks you to rename it.
+- [`clusters`](/nanoplm/reference/data/#data-cluster_subsampling-clusters) says where the clusters come from. It is required and has no default. See [Where the clusters come from](#where-the-clusters-come-from). Older configs call it `clustering`; that still works, and `from-yaml` asks you to rename it.
 - [`identity`](/nanoplm/reference/data/#data-cluster_subsampling-identity) and [`coverage`](/nanoplm/reference/data/#data-cluster_subsampling-coverage) only apply when MMseqs2 makes the clusters. Setting them to other values with another cluster source is an error.
 
 Here `max_seqs`, `val_ratio` and `val_size` count clusters, not sequences; `max_seqs: -1` uses every cluster. `val_ratio` is set once, in `data_params`; the UniRef90 experiment used `val_ratio: 0.0044` (145k of 32.9M clusters). If you leave the template's values (`max_seqs: 20000`, `val_ratio: 0.1`), training sees at most 20,000 clusters and holds out 10% of them. `from-yaml` warns about both before any stage runs:
@@ -63,7 +54,18 @@ Then set `pretrain.yaml`'s `dataset_dir` to `output_dir`. Nothing else in `pretr
 
 ## Where the clusters come from
 
-nanoPLM reads clusters in three formats. If you have none, MMseqs2 makes them.
+`clusters` takes one of four values. nanoPLM never picks one for you, so MMseqs2 only runs when you ask for it.
+
+| `clusters` | The clusters come from | Use it for |
+| --- | --- | --- |
+| `uniprot` | UniProt's UniRef50 clusters, read from `uniref50.xml.gz` | UniRef90 or UniRef100 members (`fasta: uniref50` with `members: uniref90` or `uniref100`, or a UniRef90/100 `fasta`) |
+| `headers` | a `CL:<representative>` tag in every FASTA header | FASTA files that carry the tags, such as Logan's protein files |
+| a `.tsv` file | `representative<TAB>member` lines | clusters you made yourself, for example with MMseqs2 |
+| `mmseqs2` | MMseqs2, run on the sequences that pass the filter | sequences without clusters; it takes hours on large data (see [When MMseqs2 runs](#when-mmseqs2-runs)) |
+
+`from-yaml` checks the value before any stage runs: `uniprot` on data that is not UniRef is an error, and so is `headers` when the first headers have no `CL:` tag.
+
+UniRef90 and UniRef100 members share one set of clusters and one train / validation split, because a UniRef100 representative is the same sequence as the UniRef90 one.
 
 ### UniProt UniRef clusters
 
@@ -75,11 +77,20 @@ sources:
     fasta: uniref50
     cluster_subsampling:
       members: uniref90
+      clusters: uniprot
 ```
+
+To cluster UniRef90 another way, for example at `identity: 0.3` instead of UniProt's 50%, set `clusters: mmseqs2`. nanoPLM then downloads only the members, not `uniref50.xml.gz` and not the UniRef50 FASTA.
 
 ### CL tags in the FASTA headers
 
-Each header carries `CL:<cluster id>` as a word after the id, as in Logan's protein files:
+Each header is the record id, then a tab (or space), then `CL:` and the id of the cluster's representative:
+
+```text
+>ID<TAB>CL:<representative>
+```
+
+Logan's protein files use this format. In these two headers (sequences left out), the first record is a representative, since its id is its own cluster id, and the second is a member of its cluster:
 
 ```text
 >DRR000534_5840_1	CL:DRR000534_5840_1
@@ -90,10 +101,15 @@ Each header carries `CL:<cluster id>` as a word after the id, as in Logan's prot
 sources:
   logan:
     fasta: "data/logan_sample.fasta.zst"
-    cluster_subsampling: true
+    cluster_subsampling:
+      clusters: headers
 ```
 
-The representative is the record whose id is its own cluster id. The records can come in any order. Every record needs a tag, and every cluster needs its representative in the file. Files like Logan's "all proteins" (about 31.6 billion records, 99% of them duplicates) are too large for this; use the Logan50 representatives file as a plain source instead, without `cluster_subsampling`.
+- Every header needs a tag. One record without a tag stops the `cluster_members` stage.
+- Every cluster needs its representative in the file: a record whose id is the cluster id.
+- The records need not be grouped by cluster or sorted; they can come in any order.
+
+Files like Logan's "all proteins" (about 31.6 billion records, 99% of them duplicates) are too large for this; use the Logan50 representatives file as a plain source instead, without `cluster_subsampling`.
 
 ### A cluster file
 
@@ -124,41 +140,14 @@ sources:
   mine:
     fasta: "data/my_proteins.fasta"
     cluster_subsampling:
+      clusters: mmseqs2
       identity: 0.5    # min sequence identity within a cluster
       coverage: 0.8    # min alignment coverage
 ```
 
-`cluster_subsampling: true` does the same with these defaults. See [When MMseqs2 runs](#when-mmseqs2-runs) for what it costs.
+`identity` and `coverage` default to these values. See [When MMseqs2 runs](#when-mmseqs2-runs) for what it costs.
 
 Whichever source the clusters come from, nanoPLM writes them to one table, `output_dir/cluster_index/members.tsv`, with one `cluster_id<TAB>sequence_id` line per member and the representative first.
-
-## How auto decides
-
-`clusters: auto` takes the first of these that applies:
-
-1. The members are UniRef90 or UniRef100, and `fasta` is UniRef50 or that same set: UniProt's clusters.
-2. The first headers of the members carry `CL:` tags: the tags.
-3. Otherwise: MMseqs2.
-
-| `fasta` | `members` | `clusters: auto` uses |
-| --- | --- | --- |
-| `uniref50` | `uniref90` or `uniref100` | UniProt clusters |
-| `uniref90` or `uniref100` (or a local copy) | left out | UniProt clusters |
-| a FASTA with `CL:` tags | left out | the `CL:` tags |
-| your own FASTA, or `swissprot` | left out | MMseqs2 |
-| `uniref50` | left out | MMseqs2 over all ~60M UniRef50 sequences (hours; `from-yaml` warns) |
-| `trembl`, or any FASTA over 20 GB | left out | `from-yaml` stops: set `clusters: mmseqs2`, or give a cluster file |
-
-`auto` decides before any stage runs. It reads the start of a local file, or of a file already in `output_dir/downloads/`. For a URL it asks the server for the first 1 MB. If that fails, `from-yaml` stops and asks you to set `clusters`. A `.gz` or `.zst` counts as twice its size for the 20 GB limit. On UniProt's own files (`swissprot`, `trembl`, `uniref50`, ...) it sends no request.
-
-To override `auto`:
-
-- `clusters: mmseqs2` uses MMseqs2 in every row, for example to cluster UniRef90 at `identity: 0.3` instead of UniProt's 50%. nanoPLM then downloads only the members, not `uniref50.xml.gz` and not the UniRef50 FASTA.
-- `clusters: uniprot` works only in the first two rows. On the others, `from-yaml` stops before any stage runs.
-- `clusters: headers` uses the `CL:` tags; `from-yaml` stops if the first headers have none.
-- `clusters: <file>.tsv` uses that file, in every row.
-
-UniRef90 and UniRef100 members share one set of clusters and one train / validation split, because a UniRef100 representative is the same sequence as the UniRef90 one.
 
 ## Read the table
 
@@ -188,7 +177,7 @@ Pretraining data pipeline complete (cluster subsampling).
 
 ## When MMseqs2 runs
 
-MMseqs2 runs only when you set `clusters: mmseqs2`, or when `auto` finds no clusters in the data (see [How auto decides](#how-auto-decides)).
+MMseqs2 runs only when you set `clusters: mmseqs2`.
 
 Install MMseqs2 with `nanoplm deps install --mmseqs-only` (see [Install](/nanoplm/start/install/#flags)). `from-yaml` checks for the binary before any stage runs. It runs `easy-linclust --min-seq-id <identity> -c <coverage> --cov-mode 0` over the members that passed the filter, and MMseqs2 picks each cluster's representative. With `--cov-mode 0` the alignment must cover that share of both sequences, so a fragment does not join a cluster on a short local match.
 
@@ -228,16 +217,17 @@ nanoPLM downloads `uniref50.xml.gz` once into `output_dir/downloads/` and keeps 
 
 | Message | Fix |
 | --- | --- |
-| `sources.<name>.cluster_subsampling is empty. Write cluster_subsampling: true to turn it on` | Write `true`, set a field, or delete the key to turn it off. |
-| `sources.<name>.cluster_subsampling: remove enabled` | Delete the `enabled` key. `true` turns it on, `false` turns it off. |
+| `sources.<name>.cluster_subsampling is empty. Set clusters in it to ...` | Set `clusters`, or delete the block to turn it off. |
+| `sources.<name>.cluster_subsampling: true no longer turns it on` | Write a block that sets `clusters`. See [Where the clusters come from](#where-the-clusters-come-from). |
+| `sources.<name>.cluster_subsampling.clusters is required` | Set `clusters` to `uniprot`, `headers`, `mmseqs2` or a `.tsv` file. |
+| `...clusters: auto was removed` | Choose where the clusters come from. See [Where the clusters come from](#where-the-clusters-come-from). |
+| `sources.<name>.cluster_subsampling: remove enabled` | Delete the `enabled` key. The block turns it on, `false` (or no block) turns it off. |
 | `sources.<name>.cluster_subsampling.members is uniref90, so sources.<name>.fasta must be UniRef50 or uniref90 itself` | UniRef members need `fasta: uniref50` (or the same UniRef set). |
 | `...members: uniref50 cannot be the members: UniRef50 entries are the clusters themselves` | Use `members: uniref90` or `uniref100`. |
 | `...members (...) is not a UniRef set and differs from sources.<name>.fasta. Put that FASTA in fasta and leave members out.` | Your own FASTA goes in `fasta`, without `members`. |
-| `...clusters must be auto, mmseqs2, uniprot, headers, or a cluster file ending in .tsv` | Use one of these values. |
-| `...clusters: uniprot: UniProt clusters need UniRef data` | Use one of the UniProt rows in [How auto decides](#how-auto-decides), or `clusters: auto`. |
+| `...clusters must be uniprot, headers, mmseqs2, or a cluster file ending in .tsv` | Use one of these values. |
+| `...clusters: uniprot: UniProt clusters need UniRef data` | Use `fasta: uniref50` with `members: uniref90` or `uniref100`, or set `clusters` to `headers`, `mmseqs2` or a `.tsv` file. |
 | `...clusters: headers needs a CL:<cluster id> tag after the id in every FASTA header` | The FASTA has no `CL:` tags; use another `clusters` value. |
-| `...<file> has no cluster information, so clusters: auto would cluster it with MMseqs2: about ... GB of FASTA` | Set `clusters: mmseqs2` to run it anyway, or give a cluster file. |
-| `...could not read the start of <url> to find its clusters` | Set `clusters` yourself: `headers`, `mmseqs2` or a `.tsv` file. |
 | `...identity / coverage only apply when MMseqs2 makes the clusters` | Remove them, or set `clusters: mmseqs2`. |
 | `sources.<name>: these members are clustered with MMseqs2, but mmseqs was not found` | `nanoplm deps install --mmseqs-only`, a release binary on `PATH`, or `NANOPLM_MMSEQS=/path/to/mmseqs`. |
 | `...val_ratio=... of at most ... clusters (max_seqs) holds out 0; cluster subsampling needs at least one train and one val cluster` | Raise `data_params.val_ratio` to the value the message names, or set `max_seqs: -1`. |
@@ -245,7 +235,6 @@ nanoPLM downloads `uniref50.xml.gz` once into `output_dir/downloads/` and keeps 
 | `... was built by the data-sampler experiment scripts ...` (at pretraining start) | `dataset_dir` is a folder from the old experiment scripts. Rebuild it with `nanoplm data from-yaml`. |
 | Warning: `...clustering is now called clusters; the old name still works` | Rename the key. If it was `uniprot` or `mmseqs2`, the rename reruns `cluster_members` once. |
 | Warning: `max_seqs=... trains on at most ... clusters` / `val_ratio=... holds out ...% of the clusters` | See [Turn it on](#turn-it-on). |
-| Warning: `fasta is UniRef50 and members is left out, so MMseqs2 will cluster all ~60M UniRef50 sequences` | To use UniProt's clusters, set `members: uniref90`. To cluster UniRef50 on purpose, set `clusters: mmseqs2` and the warning goes away. |
 | Warning: `cluster_subsampling ignores shuffle / shuffle_seed` | The tokenized members keep FASTA order; training shuffles the clusters each epoch. |
 
 The `cluster_members` stage checks a cluster file or the `CL:` tags against every record. It stops when a record has no tag or is missing from the file, when an id is in the file but not in the FASTA or is listed twice, or when a cluster has no representative. The message gives the counts and a few ids.
@@ -267,7 +256,7 @@ Each stage reruns only when its own inputs change:
 
 | You change | What reruns |
 | --- | --- |
-| `clusters`, `identity`, `coverage`, the cluster file | `cluster_members` and later. The tokenized members are kept. A `clusters` value that `auto` resolves to the same source reruns nothing. |
+| `clusters`, `identity`, `coverage`, the cluster file | `cluster_members` and later. The tokenized members are kept. |
 | `val_ratio`, `val_size`, `max_seqs`, a weight in a mix | `cluster_index` and the manifest (in a mix, only when the source's share of the validation split changes). |
 | `max_workers` | Nothing. |
 | Remove the block from a `fasta: uniref50`, `members: uniref90` source | The normal pipeline runs, starting with downloading `uniref50.fasta.gz`, which the cluster run never fetched. |
