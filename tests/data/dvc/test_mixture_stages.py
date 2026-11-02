@@ -34,7 +34,7 @@ def _params(stage):
 THREE = dict(
     swissprot={"fasta": "swissprot", "weight": 0.2},
     uniref50={"fasta": "uniref50", "weight": 0.7, "max_seq_len": 1024,
-              "cluster_subsampling": {"members": "uniref90"}},
+              "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}},
     u90={"fasta": "uniref90", "weight": 0.1},
 )
 
@@ -171,7 +171,7 @@ def _two_source_project(tmp_path):
     cfg["sources"] = {
         "plain": {"fasta": str(plain), "weight": 0.3},
         "clus": {"fasta": str(rel.fasta90), "weight": 0.7,
-                 "cluster_subsampling": {"members": None}},
+                 "cluster_subsampling": {"clusters": "uniprot"}},
     }
     cfg["data_params"]["val_ratio"] = 0.05
     cfg["output_dir"] = "out"
@@ -344,7 +344,7 @@ def test_removing_or_renaming_a_source_names_its_outputs(tmp_path):
 
 def test_dropping_a_cluster_block_names_its_index_and_the_xml(tmp_path):
     u = {"fasta": "uniref50", "weight": 0.5, "max_seqs": -1,
-         "cluster_subsampling": {"members": "uniref90"}}
+         "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}}
     _lock_from(tmp_path, _mix(a=A, u=u))
     assert _orphans(tmp_path, _mix(a=A, u=u)) == []
     off = _mix(a=A, u={"fasta": "uniref50", "weight": 0.5})
@@ -422,7 +422,7 @@ def test_from_yaml_one_cluster_source_with_val_size(tmp_path):
     from nanoplm.data.infra.manifest import read_manifest
     from tests.data.preparation.uniref_fixture import make_release
     rel = make_release(tmp_path / "src", n_clusters=120)
-    env = _project(tmp_path, {"members": None}, str(rel.fasta90), val_size=7)
+    env = _project(tmp_path, {"clusters": "uniprot"}, str(rel.fasta90), val_size=7)
     cfg = yaml.safe_load((tmp_path / "data.yaml").read_text())
     del cfg["data_params"]["val_ratio"]
     (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))

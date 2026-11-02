@@ -55,7 +55,7 @@ def test_the_cluster_block_never_refetches_the_source():
     """Adding or removing the block keeps get_file / extract / check as they are when the
     members are the source fasta, so DVC does not download or extract it again."""
     u90 = cc.UNIPROT_FASTA["uniref90"]
-    plain, clustered = _stages(_source(u90)), _stages(_source(u90, {}))
+    plain, clustered = _stages(_source(u90)), _stages(_source(u90, {"clusters": "uniprot"}))
     for name in ("get_file", "extract", "check"):
         assert plain[name] == clustered[name], name
     assert plain["get_file"] == {
@@ -74,13 +74,13 @@ def test_mmseqs2_on_uniref_data_fetches_neither_the_xml_nor_the_url():
     assert f"{BLOCK}.clustering" in st["cluster_members"]["params"][0]["data.yaml"]
 
 
-def test_a_block_without_clustering_lists_no_clustering_param():
-    st = _stages(_source("uniref50", {"members": "uniref90"}))
+def test_the_clusters_key_is_no_dvc_param():
+    st = _stages(_source("uniref50", {"members": "uniref90", "clusters": "uniprot"}))
     assert "params" not in st["cluster_members"] and "get_cluster_xml" in st
 
 
 def test_uniref50_url_uniref90_members_stages():
-    st = _stages(_source("uniref50", {"members": "uniref90", "clustering": "auto"}))
+    st = _stages(_source("uniref50", {"members": "uniref90", "clusters": "uniprot"}))
     assert list(st) == ["get_members_fasta", "extract_members", "check", "filter",
                         "cluster_pool", "get_cluster_xml", "cluster_members", "cluster_index",
                         "write_manifest"]
@@ -90,7 +90,7 @@ def test_uniref50_url_uniref90_members_stages():
         assert "deps" not in st[name] and "params" not in st[name], name
     assert st["get_cluster_xml"]["outs"] == [
         {f"{OUT}/downloads/uniref50.xml.gz": {"persist": True, "cache": False}}]
-    # identity / coverage are ignored here, and clustering: auto is the default
+    # identity / coverage are not used here, and clusters is no DVC param
     assert "params" not in st["cluster_members"]
     assert "--source uniref_xml --level uniref90" in st["cluster_members"]["cmd"]
     # a length-filter change must not rerun the XML scan
@@ -103,23 +103,26 @@ def test_uniref50_url_uniref90_members_stages():
     # named in the release-mismatch error; members.json no longer records it
     assert st["cluster_index"]["cmd"].endswith(
         f" --cluster-xml {OUT}/downloads/uniref50.xml.gz")
-    assert "--cluster-xml" not in _stages(_source("uniref50", {}))["cluster_index"]["cmd"]
+    assert "--cluster-xml" not in _stages(_source(
+        "uniref50", {"clusters": "mmseqs2"}))["cluster_index"]["cmd"]
 
 
 def test_writing_a_cluster_default_out_changes_nothing(tmp_path):
-    """identity 0.5, coverage 0.8 and clustering auto are what a left-out key means, so
-    writing them gives the same dvc.yaml (no new DVC param, no rerun)."""
+    """identity 0.5 and coverage 0.8 are what a left-out key means, so writing them gives
+    the same dvc.yaml (no new DVC param, no rerun)."""
     own = tmp_path / "mine.fasta"
     own.write_text(">a\nMKV\n")
-    for fasta, block in ((str(own), {}), ("uniref50", {"members": "uniref90"})):
-        written = {**block, "clustering": "auto", "identity": 0.5, "coverage": 0.8}
-        assert _stages(_source(fasta, written)) == _stages(_source(fasta, block))
-    changed = _stages(_source(str(own), {"identity": 0.6}))["cluster_members"]
+    block = {"clusters": "mmseqs2"}
+    written = {**block, "identity": 0.5, "coverage": 0.8}
+    assert _stages(_source(str(own), written)) == _stages(_source(str(own), block))
+    changed = _stages(_source(str(own), {"clusters": "mmseqs2", "identity": 0.6})
+                      )["cluster_members"]
     assert "--identity ${" + BLOCK + ".identity} --coverage 0.8" in changed["cmd"]
     assert changed["params"] == [{"data.yaml": [f"{BLOCK}.identity"]}]
 
 
-@pytest.mark.parametrize("block", [{"members": "uniref90"}, {"clustering": "mmseqs2"}])
+@pytest.mark.parametrize("block", [{"members": "uniref90", "clusters": "uniprot"},
+                                   {"clustering": "mmseqs2"}])
 def test_each_cluster_stage_depends_on_the_modules_it_runs(block):
     """An edit to cluster_pipeline.py reruns the pool and the index, never the members."""
     st = _stages(_source("uniref50", block))
@@ -135,7 +138,7 @@ def test_each_cluster_stage_depends_on_the_modules_it_runs(block):
 
 
 def test_an_override_is_referenced_where_it_is_set():
-    cfg = _source("uniref50", {"members": "uniref90"})
+    cfg = _source("uniref50", {"members": "uniref90", "clusters": "uniprot"})
     cfg["sources"]["src"]["max_seq_len"] = 1024
     st = _stages(cfg)
     assert "--max-seq-len ${sources.src.max_seq_len}" in st["cluster_pool"]["cmd"]
@@ -163,7 +166,7 @@ def test_mmseqs_params_only_reach_cluster_members(tmp_path):
     assert "members.tsv" not in str(st["cluster_pool"]["deps"])
     assert not any("cluster_pipeline.py" in d for d in st["cluster_members"]["deps"])
     # a key left out is its default, in the command itself
-    st = _stages(_source(str(own), {}))
+    st = _stages(_source(str(own), {"clusters": "mmseqs2"}))
     assert "--identity 0.5 --coverage 0.8" in st["cluster_members"]["cmd"]
     assert "params" not in st["cluster_members"]
 
@@ -226,7 +229,8 @@ def test_from_yaml_end_to_end_with_mmseqs(tmp_path):
     # not a UniRef file name, and no UniRef headers: an "own FASTA"
     own = tmp_path / "src/own.fasta"
     own.write_text(rel.fasta90.read_text().replace(">UniRef90_", ">seq_"))
-    env = _project(tmp_path, {"clustering": "auto", "identity": 0.5, "coverage": 0.8}, str(own))
+    env = _project(tmp_path, {"clusters": "mmseqs2", "identity": 0.5, "coverage": 0.8},
+                   str(own))
     r = _from_yaml(tmp_path, env)
     _assert_source_line_first(r, "clusters: MMseqs2 (50% identity, 80% coverage) | "
                                  "trains on: this fasta")
@@ -245,9 +249,12 @@ def test_from_yaml_end_to_end_with_mmseqs(tmp_path):
     # identity changes only cluster_members (and, once it reruns, what follows it)
     _edit(tmp_path, lambda c: c["sources"]["src"]["cluster_subsampling"].update(identity=0.9))
     assert _status(tmp_path, env) == {"cluster_members"}
-    # so does clustering, even when the source it resolves to stays MMseqs2
-    _edit(tmp_path, lambda c: c["sources"]["src"]["cluster_subsampling"].update(
-        identity=0.5, clustering="mmseqs2"))
+    # so does the old key clustering, a DVC param, with the same value
+    def old_key(c):
+        block = c["sources"]["src"]["cluster_subsampling"]
+        block.pop("clusters")
+        block.update(identity=0.5, clustering="mmseqs2")
+    _edit(tmp_path, old_key)
     assert _status(tmp_path, env) == {"cluster_members"}
 
 
@@ -259,7 +266,7 @@ def test_from_yaml_end_to_end_with_uniprot_clusters(tmp_path):
     downloads = tmp_path / OUT / "downloads"
     downloads.mkdir(parents=True)
     shutil.copy(rel.xml, downloads / "uniref50.xml.gz")       # reused, never downloaded
-    env = _project(tmp_path, {"members": None}, str(rel.fasta90))
+    env = _project(tmp_path, {"clusters": "uniprot"}, str(rel.fasta90))
     r = _from_yaml(tmp_path, env)
     assert "Reusing" in r.stdout + r.stderr
     _assert_source_line_first(r, "clusters: UniProt uniref50.xml.gz | trains on: this fasta")
@@ -314,7 +321,7 @@ def test_from_yaml_from_another_directory_reads_relative_paths_there(tmp_path):
     downloads = tmp_path / OUT / "downloads"
     downloads.mkdir(parents=True)
     shutil.copy(rel.xml, downloads / "uniref50.xml.gz")
-    env = _project(tmp_path, {}, "src/mine.fasta")
+    env = _project(tmp_path, {"clusters": "uniprot"}, "src/mine.fasta")
     env.pop("NANOPLM_MMSEQS", None)        # the UniProt route needs no MMseqs2
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -341,7 +348,7 @@ def test_from_yaml_with_the_template_data_params(tmp_path):
     downloads = tmp_path / OUT / "downloads"
     downloads.mkdir(parents=True)
     shutil.copy(rel.xml, downloads / "uniref50.xml.gz")
-    cfg = _source(str(rel.fasta90), {})                 # data_params exactly as shipped
+    cfg = _source(str(rel.fasta90), {"clusters": "uniprot"})   # data_params as shipped
     (tmp_path / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     env = dict(os.environ, PATH=f"{Path(sys.executable).parent}:{os.environ['PATH']}",
                CUDA_VISIBLE_DEVICES="")
@@ -358,7 +365,7 @@ def test_from_yaml_with_the_template_data_params(tmp_path):
 def test_summary_counts_clusters_and_names_the_members(tmp_path, capsys):
     from nanoplm.cli.data import _print_summary
     from nanoplm.data.preparation.data_config import parse_data_config
-    raw = _source("uniref50", {"members": "uniref90"})
+    raw = _source("uniref50", {"members": "uniref90", "clusters": "uniprot"})
     out = tmp_path / OUT
     out.mkdir(parents=True)
     (out / ".data_manifest").write_text(yaml.safe_dump({
@@ -382,7 +389,7 @@ def test_from_yaml_says_how_to_install_mmseqs(tmp_path, monkeypatch):
     from nanoplm.data.preparation import cluster_table as ct
     (tmp_path / "src").mkdir()
     (tmp_path / "src/own.fasta").write_text(">p1\nMKVLAAGIVGLLLAAGSAQAEELK\n")
-    _project(tmp_path, {}, "src/own.fasta")
+    _project(tmp_path, {"clusters": "mmseqs2"}, "src/own.fasta")
     monkeypatch.setattr(ct, "find_mmseqs", lambda explicit=None: None)
     monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("DVC must not run"))
     r = CliRunner().invoke(data, ["from-yaml", str(tmp_path / "data.yaml")])
@@ -390,7 +397,7 @@ def test_from_yaml_says_how_to_install_mmseqs(tmp_path, monkeypatch):
     assert "sources.src: these members are clustered with MMseqs2, but `mmseqs` was not found" \
         in " ".join(r.output.split())
     assert "nanoplm deps install --mmseqs-only" in r.output
-    assert "clustering: auto" not in r.output         # not UniRef: UniProt clusters can't help
+    assert "clusters: uniprot" not in r.output        # not UniRef: UniProt clusters can't help
     assert not (tmp_path / "dvc.yaml").exists()
 
 
@@ -399,8 +406,12 @@ def test_from_yaml_says_how_to_install_mmseqs(tmp_path, monkeypatch):
      "uniprot: UniProt clusters need UniRef data (fasta UniRef50 + members uniref90/uniref100, "
      "or a UniRef90/100 fasta)"),
     ({"clustering": "linclust"}, "data.yaml: sources.src.cluster_subsampling.clustering must "
-     "be auto, mmseqs2, uniprot, headers, or a cluster file ending in .tsv (.tsv.gz, .tsv.zst) "
+     "be uniprot, headers, mmseqs2, or a cluster file ending in .tsv (.tsv.gz, .tsv.zst) "
      "with representative<TAB>member lines, got 'linclust'"),
+    ({"clusters": "auto"}, "data.yaml: sources.src.cluster_subsampling.clusters: auto was "
+     "removed; choose where the clusters come from: uniprot"),
+    ({}, "data.yaml: sources.src.cluster_subsampling.clusters is required: uniprot"),
+    (True, "data.yaml: sources.src.cluster_subsampling: true no longer turns it on"),
     ({"clusters": "data/missing.tsv"}, "data.yaml: sources.src.cluster_subsampling.clusters: "
      "data/missing.tsv not found"),
     ({"clusters": "headers"}, "data.yaml: sources.src.cluster_subsampling.clusters: headers "
@@ -430,7 +441,8 @@ def test_forced_mmseqs2_on_uniref_data_needs_the_binary(tmp_path, monkeypatch):
     monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("DVC must not run"))
     r = CliRunner().invoke(data, ["from-yaml", str(tmp_path / "data.yaml")])
     assert r.exit_code != 0 and "clustered with MMseqs2, but `mmseqs` was not found" in r.output
-    assert "set sources.src.cluster_subsampling.clusters: auto" in " ".join(r.output.split())
+    assert "set sources.src.cluster_subsampling.clusters: uniprot to use UniProt's clusters" \
+        in " ".join(r.output.split())
 
 
 # ------------------------------------------------------------------ cluster files and CL: tags
@@ -473,21 +485,18 @@ def test_cluster_file_and_header_stages(tmp_path):
         "outs": [f"{OUT}/downloads/mine_cluster.tsv.gz"]}
     assert f"--tsv {OUT}/downloads/mine_cluster.tsv.gz -o" in st["cluster_members"]["cmd"]
     tagged = _logan(tmp_path / "logan.fasta", 3)
-    for block in ({}, {"clusters": "headers"}):
-        st = _stages(_source(str(tagged), block))
-        assert "get_cluster_xml" not in st and "get_cluster_tsv" not in st
-        assert st["cluster_members"]["cmd"] == (
-            f"nanoplm data cluster-members --source headers --fasta {tagged} "
-            f"-o {OUT}/cluster_index/members.tsv")
-        assert "params" not in st["cluster_members"]
+    st = _stages(_source(str(tagged), {"clusters": "headers"}))
+    assert "get_cluster_xml" not in st and "get_cluster_tsv" not in st
+    assert st["cluster_members"]["cmd"] == (
+        f"nanoplm data cluster-members --source headers --fasta {tagged} "
+        f"-o {OUT}/cluster_index/members.tsv")
+    assert "params" not in st["cluster_members"]
 
 
-def test_cluster_subsampling_true_is_the_empty_block(tmp_path):
+def test_cluster_subsampling_false_is_no_block(tmp_path):
     own = tmp_path / "mine.fasta"
     own.write_text(">a\nMKV\n")
     cfg = _source(str(own))
-    cfg["sources"]["src"]["cluster_subsampling"] = True
-    assert _stages(cfg) == _stages(_source(str(own), {}))
     cfg["sources"]["src"]["cluster_subsampling"] = False
     assert _stages(cfg) == _stages(_source(str(own)))
 
@@ -501,7 +510,7 @@ def test_only_the_old_clustering_key_is_a_dvc_param(tmp_path):
     assert old["params"] == [{"data.yaml": [f"{BLOCK}.clustering"]}]
     new = _stages(_source(str(own), {"clusters": "mmseqs2"}))["cluster_members"]
     assert "params" not in new and new["cmd"] == old["cmd"]
-    assert new == _stages(_source(str(own), {}))["cluster_members"]
+    assert {k: v for k, v in old.items() if k != "params"} == new
 
 
 def test_a_mix_downloads_a_cluster_file_once(tmp_path):
@@ -532,11 +541,13 @@ def test_plan_table_says_where_clusters_come_from_and_what_it_trains_on(tmp_path
     cfg["data_params"].update(max_seqs=-1, val_ratio=0.0044)
     cfg["sources"] = {
         "u": {"fasta": "uniref50", "weight": 0.25,
-              "cluster_subsampling": {"members": "uniref90"}},
-        "h": {"fasta": str(tagged), "weight": 0.25, "cluster_subsampling": True},
+              "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}},
+        "h": {"fasta": str(tagged), "weight": 0.25,
+              "cluster_subsampling": {"clusters": "headers"}},
         "t": {"fasta": str(own), "weight": 0.25,
               "cluster_subsampling": {"clusters": "data/my_clusters.tsv"}},
-        "m": {"fasta": str(own), "weight": 0.125, "cluster_subsampling": True},
+        "m": {"fasta": str(own), "weight": 0.125,
+              "cluster_subsampling": {"clusters": "mmseqs2"}},
         "p": {"fasta": str(own), "weight": 0.125},
     }
     parsed = parse_data_config(cfg, tmp_path)
@@ -562,7 +573,7 @@ def test_from_yaml_end_to_end_with_a_cluster_file_or_cl_tags(tmp_path, how):
     from nanoplm.data.infra.manifest import read_manifest
     tagged = _logan(tmp_path / "logan.fasta", n_clusters=40)
     if how == "headers":
-        block, fasta = True, str(tagged)
+        block, fasta = {"clusters": "headers"}, str(tagged)
     else:
         plain = tmp_path / "plain.fasta"
         plain.write_text(tagged.read_text().replace("\tCL:", " was:"))

@@ -1531,8 +1531,8 @@ def _validate_cluster_block(src, config_path: Path):
     for w in plan.warnings:
         click.echo(f"Warning: {w}", err=True)
     if plan.cluster_source == "mmseqs" and find_mmseqs() is None:
-        uniprot = (f" Or set sources.{src.name}.cluster_subsampling.clusters: auto to use "
-                   "UniProt's clusters, which need no MMseqs2."
+        uniprot = (f" Or set sources.{src.name}.cluster_subsampling.clusters: uniprot to "
+                   "use UniProt's clusters, which need no MMseqs2."
                    if plan.members_level in ("uniref90", "uniref100") else
                    " Or give the clusters yourself: clusters: <file>.tsv of "
                    "representative<TAB>member lines.")

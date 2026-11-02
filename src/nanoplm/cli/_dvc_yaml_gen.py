@@ -441,8 +441,7 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     # The command names the cluster source, so `clusters` is no DVC param. The old key
     # `clustering` set to uniprot or mmseqs2 stays one, so its dvc.lock stays valid.
     old_key = f"{block_key}.clustering"
-    members_params = [old_key] if plan.clusters_key == old_key and plan.clusters != "auto" \
-        else []
+    members_params = [old_key] if plan.clusters_key == old_key else []
     if plan.cluster_source in ("tsv", "headers"):
         # cluster_import checks the cluster file against every record before the length
         # filter, so a min/max_seq_len change does not rerun it

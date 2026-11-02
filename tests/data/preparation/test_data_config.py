@@ -60,6 +60,7 @@ def test_the_template_comments_say_what_the_design_asks():
     assert "cluster_subsampling:" not in text and "prepared" not in text
     sub = load_template("data_pretrain_subsampling")
     assert "    cluster_subsampling:\n      members: uniref90" in sub
+    assert "\n      clusters: uniprot  # " in sub
     for t in (text, sub):
         assert "enabled" not in t and "data_dirs" not in t
 
@@ -206,9 +207,10 @@ def test_the_subsampling_templates_commented_sources_parse():
     cfg["sources"]["uniref50"]["weight"] = 0.2
     cfg["sources"]["my_data"]["weight"] = cfg["sources"]["my_other"]["weight"] = 0.4
     got = _parse(cfg)
-    assert got.sources["uniref50"].cluster == {"members": "uniref90"}
+    assert got.sources["uniref50"].cluster == {"members": "uniref90", "clusters": "uniprot"}
     assert got.sources["my_data"].cluster == {"clusters": "data/my_clusters.tsv"}
-    assert got.sources["my_other"].cluster == {"identity": 0.5, "coverage": 0.8}
+    assert got.sources["my_other"].cluster == {"clusters": "mmseqs2", "identity": 0.5,
+                                               "coverage": 0.8}
     assert got.warnings == []
 
 
@@ -282,7 +284,8 @@ def test_layout_errors(cfg_edit, match):
     (lambda c: c["data_params"].update(max_seq_length=5), "data_params: unknown key max_seq_length"),
     (lambda c: c["sources"]["swissprot"].update(max_seq_length=5),
      "sources.swissprot: unknown key max_seq_length"),
-    (lambda c: c["sources"]["swissprot"].update(cluster_subsampling={"members": None, "x": 1}),
+    (lambda c: c["sources"]["swissprot"].update(cluster_subsampling={"clusters": "mmseqs2",
+                                                                     "x": 1}),
      "sources.swissprot.cluster_subsampling: unknown key x"),
 ])
 def test_unknown_keys_at_every_level_are_errors(cfg_edit, match):
@@ -315,39 +318,62 @@ def test_duplicate_keys_are_errors(tmp_path):
 
 
 def test_the_block_being_present_turns_it_on():
-    src = _parse(_with_source({"fasta": "uniref50",
-                               "cluster_subsampling": {"members": "uniref90"}})).source
-    assert src.cluster == {"members": "uniref90"}
+    src = _parse(_with_source({"fasta": "uniref50", "cluster_subsampling": {
+        "members": "uniref90", "clusters": "uniprot"}})).source
+    assert src.cluster == {"members": "uniref90", "clusters": "uniprot"}
+    assert src.cluster_keys == {"members": "sources.src.cluster_subsampling.members",
+                                "clusters": "sources.src.cluster_subsampling.clusters"}
 
 
-@pytest.mark.parametrize("block, on", [(True, {}), (False, None), ({}, {})])
-def test_true_turns_it_on_with_every_field_left_out(block, on):
-    cfg = _parse(_with_source({"fasta": "uniref90", "cluster_subsampling": block}))
-    assert cfg.source.cluster == on and cfg.source.cluster_keys == {} and cfg.warnings == []
+def test_false_turns_it_off():
+    cfg = _parse(_with_source({"fasta": "uniref90", "cluster_subsampling": False}))
+    assert cfg.source.cluster is None and cfg.source.cluster_keys == {} and cfg.warnings == []
 
 
-def test_the_old_clustering_key_still_works_with_a_hint():
+@pytest.mark.parametrize("old", ["mmseqs2", "uniprot"])
+def test_the_old_clustering_key_still_works_with_a_hint(old):
     cfg = _parse(_with_source({"fasta": "uniref90",
-                               "cluster_subsampling": {"clustering": "mmseqs2"}}))
-    assert cfg.source.cluster == {"clusters": "mmseqs2"}
+                               "cluster_subsampling": {"clustering": old}}))
+    assert cfg.source.cluster == {"clusters": old}
     assert cfg.source.cluster_keys == {
         "clusters": "sources.src.cluster_subsampling.clustering"}
     assert cfg.warnings == ["sources.src.cluster_subsampling.clustering is now called "
                             "clusters; the old name still works; renaming it reruns the "
                             "cluster_members stage once"]
-    # auto: renaming it changes nothing in dvc.yaml, so the hint does not mention a rerun
-    cfg = _parse(_with_source({"fasta": "uniref90",
-                               "cluster_subsampling": {"clustering": "auto"}}))
-    assert cfg.warnings == ["sources.src.cluster_subsampling.clustering is now called "
-                            "clusters; the old name still works"]
+
+
+CHOICES = ("uniprot (UniProt's UniRef50 clusters, for UniRef90/UniRef100 members), headers "
+           "(CL: tags in the FASTA headers), mmseqs2 (clusters with MMseqs2; slow: hours on "
+           "large files), or a .tsv file of representative<TAB>member lines")
+
+
+@pytest.mark.parametrize("block, message", [
+    (True, "sources.src.cluster_subsampling: true no longer turns it on; write a block that "
+           "sets clusters to " + CHOICES),
+    ({}, "sources.src.cluster_subsampling.clusters is required: " + CHOICES),
+    ({"members": None}, "sources.src.cluster_subsampling.clusters is required: " + CHOICES),
+    ({"clusters": None}, "sources.src.cluster_subsampling.clusters is required: " + CHOICES),
+    ({"clustering": None},
+     "sources.src.cluster_subsampling.clustering is required: " + CHOICES),
+    (None, "sources.src.cluster_subsampling is empty. Set clusters in it to " + CHOICES
+           + "; or delete the block to turn it off"),
+    ({"clusters": "auto"}, "sources.src.cluster_subsampling.clusters: auto was removed; "
+                           "choose where the clusters come from: " + CHOICES),
+    ({"clustering": "auto"}, "sources.src.cluster_subsampling.clustering: auto was removed; "
+                             "choose where the clusters come from: " + CHOICES),
+])
+def test_a_block_must_choose_its_clusters(block, message):
+    with pytest.raises(dc.DataConfigError) as e:
+        _parse(_with_source({"fasta": "uniref90", "cluster_subsampling": block}))
+    assert str(e.value) == message
 
 
 @pytest.mark.parametrize("block, match", [
-    (None, "cluster_subsampling is empty. Write cluster_subsampling: true to turn it on"),
     ({"members": None, "enabled": True},
-     "remove enabled; cluster_subsampling: true turns it on, false"),
-    ({"enabled": False}, "remove enabled; cluster_subsampling: true turns it on"),
-    ("yes", "must be true, false or a mapping, got 'yes'"),
+     "remove enabled; the block turns it on, false"),
+    ({"enabled": False}, "remove enabled; the block turns it on"),
+    ("yes", "must be a mapping with clusters .or false., got 'yes'"),
+    ({"clusters": "uniprot", "clustering": "uniprot"}, "set clusters or clustering, not both"),
     ({"clusters": "auto", "clustering": "auto"}, "set clusters or clustering, not both"),
     ({"cluster": "auto"}, "unknown key cluster .allowed: members, clusters, identity, coverage"),
 ])
@@ -357,9 +383,9 @@ def test_cluster_block_errors(block, match):
 
 
 def test_members_null_means_this_fasta():
-    src = _parse(_with_source({"fasta": "uniref90",
-                               "cluster_subsampling": {"members": None}})).source
-    assert src.cluster == {"members": None}
+    src = _parse(_with_source({"fasta": "uniref90", "cluster_subsampling": {
+        "members": None, "clusters": "uniprot"}})).source
+    assert src.cluster == {"members": None, "clusters": "uniprot"}
 
 
 def test_a_top_level_cluster_block_is_an_unknown_key():
@@ -384,7 +410,7 @@ def test_prepared_was_removed(spec):
 
 @pytest.mark.parametrize("max_seqs, val_ratio", [(100, 0.001), (3, 0.9)])
 def test_a_cluster_holdout_of_none_or_all_is_an_error_at_config_time(max_seqs, val_ratio):
-    cfg = _with_source({"fasta": "uniref90", "cluster_subsampling": {"members": None}})
+    cfg = _with_source({"fasta": "uniref90", "cluster_subsampling": {"clusters": "uniprot"}})
     cfg["data_params"].update(max_seqs=max_seqs, val_ratio=val_ratio)
     with pytest.raises(dc.DataConfigError,
                        match=rf"sources.src: data_params.val_ratio={val_ratio:g} of at most "

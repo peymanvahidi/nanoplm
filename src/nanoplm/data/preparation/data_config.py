@@ -64,6 +64,11 @@ SOURCE_KEYS = ("fasta", "weight", "cluster_subsampling")
 REMOVED_SOURCE_KEYS = {"prepared": "build the source from its fasta"}
 CLUSTER_KEYS = ("members", "clusters", "identity", "coverage")
 OLD_CLUSTER_KEYS = {"clustering": "clusters"}
+# where the clusters come from: cluster_config checks the value
+CLUSTERS_CHOICES = ("uniprot (UniProt's UniRef50 clusters, for UniRef90/UniRef100 members), "
+                    "headers (CL: tags in the FASTA headers), mmseqs2 (clusters with MMseqs2; "
+                    "slow: hours on large files), or a .tsv file of representative<TAB>member "
+                    "lines")
 TOP_KEYS = ("output_dir", "sources", "data_params")
 DATA_DIRS_KEYS = ("url", "local_fasta", "compressed_fasta", "extracted_fasta", "validation_dir",
                   "shuffled_fasta", "filtered_fasta", "splitted_fasta_dir", "output_dir")
@@ -315,19 +320,22 @@ def _fasta(value, where: str, base_dir) -> str:
 
 def _cluster_block(block, where: str, warnings: list) -> tuple:
     """(the block's fields under their new names, {field: where data.yaml sets it}), or
-    (None, {}) when it is off. ``true`` turns it on with every field left out."""
+    (None, {}) when it is off. A block must set clusters."""
     where = f"{where}.cluster_subsampling"
-    if block is True or block is False:
-        return ({} if block else None), {}
+    if block is False:
+        return None, {}
+    if block is True:
+        raise DataConfigError(f"{where}: true no longer turns it on; write a block that sets "
+                              f"clusters to {CLUSTERS_CHOICES}")
     if block is None:
-        raise DataConfigError(f"{where} is empty. Write cluster_subsampling: true to turn it "
-                              "on (everything else is found from the data), or delete it to "
-                              "turn it off")
+        raise DataConfigError(f"{where} is empty. Set clusters in it to {CLUSTERS_CHOICES}; "
+                              "or delete the block to turn it off")
     if not isinstance(block, dict):
-        raise DataConfigError(f"{where} must be true, false or a mapping, got {block!r}")
+        raise DataConfigError(f"{where} must be a mapping with clusters (or false), got "
+                              f"{block!r}")
     if "enabled" in block:
-        raise DataConfigError(f"{where}: remove enabled; cluster_subsampling: true turns it on, "
-                              "false (or no block) turns it off")
+        raise DataConfigError(f"{where}: remove enabled; the block turns it on, false (or no "
+                              "block) turns it off")
     _check_keys(where, [OLD_CLUSTER_KEYS.get(k, k) for k in block], CLUSTER_KEYS)
     out, keys = {}, {}
     for k, v in block.items():
@@ -336,11 +344,16 @@ def _cluster_block(block, where: str, warnings: list) -> tuple:
             if new in block:
                 raise DataConfigError(f"{where}: set {new} or {k}, not both ({k} is the old "
                                       "name)")
-            rerun = ("" if v in (None, "auto") else
-                     "; renaming it reruns the cluster_members stage once")
-            warnings.append(f"{where}.{k} is now called {new}; the old name still works{rerun}")
+            warnings.append(f"{where}.{k} is now called {new}; the old name still works; "
+                            "renaming it reruns the cluster_members stage once")
         out[new] = v
         keys[new] = f"{where}.{k}"
+    if out.get("clusters") == "auto":
+        raise DataConfigError(f"{keys['clusters']}: auto was removed; choose where the "
+                              f"clusters come from: {CLUSTERS_CHOICES}")
+    if out.get("clusters") is None:
+        raise DataConfigError(f"{keys.get('clusters', f'{where}.clusters')} is required: "
+                              f"{CLUSTERS_CHOICES}")
     return out, keys
 
 

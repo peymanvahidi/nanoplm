@@ -20,7 +20,7 @@ def _mix(**params):
     cfg["sources"] = {
         "swissprot": {"fasta": "swissprot", "weight": 0.2},
         "uniref50": {"fasta": "uniref50", "weight": 0.8, "max_seqs": -1,
-                     "cluster_subsampling": {"members": "uniref90"}},
+                     "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}},
     }
     cfg["data_params"].update(params)
     return cfg

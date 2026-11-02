@@ -10,7 +10,7 @@ sources:
     weight: 1.0
     cluster_subsampling:
       members: uniref90  # train on these sequences; leave out to use this fasta
-      # clusters: auto   # auto (found from the data), mmseqs2, or a .tsv of representative<TAB>member
+      clusters: uniprot  # uniprot, headers (CL: tags in the FASTA headers), mmseqs2 (slow: hours), or a .tsv of representative<TAB>member
 
   # Your own FASTA with a cluster file:
   # my_data:
@@ -24,6 +24,7 @@ sources:
   #   fasta: data/other_proteins.fasta
   #   weight: 0.5
   #   cluster_subsampling:
+  #     clusters: mmseqs2
   #     identity: 0.5    # min sequence identity within a cluster
   #     coverage: 0.8    # min alignment coverage
 

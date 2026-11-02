@@ -143,7 +143,7 @@ def test_a_dry_run_previews_up_to_a_pending_download(tmp_path, monkeypatch):
 def test_summary_for_a_uniref_cluster_source_marks_overrides(tmp_path, monkeypatch):
     cfg = yaml.safe_load(load_template("data_pretrain"))
     cfg["sources"] = {"uniref50": {"fasta": "uniref50", "max_seqs": -1,
-                                   "cluster_subsampling": {"members": "uniref90"}}}
+                                   "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}}}
     cfg["data_params"]["val_ratio"] = 0.0044
     out, _ = _dry(tmp_path, monkeypatch, cfg)
     table = out[out.index("data.yaml: 1 source"):out.index("Regenerated")]
@@ -163,13 +163,13 @@ def test_summary_names_the_files_a_cluster_run_reads(tmp_path, monkeypatch):
     dl.mkdir(parents=True)
     (dl / "uniref50.xml.gz").write_bytes(b"x" * 2_000)
     cfg = yaml.safe_load(load_template("data_pretrain"))
-    cfg["sources"] = {"u": {"fasta": "uniref50", "cluster_subsampling": {"members": "uniref90"}}}
+    cfg["sources"] = {"u": {"fasta": "uniref50", "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}}}
     out, _ = _dry(tmp_path, monkeypatch, cfg)
     day = _day(dl / "uniref50.xml.gz")
     assert f"uniref90.fasta.gz (url) + uniref50.xml.gz (reuse, 2.0 kB, {day})" in out
     assert "uniref50.fasta" not in out
     # members: null on a UniRef90 fasta: the fasta itself, and the XML
-    cfg["sources"] = {"u": {"fasta": "uniref90", "cluster_subsampling": {"members": None}}}
+    cfg["sources"] = {"u": {"fasta": "uniref90", "cluster_subsampling": {"clusters": "uniprot"}}}
     out, _ = _dry(tmp_path, monkeypatch, cfg)
     assert f"uniref90.fasta.gz (url) + uniref50.xml.gz (reuse, 2.0 kB, {day})" in out
 
@@ -222,7 +222,7 @@ def _rebuild_line(tmp_path, monkeypatch, cfg, status):
 def test_the_rebuild_line_follows_cluster_outputs_downstream(tmp_path, monkeypatch):
     cfg = yaml.safe_load(load_template("data_pretrain"))
     cfg["sources"] = {"uniref50": {"fasta": "uniref50",
-                                   "cluster_subsampling": {"members": "uniref90"}}}
+                                   "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}}}
     line = _rebuild_line(tmp_path, monkeypatch, cfg, '{"cluster_members": []}')
     assert line == (f"{RERUN}cluster_members, cluster_index, write_manifest. Up to date: "
                     "get_members_fasta, extract_members, check, filter, cluster_pool, "
@@ -276,11 +276,16 @@ def test_dvc_init_links_the_cache_for_the_sources_layout_only(tmp_path, monkeypa
      "max_workers: 1, register_tokens: 0}\n",
      "data.yaml: sources.a.fasta: missing.fasta not found"),
     ("output_dir: out\nsources:\n  a:\n    fasta: uniref50\n    cluster_subsampling:\n",
-     "sources.a.cluster_subsampling is empty. Write cluster_subsampling: true to turn it on"),
+     "sources.a.cluster_subsampling is empty. Set clusters in it to uniprot "),
     ("output_dir: out\nsources:\n  a:\n    fasta: uniref50\n    cluster_subsampling:\n"
      "      enabled: true\n      members: uniref90\n",
-     "remove enabled; cluster_subsampling: true turns it on, false (or no block) turns it "
-     "off"),
+     "remove enabled; the block turns it on, false (or no block) turns it off"),
+    ("output_dir: out\nsources:\n  a:\n    fasta: uniref50\n    cluster_subsampling: true\n",
+     "sources.a.cluster_subsampling: true no longer turns it on; write a block that sets "
+     "clusters to uniprot "),
+    ("output_dir: out\nsources:\n  a:\n    fasta: uniref50\n    cluster_subsampling:\n"
+     "      members: uniref90\n",
+     "sources.a.cluster_subsampling.clusters is required: uniprot "),
 ])
 def test_from_yaml_errors_before_dvc(tmp_path, monkeypatch, text, message):
     _no_dvc(monkeypatch)
@@ -335,7 +340,7 @@ def test_a_cluster_warning_prints_once(tmp_path, monkeypatch):
     try:
         cfg = yaml.safe_load(load_template("data_pretrain"))
         cfg["sources"] = {"uniref50": {"fasta": "uniref50",
-                                       "cluster_subsampling": {"members": "uniref90"}}}
+                                       "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}}}
         out, _ = _dry(tmp_path, monkeypatch, cfg)
     finally:
         logging.getLogger("nanoplm").removeHandler(handler)
@@ -363,7 +368,7 @@ def test_rarely_changed_fields_may_be_left_out(cluster):
     full = yaml.safe_load(load_template("data_pretrain"))
     if cluster:
         full["sources"] = {"u": {"fasta": "uniref50",
-                                 "cluster_subsampling": {"members": "uniref90"}}}
+                                 "cluster_subsampling": {"members": "uniref90", "clusters": "uniprot"}}}
     short = _without_rare(yaml.safe_load(yaml.safe_dump(full)))
     assert _gen(short) == _gen(full)
     src = parse_data_config(short).source

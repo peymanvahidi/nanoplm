@@ -3,8 +3,7 @@
 The one place that decides where the member sequences come from, which cluster source
 is used, every derived path, and which settings are errors or are ignored. Config
 validation, dvc.yaml generation and the stage commands all use it. The block sits under
-a source (data_config.Source); ``cluster_subsampling: true`` turns it on with every field
-left out, a mapping sets some of them.
+a source (data_config.Source) and must set ``clusters``.
 
 Relative paths are relative to ``base_dir``, the directory of data.yaml: that is
 where ``nanoplm data from-yaml`` runs DVC, so the stages see the same files.
@@ -13,16 +12,13 @@ Levels: a FASTA is UniRef50 / UniRef90 / UniRef100 by its headers (``>UniRef90_.
 when the file is on disk, else by its file name (``uniref90.fasta.gz``); anything else
 is a custom set. Stage commands re-check the headers when the file exists.
 
-Cluster source (``clusters``, once ``clustering``):
+Cluster source (``clusters``, once ``clustering``), required:
 
-  auto      UniProt UniRef50 clusters (from uniref50.xml.gz) when the members are a
-            UniRef90 or UniRef100 set and the source fasta is UniRef50 or that same set;
-            else the CL:<cluster id> tags in the headers when the first records carry
-            them; else MMseqs2, unless the members are too large to cluster unasked
-            (MMSEQS_AUTO_MAX_BYTES). The first records are read from the file on disk,
-            or with a small HTTP range request of the URL's start.
-  uniprot   requires that UniRef case.
-  headers   the CL: tags (cluster_import); the first headers must carry them.
+  uniprot   UniProt UniRef50 clusters (from uniref50.xml.gz); the members must be a
+            UniRef90 or UniRef100 set and the source fasta UniRef50 or that same set.
+  headers   the CL:<cluster id> tags (cluster_import); the first headers must carry them.
+            They are read from the file on disk, or with a small HTTP range request of
+            the URL's start.
   mmseqs2   clusters the members with MMseqs2 (easy-linclust, --min-seq-id identity,
             -c coverage, --cov-mode 0).
   a .tsv    a representative<TAB>member file (cluster_import), a path or a URL that is
@@ -41,9 +37,10 @@ from pathlib import Path
 from typing import Optional
 
 from nanoplm.data.preparation.cluster_import import CL_TAG, DecompressorMissing, open_decompressed
-from nanoplm.data.preparation.data_config import (FASTA_SHORTCUTS, fasta_stem,
-                                                  file_name as _name, is_compressed,
-                                                  is_fasta_name, is_url, strip_compressed)
+from nanoplm.data.preparation.data_config import (CLUSTERS_CHOICES, FASTA_SHORTCUTS,
+                                                  fasta_stem, file_name as _name,
+                                                  is_compressed, is_fasta_name, is_url,
+                                                  strip_compressed)
 from nanoplm.data.preparation.extractor import ZSTD_MAX_WINDOW
 
 UNIREF_BASE = "https://ftp.uniprot.org/pub/databases/uniprot/uniref"
@@ -57,23 +54,14 @@ MEMBERS_TSV = "members.tsv"
 ARRAYS_SUBDIR = "index"          # cluster_index/index: the arrays ClusterSampledDataset reads
 CLUSTER_INDEX_DIR = f"{INDEX_SUBDIR}/{ARRAYS_SUBDIR}"   # relative to output_dir (manifest)
 MMSEQS_TMP = ".mmseqs_tmp"
-CLUSTERS = ("auto", "mmseqs2", "uniprot", "headers")      # or a cluster file, TSV_SUFFIXES
+CLUSTERS = ("uniprot", "headers", "mmseqs2")      # or a cluster file, TSV_SUFFIXES
 TSV_SUFFIXES = (".tsv", ".tsv.gz", ".tsv.zst")
 UNIPROT_NEEDS = ("UniProt clusters need UniRef data (fasta UniRef50 + members uniref90/"
                  "uniref100, or a UniRef90/100 fasta)")
-# clusters: auto clusters members with MMseqs2 up to this size of FASTA, and stops above
-# it: at ~3M sequences per GB that is ~60M sequences, hours of MMseqs2, and larger files
-# can take days. clusters: mmseqs2 runs it at any size.
-MMSEQS_AUTO_MAX_BYTES = 20 * 10**9
-# a .gz or .zst counts as this many times its size (UniRef's .gz files hold 1.9x)
-COMPRESSION_GUESS = 2
-# the .gz size of UniProt's FASTA shortcuts (2026-11), whose headers carry no CL: tag, so
-# auto decides on them without a request
-UNIPROT_GZ_BYTES = {FASTA_SHORTCUTS["swissprot"]: 94 * 10**6,
-                    FASTA_SHORTCUTS["trembl"]: 40_600 * 10**6,
-                    FASTA_SHORTCUTS["uniref50"]: 8_800 * 10**6,
-                    FASTA_SHORTCUTS["uniref90"]: 32_100 * 10**6,
-                    FASTA_SHORTCUTS["uniref100"]: 63_200 * 10**6}
+# UniProt's FASTA shortcuts: their headers carry no CL: tag, so clusters: headers is
+# refused on them without a request
+UNIPROT_FASTAS = frozenset(FASTA_SHORTCUTS[k] for k in
+                           ("swissprot", "trembl", "uniref50", "uniref90", "uniref100"))
 PEEK_BYTES = 1 << 20           # decompressed bytes read for the first headers
 PEEK_FETCH = 1 << 20           # bytes asked of a server (a range request)
 PEEK_TIMEOUT = 30
@@ -122,15 +110,7 @@ def level_of(source: str, base_dir=None) -> Optional[str]:
     return stem if stem in ("uniref50", "uniref90", "uniref100") else None
 
 
-@dataclass
-class Peek:
-    """The first headers of a FASTA (without '>') and its size as FASTA, estimated for a
-    compressed file (None when the server does not say)."""
-    headers: list
-    size: Optional[int]
-
-
-_URL_PEEKS: dict = {}           # url -> Peek, or the reason it could not be read
+_URL_PEEKS: dict = {}           # url -> its first headers, or the reason they could not be read
 
 
 def _headers(data: bytes, whole: bool) -> list:
@@ -140,7 +120,8 @@ def _headers(data: bytes, whole: bool) -> list:
     return [line[1:].rstrip(b"\r") for line in lines if line.startswith(b">")]
 
 
-def _peek_file(path: Path) -> Peek:
+def _peek_file(path: Path) -> list:
+    """The first headers of a FASTA file (without '>')."""
     try:
         with open_decompressed(path) as f:
             data = f.read(PEEK_BYTES)
@@ -148,8 +129,7 @@ def _peek_file(path: Path) -> Peek:
         raise
     except Exception as e:              # noqa: BLE001  a damaged .gz / .zst
         raise OSError(f"{path}: {type(e).__name__}: {e}") from None
-    size = path.stat().st_size * (COMPRESSION_GUESS if is_compressed(str(path)) else 1)
-    return Peek(_headers(data, len(data) < PEEK_BYTES), size)
+    return _headers(data, len(data) < PEEK_BYTES)
 
 
 def _decompress_start(raw: bytes, name: str) -> bytes:
@@ -187,19 +167,16 @@ def _http_start(url: str) -> tuple:
     return raw, int(total) if total and str(total).isdigit() else None
 
 
-def peek_url(url: str) -> Peek:
-    """The first headers and the size of a FASTA URL, read once per process. Raises
-    OSError (with the reason) when the URL cannot be read."""
+def peek_url(url: str) -> list:
+    """The first headers of a FASTA URL, read once per process. Raises OSError (with the
+    reason) when the URL cannot be read."""
     if url not in _URL_PEEKS:
         try:
             raw, total = _http_start(url)
-            name = _name(url)
-            data = _decompress_start(raw, name)
+            data = _decompress_start(raw, _name(url))
             whole = total is not None and len(raw) >= total
-            size = None if total is None else total * (
-                COMPRESSION_GUESS if is_compressed(name) else 1)
-            _URL_PEEKS[url] = Peek(_headers(data, whole), size)
-        except Exception as e:          # noqa: BLE001  any failure: say why, ask for clusters
+            _URL_PEEKS[url] = _headers(data, whole)
+        except Exception as e:          # noqa: BLE001  any failure: say why
             _URL_PEEKS[url] = f"{type(e).__name__}: {e}"
     got = _URL_PEEKS[url]
     if isinstance(got, str):
@@ -208,20 +185,14 @@ def peek_url(url: str) -> Peek:
 
 
 def _peek_members(members: str, compressed: Optional[Path], extracted: Path,
-                  base_dir) -> Peek:
-    """The first headers and the size of the members FASTA. A copy already on disk is read
-    (the extracted FASTA, else the download) and a URL only when there is none, so the
-    choice is the same before and after the download. The size of a compressed file is
-    its compressed size times COMPRESSION_GUESS, whichever copy is read."""
-    if members in UNIPROT_GZ_BYTES:
-        return Peek([], UNIPROT_GZ_BYTES[members] * COMPRESSION_GUESS)
+                  base_dir) -> list:
+    """The first headers of the members FASTA. A copy already on disk is read (the
+    extracted FASTA, else the download) and a URL only when there is none, so the check
+    is the same before and after the download."""
     got = on_disk(compressed, base_dir) if compressed else None
-    size = (got.stat().st_size * COMPRESSION_GUESS if got is not None and got.is_file()
-            else None)
     for path in (on_disk(extracted, base_dir), got):
         if path is not None and path.is_file():
-            peek = _peek_file(path)
-            return Peek(peek.headers, size if size is not None else peek.size)
+            return _peek_file(path)
     if is_url(members):
         return peek_url(members)
     raise OSError(f"{members} not found (a relative path is relative to data.yaml's "
@@ -246,8 +217,8 @@ class ClusterPlan:
     members_compressed: Optional[Path]   # the members .gz: a download, or a local file
     members_fasta: Path            # the extracted member FASTA the pool is built from
     cluster_source: str            # "uniref_xml" | "mmseqs" | "headers" | "tsv"
-    clusters: str = "auto"         # as written in data.yaml: auto | mmseqs2 | uniprot |
-                                   # headers | a .tsv
+    clusters: str = ""             # as written in data.yaml: uniprot | headers | mmseqs2 |
+                                   # a .tsv
     clusters_key: Optional[str] = None   # where data.yaml sets it (clusters or clustering)
     xml_path: Optional[Path] = None
     xml_url: Optional[str] = None
@@ -342,7 +313,7 @@ def is_tsv_name(value: str) -> bool:
 def _clusters_setting(value, key: str, base_dir) -> str:
     """The clusters value, checked: one of CLUSTERS or a cluster file."""
     if value is None:
-        return "auto"
+        raise ClusterConfigError(f"{key} is required: {CLUSTERS_CHOICES}")
     if isinstance(value, str) and value in CLUSTERS:
         return value
     if isinstance(value, str) and value and is_tsv_name(value):
@@ -351,7 +322,7 @@ def _clusters_setting(value, key: str, base_dir) -> str:
                                      "data.yaml's directory)")
         return value
     raise ClusterConfigError(
-        f"{key} must be auto, mmseqs2, uniprot, headers, or a cluster file ending in .tsv "
+        f"{key} must be uniprot, headers, mmseqs2, or a cluster file ending in .tsv "
         f"(.tsv.gz, .tsv.zst) with representative<TAB>member lines, got {value!r}")
 
 
@@ -431,27 +402,24 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
     if clusters == "uniprot" and not uniref:
         raise ClusterConfigError(
             f"{ckey}: uniprot: {UNIPROT_NEEDS}; got fasta {source} and members "
-            f"{block.get('members') or 'null'}. Use clusters: auto, headers, mmseqs2 or a "
-            ".tsv cluster file for these sequences.")
-
-    def peek() -> Peek:
-        return _peek_members(members, members_compressed, members_fasta, base_dir)
+            f"{block.get('members') or 'null'}. Use clusters: headers, mmseqs2 or a .tsv "
+            "cluster file for these sequences.")
 
     name = _name(members)
     notes = []
     if clusters not in CLUSTERS:
         cluster_source = "tsv"
-    elif clusters == "uniprot" or (clusters == "auto" and uniref):
+    elif clusters == "uniprot":
         cluster_source = "uniref_xml"
     elif clusters == "mmseqs2":
         cluster_source = "mmseqs"
-    elif clusters == "headers":
+    else:
         cluster_source = "headers"
-        if members in UNIPROT_GZ_BYTES:
+        if members in UNIPROT_FASTAS:
             raise ClusterConfigError(f"{ckey}: headers needs a CL:<cluster id> tag after the id "
                                      f"in every FASTA header; UniProt's {name} has none")
         try:
-            got = peek().headers
+            got = _peek_members(members, members_compressed, members_fasta, base_dir)
         except OSError:
             got = None                  # the stage checks every header
         if got and not all(cl_tag(h) for h in got):
@@ -460,47 +428,14 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
                 f"{ckey}: headers needs a CL:<cluster id> tag after the id in every FASTA "
                 f"header; {sum(not cl_tag(h) for h in got):,} of the first {len(got):,} "
                 f"headers of {name} have none (e.g. >{first[:80].decode(errors='replace')})")
-    else:
-        try:
-            got = peek()
-        except OSError as e:
-            raise ClusterConfigError(
-                f"{where}: could not read the start of {members} to find its clusters ({e}). "
-                f"Set {where}.clusters to headers (CL: tags in the headers), mmseqs2, or a "
-                ".tsv cluster file") from None
-        tagged = sum(bool(cl_tag(h)) for h in got.headers)
-        if tagged and tagged == len(got.headers):
-            cluster_source = "headers"
-        elif tagged:
-            raise ClusterConfigError(
-                f"{where}: {tagged:,} of the first {len(got.headers):,} headers of {name} "
-                "carry a CL: tag; clusters from the headers need one in every header. Fix "
-                f"the file, or set {where}.clusters: mmseqs2 to ignore the tags")
-        else:
-            cluster_source = "mmseqs"
-            if got.size is not None and got.size > MMSEQS_AUTO_MAX_BYTES:
-                hint = (" To train on the members of UniProt's UniRef50 clusters instead, set "
-                        f"{where}.members: uniref90." if source_level == "uniref50" else "")
-                raise ClusterConfigError(
-                    f"{where}: {name} has no cluster information, so clusters: auto would "
-                    f"cluster it with MMseqs2: about {got.size / 1e9:,.0f} GB of FASTA, which "
-                    f"can run for many hours or days. Set {where}.clusters: mmseqs2 to run it "
-                    "anyway, or give the clusters as a .tsv file of representative<TAB>member "
-                    f"lines.{hint}")
-            if got.size is None:
-                warnings.append(
-                    f"{on}: the server did not say how large {name} is; clusters: auto "
-                    "clusters it with MMseqs2, which takes hours on tens of GB. Set "
-                    f"{where}.clusters to choose")
 
     if cluster_source != "mmseqs" and (identity != DEFAULT_IDENTITY
                                        or coverage != DEFAULT_COVERAGE):
         found = {"uniref_xml": "UniProt's clusters", "headers": f"the CL: tags of {name}",
                  "tsv": clusters}[cluster_source]
-        how = " (what clusters: auto found)" if clusters == "auto" else ""
         raise ClusterConfigError(
             f"{where}: identity / coverage only apply when MMseqs2 makes the clusters, and "
-            f"these come from {found}{how}. Remove identity / coverage, or set "
+            f"these come from {found}. Remove identity / coverage, or set "
             f"{where}.clusters: mmseqs2 to cluster with MMseqs2")
     val_ratio = params.get("val_ratio")
     if isinstance(val_ratio, (int, float)) and val_ratio > MAX_QUIET_VAL_RATIO:
@@ -511,11 +446,6 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
                else "set data_params.val_ratio lower to train on more of them")
         warnings.append(f"{on}: {_setting(src, 'val_ratio')} holds out about {val_ratio:.1%} of "
                         f"the clusters for validation; {fix}")
-    if cluster_source == "mmseqs" and source_level == "uniref50" and clusters == "auto":
-        warnings.append(f"{on}: fasta is UniRef50 and members is left out, so MMseqs2 will "
-                        "cluster all ~60M UniRef50 sequences (hours). To train on the members "
-                        "of UniProt's UniRef50 clusters instead, set "
-                        f"{where}.members: uniref90 (with clusters: auto or uniprot)")
     if cluster_source != "uniref_xml" and not from_source:
         notes.append(f"{on}: clusters: {clusters} clusters the members ({members}); the source "
                      f"fasta ({source}) is not needed and is not downloaded")

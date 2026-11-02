@@ -40,7 +40,7 @@ def test_template_source_has_no_cluster_block():
 
 
 def test_scenario2_uniref50_url_uniref90_members():
-    p = _plan(_config(url=U50, members="uniref90"))
+    p = _plan(_config(url=U50, members="uniref90", clusters="uniprot"))
     assert p.cluster_source == "uniref_xml" and p.members_level == "uniref90"
     assert not p.members_from_source and p.members == U90
     assert p.members_compressed == DOWNLOADS / "uniref90.fasta.gz"
@@ -52,7 +52,7 @@ def test_scenario2_uniref50_url_uniref90_members():
 
 
 def test_scenario3_uniref100_members():
-    p = _plan(_config(url=U50, members="uniref100"))
+    p = _plan(_config(url=U50, members="uniref100", clusters="uniprot"))
     assert p.cluster_source == "uniref_xml" and p.members_level == "uniref100"
     assert p.members_fasta.name == "uniref100.fasta"
 
@@ -60,108 +60,106 @@ def test_scenario3_uniref100_members():
 def test_scenario4_own_fasta_is_clustered_with_mmseqs(tmp_path):
     own = tmp_path / "my_proteins.fasta"
     own.write_text(">p1 x\nMKV\n")
-    p = _plan(_config(local=str(own)))
+    p = _plan(_config(local=str(own), clusters="mmseqs2"))
     assert p.cluster_source == "mmseqs" and p.members_from_source
     assert p.members_level is None and p.identity == 0.5 and p.coverage == 0.8
 
 
 def test_scenario5_uniref90_url_or_local_fasta(tmp_path):
-    p = _plan(_config(url=U90))
+    p = _plan(_config(url=U90, clusters="uniprot"))
     assert p.cluster_source == "uniref_xml" and p.members_from_source
     assert p.members_fasta == WORK / "uniref90.fasta"
     # a local file is classified by its headers, whatever its name
     local = tmp_path / "seqs.fasta"
     local.write_text(">UniRef90_A0A1 desc\nMKV\n")
-    p = _plan(_config(local=str(local)))
+    p = _plan(_config(local=str(local), clusters="uniprot"))
     assert p.cluster_source == "uniref_xml" and p.members_level == "uniref90"
     # members: uniref90 on a uniref90 url is the url itself, not a second download
-    p = _plan(_config(url=U90, members="uniref90"))
+    p = _plan(_config(url=U90, members="uniref90", clusters="uniprot"))
     assert p.members_from_source
 
 
 def test_uniref_members_need_a_uniref50_or_same_set_url():
     with pytest.raises(cc.ClusterConfigError, match="must be UniRef50 or uniref90 itself"):
-        _plan(_config(url=TREMBL, members="uniref90"))
+        _plan(_config(url=TREMBL, members="uniref90", clusters="uniprot"))
     with pytest.raises(cc.ClusterConfigError, match="must be UniRef50 or uniref100 itself"):
-        _plan(_config(url=U90, members="uniref100"))
+        _plan(_config(url=U90, members="uniref100", clusters="uniprot"))
 
 
 @pytest.mark.parametrize("members", ["uniref50", "https://example.org/x/uniref50.fasta.gz"])
 def test_uniref50_members_are_refused_clearly(members):
     with pytest.raises(cc.ClusterConfigError, match="UniRef50 entries are the clusters "
                                                     "themselves. Use members: uniref90"):
-        _plan(_config(url=U50, members=members))
+        _plan(_config(url=U50, members=members, clusters="uniprot"))
 
 
-def test_uniref50_url_alone_warns_about_mmseqs_over_all_of_it():
-    # UniRef50's ~18 GB of FASTA is under the size auto clusters unasked
-    p = _plan(_config(url=U50))
-    assert p.cluster_source == "mmseqs"
-    assert any("~60M UniRef50 sequences" in w and "members: uniref90" in w
-               and "clusters: auto or uniprot" in w for w in p.warnings)
-    # the suggestion resolves cleanly, with either value it names
-    for clusters in ("auto", "uniprot"):
-        p = _plan(_config(url=U50, members="uniref90", clusters=clusters))
-        assert p.cluster_source == "uniref_xml" and not any("~60M" in w for w in p.warnings)
-    # an explicit mmseqs2 is the user's choice: no warning
+def test_uniref50_url_alone_with_mmseqs2_is_the_users_choice():
+    # mmseqs2 runs only when asked, so it draws no warning, even on all of UniRef50
     p = _plan(_config(url=U50, clusters="mmseqs2"))
-    assert p.cluster_source == "mmseqs" and not any("~60M" in w for w in p.warnings)
+    assert p.cluster_source == "mmseqs" and p.warnings == []
+    # uniprot on UniRef50 alone has no finer level to sample
+    with pytest.raises(cc.ClusterConfigError, match="UniProt clusters need UniRef data"):
+        _plan(_config(url=U50, clusters="uniprot"))
 
 
 def test_a_missing_local_members_file_is_caught_at_config_time(tmp_path):
     with pytest.raises(cc.ClusterConfigError, match="members: data/uniref90.fasta not found"):
-        _plan(_config(url=U50, members="data/uniref90.fasta"), tmp_path)
+        _plan(_config(url=U50, members="data/uniref90.fasta", clusters="uniprot"), tmp_path)
     (tmp_path / "data").mkdir()
     (tmp_path / "data/uniref90.fasta").write_text(">UniRef90_A x\nMKV\n")
-    p = _plan(_config(url=U50, members="data/uniref90.fasta"), tmp_path)
+    p = _plan(_config(url=U50, members="data/uniref90.fasta", clusters="uniprot"), tmp_path)
     assert p.members_level == "uniref90" and p.cluster_source == "uniref_xml"
 
 
 def test_a_non_uniref_members_fasta_must_go_in_url(tmp_path):
     with pytest.raises(cc.ClusterConfigError, match=r"Put that FASTA in fasta and leave "
                                                     r"members out"):
-        _plan(_config(url=U50, members="https://example.org/mine.fasta.gz"))
+        _plan(_config(url=U50, members="https://example.org/mine.fasta.gz", clusters="mmseqs2"))
 
 
 def test_identity_and_coverage_are_an_error_with_uniprot_clusters():
     with pytest.raises(cc.ClusterConfigError,
                        match=r"identity / coverage only apply when MMseqs2 makes the clusters, "
-                             r"and these come from UniProt's clusters \(what clusters: auto "
-                             r"found\)\. .*set sources.src.cluster_subsampling.clusters: mmseqs2"):
-        _plan(_config(url=U50, members="uniref90", identity=0.3))
+                             r"and these come from UniProt's clusters\. .*set "
+                             r"sources.src.cluster_subsampling.clusters: mmseqs2"):
+        _plan(_config(url=U50, members="uniref90", identity=0.3, clusters="uniprot"))
     with pytest.raises(cc.ClusterConfigError, match="come from UniProt's clusters. Remove"):
         _plan(_config(url=U50, members="uniref90", coverage=0.9, clusters="uniprot"))
     p = _plan(_config(url=U50, members="uniref90", identity=0.3, clusters="mmseqs2"))
     assert p.cluster_source == "mmseqs" and p.identity == 0.3
     assert not any("identity / coverage" in w for w in p.warnings)
     # the old template wrote the defaults out: no error, no warning
-    p = _plan(_config(url=U50, members="uniref90", identity=0.5, coverage=0.8))
+    p = _plan(_config(url=U50, members="uniref90", identity=0.5, coverage=0.8, clusters="uniprot"))
     assert p.cluster_source == "uniref_xml" and p.warnings == []
 
 
 @pytest.mark.parametrize("shuffle, seed, warns", [
     (True, 24, False), (False, 24, True), (True, 7, True), (True, None, True)])
 def test_shuffle_warns_only_when_changed_from_the_template(shuffle, seed, warns):
-    cfg = _config(url=U90)
+    cfg = _config(url=U90, clusters="uniprot")
     cfg["data_params"].update(shuffle=shuffle, shuffle_seed=seed)
     assert any("ignores shuffle / shuffle_seed" in w
                for w in _plan(cfg).warnings) == warns
 
 
 @pytest.mark.parametrize("block,match", [
-    ({"identity": 0}, "sources.src.cluster_subsampling.identity must be a number in"),
-    ({"coverage": 1.5}, "coverage must be a number in"),
-    ({"members": 5}, "string or null"),
-    ({"enabled": True}, "remove enabled; cluster_subsampling: true turns it on"),
-    ({"enabled": False}, "remove enabled; cluster_subsampling: true turns it on"),
-    ({"cluster_url": "x"}, "unknown key cluster_url"),
-    ({"clustering": "mmseqs"}, "sources.src.cluster_subsampling.clustering must be auto, "
-                               "mmseqs2, uniprot, headers, or a cluster file ending in .tsv "
+    ({"clusters": "uniprot", "identity": 0},
+     "sources.src.cluster_subsampling.identity must be a number in"),
+    ({"clusters": "uniprot", "coverage": 1.5}, "coverage must be a number in"),
+    ({"clusters": "uniprot", "members": 5}, "string or null"),
+    ({"enabled": True}, "remove enabled; the block turns it on"),
+    ({"enabled": False}, "remove enabled; the block turns it on"),
+    ({"clusters": "uniprot", "cluster_url": "x"}, "unknown key cluster_url"),
+    ({"clustering": "mmseqs"}, "sources.src.cluster_subsampling.clustering must be uniprot, "
+                               "headers, mmseqs2, or a cluster file ending in .tsv "
                                r"\(.tsv.gz, .tsv.zst\) with representative<TAB>member lines, "
                                "got 'mmseqs'"),
-    ({"clusters": 5}, "sources.src.cluster_subsampling.clusters must be auto"),
+    ({"clusters": 5}, "sources.src.cluster_subsampling.clusters must be uniprot"),
     ({"clusters": "clusters.txt"}, "or a cluster file ending in .tsv"),
-    ({"clusters": "auto", "clustering": "auto"}, "set clusters or clustering, not both"),
+    ({"clusters": "uniprot", "clustering": "uniprot"}, "set clusters or clustering, not both"),
+    ({"clusters": "auto"}, "sources.src.cluster_subsampling.clusters: auto was removed; "
+                           "choose where the clusters come from: uniprot"),
+    ({"clustering": "auto"}, "sources.src.cluster_subsampling.clustering: auto was removed"),
 ])
 def test_bad_values_are_refused(block, match):
     with pytest.raises((cc.ClusterConfigError, DataConfigError), match=match):
@@ -195,13 +193,13 @@ def test_relative_paths_resolve_against_the_config_dir(tmp_path, monkeypatch):
     # UniRef90 by its headers only: the file name says nothing
     (cfg_dir / "src/mine.fasta").write_text(">UniRef90_A0A000 x\nMKV\n")
     monkeypatch.chdir(elsewhere)
-    p = _plan(_config(local="src/mine.fasta"), cfg_dir)
+    p = _plan(_config(local="src/mine.fasta", clusters="uniprot"), cfg_dir)
     assert p.cluster_source == "uniref_xml" and p.members_level == "uniref90"
     assert p.members_fasta == Path("src/mine.fasta")   # read in place, kept as written
 
 
 def test_template_data_params_warn_at_config_time():
-    cfg = _config(url=U50, members="uniref90")
+    cfg = _config(url=U50, members="uniref90", clusters="uniprot")
     cfg["data_params"].update(max_seqs=20000, val_ratio=0.1)        # the template's
     w = _plan(cfg).warnings
     assert ("sources.src: max_seqs=20000 (from data_params) trains on at most 20,000 "
@@ -214,21 +212,17 @@ def test_template_data_params_warn_at_config_time():
 def test_cluster_warnings_name_the_source_and_its_own_override(tmp_path):
     """A mix shares data_params, so every warning says which source it is about and
     the fix is set on that source; the 0.0044 hint is for UniProt clusters only."""
-    cfg = _config(local=_own(tmp_path))
+    cfg = _config(local=_own(tmp_path), clusters="mmseqs2")
     cfg["data_params"]["val_ratio"] = 0.2
     w = _plan(cfg).warnings
     assert ("sources.src: val_ratio=0.2 (from data_params) holds out about 20.0% of the "
             "clusters for validation; set data_params.val_ratio lower to train on more of "
             "them") in w
     assert not any("0.0044" in x for x in w)
-    p = _plan(_config(url=U50))
-    assert any(x.startswith("sources.src: fasta is UniRef50 and members is left out") and
-               "set sources.src.cluster_subsampling.members: uniref90" in x
-               for x in p.warnings)
 
 
 def test_uniprot_error_says_members_null(tmp_path):
-    with pytest.raises(cc.ClusterConfigError, match="and members null. Use clusters: auto"):
+    with pytest.raises(cc.ClusterConfigError, match="and members null. Use clusters: headers, mmseqs2"):
         _plan(_config(local=_own(tmp_path), clusters="uniprot"))
 
 
@@ -241,7 +235,7 @@ def _own(tmp_path):
     return str(own)
 
 
-# (url, local, members) -> what auto resolves to; UniRef data first, then non-UniRef
+# (url, local, members) -> the UniRef level; UniRef data first, then non-UniRef
 UNIREF_CASES = {
     "u50+uniref90": (dict(url=U50, members="uniref90"), "uniref90"),
     "u50+uniref100": (dict(url=U50, members="uniref100"), "uniref100"),
@@ -255,7 +249,7 @@ NON_UNIREF_CASES = {
 }
 
 
-CHOICES = ("auto", "uniprot", "mmseqs2")
+CHOICES = ("uniprot", "mmseqs2")
 
 
 @pytest.mark.parametrize("case", list(UNIREF_CASES))
@@ -288,26 +282,41 @@ def test_clusters_on_non_uniref_data(case, clusters, tmp_path):
         assert ("clusters: uniprot: UniProt clusters need UniRef data (fasta UniRef50 + "
                 "members uniref90/uniref100, or a UniRef90/100 fasta)") in str(e.value)
         return
-    if case == "trembl" and clusters == "auto":
-        # ~81 GB of FASTA: auto does not start MMseqs2 on it unasked
-        with pytest.raises(cc.ClusterConfigError, match="Set sources.src.cluster_subsampling"
-                                                        ".clusters: mmseqs2 to run it anyway"):
-            _plan(_config(clusters=clusters, **kw))
-        return
     p = _plan(_config(clusters=clusters, **kw))
     assert p.cluster_source == "mmseqs" and p.members_from_source and p.xml_url is None
     assert p.source_line() == ("clusters: MMseqs2 (50% identity, 80% coverage) | "
                                "trains on: this fasta")
 
 
-def test_a_missing_clusters_key_means_auto():
-    cfg = _config(url=U50, members="uniref90")
-    assert "clusters" not in cfg["sources"]["src"]["cluster_subsampling"]
-    p = _plan(cfg)
-    assert p.clusters == "auto" and p.clusters_key is None and p.cluster_source == "uniref_xml"
-    # null is auto too
-    p = _plan(_config(url=U50, members="uniref90", clusters=None))
-    assert p.clusters == "auto" and p.cluster_source == "uniref_xml"
+CHOICES_TEXT = ("uniprot (UniProt's UniRef50 clusters, for UniRef90/UniRef100 members), "
+                "headers (CL: tags in the FASTA headers), mmseqs2 (clusters with MMseqs2; "
+                "slow: hours on large files), or a .tsv file of representative<TAB>member lines")
+
+
+@pytest.mark.parametrize("block", [{"members": "uniref90"}, {"members": "uniref90",
+                                                              "clusters": None},
+                                   {"members": "uniref90", "clustering": None}])
+def test_a_block_without_clusters_lists_the_four_choices(block):
+    cfg = _config(url=U50)
+    cfg["sources"]["src"]["cluster_subsampling"] = block
+    with pytest.raises(DataConfigError) as e:
+        _plan(cfg)
+    assert str(e.value) == ("sources.src.cluster_subsampling.clusters is required: "
+                            + CHOICES_TEXT)
+
+
+def test_cluster_subsampling_true_or_empty_lists_the_four_choices():
+    cfg = _config(url=U90)
+    cfg["sources"]["src"]["cluster_subsampling"] = True
+    with pytest.raises(DataConfigError) as e:
+        _plan(cfg)
+    assert str(e.value) == ("sources.src.cluster_subsampling: true no longer turns it on; "
+                            "write a block that sets clusters to " + CHOICES_TEXT)
+    cfg["sources"]["src"]["cluster_subsampling"] = None
+    with pytest.raises(DataConfigError, match="is empty. Set clusters in it to uniprot "):
+        _plan(cfg)
+    cfg["sources"]["src"]["cluster_subsampling"] = False
+    assert _plan(cfg) is None
 
 
 def test_mmseqs2_on_uniref50_url_clusters_the_members_without_the_url_fasta():
@@ -329,11 +338,11 @@ def test_members_are_read_in_place_or_downloaded(tmp_path):
     gz = tmp_path / "uniref90.fasta.gz"
     import gzip
     gz.write_bytes(gzip.compress(b">UniRef90_A x\nMKV\n"))
-    p = _plan(_config(url=U50, members=str(gz)))
+    p = _plan(_config(url=U50, members=str(gz), clusters="uniprot"))
     assert p.members_compressed == gz and p.members_fasta == WORK / "uniref90.fasta"
     plain = tmp_path / "u90.fasta"
     plain.write_text(">UniRef90_A x\nMKV\n")
-    p = _plan(_config(url=U50, members=str(plain)))
+    p = _plan(_config(url=U50, members=str(plain), clusters="uniprot"))
     assert p.members_compressed is None and p.members_fasta == plain
 
 
@@ -357,10 +366,10 @@ def _long31_zst(path: Path) -> Path:
 
 def test_a_long31_uniref90_zst_gets_uniprot_clusters(tmp_path):
     """A local UniRef90 .fasta.zst made with --long=31 is UniRef90 by its headers, so
-    clustering: auto uses UniProt's clusters, not MMseqs2."""
+    clusters: uniprot accepts it."""
     local = _long31_zst(tmp_path / "seqs.fasta.zst")
     assert cc.level_of(str(local)) == "uniref90"
-    p = _plan(_config(local=str(local)))
+    p = _plan(_config(local=str(local), clusters="uniprot"))
     assert p.cluster_source == "uniref_xml" and p.members_level == "uniref90"
 
 
@@ -390,15 +399,15 @@ def test_zst_headers_without_zstandard_or_zstd_say_what_to_install(tmp_path, mon
     monkeypatch.setitem(sys.modules, "zstandard", None)
     monkeypatch.setenv("PATH", str(tmp_path))
     with pytest.raises(cc.ClusterConfigError, match="pip install zstandard") as e:
-        _plan(_config(local=str(local)))
+        _plan(_config(local=str(local), clusters="uniprot"))
     assert str(local) in str(e.value) and "zstd" in str(e.value)
 
 
-# ------------------------------------------------------------- cluster_subsampling: true / auto
+# ------------------------------------------------------------- headers / a .tsv / CL: tags
 
 
-def _on(fasta, block=True, **params):
-    """The template with one source "src": cluster_subsampling as given (true by default)."""
+def _on(fasta, block, **params):
+    """The template with one source "src" and this cluster_subsampling block."""
     cfg = copy.deepcopy(yaml.safe_load(TEMPLATE.read_text()))
     cfg["data_params"].update(max_seqs=-1, val_ratio=0.0044, **params)
     cfg["sources"] = {"src": {"fasta": fasta, "cluster_subsampling": block}}
@@ -408,50 +417,51 @@ def _on(fasta, block=True, **params):
 CL_FASTA = ">x2\tCL:x1\nMKV\n>x1\tCL:x1\nMKL\n>y1 CL:y1\nMMA\n"
 
 
-def test_true_clusters_this_fasta_with_what_auto_finds(tmp_path):
+def test_each_choice_on_this_fasta(tmp_path):
     own = tmp_path / "mine.fasta"
     own.write_text(">p1 x\nMKV\n>p2\nMKL\n")
-    p = _plan(_on(str(own)))
+    p = _plan(_on(str(own), {"clusters": "mmseqs2"}))
     assert p.cluster_source == "mmseqs" and p.members_from_source and p.members == str(own)
-    assert p.clusters == "auto" and p.clusters_key is None
+    assert p.clusters == "mmseqs2"
+    assert p.clusters_key == "sources.src.cluster_subsampling.clusters"
     assert p.source_line() == ("clusters: MMseqs2 (50% identity, 80% coverage) | "
                                "trains on: this fasta")
     tagged = tmp_path / "logan.fasta"
     tagged.write_text(CL_FASTA)
-    p = _plan(_on(str(tagged)))
+    p = _plan(_on(str(tagged), {"clusters": "headers"}))
     assert p.cluster_source == "headers" and p.members_from_source
     assert p.source_line() == "clusters: CL: tags in headers | trains on: this fasta"
     u90 = tmp_path / "seqs.fasta"
     u90.write_text(">UniRef90_A0A000 x\nMKV\n")
-    p = _plan(_on(str(u90)))
+    p = _plan(_on(str(u90), {"clusters": "uniprot"}))
     assert p.cluster_source == "uniref_xml"
     assert p.source_line() == "clusters: UniProt uniref50.xml.gz | trains on: this fasta"
-    assert _plan(_on(U50, {"members": "uniref90"})).source_line() == (
+    assert _plan(_on(U50, {"members": "uniref90", "clusters": "uniprot"})).source_line() == (
         "clusters: UniProt uniref50.xml.gz | trains on: UniRef90 members")
 
 
-def test_auto_reads_a_compressed_local_fasta(tmp_path):
+def test_headers_reads_a_compressed_local_fasta(tmp_path):
     import zstandard
     gz = tmp_path / "logan.fasta.gz"
     gz.write_bytes(gzip.compress(CL_FASTA.encode()))
-    assert _plan(_on(str(gz))).cluster_source == "headers"
+    assert _plan(_on(str(gz), {"clusters": "headers"})).cluster_source == "headers"
     zst = tmp_path / "logan.fa.zst"
     zst.write_bytes(zstandard.ZstdCompressor().compress(CL_FASTA.encode()))
-    assert _plan(_on(str(zst))).cluster_source == "headers"
+    assert _plan(_on(str(zst), {"clusters": "headers"})).cluster_source == "headers"
 
 
-def test_auto_refuses_headers_with_and_without_cl_tags(tmp_path):
+def test_headers_refuses_a_fasta_with_some_cl_tags(tmp_path):
     mixed = tmp_path / "mixed.fasta"
     mixed.write_text(CL_FASTA + ">z1\nMKV\n")
-    with pytest.raises(cc.ClusterConfigError, match=r"3 of the first 4 headers of mixed.fasta "
-                                                    r"carry a CL: tag; .*clusters: mmseqs2 to "
-                                                    r"ignore the tags"):
-        _plan(_on(str(mixed)))
+    with pytest.raises(cc.ClusterConfigError, match=r"1 of the first 4 headers of mixed.fasta "
+                                                    r"have none \(e.g. >z1\)"):
+        _plan(_on(str(mixed), {"clusters": "headers"}))
+    # mmseqs2 ignores the tags
     p = _plan(_on(str(mixed), {"clusters": "mmseqs2"}))
     assert p.cluster_source == "mmseqs"
 
 
-def test_forced_headers_needs_cl_tags(tmp_path):
+def test_headers_needs_cl_tags(tmp_path):
     own = tmp_path / "mine.fasta"
     own.write_text(">p1 x\nMKV\n>p2\nMKL\n")
     with pytest.raises(cc.ClusterConfigError,
@@ -466,7 +476,7 @@ def test_forced_headers_needs_cl_tags(tmp_path):
     assert _plan(_on(str(tagged), {"clusters": "headers"})).cluster_source == "headers"
 
 
-def test_forced_uniprot_needs_uniref_data(tmp_path):
+def test_uniprot_needs_uniref_data(tmp_path):
     tagged = tmp_path / "logan.fasta"
     tagged.write_text(CL_FASTA)
     with pytest.raises(cc.ClusterConfigError, match="clusters: uniprot: UniProt clusters need "
@@ -478,8 +488,8 @@ def test_identity_with_cl_headers_is_an_error(tmp_path):
     tagged = tmp_path / "logan.fasta"
     tagged.write_text(CL_FASTA)
     with pytest.raises(cc.ClusterConfigError, match=r"these come from the CL: tags of "
-                                                    r"logan.fasta \(what clusters: auto found\)"):
-        _plan(_on(str(tagged), {"identity": 0.3}))
+                                                    r"logan.fasta\. Remove identity"):
+        _plan(_on(str(tagged), {"clusters": "headers", "identity": 0.3}))
 
 
 def test_a_cluster_tsv_path_or_url(tmp_path):
@@ -504,28 +514,16 @@ def test_a_cluster_tsv_path_or_url(tmp_path):
         _plan(_on(str(own), {"clusters": url, "coverage": 0.5}), tmp_path)
 
 
-def test_mmseqs_on_a_large_input_needs_clusters_mmseqs2(tmp_path, monkeypatch):
-    own = tmp_path / "big.fasta"
-    own.write_text(">p1\nMKV\n" * 3)
-    monkeypatch.setattr(cc, "MMSEQS_AUTO_MAX_BYTES", 10)
-    with pytest.raises(cc.ClusterConfigError,
-                       match=r"big.fasta has no cluster information, so clusters: auto would "
-                             r"cluster it with MMseqs2: .* Set sources.src.cluster_subsampling"
-                             r".clusters: mmseqs2 to run it anyway, or give the clusters as a "
-                             r".tsv file"):
-        _plan(_on(str(own)))
-    assert _plan(_on(str(own), {"clusters": "mmseqs2"})).cluster_source == "mmseqs"
-    # a .gz counts as COMPRESSION_GUESS times its size
-    gz = tmp_path / "small.fasta.gz"
-    gz.write_bytes(gzip.compress(b">p1\nMKV\n"))
-    monkeypatch.setattr(cc, "MMSEQS_AUTO_MAX_BYTES", gz.stat().st_size * 2 - 1)
-    with pytest.raises(cc.ClusterConfigError, match="would cluster it with MMseqs2"):
-        _plan(_on(str(gz)))
-    monkeypatch.setattr(cc, "MMSEQS_AUTO_MAX_BYTES", gz.stat().st_size * 2)
-    assert _plan(_on(str(gz))).cluster_source == "mmseqs"
+def test_mmseqs2_runs_at_any_size(tmp_path):
+    """mmseqs2 is only run when asked, so there is no size guard."""
+    gz = tmp_path / "big.fasta.gz"
+    gz.write_bytes(gzip.compress(b">p1\nMKV\n" * 1000))
+    p = _plan(_on(str(gz), {"clusters": "mmseqs2"}))
+    assert p.cluster_source == "mmseqs" and p.warnings == []
+    assert not hasattr(cc, "MMSEQS_AUTO_MAX_BYTES")
 
 
-# ------------------------------------------------------------------ auto on a URL
+# ------------------------------------------------------------------ headers on a URL
 
 
 @pytest.fixture
@@ -546,54 +544,49 @@ def server(monkeypatch):
     return files, calls
 
 
-def test_auto_on_a_url_reads_its_start(server):
+def test_headers_on_a_url_reads_its_start(server):
     import zstandard
     files, calls = server
     tagged = "https://example.org/logan.fasta.zst"
     files[tagged] = (zstandard.ZstdCompressor().compress(CL_FASTA.encode() * 5000), 10**12)
-    p = _plan(_on(tagged))
+    p = _plan(_on(tagged, {"clusters": "headers"}))
     assert p.cluster_source == "headers" and calls == [tagged]
-    _plan(_on(tagged))
+    _plan(_on(tagged, {"clusters": "headers"}))
     assert calls == [tagged]                        # read once per process
     plain = "https://example.org/mine.fasta.gz"
     files[plain] = (gzip.compress(b">p1 x\nMKV\n" * 1000), 5000)
-    assert _plan(_on(plain)).cluster_source == "mmseqs"
-    big = "https://example.org/big.fasta.gz"
-    files[big] = (gzip.compress(b">p1 x\nMKV\n"), 30 * 10**9)
-    with pytest.raises(cc.ClusterConfigError, match="about 60 GB of FASTA"):
-        _plan(_on(big))
-    unknown = "https://example.org/unknown.fasta"
-    files[unknown] = (b">p1 x\nMKV\n", None)
-    p = _plan(_on(unknown))
-    assert p.cluster_source == "mmseqs"
-    assert any("did not say how large unknown.fasta is" in w for w in p.warnings)
+    with pytest.raises(cc.ClusterConfigError, match=r"headers needs a CL:<cluster id> tag .* "
+                                                    r"headers of mine.fasta.gz have none"):
+        _plan(_on(plain, {"clusters": "headers"}))
 
 
-def test_a_url_that_cannot_be_read_needs_clusters_set(server):
+def test_a_url_that_cannot_be_read_is_left_to_the_stage(server):
     url = "https://example.org/gone.fasta.gz"
-    with pytest.raises(cc.ClusterConfigError,
-                       match=r"could not read the start of https://example.org/gone.fasta.gz to "
-                             r"find its clusters \(OSError: HTTP Error 404: Not Found\). Set "
-                             r"sources.src.cluster_subsampling.clusters to headers"):
-        _plan(_on(url))
-    # an explicit choice needs no read; headers is checked by its stage
-    assert _plan(_on(url, {"clusters": "mmseqs2"})).cluster_source == "mmseqs"
     assert _plan(_on(url, {"clusters": "headers"})).cluster_source == "headers"
 
 
-def test_auto_reads_the_downloaded_copy_before_the_url(server, tmp_path):
+def test_headers_reads_the_downloaded_copy_before_the_url(server, tmp_path):
     files, calls = server
     url = "https://example.org/logan.fasta.gz"
     got = tmp_path / DOWNLOADS / "logan.fasta.gz"
     got.parent.mkdir(parents=True)
     got.write_bytes(gzip.compress(CL_FASTA.encode()))
-    assert _plan(_on(url), tmp_path).cluster_source == "headers" and calls == []
+    assert _plan(_on(url, {"clusters": "headers"}), tmp_path).cluster_source == "headers"
+    assert calls == []
 
 
-def test_uniprot_shortcuts_are_decided_without_a_request(server):
+def test_only_headers_reads_a_url(server):
+    """uniprot, mmseqs2 and a .tsv need no request; headers on a UniProt shortcut is refused
+    without one."""
     _, calls = server
-    _plan(_on(U50))
-    _plan(_on("swissprot"))
-    with pytest.raises(cc.ClusterConfigError, match="about 81 GB of FASTA"):
-        _plan(_on("trembl"))
+    url = "https://example.org/mine.fasta.gz"
+    _plan(_on(U50, {"members": "uniref90", "clusters": "uniprot"}))
+    _plan(_on("uniref90", {"clusters": "uniprot"}))
+    _plan(_on(U50, {"clusters": "mmseqs2"}))
+    _plan(_on("trembl", {"clusters": "mmseqs2"}))
+    _plan(_on(url, {"clusters": "mmseqs2"}))
+    _plan(_on(url, {"clusters": "https://example.org/c.tsv.gz"}))
+    for shortcut in ("swissprot", "trembl", "uniref50"):
+        with pytest.raises(cc.ClusterConfigError, match=f"UniProt's .* has none"):
+            _plan(_on(shortcut, {"clusters": "headers"}))
     assert calls == []
