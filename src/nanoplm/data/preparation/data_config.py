@@ -82,6 +82,9 @@ LEGACY_IGNORED = ("pipeline_backend", "device")
 # data_params fields that one setting serves every source of a mix: max_workers reaches
 # the stages through one environment variable
 SHARED_FIELDS = ("max_workers",)
+# data_params fields set only there, even with one source: shuffle_seed also seeds the
+# cluster val and max_seqs draws
+DATA_PARAMS_ONLY = ("shuffle", "shuffle_seed")
 
 
 class DataConfigError(ValueError):
@@ -426,6 +429,10 @@ def _parse_sources(config: dict, base_dir, name_of: str) -> DataConfig:
             raise DataConfigError(
                 f"{where}.{per_source_val[0]}: move it to data_params. The val split is set "
                 "once for the whole data.yaml and shared out by the source weights")
+        only = [f for f in DATA_PARAMS_ONLY if f in over]
+        if only:
+            raise DataConfigError(f"{where}.{only[0]}: set it in data_params; it applies to "
+                                  "every source")
         shared = [f for f in SHARED_FIELDS if f in over]
         if shared and not single:
             raise DataConfigError(f"{where}.{shared[0]}: set it in data_params; it applies to "

@@ -102,7 +102,7 @@ def test_uniref50_url_uniref90_members_stages():
     assert "--cluster-index" in st["write_manifest"]["cmd"]
     # named in the release-mismatch error; members.json no longer records it
     assert st["cluster_index"]["cmd"].endswith(
-        f" --cluster-xml {OUT}/downloads/uniref50.xml.gz")
+        f" --seed 24 --cluster-xml {OUT}/downloads/uniref50.xml.gz")
     assert "--cluster-xml" not in _stages(_source(
         "uniref50", {"clusters": "mmseqs2"}))["cluster_index"]["cmd"]
 
@@ -144,6 +144,44 @@ def test_an_override_is_referenced_where_it_is_set():
     assert "--max-seq-len ${sources.src.max_seq_len}" in st["cluster_pool"]["cmd"]
     assert "sources.src.max_seq_len" in st["cluster_pool"]["params"][0]["data.yaml"]
     assert "--val-ratio ${data_params.val_ratio}" in st["cluster_index"]["cmd"]
+
+
+@pytest.mark.parametrize("params, seed, key", [
+    ({}, "--seed 24", None),
+    ({"shuffle": False}, "--seed 24", None),
+    ({"shuffle_seed": 7}, "--seed ${data_params.shuffle_seed}", "data_params.shuffle_seed")])
+def test_cluster_index_draws_val_with_shuffle_seed(params, seed, key):
+    """The val and max_seqs draws use shuffle_seed, also with shuffle: false; at the default
+    it is a value, not a DVC param."""
+    st = _stages(_source("uniref50", {"members": "uniref90", "clusters": "uniprot"},
+                         **params))["cluster_index"]
+    assert f" {seed} " in st["cmd"]
+    assert (key in st["params"][0]["data.yaml"]) == (key is not None)
+
+
+def test_cluster_index_passes_seed_to_the_draw(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from nanoplm.cli.data import data
+    from nanoplm.data.preparation import cluster_pipeline
+    got = {}
+
+    def fake(*args, **kwargs):
+        got.update(kwargs)
+        return {"counts": {"train_clusters": 1, "val_clusters": 1, "pool_rows": 2}}
+
+    monkeypatch.setattr(cluster_pipeline, "build_index_and_val", fake)
+    f = tmp_path / "f.fasta"
+    f.write_text(">a\nM\n")
+    (tmp_path / "pool").mkdir()
+    base = ["cluster-index", "--members-tsv", str(f), "--fasta", str(f), "--pool",
+            str(tmp_path / "pool"), "--index-dir", str(tmp_path / "i"), "--val-dir",
+            str(tmp_path / "v"), "--max-seq-len", "9", "--val-ratio", "0.5",
+            "--samples-per-shard", "2"]
+    for extra, seed in ((["--seed", "7"], 7), ([], 20260918)):
+        r = CliRunner().invoke(data, base + extra)
+        assert r.exit_code == 0, r.output
+        assert got["holdout_seed"] == seed
 
 
 def test_mmseqs_params_only_reach_cluster_members(tmp_path):

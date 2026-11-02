@@ -235,7 +235,6 @@ nanoPLM downloads `uniref50.xml.gz` once into `output_dir/downloads/` and keeps 
 | `... was built by the data-sampler experiment scripts ...` (at pretraining start) | `dataset_dir` is a folder from the old experiment scripts. Rebuild it with `nanoplm data from-yaml`. |
 | Warning: `...clustering is now called clusters; the old name still works` | Rename the key. If it was `uniprot` or `mmseqs2`, the rename reruns `cluster_members` once. |
 | Warning: `max_seqs=... trains on at most ... clusters` / `val_ratio=... holds out ...% of the clusters` | See [Turn it on](#turn-it-on). |
-| Warning: `cluster_subsampling ignores shuffle / shuffle_seed` | The tokenized members keep FASTA order; training shuffles the clusters each epoch. |
 
 The `cluster_members` stage checks a cluster file or the `CL:` tags against every record. It stops when a record has no tag or is missing from the file, when an id is in the file but not in the FASTA or is listed twice, or when a cluster has no representative. The message gives the counts and a few ids.
 

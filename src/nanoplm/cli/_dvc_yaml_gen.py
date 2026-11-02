@@ -500,7 +500,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                 f"--max-seq-len {ref('max_seq_len')} {_val_arg(src)} "
                 f"--samples-per-shard {ref('samples_per_shard')} "
                 f"--seqs-num {ref('max_seqs')} "
-                f"--register-tokens {ref('register_tokens')}"
+                f"--register-tokens {ref('register_tokens')} "
+                f"--seed {ref('shuffle_seed')}"
                 + (f" --cluster-xml {plan.xml_path}" if plan.xml_path else "")),
         # build_index_and_val runs it; cluster_index reads members.tsv with
         # cluster_table and hashes accessions with uniref_hierarchy
@@ -511,7 +512,7 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                  dep("src/nanoplm/data/preparation/uniref_hierarchy.py")] + _val_deps(src),
         **_params(params_filename, [key("max_seq_len"), *_val_key(src),
                                       key("samples_per_shard"), key("max_seqs"),
-                                      key("register_tokens")]),
+                                      key("register_tokens"), key("shuffle_seed")]),
         "outs": [index_dir, f"{out}/val"],
     }
     stages["write_manifest"] = {

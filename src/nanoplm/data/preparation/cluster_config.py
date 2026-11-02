@@ -68,9 +68,6 @@ PEEK_TIMEOUT = 30
 # val_ratio counts clusters here; above this, warn (the template's 0.1 is sized for
 # sequences). The experiment held out 0.44% of the UniRef50 clusters.
 MAX_QUIET_VAL_RATIO = 0.01
-# data.yaml template values: left as they are, shuffle / shuffle_seed draw no warning
-TEMPLATE_SHUFFLE = True
-TEMPLATE_SHUFFLE_SEED = 24
 EXPERIMENT_VAL_RATIO = 0.0044
 
 
@@ -352,10 +349,6 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
     if isinstance(max_seqs, int) and max_seqs > 0:
         warnings.append(f"{on}: {_setting(src, 'max_seqs')} trains on at most {max_seqs:,} "
                         f"clusters; set {on}.max_seqs: -1 to use all of them")
-    if (params.get("shuffle", TEMPLATE_SHUFFLE) != TEMPLATE_SHUFFLE
-            or params.get("shuffle_seed", TEMPLATE_SHUFFLE_SEED) != TEMPLATE_SHUFFLE_SEED):
-        warnings.append(f"{on}: cluster_subsampling ignores shuffle / shuffle_seed: the pool "
-                        "keeps FASTA order and the training sampler orders the visits")
 
     source_level = level_of(source, base_dir)
     members = block.get("members")

@@ -18,7 +18,7 @@ A mix trains on two or more FASTA files at once. You list each file under `sourc
      uniref50:
        fasta: "uniref50_3000.fasta"
        weight: 0.8
-   data_params:            # defaults for every source; a source may override them, but not val_ratio
+   data_params:            # defaults for every source; a source may override them, but not val_ratio or shuffle
      max_seqs: -1
      min_seq_len: 20
      max_seq_len: 512

@@ -38,7 +38,7 @@ _DVC = [sys.executable, "-m", "dvc"]
 # Our own pipeline exceptions. Their messages are written for a user, so they
 # stand alone as a one-line error.
 from nanoplm.data.preparation.cluster_config import ClusterConfigError
-from nanoplm.data.preparation.cluster_index import ClusterIndexError
+from nanoplm.data.preparation.cluster_index import HOLDOUT_SEED, ClusterIndexError
 from nanoplm.data.preparation.cluster_table import ClusterTableError
 from nanoplm.data.preparation.uniref_hierarchy import HierarchyError
 
@@ -862,8 +862,11 @@ def cluster_pool(input, output, max_seq_len, samples_per_shard, register_tokens,
 @click.option("--register-tokens", type=int, default=0)
 @click.option("--cluster-xml", type=click.Path(dir_okay=False), default=None,
               help="The UniProt XML members.tsv came from, named in a release-mismatch error.")
+@click.option("--seed", type=int, default=HOLDOUT_SEED, show_default=True,
+              help="Seed of the val cluster draw and the --seqs-num cap (data.yaml shuffle_seed).")
 def cluster_index_cmd(members_tsv, fasta, pool, index_dir, val_dir, max_seq_len, val_ratio,
-                      val_count_file, samples_per_shard, seqs_num, register_tokens, cluster_xml):
+                      val_count_file, samples_per_shard, seqs_num, register_tokens, cluster_xml,
+                      seed):
     """Internal: build the cluster index and the validation gathers."""
     from nanoplm.data.preparation.cluster_pipeline import build_index_and_val
     if (val_ratio is None) == (val_count_file is None):
@@ -874,7 +877,7 @@ def cluster_index_cmd(members_tsv, fasta, pool, index_dir, val_dir, max_seq_len,
         val_ratio = want["val"] / want["units"]
     man = build_index_and_val(Path(fasta), Path(pool), Path(members_tsv), Path(index_dir),
                               Path(val_dir), max_seq_len, val_ratio, samples_per_shard,
-                              seqs_num, register_tokens,
+                              seqs_num, register_tokens, holdout_seed=seed,
                               cluster_xml=Path(cluster_xml) if cluster_xml else None)
     c = man["counts"]
     if want is not None and (c["val_clusters"], c["clusters_in_universe"]) != (

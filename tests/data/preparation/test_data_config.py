@@ -244,6 +244,17 @@ def test_mix_errors(spec, match):
         _parse(_mix(a={"fasta": "swissprot", "weight": 0.5}, b=spec))
 
 
+@pytest.mark.parametrize("field, value", [("shuffle", False), ("shuffle_seed", 7)])
+def test_shuffle_is_set_in_data_params_only(field, value):
+    with pytest.raises(dc.DataConfigError,
+                       match=f"^sources.src.{field}: set it in data_params; it applies to "
+                             "every source$"):
+        _parse(_with_source({"fasta": "swissprot", field: value}))
+    with pytest.raises(dc.DataConfigError, match=f"sources.b.{field}: set it in data_params"):
+        _parse(_mix(a={"fasta": "swissprot", "weight": 0.5},
+                    b={"fasta": "trembl", "weight": 0.5, field: value}))
+
+
 def test_a_source_name_written_twice_is_refused(tmp_path):
     p = tmp_path / "data.yaml"
     p.write_text("output_dir: o\nsources:\n  a:\n    fasta: swissprot\n    weight: 0.5\n"

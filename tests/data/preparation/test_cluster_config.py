@@ -133,13 +133,12 @@ def test_identity_and_coverage_are_an_error_with_uniprot_clusters():
     assert p.cluster_source == "uniref_xml" and p.warnings == []
 
 
-@pytest.mark.parametrize("shuffle, seed, warns", [
-    (True, 24, False), (False, 24, True), (True, 7, True), (True, None, True)])
-def test_shuffle_warns_only_when_changed_from_the_template(shuffle, seed, warns):
+@pytest.mark.parametrize("shuffle, seed", [(True, 24), (False, 24), (True, 7)])
+def test_shuffle_draws_no_warning(shuffle, seed):
+    """shuffle_seed seeds the cluster val draw, so changing it is no longer ignored."""
     cfg = _config(url=U90, clusters="uniprot")
     cfg["data_params"].update(shuffle=shuffle, shuffle_seed=seed)
-    assert any("ignores shuffle / shuffle_seed" in w
-               for w in _plan(cfg).warnings) == warns
+    assert not any("shuffle" in w for w in _plan(cfg).warnings)
 
 
 @pytest.mark.parametrize("block,match", [
