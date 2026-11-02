@@ -75,6 +75,10 @@ class PretrainManifest(DataManifestBase):
     pool_sequences: Optional[int] = None
     pool_tokens: Optional[int] = None
 
+    # False: training reads the train set in file order (data.yaml shuffle: false). None
+    # (the default, not written) means shuffled, so other manifests stay as they were.
+    shuffle: Optional[bool] = None
+
     @property
     def is_cluster_sampled(self) -> bool:
         return bool(self.cluster_index_dir)

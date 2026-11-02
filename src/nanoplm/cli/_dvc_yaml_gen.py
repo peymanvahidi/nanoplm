@@ -250,6 +250,7 @@ def _plain_stages(src: Source, kind: str, params_filename: str) -> dict:
                 + _manifest_val_arg(src) +
                 f"--samples-per-shard {ref('samples_per_shard')} "
                 f"--register-tokens {ref('register_tokens')}"
+                + _no_shuffle_arg(src)
             ),
             "deps": [
                 f"{out}/train",
@@ -258,7 +259,7 @@ def _plain_stages(src: Source, kind: str, params_filename: str) -> dict:
             ],
             **_params(params_filename, [
                 key("min_seq_len"), key("max_seq_len"), *_val_key(src),
-                key("samples_per_shard"), key("register_tokens"),
+                key("samples_per_shard"), key("register_tokens"), *_shuffle_key(src),
             ]),
             "outs": [f"{out}/.data_manifest"],
         }
@@ -327,6 +328,20 @@ def _val_key(src: Source) -> list:
 def _manifest_val_arg(src: Source) -> str:
     """write-manifest takes the val ratio as set, or works it out from the built val."""
     return "" if src.val_from_split else f"--val-ratio {src.ref('val_ratio')} "
+
+
+def _unshuffled(src: Source) -> bool:
+    return src.params.get("shuffle") is False
+
+
+def _no_shuffle_arg(src: Source) -> str:
+    """shuffle: false also trains in file order, so the manifest records it. Left out
+    otherwise, so the stage of a shuffled build stays as it was."""
+    return " --no-shuffle" if _unshuffled(src) else ""
+
+
+def _shuffle_key(src: Source) -> list:
+    return [src.key("shuffle")] if _unshuffled(src) else []
 
 
 def _count_stage(src: Source, deps: list, extra: str, params: list = (),
@@ -521,12 +536,13 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                 f"--max-seq-len {ref('max_seq_len')} "
                 + _manifest_val_arg(src) +
                 f"--samples-per-shard {ref('samples_per_shard')} "
-                f"--register-tokens {ref('register_tokens')}"),
+                f"--register-tokens {ref('register_tokens')}"
+                + _no_shuffle_arg(src)),
         "deps": [index_dir, f"{out}/val", dep("src/nanoplm/data/infra/manifest.py"),
                  dep("src/nanoplm/data/preparation/cluster_pipeline.py")],
         **_params(params_filename, [key("min_seq_len"), key("max_seq_len"),
                                       *_val_key(src), key("samples_per_shard"),
-                                      key("register_tokens")]),
+                                      key("register_tokens"), *_shuffle_key(src)]),
         "outs": [f"{out}/.data_manifest"],
     }
     return stages

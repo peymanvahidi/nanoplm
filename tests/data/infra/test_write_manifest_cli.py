@@ -105,3 +105,47 @@ def test_plain_manifest_has_only_the_fields_master_reads(tmp_path):
     assert result.exit_code == 0, result.output
     keys = set(yaml.safe_load((tmp_path / ".data_manifest").read_text()))
     assert keys <= MASTER_PRETRAIN_FIELDS, keys - MASTER_PRETRAIN_FIELDS
+
+
+def _write(tmp_path, *extra):
+    _make_pretrain_shard_dir(tmp_path / "train", [10])
+    _make_pretrain_shard_dir(tmp_path / "val", [5])
+    return CliRunner().invoke(data, [
+        "write-manifest", "--kind", "pretrain", "-o", str(tmp_path),
+        "--min-seq-len", "20", "--max-seq-len", "512",
+        "--val-ratio", "0.1", "--samples-per-shard", "10", *extra,
+    ])
+
+
+def test_write_manifest_records_shuffle_only_when_false(tmp_path):
+    from nanoplm.data.infra.manifest import read_manifest
+    on, off = tmp_path / "on", tmp_path / "off"
+    assert _write(on).exit_code == 0
+    assert "shuffle" not in yaml.safe_load((on / ".data_manifest").read_text())
+    assert read_manifest(on).shuffle is None
+    r = _write(off, "--no-shuffle")
+    assert r.exit_code == 0, r.output
+    assert yaml.safe_load((off / ".data_manifest").read_text())["shuffle"] is False
+    assert read_manifest(off).shuffle is False
+
+
+def test_write_manifest_no_shuffle_for_a_cluster_dataset(tmp_path, monkeypatch):
+    from nanoplm.data.infra.manifest import PretrainManifest, write_manifest
+    from nanoplm.data.preparation import cluster_pipeline
+
+    def fake(output_dir, *args):
+        m = PretrainManifest(pipeline_mode="pretrain", seqs_num=3, min_seq_len=1,
+                             max_seq_len=9, val_ratio=0.1, train_dir="train", val_dir="val",
+                             train_sequences=2, val_sequences=1, samples_per_shard=2,
+                             cluster_index_dir="cluster_index")
+        write_manifest(output_dir, m)
+        return m
+
+    monkeypatch.setattr(cluster_pipeline, "write_cluster_manifest", fake)
+    r = CliRunner().invoke(data, [
+        "write-manifest", "--kind", "pretrain", "--cluster-index", "-o", str(tmp_path),
+        "--min-seq-len", "1", "--max-seq-len", "9", "--val-ratio", "0.1",
+        "--samples-per-shard", "2", "--no-shuffle"])
+    assert r.exit_code == 0, r.output
+    got = yaml.safe_load((tmp_path / ".data_manifest").read_text())
+    assert got["shuffle"] is False and got["cluster_index_dir"] == "cluster_index"

@@ -436,3 +436,11 @@ def test_from_yaml_one_cluster_source_with_val_size(tmp_path):
     units = json.loads((out / "src/pool_units.json").read_text())
     assert units["kind"] == "clusters" and m.train_sequences + 7 == units["units"]
     assert m.val_ratio == round(7 / units["units"], 6)
+
+
+def test_shuffle_false_in_a_mix_is_an_error():
+    cfg = _mix(**THREE)
+    cfg["data_params"]["shuffle"] = False
+    with pytest.raises(DataConfigError, match="shuffle: false is not supported for a mix yet; "
+                                              "it comes with the mixes redesign"):
+        _stages(cfg)

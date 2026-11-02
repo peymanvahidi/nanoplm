@@ -503,11 +503,15 @@ def _check_cluster_holdout(src: Source) -> None:
 
 
 def _check_mix(sources: dict, name_of: str) -> None:
-    """The weights of several sources sum to 1. One register_tokens for all of them is
-    checked by `nanoplm data from-yaml` and again by write_mixture."""
+    """The weights of several sources sum to 1, and shuffle is on. One register_tokens
+    for all of them is checked by `nanoplm data from-yaml` and again by write_mixture."""
     err = weights_error({n: s.weight for n, s in sources.items()})
     if err:
         raise DataConfigError(f"{name_of}: {err}")
+    if any(s.params.get("shuffle") is False for s in sources.values()):
+        raise DataConfigError(f"{name_of}: data_params.shuffle: false is not supported for a "
+                              "mix yet; it comes with the mixes redesign. Remove it, or train "
+                              "on one source")
 
 
 def _source_paths(src: Source) -> dict:

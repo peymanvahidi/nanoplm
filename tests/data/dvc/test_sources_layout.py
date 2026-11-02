@@ -487,3 +487,29 @@ def test_from_yaml_builds_a_prodigal_fa_zst_without_stop_codons(tmp_path):
         got += [list(ds[i]["input_ids"]) for i in range(len(ds))]
     assert sorted(len(ids) - 1 for ids in got) == sorted(lengths)     # residues + EOS
     assert all(ids[-1] == tok.eos_token_id and tok.unk_token_id not in ids for ids in got)
+
+
+@pytest.mark.parametrize("cluster", [False, True])
+def test_shuffle_false_reaches_write_manifest_only(cluster):
+    """shuffle: false adds --no-shuffle and the param to write_manifest; at the default the
+    stage is as it was, so existing builds keep their dvc.lock."""
+    cfg = yaml.safe_load(load_template("data_pretrain"))
+    if cluster:
+        cfg["sources"] = {"src": {"fasta": "uniref50", "cluster_subsampling": {
+            "members": "uniref90", "clusters": "uniprot"}}}
+    on = yaml.safe_load(_gen(cfg))["stages"]["write_manifest"]
+    assert "--no-shuffle" not in on["cmd"]
+    assert "data_params.shuffle" not in on["params"][0]["data.yaml"]
+    cfg["data_params"]["shuffle"] = False
+    off = yaml.safe_load(_gen(cfg))["stages"]["write_manifest"]
+    assert off["cmd"] == on["cmd"] + " --no-shuffle"
+    assert off["params"][0]["data.yaml"] == on["params"][0]["data.yaml"] + ["data_params.shuffle"]
+    assert off["deps"] == on["deps"]
+
+
+def test_old_layout_shuffle_false_reaches_write_manifest():
+    cfg = yaml.safe_load((GOLDEN / "local_plain.data.yaml").read_text())
+    cfg["data_params"]["shuffle"] = False
+    st = yaml.safe_load(_gen(cfg))["stages"]["write_manifest"]
+    assert st["cmd"].endswith(" --no-shuffle")
+    assert "data_params.shuffle" in st["params"][0]["data.yaml"]

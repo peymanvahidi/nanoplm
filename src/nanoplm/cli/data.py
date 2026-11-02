@@ -1945,11 +1945,17 @@ def _print_mixture_summary(cwd: Path, cfg) -> None:
 @click.option("--teacher-model", type=str, default=None)
 @click.option("--cluster-index", is_flag=True, default=False,
               help="Describe a cluster-subsampled dataset (one member per cluster per pass).")
+@click.option("--no-shuffle", is_flag=True, default=False,
+              help="Record shuffle: false, so training reads the train set in file order.")
 @click.help_option("--help", "-h")
 def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
-                       samples_per_shard, register_tokens, teacher_model, cluster_index):
+                       samples_per_shard, register_tokens, teacher_model, cluster_index,
+                       no_shuffle):
     """Internal: write .data_manifest after shard generation."""
     output_dir = Path(output)
+    if no_shuffle and kind != "pretrain":
+        raise click.ClickException("write-manifest: --no-shuffle is for --kind pretrain")
+    shuffle = False if no_shuffle else None     # written only when false
     if cluster_index:
         from nanoplm.data.preparation.cluster_pipeline import write_cluster_manifest
         if val_ratio is None:
@@ -1958,8 +1964,11 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
             from nanoplm.data.preparation.cluster_config import CLUSTER_INDEX_DIR
             c = json.loads((output_dir / CLUSTER_INDEX_DIR / INDEX_MANIFEST).read_text())["counts"]
             val_ratio = round(c["val_clusters"] / max(1, c["clusters_in_universe"]), 6)
-        write_cluster_manifest(output_dir, min_seq_len, max_seq_len, val_ratio,
-                               samples_per_shard, register_tokens)
+        manifest = write_cluster_manifest(output_dir, min_seq_len, max_seq_len, val_ratio,
+                                          samples_per_shard, register_tokens)
+        if shuffle is not None:
+            manifest.shuffle = shuffle
+            write_manifest(output_dir, manifest)
         click.echo(f"Wrote manifest: {output_dir / '.data_manifest'}")
         return
     train_dir = output_dir / "train"
@@ -1995,6 +2004,7 @@ def write_manifest_cmd(kind, output, min_seq_len, max_seq_len, val_ratio,
             sharded=True,
             samples_per_shard=samples_per_shard,
             total_train_tokens=train_tokens,
+            shuffle=shuffle,
         )
     else:
         # Pre-computed distillation mode requires train_h5_prefix and val_h5_prefix.
