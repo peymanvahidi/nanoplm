@@ -112,7 +112,7 @@ model:
   # ── Activation checkpointing ──────────────────────────────────────────────
 
   activation_checkpointing: false       # recompute activations in backward → less VRAM
-  activation_checkpointing_mode: "attn" # layer | attn | attn+mlp   (attn = highest ROI)
+  activation_checkpointing_mode: "attn" # layer | attn | attn_minimal | attn+mlp   (attn = highest ROI; attn_minimal = attn that keeps matmul + FA outputs: faster, more memory)
 
   # ── MoE — Mixture-of-Experts (pure_torch only) ────────────────────────────
 

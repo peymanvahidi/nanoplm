@@ -125,7 +125,7 @@ model.wo_init:
   enum: [kaiming, zero]
 # click.Choice --activation-checkpointing-mode
 model.activation_checkpointing_mode:
-  enum: [layer, attn, attn+mlp]
+  enum: [layer, attn, attn_minimal, attn+mlp]
 # _resolve_canon_kernel_size -> {3, 5, 7}
 model.canon_layers_kernel_size:
   enum: [3, 5, 7]

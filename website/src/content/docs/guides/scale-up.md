@@ -104,10 +104,10 @@ Two knobs, in the order you should reach for them.
 ```yaml title="pretrain.yaml"
 model:
   activation_checkpointing: true
-  activation_checkpointing_mode: "attn"  # layer | attn | attn+mlp
+  activation_checkpointing_mode: "attn"  # layer | attn | attn_minimal | attn+mlp
 ```
 
-[`activation_checkpointing_mode: attn`](/nanoplm/reference/pretrain/#pretrain-model-activation_checkpointing_mode) has the best return: attention activations are the largest and the cheapest to recompute. `layer` and `attn+mlp` save more memory for more recompute. (MoE rejects `attn+mlp`.)
+[`activation_checkpointing_mode: attn`](/nanoplm/reference/pretrain/#pretrain-model-activation_checkpointing_mode) has the best return: attention activations are the largest and the cheapest to recompute. `layer` and `attn+mlp` save more memory for more recompute. (MoE rejects `attn+mlp`.) `attn_minimal` sits between `attn` and no checkpointing: it keeps the matmul and FlashAttention outputs of the attention branch and recomputes only the norms, QK-norm and RoPE, so the backward does no extra GEMM or attention work. On a 32-layer, 83-expert MoE (micro-batch 128, 16 GH200s) it ran 6% faster per step than `attn` at 79 GB peak instead of 60 GB; without checkpointing that batch did not fit.
 
 **`micro_batch_seqs`** is the VRAM dial. It is the number of sequences one GPU holds in one forward pass: halve it and peak memory roughly halves.
 

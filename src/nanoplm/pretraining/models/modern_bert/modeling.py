@@ -893,6 +893,53 @@ def collect_attention_probs(
             del m._attn_probs_dtype
 
 
+_ATTN_MINIMAL_SAC = None
+
+
+def _attn_minimal_context_fn():
+    """Selective-AC policy for ``activation_checkpointing_mode='attn_minimal'``.
+
+    The attention branch is checkpointed as in ``attn`` mode, but the matmul
+    outputs (Wqkv, Wo) and the FlashAttention forward outputs (out, lse) are
+    saved, so the backward recomputes only the cheap elementwise ops (norms,
+    QK-norm, RoPE) and never re-runs a projection GEMM or the FA forward.
+    Built once and cached; resolved outside the compiled forward.
+    """
+    global _ATTN_MINIMAL_SAC
+    if _ATTN_MINIMAL_SAC is not None:
+        return _ATTN_MINIMAL_SAC
+    import functools
+
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+
+    save = {torch.ops.aten.mm.default, torch.ops.aten.addmm.default}
+    for ns, name in (
+        ("flash_attn_3", "_flash_attn_forward"),
+        ("flash_attn", "_flash_attn_varlen_forward"),
+    ):
+        try:
+            save.add(getattr(getattr(torch.ops, ns), name).default)
+        except (AttributeError, RuntimeError):
+            pass
+    save |= {
+        torch.ops.aten._scaled_dot_product_flash_attention.default,
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+    }
+    save = frozenset(save)
+
+    def _policy(ctx, op, *args, **kwargs):
+        if op in save:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    _ATTN_MINIMAL_SAC = functools.partial(create_selective_checkpoint_contexts, _policy)
+    return _ATTN_MINIMAL_SAC
+
+
 def _residual_add(
     x: torch.Tensor,
     branch_out: torch.Tensor,
@@ -945,6 +992,12 @@ class ModernBertEncoderLayer(nn.Module):
             str(getattr(config, "activation_checkpointing_mode", "layer"))
             .strip()
             .lower()
+        )
+        # attn_minimal: selective AC policy, resolved here outside the compiled forward
+        self._attn_sac = (
+            _attn_minimal_context_fn()
+            if self.activation_checkpointing_mode == "attn_minimal"
+            else None
         )
         # Layer-mode AC is applied by `forward` itself (see
         # `_use_internal_layer_ac`). A parent block that already checkpoints
@@ -1013,7 +1066,7 @@ class ModernBertEncoderLayer(nn.Module):
         to eager, so the backward re-materialised ~15 layers at once (77 GB at
         micro-batch 128, R=3; experiments/loop-imp-v4/NOTES.md, Step 3 / R1).
 
-        ``attn``/``attn+mlp`` modes are unaffected: they checkpoint branches
+        ``attn``/``attn_minimal``/``attn+mlp`` modes are unaffected: they checkpoint branches
         inside ``_forward_once`` and are already inside the unit. Intended side
         effect of checkpointing from here: the Huginn recycling path
         (prelude/recurrent/coda), which calls layers outside the encoder loop
@@ -1150,7 +1203,7 @@ class ModernBertEncoderLayer(nn.Module):
         do_ckpt_attn = (
             self.activation_checkpointing
             and self.training
-            and self.activation_checkpointing_mode in {"attn", "attn+mlp"}
+            and self.activation_checkpointing_mode in {"attn", "attn_minimal", "attn+mlp"}
         )
         if do_ckpt_attn:
             _attn_mask = attn_mask
@@ -1203,10 +1256,15 @@ class ModernBertEncoderLayer(nn.Module):
                     repo_active=_repo_active,
                 )
 
-            try:
-                attn_out = _checkpoint(_attn_branch, x, use_reentrant=False)
-            except TypeError:  # older torch checkpoint API
-                attn_out = _checkpoint(_attn_branch, x)
+            if self._attn_sac is not None:
+                attn_out = _checkpoint(
+                    _attn_branch, x, use_reentrant=False, context_fn=self._attn_sac
+                )
+            else:
+                try:
+                    attn_out = _checkpoint(_attn_branch, x, use_reentrant=False)
+                except TypeError:  # older torch checkpoint API
+                    attn_out = _checkpoint(_attn_branch, x)
             x = _residual_add(x, attn_out, prores_alpha)
         else:
             fuse_ln_a = (
