@@ -6,6 +6,8 @@ off, that micro-batch's gradient lives on the unsharded parameters, out of
 reach of optimizer.zero_grad(), and used to be reduced into the first step of
 the next pass. DDP accumulates into param.grad, which zero_grad() clears, so
 it is the fresh-window reference: FSDP2 and DDP must end with the same weights.
+The reference is the legacy torch DDP path (NANOPLM_DDP_LEGACY=1), since
+distributed_mode="ddp" itself now runs on FSDP2 replicate().
 
 Runs resume_harness.py under torchrun, 2 ranks, gloo on CPU.
 """
@@ -41,10 +43,14 @@ def _weights(tmp: Path, ds: Path, mode: str, steps: int, ga: int, bwarm: int, ov
     pytest.param(22, 8, 6, 6, 0, [_pass_line(1, 5, 6, 10, 5, 1)], id="warmup_tail"),
     pytest.param(10, 2, 0, 3, 1, [_pass_line(1, 2, 3, 5, 2, 1)], id="early_exhaustion"),
 ])
-def test_fsdp_first_step_after_pass_boundary_matches_ddp(tmp_path, n, ga, bwarm, steps, over,
-                                                         lines):
+def test_fsdp_first_step_after_pass_boundary_matches_ddp(tmp_path, monkeypatch, n, ga, bwarm,
+                                                         steps, over, lines):
     ds = _dataset(tmp_path, n * 2)
-    ddp, ddp_lines = _weights(tmp_path, ds, "ddp", steps, ga, bwarm, over)
+    # The reference must not share FSDP2's grad-accum state: "ddp" now runs on
+    # FSDP2 replicate(), so pin it to the legacy torch DDP path here.
+    with monkeypatch.context() as m:
+        m.setenv("NANOPLM_DDP_LEGACY", "1")
+        ddp, ddp_lines = _weights(tmp_path, ds, "ddp", steps, ga, bwarm, over)
     fsdp, fsdp_lines = _weights(tmp_path, ds, "fsdp", steps, ga, bwarm, over)
     assert ddp_lines == fsdp_lines == lines
     assert ddp.keys() == fsdp.keys()
