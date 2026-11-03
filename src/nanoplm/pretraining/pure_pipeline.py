@@ -45,6 +45,7 @@ import torch
 import torch.distributed as dist
 import wandb
 from torch.distributed._composable.fsdp import fully_shard, FSDPModule, MixedPrecisionPolicy
+from torch.distributed._composable.replicate_with_fsdp import replicate
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -489,7 +490,7 @@ def _build_compiled_training_model(
     local_rank: int,
     device: torch.device,
 ) -> torch.nn.Module:
-    """Compile the training model and apply DDP wrapping when requested."""
+    """Compile the training model; wrap it in torch DDP only on the legacy DDP path."""
     if compile_mode is None:
         compiled_model = torch.compile(base_model, dynamic=compile_dynamic)
         logger.info("Model compiled with torch.compile(dynamic=%s)", compile_dynamic)
@@ -501,7 +502,7 @@ def _build_compiled_training_model(
             compile_mode,
         )
 
-    if distributed and distributed_mode == "ddp":
+    if distributed and distributed_mode == "ddp" and _ddp_legacy():
         ddp_kwargs = dict(
             broadcast_buffers=False,
             find_unused_parameters=False,
@@ -773,6 +774,21 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor._local_tensor if isinstance(tensor, DTensor) else tensor
 
 
+def _dp_wrap(modules, *, mesh, reshard_after_forward: bool, **fsdp_kwargs) -> None:
+    """Apply FSDP2 data parallelism to one unit: fully_shard, or replicate for DDP.
+
+    A 1-D mesh named ("replicate",) is the DDP mesh: replicate() keeps every
+    parameter whole on every rank and only all-reduces gradients, but it is the
+    same FSDP2 machinery as fully_shard, so the MixedPrecisionPolicy (bf16
+    forward params, fp32 masters, fp32 gradient reduce) is applied identically.
+    replicate() has no reshard_after_forward: nothing is ever resharded.
+    """
+    if mesh.mesh_dim_names == ("replicate",):
+        replicate(modules, mesh=mesh, **fsdp_kwargs)
+    else:
+        fully_shard(modules, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+
+
 def _fully_shard_encoder_sublayers(
     enc: ModernBertEncoderLayer,
     *,
@@ -790,11 +806,11 @@ def _fully_shard_encoder_sublayers(
     less CPU dispatch overhead — better on fast interconnects like NVLink).
     """
     if sublayer:
-        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        _dp_wrap(enc.attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
         if enc.mlp is not None:
-            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+            _dp_wrap(enc.mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
     if shard_parent:
-        fully_shard(enc, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        _dp_wrap(enc, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_transformer_layer(
@@ -833,10 +849,10 @@ def _fully_shard_transformer_layer(
             sublayer=sublayer,
         )
         if sublayer:
-            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+            _dp_wrap(layer.mhc_attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
             if layer.mhc_mlp is not None:
-                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-    fully_shard(layer, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+                _dp_wrap(layer.mhc_mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    _dp_wrap(layer, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_root_groups(
@@ -850,17 +866,17 @@ def _fully_shard_root_groups(
     tied_embeddings = model.decoder.weight is model.model.embeddings.tok_embeddings.weight
     if tied_embeddings:
         # Keep the tied embedding/unembedding weight in one FSDP group.
-        fully_shard(
+        _dp_wrap(
             [model.model.embeddings, model.decoder],
             mesh=mesh,
             reshard_after_forward=reshard_after_forward,
             **fsdp_kwargs,
         )
     else:
-        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-    fully_shard(model.head, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        _dp_wrap(model.model.embeddings, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        _dp_wrap(model.decoder, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    _dp_wrap(model.model.final_norm, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    _dp_wrap(model.head, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _has_nonfinite_tensors(tensors: list[torch.Tensor]) -> bool:
@@ -1005,14 +1021,25 @@ def _dist_barrier(local_rank: int) -> None:
         dist.barrier()
 
 
-# Sharded modes that go through the FSDP2 fully_shard() code path. "hsdp" is
-# plain FSDP2 with a 2D (replicate x shard) device mesh, so it shares every
-# sharded branch (checkpoint gather/reshard, gradient-sync toggling, etc.).
-_FSDP_MODES = ("fsdp", "hsdp")
+# Modes that go through the FSDP2 code path. "hsdp" is plain FSDP2 with a 2D
+# (replicate x shard) device mesh; "ddp" is FSDP2's replicate() on a 1D mesh
+# (every parameter whole on every rank, gradients all-reduced). All three share
+# every FSDP2 branch (mixed-precision policy, checkpoint gather, gradient-sync
+# toggling, etc.), so they train with the same numerics.
+_FSDP_MODES = ("fsdp", "hsdp", "ddp")
+
+
+def _ddp_legacy() -> bool:
+    """NANOPLM_DDP_LEGACY=1: distributed_mode="ddp" uses torch DistributedDataParallel
+    with fp32 params + torch.autocast, as before replicate(). Its residual stream
+    and norms run in fp32, so it does not match the FSDP numerics."""
+    return os.environ.get("NANOPLM_DDP_LEGACY", "0") == "1"
 
 
 def _is_fsdp(distributed_mode: str) -> bool:
-    """True for any FSDP2-backed mode (plain FSDP or HSDP)."""
+    """True for any FSDP2-backed mode (FSDP, HSDP, or DDP via replicate())."""
+    if distributed_mode == "ddp" and _ddp_legacy():
+        return False
     return distributed_mode in _FSDP_MODES
 
 
@@ -2174,7 +2201,8 @@ def _load_checkpoint(
             f"checkpoint={checkpoint_mode}, current={current_mode}. "
             "Model weights were loaded, but optimizer-state resume across FSDP/DDP/single "
             "modes is not supported. Restart with a fresh optimizer state or resume "
-            "with the matching distributed_mode."
+            "with the matching distributed_mode (DDP checkpoints saved before DDP "
+            "moved onto FSDP2 replicate() resume under NANOPLM_DDP_LEGACY=1)."
         )
 
     opt_sd = torch.load(opt_path, map_location=device, weights_only=True)
@@ -2760,6 +2788,15 @@ def run_pure_pretraining(
                 shard_size,
                 effective_world_size,
             )
+        elif distributed_mode == "ddp":
+            # replicate(): whole parameters on every rank, one gradient
+            # all-reduce per unit. The Dion-family optimizer takes the same 1D
+            # mesh and splits its per-matrix work across all ranks.
+            fsdp_mesh = init_device_mesh(
+                "cuda", (effective_world_size,), mesh_dim_names=("replicate",)
+            )
+            optimizer_dist = fsdp_mesh
+            logger.info("DDP (FSDP2 replicate) enabled: world_size=%d", effective_world_size)
         else:
             fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
             optimizer_dist = fsdp_mesh
@@ -2807,8 +2844,8 @@ def run_pure_pretraining(
             fsdp_kwargs=fsdp_kwargs,
             reshard_after_forward=fsdp_reshard_after_forward,
         )
-        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
-        # optimizer_dist was set above (full mesh for fsdp, "shard" sub-mesh for hsdp)
+        _dp_wrap(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
+        # optimizer_dist was set above (full mesh for fsdp and ddp, "shard" sub-mesh for hsdp)
 
     # Keep base_model for checkpointing/eval (eval changes shapes → recompilation).
     orig_model = base_model
@@ -2900,7 +2937,7 @@ def run_pure_pretraining(
         local_rank=local_rank,
         device=device,
     )
-    if distributed and distributed_mode == "ddp":
+    if distributed and distributed_mode == "ddp" and _ddp_legacy():
         optimizer_dist = dist.group.WORLD
 
     # ---- DataLoaders ----
@@ -3248,11 +3285,11 @@ def run_pure_pretraining(
 
     # ---- AMP / TF32 ----
     amp_dtype: Optional[torch.dtype] = None
-    if use_bf16 and (not distributed or distributed_mode == "ddp"):
+    if use_bf16 and (not distributed or (distributed_mode == "ddp" and _ddp_legacy())):
         amp_dtype = torch.bfloat16
         if distributed_mode == "ddp":
             logger.warning(
-                "DDP bf16 uses fp32 params + torch.autocast: the residual "
+                "NANOPLM_DDP_LEGACY=1: DDP bf16 uses fp32 params + torch.autocast: the residual "
                 "stream and norms run in fp32, which differs numerically from "
                 "the FSDP path (bf16 forward params, no autocast) and "
                 "disables bf16-gated kernels such as the CuTeDSL canon "
@@ -3320,7 +3357,8 @@ def run_pure_pretraining(
         "Distributed config: multi_gpu=%s mode=%s%s",
         distributed,
         distributed_mode,
-        f" ddp_bucket_cap_mb={ddp_bucket_cap_mb}" if distributed_mode == "ddp" else "",
+        f" (legacy torch DDP, ddp_bucket_cap_mb={ddp_bucket_cap_mb})"
+        if distributed_mode == "ddp" and _ddp_legacy() else "",
     )
     max_grad_norm = float(pretrain_config.max_grad_norm)
     logger.info(
