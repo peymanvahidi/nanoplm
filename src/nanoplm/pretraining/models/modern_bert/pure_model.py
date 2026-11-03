@@ -101,6 +101,7 @@ class PureProtModernBertMLM(ModernBertForMaskedLM):
             moe_n_group=config.moe_n_group,
             moe_topk_group=config.moe_topk_group,
             moe_bias_update_rate=config.moe_bias_update_rate,
+            moe_bias_update_mode=config.moe_bias_update_mode,
             moe_leading_dense_layers=config.moe_leading_dense_layers,
             moe_kernel_backend=config.moe_kernel_backend,
             moe_nan_guard=config.moe_nan_guard,

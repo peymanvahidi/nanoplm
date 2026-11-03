@@ -930,6 +930,24 @@ def _nonfinite_check_tensor(tensors: list[torch.Tensor]) -> torch.Tensor | None:
         return ~torch.stack([torch.isfinite(t).all() for t in local_tensors]).all()
 
 
+def _moe_bias_delta(counts: torch.Tensor, rate: float, mode: str) -> torch.Tensor:
+    """Zero-mean expert-bias step from one layer's global assignment counts.
+
+    Positive for underused experts, negative for overused ones.
+    ``proportional`` scales each step by the expert's relative load error;
+    ``sign`` takes a fixed +-rate step (DeepSeek-V3 / Ling-V2). Branchless, so
+    no CUDA scalar reaches the host; all-zero counts give an all-zero step.
+    """
+    total = counts.sum().clamp_min(1.0)
+    target = total / counts.numel()
+    if mode == "sign":
+        delta = rate * torch.sign(target - counts)
+    else:
+        delta = rate * (target - counts) / target
+    # Zero-mean: keep the bias vector centered (Ling-V2 --bias-zero-mean-update).
+    return delta - delta.mean()
+
+
 def _moe_nan_guard_active(model) -> bool:
     """True when any MoE router clamps NaN rows (moe_nan_guard). Scans every
     Router, not just the bias-correction layer list, which is empty when
@@ -3389,6 +3407,7 @@ def run_pure_pretraining(
     # MoE routing bias update state.
     _moe_layers: list = []
     _moe_bias_lr = float(getattr(_cfg, "moe_bias_update_rate", 1e-3))
+    _moe_bias_mode = str(getattr(_cfg, "moe_bias_update_mode", "proportional"))
     if getattr(orig_model.config, "use_moe", False) and getattr(orig_model.config, "moe_use_bias_correction", False):
         from nanoplm.pretraining.models.modern_bert.moe import MoELayer as _MoELayer
         _moe_layers = [
@@ -3988,18 +4007,11 @@ def run_pure_pretraining(
                                 if distributed and dist.is_initialized():
                                     dist.all_reduce(_moe_count_accum, op=dist.ReduceOp.SUM)
                                 for j, moe_layer in enumerate(_moe_layers):
-                                    counts_j = _moe_count_accum[j]
-                                    # Keep the update branchless so we never materialize
-                                    # a CUDA scalar on CPU via `if total > 0`.
-                                    total = counts_j.sum().clamp_min(1.0)
-                                    target = total / _moe_num_experts
-                                    # Nudge bias: positive for underused, negative for overused.
                                     # correction_bias is a registered buffer (not a
                                     # parameter), so FSDP won't shard it.
-                                    delta = _moe_bias_lr * (target - counts_j) / target
-                                    # Zero-mean: keep bias vector centered (Ling-V2 style).
-                                    # When counts are all zero, this naturally becomes all-zero.
-                                    delta = delta - delta.mean()
+                                    delta = _moe_bias_delta(
+                                        _moe_count_accum[j], _moe_bias_lr, _moe_bias_mode,
+                                    )
                                     moe_layer.router.correction_bias.add_(
                                         delta.to(moe_layer.router.correction_bias.device)
                                     )
