@@ -223,14 +223,14 @@ pretraining:
   muon_learning_rate: 1e-3
   muon_weight_decay: 0.01
   muon_cautious_weight_decay: true      # Muon/NorMuon only (NorDion2 ignores)
-  muon_use_polar_express: true
+  muon_use_polar_express: true          # used only with muon_use_gram_newton_schulz: false
   muon_momentum: 0.95
   muon_nesterov: true                   # Muon/NorMuon only (NorDion2 ignores)
   muon_eps: 1e-7
   # Shared matrix-optimizer knobs (applied per-optimizer where supported):
   muon_adjust_lr: "rms_norm"            # rms_norm | spectral_norm | none
   muon_beta2: 0.95                      # NorMuon/NorDion2 second-moment beta
-  muon_use_gram_newton_schulz: false
+  muon_use_gram_newton_schulz: true     # default orthogonalizer; overrides muon_use_polar_express
   muon_triton_post_ortho: false         # NorDion2 only in the current dion build
   muon_flatten: false
   # NorDion2-specific (used only when optimizer: nordion2):
