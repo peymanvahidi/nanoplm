@@ -6,13 +6,21 @@ on GPU and expert GEMMs run as a single grouped kernel instead of a host loop.
 Only supports the packed flat-token static-shape forward path
 (``use_packing=True``, ``use_static_inp_size=True``).
 
-Routed-expert ``Wi`` gate/up layout
------------------------------------
-For SwiGLU, ``Wi (E, H, 2I)``'s output columns are stored **interleaved, gate
-first**: column ``2j`` is gate unit ``j``, column ``2j+1`` is up unit ``j``.
-This is QuACK/SonicMoE's native gated-GEMM split, so the ``sonicmoe`` backend
-consumes ``Wi`` with no reordering; the ``cutlass``/eager branch reads the two
-strided slices. ``Wo`` is indexed by unit ``j`` under both conventions and is
+Routed-expert weight layout
+---------------------------
+Expert weights are stacked ``nn.Linear`` weights, ``(E, out_features,
+in_features)``: ``Wi (E, 2I, H)`` (``(E, I, H)`` for sReLU) and ``Wo (E, H, I)``.
+Matrix optimizers (Muon/NorMuon/Dion) read the last two dims as
+``(fan_out, fan_in)``: the spectral-norm LR scale and NorMuon's per-neuron
+normalization both depend on it, so storing ``(E, in, out)`` silently gives
+expert matrices a different update than a dense layer of the same shape. It is
+also SonicMoE's native layout. See ``EXPERT_LAYOUT_VERSION``.
+
+For SwiGLU, ``Wi``'s output rows are stored **interleaved, gate first**: row
+``2j`` is gate unit ``j``, row ``2j+1`` is up unit ``j``. This is
+QuACK/SonicMoE's native gated-GEMM split, so the ``sonicmoe`` backend consumes
+``Wi`` with no reordering; the ``cutlass``/eager branch reads the two strided
+slices. ``Wo`` is indexed by unit ``j`` under both conventions and is
 unaffected. See ``WI_GATED_LAYOUT_VERSION``.
 """
 
@@ -72,7 +80,9 @@ def convert_wi_state_dict_v1_to_v2(
         Wi_v2[..., 1::2] = Wi_v1[..., :I]    # up
 
     ``Wo`` is indexed by intermediate unit under both conventions and is left
-    alone.  A ``Wi`` is treated as gated iff its sibling ``Wo`` says so
+    alone. Gate/up version 1 predates ``EXPERT_LAYOUT_VERSION`` 2, so this works
+    on the ``(E, H, 2I)`` expert layout; follow it with
+    ``convert_expert_layout_v1_to_v2``.  A ``Wi`` is treated as gated iff its sibling ``Wo`` says so
     (``Wi.shape[-1] == 2 * Wo.shape[-2]``), so an sReLU checkpoint is a no-op
     and this is safe to run over anything.
 
@@ -131,6 +141,102 @@ def convert_wi_state_dict_v1_to_v2(
                 if torch.is_tensor(val) and val.shape == shapes[key]:
                     entry[name] = _interleave_gate_first(val)
     return converted
+
+# Storage convention for the routed-expert weights ``Wi`` / ``Wo``.
+#
+#   1  ``(E, in_features, out_features)``, transposed vs nn.Linear  (nanoPLM <= 2026-10-29)
+#   2  ``(E, out_features, in_features)``, stacked nn.Linear weights  (current)
+#
+# Same function either way; what changes is how a matrix optimizer reads the
+# tensor. Dion's Muon/NorMuon take ``(fan_out, fan_in) = shape[-2:]``, so under
+# version 1 the spectral-norm LR scale was inverted for every expert matrix
+# (``Wo`` at g7 shapes got 0.375x the update a dense layer of its shape gets,
+# ``Wi`` 1.33x) and NorMuon normalized per *input* unit instead of per output
+# neuron. Input units of ``Wo`` (intermediate units) go dormant in sparse
+# experts; output neurons do not. Every ``MoELayer`` carries the version as a
+# persistent buffer and refuses a mismatched state_dict; migrate with
+# ``convert_expert_layout_v1_to_v2``.
+EXPERT_LAYOUT_VERSION = 2
+_EXPERT_LAYOUT_BUFFER = "_expert_layout_version"
+
+
+def _is_routed_expert_pair(state_dict: dict, wi_key: str) -> bool:
+    wi = state_dict.get(wi_key)
+    wo = state_dict.get(wi_key[: -len("Wi")] + "Wo")
+    return (
+        torch.is_tensor(wi) and torch.is_tensor(wo)
+        and wi.ndim == 3 and wo.ndim == 3 and wi.shape[0] == wo.shape[0]
+    )
+
+
+def convert_expert_layout_v1_to_v2(
+    state_dict: dict,
+    optimizer_state_dict: Optional[dict] = None,
+) -> list[str]:
+    """Migrate a version-1 ``(E, in, out)`` checkpoint to ``(E, out, in)`` in place.
+
+    Transposes the last two dims of every routed-expert ``Wi`` and ``Wo`` and
+    writes the version marker. Run ``convert_wi_state_dict_v1_to_v2`` *first*
+    on checkpoints older than 2026-08-06 (it works on the version-1 expert
+    layout).
+
+    **Optimizer state** (pass ``optimizer_state_dict`` when resuming): every
+    per-element state tensor shaped like the old weight (Muon/NorMuon
+    ``momentum``, AdamW ``exp_avg``/``exp_avg_sq``) is transposed too. NorMuon's
+    ``variance_neuron`` is a per-row statistic of the *old* rows (input units),
+    which has no counterpart on the new rows, so it is reset to zeros of the new
+    shape; NorMuon then rebuilds it from the next updates (its EMA makes the
+    first update per row at most ``1/sqrt(1 - muon_beta2)`` larger than steady
+    state, and the Frobenius rescale bounds the whole update). Omitting the
+    optimizer state is only correct if it is being discarded.
+
+    Returns the list of converted parameter keys.
+    """
+    converted: list[str] = []
+    old_shapes: dict[str, torch.Size] = {}
+    for wi_key in [k for k in state_dict if k.endswith("Wi")]:
+        if not _is_routed_expert_pair(state_dict, wi_key):
+            continue  # dense nn.Linear Wi (2-D) or not a routed-expert pair
+        prefix = wi_key[: -len("Wi")]
+        for key in (wi_key, prefix + "Wo"):
+            old_shapes[key] = state_dict[key].shape
+            state_dict[key] = state_dict[key].transpose(-1, -2).contiguous()
+            converted.append(key)
+        state_dict[prefix + _EXPERT_LAYOUT_BUFFER] = torch.tensor(
+            [EXPERT_LAYOUT_VERSION], dtype=torch.int64
+        )
+
+    if not converted:
+        raise ValueError(
+            "convert_expert_layout_v1_to_v2 found no MoE routed-expert Wi/Wo pair "
+            "in this state_dict; it is not a MoE checkpoint."
+        )
+
+    if optimizer_state_dict is not None:
+        # nanoplm's MuonAdamWGroup saves {"muon": {...}, "adamw": {...}}; a plain
+        # optimizer saves {"state": ..., "param_groups": ...}.
+        subs = (
+            [optimizer_state_dict[k] for k in ("muon", "adamw") if k in optimizer_state_dict]
+            or [optimizer_state_dict]
+        )
+        for sub in subs:
+            opt_state = sub.get("state", sub)
+            for key in converted:
+                entry = opt_state.get(key)
+                if not isinstance(entry, dict):
+                    continue
+                old = old_shapes[key]
+                for name, val in list(entry.items()):
+                    if not torch.is_tensor(val):
+                        continue
+                    if val.shape == old:
+                        entry[name] = val.transpose(-1, -2).contiguous()
+                    elif name == "variance_neuron":
+                        entry[name] = torch.zeros(
+                            *old[:-2], old[-1], 1, dtype=val.dtype, device=val.device
+                        )
+    return converted
+
 
 # ── Fused router top-k + expert histogram ────────────────────────────────────
 #
@@ -452,12 +558,13 @@ class MoELayer(nn.Module):
         )
 
         # Routed expert weights — stacked for grouped_gemm.
-        # Layout: (num_experts, in_features, out_features).
-        # This is transposed relative to nn.Linear's (out, in).
+        # Layout: (num_experts, out_features, in_features), i.e. stacked
+        # nn.Linear weights (``EXPERT_LAYOUT_VERSION``). Matrix optimizers read
+        # the last two dims as (fan_out, fan_in), so this must match nn.Linear.
         #
         # SwiGLU's Wi emits gate+up (2*inter); sReLU is non-gated (just inter).
-        # ``Wi``'s output columns are stored **interleaved, gate first**:
-        # column ``2j`` is gate unit ``j``, column ``2j+1`` is up unit ``j``
+        # ``Wi``'s output rows are stored **interleaved, gate first**:
+        # row ``2j`` is gate unit ``j``, row ``2j+1`` is up unit ``j``
         # (``WI_GATED_LAYOUT``).  That is exactly the split QuACK/SonicMoE's
         # gated GEMM applies (``gate = preact[..., ::2]; up = preact[..., 1::2]``),
         # so the ``sonicmoe`` backend can consume ``Wi`` with no reordering at
@@ -470,10 +577,10 @@ class MoELayer(nn.Module):
         # permuting — see ``convert_wi_concat_to_interleaved``.
         inter_out = config.intermediate_size if self.srelu else 2 * config.intermediate_size
         self.Wi = nn.Parameter(
-            torch.empty(self.num_experts, config.hidden_size, inter_out),
+            torch.empty(self.num_experts, inter_out, config.hidden_size),
         )
         self.Wo = nn.Parameter(
-            torch.empty(self.num_experts, config.intermediate_size, config.hidden_size),
+            torch.empty(self.num_experts, config.hidden_size, config.intermediate_size),
         )
         self.drop = nn.Dropout(config.mlp_dropout)
 
@@ -570,6 +677,13 @@ class MoELayer(nn.Module):
         # sReLU's Wi is ungated, so it stays byte-compatible with every older
         # checkpoint and gets no buffer at all. 1-D on purpose: DCP's
         # `_distribute_state_dict` special-cases 0-dim tensors onto the CPU.
+        # Expert storage convention marker, for every activation (the
+        # transpose matters for sReLU too).
+        self.register_buffer(
+            _EXPERT_LAYOUT_BUFFER,
+            torch.tensor([EXPERT_LAYOUT_VERSION], dtype=torch.int64),
+            persistent=True,
+        )
         if not self.srelu:
             self.register_buffer(
                 _WI_LAYOUT_BUFFER,
@@ -598,7 +712,33 @@ class MoELayer(nn.Module):
         The message goes into ``error_msgs``, which ``nn.Module.load_state_dict``
         raises regardless of ``strict`` — this is a correctness mismatch, not a
         tolerable partial load. ``srelu`` is ungated and never checked.
+
+        The expert *storage* convention (``EXPERT_LAYOUT_VERSION``) is checked
+        the same way for every activation; a missing marker means version 1,
+        ``(E, in, out)``.
         """
+        key = prefix + _EXPERT_LAYOUT_BUFFER
+        found = state_dict.get(key)
+        if found is None:
+            version = 1          # version 1 never wrote a marker
+        else:
+            try:
+                version = int(found.reshape(-1)[0])
+            except Exception:
+                version = EXPERT_LAYOUT_VERSION
+        if version != EXPERT_LAYOUT_VERSION:
+            error_msgs.append(
+                f"MoE routed-expert layout mismatch at {prefix}Wi/Wo: the checkpoint "
+                f"was written with expert layout version {version}, this build expects "
+                f"{EXPERT_LAYOUT_VERSION}. Version 1 stored experts as (E, in, out), "
+                f"transposed against nn.Linear, which made Muon/NorMuon treat input "
+                f"units as output neurons; version 2 stores (E, out, in). Migrate "
+                f"the checkpoint (and its optimizer state when resuming) with "
+                f"nanoplm.pretraining.models.modern_bert.moe."
+                f"convert_expert_layout_v1_to_v2(state_dict, optimizer_state_dict)."
+            )
+        if found is None:
+            state_dict[key] = getattr(self, _EXPERT_LAYOUT_BUFFER).clone()
         if not self.srelu:
             key = prefix + _WI_LAYOUT_BUFFER
             found = state_dict.get(key)
@@ -776,7 +916,8 @@ class MoELayer(nn.Module):
             token_idx = (sorted_idx // self.top_k).to(torch.int32)
             slot_idx = (sorted_idx % self.top_k).to(torch.int32)
             x_sorted = moe_scatter_dispatch(x, token_idx)  # (T*top_k, H)
-            wi = moe_grouped_gemm(x_sorted, self.Wi, counts)  # (T*top_k, inter or 2*inter)
+            # Wi is (E, out, in): trans_b computes x @ Wi[e].T per expert.
+            wi = moe_grouped_gemm(x_sorted, self.Wi, counts, trans_b=True)  # (T*top_k, inter or 2*inter)
             if self.srelu:
                 h = F.relu(wi)
                 activated = h * h  # (T*top_k, inter)
@@ -790,6 +931,7 @@ class MoELayer(nn.Module):
                 self.drop(activated),
                 self.Wo,
                 counts,
+                trans_b=True,
             )  # (T*top_k, H)
 
             # --- combine: fused unsort + weighted sum ---

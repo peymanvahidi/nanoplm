@@ -58,10 +58,11 @@ def _problem(srelu: bool, seed: int = 0, device: str = "cuda"):
     x = x.to(torch.bfloat16).requires_grad_(True)
 
     bi, bo = (1.0 / H) ** 0.5, (1.0 / I) ** 0.5
-    Wi = torch.empty(E, H, i_out, device=device, dtype=torch.float32)
+    # Expert layout version 2: stacked nn.Linear weights (E, out, in).
+    Wi = torch.empty(E, i_out, H, device=device, dtype=torch.float32)
     Wi.uniform_(-bi, bi, generator=g)
     Wi = Wi.to(torch.bfloat16).requires_grad_(True)
-    Wo = torch.empty(E, I, H, device=device, dtype=torch.float32)
+    Wo = torch.empty(E, H, I, device=device, dtype=torch.float32)
     Wo.uniform_(-bo, bo, generator=g)
     Wo = Wo.to(torch.bfloat16).requires_grad_(True)
 
@@ -98,7 +99,7 @@ def _reference(x, Wi, Wo, weights, indices, srelu, pairing="nanoplm"):
         if sel.numel() == 0:
             continue
         rows = tok.index_select(0, sel)
-        y = _activate(x.index_select(0, rows) @ Wi[e], srelu, pairing) @ Wo[e]
+        y = _activate(x.index_select(0, rows) @ Wi[e].T, srelu, pairing) @ Wo[e].T
         y = y * weights.reshape(-1).index_select(0, sel).unsqueeze(-1).to(y.dtype)
         out = out.index_add(0, rows, y)
     return out
@@ -177,11 +178,15 @@ def test_glue_never_copies_wi(srelu):
     """
     mod = _sonicmoe()
     i_out = I if srelu else 2 * I
-    Wi = torch.randn(E, H, i_out, device="cuda", dtype=torch.bfloat16)
+    Wi = torch.randn(E, i_out, H, device="cuda", dtype=torch.bfloat16)
     w1 = mod._sonicmoe_w1(Wi)
     assert w1.data_ptr() == Wi.data_ptr(), "w1 is not a view of Wi"
     assert w1.shape == (i_out, H, E)
     assert w1._base is Wi or w1._base is None
+    # SonicMoE's documented native format: stride order (2, 0, 1), i.e. E
+    # outermost, H innermost. Expert layout version 2 gives exactly that.
+    order = sorted(range(3), key=lambda d: -w1.stride(d))
+    assert order == [2, 0, 1], (w1.stride(), order)
     # And no permutation machinery is left behind.
     assert not hasattr(mod, "_GatedWeightInterleave")
     assert not hasattr(mod, "_interleave_perm")
@@ -282,9 +287,9 @@ def test_sonicmoe_agrees_with_cutlass_backend():
         token_idx = (sorted_idx // TOP_K).to(torch.int32)
         slot_idx = (sorted_idx % TOP_K).to(torch.int32)
         x_sorted = moe_scatter_dispatch(x, token_idx)
-        wi = moe_grouped_gemm(x_sorted, Wi, counts)
+        wi = moe_grouped_gemm(x_sorted, Wi, counts, trans_b=True)
         gate, up = wi[..., 0::2], wi[..., 1::2]   # layout v2, gate-first
-        eo = moe_grouped_gemm(F.silu(gate) * up, Wo, counts)
+        eo = moe_grouped_gemm(F.silu(gate) * up, Wo, counts, trans_b=True)
         inv_map = build_inverse_map(token_idx, slot_idx, T, TOP_K)
         out_c = moe_gather_combine(eo, inv_map, weights, 1.0)
         g_c = torch.autograd.grad(out_c, [x, Wi, Wo], grad_out.to(out_c.dtype))
