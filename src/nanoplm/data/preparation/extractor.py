@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -43,6 +44,26 @@ class _CountingReader:
         return n
 
 
+def merge_fasta(inputs: list, output_path: Path) -> None:
+    """Write ``inputs`` one after the other into ``output_path``: a .gz / .zst is
+    decompressed, any other file copied as is. A newline goes between two files when the
+    first does not end with one, so its last sequence does not run into the next header.
+    Nothing is left at ``output_path`` when an input is cut off or damaged."""
+    with atomic_write_path(Path(output_path)) as tmp:
+        with open(tmp, "w+b") as out:
+            for path in map(Path, inputs):
+                end = out.seek(0, 2)
+                if end and os.pread(out.fileno(), 1, end - 1) != b"\n":
+                    out.write(b"\n")
+                if path.name.endswith((".gz", ".zst")):
+                    Extractor(path, Path(output_path)).write_to(out)
+                else:
+                    with open(path, "rb") as f:
+                        run_with_heartbeat(f"Copying {path.name}",
+                                           lambda: shutil.copyfileobj(f, out, _CHUNK_BYTES))
+                out.flush()
+
+
 class Extractor:
     """Decompress a .gz (pigz, else isal) or a .zst (zstd, else the zstandard package)."""
 
@@ -51,37 +72,45 @@ class Extractor:
         self.output_path = Path(output_path)
 
     def extract(self) -> None:
-        name = self.input_path.name
-        if name.endswith(".gz"):
-            if shutil.which("pigz"):
-                self._extract_cli("pigz", ["pigz", "-dc"])
-            else:
-                self._extract_isal()
-        elif name.endswith(".zst"):
-            if shutil.which("zstd"):
-                self._extract_cli("zstd", ["zstd", "-dc", "-q", "--memory=2048MB"])
-            else:
-                self._extract_zstandard()
-        else:
+        self._check_suffix()
+        with atomic_write_path(self.output_path) as tmp:
+            with open(tmp, "wb") as out:
+                self.write_to(out)
+
+    def _check_suffix(self) -> None:
+        if not self.input_path.name.endswith((".gz", ".zst")):
             raise ExtractionError(
                 f"Input must be .gz or .zst; got {self.input_path}"
             )
 
-    def _extract_cli(self, tool: str, cmd: list) -> None:
+    def write_to(self, out) -> None:
+        """Append the decompressed input to the open binary file ``out``."""
+        self._check_suffix()
+        if self.input_path.name.endswith(".gz"):
+            if shutil.which("pigz"):
+                self._extract_cli(out, "pigz", ["pigz", "-dc"])
+            else:
+                self._extract_isal(out)
+        elif shutil.which("zstd"):
+            self._extract_cli(out, "zstd", ["zstd", "-dc", "-q", "--memory=2048MB"])
+        else:
+            self._extract_zstandard(out)
+
+    def _extract_cli(self, out, tool: str, cmd: list) -> None:
+        out.flush()
         try:
-            with atomic_write_path(self.output_path) as tmp:
-                with open(tmp, "wb") as out:
-                    run_with_heartbeat(
-                        f"Extracting FASTA ({tool})",
-                        lambda: subprocess.check_call(
-                            [*cmd, str(self.input_path)],
-                            stdout=out,
-                        ),
-                    )
+            run_with_heartbeat(
+                f"Extracting FASTA ({tool})",
+                lambda: subprocess.check_call(
+                    [*cmd, str(self.input_path)],
+                    stdout=out,
+                ),
+            )
         except subprocess.CalledProcessError as e:
             raise ExtractionError(f"{tool} extraction failed: {e}") from e
+        out.seek(0, 2)                  # the tool wrote past this handle's position
 
-    def _extract_isal(self) -> None:
+    def _extract_isal(self, out) -> None:
         import isal.igzip as igzip
         from isal.isal_zlib import IsalError
 
@@ -90,9 +119,9 @@ class Extractor:
                 while chunk := f_in.read(_CHUNK_BYTES):
                     yield chunk
 
-        self._copy("isal", chunks, (IsalError, EOFError, OSError))
+        self._copy(out, "isal", chunks, (IsalError, EOFError, OSError))
 
-    def _extract_zstandard(self) -> None:
+    def _extract_zstandard(self, out) -> None:
         try:
             import zstandard
         except ImportError:
@@ -114,9 +143,9 @@ class Extractor:
             if in_frame:
                 raise EOFError("the file ends in the middle of a zstd frame (truncated?)")
 
-        self._copy("zstandard", chunks, (zstandard.ZstdError, EOFError, OSError))
+        self._copy(out, "zstandard", chunks, (zstandard.ZstdError, EOFError, OSError))
 
-    def _copy(self, tool: str, chunks, errors: tuple) -> None:
+    def _copy(self, f_out, tool: str, chunks, errors: tuple) -> None:
         """Write what ``chunks(reader)`` decompresses, logging progress against the
         compressed bytes read."""
         compressed_size = self.input_path.stat().st_size
@@ -128,25 +157,24 @@ class Extractor:
 
         def _copy() -> None:
             nonlocal last_percent
-            with atomic_write_path(self.output_path) as tmp:
-                with open(self.input_path, "rb") as raw_in, open(tmp, "wb") as f_out:
-                    counting_in = _CountingReader(raw_in)
-                    for chunk in chunks(counting_in):
-                        f_out.write(chunk)
-                        if compressed_size <= 0:
-                            continue
-                        percent = min(int(counting_in.bytes_read * 100 / compressed_size), 100)
-                        if percent < 100 and percent % 5 != 0:
-                            continue
-                        if percent == last_percent:
-                            continue
-                        last_percent = percent
-                        logger.info(
-                            "Extract progress: %d%% of compressed input read (%d/%d bytes)",
-                            percent,
-                            counting_in.bytes_read,
-                            compressed_size,
-                        )
+            with open(self.input_path, "rb") as raw_in:
+                counting_in = _CountingReader(raw_in)
+                for chunk in chunks(counting_in):
+                    f_out.write(chunk)
+                    if compressed_size <= 0:
+                        continue
+                    percent = min(int(counting_in.bytes_read * 100 / compressed_size), 100)
+                    if percent < 100 and percent % 5 != 0:
+                        continue
+                    if percent == last_percent:
+                        continue
+                    last_percent = percent
+                    logger.info(
+                        "Extract progress: %d%% of compressed input read (%d/%d bytes)",
+                        percent,
+                        counting_in.bytes_read,
+                        compressed_size,
+                    )
 
         try:
             run_with_heartbeat(f"Extracting FASTA ({tool})", _copy)

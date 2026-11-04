@@ -14,8 +14,14 @@
         "type": "object",
         "properties": {
           "fasta": {
-            "type": "string",
-            "description": "swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa (.gz/.zst)",
+            "type": [
+              "string",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa (.gz/.zst); or a list of URLs and local files, merged in list order",
             "examples": [
               "swissprot"
             ]

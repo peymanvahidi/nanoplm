@@ -14,6 +14,10 @@ Several sources (a mix) give one dvc.yaml: each source's stages named
 stage per file in downloads/ however many sources read it; and a last ``mixture`` stage that writes output_dir/.data_manifest from the source
 manifests.
 
+A source whose fasta is a list has one ``download-<file>`` stage per URL in it and a
+``merge`` stage that writes the items, in list order, into ``<source>/merged.fasta``;
+the stages after it read that file as they would one fasta.
+
 A mix, or one source with data_params.val_size, draws one val split for all of its
 sources (data.preparation.val_split): a ``count`` stage per source, one ``val_split``
 stage that reads the counts and the weights, and each source's split reads its own
@@ -103,6 +107,8 @@ def _get_stages(src: Source, params_filename: str) -> dict:
     """get_file (+ extract) for the source fasta. A local file in the sources layout is
     read in place, so it has no get_file stage."""
     stages: dict[str, Any] = {}
+    if src.is_list:
+        return _merge_stages(src)
     out_field = "compressed_fasta" if src.is_compressed else "extracted_fasta"
     if src.legacy:
         local = bool(src.paths.get("local_fasta"))
@@ -128,6 +134,24 @@ def _get_stages(src: Source, params_filename: str) -> dict:
             **_params(params_filename, src.path_params("extracted_fasta")),
             "outs": [src.path("extracted_fasta")],
         }
+    return stages
+
+
+def _merge_stages(src: Source) -> dict:
+    """A download stage per URL of a fasta list, then one merge stage: `nanoplm data
+    extract` with an -i per item, in list order (a .gz / .zst is decompressed on the way)."""
+    stages: dict[str, Any] = {}
+    reads = []
+    for item, path in src.list_items():
+        if is_url(item):
+            stages["download-" + _safe(file_name(path))] = _download_stage(item, path)
+        reads.append(path)
+    merged = src.paths["extracted_fasta"]
+    stages["merge"] = {
+        "cmd": "nanoplm data extract " + " ".join(f"-i {r}" for r in reads) + f" -o {merged}",
+        "deps": reads + [_resolve_pkg_dep("src/nanoplm/data/preparation/extractor.py")],
+        "outs": [merged],
+    }
     return stages
 
 
@@ -556,6 +580,12 @@ _SHARED_STAGES = {"get_file": "download", "get_members_fasta": "download",
                   "extract_members": "extract", "check": "check"}
 
 
+def _shared_kind(name: str):
+    """download / extract / check for a stage a mix runs once per output path, else None.
+    A fasta list's downloads are named download-<file>."""
+    return _SHARED_STAGES.get(name) or ("download" if name.startswith("download-") else None)
+
+
 def _out_path(stage: dict) -> str:
     out = stage["outs"][0]
     return next(iter(out)) if isinstance(out, dict) else out
@@ -590,7 +620,8 @@ def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
         stages = (_cluster_stages(src, plan, params_filename) if plan is not None
                   else _plain_stages(src, "pretrain", params_filename))
         for name, stage in stages.items():
-            if name not in _SHARED_STAGES:
+            kind = _shared_kind(name)
+            if kind is None:
                 per_source[f"{src.name}-{name}"] = stage
                 continue
             out = _out_path(stage)
@@ -600,7 +631,7 @@ def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
             out = os.path.normpath(out)      # ./out/x and out/x are one file
             if out in shared:
                 if shared[out][1]["cmd"] != stage["cmd"]:
-                    what = "download different URLs" if _SHARED_STAGES[name] == "download" \
+                    what = "download different URLs" if kind == "download" \
                         else "extract different files"
                     raise DataConfigError(
                         f"sources.{shared[out][2]} and sources.{src.name} {what} to the same "
@@ -608,7 +639,7 @@ def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
                         "give its path")
                 continue
             # a check is named after the FASTA it reads
-            step = _SHARED_STAGES[name] + "-" + _safe(file_name(
+            step = kind + "-" + _safe(file_name(
                 stage["deps"][0] if name == "check" else out))
             shared[out] = (step, stage, src.name)
     stages = {step: stage for step, stage, _ in shared.values()}
@@ -619,7 +650,8 @@ def _mixture_stages(cfg, params_filename: str, base_dir) -> dict:
     deps, params = [], []
     for src in cfg.sources.values():
         folder = src.data_dir
-        cmd.append(f'--source {src.name} {folder} ${{sources.{src.name}.weight}} "{src.fasta}"')
+        fasta = ", ".join(src.fasta) if src.is_list else src.fasta
+        cmd.append(f'--source {src.name} {folder} ${{sources.{src.name}.weight}} "{fasta}"')
         deps.append(f"{folder}/.data_manifest")
         params.append(f"sources.{src.name}.weight")
     stages["mixture"] = {

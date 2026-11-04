@@ -13,7 +13,7 @@ import time
 from nanoplm.config.datasets import DATASET_URLS
 
 from nanoplm.data.preparation.downloader import Downloader, DownloadError
-from nanoplm.data.preparation.extractor import Extractor, ExtractionError
+from nanoplm.data.preparation.extractor import Extractor, ExtractionError, merge_fasta
 from nanoplm.data.preparation.shuffler import FastaShuffler, ShufflingError
 from nanoplm.data.preparation.filterer import Filterer, FilterError
 from nanoplm.data.preparation.splitor import Splitor, SplitError
@@ -226,9 +226,11 @@ def get_file(dataset, url, local_fasta, output, force):
 @click.option(
     "--input",
     "-i",
+    "inputs",
     required=True,
+    multiple=True,
     type=click.Path(exists=True),
-    help="Input file path where the dataset is saved.",
+    help="Input .gz or .zst file; give -i several times to merge files in that order.",
 )
 @click.option(
     "--output",
@@ -245,21 +247,23 @@ def get_file(dataset, url, local_fasta, output, force):
     default=False,
 )
 @click.help_option("--help", "-h")
-def extract(input: str, output: str, force: bool):
-    """Extract a .gz or .zst file"""
+def extract(inputs: tuple, output: str, force: bool):
+    """Extract a .gz or .zst file, or merge several FASTA files into one"""
     from nanoplm.data.preparation.data_config import is_compressed, strip_compressed
 
-    input_path = Path(input)
     output_path = Path(output)
-    if not is_compressed(input):
-        raise click.ClickException(f"Input must be a .gz or .zst file, got: {input}")
+    if len(inputs) == 1 and not is_compressed(inputs[0]):
+        raise click.ClickException(f"Input must be a .gz or .zst file, got: {inputs[0]}")
+    if len(inputs) > 1 and output_path.is_dir():
+        raise click.ClickException("-o must be a file when -i is given several times")
 
     create_dirs(output_path)
 
     # Resolve output file path
     if output_path.is_dir():
-        output_path = output_path / strip_compressed(input_path.name)
-    _refuse_overwriting(input_path, output_path)
+        output_path = output_path / strip_compressed(Path(inputs[0]).name)
+    for input in inputs:
+        _refuse_overwriting(Path(input), output_path)
 
     # Check if output file already exists
     if output_path.exists():
@@ -271,9 +275,12 @@ def extract(input: str, output: str, force: bool):
             return
 
     # Extract dataset
-    extractor = Extractor(input_path=input_path, output_path=output_path)
-    extractor.extract()
-    click.echo(f"Extraction completed successfully. Output: {output_path}")
+    if len(inputs) == 1:
+        Extractor(input_path=Path(inputs[0]), output_path=output_path).extract()
+        click.echo(f"Extraction completed successfully. Output: {output_path}")
+    else:
+        merge_fasta(list(inputs), output_path)
+        click.echo(f"Merged {len(inputs)} files into {output_path}")
 
 
 @data.command("shuffle")
@@ -1424,7 +1431,7 @@ def _validate_source_params(src, config_path: Path) -> None:
 def _read_pretrain_config(config_path: Path, quiet: bool = False):
     """data.yaml read strictly (duplicate and unknown keys are errors) into one source."""
     from nanoplm.data.preparation.data_config import (
-        DataConfigError, load_strict, parse_data_config,
+        DataConfigError, is_url, load_strict, parse_data_config,
     )
     try:
         raw = load_strict(config_path)
@@ -1443,11 +1450,14 @@ def _read_pretrain_config(config_path: Path, quiet: bool = False):
         _validate_pipeline_fields(raw.get("data_dirs", {}), {}, "none", config_path)
     for src in cfg.sources.values():
         _validate_source_params(src, config_path)
-        if not cfg.legacy and not src.is_url:
-            local = _resolve_path(src.fasta, config_path.parent)
-            if not local.is_file():
+        if cfg.legacy:
+            continue
+        items = enumerate(src.fasta) if src.is_list else [(None, src.fasta)]
+        for i, item in items:
+            if not is_url(item) and not _resolve_path(item, config_path.parent).is_file():
+                at = "" if i is None else f"[{i}]"
                 raise click.ClickException(
-                    f"{config_path.name}: sources.{src.name}.fasta: {src.fasta} not found (a "
+                    f"{config_path.name}: sources.{src.name}.fasta{at}: {item} not found (a "
                     "relative path is relative to data.yaml's directory)")
     return cfg
 
@@ -1614,7 +1624,12 @@ def _file_cell(value: str, download, cwd: Path, shared=None, owner: str = "") ->
 def _fasta_cell(src, plan, cwd: Path, shared=None) -> str:
     """The files the stages read: the fasta, or the members FASTA when the members
     differ from it (the fasta is then never fetched), plus the cluster XML."""
-    if plan is None or plan.members_from_source:
+    from nanoplm.data.preparation.data_config import is_url
+    if src.is_list:
+        (first, path), more = src.list_items()[0], len(src.fasta) - 1
+        cell = (_file_cell(first, path if is_url(first) else None, cwd, shared, src.name)
+                + f" and {more} more")
+    elif plan is None or plan.members_from_source:
         cell = _file_cell(src.fasta, src.paths.get(
             "compressed_fasta" if src.is_compressed else "extracted_fasta"), cwd,
             shared, src.name)
@@ -1820,11 +1835,12 @@ def _rebuild_summary(names: list, changed: set, sources) -> str:
 def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=None) -> None:
     """Print a human-readable summary using .data_manifest if present."""
     import yaml as _yaml
+    from nanoplm.data.preparation.data_config import fasta_label
     if cfg is not None and cfg.is_mixture:
         _print_mixture_summary(cwd, cfg)
         return
     if cfg is not None:
-        output_dir_value, src_value = cfg.output_dir, cfg.source.fasta
+        output_dir_value, src_value = cfg.output_dir, fasta_label(cfg.source.fasta)
     else:
         data_dirs = params.get("data_dirs") or {}
         output_dir_value = data_dirs.get("output_dir")
@@ -1850,7 +1866,7 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
         source = f"  Cluster source:  {plan.clusters_text()}\n" if plan else ""
         click.echo(
             f"\n{title} data pipeline complete (cluster subsampling).\n\n"
-            f"  Members:         {plan.members if plan else src_value}\n"
+            f"  Members:         {fasta_label(plan.members) if plan else src_value}\n"
             f"{source}"
             f"  Pool sequences:  {m.get('pool_sequences')}\n"
             f"  {_clusters_line(m)}\n"

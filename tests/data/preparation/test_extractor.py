@@ -128,3 +128,49 @@ def test_a_zst_without_zstd_or_zstandard_says_what_to_install(tmp_path, monkeypa
         Extractor(input_path=src, output_path=dst).extract()
     assert "zstd" in str(e.value) and str(src) in str(e.value)
     assert not dst.exists()
+
+
+# ------------------------------------------------------------------ merge (a fasta list)
+
+
+def test_merge_writes_plain_gz_and_zst_in_list_order(tmp_path):
+    from nanoplm.data.preparation.extractor import merge_fasta
+    plain = tmp_path / "a.fa"
+    plain.write_bytes(b">a1\nMK\n>a2\nMKV")                 # no newline at the end
+    gz, gz_text = _make_gz(tmp_path, b">g1\nAAAA\n")
+    zst, zst_text = _make_zst(tmp_path)
+    dst = tmp_path / "merged.fasta"
+    merge_fasta([zst, plain, gz], dst)
+    assert dst.read_bytes() == zst_text + b">a1\nMK\n>a2\nMKV\n" + gz_text
+
+
+@pytest.mark.parametrize("damage", ["truncated", "empty"])
+def test_merge_with_a_broken_input_leaves_no_output(tmp_path, damage):
+    from nanoplm.data.preparation.extractor import merge_fasta
+    plain = tmp_path / "a.fa"
+    plain.write_bytes(b">a1\nMK\n")
+    whole = zstandard.ZstdCompressor().compress(b">z\nMKV\n" * 1000)
+    bad = tmp_path / "bad.fa.zst"
+    bad.write_bytes(whole[:-3] if damage == "truncated" else b"")
+    dst = tmp_path / "merged.fasta"
+    with pytest.raises(ExtractionError):
+        merge_fasta([plain, bad], dst)
+    assert not dst.exists()
+
+
+def test_extract_cli_takes_several_inputs(tmp_path):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    a, b = tmp_path / "a.fa", tmp_path / "b.fasta"
+    a.write_text(">a\nMK\n")
+    b.write_text(">b\nMV\n")
+    gz, _ = _make_gz(tmp_path, b">g\nAA\n")
+    out = tmp_path / "out" / "merged.fasta"
+    r = CliRunner().invoke(data, ["extract", "-i", str(b), "-i", str(gz), "-i", str(a),
+                                  "-o", str(out)])
+    assert r.exit_code == 0, r.output
+    assert out.read_text() == ">b\nMV\n>g\nAA\n>a\nMK\n"
+    r = CliRunner().invoke(data, ["extract", "-i", str(a), "-i", str(b), "-o", str(a)])
+    assert r.exit_code != 0 and "is the input file" in r.output
+    r = CliRunner().invoke(data, ["extract", "-i", str(a), "-o", str(tmp_path / "x.fa")])
+    assert r.exit_code != 0 and ".gz or .zst" in r.output

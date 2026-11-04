@@ -4,7 +4,8 @@ Two layouts are accepted:
 
   sources layout   ``output_dir`` + ``sources: {name: spec}`` + ``data_params`` defaults.
                    Each source names a ``fasta``: a UniProt shortcut, a URL that is
-                   downloaded, or a local file read in place.
+                   downloaded, or a local file read in place; or a list of URLs and
+                   local files, merged in list order into ``<source>/merged.fasta``.
                    Any data_params field but val_ratio / val_size / shuffle / shuffle_seed
                    may be set on a source to override the default; those four are set
                    once, for all sources.
@@ -18,7 +19,9 @@ directory, where ``nanoplm data from-yaml`` runs DVC.
 The sources layout puts everything under ``output_dir``:
 
   downloads/<file>          one file per URL (the source FASTA, members, uniref50.xml.gz),
-                            shared by every source that names that URL
+                            shared by every source that names that URL; a URL in a
+                            fasta list is downloads/<hash of the URL>-<file>, not shared
+                            with a source that names the same URL as a string
   <source>/                 that source's intermediate FASTAs, validation/ and split/
   train/ val/ .data_manifest   the dataset pretrain.yaml's dataset_dir points at
   cluster_index/            members.tsv and the index (cluster subsampling only)
@@ -30,11 +33,13 @@ checked there (``<file>_validation/``), once for all the sources that read it.
 """
 from __future__ import annotations
 
+import hashlib
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -46,6 +51,7 @@ FASTA_SHORTCUTS = {k: DATASET_URLS[k]
                    for k in ("swissprot", "trembl", "uniref50", "uniref90", "uniref100")}
 URL_SCHEMES = ("http://", "https://", "ftp://")
 FASTA_SUFFIXES = (".fasta", ".fa")
+MERGED_FASTA = "merged.fasta"              # a fasta list, merged in list order (work_dir)
 COMPRESSED_SUFFIXES = (".gz", ".zst")      # the extract stage unpacks these
 # data_params fields of a pretraining run, in docs-schema order: the template's, with
 # val_size (shipped commented out) where the schema adds it, before "Rarely changed"
@@ -184,6 +190,21 @@ def is_default(value, default) -> bool:
     return type(value) is type(default) and value == default
 
 
+def fasta_label(value) -> str:
+    """A fasta for a table or a message: a list is its first item and how many more."""
+    if isinstance(value, (list, tuple)):
+        more = len(value) - 1
+        return f"{value[0]} and {more} more" if more else str(value[0])
+    return str(value)
+
+
+def list_download_name(url: str) -> str:
+    """Where a URL of a fasta list goes in downloads/: a short hash of the URL before its
+    file name, so two URLs with one file name do not collide and reordering the list
+    downloads nothing again."""
+    return f"{hashlib.sha1(url.encode()).hexdigest()[:8]}-{file_name(url)}"
+
+
 def _join(*parts: str) -> str:
     return "/".join(p.rstrip("/") for p in parts if p)
 
@@ -195,7 +216,8 @@ class Source:
 
     name: str
     legacy: bool = False
-    fasta: Optional[str] = None            # URL or path; a shortcut is expanded
+    # URL or path (a shortcut is expanded), or a tuple of them merged in that order
+    fasta: Union[str, tuple, None] = None
     weight: Optional[float] = None
     params: dict = field(default_factory=dict)
     keys: dict = field(default_factory=dict)
@@ -218,12 +240,17 @@ class Source:
         return self.work_dir if self.mixed else self.output_dir
 
     @property
+    def is_list(self) -> bool:
+        """fasta is a list of files, merged into one (``paths["extracted_fasta"]``)."""
+        return isinstance(self.fasta, tuple)
+
+    @property
     def is_url(self) -> bool:
-        return bool(self.fasta) and is_url(self.fasta)
+        return bool(self.fasta) and not self.is_list and is_url(self.fasta)
 
     @property
     def is_compressed(self) -> bool:
-        return bool(self.fasta) and is_compressed(self.fasta)
+        return bool(self.fasta) and not self.is_list and is_compressed(self.fasta)
 
     @property
     def work_dir(self) -> str:
@@ -254,6 +281,12 @@ class Source:
 
     def download_path(self, url: str) -> str:
         return _join(self.downloads_dir, file_name(url))
+
+    def list_items(self) -> list:
+        """(item, the path the merge stage reads) per item of a fasta list: a URL's
+        download, a local file in place."""
+        return [(f, _join(self.downloads_dir, list_download_name(f)) if is_url(f) else f)
+                for f in self.fasta]
 
 
 @dataclass
@@ -306,22 +339,57 @@ def _params(block: dict, where: str, warnings: list) -> dict:
     return out
 
 
-def _fasta(value, where: str, base_dir) -> str:
+def _fasta(value, where: str, base_dir):
+    """The fasta: a string (a shortcut expanded), or a tuple for a list of two or more
+    files. A one-item list is that item, so it builds like the string."""
+    if isinstance(value, list):
+        if not value:
+            raise DataConfigError(f"{where}.fasta is an empty list; give at least one URL or "
+                                  "path")
+        items, seen = [], {}
+        for i, item in enumerate(value):
+            at = f"{where}.fasta[{i}]"
+            if isinstance(item, str) and item in FASTA_SHORTCUTS:
+                raise DataConfigError(f"{at}: {item} is a UniProt shortcut, which cannot go in "
+                                      "a list; give a URL or a path that ends with .fasta or "
+                                      ".fa (optionally .gz or .zst)")
+            if not isinstance(item, str) or not item:
+                raise DataConfigError(f"{at} must be a URL or a file path, got {item!r}")
+            key = _same_file_key(item, base_dir)
+            if key in seen:
+                raise DataConfigError(f"{at} is {where}.fasta[{seen[key]}] again: "
+                                      f"{item}; list each file once")
+            seen[key] = i
+            items.append(_fasta_item(item, at, base_dir))
+        return items[0] if len(items) == 1 else tuple(items)
     if not isinstance(value, str) or not value:
         raise DataConfigError(f"{where}.fasta must be a shortcut ({', '.join(FASTA_SHORTCUTS)}), "
-                              f"a URL or a file path, got {value!r}")
-    fasta = FASTA_SHORTCUTS.get(value, value)
-    name = file_name(fasta)
+                              f"a URL, a file path or a list of URLs and paths, got {value!r}")
+    return _fasta_item(FASTA_SHORTCUTS.get(value, value), f"{where}.fasta", base_dir,
+                       f"a shortcut ({', '.join(FASTA_SHORTCUTS)}) or ")
+
+
+def _same_file_key(item: str, base_dir) -> str:
+    """A URL as written; a path resolved against base_dir and normalised, so a.fa,
+    ./a.fa and its absolute form count as the same file."""
+    if is_url(item):
+        return item
+    p = Path(item)
+    if not p.is_absolute() and base_dir is not None:
+        p = Path(base_dir) / p
+    return os.path.normpath(os.path.abspath(p))
+
+
+def _fasta_item(fasta: str, at: str, base_dir, shortcut: str = "") -> str:
+    """One URL or path: not a directory, ends with .fasta/.fa (.gz/.zst)."""
     if not is_url(fasta):
         p = Path(fasta)
         on_disk = p if p.is_absolute() or base_dir is None else Path(base_dir) / p
         if on_disk.is_dir():
-            raise DataConfigError(f"{where}.fasta is a directory, not a .fasta/.fa file: "
-                                  f"{fasta}")
-    if not is_fasta_name(name):
-        raise DataConfigError(f"{where}.fasta must be a shortcut ({', '.join(FASTA_SHORTCUTS)}) "
-                              "or a URL or path that ends with .fasta or .fa (optionally .gz or "
-                              f".zst), got: {fasta}")
+            raise DataConfigError(f"{at} is a directory, not a .fasta/.fa file: {fasta}")
+    if not is_fasta_name(file_name(fasta)):
+        raise DataConfigError(f"{at} must be {shortcut}a URL or path that ends with .fasta or "
+                              f".fa (optionally .gz or .zst), got: {fasta}")
     return fasta
 
 
@@ -520,7 +588,9 @@ def _source_paths(src: Source) -> dict:
     work = src.work_dir
     # a mix extracts into downloads/, so the sources that read one .gz share the extract
     unpacked = src.downloads_dir if src.mixed else work
-    if src.is_url:
+    if src.is_list:                         # the merge stage writes it, for this source alone
+        compressed, extracted = None, _join(work, MERGED_FASTA)
+    elif src.is_url:
         got = src.download_path(src.fasta)
         compressed, extracted = (got, _join(unpacked, strip_compressed(file_name(src.fasta)))) \
             if src.is_compressed else (None, got)

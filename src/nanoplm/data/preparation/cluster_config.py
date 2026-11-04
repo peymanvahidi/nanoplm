@@ -38,7 +38,8 @@ from typing import Optional
 
 from nanoplm.data.preparation.cluster_import import CL_TAG, DecompressorMissing, open_decompressed
 from nanoplm.data.preparation.data_config import (CLUSTERS_CHOICES, FASTA_SHORTCUTS,
-                                                  fasta_stem, file_name as _name,
+                                                  fasta_label, fasta_stem,
+                                                  file_name as _name,
                                                   is_compressed, is_fasta_name, is_url,
                                                   strip_compressed)
 from nanoplm.data.preparation.extractor import ZSTD_MAX_WINDOW
@@ -196,6 +197,18 @@ def _peek_members(members: str, compressed: Optional[Path], extracted: Path,
                   "directory)")
 
 
+def _peek_list(items: tuple, merged: Path, base_dir) -> list:
+    """The first headers of a fasta list: the merged FASTA once it is built, else its
+    first item."""
+    first = items[0]
+    for path in (on_disk(merged, base_dir), None if is_url(first) else on_disk(first, base_dir)):
+        if path is not None and path.is_file():
+            return _peek_file(path)
+    if is_url(first):
+        return peek_url(first)
+    raise OSError(f"{first} not found (a relative path is relative to data.yaml's directory)")
+
+
 def cl_tag(header: bytes) -> Optional[bytes]:
     """The cluster id of a header's CL:<cluster id> token (after the id), or None."""
     for token in header.split()[1:]:
@@ -337,6 +350,8 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
     ckey = written.get("clusters", f"{where}.clusters")
     params = src.params
     source = src.fasta
+    # a fasta list: its merged FASTA is the members; it has no UniRef level
+    is_list = isinstance(source, tuple)
     compressed = src.paths["compressed_fasta"]
     extracted = src.paths["extracted_fasta"]
     clusters = _clusters_setting(block.get("clusters"), ckey, base_dir)
@@ -350,10 +365,13 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
         warnings.append(f"{on}: {_setting(src, 'max_seqs')} trains on at most {max_seqs:,} "
                         f"clusters; set {on}.max_seqs: -1 to use all of them")
 
-    source_level = level_of(source, base_dir)
+    source_level = None if is_list else level_of(source, base_dir)
     members = block.get("members")
     if members is not None and (not isinstance(members, str) or not members):
         raise ClusterConfigError(f"{where}.members must be a string or null, got {members!r}")
+    if members is not None and is_list:
+        raise ClusterConfigError(f"{where}.members is not supported with a fasta list yet; "
+                                 "leave it out to train on the merged list")
     if members in ("uniref90", "uniref100"):
         members = UNIPROT_FASTA[members]
     if members is None or members == source:
@@ -394,11 +412,11 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
     uniref = members_level in ("uniref90", "uniref100")
     if clusters == "uniprot" and not uniref:
         raise ClusterConfigError(
-            f"{ckey}: uniprot: {UNIPROT_NEEDS}; got fasta {source} and members "
+            f"{ckey}: uniprot: {UNIPROT_NEEDS}; got fasta {fasta_label(source)} and members "
             f"{block.get('members') or 'null'}. Use clusters: headers, mmseqs2 or a .tsv "
             "cluster file for these sequences.")
 
-    name = _name(members)
+    name = _name(members[0] if is_list else members)
     notes = []
     if clusters not in CLUSTERS:
         cluster_source = "tsv"
@@ -412,7 +430,8 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
             raise ClusterConfigError(f"{ckey}: headers needs a CL:<cluster id> tag after the id "
                                      f"in every FASTA header; UniProt's {name} has none")
         try:
-            got = _peek_members(members, members_compressed, members_fasta, base_dir)
+            got = (_peek_list(members, members_fasta, base_dir) if is_list else
+                   _peek_members(members, members_compressed, members_fasta, base_dir))
         except OSError:
             got = None                  # the stage checks every header
         if got and not all(cl_tag(h) for h in got):

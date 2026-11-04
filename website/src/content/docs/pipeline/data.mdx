@@ -71,11 +71,12 @@ sources:
     fasta: my_proteins.fasta   # or .fa, and either one as .gz or .zst
 ```
 
-`fasta` accepts three kinds of value:
+`fasta` accepts four kinds of value:
 
 - a shortcut for a UniProt file, from the table below;
 - a URL (`http://`, `https://` or `ftp://`), downloaded once into `output_dir/downloads/`;
-- a local `.fasta` or `.fa` file, optionally compressed as `.gz` or `.zst`.
+- a local `.fasta` or `.fa` file, optionally compressed as `.gz` or `.zst`;
+- a list of URLs and local files, for data that comes in several files.
 
 | Shortcut | URL |
 | --- | --- |
@@ -86,6 +87,21 @@ sources:
 | `uniref100` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz` |
 
 A `*` at the end of a sequence is a stop codon (Prodigal writes one). The `filter` stage removes it before the length filter; the `check` stage warns with the number of records it was removed from, and the `from-yaml` summary shows that number. A `*` anywhere else, including a second one at the end, makes the sequence [invalid](#invalid-sequences).
+
+### Several files
+
+Data split over several files, such as Logan's per-sample shards, goes in one source as a list:
+
+```yaml title="data.yaml"
+sources:
+  logan:
+    fasta:
+      - https://example.org/logan/SRR1001.contigs.fa.zst
+      - https://example.org/logan/SRR1002.contigs.fa.zst
+      - extra/my_contigs.fa
+```
+
+Each URL is downloaded into `output_dir/downloads/`, with a short hash of the URL before its file name, so two URLs ending in the same file name do not collide. This download is not shared with a source that names the same URL as a plain string; that source downloads it again to `downloads/<file>`. A `merge` stage then writes every file, in list order and decompressed, into `<source>/merged.fasta`. The other stages run on that file as they would on one `fasta`: the sequences are shuffled, filtered and split together. A list cannot hold the UniProt shortcuts, and a file listed twice is an error. A list of one file builds like that file on its own. Adding a file to the list merges again and reruns the stages after it.
 
 Start with SwissProt (about 570k sequences). It downloads in minutes, so you can test the pipeline on it before a UniRef-scale run.
 
