@@ -516,6 +516,17 @@
             "value": true
           }
         },
+        "moe_bias_update_mode": {
+          "type": "string",
+          "default": "proportional",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "description": "proportional | sign (fixed step, DeepSeek-V3 / Ling-V2)",
+          "x-nanoplm-visible-when": {
+            "field": "use_moe",
+            "op": "==",
+            "value": true
+          }
+        },
         "moe_leading_dense_layers": {
           "type": "integer",
           "default": 1,

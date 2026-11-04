@@ -60,6 +60,6 @@ def visibility_gates() -> dict:
     g["prores_T"] = eq_true("use_prores")
     for f in ("moe_num_experts", "moe_top_k", "moe_use_bias_correction", "moe_aux_loss_coef",
               "moe_z_loss_coef", "moe_routed_scaling_factor", "moe_n_group", "moe_topk_group",
-              "moe_bias_update_rate", "moe_leading_dense_layers"):
+              "moe_bias_update_rate", "moe_bias_update_mode", "moe_leading_dense_layers"):
         g[f] = eq_true("use_moe")
     return g

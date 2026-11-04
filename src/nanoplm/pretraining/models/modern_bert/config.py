@@ -155,6 +155,9 @@ class ModernBertConfig:
     moe_n_group: int = 1
     moe_topk_group: int = 1
     moe_bias_update_rate: float = 1e-3
+    # Expert-bias step: "proportional" scales by each expert's relative load
+    # error; "sign" takes a fixed +-moe_bias_update_rate step (DeepSeek-V3 / Ling-V2).
+    moe_bias_update_mode: str = "proportional"
     moe_leading_dense_layers: int = 0  # first N layers are always dense (DeepSeek uses 1)
     # Skip-and-log NaN mitigation. A non-finite router input makes the fused top-k
     # return an out-of-bounds index and the next gather aborts the job. With the
@@ -464,6 +467,11 @@ class ModernBertConfig:
                 raise ValueError(
                     "moe_top_k must satisfy 1 <= moe_top_k <= moe_num_experts: "
                     f"{self.moe_top_k} vs {self.moe_num_experts}"
+                )
+            if self.moe_bias_update_mode not in ("proportional", "sign"):
+                raise ValueError(
+                    "moe_bias_update_mode must be 'proportional' or 'sign', "
+                    f"got {self.moe_bias_update_mode!r}"
                 )
             if self.moe_n_group < 1:
                 raise ValueError(f"moe_n_group must be >= 1, got {self.moe_n_group}")
