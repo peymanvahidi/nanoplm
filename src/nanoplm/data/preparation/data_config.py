@@ -54,10 +54,11 @@ PARAM_FIELDS = ("max_seqs", "min_seq_len", "max_seq_len", "val_ratio", "drop_inv
                 "register_tokens")
 # the val size: data_params sets exactly one of them, for the whole data.yaml
 VAL_FIELDS = ("val_ratio", "val_size")
-# the "rarely changed" fields may be left out (master's template values). In the sources
+# the "rarely changed" fields may be left out (the template values; drop_invalid_sequences
+# was false before 2026-11, so an old config that left it out now drops). In the sources
 # layout a field at its default goes into dvc.yaml as a value, not a DVC param, so
 # writing it out or deleting it reruns nothing.
-PARAM_DEFAULTS = {"drop_invalid_sequences": False, "shuffle": True, "shuffle_seed": 24,
+PARAM_DEFAULTS = {"drop_invalid_sequences": True, "shuffle": True, "shuffle_seed": 24,
                   "samples_per_shard": 2000, "max_workers": 2, "register_tokens": 0}
 OLD_PARAM_NAMES = {"seqs_num": "max_seqs"}
 SOURCE_KEYS = ("fasta", "weight", "cluster_subsampling")

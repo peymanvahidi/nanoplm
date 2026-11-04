@@ -35,7 +35,7 @@ data_params:
   val_ratio: 0.0044      # share of the mix's clusters held out for validation
   # OR (together you'll get error, comment one out)
   # val_size: 150000
-  drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
+  drop_invalid_sequences: true   # false: stop on records with unknown characters instead of dropping them
 
   # Rarely changed
   shuffle: true          # shuffle before the train / val split; false also trains in file order

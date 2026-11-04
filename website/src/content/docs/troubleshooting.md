@@ -311,7 +311,11 @@ For errors about a `cluster_subsampling` block, or MMseqs2 not found, see the [c
 
 **`Error: Validation found 2 problematic sequence(s).`**
 
-With the default [`drop_invalid_sequences: false`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences), the `check` stage stops the pipeline when a sequence has a residue it does not recognise. Look at `output_dir/<source>/validation/invalid.fasta`. Then run `nanoplm data from-yaml --fix` to drop those sequences and continue ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
+You set [`drop_invalid_sequences: false`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences), so the `check` stage stops the pipeline when a sequence has a residue it does not recognise. Look at `output_dir/<source>/validation/invalid.fasta`. Then run `nanoplm data from-yaml --fix` to drop those sequences and continue ([details](/nanoplm/pipeline/data/#invalid-sequences)).
+
+**`WARNING check: dropping 2 records with characters outside the amino-acid alphabet or empty`**
+
+Not an error. With the default `drop_invalid_sequences: true` the `filter` stage drops those records. They are listed in the `invalid.fasta` the warning names.
 
 ### `--dry-run` refuses or stops early
 

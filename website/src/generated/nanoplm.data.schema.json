@@ -93,8 +93,8 @@
         },
         "drop_invalid_sequences": {
           "type": "boolean",
-          "default": false,
-          "description": "true: drop sequences with unknown residues instead of stopping"
+          "default": true,
+          "description": "false: stop on records with unknown characters instead of dropping them"
         },
         "val_size": {
           "type": "integer",

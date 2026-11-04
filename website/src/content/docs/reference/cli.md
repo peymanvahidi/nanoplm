@@ -117,7 +117,7 @@ Running dvc repro (full pipeline)...
 # ... dvc stage output ...
 ```
 
-[Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run) explains the table, the line under it, and what `--dry-run` can preview. Use `--fix` when the `check` stage rejects invalid sequences ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
+[Prepare data](/nanoplm/pipeline/data/#read-the-table-before-the-run) explains the table, the line under it, and what `--dry-run` can preview. Use `--fix` when `drop_invalid_sequences: false` made the `check` stage stop on invalid sequences ([details](/nanoplm/pipeline/data/#invalid-sequences)).
 
 ### data get-file
 
@@ -160,7 +160,7 @@ Checks every sequence for unknown residues. Writes `validation.json`, `invalid.f
 | --- | --- | --- |
 | `--input`, `-i PATH` | **Required.** Input FASTA | - |
 | `--output`, `-o PATH` | **Required.** Output directory for the validation sidecars | - |
-| `--drop-invalid [true\|false]` | Drop invalid sequences and exit 0 | `false` |
+| `--drop-invalid [true\|false]` | `true`: warn and list invalid records for the filter to drop; `false`: stop on them | `true` |
 
 ### data shuffle
 

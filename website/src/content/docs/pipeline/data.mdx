@@ -85,7 +85,7 @@ sources:
 | `uniref90` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` |
 | `uniref100` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz` |
 
-A `*` at the end of a sequence is a stop codon (Prodigal writes one). The `filter` stage removes it before the length filter. A `*` anywhere else makes the sequence [invalid](#invalid-sequences-will-stop-you-once).
+A `*` at the end of a sequence is a stop codon (Prodigal writes one). The `filter` stage removes it before the length filter. A `*` anywhere else makes the sequence [invalid](#invalid-sequences).
 
 Start with SwissProt (about 570k sequences). It downloads in minutes, so you can test the pipeline on it before a UniRef-scale run.
 
@@ -120,7 +120,7 @@ data_params:
   val_ratio: 0.1         # share of the mix held out for validation
   # OR (together you'll get error, comment one out)
   # val_size: 150000
-  drop_invalid_sequences: false  # true: drop sequences with unknown residues instead of stopping
+  drop_invalid_sequences: true   # false: stop on records with unknown characters instead of dropping them
 
   # Rarely changed
   shuffle: true          # shuffle before the train / val split; false also trains in file order
@@ -185,30 +185,33 @@ To see the table and the stages that would run without running them, use `nanopl
 - `from-yaml` must have run once in this folder first, because `--dry-run` does not set up DVC.
 - The preview stops at the first download that has not happened yet. DVC cannot plan the stages that read a file that does not exist.
 
-## Invalid sequences will stop you once
+## Invalid sequences
 
-Real FASTA files contain residues outside the 20 standard amino acids. The `check` stage finds them. With the default `drop_invalid_sequences: false` it stops the pipeline, so your dataset never changes without you knowing:
+Real FASTA files contain residues outside the 20 standard amino acids. The `check` stage finds records with a character outside `ACDEFGHIKLMNPQRSTVWYBJOUXZ` (either case), a `*` before the end, or no sequence at all. With the default `drop_invalid_sequences: true` the `filter` stage drops them, and the `check` stage warns:
 
 ```text title="Output (trimmed)"
 Running stage 'check':
-> nanoplm data check -i my_proteins.fasta -o output/data/pretrain_data/mine/validation --drop-invalid false
-WARNING check: found 2 invalid sequence(s); see output/data/pretrain_data/mine/validation/invalid.fasta
+> nanoplm data check -i my_proteins.fasta -o output/data/pretrain_data/mine/validation --drop-invalid true
+WARNING check: dropping 2 records with characters outside the amino-acid alphabet or empty (first: seq7, seq19); see output/data/pretrain_data/mine/validation/invalid.fasta
+```
+
+The summary at the end of `from-yaml` repeats the count, per source:
+
+```text
+  Dropped:         2 invalid records, listed in output/data/pretrain_data/mine/validation/invalid.fasta
+```
+
+Look at `invalid.fasta`. A large count usually means the file is not what you thought it was.
+
+To stop instead, set `drop_invalid_sequences: false`. The `check` stage then fails on the first run that finds invalid records, so the dataset never changes without you knowing:
+
+```text title="Output (trimmed)"
 Error: Validation found 2 problematic sequence(s).
   Inspect: output/data/pretrain_data/mine/validation/invalid.fasta
   Summary: output/data/pretrain_data/mine/validation/validation.json
 
 To exclude these sequences and continue the pipeline:
     nanoplm data from-yaml --fix
-```
-
-Look at `invalid.fasta` first. A large count usually means the file is not what you thought it was. To drop those sequences and continue:
-
-```sh
-nanoplm data from-yaml --fix
-```
-
-```text title="Output (first line)"
-Set data.yaml: drop_invalid_sequences=true
 ```
 
 `--fix` sets `drop_invalid_sequences: true` in your `data.yaml`, everywhere it appears, and runs again. The `filter` stage then drops the IDs listed in `<source>/validation/invalid_ids.txt`. The change is in your file, so `git diff` shows it.

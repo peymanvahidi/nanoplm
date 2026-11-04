@@ -77,8 +77,8 @@ puts in the env.
 
    `from-yaml` prints the table at the top before anything runs, so you can check the file and
    settings first ([columns explained here](/nanoplm/pipeline/data/#read-the-table-before-the-run)).
-   If the `check` stage stops on invalid sequences, run `nanoplm data from-yaml --fix`
-   ([details](/nanoplm/pipeline/data/#invalid-sequences-will-stop-you-once)).
+   Invalid sequences are dropped with a warning
+   ([details](/nanoplm/pipeline/data/#invalid-sequences)).
 
 </Steps>
 

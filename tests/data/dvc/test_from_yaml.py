@@ -111,7 +111,8 @@ def test_from_yaml_fix_preserves_comments(tmp_path):
     """--fix must not destroy YAML comments in the user's data.yaml."""
     from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
-    cfg.write_text(load_template("data_pretrain"))
+    cfg.write_text(load_template("data_pretrain").replace(
+        "drop_invalid_sequences: true", "drop_invalid_sequences: false"))
     # data_pretrain.yaml has a commented-out source example starting with "# another_source:"
     assert "# another_source:" in cfg.read_text()
     (tmp_path / ".dvc").mkdir(exist_ok=True)

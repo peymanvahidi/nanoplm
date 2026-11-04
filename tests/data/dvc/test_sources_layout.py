@@ -375,7 +375,7 @@ def test_rarely_changed_fields_may_be_left_out(cluster):
     src = parse_data_config(short).source
     assert {k: src.params[k] for k in RARE} == {
         "shuffle": True, "shuffle_seed": 24, "samples_per_shard": 2000, "max_workers": 2,
-        "register_tokens": 0, "drop_invalid_sequences": False}
+        "register_tokens": 0, "drop_invalid_sequences": True}
     stages = yaml.safe_load(_gen(short))["stages"]
     for name, st in stages.items():
         st = st.get("do", st)
@@ -409,10 +409,12 @@ def test_old_layout_still_needs_every_field(tmp_path, monkeypatch):
 @pytest.mark.parametrize("indent", ["  ", "    "])
 def test_fix_adds_drop_invalid_when_it_is_left_out(tmp_path, indent):
     from nanoplm.cli.data import _flip_drop_invalid
-    text = load_template("data_pretrain").replace("  drop_invalid_sequences: false\n", "")
+    text = re.sub(r"\n  drop_invalid_sequences:[^\n]*", "", load_template("data_pretrain"))
+    assert "drop_invalid_sequences" not in text
     text = text.replace("\n  ", "\n" + indent) if indent != "  " else text
     p = _write(tmp_path, text)
     _flip_drop_invalid(p, True)
+    assert p.read_text().count(f"\n{indent}drop_invalid_sequences: true") == 1
     assert parse_data_config(yaml.safe_load(p.read_text())).source.params[
         "drop_invalid_sequences"] is True
     p.write_text("output_dir: out\nsources:\n  s:\n    fasta: swissprot\n")

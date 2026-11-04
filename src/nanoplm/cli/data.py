@@ -413,14 +413,14 @@ def filter(
 @click.option("--output", "-o", required=True,
               type=click.Path(file_okay=False),
               help="Output directory for validation sidecars")
-@click.option("--drop-invalid", default="false",
+@click.option("--drop-invalid", default="true",
               type=click.Choice(["true", "false"], case_sensitive=False),
-              help="If true, exit 0 even with invalid sequences and write invalid_ids.txt")
+              help="true: list invalid records for the filter to drop; false: stop on them")
 @click.help_option("--help", "-h")
 def check(input: str, output: str, drop_invalid: str):
     """Validate FASTA sequences. Writes validation.json, invalid.fasta, invalid_ids.txt
     into the output directory. Exits non-zero if invalid sequences are found AND
-    --drop-invalid=false; exits zero otherwise.
+    --drop-invalid=false; otherwise warns and exits zero.
     """
     from nanoplm.data.preparation.checker import Checker
 
@@ -431,19 +431,15 @@ def check(input: str, output: str, drop_invalid: str):
         drop_invalid=drop,
     ).check()
 
-    if result.invalid_count > 0:
-        msg = (
+    # with drop on, the Checker's warning is the only message
+    if result.invalid_count > 0 and not drop:
+        raise click.ClickException(
             f"Validation found {result.invalid_count:,} problematic sequence(s).\n"
             f"  Inspect: {Path(output) / 'invalid.fasta'}\n"
             f"  Summary: {Path(output) / 'validation.json'}\n"
+            "\nTo exclude these sequences and continue the pipeline:\n"
+            "    nanoplm data from-yaml --fix\n"
         )
-        if not drop:
-            msg += (
-                "\nTo exclude these sequences and continue the pipeline:\n"
-                "    nanoplm data from-yaml --fix\n"
-            )
-            raise click.ClickException(msg)
-        click.echo(msg, err=True)
 
 
 @data.command("split")
@@ -1557,7 +1553,7 @@ def _detect_kind(data_params: dict, filename: str) -> str:
 def _flip_drop_invalid(config_path: Path, value: bool) -> None:
     """Edit drop_invalid_sequences in place (every occurrence, so a per-source
     override flips too), keeping the file's comments and layout. A data.yaml that
-    leaves it out (it defaults to false) gets it added under data_params."""
+    leaves it out gets it added under data_params."""
     import re
     text = config_path.read_text()
     new_val = "true" if value else "false"
@@ -1861,6 +1857,7 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
             f"    Train:         {m.get('train_sequences')}\n"
             f"    Val:           {m.get('val_sequences')}\n"
             f"{_left_out_line(manifest_path.parent / m['cluster_index_dir'])}"
+            f"{_dropped_lines(cwd, params)}"
             f"  Manifest:        {manifest_path}\n"
             f"{_dataset_dir_line(manifest_path, kind)}"
         )
@@ -1871,9 +1868,43 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
         f"  Total sequences: {m.get('seqs_num')}\n"
         f"    Train:         {m.get('train_sequences')}\n"
         f"    Val:           {m.get('val_sequences')}\n"
+        f"{_dropped_lines(cwd, params)}"
         f"  Manifest:        {manifest_path}\n"
         f"{_dataset_dir_line(manifest_path, kind)}"
     )
+
+
+def _dropped_lines(cwd: Path, params: dict, sources=None) -> str:
+    """'Dropped: N invalid records' for each source whose check listed records for the
+    filter to drop, read from invalid_ids.txt in the validation folders dvc.yaml names.
+    Empty when nothing was dropped or a file is missing."""
+    try:
+        graph = _stage_graph((cwd / "dvc.yaml").read_text(encoding="utf-8"), params)
+    except (OSError, ValueError, AttributeError):
+        return ""
+    checks = [outs[0] for name, (_, outs) in graph.items()
+              if outs and (name == "check" or name.endswith("-check")
+                           or name.startswith("check-"))]
+    if sources is None:
+        rows = [("Dropped:", d) for d in checks]
+    else:       # a mix: the validation folder each source's filter reads
+        rows = [(f"Dropped ({s}):", d) for s in sources
+                for d in checks if d in graph.get(f"{s}-filter", ((), ()))[0]]
+    found = []
+    for label, d in rows:
+        folder = Path(d) if Path(d).is_absolute() else cwd / d
+        try:
+            with open(folder / "invalid_ids.txt", encoding="utf-8", errors="replace") as f:
+                n = sum(1 for line in f if line.strip())
+        except OSError:
+            continue
+        if n:
+            found.append((label, n, folder))
+    # one source lines up with 'Manifest:'; a mix lines up with its longest label
+    width = 16 if sources is None else max((len(f[0]) for f in found), default=0)
+    lines = [f"  {label:<{width}} {n:,} invalid records, listed in "
+             f"{folder / 'invalid.fasta'}\n" for label, n, folder in found]
+    return "".join(lines)
 
 
 def _clusters_line(m: dict) -> str:
@@ -1930,7 +1961,8 @@ def _print_mixture_summary(cwd: Path, cfg) -> None:
                "val count clusters for a cluster source).\n")
     for r in rows:
         click.echo("  " + "  ".join(c.ljust(w) for c, w in zip(r, widths)))
-    click.echo(f"\n  Manifest:  {folder / '.data_manifest'}\n"
+    dropped = _dropped_lines(cwd, cfg.raw, list(cfg.sources))
+    click.echo(f"\n{dropped}  Manifest:  {folder / '.data_manifest'}\n"
                f"  Set pretrain.yaml's dataset_dir to {folder}.\n")
 
 
