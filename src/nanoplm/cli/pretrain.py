@@ -378,8 +378,8 @@ def pretrain():
 )
 @click.option(
     "--muon-use-gram-newton-schulz/--no-muon-use-gram-newton-schulz",
-    default=False,
-    help="Use the Gram-Newton-Schulz orthogonalization kernels where supported",
+    default=True,
+    help="Use Gram Newton-Schulz orthogonalization (default; overrides --muon-use-polar-express)",
 )
 @click.option(
     "--muon-triton-post-ortho/--no-muon-triton-post-ortho",

@@ -467,7 +467,7 @@ def build_optimizer(
     muon_variant: str = "normuon",
     muon_adjust_lr: str = "rms_norm",
     muon_beta2: float = 0.95,
-    muon_use_gram_newton_schulz: bool = False,
+    muon_use_gram_newton_schulz: bool = True,
     muon_triton_post_ortho: bool = False,
     muon_flatten: bool = False,
     nordion2_fraction: float = 0.25,
@@ -526,7 +526,12 @@ def build_optimizer(
             "muon, normuon, nordion2."
         )
 
-    ns_func = _polar_express_paper if muon_use_polar_express else None
+    # dion uses a custom newton_schulz_func ahead of use_gram_newton_schulz, so
+    # only pass ours when GNS is off. Under torch.compile our bf16 Polar Express
+    # was seen to diverge (output ~1e9) on a near-dormant MoE expert's momentum,
+    # which NorMuon turned into a NaN-producing weight step; GNS does not.
+    use_custom_pe = muon_use_polar_express and not muon_use_gram_newton_schulz
+    ns_func = _polar_express_paper if use_custom_pe else None
 
     if variant == "nordion2":
         try:

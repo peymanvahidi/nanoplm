@@ -6,7 +6,7 @@
 #   1. torch 2.12.1+cu130                    2. dion (pinned commit)
 #   3. TransformerEngine v2.16 (from source) 4. flash-attn-3 (pinned wheel, sha256)
 #   5. quack-kernels[cu13]==0.5.0 + nvidia-cutlass-dsl[cu13]==4.5.3
-#      + sonic-moe (pinned commit)
+#      + sonic-moe (pinned commit) + gram-newton-schulz 0.1.6 (default Muon orthogonalizer)
 #   optional: MMseqs2 static binary (--with-mmseqs, or --mmseqs-only)
 #
 # Not user-facing: run `nanoplm deps install`.
@@ -18,7 +18,10 @@ set -euo pipefail
 # ---- pins: THE single source of truth (the spec table mirrors this block) ----
 TORCH_PIN="2.12.1+cu130"
 TORCH_INDEX="https://download.pytorch.org/whl/cu130"
-DION_SHA="dd6c02f5173dc43cc7a0974535d7011a74bda494"           # microsoft/dion main (upstream)
+DION_SHA="7692479288f928a3d61d1cc58137b4dbe4f71000"           # microsoft/dion main (upstream)
+# gram-newton-schulz pins nvidia-cutlass-dsl==4.5.2; we run 4.5.3 for sonic-moe,
+# so it installs --no-deps (its quack/DSL needs are covered by step_moe).
+GNS_SPEC="gram-newton-schulz==0.1.6"
 TE_TAG="${TE_TAG:-v2.16}"
 SONICMOE_SHA="4923037d858aebfe5738ebb17d02f88d7871c333"       # Dao-AILab/sonic-moe PR #64 head
 SONICMOE_URL="git+https://github.com/Dao-AILab/sonic-moe.git@${SONICMOE_SHA}"
@@ -608,6 +611,10 @@ step_moe() {
   if satisfied sonic-moe "$SONICMOE_SHA"; then log "sonic-moe @ ${SONICMOE_SHA:0:12} present; skipping."; else
     log "installing sonic-moe @ ${SONICMOE_SHA:0:12}"
     run_cmd "$PY" -m pip install "$SONICMOE_URL"
+  fi
+  if satisfied gram-newton-schulz "0.1.6"; then log "gram-newton-schulz 0.1.6 present; skipping."; else
+    log "installing $GNS_SPEC (--no-deps)"
+    run_cmd "$PY" -m pip install --no-deps "$GNS_SPEC"
   fi
 }
 

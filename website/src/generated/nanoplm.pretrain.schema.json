@@ -842,7 +842,8 @@
         "muon_use_polar_express": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "used only with muon_use_gram_newton_schulz: false"
         },
         "muon_momentum": {
           "type": "number",
@@ -879,8 +880,9 @@
         },
         "muon_use_gram_newton_schulz": {
           "type": "boolean",
-          "default": false,
-          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)"
+          "default": true,
+          "x-nanoplm-group": "Optimizer \u2014 matrix optimizers (muon | normuon | nordion2)",
+          "description": "default orthogonalizer; overrides muon_use_polar_express"
         },
         "muon_triton_post_ortho": {
           "type": "boolean",

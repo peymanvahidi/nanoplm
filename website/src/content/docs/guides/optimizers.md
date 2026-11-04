@@ -118,7 +118,7 @@ The peak LR does not act alone: it is scaled by the schedule. See [Cooldown and 
 
 ## Leave the Muon internals alone
 
-`muon_momentum` (`0.95`), `muon_nesterov` (`true`), `muon_use_polar_express` (`true`), `muon_cautious_weight_decay` (`true`), and `muon_eps` (`1e-7`) are the orthogonalization and momentum internals. The defaults are the published ones and are a fine place to stay. They are listed with their types in the [pretrain.yaml reference](/nanoplm/reference/pretrain/).
+`muon_momentum` (`0.95`), `muon_nesterov` (`true`), `muon_use_gram_newton_schulz` (`true`), `muon_use_polar_express` (`true`), `muon_cautious_weight_decay` (`true`), and `muon_eps` (`1e-7`) are the orthogonalization and momentum internals. Gram Newton-Schulz is the default orthogonalizer; `muon_use_polar_express` only applies when it is turned off. The defaults are the published ones and are a fine place to stay. They are listed with their types in the [pretrain.yaml reference](/nanoplm/reference/pretrain/).
 
 ## Where to go next
 
