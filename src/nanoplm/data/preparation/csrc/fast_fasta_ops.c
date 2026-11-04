@@ -1102,8 +1102,10 @@ API_EXPORT int nanoplm_shuffle_fasta(
  * Validation rules:
  *   - Allowed AA alphabet: ACDEFGHIKLMNPQRSTVWY (standard 20)
  *                          BJOUXZ (ambiguous)
- *   - One trailing '*' (stop codon) is allowed and not counted; the
- *     filter strips it. A '*' anywhere else makes the sequence invalid.
+ *   - One trailing '*' (stop codon) is allowed; the filter strips it. Valid
+ *     records that end in one are counted (trailing_stop_count, with the
+ *     first ids). A '*' anywhere else, including a second one at the end
+ *     ("**"), makes the sequence invalid.
  *   - A sequence is "empty"   if it has no AA characters.
  *   - A sequence is "invalid" if any AA character is outside the
  *     allowed alphabet, OR if the sequence is empty.
@@ -1257,6 +1259,8 @@ API_EXPORT int validate_fasta_native(
     long long empty_count    = 0;
     char first_invalid_id[201];
     first_invalid_id[0] = '\0';
+    long long trailing_stop_count = 0;
+    char first_stop_ids[3][201];
 
     char *linebuf = NULL;
     size_t linecap = 0;
@@ -1295,6 +1299,7 @@ API_EXPORT int validate_fasta_native(
         /* one trailing '*' (stop codon) is not a residue */ \
         size_t _n = cur_seq.len; \
         if (_n > 0 && cur_seq.data[_n - 1] == '*') _n--; \
+        int _had_stop = (_n < cur_seq.len); \
         /* Check for empty sequence */ \
         if (_n == 0) { \
             empty_count++; \
@@ -1325,7 +1330,18 @@ API_EXPORT int validate_fasta_native(
                     break; \
                 } \
             } \
-            if (_bad) EMIT_INVALID(); \
+            if (_bad) { \
+                EMIT_INVALID(); \
+            } else if (_had_stop) { \
+                if (trailing_stop_count < 3) { \
+                    char *_sid4 = extract_seq_id(cur_header.data ? cur_header.data : ""); \
+                    char *_dst = first_stop_ids[trailing_stop_count]; \
+                    strncpy(_dst, _sid4 ? _sid4 : "", 200); \
+                    _dst[200] = '\0'; \
+                    free(_sid4); \
+                } \
+                trailing_stop_count++; \
+            } \
         } \
     } while (0)
 
@@ -1392,7 +1408,13 @@ API_EXPORT int validate_fasta_native(
         fprintf(frep, "  \"empty_count\": %lld,\n",    empty_count);
         fprintf(frep, "  \"first_invalid_id\": ");
         write_json_string(frep, first_invalid_id);
-        fprintf(frep, "\n}\n");
+        fprintf(frep, ",\n  \"trailing_stop_count\": %lld,\n", trailing_stop_count);
+        fprintf(frep, "  \"first_trailing_stop_ids\": [");
+        for (long long _k = 0; _k < trailing_stop_count && _k < 3; _k++) {
+            if (_k) fputs(", ", frep);
+            write_json_string(frep, first_stop_ids[_k]);
+        }
+        fprintf(frep, "]\n}\n");
         fclose(frep);
     }
     rc = 0;

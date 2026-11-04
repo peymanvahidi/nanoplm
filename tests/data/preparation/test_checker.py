@@ -44,6 +44,10 @@ def test_one_trailing_stop_codon_is_valid(tmp_path):
     src.write_text(">a # 1 # 30 # 1 # ID=1_1\nMAGV*\n>b\nVVA\nGM*\n>c\nMAGV\n")
     result = Checker(input_path=src, output_dir=tmp_path / "validation").check()
     assert result.total_sequences == 3 and result.invalid_count == 0
+    assert result.trailing_stop_count == 2
+    report = json.loads((tmp_path / "validation" / "validation.json").read_text())
+    assert report["trailing_stop_count"] == 2
+    assert report["first_trailing_stop_ids"] == ["a", "b"]
 
 
 def test_a_stop_codon_anywhere_else_is_invalid(tmp_path):
@@ -55,3 +59,5 @@ def test_a_stop_codon_anywhere_else_is_invalid(tmp_path):
     ids = (out_dir / "invalid_ids.txt").read_text().split()
     assert ids == ["mid", "two", "first", "only"]
     assert ">only\n*\n" in (out_dir / "invalid.fasta").read_text()
+    # only the valid record counts: "**", "*" alone and an internal '*' are dropped instead
+    assert result.trailing_stop_count == 1

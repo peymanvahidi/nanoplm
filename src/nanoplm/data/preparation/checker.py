@@ -13,6 +13,7 @@ class CheckResult:
     total_sequences: int
     invalid_count: int
     empty_count: int
+    trailing_stop_count: int = 0
 
 
 class Checker:
@@ -64,7 +65,16 @@ class Checker:
             total_sequences=native_result.total_sequences,
             invalid_count=native_result.invalid_count,
             empty_count=native_result.empty_count,
+            trailing_stop_count=native_result.trailing_stop_count,
         )
+
+        n_stop = result.trailing_stop_count
+        if n_stop > 0:
+            logger.warning(
+                f"check: removing the trailing '*' (stop codon) from {n_stop:,} "
+                f"record{'s' if n_stop != 1 else ''} "
+                f"(first: {', '.join(native_result.first_trailing_stop_ids)})"
+            )
 
         if result.invalid_count > 0 and self.drop_invalid:
             logger.warning(

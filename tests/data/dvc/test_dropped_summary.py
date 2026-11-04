@@ -43,6 +43,24 @@ def test_one_dropped_record_is_singular(tmp_path):
     msgs = _logged(lambda: Checker(src, out).check())
     assert msgs[0].startswith("check: dropping 1 record with characters outside")
 
+def test_check_warns_about_trailing_stop_codons(tmp_path):
+    src = tmp_path / "in.fasta"
+    src.write_text(">a\nMAGV*\n>b\nMAGV\n>c\nMA*\n>d\nGV*\n>e\nMK*\n>f\nMAG**\n")
+    msgs = _logged(lambda: Checker(src, tmp_path / "validation").check())
+    assert msgs[0] == ("check: removing the trailing '*' (stop codon) from 4 records "
+                       "(first: a, c, d)")
+    assert msgs[1].startswith("check: dropping 1 record ")      # "**" is invalid
+
+
+def test_one_stop_codon_is_singular_and_none_is_silent(tmp_path):
+    src = tmp_path / "in.fasta"
+    src.write_text(">a\nMAGV*\n")
+    msgs = _logged(lambda: Checker(src, tmp_path / "v1").check())
+    assert msgs == ["check: removing the trailing '*' (stop codon) from 1 record (first: a)"]
+    src.write_text(">a\nMAGV\n")
+    assert _logged(lambda: Checker(src, tmp_path / "v2").check()) == []
+
+
 def test_the_check_command_drops_by_default_and_false_still_stops(tmp_path):
     src = tmp_path / "in.fasta"
     src.write_text(">ok\nMAGV\n>bad\nMAG!\n")
@@ -90,6 +108,10 @@ def test_the_summary_says_how_many_were_dropped(tmp_path, monkeypatch):
     assert "Dropped" not in run()                   # nothing dropped
     (val / "invalid_ids.txt").write_text("a\nb\nc\n")
     assert f"  Dropped:         3 invalid records, listed in {val / 'invalid.fasta'}\n" in run()
+    (val / "validation.json").write_text('{"trailing_stop_count": 0}')
+    assert "Stop codons" not in run()
+    (val / "validation.json").write_text('{"trailing_stop_count": 1234}')
+    assert "  Stop codons:     1,234 trailing '*' removed\n" in run()
 
 
 def test_a_mix_says_it_per_source_and_a_shared_check_for_each_reader(tmp_path):
@@ -106,7 +128,10 @@ def test_a_mix_says_it_per_source_and_a_shared_check_for_each_reader(tmp_path):
         val = tmp_path / "out" / "downloads" / f"{name}_validation"
         val.mkdir(parents=True)
         (val / "invalid_ids.txt").write_text(ids)
+    (tmp_path / "out/downloads/uniprot_sprot_fasta_validation/validation.json").write_text(
+        '{"trailing_stop_count": 5}')
     lines = _dropped_lines(tmp_path, cfg, list(cfg["sources"])).splitlines()
     shared = tmp_path / "out/downloads/uniref90_fasta_validation/invalid.fasta"
-    assert lines == [f"  Dropped (uniref50): 2 invalid records, listed in {shared}",
-                     f"  Dropped (u90):      2 invalid records, listed in {shared}"]
+    assert lines == ["  Stop codons (swissprot): 5 trailing '*' removed",
+                     f"  Dropped (uniref50):      2 invalid records, listed in {shared}",
+                     f"  Dropped (u90):           2 invalid records, listed in {shared}"]

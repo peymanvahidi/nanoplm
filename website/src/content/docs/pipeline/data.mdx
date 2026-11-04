@@ -85,7 +85,7 @@ sources:
 | `uniref90` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref90/uniref90.fasta.gz` |
 | `uniref100` | `https://ftp.uniprot.org/pub/databases/uniprot/uniref/uniref100/uniref100.fasta.gz` |
 
-A `*` at the end of a sequence is a stop codon (Prodigal writes one). The `filter` stage removes it before the length filter. A `*` anywhere else makes the sequence [invalid](#invalid-sequences).
+A `*` at the end of a sequence is a stop codon (Prodigal writes one). The `filter` stage removes it before the length filter; the `check` stage warns with the number of records it was removed from, and the `from-yaml` summary shows that number. A `*` anywhere else, including a second one at the end, makes the sequence [invalid](#invalid-sequences).
 
 Start with SwissProt (about 570k sequences). It downloads in minutes, so you can test the pipeline on it before a UniRef-scale run.
 

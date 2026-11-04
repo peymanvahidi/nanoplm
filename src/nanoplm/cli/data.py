@@ -1876,8 +1876,10 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
 
 def _dropped_lines(cwd: Path, params: dict, sources=None) -> str:
     """'Dropped: N invalid records' for each source whose check listed records for the
-    filter to drop, read from invalid_ids.txt in the validation folders dvc.yaml names.
-    Empty when nothing was dropped or a file is missing."""
+    filter to drop, read from invalid_ids.txt in the validation folders dvc.yaml names,
+    and 'Stop codons: N trailing '*' removed' from validation.json there.
+    Empty when nothing was dropped or removed, or a file is missing."""
+    import json
     try:
         graph = _stage_graph((cwd / "dvc.yaml").read_text(encoding="utf-8"), params)
     except (OSError, ValueError, AttributeError):
@@ -1886,25 +1888,31 @@ def _dropped_lines(cwd: Path, params: dict, sources=None) -> str:
               if outs and (name == "check" or name.endswith("-check")
                            or name.startswith("check-"))]
     if sources is None:
-        rows = [("Dropped:", d) for d in checks]
+        rows = [("", d) for d in checks]
     else:       # a mix: the validation folder each source's filter reads
-        rows = [(f"Dropped ({s}):", d) for s in sources
+        rows = [(f" ({s})", d) for s in sources
                 for d in checks if d in graph.get(f"{s}-filter", ((), ()))[0]]
     found = []
-    for label, d in rows:
+    for name, d in rows:
         folder = Path(d) if Path(d).is_absolute() else cwd / d
         try:
             with open(folder / "invalid_ids.txt", encoding="utf-8", errors="replace") as f:
                 n = sum(1 for line in f if line.strip())
         except OSError:
-            continue
+            n = 0
         if n:
-            found.append((label, n, folder))
+            found.append((f"Dropped{name}:", f"{n:,} invalid records, listed in "
+                                              f"{folder / 'invalid.fasta'}"))
+        try:
+            n = int(json.loads((folder / "validation.json").read_text())
+                    .get("trailing_stop_count", 0))
+        except (OSError, ValueError, AttributeError, TypeError):
+            n = 0
+        if n:
+            found.append((f"Stop codons{name}:", f"{n:,} trailing '*' removed"))
     # one source lines up with 'Manifest:'; a mix lines up with its longest label
     width = 16 if sources is None else max((len(f[0]) for f in found), default=0)
-    lines = [f"  {label:<{width}} {n:,} invalid records, listed in "
-             f"{folder / 'invalid.fasta'}\n" for label, n, folder in found]
-    return "".join(lines)
+    return "".join(f"  {label:<{width}} {text}\n" for label, text in found)
 
 
 def _clusters_line(m: dict) -> str:
