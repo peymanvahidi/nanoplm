@@ -9,10 +9,13 @@ The dispatch gather is fused into the up-projection GEMM (``A_idx=x_gather_idx``
 and the down-projection scatters/combines with the router weights — no
 materialized sorted-token buffer.
 
-Weight layout: nanoplm stores ``Wi=(E, H, I_out)`` and ``Wo=(E, I, H)``; SonicMoE
-expects ``w1=(I_out, H, E)`` and ``w2=(H, I, E)``. Both are passed as permuted
-views (the double permute is a no-op round trip — SonicMoE permutes back before
-the GEMM), and nothing else is done to them: no copy, no gather, no reorder.
+Weight layout: nanoplm stores stacked nn.Linear weights ``Wi=(E, I_out, H)`` and
+``Wo=(E, H, I)`` (``moe.EXPERT_LAYOUT_VERSION`` 2); SonicMoE expects
+``w1=(I_out, H, E)`` and ``w2=(H, I, E)`` with stride order ``(2, 0, 1)``, i.e.
+exactly that memory layout. Both are passed as ``permute(1, 2, 0)`` views and
+nothing else is done to them: no copy, no gather, no reorder. (Under expert
+layout version 1, ``(E, in, out)``, the same views were N-major instead of
+SonicMoE's K-major.)
 
 SwiGLU gate/up convention
 -------------------------
@@ -78,13 +81,13 @@ except Exception:  # pragma: no cover - future sonicmoe may rename these
 
 
 def _sonicmoe_w1(Wi: torch.Tensor) -> torch.Tensor:
-    """nanoplm ``Wi (E, H, I_out)`` -> SonicMoE ``w1 (I_out, H, E)`` view.
+    """nanoplm ``Wi (E, I_out, H)`` -> SonicMoE ``w1 (I_out, H, E)`` view.
 
     A pure view for both activations: ``srelu``/``relu_sq`` is ungated, and the
     gated layout already matches QuACK's interleaved gate-first split (see the
     module docstring).
     """
-    return Wi.permute(2, 1, 0)
+    return Wi.permute(1, 2, 0)
 
 
 def _routed_experts_fixed_topk(
@@ -198,8 +201,8 @@ def sonicmoe_routed_experts(
     x: torch.Tensor,
     indices: torch.Tensor,        # (T, top_k) selected expert ids
     weights: torch.Tensor,        # (T, top_k) combine weights (renormalized sigmoid)
-    Wi: torch.Tensor,             # (E, H, I_out)
-    Wo: torch.Tensor,             # (E, I, H)
+    Wi: torch.Tensor,             # (E, I_out, H)
+    Wo: torch.Tensor,             # (E, H, I)
     num_experts: int,
     top_k: int,
     srelu: bool,
@@ -225,7 +228,7 @@ def sonicmoe_routed_experts(
     scores = scores.contiguous()
 
     w1 = _sonicmoe_w1(Wi)                   # (I_out, H, E)
-    w2 = Wo.permute(2, 1, 0)                # (H,     I, E)
+    w2 = Wo.permute(1, 2, 0)                # (H,     I, E)
     activation = ActivationType.RELU_SQ if srelu else ActivationType.SWIGLU
 
     runner = _routed_experts_fixed_topk if _HAVE_FIXED_TOPK_PATH else _routed_experts_general

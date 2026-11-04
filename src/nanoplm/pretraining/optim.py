@@ -255,7 +255,8 @@ def build_muon_optimizer(
             else:
                 muon_params.append(param)
         elif param.ndim == 3 and _is_moe_routed_expert_param(name):
-            # MoE routed experts are stored as stacked 3D tensors for grouped_mm.
+            # MoE routed experts are stored as stacked 3D tensors for grouped_mm,
+            # (E, out, in) so each slice reads as nn.Linear.weight (see moe.py).
             # NorMuon/NorDion2 support batched updates, so keep these on the matrix
             # side instead of falling back to AdamW just because of the storage layout.
             muon_params.append(param)
