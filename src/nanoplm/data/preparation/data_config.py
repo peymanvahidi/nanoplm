@@ -5,8 +5,9 @@ Two layouts are accepted:
   sources layout   ``output_dir`` + ``sources: {name: spec}`` + ``data_params`` defaults.
                    Each source names a ``fasta``: a UniProt shortcut, a URL that is
                    downloaded, or a local file read in place.
-                   Any data_params field but val_ratio / val_size may be set on a source
-                   to override the default; the val size is set once (val_split).
+                   Any data_params field but val_ratio / val_size / shuffle / shuffle_seed
+                   may be set on a source to override the default; those four are set
+                   once, for all sources.
   data_dirs layout the old one: ``data_dirs.url`` / ``local_fasta`` and nine paths. It is
                    read as one source named "main" and every stage keeps its old shape.
 

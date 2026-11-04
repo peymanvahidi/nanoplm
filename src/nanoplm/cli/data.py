@@ -1878,7 +1878,7 @@ def _print_summary(cwd: Path, params: dict, kind: str, config_path: Path, cfg=No
 
 def _clusters_line(m: dict) -> str:
     """'UniRef50 clusters: 265 (members from UniRef90)', 'MMseqs2 clusters:  40', or
-    'Clusters:           40 (from the CL: tags)': every label padded to one width."""
+    'Clusters:          40 (from the CL: tags)': every label padded to one width."""
     level, n = m.get("cluster_level"), m.get("seqs_num")
     if level in ("uniref90", "uniref100"):
         label, note = "UniRef50 clusters:", f" (members from UniRef{level[len('uniref'):]})"
@@ -1904,7 +1904,8 @@ def _left_out_line(index_dir: Path) -> str:
     if left_out <= 0:
         return ""
     return (f"  Left out:        {left_out} clusters, their representative outside "
-            f"min/max_seq_len or invalid ({with_members} of them had in-range members)\n")
+            f"min/max_seq_len or invalid ({with_members} of them had members that passed "
+            f"the filter)\n")
 
 
 def _dataset_dir_line(manifest_path: Path, kind: str) -> str:

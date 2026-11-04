@@ -424,7 +424,7 @@ def test_summary_counts_clusters_and_names_the_members(tmp_path, capsys):
 
 @pytest.mark.parametrize("before_cap, line", [
     (150, "  Left out:        50 clusters, their representative outside min/max_seq_len or "
-          "invalid (30 of them had in-range members)\n"),
+          "invalid (30 of them had members that passed the filter)\n"),
     (200, None),
 ])
 def test_summary_counts_clusters_left_out_by_the_filter(tmp_path, capsys, before_cap, line):

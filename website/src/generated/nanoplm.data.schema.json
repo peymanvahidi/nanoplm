@@ -66,7 +66,7 @@
           }
         }
       },
-      "description": "One entry per source, keyed by a name you pick (letters, digits and _). Each names a fasta to build from. Any data_params field but val_ratio / val_size set on a source overrides the default for that source. Several sources make a mix: each is built on its own and training draws from them by weight."
+      "description": "One entry per source, keyed by a name you pick (letters, digits and _). Each names a fasta to build from. Any data_params field but val_ratio, val_size, shuffle and shuffle_seed set on a source overrides the default for that source. Several sources make a mix: each is built on its own and training draws from them by weight."
     },
     "data_params": {
       "type": "object",
