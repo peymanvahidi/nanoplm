@@ -15,6 +15,7 @@ def _tiny_config(*, use_mhc_lite: bool, wrapping_level: str):
         mhc_n_streams=3,
         mhc_triton_fused=False,
         mhc_lite_wrapping_level=wrapping_level,
+        no_mlp_on_first_layer=False,  # layer 0 gets both sublayer blocks
         use_canon_layers=False,
         use_repo=False,
     )

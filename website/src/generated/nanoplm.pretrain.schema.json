@@ -300,7 +300,7 @@
           "type": "boolean",
           "default": true,
           "x-nanoplm-group": "mHC-lite (pure_torch only)",
-          "description": "fused Triton stream ops; first run slow (autotune)",
+          "description": "fused mHC kernels (CuTe on GH200 at C=1024 with cutlass-dsl >= 4.5, else Triton v2)",
           "x-nanoplm-visible-when": {
             "field": "use_mhc_lite",
             "op": "==",
@@ -532,6 +532,12 @@
           "default": "sonicmoe",
           "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
           "description": "cutlass | sonicmoe  (SonicMoE/quack fused path)"
+        },
+        "moe_nan_guard": {
+          "type": "boolean",
+          "default": false,
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "description": "skip and log a step with a NaN instead of crashing (+1 host sync/step)"
         },
         "use_huginn_looping": {
           "type": "boolean",
@@ -1592,7 +1598,7 @@
             "continue",
             "decay"
           ],
-          "description": "FOOTGUN: the stock default mode is \"decay\". Flipping only is_resume: true starts a decay run, not a continuation. Always set mode explicitly. Two resume modes: continue - finish the original token/step budget from the checkpoint with the original schedule. Takes NO decay_* fields. decay - anneal a stable-end trunk checkpoint over an additional budget. Set exactly one of decay_tokens / decay_steps. decay_shape is OPTIONAL (falls back to schedule default). lr_decay_to_fraction is REQUIRED for mode: decay. NOTE: decay restarts the dataloader from the start of a pass, so a resume-decay matches a single-run wsd decay bit-for-bit only when the trunk's stable->decay boundary is data-pass aligned; keep global_batch_tokens / world_size identical to the trunk's run. continue | decay"
+          "description": "FOOTGUN: the stock default mode is \"decay\". Flipping only is_resume: true starts a decay run, not a continuation. Always set mode explicitly. Two resume modes: continue - finish the original token/step budget from the checkpoint with the original schedule. Takes NO decay_* fields. decay - anneal a stable-end trunk checkpoint over an additional budget. Set exactly one of decay_tokens / decay_steps. decay_shape is OPTIONAL (falls back to schedule default). lr_decay_to_fraction is REQUIRED for mode: decay. NOTE: decay continues the dataloader from the trunk's saved position, so it sees the data a single-run wsd decay would; keep global_batch_tokens / world_size identical to the trunk's run. The masking RNG is not restored, so weights match a single-run wsd decay bit-for-bit only when the trunk's stable->decay boundary is pass-aligned. continue | decay"
         },
         "decay_tokens": {
           "type": "integer",

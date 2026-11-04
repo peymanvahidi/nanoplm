@@ -92,7 +92,7 @@ model:
   use_mhc_lite: false
   mhc_n_streams: 4                      # residual streams (n! permutation matrices)
   mhc_lite_wrapping_level: "layer"      # layer | sublayers
-  mhc_triton_fused: true                # fused Triton stream ops; first run slow (autotune)
+  mhc_triton_fused: true                # fused mHC kernels (CuTe on GH200 at C=1024 with cutlass-dsl >= 4.5, else Triton v2)
 
   # ── Differential attention & paired heads (pure_torch only) ───────────────
 
@@ -130,6 +130,7 @@ model:
   moe_bias_update_rate: 1e-3            # expert-bias correction step size
   moe_leading_dense_layers: 1           # first N layers stay dense (DeepSeek uses 1)
   moe_kernel_backend: 'sonicmoe'        # cutlass | sonicmoe  (SonicMoE/quack fused path)
+  moe_nan_guard: false                  # skip and log a step with a NaN instead of crashing (+1 host sync/step)
 
   # ── Recycling / Huginn looping (pure_torch only) ──────────────────────────
 
@@ -388,10 +389,11 @@ resume:
   #   Set exactly one of decay_tokens / decay_steps. decay_shape is OPTIONAL
   #   (falls back to schedule default). lr_decay_to_fraction is REQUIRED for
   #   mode: decay.
-  #   NOTE: decay restarts the dataloader from the start of a pass, so a
-  #   resume-decay matches a single-run wsd decay bit-for-bit only when the
-  #   trunk's stable->decay boundary is data-pass aligned; keep
-  #   global_batch_tokens / world_size identical to the trunk's run.
+  #   NOTE: decay continues the dataloader from the trunk's saved position,
+  #   so it sees the data a single-run wsd decay would; keep
+  #   global_batch_tokens / world_size identical to the trunk's run. The
+  #   masking RNG is not restored, so weights match a single-run wsd decay
+  #   bit-for-bit only when the trunk's stable->decay boundary is pass-aligned.
   mode: "decay"                         # continue | decay
 
   # ── Decay-mode fields (omit / null for mode: continue) ────────────────────

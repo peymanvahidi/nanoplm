@@ -88,13 +88,13 @@ def test_commented_out_step_override_is_not_attached_as_description():
 
 def test_same_key_comment_prose_is_kept():
     by_key = {(f.section, f.key): f for f in templates.parse_fields(templates.load_template_text("pretrain"))}
-    # Prose shaped like `Word: ...` (`# NOTE: decay restarts the dataloader ...`)
+    # Prose shaped like `Word: ...` (`# NOTE: decay continues the dataloader ...`)
     # and plain headings (`# Two resume modes:`) are documentation for the field
     # below them and must be retained (no over-correction), together with the
     # field's own end-of-line comment.
     mode = by_key[("resume", "mode")]
     assert "Two resume modes" in mode.description
-    assert "decay restarts the dataloader" in mode.description
+    assert "decay continues the dataloader" in mode.description
     assert "continue | decay" in mode.description
     # A `# decay-mode fields (leave null / omit for mode: continue):` heading is
     # prose too, not a commented-out field. It opens its banner's block, so it is

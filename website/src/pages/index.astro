@@ -9,7 +9,6 @@
 // It still imports the docs stylesheet, so every colour, font and light/dark
 // override comes from the one place that already defines them. Nothing about
 // the palette is restated here; if custom.css changes, this page follows.
-import fs from 'node:fs';
 import { Image } from 'astro:assets';
 import logo from '../assets/nanoplm-logo.png';
 import tumLogo from '../assets/logo-tum.svg';
@@ -24,58 +23,10 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const GITHUB = 'https://github.com/peymanvahidi/nanoplm';
 const PYPI = 'https://pypi.org/project/nanoplm/';
 
-// Read the version from the package metadata instead of hardcoding it. The docs
-// already generate their reference tables from the source of truth so they
-// cannot go stale; the one number on the landing page should not be the
-// exception that quietly rots.
-let version = '';
-try {
-  const pyproject = fs.readFileSync(new URL('../../../pyproject.toml', import.meta.url), 'utf8');
-  version = pyproject.match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? '';
-} catch {
-  // A missing pyproject only costs us the version chip, so render without it.
-}
-
 const title = 'nanoPLM: from FASTA to a protein language model';
 const description =
   'nanoPLM pretrains a protein language model from a FASTA file. Three YAML files, six commands, and reproducible artifacts that flow between them.';
 const ogImage = new URL(logo.src, Astro.site).href;
-
-// The quickstart, split so each block gets its own copy button. These are the
-// same commands as the install docs; the section links there for the full story
-// (clusters, verification, the eval extra) rather than duplicating it.
-const STEPS = [
-  {
-    n: '01',
-    title: 'Install',
-    body: 'One pinned GPU stack: torch, Transformer Engine, FlashAttention-3, SonicMoE and Dion.',
-    code: `uv venv && source .venv/bin/activate
-uv pip install "nanoplm @ git+https://github.com/peymanvahidi/nanoplm" \\
-    --extra-index-url https://download.pytorch.org/whl/cu130
-nanoplm deps install`,
-  },
-  {
-    n: '02',
-    title: 'Prepare data',
-    body: 'FASTA in, tokenized shards out, tracked by DVC and described by a manifest.',
-    code: `nanoplm data get-yaml
-nanoplm data from-yaml`,
-  },
-  {
-    n: '03',
-    title: 'Pretrain',
-    body: 'Shards in, a checkpoint out. The manifest tells pretraining what the data stage decided.',
-    code: `nanoplm pretrain get-yaml
-nanoplm pretrain from-yaml`,
-  },
-  {
-    n: '04',
-    title: 'Evaluate',
-    body: 'A checkpoint in, benchmark scores out, via biotrainer’s autoeval pipeline.',
-    code: `nanoplm eval get-yaml
-nanoplm eval from-yaml`,
-  },
-];
 
 // `hue` walks the logo left to right, so the six cards together replay the
 // wordmark's own sweep rather than repeating one accent six times.
@@ -219,12 +170,9 @@ const AFFILIATIONS = [
         <div class="hero-glow" aria-hidden="true"></div>
         <div class="shell hero-grid">
           <div class="hero-copy">
-            <p class="eyebrow">
-              <span class="dot" aria-hidden="true"></span>
-              Encoder-only protein language models
-              {version && <span class="ver">v{version}</span>}
-            </p>
-
+            <div class="hero-logo" id="hero-logo">
+              <Image src={logo} alt="nanoPLM" height={84} densities={[1, 2]} loading="eager" />
+            </div>
             {/* Broken by hand into three lines. Left to wrap on its own the
                 article "a" ends up orphaned on a line of its own, and the
                 headline is short enough that these breaks hold down to 320px. */}
@@ -257,22 +205,9 @@ const AFFILIATIONS = [
               </a>
             </div>
 
-            <div class="install-line">
+            <div class="install-line soon" aria-disabled="true">
               <code>uv pip install nanoplm &amp;&amp; nanoplm deps install</code>
-              <button
-                class="copy"
-                type="button"
-                data-copy="uv pip install nanoplm && nanoplm deps install"
-                aria-label="Copy install command"
-              >
-                <svg class="i-copy" viewBox="0 0 24 24" aria-hidden="true"
-                  ><rect width="14" height="14" x="8" y="8" rx="2"></rect><path
-                    d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path></svg
-                >
-                <svg class="i-check" viewBox="0 0 24 24" aria-hidden="true"
-                  ><path d="M20 6 9 17l-5-5"></path></svg
-                >
-              </button>
+              <span class="soon-tag">Soon on PyPI</span>
             </div>
             <p class="fineprint">
               Hopper GPU and CUDA 13 required. <a href={`${base}/start/install/`}>Full install</a>.
@@ -280,7 +215,7 @@ const AFFILIATIONS = [
           </div>
 
           <!-- A real session, not a mockup of one: these are the commands from
-               the quickstart and the log lines the pretrain loop actually
+               the pipeline and the log lines the pretrain loop actually
                prints. The lines fade in one by one on load, and appear at once
                when reduced motion is requested. -->
           <div class="term" data-reveal-seq>
@@ -373,12 +308,12 @@ const AFFILIATIONS = [
 
           <div class="why" data-reveal>
             <p>
-              Protein language modelling borrowed its playbook from natural language processing,
-              then fell behind it. New architectures, optimizers and training methods land in NLP
-              almost weekly, while protein models see a new state of the art every year or two.
+              Protein language modelling grew out of natural language processing, and there is
+              still a lot to bring over. New architectures, optimizers and training methods appear
+              in NLP almost every week. nanoPLM makes it easy to test them on proteins.
             </p>
             <p>
-              That gap is not a shortage of scientific interest. Training a pLM from scratch means
+              What slows this down is not a shortage of scientific interest. Training a pLM from scratch means
               multi-GPU setups, input pipelines fast enough to keep the GPUs fed, batch
               construction, sequence packing, and a long tail of choices that sit well outside most
               computational biologists' day job. So the realistic options are months of
@@ -390,42 +325,6 @@ const AFFILIATIONS = [
               have. <strong>What is missing is the tooling.</strong>
             </p>
           </div>
-        </div>
-      </section>
-
-      <!-- ================= THE LOOP ================= -->
-      <section class="band alt" id="loop">
-        <div class="shell">
-          <header class="sec-head" data-reveal>
-            <p class="kicker">The loop</p>
-            <h2>Every stage has the same two verbs</h2>
-            <p class="sub">
-              Learn the loop once and you know the whole tool. <code>get-yaml</code> scaffolds a
-              fully commented config, you edit it, <code>from-yaml</code> runs it. Shown for
-              pretraining; swap in <code>data</code> or <code>eval</code> and the shape is identical.
-            </p>
-          </header>
-
-          <ol class="loop" data-reveal>
-            <li style="--h: var(--c-indigo)">
-              <span class="loop-n">1</span>
-              <h3>Scaffold</h3>
-              <p>A config with every key explained in place, written to your working directory.</p>
-              <code class="loop-code"><i>$</i> nanoplm pretrain get-yaml</code>
-            </li>
-            <li style="--h: var(--c-cyan)">
-              <span class="loop-n">2</span>
-              <h3>Edit</h3>
-              <p>Change what your experiment needs. Every field is commented in place, so you rarely leave the file.</p>
-              <code class="loop-code"><i>#</i> $EDITOR pretrain.yaml</code>
-            </li>
-            <li style="--h: var(--c-violet)">
-              <span class="loop-n">3</span>
-              <h3>Run</h3>
-              <p>The config is the run. Rerunning the same file reproduces the same result.</p>
-              <code class="loop-code"><i>$</i> nanoplm pretrain from-yaml</code>
-            </li>
-          </ol>
         </div>
       </section>
 
@@ -454,49 +353,6 @@ const AFFILIATIONS = [
               >
             </a>
           </p>
-        </div>
-      </section>
-
-      <!-- ================= QUICKSTART ================= -->
-      <section class="band alt" id="quickstart">
-        <div class="shell">
-          <header class="sec-head" data-reveal>
-            <p class="kicker">Quickstart</p>
-            <h2>Zero to a trained model</h2>
-            <p class="sub">
-              The defaults are wired to chain: <code>data.yaml</code> writes shards exactly where
-              <code>pretrain.yaml</code> looks for them. The one value the defaults cannot guess is
-              <code>eval.checkpoint_dir</code>, so point that at the run you just trained.
-            </p>
-          </header>
-
-          <ol class="steps">
-            {
-              STEPS.map((s) => (
-                <li data-reveal>
-                  <div class="step-head">
-                    <span class="step-n">{s.n}</span>
-                    <div>
-                      <h3>{s.title}</h3>
-                      <p>{s.body}</p>
-                    </div>
-                  </div>
-                  <div class="code-card">
-                    <button class="copy" type="button" data-copy={s.code} aria-label={`Copy the ${s.title.toLowerCase()} commands`}>
-                      <svg class="i-copy" viewBox="0 0 24 24" aria-hidden="true">
-                        <rect width="14" height="14" x="8" y="8" rx="2" />
-                        <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
-                      </svg>
-                      <svg class="i-check" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M20 6 9 17l-5-5" />
-                      </svg>
-                    </button>
-                    <pre><code>{s.code}</code></pre>
-                  </div>
-                </li>
-              ))
-            }
-          </ol>
         </div>
       </section>
 
@@ -652,25 +508,22 @@ const AFFILIATIONS = [
         </nav>
       </div>
       <div class="shell foot-legal">
-        <p>MIT licensed. Copyright &copy; 2025 Peyman Vahidi.</p>
+        <p>MIT licensed. Copyright &copy; 2025 The nanoPLM development team.</p>
         <a href="#top" class="to-top">Back to top</a>
       </div>
     </footer>
 
     <script>
-      // Copy buttons. The button swaps to a check for a moment, which is the
-      // only feedback a copy action can honestly give.
-      document.querySelectorAll<HTMLButtonElement>('button[data-copy]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          try {
-            await navigator.clipboard.writeText(btn.dataset.copy ?? '');
-            btn.classList.add('copied');
-            setTimeout(() => btn.classList.remove('copied'), 1600);
-          } catch {
-            // Clipboard access can be denied; the text is selectable anyway.
-          }
-        });
-      });
+      // Show the nav logo only once the hero logo has scrolled out of view.
+      const heroLogo = document.getElementById('hero-logo');
+      const brand = document.querySelector('.brand');
+      if (heroLogo && brand && 'IntersectionObserver' in window) {
+        new IntersectionObserver(([entry]) => {
+          brand.classList.toggle('shown', !entry.isIntersecting);
+        }).observe(heroLogo);
+      } else {
+        brand?.classList.add('shown');
+      }
 
       // Theme toggle, writing the key Starlight reads so the choice carries
       // over to the docs and back.
@@ -861,8 +714,6 @@ const AFFILIATIONS = [
          that can contain code is allowed to shrink instead, which lets the code
          scroll inside its own box the way it should. */
       .hero-grid > *,
-      .loop li,
-      .steps li,
       .card,
       .install-grid > *,
       .reqs > div,
@@ -907,6 +758,24 @@ const AFFILIATIONS = [
         display: flex;
         align-items: center;
         flex-shrink: 0;
+      }
+      /* The hero carries the full-size logo, so the nav copy stays out of the way
+         until the hero logo scrolls off screen (see the script at the bottom). */
+      .brand {
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.25s ease;
+      }
+      .brand.shown {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      .hero-logo {
+        margin-bottom: 1.25rem;
+      }
+      .hero-logo :global(img) {
+        width: min(100%, 30rem);
+        height: auto;
       }
       .nav-links {
         display: none;
@@ -1112,52 +981,10 @@ const AFFILIATIONS = [
         }
       }
 
-      .eyebrow {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        margin-bottom: 1.5rem;
-        padding: 0.3rem 0.75rem 0.3rem 0.6rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 999px;
-        background: var(--surface);
-        font-size: 0.775rem;
-        font-weight: 500;
-        color: var(--sl-color-gray-2);
-      }
-      .dot {
-        width: 0.4rem;
-        height: 0.4rem;
-        border-radius: 999px;
-        background: var(--sl-color-accent);
-      }
-      @media (prefers-reduced-motion: no-preference) {
-        .dot {
-          animation: pulse 2.6s ease-in-out infinite;
-        }
-      }
-      @keyframes pulse {
-        0%,
-        100% {
-          opacity: 1;
-        }
-        50% {
-          opacity: 0.35;
-        }
-      }
-      .ver {
-        padding-left: 0.55rem;
-        border-left: 1px solid var(--sl-color-hairline-shade);
-        font-family: var(--sl-font-mono);
-        font-size: 0.72rem;
-        color: var(--sl-color-accent-high);
-      }
-
       h1 {
-        /* The lower bound is set by "Foundation Model", the longest of the three
-           hand-broken lines: at 2.25rem it fills a 320px screen to the pixel, so
-           any font-metric difference would wrap it and strand a word. */
-        font-size: clamp(2.05rem, 6.2vw, 3.65rem);
+        /* A subtitle under the hero logo, so it is sized well below a headline.
+           The three hand-broken lines fit a 320px screen with room to spare. */
+        font-size: clamp(1.4rem, 3.2vw, 2rem);
         line-height: 1.06;
         letter-spacing: -0.033em;
         font-weight: 700;
@@ -1239,50 +1066,20 @@ const AFFILIATIONS = [
         text-underline-offset: 3px;
       }
 
-      /* Copy button: 44px hit area, icon crossfade on success. */
-      .copy {
-        position: relative;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
+      /* Not on PyPI yet: the command is shown greyed out, without a copy button. */
+      .install-line.soon code {
+        color: var(--sl-color-gray-4);
+        user-select: none;
+      }
+      .soon-tag {
         flex-shrink: 0;
-        width: 2.2rem;
-        height: 2.2rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 0.45rem;
-        background: var(--surface-2);
-        color: var(--sl-color-gray-3);
-        cursor: pointer;
-        transition:
-          color 0.18s ease,
-          border-color 0.18s ease;
-      }
-      .copy::after {
-        /* Pads the pointer target out to 44px without moving the visual box. */
-        content: '';
-        position: absolute;
-        inset: -0.6rem;
-      }
-      .copy:hover {
+        padding: 0.2rem 0.6rem;
+        border: 1px solid var(--sl-color-accent);
+        border-radius: 999px;
+        font-size: 0.72rem;
+        font-weight: 500;
+        white-space: nowrap;
         color: var(--sl-color-accent-high);
-        border-color: var(--sl-color-accent);
-      }
-      .copy svg {
-        width: 0.95rem;
-        height: 0.95rem;
-      }
-      .copy .i-check {
-        display: none;
-      }
-      .copy.copied {
-        color: var(--sl-color-accent);
-        border-color: var(--sl-color-accent);
-      }
-      .copy.copied .i-copy {
-        display: none;
-      }
-      .copy.copied .i-check {
-        display: block;
       }
 
       /* --- Terminal --------------------------------------------------------- */
@@ -1612,155 +1409,12 @@ const AFFILIATIONS = [
         transform: translateX(3px);
       }
 
-      /* --- The loop --------------------------------------------------------- */
-      .loop {
-        display: grid;
-        gap: 1rem;
-        counter-reset: loop;
-      }
-      /* Three across only once a card is wide enough for a whole command on one
-         line. Below that the stacked layout wins, because a command clipped
-         mid-word reads as broken in a way a taller card does not. */
-      @media (min-width: 54rem) {
-        .loop {
-          grid-template-columns: repeat(3, 1fr);
-        }
-        .loop-code {
-          font-size: 0.72rem;
-        }
-      }
-      .loop li {
-        position: relative;
-        padding: 1.6rem 1.5rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 0.75rem;
-        background: var(--surface);
-      }
-      /* A connector between the three steps, so they read as one loop rather
-         than three unrelated cards. Wide screens only, where they sit in a row. */
-      @media (min-width: 54rem) {
-        .loop li:not(:last-child)::after {
-          content: '';
-          position: absolute;
-          top: 2.55rem;
-          right: -1rem;
-          width: 1rem;
-          border-top: 1px dashed var(--sl-color-gray-4);
-        }
-      }
-      .loop-n {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 1.7rem;
-        height: 1.7rem;
-        border-radius: 999px;
-        background: color-mix(in srgb, var(--h) 16%, transparent);
-        font-family: var(--sl-font-mono);
-        font-size: 0.78rem;
-        font-weight: 600;
-        color: var(--h);
-      }
-      .loop h3 {
-        margin-top: 0.85rem;
-        font-size: 1.1rem;
-        font-weight: 650;
-        letter-spacing: -0.015em;
-      }
-      .loop p {
-        margin-top: 0.4rem;
-        font-size: 0.9rem;
-        line-height: 1.6;
-        color: var(--sl-color-gray-3);
-      }
-      .loop-code {
-        display: block;
-        margin-top: 1.1rem;
-        padding-top: 0.9rem;
-        border-top: 1px solid var(--sl-color-hairline-shade);
-        font-size: 0.76rem;
-        color: var(--sl-color-gray-2);
-        overflow-x: auto;
-        white-space: nowrap;
-      }
-      .loop-code i {
-        font-style: normal;
-        color: var(--h);
-      }
-
       /* --- Pipeline host ----------------------------------------------------- */
       /* PipelineDiagram is a container-query component sized for the 50rem prose
          column, so it is given exactly that much room and centred here. */
       .pipe-host {
         max-width: 54rem;
         margin-inline: auto;
-      }
-
-      /* --- Quickstart steps -------------------------------------------------- */
-      .steps {
-        display: grid;
-        gap: 1rem;
-      }
-      @media (min-width: 56rem) {
-        .steps {
-          grid-template-columns: repeat(2, 1fr);
-          gap: 1.25rem;
-        }
-      }
-      .steps li {
-        display: flex;
-        flex-direction: column;
-        padding: 1.6rem 1.5rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 0.75rem;
-        background: var(--surface);
-      }
-      .step-head {
-        display: flex;
-        gap: 0.9rem;
-      }
-      .step-n {
-        flex-shrink: 0;
-        font-family: var(--sl-font-mono);
-        font-size: 0.78rem;
-        font-weight: 600;
-        line-height: 1.7;
-        color: var(--sl-color-accent);
-      }
-      .steps h3 {
-        font-size: 1.1rem;
-        font-weight: 650;
-        letter-spacing: -0.015em;
-      }
-      .steps .step-head p {
-        margin-top: 0.35rem;
-        font-size: 0.9rem;
-        line-height: 1.6;
-        color: var(--sl-color-gray-3);
-      }
-      .code-card {
-        position: relative;
-        margin-top: 1.2rem;
-        border: 1px solid var(--sl-color-hairline-shade);
-        border-radius: 0.55rem;
-        background: color-mix(in srgb, var(--sl-color-bg) 70%, var(--surface-2));
-      }
-      :global([data-theme='light']) .code-card {
-        background: #f2f6f6;
-      }
-      .code-card .copy {
-        position: absolute;
-        top: 0.5rem;
-        right: 0.5rem;
-        z-index: 1;
-      }
-      .code-card pre {
-        margin: 0;
-        padding: 0.9rem 3rem 0.9rem 1rem;
-        overflow-x: auto;
-        font-size: 0.775rem;
-        line-height: 1.75;
-        color: var(--sl-color-gray-1);
       }
 
       /* --- Feature cards ----------------------------------------------------- */

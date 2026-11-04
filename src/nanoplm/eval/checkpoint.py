@@ -14,6 +14,7 @@ import yaml
 from nanoplm.data.infra.atomic import atomic_write_path
 from nanoplm.pretraining.fp8 import convert_fp8_targets
 from nanoplm.pretraining.models.modern_bert.model import ProtModernBertMLMConfig
+from nanoplm.pretraining.models.modern_bert.modeling import check_mhc_checkpoint
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.utils import checkpoint_step as _checkpoint_step
 from nanoplm.utils.common import git_sha
@@ -302,6 +303,7 @@ def load_checkpoint(
     model = PureProtModernBertMLM(config)
     pretrain_cfg = _pretrain_config_from_checkpoint(checkpoint_dir)
     _apply_training_mlp_layout(model, pretrain_cfg, device)
+    check_mhc_checkpoint(model, state_dict)
     model.load_state_dict(state_dict, strict=True)
     if device.type == "cuda" and next(model.parameters()).device.type != "cuda":
         model.to(device)

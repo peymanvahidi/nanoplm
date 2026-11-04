@@ -98,7 +98,7 @@ def test_run_reports_an_unknown_name_as_one_error_line(monkeypatch):
 def test_names_match_biotrainer():
     autoeval = pytest.importorskip(
         "biotrainer_core.data_classes.autoeval",
-        reason="requires the nanoplm[eval] extra",
+        reason="requires biotrainer",
     )
     assert set(PBC_SUPERVISED_DATASETS) == set(
         autoeval.all_pbc_supervised_datasets()

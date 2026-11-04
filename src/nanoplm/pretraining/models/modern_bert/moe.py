@@ -295,9 +295,12 @@ class Router(nn.Module):
         bias_correction: bool = True,
         n_group: int = 1,
         topk_group: int = 1,
+        nan_guard: bool = False,
     ):
         super().__init__()
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+        # Same value on every layer, so dynamo guards once and keeps one graph.
+        self.nan_guard = bool(nan_guard)
         self.num_experts = num_experts
         self.top_k = top_k
         self.n_group = n_group
@@ -396,6 +399,14 @@ class Router(nn.Module):
         indices, counts = _router_topk_indices(
             selection_logits, self.top_k, self.track_expert_counts,
         )
+        if self.nan_guard and self.training:
+            # An all-NaN row comes back from the fused top-k as an out-of-bounds
+            # sentinel, and the gather below would abort the job on it. Keep the
+            # index in range so the forward finishes with a non-finite loss that
+            # the pipeline's skip path discards. Training only: in eval there is
+            # no skip path, so a NaN still aborts loudly. Out-of-place, because
+            # the gather saves `indices` for backward.
+            indices = indices.clamp(0, self.num_experts - 1)
 
         # Combine weights come from the *unbiased* sigmoid scores.
         if self.correction_bias is not None:
@@ -437,6 +448,7 @@ class MoELayer(nn.Module):
             bias_correction=config.moe_use_bias_correction,
             n_group=config.moe_n_group,
             topk_group=config.moe_topk_group,
+            nan_guard=config.moe_nan_guard,
         )
 
         # Routed expert weights — stacked for grouped_gemm.
