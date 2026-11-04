@@ -300,7 +300,8 @@ def test_a_block_without_clusters_lists_the_four_choices(block):
     cfg["sources"]["src"]["cluster_subsampling"] = block
     with pytest.raises(DataConfigError) as e:
         _plan(cfg)
-    assert str(e.value) == ("sources.src.cluster_subsampling.clusters is required: "
+    key = "clustering" if "clustering" in block else "clusters"  # the key the user wrote
+    assert str(e.value) == (f"sources.src.cluster_subsampling.{key} is required: "
                             + CHOICES_TEXT)
 
 
