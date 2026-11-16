@@ -78,6 +78,10 @@ Continue reads the *original* schedule back out of the checkpoint's `training_st
 
 Nothing in `pretraining:` needs to change. Continue does not take a new budget, a new peak LR, or a new schedule.
 
+:::note[Unless the resume warns about the Muon orthogonalizer]
+Resume (both modes) warns with `Muon orthogonalizer changed on resume` when the current config orthogonalizes Muon updates differently from the checkpoint, typically a Polar Express run resumed after Gram Newton-Schulz became the default. The warning lists the `pretraining:` flags that restore the checkpoint's orthogonalizer. For Polar Express that is `muon_use_polar_express: true` and `muon_use_gram_newton_schulz: false` (see [Optimizers](/nanoplm/guides/optimizers/#leave-the-muon-internals-alone)).
+:::
+
 :::caution[The scaffold does not ship a continue block]
 `nanoplm pretrain get-yaml` writes `mode: "decay"` with `decay_tokens`, `decay_shape`, and `lr_decay_to_fraction` already filled in. Two consequences:
 

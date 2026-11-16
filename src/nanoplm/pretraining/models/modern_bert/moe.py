@@ -26,6 +26,7 @@ unaffected. See ``WI_GATED_LAYOUT_VERSION``.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 import torch
@@ -52,8 +53,10 @@ from .moe_triton_ops import (
 # The two conventions are *different functions of the same weights*, so a v1
 # checkpoint loaded by v2 code would silently re-pair gate/up and destroy the
 # run. Every gated ``MoELayer`` therefore carries the version as a persistent
-# buffer and refuses to load a state_dict that does not match; use
-# ``convert_wi_state_dict_v1_to_v2`` to migrate.
+# buffer and refuses to load a state_dict that does not match. A gate/up v1
+# checkpoint also predates expert layout 2, so this build refuses it as pre-#170
+# (see ``EXPERT_LAYOUT_VERSION``); ``convert_wi_state_dict_v1_to_v2`` is kept for
+# use with a pre-#170 build.
 WI_GATED_LAYOUT_VERSION = 2
 _WI_LAYOUT_BUFFER = "_wi_gated_layout_version"
 
@@ -81,8 +84,8 @@ def convert_wi_state_dict_v1_to_v2(
 
     ``Wo`` is indexed by intermediate unit under both conventions and is left
     alone. Gate/up version 1 predates ``EXPERT_LAYOUT_VERSION`` 2, so this works
-    on the ``(E, H, 2I)`` expert layout; follow it with
-    ``convert_expert_layout_v1_to_v2``.  A ``Wi`` is treated as gated iff its sibling ``Wo`` says so
+    on the ``(E, H, 2I)`` expert layout, which only nanoPLM builds before that
+    change can load.  A ``Wi`` is treated as gated iff its sibling ``Wo`` says so
     (``Wi.shape[-1] == 2 * Wo.shape[-2]``), so an sReLU checkpoint is a no-op
     and this is safe to run over anything.
 
@@ -154,88 +157,123 @@ def convert_wi_state_dict_v1_to_v2(
 # ``Wi`` 1.33x) and NorMuon normalized per *input* unit instead of per output
 # neuron. Input units of ``Wo`` (intermediate units) go dormant in sparse
 # experts; output neurons do not. Every ``MoELayer`` carries the version as a
-# persistent buffer and refuses a mismatched state_dict; migrate with
-# ``convert_expert_layout_v1_to_v2``.
+# persistent buffer and refuses a mismatched state_dict (see
+# ``check_moe_checkpoint``). Version-1 checkpoints are not converted: resume or
+# evaluate them with a nanoPLM commit from before this change (``_PRE_170_COMMIT``).
 EXPERT_LAYOUT_VERSION = 2
 _EXPERT_LAYOUT_BUFFER = "_expert_layout_version"
+# Last master commit before PR #170 changed the expert layout.
+_PRE_170_COMMIT = "7fbb03a"
 
 
-def _is_routed_expert_pair(state_dict: dict, wi_key: str) -> bool:
-    wi = state_dict.get(wi_key)
-    wo = state_dict.get(wi_key[: -len("Wi")] + "Wo")
-    return (
-        torch.is_tensor(wi) and torch.is_tensor(wo)
-        and wi.ndim == 3 and wo.ndim == 3 and wi.shape[0] == wo.shape[0]
-    )
+def _describe_layers(prefixes: list[str]) -> str:
+    """``["model.layers.4.mlp.", "model.layers.5.mlp."]`` -> ``model.layers.{4..5}.mlp``."""
+    names = [p[:-1] if p.endswith(".") else p for p in prefixes]
+    groups: dict[tuple[str, str], list[int]] = {}
+    plain: list[str] = []
+    for n in names:
+        m = re.match(r"^(.*?\.)(\d+)((?:\..*)?)$", n)
+        if m is None:
+            plain.append(n or "<root>")
+        else:
+            groups.setdefault((m.group(1), m.group(3)), []).append(int(m.group(2)))
+    out = list(dict.fromkeys(plain))
+    for (head, tail), idx in groups.items():
+        idx = sorted(set(idx))
+        if len(idx) == 1:
+            out.append(f"{head}{idx[0]}{tail}")
+            continue
+        runs, start = [], idx[0]
+        for a, b in zip(idx, idx[1:] + [None]):
+            if b != a + 1:
+                runs.append(str(start) if start == a else f"{start}..{a}")
+                start = b
+        out.append(f"{head}{{{','.join(runs)}}}{tail}")
+    return ", ".join(out)
 
 
-def convert_expert_layout_v1_to_v2(
-    state_dict: dict,
-    optimizer_state_dict: Optional[dict] = None,
-) -> list[str]:
-    """Migrate a version-1 ``(E, in, out)`` checkpoint to ``(E, out, in)`` in place.
+def _format_layout_errors(items: list[tuple[str, str, object]]) -> list[str]:
+    """One message per kind of problem, naming every affected MoE layer.
 
-    Transposes the last two dims of every routed-expert ``Wi`` and ``Wo`` and
-    writes the version marker. Run ``convert_wi_state_dict_v1_to_v2`` *first*
-    on checkpoints older than 2026-08-06 (it works on the version-1 expert
-    layout).
-
-    **Optimizer state** (pass ``optimizer_state_dict`` when resuming): every
-    per-element state tensor shaped like the old weight (Muon/NorMuon
-    ``momentum``, AdamW ``exp_avg``/``exp_avg_sq``) is transposed too. NorMuon's
-    ``variance_neuron`` is a per-row statistic of the *old* rows (input units),
-    which has no counterpart on the new rows, so it is reset to zeros of the new
-    shape; NorMuon then rebuilds it from the next updates (its EMA makes the
-    first update per row at most ``1/sqrt(1 - muon_beta2)`` larger than steady
-    state, and the Frobenius rescale bounds the whole update). Omitting the
-    optimizer state is only correct if it is being discarded.
-
-    Returns the list of converted parameter keys.
+    ``items`` are ``(kind, prefix, detail)`` from ``MoELayer._layout_marker_errors``
+    (plus ``"no_wi"`` from ``check_moe_checkpoint``).
     """
-    converted: list[str] = []
-    old_shapes: dict[str, torch.Size] = {}
-    for wi_key in [k for k in state_dict if k.endswith("Wi")]:
-        if not _is_routed_expert_pair(state_dict, wi_key):
-            continue  # dense nn.Linear Wi (2-D) or not a routed-expert pair
-        prefix = wi_key[: -len("Wi")]
-        for key in (wi_key, prefix + "Wo"):
-            old_shapes[key] = state_dict[key].shape
-            state_dict[key] = state_dict[key].transpose(-1, -2).contiguous()
-            converted.append(key)
-        state_dict[prefix + _EXPERT_LAYOUT_BUFFER] = torch.tensor(
-            [EXPERT_LAYOUT_VERSION], dtype=torch.int64
-        )
+    by_kind: dict[str, list[tuple[str, object]]] = {}
+    for kind, prefix, detail in items:
+        by_kind.setdefault(kind, []).append((prefix, detail))
 
-    if not converted:
-        raise ValueError(
-            "convert_expert_layout_v1_to_v2 found no MoE routed-expert Wi/Wo pair "
-            "in this state_dict; it is not a MoE checkpoint."
-        )
+    def layers(kind):
+        return _describe_layers([p for p, _ in by_kind[kind]])
 
-    if optimizer_state_dict is not None:
-        # nanoplm's MuonAdamWGroup saves {"muon": {...}, "adamw": {...}}; a plain
-        # optimizer saves {"state": ..., "param_groups": ...}.
-        subs = (
-            [optimizer_state_dict[k] for k in ("muon", "adamw") if k in optimizer_state_dict]
-            or [optimizer_state_dict]
+    def values(kind):
+        return "/".join(dict.fromkeys(
+            "missing" if d is None else str(d) for _, d in by_kind[kind]))
+
+    msgs: list[str] = []
+    if "no_wi" in by_kind:
+        msgs.append(
+            f"MoE layer(s) {layers('no_wi')} have no Wi in the checkpoint "
+            f"(architecture mismatch?)"
         )
-        for sub in subs:
-            opt_state = sub.get("state", sub)
-            for key in converted:
-                entry = opt_state.get(key)
-                if not isinstance(entry, dict):
-                    continue
-                old = old_shapes[key]
-                for name, val in list(entry.items()):
-                    if not torch.is_tensor(val):
-                        continue
-                    if val.shape == old:
-                        entry[name] = val.transpose(-1, -2).contiguous()
-                    elif name == "variance_neuron":
-                        entry[name] = torch.zeros(
-                            *old[:-2], old[-1], 1, dtype=val.dtype, device=val.device
-                        )
-    return converted
+    if "expert_old" in by_kind:
+        msgs.append(
+            f"MoE checkpoint uses the pre-#170 MoE expert layout (E, in, out), "
+            f"which is no longer supported, at {layers('expert_old')} "
+            f"({_EXPERT_LAYOUT_BUFFER} is {values('expert_old')}; this build "
+            f"needs {EXPERT_LAYOUT_VERSION}, stores routed experts as "
+            f"(E, out, in) and does not convert old checkpoints). Resume or "
+            f"evaluate it with a nanoPLM commit before PR #170, e.g. "
+            f"{_PRE_170_COMMIT}."
+        )
+    if "expert_new" in by_kind:
+        msgs.append(
+            f"MoE checkpoint has expert layout version {values('expert_new')} at "
+            f"{layers('expert_new')}; this build supports only version "
+            f"{EXPERT_LAYOUT_VERSION}. It was written by a newer nanoPLM."
+        )
+    for kind, buf in (("expert_unreadable", _EXPERT_LAYOUT_BUFFER),
+                      ("wi_unreadable", _WI_LAYOUT_BUFFER)):
+        if kind in by_kind:
+            msgs.append(
+                f"MoE checkpoint has an unreadable {buf} marker at "
+                f"{layers(kind)} ({values(kind)}), so its layout is unknown; "
+                f"refusing to load it."
+            )
+    if "wi_mismatch" in by_kind:
+        msgs.append(
+            f"MoE routed-expert Wi layout mismatch at {layers('wi_mismatch')}: "
+            f"the checkpoint was written with gate/up layout version "
+            f"{values('wi_mismatch')}, this build expects "
+            f"{WI_GATED_LAYOUT_VERSION}. Version 1 stored Wi's gated dim as "
+            f"block-concat [up | gate]; version 2 stores it interleaved "
+            f"gate-first [gate_0, up_0, gate_1, up_1, ...]. Loading it as-is "
+            f"would silently re-pair gate/up and train a different function. "
+            f"Migrate the checkpoint with nanoplm.pretraining.models."
+            f"modern_bert.moe.convert_wi_state_dict_v1_to_v2(state_dict)."
+        )
+    return msgs
+
+
+class _LayoutErrors(str):
+    """An ``error_msgs`` entry that remembers its items, so the per-layer
+    ``_load_from_state_dict`` hooks of one ``load_state_dict`` call merge into a
+    single entry instead of one message per layer."""
+
+    items: list
+
+    @classmethod
+    def build(cls, items):
+        obj = cls("\n\t".join(_format_layout_errors(items)))
+        obj.items = list(items)
+        return obj
+
+
+def _merge_layout_errors(error_msgs: list, items: list) -> None:
+    for i, msg in enumerate(error_msgs):
+        if isinstance(msg, _LayoutErrors):
+            error_msgs[i] = _LayoutErrors.build(msg.items + items)
+            return
+    error_msgs.append(_LayoutErrors.build(items))
 
 
 # ── Fused router top-k + expert histogram ────────────────────────────────────
@@ -691,6 +729,42 @@ class MoELayer(nn.Module):
                 persistent=True,
             )
 
+    def _layout_marker_errors(self, state_dict, prefix: str) -> list[tuple[str, str, object]]:
+        """``(kind, prefix, detail)`` for every layout marker under ``prefix`` in
+        ``state_dict`` that does not match this build; ``_format_layout_errors``
+        turns them into messages. A missing marker means version 1, which never
+        wrote one; a marker that cannot be read is an error, not a pass. Reads
+        only; shared by ``_load_from_state_dict`` and ``check_moe_checkpoint``.
+        """
+        def read(buf):
+            found = state_dict.get(prefix + buf)
+            if found is None:
+                return 1, None           # version 1 never wrote a marker
+            try:
+                return int(found.reshape(-1)[0]), None
+            except Exception as exc:
+                return None, f"{type(exc).__name__}: {exc}"
+
+        items: list[tuple[str, str, object]] = []
+        version, bad = read(_EXPERT_LAYOUT_BUFFER)
+        if bad is not None:
+            items.append(("expert_unreadable", prefix, bad))
+        elif version < EXPERT_LAYOUT_VERSION:
+            missing = state_dict.get(prefix + _EXPERT_LAYOUT_BUFFER) is None
+            items.append(("expert_old", prefix, None if missing else version))
+            # Every gate/up-v1 checkpoint is also pre-#170, and the gate/up
+            # converter cannot make it loadable here: report only pre-#170.
+            return items
+        elif version != EXPERT_LAYOUT_VERSION:
+            items.append(("expert_new", prefix, version))
+        if not self.srelu:
+            version, bad = read(_WI_LAYOUT_BUFFER)
+            if bad is not None:
+                items.append(("wi_unreadable", prefix, bad))
+            elif version != WI_GATED_LAYOUT_VERSION:
+                items.append(("wi_mismatch", prefix, version))
+        return items
+
     def _load_from_state_dict(
         self,
         state_dict,
@@ -701,7 +775,7 @@ class MoELayer(nn.Module):
         unexpected_keys,
         error_msgs,
     ) -> None:
-        """Refuse a state_dict whose ``Wi`` uses a different gate/up layout.
+        """Refuse a state_dict whose layout markers do not match this build.
 
         A v1 (``[up | gate]`` block-concat) checkpoint is numerically valid but
         means something *different* under v2 code: gate and up get re-paired, so
@@ -714,61 +788,24 @@ class MoELayer(nn.Module):
         tolerable partial load. ``srelu`` is ungated and never checked.
 
         The expert *storage* convention (``EXPERT_LAYOUT_VERSION``) is checked
-        the same way for every activation; a missing marker means version 1,
-        ``(E, in, out)``.
+        the same way for every activation; a missing marker means the pre-#170
+        ``(E, in, out)`` layout, which is refused, not converted.
+
+        ``set_model_state_dict`` (FSDP/HSDP resume) fills keys missing from the
+        checkpoint with the live model's values before this hook runs, so this
+        hook cannot see a missing marker there; ``check_moe_checkpoint`` runs on
+        the raw checkpoint for that reason.
         """
-        key = prefix + _EXPERT_LAYOUT_BUFFER
-        found = state_dict.get(key)
-        if found is None:
-            version = 1          # version 1 never wrote a marker
-        else:
-            try:
-                version = int(found.reshape(-1)[0])
-            except Exception:
-                version = EXPERT_LAYOUT_VERSION
-        if version != EXPERT_LAYOUT_VERSION:
-            error_msgs.append(
-                f"MoE routed-expert layout mismatch at {prefix}Wi/Wo: the checkpoint "
-                f"was written with expert layout version {version}, this build expects "
-                f"{EXPERT_LAYOUT_VERSION}. Version 1 stored experts as (E, in, out), "
-                f"transposed against nn.Linear, which made Muon/NorMuon treat input "
-                f"units as output neurons; version 2 stores (E, out, in). Migrate "
-                f"the checkpoint (and its optimizer state when resuming) with "
-                f"nanoplm.pretraining.models.modern_bert.moe."
-                f"convert_expert_layout_v1_to_v2(state_dict, optimizer_state_dict)."
-            )
-        if found is None:
-            state_dict[key] = getattr(self, _EXPERT_LAYOUT_BUFFER).clone()
-        if not self.srelu:
-            key = prefix + _WI_LAYOUT_BUFFER
-            found = state_dict.get(key)
-            if found is None:
-                version = 1          # v1 never wrote a marker
-            else:
-                try:
-                    version = int(found.reshape(-1)[0])
-                except Exception:
-                    # Present but not a plain readable tensor (some exotic
-                    # loader). Presence alone proves it is not v1, which is the
-                    # case that matters; do not block the load on the value.
-                    version = WI_GATED_LAYOUT_VERSION
-            if version != WI_GATED_LAYOUT_VERSION:
-                error_msgs.append(
-                    f"MoE routed-expert Wi layout mismatch at {prefix}Wi: the "
-                    f"checkpoint was written with layout version {version}, this "
-                    f"build expects {WI_GATED_LAYOUT_VERSION}. Version 1 stored "
-                    f"Wi's last dim as block-concat [up | gate]; version 2 stores "
-                    f"it interleaved gate-first [gate_0, up_0, gate_1, up_1, ...]. "
-                    f"Loading it as-is would silently re-pair gate/up and train a "
-                    f"different function. Migrate the checkpoint with "
-                    f"nanoplm.pretraining.models.modern_bert.moe."
-                    f"convert_wi_state_dict_v1_to_v2(state_dict)."
-                )
-            if found is None:
-                # Supply the expected value so the generic machinery does not
-                # *also* report a bare "Missing key(s)" and bury the message
-                # above. If we reached here the load is already failing.
-                state_dict[key] = getattr(self, _WI_LAYOUT_BUFFER).clone()
+        items = self._layout_marker_errors(state_dict, prefix)
+        if items:
+            _merge_layout_errors(error_msgs, items)
+        # Supply the expected marker when it is missing so the generic machinery
+        # does not *also* report a bare "Missing key(s)" and bury the message
+        # above. If a marker was missing, the load is already failing.
+        bufs = (_EXPERT_LAYOUT_BUFFER,) + (() if self.srelu else (_WI_LAYOUT_BUFFER,))
+        for buf in bufs:
+            if state_dict.get(prefix + buf) is None:
+                state_dict[prefix + buf] = getattr(self, buf).clone()
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -978,3 +1015,38 @@ class MoELayer(nn.Module):
         if len(orig_shape) == 3:
             out = out.view(orig_shape)
         return out
+
+
+def check_moe_checkpoint(model: nn.Module, state_dict: dict) -> None:
+    """Refuse a checkpoint whose MoE layout markers do not match this build.
+
+    Run on the *raw* checkpoint dict before loading it.
+    ``MoELayer._load_from_state_dict`` already refuses on
+    ``nn.Module.load_state_dict``, but
+    ``torch.distributed.checkpoint.state_dict.set_model_state_dict`` (the
+    FSDP/HSDP resume path) first fills every key missing from the checkpoint
+    with the live model's own value, so an unmarked pre-#170 checkpoint would
+    reach the hook carrying the current version and load: transposed when the
+    experts are square, gate/up re-paired for a gated v1-concat ``Wi``. The
+    same fill-in would load the live (random) weights of a layer the
+    checkpoint lacks, so an absent ``Wi`` is refused too; that also fails
+    loudly if a wrapper ever makes module names differ from the state_dict
+    keys.
+
+    Pass the unwrapped model (not a ``torch.compile``-d or DDP-wrapped one):
+    module names are matched against the checkpoint keys as-is.
+    """
+    items: list[tuple[str, str, object]] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, MoELayer):
+            continue
+        prefix = name + "." if name else ""
+        if prefix + "Wi" not in state_dict:
+            items.append(("no_wi", prefix, None))
+            continue
+        items.extend(module._layout_marker_errors(state_dict, prefix))
+    if items:
+        raise RuntimeError(
+            "Error(s) in loading MoE checkpoint:\n\t"
+            + "\n\t".join(_format_layout_errors(items))
+        )

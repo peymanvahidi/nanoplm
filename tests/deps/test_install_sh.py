@@ -115,9 +115,12 @@ def test_source_safe():
 
 def test_all_pins_present():
     text = SCRIPT.read_text()
-    assert "dd6c02f5173dc43cc7a0974535d7011a74bda494" in text          # dion
+    assert "7692479288f928a3d61d1cc58137b4dbe4f71000" in text          # dion
     assert "4923037d858aebfe5738ebb17d02f88d7871c333" in text          # sonic-moe
     assert "Dao-AILab/sonic-moe" in text
+    assert 'GNS_VERSION="0.1.6"' in text                               # default Muon orthogonalizer
+    assert 'GNS_SPEC="gram-newton-schulz==${GNS_VERSION}"' in text
+    assert 'satisfied gram-newton-schulz "$GNS_VERSION"' in text       # skip check uses the same pin
     assert "quack-kernels[cu13]==0.5.0" in text                        # 0.5.0 = compile-under-flock fix
     assert "nvidia-cutlass-dsl[cu13]==4.5.3" in text                   # pinned: 0.5.0 only floors it
     assert "v2.16" in text                                             # TE tag
@@ -282,7 +285,7 @@ def test_dry_run_prints_full_pinned_sequence(tmp_path):
     # 1. torch (forced, regardless of what's already satisfied)
     assert "pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cu130" in out
     # 2. dion @ SHA
-    assert "git+https://github.com/microsoft/dion.git@dd6c02f5173dc43cc7a0974535d7011a74bda494" in out
+    assert "git+https://github.com/microsoft/dion.git@7692479288f928a3d61d1cc58137b4dbe4f71000" in out
     # 3. TE: pre-install runtime deps, clone tag, no-isolation no-deps build
     assert "nvdlfw-inspect" in out
     assert "--branch v2.16" in out
@@ -293,6 +296,12 @@ def test_dry_run_prints_full_pinned_sequence(tmp_path):
     assert "quack-kernels[cu13]==0.5.0" in out
     assert "nvidia-cutlass-dsl[cu13]==4.5.3" in out
     assert "git+https://github.com/Dao-AILab/sonic-moe.git@4923037d858aebfe5738ebb17d02f88d7871c333" in out
+    # 6. gram-newton-schulz --no-deps (its DSL==4.5.2 pin would downgrade 4.5.3), after sonic-moe
+    gns = "pip install --no-deps gram-newton-schulz==0.1.6"
+    assert gns in out
+    assert out.index("git+https://github.com/Dao-AILab/sonic-moe.git@") < out.index(gns)
+    # and after the DSL 4.5.3 install, which --no-deps keeps GNS from downgrading
+    assert out.index("nvidia-cutlass-dsl[cu13]==4.5.3") < out.index(gns)
     # steps run in pin order
     assert out.index("torch==2.12.1") < out.index("dion") < out.index("v2.16") \
         < out.index("flash-attention3-wheels") < out.index("quack-kernels")

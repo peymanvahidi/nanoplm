@@ -40,10 +40,10 @@ none of the four possible gate/up pairings).
 
 **Checkpoints.** ``moe_kernel_backend`` may be switched freely between
 ``cutlass`` and ``sonicmoe`` across a save/resume — both read the same layout.
-A checkpoint written under layout version 1 must be converted before it can be
-resumed; ``MoELayer`` carries a persistent version marker and refuses to load a
-mismatched one. See ``moe.convert_wi_state_dict_v1_to_v2``. ``srelu`` is ungated
-and unaffected by any of this.
+``MoELayer`` carries a persistent version marker and refuses to load a
+mismatched one. A checkpoint written under gate/up layout version 1 also
+predates expert layout 2 (PR #170), so this build refuses it as pre-#170; see
+``moe.check_moe_checkpoint``. ``srelu`` is ungated and unaffected by any of this.
 """
 from __future__ import annotations
 

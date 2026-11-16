@@ -45,6 +45,7 @@ import torch
 import torch.distributed as dist
 import wandb
 from torch.distributed._composable.fsdp import fully_shard, FSDPModule, MixedPrecisionPolicy
+from torch.distributed._composable.replicate_with_fsdp import replicate
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -83,10 +84,15 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertEncoderLayer,
     check_mhc_checkpoint,
 )
+from nanoplm.pretraining.models.modern_bert.moe import check_moe_checkpoint
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import (
+    CUSTOM_PE,
+    GNS,
+    QUINTIC,
     build_muon_optimizer,
     is_muon_optimizer,
+    legacy_muon_orthogonalizer,
     MuonAdamWGroup,
 )
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
@@ -490,7 +496,7 @@ def _build_compiled_training_model(
     local_rank: int,
     device: torch.device,
 ) -> torch.nn.Module:
-    """Compile the training model and apply DDP wrapping when requested."""
+    """Compile the training model; wrap it in torch DDP only on the legacy DDP path."""
     if compile_mode is None:
         compiled_model = torch.compile(base_model, dynamic=compile_dynamic)
         logger.info("Model compiled with torch.compile(dynamic=%s)", compile_dynamic)
@@ -502,7 +508,7 @@ def _build_compiled_training_model(
             compile_mode,
         )
 
-    if distributed and distributed_mode == "ddp":
+    if distributed and distributed_mode == "ddp" and _ddp_legacy():
         ddp_kwargs = dict(
             broadcast_buffers=False,
             find_unused_parameters=False,
@@ -774,6 +780,21 @@ def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor._local_tensor if isinstance(tensor, DTensor) else tensor
 
 
+def _dp_wrap(modules, *, mesh, reshard_after_forward: bool, **fsdp_kwargs) -> None:
+    """Apply FSDP2 data parallelism to one unit: fully_shard, or replicate for DDP.
+
+    A 1-D mesh named ("replicate",) is the DDP mesh: replicate() keeps every
+    parameter whole on every rank and only all-reduces gradients, but it is the
+    same FSDP2 machinery as fully_shard, so the MixedPrecisionPolicy (bf16
+    forward params, fp32 masters, fp32 gradient reduce) is applied identically.
+    replicate() has no reshard_after_forward: nothing is ever resharded.
+    """
+    if mesh.mesh_dim_names == ("replicate",):
+        replicate(modules, mesh=mesh, **fsdp_kwargs)
+    else:
+        fully_shard(modules, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+
+
 def _fully_shard_encoder_sublayers(
     enc: ModernBertEncoderLayer,
     *,
@@ -791,11 +812,11 @@ def _fully_shard_encoder_sublayers(
     less CPU dispatch overhead — better on fast interconnects like NVLink).
     """
     if sublayer:
-        fully_shard(enc.attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        _dp_wrap(enc.attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
         if enc.mlp is not None:
-            fully_shard(enc.mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+            _dp_wrap(enc.mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
     if shard_parent:
-        fully_shard(enc, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        _dp_wrap(enc, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_transformer_layer(
@@ -834,10 +855,10 @@ def _fully_shard_transformer_layer(
             sublayer=sublayer,
         )
         if sublayer:
-            fully_shard(layer.mhc_attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+            _dp_wrap(layer.mhc_attn, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
             if layer.mhc_mlp is not None:
-                fully_shard(layer.mhc_mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-    fully_shard(layer, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+                _dp_wrap(layer.mhc_mlp, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    _dp_wrap(layer, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _fully_shard_root_groups(
@@ -851,17 +872,17 @@ def _fully_shard_root_groups(
     tied_embeddings = model.decoder.weight is model.model.embeddings.tok_embeddings.weight
     if tied_embeddings:
         # Keep the tied embedding/unembedding weight in one FSDP group.
-        fully_shard(
+        _dp_wrap(
             [model.model.embeddings, model.decoder],
             mesh=mesh,
             reshard_after_forward=reshard_after_forward,
             **fsdp_kwargs,
         )
     else:
-        fully_shard(model.model.embeddings, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-        fully_shard(model.decoder, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-    fully_shard(model.model.final_norm, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
-    fully_shard(model.head, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        _dp_wrap(model.model.embeddings, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+        _dp_wrap(model.decoder, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    _dp_wrap(model.model.final_norm, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
+    _dp_wrap(model.head, mesh=mesh, reshard_after_forward=reshard_after_forward, **fsdp_kwargs)
 
 
 def _has_nonfinite_tensors(tensors: list[torch.Tensor]) -> bool:
@@ -1024,14 +1045,25 @@ def _dist_barrier(local_rank: int) -> None:
         dist.barrier()
 
 
-# Sharded modes that go through the FSDP2 fully_shard() code path. "hsdp" is
-# plain FSDP2 with a 2D (replicate x shard) device mesh, so it shares every
-# sharded branch (checkpoint gather/reshard, gradient-sync toggling, etc.).
-_FSDP_MODES = ("fsdp", "hsdp")
+# Modes that go through the FSDP2 code path. "hsdp" is plain FSDP2 with a 2D
+# (replicate x shard) device mesh; "ddp" is FSDP2's replicate() on a 1D mesh
+# (every parameter whole on every rank, gradients all-reduced). All three share
+# every FSDP2 branch (mixed-precision policy, checkpoint gather, gradient-sync
+# toggling, etc.), so they train with the same numerics.
+_FSDP_MODES = ("fsdp", "hsdp", "ddp")
+
+
+def _ddp_legacy() -> bool:
+    """NANOPLM_DDP_LEGACY=1: distributed_mode="ddp" uses torch DistributedDataParallel
+    with fp32 params + torch.autocast, as before replicate(). Its residual stream
+    and norms run in fp32, so it does not match the FSDP numerics."""
+    return os.environ.get("NANOPLM_DDP_LEGACY", "0") == "1"
 
 
 def _is_fsdp(distributed_mode: str) -> bool:
-    """True for any FSDP2-backed mode (plain FSDP or HSDP)."""
+    """True for any FSDP2-backed mode (FSDP, HSDP, or DDP via replicate())."""
+    if distributed_mode == "ddp" and _ddp_legacy():
+        return False
     return distributed_mode in _FSDP_MODES
 
 
@@ -1818,7 +1850,9 @@ def _create_scheduler(
             (case-insensitive). Used by ``wsd`` and ``decay``.
         last_epoch: If >= 0 the scheduler is positioned at that step
             (useful when reconstructing the schedule on resume).
-            ``initial_lr`` is injected into param groups automatically.
+            ``initial_lr`` is injected into param groups automatically, as a
+            float: dion keeps ``lr`` as a tensor that the scheduler fills in
+            place, so storing that tensor would make ``initial_lr`` follow it.
 
     Note:
         For ``wsd`` the floor (``lr_decay_to_fraction``) is the value AT step
@@ -1869,7 +1903,8 @@ def _create_scheduler(
     def _make_scheduler(opt, last_ep):
         if last_ep >= 0:
             for pg in opt.param_groups:
-                pg.setdefault("initial_lr", pg["lr"])
+                if "initial_lr" not in pg:
+                    pg["initial_lr"] = float(pg["lr"])
         return LambdaLR(opt, lr_lambda, last_epoch=last_ep)
 
     def _make_scheduler_any(opt, last_ep):
@@ -1883,7 +1918,8 @@ def _create_scheduler(
 
     if last_epoch >= 0:
         for pg in optimizer.param_groups:
-            pg.setdefault("initial_lr", pg["lr"])
+            if "initial_lr" not in pg:
+                pg["initial_lr"] = float(pg["lr"])
 
     return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
 
@@ -2152,6 +2188,9 @@ def _save_checkpoint(
     # Schedule descriptor: lets resume reconstruct/validate the LR curve and
     # lets eval/resume target a role (stable-end/final) instead of a step number.
     training_state["phase"] = phase
+    muon_orthogonalizer = getattr(optimizer, "muon_orthogonalizer", None)
+    if muon_orthogonalizer is not None:
+        training_state["muon_orthogonalizer"] = muon_orthogonalizer
     if pretrain_config is not None:
         training_state["lr_schedule"] = pretrain_config.lr_schedule
         training_state["decay_shape"] = pretrain_config.decay_shape
@@ -2198,6 +2237,42 @@ def _save_checkpoint(
     logger.info(f"Checkpoint saved -> {ckpt}")
 
 
+def _check_checkpoint_keys(model, model_sd: dict, path) -> None:
+    """Refuse a checkpoint whose keys differ from the model's, as strict
+    ``load_state_dict`` does on the single-GPU/DDP path.
+
+    ``set_model_state_dict(full_state_dict=True)`` (FSDP/HSDP) fills every key
+    missing from the checkpoint with the live model's value, so a missing key
+    would otherwise resume silently with its fresh init. Expected keys use the
+    naming ``get_model_state_dict`` writes on save (wrapper prefixes such as
+    ``_orig_mod.`` removed); non-persistent buffers are not in either, tied
+    weights are in both. Every rank holds the full checkpoint and raises the
+    same error before any collective.
+    """
+    from torch.distributed.checkpoint.state_dict import _get_fqns
+
+    expected = {fqn for key in model.state_dict() for fqn in _get_fqns(model, key)}
+    found = set(model_sd)
+    missing = sorted(expected - found)
+    unexpected = sorted(found - expected)
+    if not (missing or unexpected):
+        return
+
+    def show(keys):
+        return ", ".join(keys[:10]) + (f", ... ({len(keys) - 10} more)" if len(keys) > 10 else "")
+
+    parts = []
+    if missing:
+        parts.append(f"missing {len(missing)} key(s): {show(missing)}")
+    if unexpected:
+        parts.append(f"unexpected {len(unexpected)} key(s): {show(unexpected)}")
+    raise RuntimeError(
+        f"Checkpoint {path} does not match the model: " + "; ".join(parts)
+        + ". Refusing to resume (FSDP/HSDP loading would keep the freshly "
+        "initialised value of every missing key without saying so)."
+    )
+
+
 def _load_checkpoint(
     model, optimizer, scheduler, checkpoint_dir, device,
     distributed=False, load_scheduler=True, distributed_mode="fsdp",
@@ -2227,7 +2302,9 @@ def _load_checkpoint(
 
     model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
     check_mhc_checkpoint(model, model_sd)
+    check_moe_checkpoint(model, model_sd)
     if distributed and _is_fsdp(distributed_mode):
+        _check_checkpoint_keys(model, model_sd, ckp / "pytorch_model.bin")
         set_model_state_dict(model, model_sd, options=StateDictOptions(full_state_dict=True))
     else:
         model.load_state_dict(model_sd)
@@ -2239,7 +2316,8 @@ def _load_checkpoint(
             f"checkpoint={checkpoint_mode}, current={current_mode}. "
             "Model weights were loaded, but optimizer-state resume across FSDP/DDP/single "
             "modes is not supported. Restart with a fresh optimizer state or resume "
-            "with the matching distributed_mode."
+            "with the matching distributed_mode (DDP checkpoints saved before DDP "
+            "moved onto FSDP2 replicate() resume under NANOPLM_DDP_LEGACY=1)."
         )
 
     opt_sd = torch.load(opt_path, map_location=device, weights_only=True)
@@ -2326,6 +2404,37 @@ def _load_checkpoint(
     return 0, 0
 
 
+def _group_lr(pg: dict):
+    """Snapshot ``pg["lr"]`` so a later ``scheduler.step()`` cannot change it.
+
+    dion keeps ``lr`` as a persistent 0-d device tensor that LambdaLR updates in
+    place, so a bare reference held across ``scheduler.step()`` reads the next
+    step's LR. A device clone avoids a per-step host sync; convert with
+    ``float()`` where the value is logged.
+    """
+    lr = pg["lr"]
+    return lr.detach().clone() if isinstance(lr, torch.Tensor) else lr
+
+
+def _snapshot_lrs(optimizer):
+    """Return ``(learning_rate, muon_lr)`` for the step that just ran.
+
+    Call after ``optimizer.step()`` and before ``scheduler.step()``.
+    ``learning_rate`` is the AdamW (or only) group's LR; ``muon_lr`` is None
+    for a plain torch optimizer. Values are ``_group_lr`` snapshots, so no
+    host sync happens here.
+    """
+    if isinstance(optimizer, MuonAdamWGroup):
+        return (
+            _group_lr(optimizer.adamw.param_groups[0]),
+            _group_lr(optimizer.muon.param_groups[0]),
+        )
+    if _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
+        # param_groups[0] = muon, param_groups[1] = adamw
+        return _group_lr(optimizer.param_groups[1]), _group_lr(optimizer.param_groups[0])
+    return _group_lr(optimizer.param_groups[0]), None
+
+
 def _iter_param_groups(optimizer):
     """Yield param groups across plain optimizers and MuonAdamWGroup."""
     if isinstance(optimizer, MuonAdamWGroup):
@@ -2352,6 +2461,89 @@ def _read_training_state(checkpoint_dir: str) -> dict:
             f"Could not parse training state at {state_path}: {exc}. "
             "The checkpoint may be corrupt (e.g. truncated by a crash mid-write)."
         ) from exc
+
+
+def _checkpoint_muon_orthogonalizer(checkpoint_dir) -> tuple[str, ...]:
+    """The orthogonalizer(s) a checkpoint may have been trained with: the
+    label recorded in training_state.json, else inferred from its
+    pretrain_config.yaml. Empty if unknown or the checkpoint used a non-Muon
+    optimizer. Two entries (CUSTOM_PE, GNS) when the flags are ambiguous: an
+    unlabelled checkpoint with both flags true ran our Polar Express on builds
+    before #171 and Gram Newton-Schulz on builds that already had GNS as the
+    default."""
+    try:
+        state = _read_training_state(checkpoint_dir)
+    except (OSError, ValueError):
+        state = None
+    recorded = state.get("muon_orthogonalizer") if isinstance(state, dict) else None
+    if recorded:
+        return (str(recorded),)
+    try:
+        with open(Path(checkpoint_dir) / "pretrain_config.yaml") as f:
+            pc = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return ()
+    if not isinstance(pc, dict) or str(pc.get("optimizer", "")).lower() not in {
+        "muon", "normuon", "nordion2",
+    }:
+        return ()
+
+    def _flag(key, default):
+        v = pc.get(key, default)
+        return v.strip().lower() == "true" if isinstance(v, str) else bool(v)
+
+    pe = _flag("muon_use_polar_express", True)
+    gns = _flag("muon_use_gram_newton_schulz", False)
+    if pe and gns:
+        return (CUSTOM_PE, GNS)
+    return (legacy_muon_orthogonalizer(pe, gns),)
+
+
+_ORTHOGONALIZER_PINS = {
+    CUSTOM_PE: "muon_use_polar_express: true\n  muon_use_gram_newton_schulz: false",
+    GNS: "muon_use_gram_newton_schulz: true",
+    QUINTIC: "muon_use_polar_express: false\n  muon_use_gram_newton_schulz: false",
+}
+
+
+def _warn_on_orthogonalizer_change(checkpoint_dir, current: Optional[str]) -> bool:
+    """Warn when a resumed run orthogonalizes Muon updates differently from
+    the checkpoint it resumes, or when the checkpoint's orthogonalizer cannot
+    be told from its config. Returns True if it warned."""
+    if current is None:
+        return False
+    previous = _checkpoint_muon_orthogonalizer(checkpoint_dir)
+    if len(previous) > 1:
+        logger.warning(
+            f"Muon orthogonalizer of checkpoint {checkpoint_dir} is not recorded. Its "
+            "pretrain_config.yaml sets muon_use_polar_express: true and "
+            "muon_use_gram_newton_schulz: true, so it ran "
+            f"{CUSTOM_PE} if it was trained before PR #171 and {GNS} if it was "
+            "trained with a build that already had Gram Newton-Schulz as the default. "
+            f"This run uses {current}. To pin {CUSTOM_PE}, set under pretraining:\n"
+            f"  {_ORTHOGONALIZER_PINS[CUSTOM_PE]}\n"
+            f"To pin {GNS}, set under pretraining:\n  {_ORTHOGONALIZER_PINS[GNS]}"
+        )
+        return True
+    if not previous or previous[0] == current:
+        return False
+    (previous,) = previous
+    msg = (
+        f"Muon orthogonalizer changed on resume: checkpoint {checkpoint_dir} was "
+        f"trained with {previous}, this run uses {current}. "
+    )
+    if current == GNS:
+        msg += "muon_use_gram_newton_schulz now defaults to true"
+        if previous == CUSTOM_PE:
+            msg += " and takes precedence over muon_use_polar_express"
+        msg += ", so the effective update changes from this step on."
+    else:
+        msg += "The effective update changes from this step on."
+    pin = _ORTHOGONALIZER_PINS.get(previous)
+    if pin:
+        msg += f" To keep the checkpoint's orthogonalizer, set under pretraining:\n  {pin}"
+    logger.warning(msg)
+    return True
 
 
 def _rebuild_scheduler_for_resume(
@@ -2947,6 +3139,15 @@ def run_pure_pretraining(
                 shard_size,
                 effective_world_size,
             )
+        elif distributed_mode == "ddp":
+            # replicate(): whole parameters on every rank, one gradient
+            # all-reduce per unit. The Dion-family optimizer takes the same 1D
+            # mesh and splits its per-matrix work across all ranks.
+            fsdp_mesh = init_device_mesh(
+                "cuda", (effective_world_size,), mesh_dim_names=("replicate",)
+            )
+            optimizer_dist = fsdp_mesh
+            logger.info("DDP (FSDP2 replicate) enabled: world_size=%d", effective_world_size)
         else:
             fsdp_mesh = init_device_mesh("cuda", (effective_world_size,))
             optimizer_dist = fsdp_mesh
@@ -2994,8 +3195,8 @@ def run_pure_pretraining(
             fsdp_kwargs=fsdp_kwargs,
             reshard_after_forward=fsdp_reshard_after_forward,
         )
-        fully_shard(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
-        # optimizer_dist was set above (full mesh for fsdp, "shard" sub-mesh for hsdp)
+        _dp_wrap(base_model, mesh=fsdp_mesh, reshard_after_forward=fsdp_reshard_after_forward, **fsdp_kwargs)
+        # optimizer_dist was set above (full mesh for fsdp and ddp, "shard" sub-mesh for hsdp)
 
     # Keep base_model for checkpointing/eval (eval changes shapes → recompilation).
     orig_model = base_model
@@ -3087,7 +3288,7 @@ def run_pure_pretraining(
         local_rank=local_rank,
         device=device,
     )
-    if distributed and distributed_mode == "ddp":
+    if distributed and distributed_mode == "ddp" and _ddp_legacy():
         optimizer_dist = dist.group.WORLD
 
     # ---- DataLoaders ----
@@ -3127,6 +3328,10 @@ def run_pure_pretraining(
 
     # ---- Optimizer / Scheduler ----
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
+    if is_main and resume_config and resume_config.is_resume:
+        _warn_on_orthogonalizer_change(
+            resume_config.checkpoint_dir, getattr(optimizer, "muon_orthogonalizer", None),
+        )
 
     # One pass == one epoch. The packed batch count can change with the epoch
     # (the sampler reshuffles, and a cluster-sampled dataset draws other
@@ -3453,6 +3658,7 @@ def run_pure_pretraining(
                 name=wandb_run_name,
                 mode="offline",
                 config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps,
+                        "muon_orthogonalizer": getattr(optimizer, "muon_orthogonalizer", None),
                         **({"data_mixture": mixture.plan} if mixture else {})},
             )
             wandb_enabled = wandb.run is not None
@@ -3469,11 +3675,11 @@ def run_pure_pretraining(
 
     # ---- AMP / TF32 ----
     amp_dtype: Optional[torch.dtype] = None
-    if use_bf16 and (not distributed or distributed_mode == "ddp"):
+    if use_bf16 and (not distributed or (distributed_mode == "ddp" and _ddp_legacy())):
         amp_dtype = torch.bfloat16
         if distributed_mode == "ddp":
             logger.warning(
-                "DDP bf16 uses fp32 params + torch.autocast: the residual "
+                "NANOPLM_DDP_LEGACY=1: DDP bf16 uses fp32 params + torch.autocast: the residual "
                 "stream and norms run in fp32, which differs numerically from "
                 "the FSDP path (bf16 forward params, no autocast) and "
                 "disables bf16-gated kernels such as the CuTeDSL canon "
@@ -3541,7 +3747,8 @@ def run_pure_pretraining(
         "Distributed config: multi_gpu=%s mode=%s%s",
         distributed,
         distributed_mode,
-        f" ddp_bucket_cap_mb={ddp_bucket_cap_mb}" if distributed_mode == "ddp" else "",
+        f" (legacy torch DDP, ddp_bucket_cap_mb={ddp_bucket_cap_mb})"
+        if distributed_mode == "ddp" and _ddp_legacy() else "",
     )
     max_grad_norm = float(pretrain_config.max_grad_norm)
     logger.info(
@@ -4192,15 +4399,8 @@ def run_pure_pretraining(
                         nonfinite_t = _nonfinite_check_tensor([param for param in orig_model.parameters()])
                         if nonfinite_t is not None:
                             param_finite_check.submit(nonfinite_t)
-                    if isinstance(optimizer, MuonAdamWGroup):
-                        muon_lr = optimizer.muon.param_groups[0]["lr"]
-                        learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
-                        muon_lr = optimizer.param_groups[0]["lr"]
-                        learning_rate = optimizer.param_groups[1]["lr"]
-                    else:
-                        learning_rate = optimizer.param_groups[0]["lr"]
-                        muon_lr = None
+                    # Snapshot before scheduler.step(): dion's lr is a tensor it fills in place.
+                    learning_rate, muon_lr = _snapshot_lrs(optimizer)
 
                     if not step_skipped:
                         scheduler.step()
@@ -4341,6 +4541,8 @@ def run_pure_pretraining(
                                 reset_peak=True,
                             )
                     if should_log and is_main:
+                        learning_rate = float(learning_rate)
+                        muon_lr = float(muon_lr) if muon_lr is not None else None
                         waste = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
                         muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
                         moe_str = ""
