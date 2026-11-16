@@ -20,6 +20,10 @@ class MuonAdamWGroup:
     and .param_groups (muon groups first, then adamw groups).
     """
 
+    # Name of the function that orthogonalizes Muon updates (see
+    # resolve_muon_orthogonalizer); set by build_optimizer.
+    muon_orthogonalizer: str | None = None
+
     def __init__(self, muon_optimizer, adamw_optimizer):
         self.muon = muon_optimizer
         self.adamw = adamw_optimizer
@@ -441,6 +445,34 @@ def _polar_express_paper(G: torch.Tensor, epsilon: float = 1e-7) -> torch.Tensor
     return X
 
 
+GNS = "gram_newton_schulz"
+CUSTOM_PE = "polar_express_paper_bf16_8it"
+DION_PE = "dion_polar_express"
+QUINTIC = "dion_quintic_ns"
+
+
+def resolve_muon_orthogonalizer(
+    use_pe: bool, use_gns: bool, dion_has_gns_kwarg: bool = True,
+) -> str:
+    """Name the orthogonalizer build_optimizer runs. We pass our PE only when
+    GNS is off; dion then picks custom newton_schulz_func >
+    use_gram_newton_schulz > use_polar_express > quintic NS."""
+    if use_pe and not use_gns:
+        return CUSTOM_PE
+    if use_gns and dion_has_gns_kwarg:
+        return GNS
+    return DION_PE if use_pe else QUINTIC
+
+
+def legacy_muon_orthogonalizer(use_pe: bool, use_gns: bool) -> str:
+    """What a pre-#171 build ran: our PE was always passed when use_pe was
+    set and dion prefers it, so muon_use_gram_newton_schulz only mattered
+    with PE off."""
+    if use_pe:
+        return CUSTOM_PE
+    return GNS if use_gns else QUINTIC
+
+
 def build_optimizer(
     muon_params: list[torch.nn.Parameter],
     adamw_params: list[torch.nn.Parameter],
@@ -584,7 +616,15 @@ def build_optimizer(
         if "selection_scope" in sig:
             kwargs["selection_scope"] = str(nordion2_selection_scope)
 
+    ortho = resolve_muon_orthogonalizer(
+        bool(muon_use_polar_express), bool(muon_use_gram_newton_schulz),
+        "use_gram_newton_schulz" in sig,
+    )
     muon_opt = MatrixCls(_muon_param_groups(), **kwargs)
+    logger.info(
+        f"Muon orthogonalizer: {ortho} (muon_use_polar_express={muon_use_polar_express}, "
+        f"muon_use_gram_newton_schulz={muon_use_gram_newton_schulz})"
+    )
 
     # -- torch.optim.AdamW(fused=True): adamw / resid / x0 params -------------
     adamw_groups: list[dict] = []
@@ -663,4 +703,6 @@ def build_optimizer(
 
     adamw_opt = torch.optim.AdamW(adamw_groups, fused=True)
 
-    return MuonAdamWGroup(muon_opt, adamw_opt)
+    group = MuonAdamWGroup(muon_opt, adamw_opt)
+    group.muon_orthogonalizer = ortho
+    return group

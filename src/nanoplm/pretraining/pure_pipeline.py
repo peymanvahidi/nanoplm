@@ -84,8 +84,12 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import (
+    CUSTOM_PE,
+    GNS,
+    QUINTIC,
     build_muon_optimizer,
     is_muon_optimizer,
+    legacy_muon_orthogonalizer,
     MuonAdamWGroup,
 )
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
@@ -2087,6 +2091,9 @@ def _save_checkpoint(
     # Schedule descriptor: lets resume reconstruct/validate the LR curve and
     # lets eval/resume target a role (stable-end/final) instead of a step number.
     training_state["phase"] = phase
+    muon_orthogonalizer = getattr(optimizer, "muon_orthogonalizer", None)
+    if muon_orthogonalizer is not None:
+        training_state["muon_orthogonalizer"] = muon_orthogonalizer
     if pretrain_config is not None:
         training_state["lr_schedule"] = pretrain_config.lr_schedule
         training_state["decay_shape"] = pretrain_config.decay_shape
@@ -2287,6 +2294,89 @@ def _read_training_state(checkpoint_dir: str) -> dict:
             f"Could not parse training state at {state_path}: {exc}. "
             "The checkpoint may be corrupt (e.g. truncated by a crash mid-write)."
         ) from exc
+
+
+def _checkpoint_muon_orthogonalizer(checkpoint_dir) -> tuple[str, ...]:
+    """The orthogonalizer(s) a checkpoint may have been trained with: the
+    label recorded in training_state.json, else inferred from its
+    pretrain_config.yaml. Empty if unknown or the checkpoint used a non-Muon
+    optimizer. Two entries (CUSTOM_PE, GNS) when the flags are ambiguous: an
+    unlabelled checkpoint with both flags true ran our Polar Express on builds
+    before #171 and Gram Newton-Schulz on builds that already had GNS as the
+    default."""
+    try:
+        state = _read_training_state(checkpoint_dir)
+    except (OSError, ValueError):
+        state = None
+    recorded = state.get("muon_orthogonalizer") if isinstance(state, dict) else None
+    if recorded:
+        return (str(recorded),)
+    try:
+        with open(Path(checkpoint_dir) / "pretrain_config.yaml") as f:
+            pc = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return ()
+    if not isinstance(pc, dict) or str(pc.get("optimizer", "")).lower() not in {
+        "muon", "normuon", "nordion2",
+    }:
+        return ()
+
+    def _flag(key, default):
+        v = pc.get(key, default)
+        return v.strip().lower() == "true" if isinstance(v, str) else bool(v)
+
+    pe = _flag("muon_use_polar_express", True)
+    gns = _flag("muon_use_gram_newton_schulz", False)
+    if pe and gns:
+        return (CUSTOM_PE, GNS)
+    return (legacy_muon_orthogonalizer(pe, gns),)
+
+
+_ORTHOGONALIZER_PINS = {
+    CUSTOM_PE: "muon_use_polar_express: true\n  muon_use_gram_newton_schulz: false",
+    GNS: "muon_use_gram_newton_schulz: true",
+    QUINTIC: "muon_use_polar_express: false\n  muon_use_gram_newton_schulz: false",
+}
+
+
+def _warn_on_orthogonalizer_change(checkpoint_dir, current: Optional[str]) -> bool:
+    """Warn when a resumed run orthogonalizes Muon updates differently from
+    the checkpoint it resumes, or when the checkpoint's orthogonalizer cannot
+    be told from its config. Returns True if it warned."""
+    if current is None:
+        return False
+    previous = _checkpoint_muon_orthogonalizer(checkpoint_dir)
+    if len(previous) > 1:
+        logger.warning(
+            f"Muon orthogonalizer of checkpoint {checkpoint_dir} is not recorded. Its "
+            "pretrain_config.yaml sets muon_use_polar_express: true and "
+            "muon_use_gram_newton_schulz: true, so it ran "
+            f"{CUSTOM_PE} if it was trained before PR #171 and {GNS} if it was "
+            "trained with a build that already had Gram Newton-Schulz as the default. "
+            f"This run uses {current}. To pin {CUSTOM_PE}, set under pretraining:\n"
+            f"  {_ORTHOGONALIZER_PINS[CUSTOM_PE]}\n"
+            f"To pin {GNS}, set under pretraining:\n  {_ORTHOGONALIZER_PINS[GNS]}"
+        )
+        return True
+    if not previous or previous[0] == current:
+        return False
+    (previous,) = previous
+    msg = (
+        f"Muon orthogonalizer changed on resume: checkpoint {checkpoint_dir} was "
+        f"trained with {previous}, this run uses {current}. "
+    )
+    if current == GNS:
+        msg += "muon_use_gram_newton_schulz now defaults to true"
+        if previous == CUSTOM_PE:
+            msg += " and takes precedence over muon_use_polar_express"
+        msg += ", so the effective update changes from this step on."
+    else:
+        msg += "The effective update changes from this step on."
+    pin = _ORTHOGONALIZER_PINS.get(previous)
+    if pin:
+        msg += f" To keep the checkpoint's orthogonalizer, set under pretraining:\n  {pin}"
+    logger.warning(msg)
+    return True
 
 
 def _rebuild_scheduler_for_resume(
@@ -2929,6 +3019,10 @@ def run_pure_pretraining(
 
     # ---- Optimizer / Scheduler ----
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
+    if is_main and resume_config and resume_config.is_resume:
+        _warn_on_orthogonalizer_change(
+            resume_config.checkpoint_dir, getattr(optimizer, "muon_orthogonalizer", None),
+        )
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
     if synced_len == 0:
@@ -3232,7 +3326,8 @@ def run_pure_pretraining(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 mode="offline",
-                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps,
+                        "muon_orthogonalizer": getattr(optimizer, "muon_orthogonalizer", None)},
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
