@@ -118,7 +118,35 @@ The peak LR does not act alone: it is scaled by the schedule. See [Cooldown and 
 
 ## Leave the Muon internals alone
 
-`muon_momentum` (`0.95`), `muon_nesterov` (`true`), `muon_use_polar_express` (`true`), `muon_cautious_weight_decay` (`true`), and `muon_eps` (`1e-7`) are the orthogonalization and momentum internals. The defaults are the published ones and are a fine place to stay. They are listed with their types in the [pretrain.yaml reference](/nanoplm/reference/pretrain/).
+`muon_momentum` (`0.95`), `muon_nesterov` (`true`), `muon_use_gram_newton_schulz` (`true`), `muon_use_polar_express` (`true`), `muon_cautious_weight_decay` (`true`), and `muon_eps` (`1e-7`) are the orthogonalization and momentum internals. Gram Newton-Schulz is the default orthogonalizer; `muon_use_polar_express` only applies when it is turned off. The defaults are the published ones and are a fine place to stay. They are listed with their types in the [pretrain.yaml reference](/nanoplm/reference/pretrain/).
+
+The two orthogonalizer flags pick one function, in this order:
+
+| `muon_use_gram_newton_schulz` | `muon_use_polar_express` | Orthogonalizer |
+| --- | --- | --- |
+| `true` *(default)* | any | Gram Newton-Schulz (`gram_newton_schulz`) |
+| `false` | `true` | 8-iteration bf16 Polar Express (`polar_express_paper_bf16_8it`) |
+| `false` | `false` | dion's quintic Newton-Schulz (`dion_quintic_ns`) |
+
+The run logs its choice once, at optimizer build, and records it in each checkpoint's `training_state.json` and in the W&B config:
+
+```
+Muon orthogonalizer: gram_newton_schulz (muon_use_polar_express=True, muon_use_gram_newton_schulz=True)
+```
+
+Gram Newton-Schulz became the default in PR #171. To keep Polar Express (what runs and checkpoints from before #171 used), pin both flags:
+
+```yaml title="pretrain.yaml"
+pretraining:
+  muon_use_polar_express: true
+  muon_use_gram_newton_schulz: false
+```
+
+:::caution[Runs from before #171 that set `muon_use_gram_newton_schulz: true` ran Polar Express]
+Before #171 the flag did nothing while `muon_use_polar_express` was on, which it is by default. Those runs, and any "GNS on vs off" comparison made with them, used Polar Express on both sides. The same YAML now runs Gram Newton-Schulz.
+:::
+
+Resuming a checkpoint that ran a different orthogonalizer than the current config logs `Muon orthogonalizer changed on resume` with the flags that restore the old one. Checkpoints from before this label was recorded are judged from their `pretrain_config.yaml`. One case cannot be told apart: both flags `true` ran Polar Express on builds before #171, but Gram Newton-Schulz on builds that already had the new default (`develop` and branches based on it since late October 2026). Resuming such a checkpoint logs `Muon orthogonalizer of checkpoint ... is not recorded` with the pin for each choice. Pin the one the checkpoint was trained with.
 
 ## Where to go next
 

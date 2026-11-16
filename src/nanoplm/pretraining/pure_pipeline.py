@@ -85,8 +85,12 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
 from nanoplm.pretraining.models.modern_bert.moe import check_moe_checkpoint
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import (
+    CUSTOM_PE,
+    GNS,
+    QUINTIC,
     build_muon_optimizer,
     is_muon_optimizer,
+    legacy_muon_orthogonalizer,
     MuonAdamWGroup,
 )
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
@@ -1800,7 +1804,9 @@ def _create_scheduler(
             (case-insensitive). Used by ``wsd`` and ``decay``.
         last_epoch: If >= 0 the scheduler is positioned at that step
             (useful when reconstructing the schedule on resume).
-            ``initial_lr`` is injected into param groups automatically.
+            ``initial_lr`` is injected into param groups automatically, as a
+            float: dion keeps ``lr`` as a tensor that the scheduler fills in
+            place, so storing that tensor would make ``initial_lr`` follow it.
 
     Note:
         For ``wsd`` the floor (``lr_decay_to_fraction``) is the value AT step
@@ -1851,7 +1857,8 @@ def _create_scheduler(
     def _make_scheduler(opt, last_ep):
         if last_ep >= 0:
             for pg in opt.param_groups:
-                pg.setdefault("initial_lr", pg["lr"])
+                if "initial_lr" not in pg:
+                    pg["initial_lr"] = float(pg["lr"])
         return LambdaLR(opt, lr_lambda, last_epoch=last_ep)
 
     def _make_scheduler_any(opt, last_ep):
@@ -1865,7 +1872,8 @@ def _create_scheduler(
 
     if last_epoch >= 0:
         for pg in optimizer.param_groups:
-            pg.setdefault("initial_lr", pg["lr"])
+            if "initial_lr" not in pg:
+                pg["initial_lr"] = float(pg["lr"])
 
     return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
 
@@ -2088,6 +2096,9 @@ def _save_checkpoint(
     # Schedule descriptor: lets resume reconstruct/validate the LR curve and
     # lets eval/resume target a role (stable-end/final) instead of a step number.
     training_state["phase"] = phase
+    muon_orthogonalizer = getattr(optimizer, "muon_orthogonalizer", None)
+    if muon_orthogonalizer is not None:
+        training_state["muon_orthogonalizer"] = muon_orthogonalizer
     if pretrain_config is not None:
         training_state["lr_schedule"] = pretrain_config.lr_schedule
         training_state["decay_shape"] = pretrain_config.decay_shape
@@ -2300,6 +2311,37 @@ def _load_checkpoint(
     return 0, 0
 
 
+def _group_lr(pg: dict):
+    """Snapshot ``pg["lr"]`` so a later ``scheduler.step()`` cannot change it.
+
+    dion keeps ``lr`` as a persistent 0-d device tensor that LambdaLR updates in
+    place, so a bare reference held across ``scheduler.step()`` reads the next
+    step's LR. A device clone avoids a per-step host sync; convert with
+    ``float()`` where the value is logged.
+    """
+    lr = pg["lr"]
+    return lr.detach().clone() if isinstance(lr, torch.Tensor) else lr
+
+
+def _snapshot_lrs(optimizer):
+    """Return ``(learning_rate, muon_lr)`` for the step that just ran.
+
+    Call after ``optimizer.step()`` and before ``scheduler.step()``.
+    ``learning_rate`` is the AdamW (or only) group's LR; ``muon_lr`` is None
+    for a plain torch optimizer. Values are ``_group_lr`` snapshots, so no
+    host sync happens here.
+    """
+    if isinstance(optimizer, MuonAdamWGroup):
+        return (
+            _group_lr(optimizer.adamw.param_groups[0]),
+            _group_lr(optimizer.muon.param_groups[0]),
+        )
+    if _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
+        # param_groups[0] = muon, param_groups[1] = adamw
+        return _group_lr(optimizer.param_groups[1]), _group_lr(optimizer.param_groups[0])
+    return _group_lr(optimizer.param_groups[0]), None
+
+
 def _iter_param_groups(optimizer):
     """Yield param groups across plain optimizers and MuonAdamWGroup."""
     if isinstance(optimizer, MuonAdamWGroup):
@@ -2326,6 +2368,89 @@ def _read_training_state(checkpoint_dir: str) -> dict:
             f"Could not parse training state at {state_path}: {exc}. "
             "The checkpoint may be corrupt (e.g. truncated by a crash mid-write)."
         ) from exc
+
+
+def _checkpoint_muon_orthogonalizer(checkpoint_dir) -> tuple[str, ...]:
+    """The orthogonalizer(s) a checkpoint may have been trained with: the
+    label recorded in training_state.json, else inferred from its
+    pretrain_config.yaml. Empty if unknown or the checkpoint used a non-Muon
+    optimizer. Two entries (CUSTOM_PE, GNS) when the flags are ambiguous: an
+    unlabelled checkpoint with both flags true ran our Polar Express on builds
+    before #171 and Gram Newton-Schulz on builds that already had GNS as the
+    default."""
+    try:
+        state = _read_training_state(checkpoint_dir)
+    except (OSError, ValueError):
+        state = None
+    recorded = state.get("muon_orthogonalizer") if isinstance(state, dict) else None
+    if recorded:
+        return (str(recorded),)
+    try:
+        with open(Path(checkpoint_dir) / "pretrain_config.yaml") as f:
+            pc = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return ()
+    if not isinstance(pc, dict) or str(pc.get("optimizer", "")).lower() not in {
+        "muon", "normuon", "nordion2",
+    }:
+        return ()
+
+    def _flag(key, default):
+        v = pc.get(key, default)
+        return v.strip().lower() == "true" if isinstance(v, str) else bool(v)
+
+    pe = _flag("muon_use_polar_express", True)
+    gns = _flag("muon_use_gram_newton_schulz", False)
+    if pe and gns:
+        return (CUSTOM_PE, GNS)
+    return (legacy_muon_orthogonalizer(pe, gns),)
+
+
+_ORTHOGONALIZER_PINS = {
+    CUSTOM_PE: "muon_use_polar_express: true\n  muon_use_gram_newton_schulz: false",
+    GNS: "muon_use_gram_newton_schulz: true",
+    QUINTIC: "muon_use_polar_express: false\n  muon_use_gram_newton_schulz: false",
+}
+
+
+def _warn_on_orthogonalizer_change(checkpoint_dir, current: Optional[str]) -> bool:
+    """Warn when a resumed run orthogonalizes Muon updates differently from
+    the checkpoint it resumes, or when the checkpoint's orthogonalizer cannot
+    be told from its config. Returns True if it warned."""
+    if current is None:
+        return False
+    previous = _checkpoint_muon_orthogonalizer(checkpoint_dir)
+    if len(previous) > 1:
+        logger.warning(
+            f"Muon orthogonalizer of checkpoint {checkpoint_dir} is not recorded. Its "
+            "pretrain_config.yaml sets muon_use_polar_express: true and "
+            "muon_use_gram_newton_schulz: true, so it ran "
+            f"{CUSTOM_PE} if it was trained before PR #171 and {GNS} if it was "
+            "trained with a build that already had Gram Newton-Schulz as the default. "
+            f"This run uses {current}. To pin {CUSTOM_PE}, set under pretraining:\n"
+            f"  {_ORTHOGONALIZER_PINS[CUSTOM_PE]}\n"
+            f"To pin {GNS}, set under pretraining:\n  {_ORTHOGONALIZER_PINS[GNS]}"
+        )
+        return True
+    if not previous or previous[0] == current:
+        return False
+    (previous,) = previous
+    msg = (
+        f"Muon orthogonalizer changed on resume: checkpoint {checkpoint_dir} was "
+        f"trained with {previous}, this run uses {current}. "
+    )
+    if current == GNS:
+        msg += "muon_use_gram_newton_schulz now defaults to true"
+        if previous == CUSTOM_PE:
+            msg += " and takes precedence over muon_use_polar_express"
+        msg += ", so the effective update changes from this step on."
+    else:
+        msg += "The effective update changes from this step on."
+    pin = _ORTHOGONALIZER_PINS.get(previous)
+    if pin:
+        msg += f" To keep the checkpoint's orthogonalizer, set under pretraining:\n  {pin}"
+    logger.warning(msg)
+    return True
 
 
 def _rebuild_scheduler_for_resume(
@@ -2968,6 +3093,10 @@ def run_pure_pretraining(
 
     # ---- Optimizer / Scheduler ----
     optimizer = _create_optimizer(orig_model, pretrain_config, distributed_mesh=optimizer_dist)
+    if is_main and resume_config and resume_config.is_resume:
+        _warn_on_orthogonalizer_change(
+            resume_config.checkpoint_dir, getattr(optimizer, "muon_orthogonalizer", None),
+        )
 
     synced_len = _sync_train_loader_len(len(train_loader), distributed, device)
     if synced_len == 0:
@@ -3271,7 +3400,8 @@ def run_pure_pretraining(
                 project=pretrain_config.project_name,
                 name=wandb_run_name,
                 mode="offline",
-                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps},
+                config={"pretrain": pretrain_config.__dict__, "model": _model_cfg.__dict__, "total_steps": total_steps, "warmup_steps": warmup_steps,
+                        "muon_orthogonalizer": getattr(optimizer, "muon_orthogonalizer", None)},
             )
             wandb_enabled = wandb.run is not None
             if wandb_enabled:
@@ -4005,15 +4135,8 @@ def run_pure_pretraining(
                         nonfinite_t = _nonfinite_check_tensor([param for param in orig_model.parameters()])
                         if nonfinite_t is not None:
                             param_finite_check.submit(nonfinite_t)
-                    if isinstance(optimizer, MuonAdamWGroup):
-                        muon_lr = optimizer.muon.param_groups[0]["lr"]
-                        learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
-                        muon_lr = optimizer.param_groups[0]["lr"]
-                        learning_rate = optimizer.param_groups[1]["lr"]
-                    else:
-                        learning_rate = optimizer.param_groups[0]["lr"]
-                        muon_lr = None
+                    # Snapshot before scheduler.step(): dion's lr is a tensor it fills in place.
+                    learning_rate, muon_lr = _snapshot_lrs(optimizer)
 
                     if not step_skipped:
                         scheduler.step()
@@ -4161,6 +4284,8 @@ def run_pure_pretraining(
                                 reset_peak=True,
                             )
                     if should_log and is_main:
+                        learning_rate = float(learning_rate)
+                        muon_lr = float(muon_lr) if muon_lr is not None else None
                         waste = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
                         muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
                         moe_str = ""

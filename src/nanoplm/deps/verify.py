@@ -20,6 +20,7 @@ IMPORT_CHECKS = (
     "flash_attn_interface",   # FA3's import name (dist name is flash_attn_3)
     "quack",
     "sonicmoe",               # sonic-moe's import name (NOT sonic_moe)
+    "gram_newton_schulz",     # default Muon-family orthogonalizer
 )
 _DRIVER_HINTS = ("libcuda", "cuda driver", "driver library")
 

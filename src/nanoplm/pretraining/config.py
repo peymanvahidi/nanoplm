@@ -95,7 +95,9 @@ class PretrainingConfig:
     # hardcoded muon/normuon behavior; dion's native default is 'spectral_norm'.
     muon_adjust_lr: str = "rms_norm"  # rms_norm | spectral_norm | none
     muon_beta2: float = 0.95  # NorMuon/NorDion2 second-moment beta (ignored by plain Muon)
-    muon_use_gram_newton_schulz: bool = False
+    # Gram Newton-Schulz (Dao-AILab gram-newton-schulz, run through dion) is the
+    # default orthogonalizer and takes precedence over muon_use_polar_express.
+    muon_use_gram_newton_schulz: bool = True
     muon_triton_post_ortho: bool = False  # NorDion2 only in the current dion build
     muon_flatten: bool = False
     # NorDion2-specific. Only used when optimizer == "nordion2".
