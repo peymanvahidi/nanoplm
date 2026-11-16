@@ -103,6 +103,7 @@ class ProtModernBertMLMConfig:
     moe_n_group: int = 1  # group-limited routing: number of expert groups (1 = flat top-k)
     moe_topk_group: int = 1  # group-limited routing: number of groups kept per token
     moe_bias_update_rate: float = 1e-3  # Ling-style expert-bias update rate
+    moe_bias_update_mode: str = "proportional"  # proportional | sign (fixed +-rate step, DeepSeek-V3 / Ling-V2)
     moe_leading_dense_layers: int = 0
     moe_kernel_backend: str = "cutlass"  # cutlass | sonicmoe (routed-expert compute)
     moe_nan_guard: bool = False  # skip-and-log a NaN step instead of crashing (see ModernBertConfig)
