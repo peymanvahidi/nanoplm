@@ -846,7 +846,7 @@ def pretrain():
     help="Checkpoint scope. 'layer' checkpoints the whole transformer layer; "
     "'attn' checkpoints only the attention residual branch (usually the best tradeoff); "
     "'attn_minimal' is 'attn' but keeps the matmul and FlashAttention outputs, so the backward "
-    "recomputes only norms/QK-norm/RoPE (faster, more memory); "
+    "recomputes only norms/QK-norm/RoPE (faster, more memory; needs attention_dropout 0); "
     "'attn+mlp' checkpoints both attention and MLP branches.",
 )
 @click.option(

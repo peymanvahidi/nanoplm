@@ -412,6 +412,29 @@ class ModernBertConfig:
                 "use_paired_head_attention is not compatible with Canon-B. "
                 "Remove 'b' from canon_layers_mode."
             )
+        self.activation_checkpointing_mode = (
+            str(self.activation_checkpointing_mode).strip().lower()
+        )
+        _ac_modes = ("layer", "attn", "attn_minimal", "attn+mlp")
+        if self.activation_checkpointing_mode not in _ac_modes:
+            raise ValueError(
+                "Unsupported activation_checkpointing_mode: "
+                f"{self.activation_checkpointing_mode!r}. Supported: {list(_ac_modes)}"
+            )
+        if (
+            self.activation_checkpointing
+            and self.activation_checkpointing_mode == "attn_minimal"
+            and self.attention_dropout > 0.0
+        ):
+            # attn_minimal saves the attention kernel's outputs, so the kernel is
+            # not re-run on recompute and does not advance the RNG; the recomputed
+            # dropout then draws a different mask than the forward did and the
+            # gradients are silently wrong on GPU (SDPA and FA2 dropout paths).
+            raise ValueError(
+                "activation_checkpointing_mode='attn_minimal' does not support "
+                f"attention_dropout > 0 (got {self.attention_dropout}). "
+                "Use activation_checkpointing_mode='attn', or set attention_dropout to 0.0."
+            )
         if self.use_noble and self.mlp_activation == "srelu":
             import warnings
             warnings.warn(

@@ -155,3 +155,42 @@ def test_moe_accepts_attn_minimal():
     ModernBertConfig(activation_checkpointing_mode="attn_minimal", **kw)
     with pytest.raises(ValueError, match="attn\\+mlp"):
         ModernBertConfig(activation_checkpointing_mode="attn+mlp", **kw)
+
+
+def test_attn_minimal_rejects_attention_dropout():
+    # attn_minimal saves the SDPA/FA2 kernel outputs; with dropout those kernels
+    # consume RNG in forward but not on recompute, so the recomputed dropout
+    # draws a different mask and the gradients are silently wrong (GPU only).
+    with pytest.raises(ValueError, match="attention_dropout"):
+        PureProtModernBertMLM(
+            _cfg(
+                activation_checkpointing=True,
+                activation_checkpointing_mode="Attn_Minimal",
+                attention_dropout=0.1,
+            )
+        )
+    # Neighbouring combinations still build.
+    for ac, mode, p in (
+        (True, "attn", 0.1),
+        (True, "attn_minimal", 0.0),
+        (False, "attn_minimal", 0.1),
+    ):
+        PureProtModernBertMLM(
+            _cfg(
+                activation_checkpointing=ac,
+                activation_checkpointing_mode=mode,
+                attention_dropout=p,
+            )
+        )
+
+
+def test_unknown_activation_checkpointing_mode_raises():
+    # A typo used to disable AC silently (no branch matched the mode).
+    for enabled in (True, False):
+        with pytest.raises(ValueError, match="attn_minimal"):
+            PureProtModernBertMLM(
+                _cfg(
+                    activation_checkpointing=enabled,
+                    activation_checkpointing_mode="attn-minimal",
+                )
+            )
