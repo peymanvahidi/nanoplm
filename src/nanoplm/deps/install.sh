@@ -20,7 +20,8 @@ TORCH_INDEX="https://download.pytorch.org/whl/cu130"
 DION_SHA="7692479288f928a3d61d1cc58137b4dbe4f71000"           # microsoft/dion main (upstream)
 # gram-newton-schulz pins nvidia-cutlass-dsl==4.5.2; we run 4.5.3 for sonic-moe,
 # so it installs --no-deps (its quack/DSL needs are covered by step_moe).
-GNS_SPEC="gram-newton-schulz==0.1.6"
+GNS_VERSION="0.1.6"
+GNS_SPEC="gram-newton-schulz==${GNS_VERSION}"
 TE_TAG="${TE_TAG:-v2.16}"
 SONICMOE_SHA="4923037d858aebfe5738ebb17d02f88d7871c333"       # Dao-AILab/sonic-moe PR #64 head
 SONICMOE_URL="git+https://github.com/Dao-AILab/sonic-moe.git@${SONICMOE_SHA}"
@@ -597,7 +598,7 @@ step_moe() {
     log "installing sonic-moe @ ${SONICMOE_SHA:0:12}"
     run_cmd "$PY" -m pip install "$SONICMOE_URL"
   fi
-  if satisfied gram-newton-schulz "0.1.6"; then log "gram-newton-schulz 0.1.6 present; skipping."; else
+  if satisfied gram-newton-schulz "$GNS_VERSION"; then log "gram-newton-schulz $GNS_VERSION present; skipping."; else
     log "installing $GNS_SPEC (--no-deps)"
     run_cmd "$PY" -m pip install --no-deps "$GNS_SPEC"
   fi

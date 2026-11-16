@@ -1803,7 +1803,9 @@ def _create_scheduler(
             (case-insensitive). Used by ``wsd`` and ``decay``.
         last_epoch: If >= 0 the scheduler is positioned at that step
             (useful when reconstructing the schedule on resume).
-            ``initial_lr`` is injected into param groups automatically.
+            ``initial_lr`` is injected into param groups automatically, as a
+            float: dion keeps ``lr`` as a tensor that the scheduler fills in
+            place, so storing that tensor would make ``initial_lr`` follow it.
 
     Note:
         For ``wsd`` the floor (``lr_decay_to_fraction``) is the value AT step
@@ -1854,7 +1856,8 @@ def _create_scheduler(
     def _make_scheduler(opt, last_ep):
         if last_ep >= 0:
             for pg in opt.param_groups:
-                pg.setdefault("initial_lr", pg["lr"])
+                if "initial_lr" not in pg:
+                    pg["initial_lr"] = float(pg["lr"])
         return LambdaLR(opt, lr_lambda, last_epoch=last_ep)
 
     def _make_scheduler_any(opt, last_ep):
@@ -1868,7 +1871,8 @@ def _create_scheduler(
 
     if last_epoch >= 0:
         for pg in optimizer.param_groups:
-            pg.setdefault("initial_lr", pg["lr"])
+            if "initial_lr" not in pg:
+                pg["initial_lr"] = float(pg["lr"])
 
     return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
 
@@ -2266,6 +2270,37 @@ def _load_checkpoint(
         state = training_state
         return int(state.get("global_step", 0)), int(state.get("epoch", 0))
     return 0, 0
+
+
+def _group_lr(pg: dict):
+    """Snapshot ``pg["lr"]`` so a later ``scheduler.step()`` cannot change it.
+
+    dion keeps ``lr`` as a persistent 0-d device tensor that LambdaLR updates in
+    place, so a bare reference held across ``scheduler.step()`` reads the next
+    step's LR. A device clone avoids a per-step host sync; convert with
+    ``float()`` where the value is logged.
+    """
+    lr = pg["lr"]
+    return lr.detach().clone() if isinstance(lr, torch.Tensor) else lr
+
+
+def _snapshot_lrs(optimizer):
+    """Return ``(learning_rate, muon_lr)`` for the step that just ran.
+
+    Call after ``optimizer.step()`` and before ``scheduler.step()``.
+    ``learning_rate`` is the AdamW (or only) group's LR; ``muon_lr`` is None
+    for a plain torch optimizer. Values are ``_group_lr`` snapshots, so no
+    host sync happens here.
+    """
+    if isinstance(optimizer, MuonAdamWGroup):
+        return (
+            _group_lr(optimizer.adamw.param_groups[0]),
+            _group_lr(optimizer.muon.param_groups[0]),
+        )
+    if _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
+        # param_groups[0] = muon, param_groups[1] = adamw
+        return _group_lr(optimizer.param_groups[1]), _group_lr(optimizer.param_groups[0])
+    return _group_lr(optimizer.param_groups[0]), None
 
 
 def _iter_param_groups(optimizer):
@@ -4061,15 +4096,8 @@ def run_pure_pretraining(
                         nonfinite_t = _nonfinite_check_tensor([param for param in orig_model.parameters()])
                         if nonfinite_t is not None:
                             param_finite_check.submit(nonfinite_t)
-                    if isinstance(optimizer, MuonAdamWGroup):
-                        muon_lr = optimizer.muon.param_groups[0]["lr"]
-                        learning_rate = optimizer.adamw.param_groups[0]["lr"]
-                    elif _DION_OPTIMIZER_TYPES and isinstance(optimizer, _DION_OPTIMIZER_TYPES):
-                        muon_lr = optimizer.param_groups[0]["lr"]
-                        learning_rate = optimizer.param_groups[1]["lr"]
-                    else:
-                        learning_rate = optimizer.param_groups[0]["lr"]
-                        muon_lr = None
+                    # Snapshot before scheduler.step(): dion's lr is a tensor it fills in place.
+                    learning_rate, muon_lr = _snapshot_lrs(optimizer)
 
                     if not step_skipped:
                         scheduler.step()
@@ -4217,6 +4245,8 @@ def run_pure_pretraining(
                                 reset_peak=True,
                             )
                     if should_log and is_main:
+                        learning_rate = float(learning_rate)
+                        muon_lr = float(muon_lr) if muon_lr is not None else None
                         waste = (1.0 - step_tok / max(step_raw_tok, 1)) * 100
                         muon_str = f"muon_lr={muon_lr:.2e} " if muon_lr is not None else ""
                         moe_str = ""

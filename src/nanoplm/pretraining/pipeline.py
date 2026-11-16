@@ -125,8 +125,9 @@ class TokenTrackingTrainer(Trainer):
 
         if is_muon_optimizer(optimizer):
             # param_groups[0] = muon, param_groups[1] = adamw
-            muon_lr = optimizer.param_groups[0]["lr"]
-            adamw_lr = optimizer.param_groups[1]["lr"]
+            # float(): dion keeps lr as a device tensor; logs must hold plain numbers.
+            muon_lr = float(optimizer.param_groups[0]["lr"])
+            adamw_lr = float(optimizer.param_groups[1]["lr"])
             logs["learning_rate"] = adamw_lr
             logs["adamw_lr"] = adamw_lr
             logs["muon_lr"] = muon_lr
