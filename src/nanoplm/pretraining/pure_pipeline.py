@@ -82,6 +82,7 @@ from nanoplm.pretraining.models.modern_bert.modeling import (
     ModernBertEncoderLayer,
     check_mhc_checkpoint,
 )
+from nanoplm.pretraining.models.modern_bert.moe import check_moe_checkpoint
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
 from nanoplm.pretraining.optim import (
     build_muon_optimizer,
@@ -2133,6 +2134,42 @@ def _save_checkpoint(
     logger.info(f"Checkpoint saved -> {ckpt}")
 
 
+def _check_checkpoint_keys(model, model_sd: dict, path) -> None:
+    """Refuse a checkpoint whose keys differ from the model's, as strict
+    ``load_state_dict`` does on the single-GPU/DDP path.
+
+    ``set_model_state_dict(full_state_dict=True)`` (FSDP/HSDP) fills every key
+    missing from the checkpoint with the live model's value, so a missing key
+    would otherwise resume silently with its fresh init. Expected keys use the
+    naming ``get_model_state_dict`` writes on save (wrapper prefixes such as
+    ``_orig_mod.`` removed); non-persistent buffers are not in either, tied
+    weights are in both. Every rank holds the full checkpoint and raises the
+    same error before any collective.
+    """
+    from torch.distributed.checkpoint.state_dict import _get_fqns
+
+    expected = {fqn for key in model.state_dict() for fqn in _get_fqns(model, key)}
+    found = set(model_sd)
+    missing = sorted(expected - found)
+    unexpected = sorted(found - expected)
+    if not (missing or unexpected):
+        return
+
+    def show(keys):
+        return ", ".join(keys[:10]) + (f", ... ({len(keys) - 10} more)" if len(keys) > 10 else "")
+
+    parts = []
+    if missing:
+        parts.append(f"missing {len(missing)} key(s): {show(missing)}")
+    if unexpected:
+        parts.append(f"unexpected {len(unexpected)} key(s): {show(unexpected)}")
+    raise RuntimeError(
+        f"Checkpoint {path} does not match the model: " + "; ".join(parts)
+        + ". Refusing to resume (FSDP/HSDP loading would keep the freshly "
+        "initialised value of every missing key without saying so)."
+    )
+
+
 def _load_checkpoint(
     model, optimizer, scheduler, checkpoint_dir, device,
     distributed=False, load_scheduler=True, distributed_mode="fsdp",
@@ -2162,7 +2199,9 @@ def _load_checkpoint(
 
     model_sd = torch.load(ckp / "pytorch_model.bin", map_location=device, weights_only=True)
     check_mhc_checkpoint(model, model_sd)
+    check_moe_checkpoint(model, model_sd)
     if distributed and _is_fsdp(distributed_mode):
+        _check_checkpoint_keys(model, model_sd, ckp / "pytorch_model.bin")
         set_model_state_dict(model, model_sd, options=StateDictOptions(full_state_dict=True))
     else:
         model.load_state_dict(model_sd)
