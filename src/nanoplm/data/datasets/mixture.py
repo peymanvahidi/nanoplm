@@ -66,6 +66,10 @@ def source_key(seed: int, name: str) -> int:
     return splitmix64(((int(seed) ^ PERM_TAG) & MASK64) ^ _name_key(name))
 
 
+# source_slots multiplies two values below n in uint64
+_MAX_SLOT_ITEMS = 1 << 32
+
+
 def _affine(key: int, pass_: int, n: int) -> tuple:
     if n <= 1:
         return 1, 0
@@ -150,6 +154,10 @@ class MixtureDataset(torch.utils.data.Dataset):
         """(items, passes) of source s's k_s positions in mixture epoch ``epoch``."""
         e = self._epoch if epoch is None else int(epoch)
         n, k = self.sizes[s], self.counts[s]
+        if n >= _MAX_SLOT_ITEMS:
+            # a * u below runs in uint64 with a, u < n: exact only while n < 2^32
+            raise ValueError(f"mixture source {s} has {n:,} items; source_slots supports "
+                             f"fewer than 2^32 ({_MAX_SLOT_ITEMS:,})")
         q = e * k + np.arange(k, dtype=np.int64)
         p, u = np.divmod(q, n)
         # one (a, b) per pass, then all slots at once: a small source can repeat

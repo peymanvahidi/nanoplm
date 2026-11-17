@@ -337,3 +337,21 @@ def test_eval_takes_val_rows_spread_over_the_whole_set():
     assert mx.eval_indices(7, 7) == list(range(7))      # all of a small set, in order
     assert mx.eval_indices(9, 8) == [0, 1, 2, 3, 5, 6, 7, 8]  # the last row too
 
+
+
+def test_source_slots_refuses_2_pow_32_items():
+    from types import SimpleNamespace
+
+    from nanoplm.data.datasets.mixture import MixtureDataset
+    fake = SimpleNamespace(_epoch=0, sizes=[1 << 32], counts=[1], _keys=[0])
+    with pytest.raises(ValueError, match="fewer than 2"):
+        MixtureDataset.source_slots(fake, 0)
+
+
+def test_run_plan_warning_when_every_source_is_over():
+    from nanoplm.data.infra import mixture as mx_infra
+    plan = [dict(name="a", share=0.5, size=10, kind="plain", tokens=1.0, epochs=12.0),
+            dict(name="b", share=0.5, size=10, kind="plain", tokens=1.0, epochs=11.0)]
+    warns = [ln for ln in mx_infra.format_run_plan(plan, 100) if ln.startswith("Warning")]
+    assert len(warns) == 2
+    assert all("lower the token budget" in w and ".weight" not in w for w in warns)

@@ -228,11 +228,14 @@ def format_run_plan(plan: list, budget_tokens: int) -> list:
              "(share = share of training sequences):"]
     lines += ["  " + "  ".join(c.ljust(w) if i == 0 else c.rjust(w)
                                for i, (c, w) in enumerate(zip(r, widths))) for r in rows]
-    for p in plan:
-        if p["epochs"] > REPEAT_WARN:
-            lines.append(f"Warning: sources.{p['name']}: read {p['epochs']:.1f} times over "
-                         f"the run (more than {REPEAT_WARN}x); lower sources.{p['name']}.weight "
-                         "or add data")
+    over = [p for p in plan if p["epochs"] > REPEAT_WARN]
+    for p in over:
+        # when every source is over, a lower weight only moves the repeats elsewhere
+        fix = ("lower the token budget (train_tokens, or stable_tokens + decay_tokens) or "
+               "add data" if len(over) == len(plan) else
+               f"lower sources.{p['name']}.weight or add data")
+        lines.append(f"Warning: sources.{p['name']}: read {p['epochs']:.1f} times over "
+                     f"the run (more than {REPEAT_WARN}x); {fix}")
     return lines
 
 
