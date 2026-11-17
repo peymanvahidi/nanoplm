@@ -240,6 +240,16 @@ class ClusterSampledDataset(ShardedDataset):
             out[a:b] = lengths[self._members[start + slot]]
         return out
 
+    def rows_at(self, idx: np.ndarray, epochs) -> np.ndarray:
+        """Pool row the member position ``idx[i]`` gives in pass ``epochs[i]`` (or one
+        pass for all)."""
+        tc = np.asarray(self._tc[np.asarray(idx, dtype=np.int64)])
+        uloc = np.asarray(self._g2u[tc], dtype=np.int64)
+        start = np.asarray(self._off[uloc], dtype=np.int64)
+        size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
+        slot = member_slots_vec(self.seed, tc, epochs, size)
+        return np.asarray(self._members[start + slot])
+
     def read_pool_row(self, row: int) -> Dict[str, torch.Tensor]:
         """Pool row ``row``, read the way ShardedDataset.__getitem__ reads its rows.
 

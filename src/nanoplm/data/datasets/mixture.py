@@ -185,6 +185,37 @@ class MixtureDataset(torch.utils.data.Dataset):
             self._lengths_cache = (key, np.concatenate(parts).astype(np.int32))
         return self._lengths_cache[1]
 
+    def lengths_at_positions(self, idx: np.ndarray, epoch: Optional[int] = None) -> np.ndarray:
+        """``get_all_sequence_lengths()[idx]`` without the full array: int32 length of
+        the sequence at mixture positions ``idx`` (any order, repeats allowed)."""
+        e = self._epoch if epoch is None else int(epoch)
+        idx = np.asarray(idx, dtype=np.int64)
+        if len(idx) and (idx.min() < 0 or idx.max() >= len(self)):
+            raise IndexError(f"mixture positions must lie in [0, {len(self)})")
+        out = np.empty(len(idx), dtype=np.int32)
+        src = np.searchsorted(self.starts, idx, side="right") - 1
+        for s, ds in enumerate(self.datasets):
+            sel = np.nonzero(src == s)[0]
+            if not len(sel):
+                continue
+            n, k = self.sizes[s], self.counts[s]
+            if n >= _MAX_SLOT_ITEMS:
+                # a * u below runs in uint64 with a, u < n: exact only while n < 2^32
+                raise ValueError(f"mixture source {s} has {n:,} items; lengths_at_positions "
+                                 f"supports fewer than 2^32 ({_MAX_SLOT_ITEMS:,})")
+            p, u = np.divmod(e * k + (idx[sel] - int(self.starts[s])), n)
+            # positions arrive unsorted: span the passes by min/max, not first/last
+            p0 = int(p.min())
+            ab = np.array([_affine(self._keys[s], pv, n) for pv in range(p0, int(p.max()) + 1)],
+                          dtype=np.uint64).reshape(-1, 2)
+            w = p - p0
+            with np.errstate(over="ignore"):
+                items = ((ab[w, 0] * u.astype(np.uint64) + ab[w, 1])
+                         % np.uint64(n)).astype(np.int64)
+            rows = ds.rows_at(items, p) if self.is_cluster(s) else items
+            out[sel] = ds.row_lengths_at(rows)
+        return out
+
     # ---- pickling: drop the caches, keep the sources ----------------------------
     def __getstate__(self) -> dict:
         state = dict(self.__dict__)

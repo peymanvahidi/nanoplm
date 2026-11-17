@@ -176,6 +176,23 @@ class ShardedDataset(Dataset):
             all_lengths.append(np.diff(offsets).astype(np.int32))
         return np.concatenate(all_lengths)
 
+    def row_lengths_at(self, rows: np.ndarray) -> np.ndarray:
+        """int32 length of shard rows ``rows`` (any order, repeats allowed), read from
+        the per-shard offsets without building the flat per-row array."""
+        rows = np.asarray(rows, dtype=np.int64)
+        out = np.empty(len(rows), dtype=np.int32)
+        cum = np.asarray(self.cum_lengths, dtype=np.int64)
+        shard = np.searchsorted(cum, rows, side="right")
+        order = np.argsort(shard, kind="stable")
+        bounds = np.searchsorted(shard[order], np.arange(len(cum) + 1))
+        for s in range(len(cum)):
+            sel = order[bounds[s]:bounds[s + 1]]
+            if len(sel):
+                local = rows[sel] - (int(cum[s - 1]) if s else 0)
+                off = self._offsets[s]
+                out[sel] = off[local + 1] - off[local]
+        return out
+
     def fingerprint(self) -> str:
         """Return a lightweight hex digest identifying this dataset's content.
 
@@ -332,6 +349,12 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
             dtype=np.int64,
         )
 
+    def _lengths_at(self, idx: np.ndarray) -> np.ndarray:
+        """Lengths at dataset positions ``idx``; a mixture computes only those."""
+        if hasattr(self.dataset, "lengths_at_positions"):
+            return self.dataset.lengths_at_positions(idx)
+        return self._all_sequence_lengths()[idx]
+
     def _per_worker_sample_lengths(self) -> list[list[int]]:
         """Sample lengths in the order each DataLoader worker packs them.
 
@@ -343,9 +366,8 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
             return [self._resolve_sample_lengths()]
 
         if isinstance(self.sampler, torch.utils.data.DistributedSampler):
-            lengths = self._all_sequence_lengths()
             return [
-                lengths[idx].tolist()
+                self._lengths_at(idx).tolist()
                 for idx in self._distributed_worker_indices(nw, self._epoch)
             ]
         if self.sampler is not None:
@@ -365,7 +387,7 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         """Sample lengths in the order of the rank sampler (single stream)."""
         if isinstance(self.sampler, torch.utils.data.DistributedSampler):
             (idx,) = self._distributed_worker_indices(1, self.sampler.epoch)
-            return self._all_sequence_lengths()[idx].tolist()
+            return self._lengths_at(idx).tolist()
 
         if hasattr(self.dataset, "get_all_sequence_lengths"):
             lengths = np.asarray(self.dataset.get_all_sequence_lengths())

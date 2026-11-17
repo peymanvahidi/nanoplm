@@ -212,6 +212,52 @@ def test_lengths_match_items(mix):
         assert all(lengths[i] == len(mix[i]["input_ids"]) for i in range(len(mix)))
 
 
+def test_lengths_at_positions_match_the_full_array(mix):
+    rng = np.random.default_rng(0)
+    for e in (0, 3):
+        mix.set_epoch(e)
+        full = mix.get_all_sequence_lengths()
+        some = rng.integers(0, len(mix), size=3 * len(mix))  # shuffled, with repeats
+        for idx in (np.arange(len(mix)), some, np.array([], dtype=np.int64)):
+            got = mix.lengths_at_positions(idx)
+            assert got.dtype == np.int32
+            assert np.array_equal(got, full[idx])
+            assert np.array_equal(mix.lengths_at_positions(idx, epoch=e), full[idx])
+
+
+def test_lengths_at_positions_uses_the_epoch_argument(mix):
+    mix.set_epoch(3)
+    full3 = mix.get_all_sequence_lengths().copy()
+    idx = np.arange(len(mix))
+    mix.set_epoch(0)
+    assert not np.array_equal(mix.get_all_sequence_lengths(), full3)  # epochs must differ
+    assert np.array_equal(mix.lengths_at_positions(idx, epoch=3), full3)
+
+
+def test_lengths_at_positions_rejects_out_of_range(mix):
+    for bad in ([len(mix)], [-1], [0, len(mix) + 5]):
+        with pytest.raises(IndexError):
+            mix.lengths_at_positions(np.array(bad))
+
+
+def test_packed_len_on_a_mixture_skips_the_full_length_array(built, monkeypatch):
+    root, folders, _ = built
+    packed = _packed(root, _write(root, folders, {"a": 0.5, "b": 0.2, "c": 0.3}))
+    packed.set_epoch(1)
+    want = len(_batches(packed, 0))
+
+    def boom(self):
+        raise AssertionError("get_all_sequence_lengths called")
+    monkeypatch.setattr(MixtureDataset, "get_all_sequence_lengths", boom)
+    for workers in (0, 2):
+        packed.set_num_workers(workers)
+        packed._cached_len = None
+        assert len(packed) > 0
+    packed.set_num_workers(0)
+    packed._cached_len = None
+    assert len(packed) == want
+
+
 def test_a_repeated_cluster_source_draws_new_members_each_pass(built, tmp_path):
     _, folders, pool = built
     m = _write(tmp_path, folders, {"a": 0.1, "c": 0.9})
