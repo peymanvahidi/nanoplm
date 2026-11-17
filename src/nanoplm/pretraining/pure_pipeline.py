@@ -2117,39 +2117,60 @@ def _rescale_resume_data_step(
     world_size: int,
     saved_num_workers: Optional[int] = None,
     num_workers: Optional[int] = None,
-) -> tuple[int, list[str]]:
-    """Translate a saved per-rank ``epoch_data_step`` to this run's rank count.
+    saved_len: Optional[int] = None,
+    pass_len: Optional[int] = None,
+) -> tuple[int, bool, list[str]]:
+    """Translate a saved per-rank ``epoch_data_step`` to this run's layout.
 
-    The saved step counts micro-batches per rank, so ``step * W_old`` micro-
-    batches were consumed across the job. With ``W_new`` ranks the same share
-    is ``round(step * W_old / W_new)`` per rank. The samplers deal items to
-    ranks (and workers) differently at another count, so the result is an
-    estimate. Checkpoints written before these keys were saved carry no
-    counts: the step is returned unchanged, with no warning.
+    The saved step counts micro-batches per rank of a pass ``saved_len`` long.
+    On another layout (rank count, worker count or micro-batch size) the same
+    fraction of the pass is ``round(step * pass_len / saved_len)``; a step at
+    or past ``saved_len`` means the pass was finished. Checkpoints that saved
+    ``world_size`` but not the pass length fall back to the rank ratio. The
+    samplers deal items differently on another layout, so mid-pass the result
+    is an estimate. Checkpoints with no ``world_size`` keep their step.
 
-    Returns ``(data_step, warnings)``.
+    Returns ``(data_step, layout_changed, warnings)``.
     """
-    warnings: list[str] = []
-    if saved_world_size is not None and int(saved_world_size) != int(world_size):
-        old_w, new_w = int(saved_world_size), int(world_size)
-        new_step = int(round(data_step * old_w / new_w))
-        warnings.append(
-            f"Resuming on {new_w} ranks from a checkpoint saved on {old_w} ranks: "
-            f"data position rescaled from {data_step} to {new_step} micro-steps per "
-            f"rank. The position is an estimate; a little data may repeat or be skipped."
-        )
-        data_step = new_step
-    if (
-        saved_num_workers is not None
-        and num_workers is not None
-        and int(saved_num_workers) != int(num_workers)
-    ):
-        warnings.append(
-            f"Resuming with num_workers={int(num_workers)} from a checkpoint saved with "
-            f"num_workers={int(saved_num_workers)}: the workers split the data "
-            f"differently, so a little data may repeat or be skipped."
-        )
-    return data_step, warnings
+    def _differs(a, b):
+        return a is not None and b is not None and int(a) != int(b)
+
+    changed = (
+        _differs(saved_world_size, world_size)
+        or _differs(saved_num_workers, num_workers)
+        or _differs(saved_len, pass_len)
+    )
+    if saved_len is not None and pass_len is not None and data_step >= int(saved_len):
+        return int(pass_len), changed, []  # finished pass: the caller starts the next
+    if data_step <= 0:
+        return 0, changed, []
+    if saved_world_size is None:
+        return data_step, False, [
+            "This checkpoint does not record its GPU count. The data position "
+            f"(micro-step {data_step}) is only right when resuming on the same GPU "
+            "count, num_workers and micro_batch_seqs."
+        ]
+    if not changed:
+        return data_step, False, []
+    what = []
+    if _differs(saved_world_size, world_size):
+        what.append(f"{int(saved_world_size)} -> {int(world_size)} GPUs")
+    if _differs(saved_num_workers, num_workers):
+        what.append(f"num_workers {int(saved_num_workers)} -> {int(num_workers)}")
+    if saved_len is not None and pass_len is not None:
+        if _differs(saved_len, pass_len):
+            what.append(f"pass length {int(saved_len)} -> {int(pass_len)} micro-steps")
+        new_step = int(round(data_step * int(pass_len) / int(saved_len)))
+    else:
+        new_step = int(round(data_step * int(saved_world_size) / int(world_size)))
+    if new_step == data_step:
+        pos = f"data position kept at micro-step {data_step}"
+    else:
+        pos = f"data position rescaled from micro-step {data_step} to {new_step}"
+    return new_step, True, [
+        f"Resumed with a different data layout ({', '.join(what)}): {pos}. "
+        f"Within this pass a little data may repeat or be skipped."
+    ]
 
 
 def _checkpoint_dir_name(global_step: int, phase: str = "periodic") -> str:
@@ -2177,6 +2198,7 @@ def _save_checkpoint(
     decay_steps: Optional[int] = None,
     world_size: Optional[int] = None,
     num_workers: Optional[int] = None,
+    epoch_data_len: Optional[int] = None,
 ) -> None:
     ckpt = Path(output_dir) / _checkpoint_dir_name(global_step, phase)
 
@@ -2256,6 +2278,8 @@ def _save_checkpoint(
         training_state["world_size"] = int(world_size)
     if num_workers is not None:
         training_state["num_workers"] = int(num_workers)
+    if epoch_data_len is not None:
+        training_state["epoch_data_len"] = int(epoch_data_len)
     (ckpt / "training_state.json").write_text(
         json.dumps(training_state, indent=2),
         encoding="utf-8",
@@ -3550,6 +3574,7 @@ def run_pure_pretraining(
     start_step, start_epoch = 0, 0
     resume_data_step, resume_sub_batch_step = 0, 0
     resume_batch_split_divisor = 1
+    resume_tokens_seen: Optional[int] = None
     resume_epoch = 0
     # When a `decay` resume anneals a `warmup_stable` trunk, the loaded
     # pretrain_config still says lr_schedule="warmup_stable", which would make
@@ -3668,6 +3693,17 @@ def run_pure_pretraining(
                 decay_steps=horizon.decay_steps,
                 is_main=is_main,
             )
+            _ckp_gbt = (_ckp_state or {}).get("achieved_global_batch_tokens")
+            if is_main and _ckp_gbt is not None and int(_ckp_gbt) != int(achieved_global_batch_tokens):
+                logger.warning(
+                    "Continue resume: achieved_global_batch_tokens changed since the "
+                    "checkpoint (%d -> %d); the remaining steps use this run's batch, so "
+                    "the token total changes (and, with a token budget, total_steps "
+                    "and the LR schedule position).",
+                    int(_ckp_gbt), int(achieved_global_batch_tokens),
+                )
+            if _ckp_state is not None and "tokens_seen" in _ckp_state:
+                resume_tokens_seen = int(_ckp_state["tokens_seen"])
         # Both modes continue the data where the checkpoint stopped. A decay
         # that restarted the pass would re-train on data the trunk has already
         # seen, and arms branching from one trunk step would only share their
@@ -3686,22 +3722,7 @@ def run_pure_pretraining(
             resume_batch_split_divisor = max(
                 1, int(_ckp_state.get("batch_split_divisor", 1))
             )
-            _saved_step = resume_data_step
-            resume_data_step, _pos_warnings = _rescale_resume_data_step(
-                resume_data_step,
-                _ckp_state.get("world_size"),
-                effective_world_size,
-                _ckp_state.get("num_workers"),
-                num_workers,
-            )
-            if resume_data_step != _saved_step:
-                # The sub-batch offset belongs to the old micro-step; start
-                # the estimated one from its top.
-                resume_sub_batch_step = 0
-                resume_batch_split_divisor = 1
-            if is_main:
-                for _w in _pos_warnings:
-                    logger.warning(_w)
+            _rescale_pos = True
         else:
             # Dataset changed, or a checkpoint written before the position
             # was saved (terminal/role checkpoints only carry it since
@@ -3711,11 +3732,31 @@ def run_pure_pretraining(
             resume_data_step = 0
             resume_sub_batch_step = 0
             resume_batch_split_divisor = 1
+            _rescale_pos = False
         if resume_epoch != synced_len_epoch:
             synced_len = _synced_len_at(resume_epoch)
             synced_len_epoch = resume_epoch
             _check_pass_len(synced_len, inferred_grad_accum_steps,
                             pretrain_config.global_batch_tokens, resume_epoch)
+        if _rescale_pos:
+            # Needs this run's pass length, so it runs after synced_len is set.
+            resume_data_step, _layout_changed, _pos_warnings = _rescale_resume_data_step(
+                resume_data_step,
+                _ckp_state.get("world_size"),
+                effective_world_size,
+                _ckp_state.get("num_workers"),
+                num_workers,
+                _ckp_state.get("epoch_data_len"),
+                synced_len,
+            )
+            if _layout_changed:
+                # The sub-batch offset belongs to the old layout's micro-step;
+                # start the rescaled one from its top.
+                resume_sub_batch_step = 0
+                resume_batch_split_divisor = 1
+            if is_main:
+                for _w in _pos_warnings:
+                    logger.warning(_w)
         if resume_data_step >= synced_len:
             # Saved position lands at/after the end of a pass; start the next
             # pass cleanly from the top.
@@ -3894,8 +3935,12 @@ def run_pure_pretraining(
     # Anchored at start_step so resume stays consistent. When
     # global_batch_warmup_steps > 0 the per-step token count ramps; we use the
     # steady-state achieved_global_batch_tokens here, so tokens_seen is an
-    # approximation in that regime (noted in the warmup log above).
-    tokens_seen = int(start_step) * int(achieved_global_batch_tokens)
+    # approximation in that regime (noted in the warmup log above). A continue
+    # resume keeps the checkpoint's count (its batch size may differ from ours).
+    if resume_tokens_seen is not None:
+        tokens_seen = resume_tokens_seen
+    else:
+        tokens_seen = int(start_step) * int(achieved_global_batch_tokens)
     accum_micro_count = 0
     effective_grad_accum, effective_micro_batch, mbs_divisor = _get_batch_warmup_params(
         global_step,
@@ -4084,6 +4129,7 @@ def run_pure_pretraining(
             achieved_global_batch_tokens=achieved_global_batch_tokens,
             stable_steps=horizon.stable_steps, decay_steps=horizon.decay_steps,
             world_size=effective_world_size, num_workers=num_workers,
+            epoch_data_len=synced_len,
             phase=phase,
             **over,
         )
