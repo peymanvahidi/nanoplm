@@ -262,6 +262,7 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         self._cached_len: Optional[int] = None
         self._skip_samples = 0
         self._skip_epoch: Optional[int] = None
+        self._worker_idx_cache: Optional[tuple] = None
 
     def set_num_workers(self, num_workers: int) -> None:
         """Tell the dataset how many DataLoader workers will read it."""
@@ -275,10 +276,17 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
 
         Bit-identical to ``DistributedSampler(self.dataset, num_replicas=W * nw,
         rank=r * nw + w, ...)`` with ``set_epoch(epoch)``, for w in range(nw),
-        which is what ``__iter__`` builds (nw == 1 gives the rank sampler's own
-        order).  Draws the epoch permutation once instead of once per worker and
-        keeps it in numpy instead of a Python list.
+        which is the order each ``__iter__`` worker reads (nw == 1 gives the
+        rank sampler's own order).  Draws the epoch permutation once instead of
+        once per worker and keeps it in numpy instead of a Python list.  Keeps
+        one ``(num_workers, epoch)`` entry: ``len()`` runs before ``iter()``
+        each pass, so forked DataLoader workers inherit it instead of drawing
+        the permutation again.
         """
+        key = (int(num_workers), int(epoch))
+        cache = self._worker_idx_cache
+        if cache is not None and cache[0] == key:
+            return cache[1]
         sampler = self.sampler
         n = len(self.dataset)
         replicas = sampler.num_replicas * num_workers
@@ -295,15 +303,15 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
             order = torch.randperm(n, generator=g).numpy()
         else:
             order = np.arange(n, dtype=np.int64)
-        if sampler.drop_last:
-            order = order[:total_size]
-        elif total_size > n:
-            # DistributedSampler pads by repeating the order cyclically.
-            order = np.resize(order, total_size)
-        return [
-            order[sampler.rank * num_workers + w:total_size:replicas]
+        # Gather (a copy, not a view) so the full permutation is freed.  The
+        # modulo wraps like DistributedSampler's cyclic padding; with drop_last
+        # total_size <= n and it is a no-op.
+        out = [
+            order[np.arange(sampler.rank * num_workers + w, total_size, replicas) % n]
             for w in range(num_workers)
         ]
+        self._worker_idx_cache = (key, out)
+        return out
 
     def _all_sequence_lengths(self) -> np.ndarray:
         if hasattr(self.dataset, "get_all_sequence_lengths"):
@@ -456,21 +464,15 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
                  )
              if worker_info is not None and worker_info.num_workers > 1:
                  if isinstance(self.sampler, torch.utils.data.DistributedSampler):
-                     # Build a per-worker DistributedSampler instead of sharing one sampler
-                     # and slicing in Python. This avoids O(dataset_size) index fan-out per worker.
-                     worker_sampler = torch.utils.data.DistributedSampler(
-                         self.dataset,
-                         num_replicas=self.sampler.num_replicas * worker_info.num_workers,
-                         rank=self.sampler.rank * worker_info.num_workers + worker_info.id,
-                         shuffle=self.sampler.shuffle,
-                         seed=self.sampler.seed,
-                         drop_last=self.sampler.drop_last,
-                     )
-                     worker_sampler.set_epoch(self._epoch)
+                     # Same order as a per-worker DistributedSampler; usually inherited
+                     # from the parent's len() call, so no permutation is drawn here.
+                     worker_indices = self._distributed_worker_indices(
+                         worker_info.num_workers, self._epoch
+                     )[worker_info.id].tolist()
                      # When fast-forwarding, skip the corresponding per-worker share of samples.
                      # Each worker sees 1/num_workers of the total samples, so scale accordingly.
                      per_worker_skip = skip_samples // worker_info.num_workers
-                     indices = islice(worker_sampler, per_worker_skip, None)
+                     indices = islice(worker_indices, per_worker_skip, None)
                      iterator = (self.dataset[i] for i in indices)
                  else:
                      # Generic fallback for non-distributed samplers.
@@ -546,6 +548,9 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         the correct position.
 
         Returns the number of underlying samples that will be skipped.
+
+        Unused by the training loop, and not exact with more than one worker
+        (each worker packs its own shard).
         """
         if n_batches <= 0:
             self._skip_samples = 0

@@ -5,6 +5,8 @@ DistributedSampler shard and drops its own partial last batch, so the length
 must be summed per worker, not packed over the rank's order.
 """
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -109,6 +111,89 @@ def test_worker_indices_match_per_worker_distributed_sampler(shuffle, drop_last,
                     )
                     ref.set_epoch(5)
                     assert fast[w].tolist() == list(ref), (world, nw, rank, w)
+
+
+def _stream(packed, nw):
+    loader = DataLoader(packed, batch_size=None, num_workers=nw, collate_fn=lambda b: b)
+    return [[int(s["input_ids"][0]) for s in batch] for batch in loader]
+
+
+def _reference_stream(ds, world, rank, nw, epoch, drop_last_sampler):
+    """What HEAD yielded: each worker packs its own per-worker DistributedSampler."""
+    workers = []
+    for w in range(max(nw, 1)):
+        ref = DistributedSampler(
+            ds, num_replicas=world * max(nw, 1), rank=rank * max(nw, 1) + w,
+            shuffle=True, seed=7, drop_last=drop_last_sampler,
+        )
+        ref.set_epoch(epoch)
+        packer = TokenPackingDataset([ds[i] for i in ref], MAX_TOKENS, drop_last=True)
+        workers.append([[int(s["input_ids"][0]) for s in b] for b in packer])
+    # The DataLoader takes batches from its workers round-robin.
+    out = []
+    for i in range(max(map(len, workers))):
+        out.extend(w[i] for w in workers if i < len(w))
+    return out
+
+
+@pytest.mark.parametrize(
+    "n,world,nw,epoch,drop_last_sampler",
+    [
+        (N, 4, 2, 0, False),
+        (N, 4, 2, 3, True),
+        (N, 3, 4, 1, False),  # n % (world * nw) != 0
+        (N, 3, 4, 2, True),
+        (N, 2, 1, 4, False),
+        (N, 2, 0, 4, True),
+    ],
+)
+def test_dataloader_stream_matches_per_worker_sampler(n, world, nw, epoch, drop_last_sampler):
+    ds = LengthsDataset(_lengths(3)[:n])
+    for rank in range(world):
+        packed = _packed(ds, world, rank, nw, drop_last_sampler=drop_last_sampler, epoch=epoch)
+        if rank % 2:
+            len(packed)  # memoized entry inherited by the workers; even ranks compute it there
+        assert _stream(packed, nw) == _reference_stream(
+            ds, world, rank, nw, epoch, drop_last_sampler
+        ), (n, world, nw, epoch, rank)
+
+
+def test_forked_workers_inherit_indices_after_len(monkeypatch, tmp_path):
+    """After len(), the forked workers reuse the parent's indices: no permutation drawn in them."""
+    log = tmp_path / "randperm_pids"
+    real = torch.randperm
+
+    def logging_randperm(*args, **kwargs):
+        with open(log, "a") as f:
+            f.write(f"{os.getpid()}\n")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "randperm", logging_randperm)
+
+    def pids():
+        out = [int(x) for x in log.read_text().split()] if log.exists() else []
+        log.unlink(missing_ok=True)
+        return out
+
+    ds = LengthsDataset(_lengths(4)[:301])
+    packed = _packed(ds, 2, 1, 2, epoch=2)
+    expected = _reference_stream(ds, 2, 1, 2, 2, False)
+    pids()
+
+    len(packed)
+    assert pids() == [os.getpid()]
+    loader = DataLoader(
+        packed, batch_size=None, num_workers=2, collate_fn=lambda b: b,
+        multiprocessing_context="fork",
+    )
+    assert [[int(s["input_ids"][0]) for s in b] for b in loader] == expected
+    assert pids() == []
+
+    # Control: without the memoized entry the workers do draw (the logging reaches them).
+    packed._worker_idx_cache = None
+    assert [[int(s["input_ids"][0]) for s in b] for b in loader] == expected
+    drawn = pids()
+    assert len(drawn) == 2 and os.getpid() not in drawn
 
 
 def test_len_draws_one_permutation(monkeypatch):
