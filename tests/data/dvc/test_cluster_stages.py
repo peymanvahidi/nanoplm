@@ -680,3 +680,22 @@ def test_from_yaml_end_to_end_with_a_cluster_file_or_cl_tags(tmp_path, how):
     assert ("Clusters:          40 (from the " + ("CL: tags" if how == "headers" else
                                                  "cluster file") + ")") in r.stdout
     assert _status(tmp_path, env) == set()
+
+
+def test_cluster_index_stage_warns_when_validation_holds_out_many(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import cluster_index_cmd
+    import nanoplm.data.preparation.cluster_pipeline as cp
+    counts = {"val_clusters": 15000, "train_clusters": 285000,
+              "clusters_in_universe": 300000, "pool_rows": 1}
+    monkeypatch.setattr(cp, "build_index_and_val", lambda *a, **k: {"counts": counts})
+    (tmp_path / "pool").mkdir()
+    for f in ("members.tsv", "a.fasta"):
+        (tmp_path / f).write_text("")
+    r = CliRunner().invoke(cluster_index_cmd, [
+        "--members-tsv", str(tmp_path / "members.tsv"), "--fasta", str(tmp_path / "a.fasta"),
+        "--pool", str(tmp_path / "pool"), "--index-dir", str(tmp_path / "i"),
+        "--val-dir", str(tmp_path / "v"), "--max-seq-len", "512", "--val-ratio", "0.05",
+        "--samples-per-shard", "2000"])
+    assert r.exit_code == 0, r.output
+    assert "validation holds out 15,000 of 300,000 clusters (5.0%)" in r.output

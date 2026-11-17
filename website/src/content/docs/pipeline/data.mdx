@@ -134,8 +134,7 @@ data_params:
   min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
   val_ratio: 0.1         # share of the mix held out for validation
-  # OR (together you'll get error, comment one out)
-  # val_size: 150000
+  # val_size: 150000   # or a count of val sequences instead; set only one
   drop_invalid_sequences: true   # false: stop on records with unknown characters instead of dropping them
 
   # Rarely changed
@@ -312,7 +311,7 @@ To skip the download, set fasta: "output/data/raw/sequences.fasta.gz" (the file 
 Then these old files can be deleted: output/data/raw/sequences.fasta, output/data/validation, output/data/raw/sequences_shuffled.fasta, output/data/filter/sequences_filtered.fasta, output/data/split.
 ```
 
-The `To skip the download` line appears only when that file exists.
+The `To skip the download` line appears only for a `url` source whose downloaded file exists.
 
 Switch before your first run with this version. The old layout reruns from the download step, so a `url` source downloads again, even though it builds the same files.
 

@@ -34,9 +34,9 @@ data_params:
   min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
   val_ratio: 0.0044      # share of the clusters held out for validation; 0.0044 is for UniRef50
-                         # (145k of 32.9M clusters). For your own data use 0.01-0.1, or val_size
-  # OR (together you'll get error, comment one out)
-  # val_size: 150000
+                         # (145k of 32.9M clusters). Up to 0.1 while that holds out under 10,000
+                         # clusters; above that keep it at 0.01 or less
+  # val_size: 150000     # or a count of val clusters instead; set only one
   drop_invalid_sequences: true   # false: stop on records with unknown characters instead of dropping them
 
   # Rarely changed

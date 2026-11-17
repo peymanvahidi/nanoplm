@@ -175,8 +175,12 @@ sources.fasta:
 # heading opens this block.
 data_params.shuffle: { group: Rarely changed }
 data_params.shuffle_seed: { group: Rarely changed }
-data_params.samples_per_shard: { group: Rarely changed }
-data_params.max_workers: { group: Rarely changed }
+data_params.samples_per_shard:
+  group: Rarely changed
+  description: sequences per shard file; raised automatically for large cluster datasets
+data_params.max_workers:
+  group: Rarely changed
+  description: tokenizer processes and MMseqs2 threads; -1 = all cores
 data_params.register_tokens: { group: Rarely changed }
 
 # --------------------------------------------------------------- distillation
