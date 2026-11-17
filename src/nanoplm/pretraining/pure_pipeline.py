@@ -2107,6 +2107,47 @@ def _legacy_shard_opt_state_for_fsdp(opt_sd, optimizer):
         _shard_sub(opt_sd, optimizer)
 
 
+def _rescale_resume_data_step(
+    data_step: int,
+    saved_world_size: Optional[int],
+    world_size: int,
+    saved_num_workers: Optional[int] = None,
+    num_workers: Optional[int] = None,
+) -> tuple[int, list[str]]:
+    """Translate a saved per-rank ``epoch_data_step`` to this run's rank count.
+
+    The saved step counts micro-batches per rank, so ``step * W_old`` micro-
+    batches were consumed across the job. With ``W_new`` ranks the same share
+    is ``round(step * W_old / W_new)`` per rank. The samplers deal items to
+    ranks (and workers) differently at another count, so the result is an
+    estimate. Checkpoints written before these keys were saved carry no
+    counts: the step is returned unchanged, with no warning.
+
+    Returns ``(data_step, warnings)``.
+    """
+    warnings: list[str] = []
+    if saved_world_size is not None and int(saved_world_size) != int(world_size):
+        old_w, new_w = int(saved_world_size), int(world_size)
+        new_step = int(round(data_step * old_w / new_w))
+        warnings.append(
+            f"Resuming on {new_w} ranks from a checkpoint saved on {old_w} ranks: "
+            f"data position rescaled from {data_step} to {new_step} micro-steps per "
+            f"rank. The position is an estimate; a little data may repeat or be skipped."
+        )
+        data_step = new_step
+    if (
+        saved_num_workers is not None
+        and num_workers is not None
+        and int(saved_num_workers) != int(num_workers)
+    ):
+        warnings.append(
+            f"Resuming with num_workers={int(num_workers)} from a checkpoint saved with "
+            f"num_workers={int(saved_num_workers)}: the workers split the data "
+            f"differently, so a little data may repeat or be skipped."
+        )
+    return data_step, warnings
+
+
 def _checkpoint_dir_name(global_step: int, phase: str = "periodic") -> str:
     if phase == "stable-end":
         return "checkpoint-stable-end"
@@ -2130,6 +2171,8 @@ def _save_checkpoint(
     achieved_global_batch_tokens: Optional[int] = None,
     stable_steps: Optional[int] = None,
     decay_steps: Optional[int] = None,
+    world_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
 ) -> None:
     ckpt = Path(output_dir) / _checkpoint_dir_name(global_step, phase)
 
@@ -2203,6 +2246,12 @@ def _save_checkpoint(
         training_state["stable_steps"] = int(stable_steps)
     if decay_steps is not None:
         training_state["decay_steps"] = int(decay_steps)
+    # epoch_data_step counts per-rank micro-steps, so it only means something
+    # with the rank (and DataLoader worker) count that produced it.
+    if world_size is not None:
+        training_state["world_size"] = int(world_size)
+    if num_workers is not None:
+        training_state["num_workers"] = int(num_workers)
     (ckpt / "training_state.json").write_text(
         json.dumps(training_state, indent=2),
         encoding="utf-8",
@@ -3618,6 +3667,22 @@ def run_pure_pretraining(
             resume_batch_split_divisor = max(
                 1, int(_ckp_state.get("batch_split_divisor", 1))
             )
+            _saved_step = resume_data_step
+            resume_data_step, _pos_warnings = _rescale_resume_data_step(
+                resume_data_step,
+                _ckp_state.get("world_size"),
+                effective_world_size,
+                _ckp_state.get("num_workers"),
+                num_workers,
+            )
+            if resume_data_step != _saved_step:
+                # The sub-batch offset belongs to the old micro-step; start
+                # the estimated one from its top.
+                resume_sub_batch_step = 0
+                resume_batch_split_divisor = 1
+            if is_main:
+                for _w in _pos_warnings:
+                    logger.warning(_w)
         else:
             # Dataset changed, or a checkpoint written before the position
             # was saved (terminal/role checkpoints only carry it since
@@ -3635,6 +3700,14 @@ def run_pure_pretraining(
         if resume_data_step >= synced_len:
             # Saved position lands at/after the end of a pass; start the next
             # pass cleanly from the top.
+            if is_main and resume_data_step > synced_len:
+                logger.warning(
+                    "Resume: saved data position %d is past the end of epoch %d "
+                    "(%d micro-steps per rank on this run); starting epoch %d from "
+                    "the top. The rest of epoch %d is skipped.",
+                    resume_data_step, resume_epoch, synced_len,
+                    resume_epoch + 1, resume_epoch,
+                )
             resume_data_step = 0
             resume_sub_batch_step = 0
             resume_batch_split_divisor = 1
@@ -3991,6 +4064,7 @@ def run_pure_pretraining(
             tokens_seen=tokens_seen,
             achieved_global_batch_tokens=achieved_global_batch_tokens,
             stable_steps=horizon.stable_steps, decay_steps=horizon.decay_steps,
+            world_size=effective_world_size, num_workers=num_workers,
             phase=phase,
             **over,
         )
