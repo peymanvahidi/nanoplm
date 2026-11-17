@@ -891,6 +891,12 @@ def cluster_index_cmd(members_tsv, fasta, pool, index_dir, val_dir, max_seq_len,
             "`nanoplm data from-yaml` again")
     click.echo(f"Cluster index: {c['train_clusters']:,} train / {c['val_clusters']:,} val "
                f"clusters over {c['pool_rows']:,} pool sequences")
+    from nanoplm.data.preparation.cluster_config import VAL_HOLDOUT_FIX, holdout_matters
+    held = c["val_clusters"]
+    total = held + c["train_clusters"]
+    if total and holdout_matters(held, held / total):
+        click.echo(f"Warning: cluster index: validation holds out {held:,} of {total:,} "
+                   f"clusters ({held / total:.1%}); {VAL_HOLDOUT_FIX}", err=True)
 
 
 def _read_val_count(path) -> dict:

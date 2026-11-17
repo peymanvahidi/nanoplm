@@ -203,9 +203,28 @@ def test_template_data_params_warn_at_config_time():
     w = _plan(cfg).warnings
     assert ("sources.src: max_seqs=20000 (from data_params) trains on at most 20,000 "
             "clusters; set sources.src.max_seqs: -1 to use all of them") in w
-    assert ("sources.src: val_ratio=0.1 (from data_params) holds out about 10.0% of the "
-            "clusters for validation; the UniRef90 experiment used data_params.val_ratio: "
-            "0.0044") in w
+    # 2,000 clusters at 10% is not worth a warning
+    assert not any("holds out" in x for x in w)
+
+
+@pytest.mark.parametrize("max_seqs, ratio, warned", [
+    (20000, 0.15, "holds out 3,000 of at most 20,000 clusters (15.0%)"),   # share
+    (200000, 0.06, "holds out 12,000 of at most 200,000 clusters (6.0%)"),  # count
+    (-1, 0.2, "holds out 20.0% of the clusters"),                           # count unknown
+    (80, 0.1, None),                                                        # tiny data
+    (-1, 0.05, None),            # count unknown: the cluster_index stage decides
+    (10_000_000, 0.0044, None),  # 44k held out, but a small share
+])
+def test_holdout_warning_only_when_it_matters(max_seqs, ratio, warned):
+    cfg = _config(url=U50, members="uniref90", clusters="uniprot")
+    cfg["data_params"].update(max_seqs=max_seqs, val_ratio=ratio)
+    w = [x for x in _plan(cfg).warnings if "holds out" in x]
+    if warned is None:
+        assert w == []
+    else:
+        assert len(w) == 1 and warned in w[0]
+        assert "lower data_params.val_ratio or set data_params.val_size" in w[0]
+        assert "val_ratio: 0.0044 holds out about 145k of 32.9M clusters" in w[0]
 
 
 def test_cluster_warnings_name_the_source_and_its_own_override(tmp_path):
@@ -214,9 +233,9 @@ def test_cluster_warnings_name_the_source_and_its_own_override(tmp_path):
     cfg = _config(local=_own(tmp_path), clusters="mmseqs2")
     cfg["data_params"]["val_ratio"] = 0.2
     w = _plan(cfg).warnings
-    assert ("sources.src: val_ratio=0.2 (from data_params) holds out about 20.0% of the "
-            "clusters for validation; set data_params.val_ratio lower to train on more of "
-            "them") in w
+    assert ("sources.src: val_ratio=0.2 (from data_params) holds out 20.0% of the "
+            "clusters for validation; to train on more of them, lower data_params.val_ratio "
+            "or set data_params.val_size (a count)") in w
     assert not any("0.0044" in x for x in w)
 
 

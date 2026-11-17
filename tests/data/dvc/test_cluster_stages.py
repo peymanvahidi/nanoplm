@@ -394,7 +394,8 @@ def test_from_yaml_with_the_template_data_params(tmp_path):
     err = r.stdout + r.stderr
     assert ("sources.src: max_seqs=20000 (from data_params) trains on at most 20,000 clusters"
             in err)
-    assert "sources.src: val_ratio=0.1 (from data_params) holds out about 10.0% of the clusters" in err
+    # 10% of at most 20,000 clusters: no warning at config time, nor from the stage
+    assert "holds out" not in err
     m = read_manifest(tmp_path / OUT)
     assert m.cluster_level == "uniref90" and m.samples_per_shard == 2000
     assert m.val_sequences == round(m.seqs_num * 0.1)

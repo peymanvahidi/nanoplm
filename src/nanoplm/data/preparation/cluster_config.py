@@ -66,10 +66,22 @@ UNIPROT_FASTAS = frozenset(FASTA_SHORTCUTS[k] for k in
 PEEK_BYTES = 1 << 20           # decompressed bytes read for the first headers
 PEEK_FETCH = 1 << 20           # bytes asked of a server (a range request)
 PEEK_TIMEOUT = 30
-# val_ratio counts clusters here; above this, warn (the template's 0.1 is sized for
-# sequences). The experiment held out 0.44% of the UniRef50 clusters.
+# val_ratio counts clusters here. Warn when the held-out share is large, or when many
+# clusters are held out at more than a small share; a tiny dataset that holds out a
+# few clusters is quiet. UniRef50 at val_ratio 0.0044 holds out 145k of 32.9M clusters.
 MAX_QUIET_VAL_RATIO = 0.01
 EXPERIMENT_VAL_RATIO = 0.0044
+WARN_VAL_SHARE = 0.10
+WARN_VAL_CLUSTERS = 10_000
+VAL_HOLDOUT_FIX = ("to train on more of them, lower data_params.val_ratio or set "
+                   "data_params.val_size (a count)")
+
+
+def holdout_matters(held: Optional[int], share: float) -> bool:
+    """True when holding out ``held`` clusters (None = not known yet), a ``share`` of
+    them, is worth a warning."""
+    return share > WARN_VAL_SHARE or (
+        held is not None and held > WARN_VAL_CLUSTERS and share > MAX_QUIET_VAL_RATIO)
 
 
 class ClusterConfigError(ValueError):
@@ -449,15 +461,22 @@ def resolve_cluster_plan(src, base_dir=None) -> Optional[ClusterPlan]:
             f"{where}: identity / coverage only apply when MMseqs2 makes the clusters, and "
             f"these come from {found}. Remove identity / coverage, or set "
             f"{where}.clusters: mmseqs2 to cluster with MMseqs2")
+    # One source with val_ratio holds out that share of its clusters; with max_seqs > 0
+    # the count is known too. In a mix (or with val_size) the val_split stage sets the
+    # count, and the cluster_index stage warns with the real share.
     val_ratio = params.get("val_ratio")
-    if isinstance(val_ratio, (int, float)) and val_ratio > MAX_QUIET_VAL_RATIO:
-        # the experiment's holdout is a share of UniProt's UniRef50 clusters
-        # (in a mix, val_ratio is a share of the whole pool, which counts these clusters)
-        fix = (f"the UniRef90 experiment used data_params.val_ratio: {EXPERIMENT_VAL_RATIO}"
-               if cluster_source == "uniref_xml"
-               else "set data_params.val_ratio lower to train on more of them")
-        warnings.append(f"{on}: {_setting(src, 'val_ratio')} holds out about {val_ratio:.1%} of "
-                        f"the clusters for validation; {fix}")
+    if (not getattr(src, "val_from_split", False)
+            and isinstance(val_ratio, (int, float)) and not isinstance(val_ratio, bool)):
+        held = round(max_seqs * val_ratio) if isinstance(max_seqs, int) and max_seqs > 0 \
+            else None
+        if holdout_matters(held, val_ratio):
+            what = (f"{held:,} of at most {max_seqs:,} clusters ({val_ratio:.1%})"
+                    if held is not None else f"{val_ratio:.1%} of the clusters")
+            fix = VAL_HOLDOUT_FIX + (
+                f"; for UniRef50, val_ratio: {EXPERIMENT_VAL_RATIO} holds out about 145k of "
+                "32.9M clusters" if cluster_source == "uniref_xml" else "")
+            warnings.append(f"{on}: {_setting(src, 'val_ratio')} holds out {what} for "
+                            f"validation; {fix}")
     if cluster_source != "uniref_xml" and not from_source:
         notes.append(f"{on}: clusters: {clusters} clusters the members ({members}); the source "
                      f"fasta ({source}) is not needed and is not downloaded")
