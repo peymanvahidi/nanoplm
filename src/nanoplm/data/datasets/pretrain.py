@@ -239,6 +239,7 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         drop_last: bool = True,
         split_samples: bool = False,
         sampler: Optional[torch.utils.data.Sampler] = None,
+        num_workers: int = 0,
     ):
         """
         Args:
@@ -247,18 +248,111 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
             drop_last: Whether to drop the last batch if it's less than max_length.
             split_samples: Whether to split samples to ensure batches have exactly max_tokens_per_batch tokens.
             sampler: Optional sampler to determine the order of iteration over the dataset.
+            num_workers: ``num_workers`` of the DataLoader that will read this dataset.
+                With more than one worker each worker packs its own shard and drops
+                its own partial last batch, so ``__len__`` needs it to be exact.
         """
         self.dataset = dataset
         self.max_tokens_per_batch = max_tokens_per_batch
         self.drop_last = drop_last
         self.split_samples = split_samples
         self.sampler = sampler
+        self.num_workers = int(num_workers)
         self._epoch = 0
         self._cached_len: Optional[int] = None
         self._skip_samples = 0
         self._skip_epoch: Optional[int] = None
 
+    def set_num_workers(self, num_workers: int) -> None:
+        """Tell the dataset how many DataLoader workers will read it."""
+        num_workers = int(num_workers)
+        if num_workers != self.num_workers:
+            self.num_workers = num_workers
+            self._cached_len = None
+
+    def _distributed_worker_indices(self, num_workers: int, epoch: int) -> list[np.ndarray]:
+        """Index order of each worker's per-worker DistributedSampler, from one permutation.
+
+        Bit-identical to ``DistributedSampler(self.dataset, num_replicas=W * nw,
+        rank=r * nw + w, ...)`` with ``set_epoch(epoch)``, for w in range(nw),
+        which is what ``__iter__`` builds (nw == 1 gives the rank sampler's own
+        order).  Draws the epoch permutation once instead of once per worker and
+        keeps it in numpy instead of a Python list.
+        """
+        sampler = self.sampler
+        n = len(self.dataset)
+        replicas = sampler.num_replicas * num_workers
+        # Same sizing as DistributedSampler.__init__.
+        if sampler.drop_last and n % replicas != 0:
+            num_samples = ceil((n - replicas) / replicas)
+        else:
+            num_samples = ceil(n / replicas)
+        total_size = num_samples * replicas
+
+        if sampler.shuffle:
+            g = torch.Generator()
+            g.manual_seed(sampler.seed + epoch)
+            order = torch.randperm(n, generator=g).numpy()
+        else:
+            order = np.arange(n, dtype=np.int64)
+        if sampler.drop_last:
+            order = order[:total_size]
+        elif total_size > n:
+            # DistributedSampler pads by repeating the order cyclically.
+            order = np.resize(order, total_size)
+        return [
+            order[sampler.rank * num_workers + w:total_size:replicas]
+            for w in range(num_workers)
+        ]
+
+    def _all_sequence_lengths(self) -> np.ndarray:
+        if hasattr(self.dataset, "get_all_sequence_lengths"):
+            return np.asarray(self.dataset.get_all_sequence_lengths())
+        if not hasattr(self.dataset, "__getitem__"):
+            raise TypeError(
+                "Underlying dataset must support indexed access or expose "
+                "'get_all_sequence_lengths' to compute TokenPackingDataset length"
+            )
+        return np.asarray(
+            [len(self.dataset[idx]["input_ids"]) for idx in range(len(self.dataset))],
+            dtype=np.int64,
+        )
+
+    def _per_worker_sample_lengths(self) -> list[list[int]]:
+        """Sample lengths in the order each DataLoader worker packs them.
+
+        Mirrors the sharding in ``__iter__``: with more than one worker each
+        worker packs (and drops the partial last batch of) its own shard.
+        """
+        nw = self.num_workers
+        if nw <= 1:
+            return [self._resolve_sample_lengths()]
+
+        if isinstance(self.sampler, torch.utils.data.DistributedSampler):
+            lengths = self._all_sequence_lengths()
+            return [
+                lengths[idx].tolist()
+                for idx in self._distributed_worker_indices(nw, self._epoch)
+            ]
+        if self.sampler is not None:
+            # Generic sampler: worker w reads every nw-th index starting at w.
+            # Exact only for samplers that repeat their order (not RandomSampler
+            # without a fixed generator).
+            order = self._resolve_sample_lengths()
+            return [order[w::nw] for w in range(nw)]
+        if isinstance(self.dataset, torch.utils.data.IterableDataset):
+            # The wrapped iterable does its own worker sharding; unknown split.
+            return [self._resolve_sample_lengths()]
+        lengths = self._all_sequence_lengths().tolist()
+        per_worker = int(ceil(len(lengths) / nw))
+        return [lengths[w * per_worker:(w + 1) * per_worker] for w in range(nw)]
+
     def _resolve_sample_lengths(self) -> list[int]:
+        """Sample lengths in the order of the rank sampler (single stream)."""
+        if isinstance(self.sampler, torch.utils.data.DistributedSampler):
+            (idx,) = self._distributed_worker_indices(1, self.sampler.epoch)
+            return self._all_sequence_lengths()[idx].tolist()
+
         if hasattr(self.dataset, "get_all_sequence_lengths"):
             lengths = np.asarray(self.dataset.get_all_sequence_lengths())
             if self.sampler is None:
@@ -316,10 +410,17 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         return batches
 
     def __len__(self) -> int:
-        """Return the exact number of batches yielded by the dataset."""
+        """Return the exact number of batches yielded in the current epoch.
+
+        Summed over the DataLoader workers set by ``num_workers``: each worker
+        drops its own partial last batch, so this is not the packed count of
+        the rank's order.  Cached until ``set_epoch`` changes the epoch.
+        """
         if self._cached_len is None:
-            lengths = self._resolve_sample_lengths()
-            self._cached_len = self._count_batches_from_lengths(lengths)
+            self._cached_len = sum(
+                self._count_batches_from_lengths(lengths)
+                for lengths in self._per_worker_sample_lengths()
+            )
         return self._cached_len
 
     def __iter__(self):
@@ -343,6 +444,16 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         if self.sampler is not None:
              # Handle DataLoader worker sharding if using multiple workers
              worker_info = torch.utils.data.get_worker_info()
+             if (
+                 worker_info is not None
+                 and worker_info.id == 0
+                 and max(worker_info.num_workers, 1) != max(self.num_workers, 1)
+             ):
+                 logger.warning(
+                     "TokenPackingDataset read by %d DataLoader workers but built with "
+                     "num_workers=%d; __len__ does not match the batches yielded.",
+                     worker_info.num_workers, self.num_workers,
+                 )
              if worker_info is not None and worker_info.num_workers > 1:
                  if isinstance(self.sampler, torch.utils.data.DistributedSampler):
                      # Build a per-worker DistributedSampler instead of sharing one sampler

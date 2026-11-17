@@ -121,10 +121,12 @@ torch.backends.cudnn.allow_tf32 = True
 H100_PEAK_TFLOPS = 989.4
 
 # How many micro-steps before the synced epoch end the per-step batch
-# exhaustion allreduce kicks in.  synced_len is the all-rank MIN of exact
-# per-rank loader lengths, so ranks can only run dry inside this window;
-# running the (blocking) coordination allreduce every step would serialize
-# host and device once per micro-step.
+# exhaustion allreduce kicks in.  synced_len is the all-rank MIN of the
+# per-rank loader lengths for the current pass, and TokenPackingDataset.__len__
+# counts exactly what its DataLoader workers yield, so no rank should run dry
+# before synced_len.  The window is a safety net in case a loader still
+# over-reports; running the (blocking) coordination allreduce every step
+# would serialize host and device once per micro-step.
 BATCH_COORD_TAIL_STEPS = 64
 
 # Optimizer steps to run before the max_wallclock_hours clock starts.  Step 1
@@ -3064,6 +3066,9 @@ def run_pure_pretraining(
             drop_last=True,
             split_samples=False,
             sampler=inner_sampler,
+            # __len__ must know the worker count: each worker packs its own
+            # shard and drops its own partial last batch.
+            num_workers=num_workers,
         )
         inner_collator = ProtDataCollatorForLM(
             tokenizer=tokenizer,
@@ -4157,12 +4162,13 @@ def run_pure_pretraining(
                     has_batch = False
                     full_batch = None
 
-                # When packing + num_workers > 0, greedy bin-packing can produce
-                # different batch counts per rank.  Coordinate so all ranks break
-                # together to avoid FSDP / NCCL deadlock.  synced_len is the
-                # all-rank MIN of exact per-rank loader lengths, so exhaustion is
-                # only possible near the epoch tail — gate the (blocking)
-                # allreduce to that window instead of serializing every step.
+                # Greedy bin-packing gives each rank a different batch count;
+                # synced_len is the all-rank MIN of the exact per-rank counts
+                # for this pass, so no rank should run dry before it.  As a
+                # safety net, coordinate exhaustion over the last
+                # BATCH_COORD_TAIL_STEPS micro-steps so all ranks break together
+                # (avoids an FSDP / NCCL deadlock) without a blocking allreduce
+                # on every step.
                 near_epoch_tail = micro_step >= synced_len - BATCH_COORD_TAIL_STEPS
                 if distributed and dist.is_initialized() and near_epoch_tail:
                     has_batch_t = torch.tensor(1 if has_batch else 0, device=device, dtype=torch.int32)
@@ -4962,9 +4968,9 @@ def run_pure_pretraining(
             # accumulated loss, MoE expert counts, the finite-check flag, and
             # the token/FLOP/loss window counters. Timing window is reset at
             # the top of the next epoch iteration, after iter(train_loader).
-            # A loader that yields fewer batches than synced_len (packing with
-            # several workers drops each worker's last partial batch) breaks
-            # out mid-window; FSDP2 keeps those grads on the unsharded params,
+            # A loader that yields fewer batches than synced_len (should not
+            # happen: packing __len__ is exact per pass) breaks out
+            # mid-window; FSDP2 keeps those grads on the unsharded params,
             # so drop them explicitly.
             epoch_fwd_count = epoch_sub_batch_count
             partial_discarded = accum_micro_count + skipped_tail_count
