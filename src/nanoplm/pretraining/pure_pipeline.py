@@ -2549,6 +2549,30 @@ def _first_len_epoch(resume_config) -> int:
     return 0
 
 
+def _plan_resume_skip(train_ds, data_step: int, distributed: bool, device) -> bool:
+    """Plan the exact skip of the resume pass's first ``data_step`` batches.
+
+    Every rank tries ``train_ds.skip_batches``; one MIN all-reduce makes them
+    agree.  If any rank failed, every rank clears its plan and all replay:
+    a rank replaying alone would reach the tail all-reduce at micro-steps the
+    others never visit, and the job would hang.  True means skipped.
+    """
+    ok = 1
+    try:
+        train_ds.skip_batches(data_step)
+    except Exception as exc:  # the replay is always correct
+        logger.warning("Exact resume skip unavailable on this rank (%s: %s); "
+                       "replaying instead", type(exc).__name__, exc)
+        ok = 0
+    if distributed and dist.is_initialized():
+        t = torch.tensor(ok, device=device, dtype=torch.int32)
+        dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        ok = int(t.item())
+    if not ok and hasattr(train_ds, "skip_batches"):
+        train_ds.skip_batches(0)  # clears this rank's plan
+    return bool(ok)
+
+
 def _checkpoint_muon_orthogonalizer(checkpoint_dir) -> tuple[str, ...]:
     """The orthogonalizer(s) a checkpoint may have been trained with: the
     label recorded in training_state.json, else inferred from its
@@ -4159,6 +4183,23 @@ def run_pure_pretraining(
             # per-pass "optimizer steps" log line below.
             epoch_start_step = global_step
 
+            # Resume mid-pass: start the loader at the saved batch (exact skip,
+            # after len() and before iter() so workers inherit the plan), or
+            # replay the pass up to it.  micro_step still counts from the pass start.
+            first_micro = 0
+            if resume_data_step > 0 and epoch == resume_epoch:
+                if use_packing and _plan_resume_skip(
+                    train_ds, resume_data_step, distributed, device
+                ):
+                    first_micro = resume_data_step
+                if is_main:
+                    logger.info(
+                        "Resume: skipping %d data steps of pass %d by %s",
+                        resume_data_step, epoch + 1,
+                        "exact skip (item lengths only, no batch read)" if first_micro
+                        else "replay (each batch read and discarded)",
+                    )
+
             train_iter = iter(train_loader)
             # Reset timing window AFTER dataloader workers are ready so the
             # first logging window doesn't include iter(train_loader) overhead.
@@ -4172,7 +4213,7 @@ def run_pure_pretraining(
             # next grad-accum window; the rest of the pass is skipped.
             skip_pass_tail = False
             skipped_tail_count = 0
-            for micro_step in range(synced_len):
+            for micro_step in range(first_micro, synced_len):
                 if pending_compile_rebuild:
                     if distributed and dist.is_initialized():
                         _dist_barrier(local_rank)
@@ -4246,22 +4287,13 @@ def run_pure_pretraining(
                     break
 
                 if resume_data_step > 0 and epoch == resume_epoch and micro_step < resume_data_step:
-                    if micro_step % 1000 == 0 and is_main:
-                        logger.info(
-                            f"Fast-forwarding dataloader: {micro_step}/{resume_data_step} "
-                            f"data steps skipped ({100 * micro_step / resume_data_step:.0f}%)"
-                        )
-                    continue
+                    continue  # replay: discard batches before the saved position
 
                 resume_sub_batch_start = 0
                 batch_split_divisor = mbs_divisor
                 if epoch == resume_epoch and micro_step == resume_data_step and resume_sub_batch_step > 0:
                     resume_sub_batch_start = resume_sub_batch_step
                     batch_split_divisor = resume_batch_split_divisor
-                elif epoch == resume_epoch and micro_step == resume_data_step and resume_data_step > 0 and is_main:
-                    logger.info(
-                        f"Dataloader fast-forward complete — resuming training at data_step {micro_step}"
-                    )
 
                 effective_tokens_per_split = max(1, tokens_per_micro // max(1, batch_split_divisor))
                 sub_batches = _split_batch(

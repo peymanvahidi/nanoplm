@@ -254,6 +254,66 @@ def packing_sampler(dataset: Dataset, seed: int, distributed: bool,
                                                shuffle=shuffle, seed=seed)
 
 
+def split_skip(counts: list[int], k: int) -> tuple[list[int], int]:
+    """(batches each worker has yielded, walk position) after k batches of the rank.
+
+    A DataLoader over an IterableDataset hands tasks round-robin to the workers
+    still alive and returns results in task order; a worker that runs out drops
+    out of the walk.  So the rank's stream is a cyclic walk 0, 1, .., nw-1, 0, ..
+    in which each worker gives one batch per visit until it has none left.
+    """
+    nw = len(counts)
+    if k > sum(counts):
+        raise ValueError(f"cannot skip {k} batches of {sum(counts)}")
+    done, w, y = [0] * nw, 0, 0
+    while y < k:
+        if done[w] < counts[w]:
+            done[w] += 1
+            y += 1
+        w = (w + 1) % nw
+    return done, w
+
+
+def samples_before_batch(lengths: list[int], b: int, max_tokens: int) -> int:
+    """Samples a worker's packer has finished with when its batch b is about to start.
+
+    Mirrors TokenPackingDataset.__iter__ (split_samples=False). An overflowing sample
+    is NOT counted: it is the first sample of the next batch, so the packer restarts
+    on it with an empty state.
+    """
+    if b <= 0:
+        return 0
+    cur, nb, held = 0, 0, 0
+    for i, n in enumerate(lengths):
+        cur += n
+        if cur == max_tokens:
+            nb += 1
+            cur, held = 0, 0
+            if nb == b:
+                return i + 1
+        elif cur > max_tokens:
+            if held:
+                nb += 1
+                if nb == b:
+                    if n >= max_tokens:
+                        raise ValueError("a sample fills a whole batch; replay instead")
+                    return i
+            cur, held = n, 1
+        else:
+            held += 1
+    raise ValueError(f"worker has fewer than {b} batches")
+
+
+def _check_plan_workers(plan, num_workers: int) -> None:
+    """The training loop starts this pass at the planned batch: a plan made for
+    another worker count must not be dropped silently."""
+    if len(plan[2]) != num_workers:
+        raise RuntimeError(
+            f"exact-skip plan was made for {len(plan[2])} worker(s) but the pass is read "
+            f"by {num_workers}; the loop would mislabel batches"
+        )
+
+
 class TokenPackingDataset(torch.utils.data.IterableDataset):
     """Dataset that uses sequence packing to construct batches with variable length up to a maximum number of tokens."""
 
@@ -287,6 +347,8 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         self._cached_len: Optional[int] = None
         self._skip_samples = 0
         self._skip_epoch: Optional[int] = None
+        # (epoch, rotation, sample offset per logical worker), set by skip_batches.
+        self._skip_plan: Optional[tuple] = None
         self._worker_idx_cache: Optional[tuple] = None
 
     def set_num_workers(self, num_workers: int) -> None:
@@ -482,6 +544,11 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
             # Reset in the local worker copy after consuming the scheduled skip.
             self._skip_samples = 0
             self._skip_epoch = None
+        # An exact skip planned by skip_batches for this pass (kept until set_epoch
+        # moves to another pass or skip_batches(0) clears it).
+        plan = getattr(self, "_skip_plan", None)
+        if plan is not None and plan[0] != self._epoch:
+            plan = None
 
         if self.sampler is not None:
              # Handle DataLoader worker sharding if using multiple workers
@@ -500,14 +567,18 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
                  if isinstance(self.sampler, torch.utils.data.DistributedSampler):
                      # Same order as a per-worker DistributedSampler; usually inherited
                      # from the parent's len() call, so no permutation is drawn here.
-                     worker_indices = self._distributed_worker_indices(
-                         worker_info.num_workers, self._epoch
-                     )[worker_info.id].tolist()
-                     # When fast-forwarding, skip the corresponding per-worker share of samples.
-                     # Each worker sees 1/num_workers of the total samples, so scale accordingly.
-                     per_worker_skip = skip_samples // worker_info.num_workers
-                     indices = islice(worker_indices, per_worker_skip, None)
-                     iterator = (self.dataset[i] for i in indices)
+                     nw = worker_info.num_workers
+                     wid = worker_info.id
+                     # fast_forward: each worker skips 1/num_workers of the samples (inexact).
+                     start = skip_samples // nw
+                     if plan is not None:
+                         _check_plan_workers(plan, nw)
+                         # Exact skip: a new DataLoader starts its walk at worker 0, so
+                         # physical worker i plays logical worker (i + rotation) % nw.
+                         wid = (wid + plan[1]) % nw
+                         start = plan[2][wid]
+                     worker_indices = self._distributed_worker_indices(nw, self._epoch)[wid]
+                     iterator = (self.dataset[i] for i in worker_indices[start:].tolist())
                  else:
                      # Generic fallback for non-distributed samplers.
                      iterator = (
@@ -517,7 +588,11 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
              elif isinstance(self.sampler, torch.utils.data.DistributedSampler):
                  # The rank sampler's order, usually memoized by len(): no second permutation.
                  (idx,) = self._distributed_worker_indices(1, self.sampler.epoch)
-                 iterator = (self.dataset[i] for i in idx[skip_samples:].tolist())
+                 start = skip_samples
+                 if plan is not None:
+                     _check_plan_workers(plan, 1)
+                     start = plan[2][0]
+                 iterator = (self.dataset[i] for i in idx[start:].tolist())
              else:
                  indices = islice(self.sampler, skip_samples, None)
                  iterator = (self.dataset[i] for i in indices)
@@ -588,8 +663,10 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         Returns the number of underlying samples that will be skipped.
 
         Unused by the training loop, and not exact with more than one worker
-        (each worker packs its own shard).
+        (each worker packs its own shard).  The loop's resume uses the exact
+        ``skip_batches`` instead.
         """
+        self._skip_plan = None
         if n_batches <= 0:
             self._skip_samples = 0
             self._skip_epoch = None
@@ -632,15 +709,54 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         self._skip_epoch = self._epoch
         return samples_consumed
 
+    def skip_batches(self, k: int) -> Optional[dict]:
+        """Make the next pass over this dataset start at the rank's batch k, exactly.
+
+        The DataLoader then yields the same batches, in the same order, as a
+        replay of the current epoch that discards its first k batches; ``len()``
+        stays the full pass length.  No sample is read: the plan comes from the
+        item lengths ``len()`` uses.  Each worker starts its index array at the
+        offset of its next batch (``samples_before_batch``), and the workers are
+        rotated so the DataLoader's walk continues where it stood after k
+        batches (``split_skip``).  The plan holds until ``set_epoch`` moves to
+        another pass or ``skip_batches(0)`` clears it.  Make it after ``len()``
+        and before ``iter()``, so forked workers inherit it.
+
+        Covers a DistributedSampler with ``split_samples=False`` and
+        ``drop_last=True``; anything else raises ValueError (with no plan left),
+        so the caller can replay instead.
+        """
+        self._skip_plan = None
+        self._skip_samples, self._skip_epoch = 0, None
+        k = int(k)
+        if k <= 0:
+            return None
+        if (self.split_samples or not self.drop_last
+                or not isinstance(self.sampler, torch.utils.data.DistributedSampler)):
+            raise ValueError("exact skip covers DistributedSampler, split_samples=False, "
+                             "drop_last=True only")
+        per_worker = self._per_worker_sample_lengths()  # the arrays len() packs
+        if any(lens and min(lens) <= 0 for lens in per_worker):
+            # The packer and the batch count treat empty samples differently.
+            raise ValueError("empty samples in the pass; replay instead")
+        counts = [self._count_batches_from_lengths(lens) for lens in per_worker]
+        done, rotation = split_skip(counts, k)
+        offsets = [samples_before_batch(lens, b, self.max_tokens_per_batch)
+                   for lens, b in zip(per_worker, done)]
+        self._skip_plan = (self._epoch, rotation, offsets)
+        return dict(counts=counts, done=done, rotation=rotation, offsets=offsets)
+
     def set_epoch(self, epoch: int):
         """Set the epoch for the dataset.
 
         The batch count depends on the epoch: a shuffling sampler reorders the
         samples, and an epoch-dependent dataset can return other sequences, so
-        the cached length is dropped whenever the epoch changes.
+        the cached length is dropped whenever the epoch changes, and so is a
+        plan made by ``skip_batches``.
         """
         if int(epoch) != self._epoch:
             self._cached_len = None
+            self._skip_plan = None
         self._epoch = int(epoch)
         if hasattr(self.dataset, "set_epoch"):
             self.dataset.set_epoch(self._epoch)

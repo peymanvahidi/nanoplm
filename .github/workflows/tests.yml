@@ -55,6 +55,7 @@ jobs:
           tests/deps/test_install_sh.py
           tests/test_token_packing.py
           tests/test_token_packing_worker_len.py
+          tests/test_token_packing_skip.py
           tests/test_resume_world_size.py
           tests/test_batch_setup_warnings.py
           tests/test_mixture_training.py
