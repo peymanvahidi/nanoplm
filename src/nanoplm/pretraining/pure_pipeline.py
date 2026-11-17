@@ -97,6 +97,8 @@ from nanoplm.pretraining.optim import (
 )
 from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.utils import (
+    batch_rounding_warning,
+    check_num_workers_agree,
     compute_batch_setup,
     format_passes_hint,
     get_num_workers,
@@ -105,7 +107,7 @@ from nanoplm.pretraining.utils import (
     tokens_to_steps,
     StepHorizon,
 )
-from nanoplm.utils.common import create_dirs, get_device, resolve_world_size
+from nanoplm.utils.common import create_dirs, get_device, is_global_main, resolve_world_size
 from nanoplm.utils.logger import logger
 from nanoplm.utils.wandb_artifacts import upload_run_source_snapshot
 from nanoplm.pretraining.debug_metrics import LayerwiseDebugTracker
@@ -2970,6 +2972,12 @@ def run_pure_pretraining(
         f"grad_accum_steps={inferred_grad_accum_steps}, "
         f"effective_global_batch_tokens={achieved_global_batch_tokens:,} tokens"
     )
+    _rounding_msg = batch_rounding_warning(
+        pretrain_config.global_batch_tokens, achieved_global_batch_tokens,
+        effective_world_size, pretrain_config.micro_batch_seqs, manifest.max_seq_len,
+    )
+    if _rounding_msg and is_global_main():
+        logger.warning(_rounding_msg)
 
     run = prepare_run_and_steps(
         pretrain_config=pretrain_config,
@@ -3033,6 +3041,12 @@ def run_pure_pretraining(
                 dist.init_process_group(backend=backend)
 
     is_main = (not distributed) or dist.get_rank() == 0
+    if distributed and dist.get_world_size() > 1:
+        # Per-worker samplers and the saved data position assume one worker
+        # count on every rank; `auto` resolves per rank from CPU affinity.
+        _nw_all = [None] * dist.get_world_size()
+        dist.all_gather_object(_nw_all, int(num_workers))
+        check_num_workers_agree(_nw_all)
     if not mixture:
         eval_sampler = DistributedSampler(val_ds, shuffle=False) if distributed else SequentialSampler(val_ds)
 
