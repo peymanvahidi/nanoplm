@@ -40,6 +40,8 @@ jobs:
       # torch first, from the CPU index, at the version pyproject.toml pins: a plain
       # `pip install -e .` would pull the CUDA wheels (several GB) from PyPI.
       - run: pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
+      # The CPU torch wheel has no triton, but the MoE kernels import it at module load.
+      - run: pip install triton==3.7.1
       - run: pip install -e .
       # DVC tests run `git init` and commit in scratch repos.
       - run: |
@@ -52,6 +54,9 @@ jobs:
           tests/docs_schema
           tests/deps/test_install_sh.py
           tests/test_token_packing.py
+          tests/test_token_packing_worker_len.py
+          tests/test_resume_world_size.py
+          tests/test_batch_setup_warnings.py
           tests/test_mixture_training.py
           tests/test_pass_length_check.py
           tests/cli/test_pipeline_gating.py
