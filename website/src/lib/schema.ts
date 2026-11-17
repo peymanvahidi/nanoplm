@@ -66,7 +66,7 @@ export interface Group {
  *
  * Shared by the renderer and the table-of-contents override. The ToC links to
  * these ids and Starlight's scroll-spy matches on them, so the two must agree
- * exactly. `_` is kept as a word character so `pure_torch` survives intact.
+ * exactly. `_` is kept as a word character so `use_canon_layers` survives intact.
  */
 export function groupSlug(prefix: string, title: string): string {
   const body = title

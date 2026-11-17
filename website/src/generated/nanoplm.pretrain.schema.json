@@ -177,21 +177,15 @@
         "use_canon_layers": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Canon (pure_torch only)",
+          "x-nanoplm-group": "Canon",
           "description": "Canon-ABCD local mixing layers",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "canon_layers_mode": {
           "type": "string",
           "default": "ac",
-          "x-nanoplm-group": "Canon (pure_torch only)",
+          "x-nanoplm-group": "Canon",
           "description": "subset of sites A/B/C/D  (e.g. \"ac\" = lighter)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_canon_layers",
@@ -202,16 +196,13 @@
         "canon_layers_kernel_size": {
           "type": "integer",
           "default": 5,
-          "x-nanoplm-group": "Canon (pure_torch only)",
+          "x-nanoplm-group": "Canon",
           "enum": [
             3,
             5,
             7
           ],
           "description": "3 | 5 | 7",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_canon_layers",
@@ -222,17 +213,14 @@
         "use_repo": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "RePO (pure_torch only)",
+          "x-nanoplm-group": "RePO",
           "description": "learned per-head positions instead of fixed RoPE",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "repo_after_n_layers": {
           "type": "integer",
           "default": 3,
-          "x-nanoplm-group": "RePO (pure_torch only)",
+          "x-nanoplm-group": "RePO",
           "description": "first N layers keep standard RoPE; rest use RePO",
           "x-nanoplm-visible-when": {
             "field": "use_repo",
@@ -260,16 +248,13 @@
         "use_mhc_lite": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "mHC-lite (pure_torch only)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
+          "x-nanoplm-group": "mHC-lite",
           "x-nanoplm-advanced": true
         },
         "mhc_n_streams": {
           "type": "integer",
           "default": 4,
-          "x-nanoplm-group": "mHC-lite (pure_torch only)",
+          "x-nanoplm-group": "mHC-lite",
           "description": "residual streams (n! permutation matrices)",
           "x-nanoplm-visible-when": {
             "field": "use_mhc_lite",
@@ -280,15 +265,12 @@
         "mhc_lite_wrapping_level": {
           "type": "string",
           "default": "layer",
-          "x-nanoplm-group": "mHC-lite (pure_torch only)",
+          "x-nanoplm-group": "mHC-lite",
           "enum": [
             "layer",
             "sublayers"
           ],
           "description": "layer | sublayers",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_mhc_lite",
@@ -299,7 +281,7 @@
         "mhc_triton_fused": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "mHC-lite (pure_torch only)",
+          "x-nanoplm-group": "mHC-lite",
           "description": "fused mHC kernels (CuTe on GH200 at C=1024 with cutlass-dsl >= 4.5, else Triton v2)",
           "x-nanoplm-visible-when": {
             "field": "use_mhc_lite",
@@ -310,36 +292,27 @@
         "use_diff_attn_v2": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Differential attention & paired heads (pure_torch only)",
+          "x-nanoplm-group": "Differential attention & paired heads",
           "description": "DiffAttn V2: doubles Q heads + differential subtract",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "use_paired_head_attention": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Differential attention & paired heads (pure_torch only)",
+          "x-nanoplm-group": "Differential attention & paired heads",
           "description": "pair adjacent heads \u2192 shared softmax; MHA only; incompatible with diff_attn_v2, RePO, Canon-B",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "use_noble": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "NOBLE (pure_torch only)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
+          "x-nanoplm-group": "NOBLE",
           "x-nanoplm-advanced": true
         },
         "noble_rank": {
           "type": "integer",
           "default": 64,
-          "x-nanoplm-group": "NOBLE (pure_torch only)",
+          "x-nanoplm-group": "NOBLE",
           "description": "bottleneck rank (typical 64\u2013256)",
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -350,7 +323,7 @@
         "noble_alpha": {
           "type": "number",
           "default": 0.01,
-          "x-nanoplm-group": "NOBLE (pure_torch only)",
+          "x-nanoplm-group": "NOBLE",
           "description": "W_up initialization scale",
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -361,7 +334,7 @@
         "noble_half_kaiming": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "NOBLE (pure_torch only)",
+          "x-nanoplm-group": "NOBLE",
           "description": "halve main weight init scale (paper \u00a73.3)",
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -372,7 +345,7 @@
         "noble_targets": {
           "type": "string",
           "default": "all",
-          "x-nanoplm-group": "NOBLE (pure_torch only)",
+          "x-nanoplm-group": "NOBLE",
           "enum": [
             "all",
             "attn",
@@ -381,9 +354,6 @@
             "out"
           ],
           "description": "all | attn | ffn | qkv | out",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -412,16 +382,13 @@
         "use_moe": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "x-nanoplm-advanced": true
         },
         "moe_num_experts": {
           "type": "integer",
           "default": 8,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "routed experts",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -432,7 +399,7 @@
         "moe_top_k": {
           "type": "integer",
           "default": 2,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "experts activated per token",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -443,7 +410,7 @@
         "moe_use_bias_correction": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "expert-bias load balancing (selection-only)",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -454,7 +421,7 @@
         "moe_aux_loss_coef": {
           "type": "number",
           "default": 0.01,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "differentiable balance regularizer (router mass)",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -465,7 +432,7 @@
         "moe_z_loss_coef": {
           "type": "number",
           "default": 5e-05,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "router z-loss (small-model MoE stability)",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -476,7 +443,7 @@
         "moe_routed_scaling_factor": {
           "type": "number",
           "default": 1.0,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "routed branch output scale; start conservative",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -487,7 +454,7 @@
         "moe_n_group": {
           "type": "integer",
           "default": 1,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "group-limited routing: 1 = off; >1 = partitions",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -498,7 +465,7 @@
         "moe_topk_group": {
           "type": "integer",
           "default": 1,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "when moe_n_group > 1: keep top-K groups / token",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -509,7 +476,7 @@
         "moe_bias_update_rate": {
           "type": "number",
           "default": 0.001,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "expert-bias correction step size",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -520,7 +487,7 @@
         "moe_bias_update_mode": {
           "type": "string",
           "default": "proportional",
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "proportional | sign (fixed step, DeepSeek-V3 / Ling-V2)",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -531,7 +498,7 @@
         "moe_leading_dense_layers": {
           "type": "integer",
           "default": 1,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "first N layers stay dense (DeepSeek uses 1)",
           "x-nanoplm-visible-when": {
             "field": "use_moe",
@@ -542,29 +509,26 @@
         "moe_kernel_backend": {
           "type": "string",
           "default": "sonicmoe",
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "cutlass | sonicmoe  (SonicMoE/quack fused path)"
         },
         "moe_nan_guard": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts (pure_torch only)",
+          "x-nanoplm-group": "MoE \u2014 Mixture-of-Experts",
           "description": "skip and log a step with a NaN instead of crashing (+1 host sync/step)"
         },
         "use_huginn_looping": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping",
           "description": "master switch; needs recycling_loop_count >= 2",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "recycling_num_prelude_layers": {
           "type": "integer",
           "default": 0,
-          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping",
           "description": "P",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -575,7 +539,7 @@
         "recycling_num_coda_layers": {
           "type": "integer",
           "default": 0,
-          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping",
           "description": "C",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -586,17 +550,14 @@
         "recycling_loop_count": {
           "type": "integer",
           "default": 1,
-          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping",
           "description": "target mean loop count (1 = off)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "recycling_adapter_bias": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping",
           "description": "bias on 2h\u2192h adapter (Huginn: no bias)",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -607,7 +568,7 @@
         "recycling_s0_noise_sigma": {
           "type": "number",
           "default": 0.6324555320336759,
-          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping",
           "description": "sqrt(2/5) \u2014 Huginn s\u2080 noise scale",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -618,7 +579,7 @@
         "recycling_use_takase_init": {
           "type": "boolean",
           "default": true,
-          "x-nanoplm-group": "Recycling / Huginn looping (pure_torch only)",
+          "x-nanoplm-group": "Recycling / Huginn looping",
           "description": "Takase spike init on recurrent block + adapter",
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -629,21 +590,15 @@
         "use_loopie": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "x-nanoplm-group": "Loopie layer looping",
           "description": "master switch",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "loopie_loop_count": {
           "type": "integer",
           "default": 2,
-          "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "x-nanoplm-group": "Loopie layer looping",
           "description": "times each layer is applied (>= 2 when enabled)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_loopie",
@@ -657,12 +612,9 @@
             "null"
           ],
           "default": null,
-          "x-nanoplm-group": "Loopie layer looping (pure_torch only)",
+          "x-nanoplm-group": "Loopie layer looping",
           "minimum": 1,
           "description": "null = full backprop; k = grad through the last k applications only (~1.33x a plain step at R=2 with k=1, not 2x). With truncation, only k of the R applications send MoE aux- and z-loss gradient to the router, each weighted 1/R.",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_loopie",
@@ -672,12 +624,11 @@
         }
       },
       "x-nanoplm-group-notes": {
-        "QK-norm & residual scales": "Available on pure_torch unless a feature banner says otherwise.",
-        "mHC-lite (pure_torch only)": "Multi-stream residual with doubly stochastic mixing.\nIncompatible with use_resid_lambdas.",
-        "NOBLE (pure_torch only)": "Nonlinear low-rank branches on linear layers.\nTraining LR scaling lives under pretraining.noble_* (active when use_noble).",
-        "MoE \u2014 Mixture-of-Experts (pure_torch only)": "Requires: pretraining.use_packing: true  and  use_static_inp_size: true\nAlways-on: one shared expert; routing is always sigmoid.",
-        "Recycling / Huginn looping (pure_torch only)": "Runs a block of middle layers in a loop, reusing the same weights.\nTraining knobs: pretraining.recycling_*",
-        "Loopie layer looping (pure_torch only)": "Runs each layer N times in a row, reusing the same weights.\nCannot be used together with Huginn recycling above."
+        "mHC-lite": "Multi-stream residual with doubly stochastic mixing.\nIncompatible with use_resid_lambdas.",
+        "NOBLE": "Nonlinear low-rank branches on linear layers.\nTraining LR scaling lives under pretraining.noble_* (active when use_noble).",
+        "MoE \u2014 Mixture-of-Experts": "Requires: pretraining.use_packing: true  and  use_static_inp_size: true\nAlways-on: one shared expert; routing is always sigmoid.",
+        "Recycling / Huginn looping": "Runs a block of middle layers in a loop, reusing the same weights.\nTraining knobs: pretraining.recycling_*",
+        "Loopie layer looping": "Runs each layer N times in a row, reusing the same weights.\nCannot be used together with Huginn recycling above."
       }
     },
     "pretraining": {
@@ -927,9 +878,6 @@
           "type": "integer",
           "default": 1000,
           "x-nanoplm-group": "RePO training (when model.use_repo: true)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "noble_base_lr": {
@@ -937,9 +885,6 @@
           "default": 0.0003,
           "x-nanoplm-group": "NOBLE LR scaling (only when model.use_noble: true)",
           "description": "independent base LR for NOBLE branch params",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -952,9 +897,6 @@
           "default": 0.3,
           "x-nanoplm-group": "NOBLE LR scaling (only when model.use_noble: true)",
           "description": "W_up LR power  (actual exponent = 2\u03b3 = 0.6)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -967,9 +909,6 @@
           "default": 0.45,
           "x-nanoplm-group": "NOBLE LR scaling (only when model.use_noble: true)",
           "description": "M mixing-matrix LR power",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -982,9 +921,6 @@
           "default": 3.0,
           "x-nanoplm-group": "NOBLE LR scaling (only when model.use_noble: true)",
           "description": "\u03c9 frequency LR multiplier",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -997,9 +933,6 @@
           "default": 5.0,
           "x-nanoplm-group": "NOBLE LR scaling (only when model.use_noble: true)",
           "description": "\u03c6 phase LR multiplier",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_noble",
@@ -1012,9 +945,6 @@
           "default": 8,
           "x-nanoplm-group": "Recycling training (only when model.recycling_loop_count > 1)",
           "description": "truncated BPTT depth K (last K iters get grads)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -1031,9 +961,6 @@
             "lognormal_poisson"
           ],
           "description": "fixed | lognormal_poisson",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -1046,9 +973,6 @@
           "default": 0.5,
           "x-nanoplm-group": "Recycling training (only when model.recycling_loop_count > 1)",
           "description": "log-normal std (Huginn value)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -1066,9 +990,6 @@
             "1_sqrt"
           ],
           "description": "none | linear | 1_sqrt",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -1081,9 +1002,6 @@
           "default": -1,
           "x-nanoplm-group": "Recycling training (only when model.recycling_loop_count > 1)",
           "description": "-1 = auto (25% of total steps)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "recycling_loop_count",
@@ -1102,9 +1020,6 @@
             "type": "integer"
           },
           "description": "null = single r at target mean; e.g. [1, 4] for eval sweep",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "loopie_loop_count_jitter": {
@@ -1113,9 +1028,6 @@
           "x-nanoplm-group": "Loopie stochastic depth (only when model.use_loopie: true)",
           "minimum": 0,
           "description": "0 = fixed depth; 1 at count 2 gives R in {1,2,3}",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_loopie",
@@ -1229,9 +1141,6 @@
           "default": false,
           "x-nanoplm-group": "Debug",
           "description": "per-layer grad/weight norms, residual RMS (keys block_XXX_rep{r} on every run), logits; overhead",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "debug_layerwise_log_every": {
@@ -1239,18 +1148,12 @@
           "default": 100,
           "x-nanoplm-group": "Debug",
           "description": "log layerwise metrics every N optimizer steps",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "debug_memory_snapshot": {
           "type": "boolean",
           "default": false,
           "description": "Record the CUDA caching allocator's history (allocation stacks and compile context) for the whole run and write it as a pickle that https://docs.pytorch.org/memory_viz renders, which is how a VRAM peak gets attributed to saved activations, all-gather buffers, optimizer state or fragmentation instead of guessed at. A pickle is written when a torch.OutOfMemoryError escapes the training loop (the error then propagates unchanged) and after debug_memory_snapshot_step. Every rank records. The scheduled dump is written by LOCAL_RANK 0; an OOM dump is written by whichever rank hit it, because an OOM is rank-local. Files land in <run root>/memory_snapshots/rank<RANK>_<tag>.pickle, that is, in the run directory the job creates under ckp_dir. Recording captures a Python stack per allocation, so leave it off for throughput measurements. Shipped commented out by `nanoplm pretrain get-yaml`.",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-group": "Debug"
         },
@@ -1258,9 +1161,6 @@
           "type": "integer",
           "default": -1,
           "description": "Also dump a memory snapshot right after this optimizer step, giving a reference picture of a step that fits to compare against the OOM dump. -1 (the default) dumps only on an out-of-memory error. Ignored unless debug_memory_snapshot is true. Shipped commented out by `nanoplm pretrain get-yaml`.",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-group": "Debug"
         },
@@ -1269,9 +1169,6 @@
           "default": 100000,
           "minimum": 1,
           "description": "Number of allocator events kept in the memory-history ring buffer; older events are dropped. Lower it if the pickles get unwieldy, raise it if the OOM dump no longer reaches back to the allocations that built the peak. Ignored unless debug_memory_snapshot is true. Shipped commented out by `nanoplm pretrain get-yaml`.",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-group": "Debug"
         },
@@ -1299,31 +1196,22 @@
         "use_compile_max_autotune": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "torch.compile knobs (pure_torch only)",
+          "x-nanoplm-group": "torch.compile knobs",
           "description": "may raise throughput; long compile/autotune at start",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "compile_triton_persistent_reductions": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "torch.compile knobs (pure_torch only)",
+          "x-nanoplm-group": "torch.compile knobs",
           "description": "set true if it works on your shapes/GPU",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "compile_triton_mix_order_reduction": {
           "type": "boolean",
           "default": false,
-          "x-nanoplm-group": "torch.compile knobs (pure_torch only)",
+          "x-nanoplm-group": "torch.compile knobs",
           "description": "may be faster; can hit shared-memory limits",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "compile_mode": {
@@ -1336,11 +1224,8 @@
             "max-autotune-no-cudagraphs"
           ],
           "description": "Explicit mode passed to torch.compile for the training graph. Unset (the default) compiles in Inductor's default mode, or in max-autotune-no-cudagraphs when use_compile_max_autotune is true; setting this field overrides that flag. reduce-overhead enables CUDA graphs, which cuts per-step launch overhead on a CPU-dispatch-bound step but costs extra VRAM for the graph pools and re-records when input addresses or shapes change. max-autotune adds CUDA graphs on top of kernel autotuning; max-autotune-no-cudagraphs autotunes only. Shipped commented out by `nanoplm pretrain get-yaml` because the default mode is the right choice for an ordinary run.",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
-          "x-nanoplm-group": "torch.compile knobs (pure_torch only)"
+          "x-nanoplm-group": "torch.compile knobs"
         },
         "bf16": {
           "type": "boolean",
@@ -1362,19 +1247,13 @@
           "type": "string",
           "default": "mlp",
           "x-nanoplm-group": "Precision",
-          "description": "mlp | attn_wqkv | attn_wo; combine as \"attn_wqkv,mlp\" or YAML list",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ]
+          "description": "mlp | attn_wqkv | attn_wo; combine as \"attn_wqkv,mlp\" or YAML list"
         },
         "fp8_skip_last_n_layers": {
           "type": "integer",
           "default": 0,
           "x-nanoplm-group": "Precision",
-          "description": "FP8: keep final N layers in bf16",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ]
+          "description": "FP8: keep final N layers in bf16"
         },
         "fp8_recipe": {
           "type": "string",
@@ -1387,10 +1266,7 @@
             "mxfp8",
             "nvfp4"
           ],
-          "description": "delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ]
+          "description": "delayed | current | block | mxfp8 | nvfp4 (mxfp8/nvfp4 = Blackwell+)"
         },
         "fp8_format": {
           "type": "string",
@@ -1400,19 +1276,13 @@
             "hybrid",
             "e4m3"
           ],
-          "description": "hybrid | e4m3; ignored by nvfp4",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ]
+          "description": "hybrid | e4m3; ignored by nvfp4"
         },
         "fp8_amax_history_len": {
           "type": "integer",
           "default": 64,
           "x-nanoplm-group": "Precision",
           "description": "DelayedScaling only: amax history window",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "fp8_reduce_amax": {
@@ -1420,9 +1290,6 @@
           "default": true,
           "x-nanoplm-group": "Precision",
           "description": "DelayedScaling: sync amax across FP8 group",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "fp8_cpu_activation_offload": {
@@ -1430,9 +1297,6 @@
           "default": false,
           "x-nanoplm-group": "Precision",
           "description": "FP8: TE CPU activation offload hooks",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "fp8_cpu_activation_offload_layers": {
@@ -1440,9 +1304,6 @@
           "default": "auto",
           "x-nanoplm-group": "Precision",
           "description": "Offload knobs below were hand-tuned for 4\u00d7GH200; other systems not guaranteed. reserved; offloads eligible TE LayerNormLinear + LayerNormMLP wrappers",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "fp8_cpu_activation_offload_retain_buffers": {
@@ -1450,9 +1311,6 @@
           "default": false,
           "x-nanoplm-group": "Precision",
           "description": "reuse pinned CPU buffers across iters (stable shapes)",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "multi_gpu": {
@@ -1469,7 +1327,7 @@
             "hsdp",
             "ddp"
           ],
-          "description": "fsdp | hsdp | ddp (pure_torch honors this; HF path ignores it)"
+          "description": "fsdp | hsdp | ddp"
         },
         "hsdp_shard_size": {
           "type": "string",
@@ -1530,9 +1388,6 @@
           "type": "boolean",
           "default": false,
           "description": "Record per-operator input shapes in the PyTorch profiler trace. Shape recording adds bookkeeping on the dispatch path, which is the path a CPU-bound step is limited by, so a trace taken with it on overstates step time and must not be read as a steady-state wall-clock reference. Turn it on only to attribute kernels to tensor shapes. Ignored unless profiler_enabled is true. Shipped commented out by `nanoplm pretrain get-yaml`.",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-group": "Profiler"
         },
@@ -1694,13 +1549,7 @@
       "activation_checkpointing",
       "attn_layer_pattern"
     ],
-    "pipeline_reject": [
-      {
-        "flag": "pure_torch",
-        "reason": "Recycling lands only in pure_pipeline.py for v1; the HF path is out of scope.",
-        "condition": "pure_torch is False"
-      }
-    ],
+    "pipeline_reject": [],
     "pipeline_caveat": [
       {
         "flag": "fp8",

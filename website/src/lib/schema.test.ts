@@ -32,13 +32,10 @@ describe('toRows', () => {
     expect(rows.find((r) => r.key === 'run_name')?.description).toBeTruthy();
   });
 
-  it('surfaces enum and backend tags', () => {
+  it('surfaces enum values', () => {
     const rows = toRows(pretrain as Surface, 'pretraining');
     const opt = rows.find((r) => r.key === 'optimizer')!;
     expect(opt.enum).toContain('normuon');
-    const model = toRows(pretrain as Surface, 'model');
-    const canon = model.find((r) => r.key === 'use_canon_layers')!;
-    expect(canon.backend).toContain('pure_torch');
   });
 
   it('includes the commented-out duration budgets, marked advanced', () => {
@@ -209,10 +206,10 @@ describe('toRows', () => {
   });
 
   describe('groupSlug', () => {
-    it('keeps underscores so a backend name survives', () => {
+    it('keeps underscores in the slug', () => {
       expect(
-        groupSlug('pretrain-model', 'Recycling / Huginn architecture (pure_torch only)'),
-      ).toBe('pretrain-model-group-recycling-huginn-architecture-pure_torch-only');
+        groupSlug('pretrain-model', 'torch_compile knobs (inductor)'),
+      ).toBe('pretrain-model-group-torch_compile-knobs-inductor');
       expect(groupSlug('pretrain-model', 'Norms & MLP')).toBe('pretrain-model-group-norms-mlp');
     });
   });

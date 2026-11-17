@@ -236,8 +236,7 @@ def build_surface(surface: str) -> dict:
             frag = _field_schema(f.section, f.key, f.raw_default, _template_description(f, ov),
                                  o, vis, f.group)
             if not f.section:
-                # Only the top-level scalars overlay.yaml names: pretrain.yaml's
-                # `pure_torch: true` has one legal value and is not a setting.
+                # Only the top-level scalars overlay.yaml names become fields.
                 if ov.get("top_level"):
                     sections[f.key] = frag
                 continue

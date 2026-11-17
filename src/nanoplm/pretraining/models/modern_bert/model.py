@@ -126,37 +126,37 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         if config.recycling_loop_count != 1 or config.use_huginn_looping:
             raise ValueError(
                 "Huginn-style recycling (recycling_loop_count > 1) is implemented only "
-                "in the pure-torch path. Use --pure-torch with recycling_loop_count>1."
+                "in the pure-torch path. Use PureProtModernBertMLM."
             )
         if config.use_loopie:
             raise ValueError(
                 "Loopie layer looping (use_loopie=true) is implemented only in the "
-                "pure-torch path. Use --pure-torch."
+                "pure-torch path (PureProtModernBertMLM)."
             )
         if config.use_noble:
             raise ValueError(
                 "NOBLE is implemented only in the pure-torch path. "
-                "Use --pure-torch with use_noble=true."
+                "Use PureProtModernBertMLM."
             )
         if not config.fused_qkv:
             raise ValueError(
                 "fused_qkv=False is implemented only in the pure-torch path. "
-                "Use --pure-torch with fused_qkv=false."
+                "Use PureProtModernBertMLM."
             )
         if not config.fused_up_gate:
             raise ValueError(
                 "fused_up_gate=False is implemented only in the pure-torch path. "
-                "Use --pure-torch with fused_up_gate=false."
+                "Use PureProtModernBertMLM."
             )
         if config.use_moe:
             raise ValueError(
                 "MoE is implemented only in the pure-torch path. "
-                "Use --pure-torch with use_moe=true."
+                "Use PureProtModernBertMLM."
             )
         if config.use_canon_layers:
             raise ValueError(
                 "Canon layers are currently implemented only in the pure-torch path. "
-                "Use --pure-torch with use_canon_layers=true."
+                "Use PureProtModernBertMLM."
             )
         if (
             config.num_kv_heads is not None
@@ -164,17 +164,17 @@ class ProtModernBertMLM(ModernBertForMaskedLM):
         ):
             raise ValueError(
                 "GQA is not implemented in the HF ModernBERT path. "
-                "Set num_kv_heads equal to num_attention_heads or use --pure-torch."
+                "Set num_kv_heads equal to num_attention_heads or use PureProtModernBertMLM."
             )
         if str(config.classifier_activation).strip().lower() == "srelu":
             raise ValueError(
                 "classifier_activation='srelu' is implemented only in the pure-torch "
-                "path. Use --pure-torch or choose relu/gelu."
+                "path (PureProtModernBertMLM). Choose relu/gelu here."
             )
         if config.use_paired_head_attention:
             raise ValueError(
                 "Paired head attention is implemented only in the pure-torch path. "
-                "Use --pure-torch or disable use_paired_head_attention."
+                "Use PureProtModernBertMLM or disable use_paired_head_attention."
             )
 
         self.tokenizer = ProtModernBertTokenizer(

@@ -52,7 +52,6 @@ model:
 
   # ── QK-norm & residual scales ─────────────────────────────────────────────
 
-  # Available on pure_torch unless a feature banner says otherwise.
   use_qk_norm: false                    # RMS-norm Q and K in attention
   reorder_RoPE_QKNorm: false            # true = norm BEFORE RoPE (LLaMA-style, better fusion); needs use_qk_norm
   use_resid_lambdas: false              # per-layer residual scale; incompatible with use_mhc_lite
@@ -68,13 +67,13 @@ model:
   fused_up_gate: true                   # false = separate W_up / W_gate (SwiGLU/GLU)
   wo_init: "kaiming"                    # residual out-proj init: kaiming | zero
 
-  # ── Canon (pure_torch only) ───────────────────────────────────────────────
+  # ── Canon ─────────────────────────────────────────────────────────────────
 
   use_canon_layers: false               # Canon-ABCD local mixing layers
   canon_layers_mode: "ac"               # subset of sites A/B/C/D  (e.g. "ac" = lighter)
   canon_layers_kernel_size: 5           # 3 | 5 | 7
 
-  # ── RePO (pure_torch only) ────────────────────────────────────────────────
+  # ── RePO ──────────────────────────────────────────────────────────────────
 
   use_repo: false                       # learned per-head positions instead of fixed RoPE
   repo_after_n_layers: 3                # first N layers keep standard RoPE; rest use RePO
@@ -85,7 +84,7 @@ model:
   use_prores: false                     # progressive residual warmup (deeper layers slower)
   prores_T: 1000                        # warmup length for layer 0; layer l ends at step T*l
 
-  # ── mHC-lite (pure_torch only) ────────────────────────────────────────────
+  # ── mHC-lite ──────────────────────────────────────────────────────────────
 
   # Multi-stream residual with doubly stochastic mixing.
   # Incompatible with use_resid_lambdas.
@@ -94,12 +93,12 @@ model:
   mhc_lite_wrapping_level: "layer"      # layer | sublayers
   mhc_triton_fused: true                # fused mHC kernels (CuTe on GH200 at C=1024 with cutlass-dsl >= 4.5, else Triton v2)
 
-  # ── Differential attention & paired heads (pure_torch only) ───────────────
+  # ── Differential attention & paired heads ─────────────────────────────────
 
   use_diff_attn_v2: false               # DiffAttn V2: doubles Q heads + differential subtract
   use_paired_head_attention: false      # pair adjacent heads → shared softmax; MHA only; incompatible with diff_attn_v2, RePO, Canon-B
 
-  # ── NOBLE (pure_torch only) ───────────────────────────────────────────────
+  # ── NOBLE ─────────────────────────────────────────────────────────────────
 
   # Nonlinear low-rank branches on linear layers.
   # Training LR scaling lives under pretraining.noble_* (active when use_noble).
@@ -114,7 +113,7 @@ model:
   activation_checkpointing: false       # recompute activations in backward → less VRAM
   activation_checkpointing_mode: "attn" # layer | attn | attn_minimal | attn+mlp   (attn = highest ROI; attn_minimal = attn that keeps matmul + FA outputs: faster, more memory; needs attention_dropout 0)
 
-  # ── MoE — Mixture-of-Experts (pure_torch only) ────────────────────────────
+  # ── MoE — Mixture-of-Experts ──────────────────────────────────────────────
 
   # Requires: pretraining.use_packing: true  and  use_static_inp_size: true
   # Always-on: one shared expert; routing is always sigmoid.
@@ -133,7 +132,7 @@ model:
   moe_kernel_backend: 'sonicmoe'        # cutlass | sonicmoe  (SonicMoE/quack fused path)
   moe_nan_guard: false                  # skip and log a step with a NaN instead of crashing (+1 host sync/step)
 
-  # ── Recycling / Huginn looping (pure_torch only) ──────────────────────────
+  # ── Recycling / Huginn looping ────────────────────────────────────────────
 
   # Runs a block of middle layers in a loop, reusing the same weights.
   # Training knobs: pretraining.recycling_*
@@ -145,7 +144,7 @@ model:
   recycling_s0_noise_sigma: 0.6324555320336759  # sqrt(2/5) — Huginn s₀ noise scale
   recycling_use_takase_init: true       # Takase spike init on recurrent block + adapter
 
-  # ── Loopie layer looping (pure_torch only) ────────────────────────────────
+  # ── Loopie layer looping ──────────────────────────────────────────────────
 
   # Runs each layer N times in a row, reusing the same weights.
   # Cannot be used together with Huginn recycling above.
@@ -322,7 +321,7 @@ pretraining:
   use_packing: true
   use_static_inp_size: true             # required for MoE; also helps compile shapes
 
-  # ── torch.compile knobs (pure_torch only) ─────────────────────────────────
+  # ── torch.compile knobs ───────────────────────────────────────────────────
 
   use_compile_max_autotune: false       # may raise throughput; long compile/autotune at start
   # compile_mode: "reduce-overhead"     # explicit torch.compile mode; wins over use_compile_max_autotune
@@ -356,7 +355,7 @@ pretraining:
   # ── Distributed ───────────────────────────────────────────────────────────
 
   multi_gpu: true
-  distributed_mode: "fsdp"              # fsdp | hsdp | ddp (pure_torch honors this; HF path ignores it)
+  distributed_mode: "fsdp"              # fsdp | hsdp | ddp
   hsdp_shard_size: 'auto'               # hsdp only: GPUs per replica; 'auto'=LOCAL_WORLD_SIZE; must divide world_size
   fsdp_shard_granularity: "layer"       # layer (NVLink/SXM) | sublayer (PCIe overlap)
   fsdp_reshard_after_forward: false     # FSDP2 reshard_after_forward
@@ -403,9 +402,3 @@ resume:
   decay_tokens: 1000000                 # additional anneal tokens (or use decay_steps)
   decay_shape: "1-sqrt"                 # 1-sqrt | linear
   lr_decay_to_fraction: 0.1             # REQUIRED for mode: decay
-
-
-# =============================================================================
-# Backend selection (CLI flags override these)
-# =============================================================================
-pure_torch: true

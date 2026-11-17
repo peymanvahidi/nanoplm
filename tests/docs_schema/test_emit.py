@@ -19,9 +19,9 @@ def test_pretrain_schema_shape():
     # visibility gate annotation present on a recycling field
     rb = props["pretraining"]["properties"]["recycling_bptt"]
     assert rb["x-nanoplm-visible-when"]["field"] == "recycling_loop_count"
-    # backend tag folded onto a model field
+    # no backend tags: every backend is the pure-torch path now
     canon = props["model"]["properties"]["use_canon_layers"]
-    assert "pure_torch" in canon["x-nanoplm-backend"]
+    assert "x-nanoplm-backend" not in canon
     # compat rules attached at surface level
     assert any(r["flag"] == "use_moe" for r in s["x-nanoplm-compat"]["model_warn"])
 
@@ -209,7 +209,7 @@ def test_nested_entry_outside_a_map_section_fails_loudly(monkeypatch):
 
 
 def test_only_marked_top_level_scalars_are_documented():
-    """data.yaml's output_dir is a field; pretrain.yaml's `pure_torch: true` is not."""
+    """data.yaml's output_dir is a field; the legacy pretrain.yaml `pure_torch` key is not (the template no longer has it)."""
     assert "output_dir" in emit.build_surface("data")["properties"]
     assert "pure_torch" not in emit.build_surface("pretrain")["properties"]
 

@@ -1,45 +1,37 @@
+import click
 import pytest
-from nanoplm.cli.pretrain import _check_pipeline_supported
+from click.testing import CliRunner
+
+from nanoplm.cli.pretrain import _check_pure_torch_key, pretrain
 
 
-class TestPipelineGating:
-    def test_hf_pretraining_rejected(self):
-        with pytest.raises(ValueError, match="pure_torch"):
-            _check_pipeline_supported(pure_torch=False)
-
-    def test_pure_torch_allowed(self):
-        _check_pipeline_supported(pure_torch=True)
-
-
-def _mixture_dir(root):
-    from nanoplm.data.infra.mixture import write_mixture
-    from tests.data.datasets.mixture_sources import plain_source
-    a = plain_source(root / "a", 30, tag=5)
-    b = plain_source(root / "b", 30, tag=6)
-    write_mixture(root, [("a", a, 0.5, "a.fasta"), ("b", b, 0.5, "b.fasta")])
-    return root
+@pytest.fixture
+def warnings_seen(monkeypatch):
+    # The nanoplm logger has propagate=False, so caplog cannot see it: spy instead.
+    seen = []
+    from nanoplm.utils.logger import logger as _nplm_logger
+    monkeypatch.setattr(_nplm_logger, "warning",
+                        lambda msg, *a, **k: seen.append(msg % a if a else msg))
+    return seen
 
 
-def test_a_mixture_without_pure_torch_names_the_flag(tmp_path):
-    from click.testing import CliRunner
-    from nanoplm.cli.pretrain import pretrain
-    _mixture_dir(tmp_path / "mix")
-    (tmp_path / "pretrain.yaml").write_text(
-        "model: {hidden_size: 16, intermediate_size: 32, num_hidden_layers: 1, "
-        "num_attention_heads: 2}\n"
-        f"pretraining: {{dataset_dir: {tmp_path / 'mix'}, ckp_dir: {tmp_path / 'ckp'}, "
-        "micro_batch_seqs: 4, global_batch_tokens: 512, train_tokens: 5120, "
-        "lr_schedule: warmup_stable, warmup_steps: 1}\n")
-    r = CliRunner().invoke(pretrain, ["from-yaml", str(tmp_path / "pretrain.yaml")])
-    assert r.exit_code != 0
-    assert "data mixtures need --pure-torch" in r.output
-    assert "Validating mixture source" not in r.output    # refused before the shard checks
+class TestPureTorchKey:
+    def test_absent_is_silent(self, warnings_seen):
+        _check_pure_torch_key({"model": {}})
+        assert warnings_seen == []
+
+    def test_true_warns_once(self, warnings_seen):
+        _check_pure_torch_key({"pure_torch": True})
+        assert len(warnings_seen) == 1
+        assert "pure_torch is no longer needed" in warnings_seen[0]
+
+    def test_false_is_rejected(self, warnings_seen):
+        with pytest.raises(click.ClickException, match="no longer supported"):
+            _check_pure_torch_key({"pure_torch": False})
 
 
-def test_the_hf_pipeline_refuses_a_mixture(tmp_path):
-    from types import SimpleNamespace
-    from nanoplm.data.infra.manifest import read_manifest
-    from nanoplm.pretraining.pipeline import run_pretraining
-    m = read_manifest(_mixture_dir(tmp_path))
-    with pytest.raises(ValueError, match="data mixtures need --pure-torch"):
-        run_pretraining(None, SimpleNamespace(dataset_dir=str(tmp_path)), m)
+@pytest.mark.parametrize("cmd", ["from-yaml", "run"])
+def test_pure_torch_flag_is_hidden(cmd):
+    r = CliRunner().invoke(pretrain, [cmd, "--help"])
+    assert r.exit_code == 0
+    assert "--pure-torch" not in r.output

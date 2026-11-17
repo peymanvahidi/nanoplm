@@ -85,9 +85,6 @@
       "default": null,
       "minimum": 1,
       "description": "Refinement depth to run this checkpoint at, overriding the depth it was trained with. None = the depth in the checkpoint's model_config.yaml. Works for both loopie and huginn checkpoints; a checkpoint with no looping rejects it.",
-      "x-nanoplm-backend": [
-        "pure_torch"
-      ],
       "x-nanoplm-advanced": true
     },
     "torch_compile": {
