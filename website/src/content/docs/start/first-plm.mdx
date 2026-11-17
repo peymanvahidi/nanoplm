@@ -5,7 +5,7 @@ description: Train and evaluate a small protein language model on SwissProt, end
 
 import { Steps, FileTree } from '@astrojs/starlight/components';
 
-You are going to pretrain a real protein language model (a 2.3M-parameter ModernBERT-style
+You are going to pretrain a real protein language model (a 2.7M-parameter ModernBERT-style
 encoder) on 20,000 SwissProt sequences, then score it on a downstream benchmark. Every command is
 run from the same working directory, and each stage hands its artifacts to the next.
 
@@ -121,6 +121,7 @@ You now have the tokenized sequences in binary shard files, and a manifest that 
      intermediate_size: 512
      num_hidden_layers: 4
      num_attention_heads: 4
+     num_kv_heads: 4         # must divide num_attention_heads
      vocab_size: 32          # the protein tokenizer's vocabulary: leave it
      # ... leave the rest of the model block as generated
    ```
@@ -156,7 +157,7 @@ You now have the tokenized sequences in binary shard files, and a manifest that 
    ```bash
    nanoplm pretrain from-yaml
    # Using pure-torch model and training loop
-   # Total Trainable Parameters: 2306848
+   # Total Trainable Parameters: 2705952
    # Flash attention available: True
    # ...
    # [total] Budget: 10,092,544 tokens → ≈1.6 passes over the train set (each sample seen ~1.6×)

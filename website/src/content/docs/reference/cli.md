@@ -37,6 +37,8 @@ Runs the packaged installer into the **active virtualenv**, then verifies in a f
 | --- | --- | --- |
 | `--arch TEXT` | CUDA arch for source builds (`NVTE_CUDA_ARCHS`). `90` = Hopper / H100 | `90` |
 | `--force` | Reinstall every component even if already satisfied | off |
+| `--with-mmseqs` | Also install the MMseqs2 binary into the venv (only needed when `cluster_subsampling` clusters with MMseqs2) | off |
+| `--mmseqs-only` | Install only the MMseqs2 binary; no GPU stack, no verification | off |
 
 ```bash
 module load CUDA/13 NCCL cuDNN Ninja    # clusters only
