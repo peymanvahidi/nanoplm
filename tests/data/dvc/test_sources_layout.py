@@ -262,6 +262,52 @@ def test_dvc_init_links_the_cache_for_the_sources_layout_only(tmp_path, monkeypa
     assert not any("cache.type" in c for c in calls)
 
 
+@pytest.mark.parametrize("cfg, current, rc, dry, sets", [
+    ("sources", "", 0, False, True), ("sources", "", 251, False, True),
+    ("sources", "copy\n", 0, False, False),
+    ("legacy", "", 0, False, False), ("sources", "", 0, True, False)])
+def test_an_existing_repo_gets_the_linked_cache_only_when_unset(tmp_path, monkeypatch,
+                                                                cfg, current, rc, dry, sets):
+    """An existing .dvc gets cache.type like dvc init does, only for the sources layout,
+    only when unset, and never on --dry-run. Unset is exit 0 + empty stdout (dvc 3.67)
+    or exit 251 (older dvc)."""
+    calls = []
+
+    def fake(cmd, *a, **k):
+        calls.append(cmd)
+        query = cmd[-1] == "cache.type"
+        return type("R", (), {"returncode": rc if query else 0,
+                              "stdout": current if query else "", "stderr": ""})()
+    monkeypatch.setattr("subprocess.run", fake)
+    (tmp_path / ".dvc").mkdir()
+    text = load_template("data_pretrain") if cfg == "sources" else \
+        (GOLDEN / "local_gz.data.yaml").read_text()
+    r = _run(_write(tmp_path, text), *(["--dry-run"] if dry else []))
+    assert r.exit_code == 0, r.output
+    assert not any("init" in c for c in calls)
+    set_call = [c for c in calls if c[-3:] == ["config", "cache.type", "hardlink,symlink"]]
+    assert bool(set_call) == sets
+    assert ("cache.type was unset" in r.output) == sets
+
+
+def test_an_existing_repo_reports_a_failing_cache_type_query(tmp_path, monkeypatch):
+    """A broken dvc or corrupt .dvc/config is an error naming the command and its stderr,
+    not read as an unset key."""
+    calls = []
+
+    def fake(cmd, *a, **k):
+        calls.append(cmd)
+        return type("R", (), {"returncode": 1, "stdout": "",
+                              "stderr": "ERROR: configuration error\n"})()
+    monkeypatch.setattr("subprocess.run", fake)
+    (tmp_path / ".dvc").mkdir()
+    r = _run(_write(tmp_path, load_template("data_pretrain")))
+    assert r.exit_code != 0
+    assert "config cache.type' exited 1" in r.output
+    assert "ERROR: configuration error" in r.output and str(tmp_path) in r.output
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("text, message", [
     ("output_dir: out\nsources:\n  a: {fasta: swissprot}\n  a: {fasta: trembl}\n",
      "data.yaml:4: duplicate key 'a' (first on line 3)"),
