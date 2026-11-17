@@ -32,7 +32,7 @@ class ValSplitError(ValueError):
     """The val size of data.yaml cannot be met; the message says what to change."""
 
 
-_HEADER = re.compile(rb"^>(\S*)", re.M)
+_HEADER = re.compile(rb"\n>(\S*)")
 _CHUNK = 1 << 26
 
 
@@ -50,9 +50,9 @@ def _header_ids(fasta):
                 tail = block
                 continue
             tail = block[cut:]
-            yield _HEADER.findall(block, 0, cut)
+            yield _HEADER.findall(b"\n" + block[:cut])
     if tail:
-        yield _HEADER.findall(tail)
+        yield _HEADER.findall(b"\n" + tail)
 
 
 def count_fasta_records(fasta) -> int:
@@ -72,6 +72,7 @@ def count_universe_clusters(fasta, members_tsv, max_clusters: int = -1) -> int:
             continue
         lens = np.fromiter((len(i) for i in ids), dtype=np.int64, count=len(ids))
         keys = uh.hash_accessions(np.frombuffer(b"".join(ids), dtype=np.uint8), lens)
+        keys.sort()
         pos = np.clip(np.searchsorted(table.keys, keys), 0, len(table.keys) - 1)
         hit = np.asarray(table.keys[pos]) == keys
         n += int(np.asarray(table.is_rep[pos[hit]]).sum())
