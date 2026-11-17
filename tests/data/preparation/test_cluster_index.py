@@ -141,6 +141,9 @@ def _copy(built, tmp_path):
     ("csr_swap", "csr_member_cluster_agrees_with_pool_cluster"),
     ("pool_lengths", "pool_lengths_is_the_concatenated_shard_index"),
     ("train_holds_val", "train_is_universe_minus_val"),
+    ("duplicate_member", "csr_covers_every_universe_member"),
+    ("negative_member", "csr_members_in_range"),
+    ("train_drops_one", "train_is_universe_minus_val"),
 ])
 def test_verify_rejects_a_tampered_index(built, tmp_path, tamper, check):
     d = _copy(built, tmp_path)
@@ -154,11 +157,37 @@ def test_verify_rejects_a_tampered_index(built, tmp_path, tamper, check):
         L = np.load(ix / "pool_lengths.npy")
         L[3] += 1
         np.save(ix / "pool_lengths.npy", L)
+    elif tamper == "duplicate_member":
+        mem = np.load(ix / "cluster_members.npy")
+        mem[1] = mem[0]
+        np.save(ix / "cluster_members.npy", mem)
+    elif tamper == "negative_member":
+        mem = np.load(ix / "cluster_members.npy")
+        mem[0] = -1
+        np.save(ix / "cluster_members.npy", mem)
+    elif tamper == "train_drops_one":       # not caught by the np.isin part
+        np.save(ix / "train_clusters.npy", np.load(ix / "train_clusters.npy")[:-1])
     else:
         np.save(ix / "train_clusters.npy", np.sort(np.concatenate(
             [np.load(ix / "train_clusters.npy"), np.load(ix / "val_clusters.npy")[:1]])))
     res = ci.verify_cluster_index(ix, d / "train")
     assert not res["ok"] and check in res["failures"]
+
+
+def test_verify_negative_val_takes_the_sort_path(built, tmp_path):
+    """A negative val id wraps in umask[val]; the check falls back to setdiff1d and
+    matches the old expression."""
+    d = _copy(built, tmp_path)
+    ix = d / "cluster_index"
+    val = np.load(ix / "val_clusters.npy")
+    val[0] = -1
+    np.save(ix / "val_clusters.npy", val)
+    train, universe = np.load(ix / "train_clusters.npy"), np.load(ix / "universe_clusters.npy")
+    old = (np.array_equal(train, np.setdiff1d(universe, val))
+           and not np.isin(val, train).any())
+    res = ci.verify_cluster_index(ix, d / "train")
+    assert res["checks"]["train_is_universe_minus_val"] == bool(old)
+    assert not res["checks"]["train_is_universe_minus_val"]
 
 
 def test_join_refuses_an_accession_outside_the_hierarchy(release, tmp_path):

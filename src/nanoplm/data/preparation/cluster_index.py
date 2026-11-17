@@ -533,16 +533,27 @@ def verify_cluster_index(index_dir: Path, pool_dir: Path) -> dict:
     if seg_ok and len(inc):
         within[off[1:-1] - 1] = False      # pairs that straddle two clusters
     check("csr_members_strictly_increasing_within_a_cluster", np.all(inc[within] > 0))
-    check("csr_covers_every_universe_member", int(umask[pc].sum()) == len(mem)
-          and len(np.unique(mem)) == len(mem))
+    if checks["csr_members_in_range"]:     # O(n) bincount-style mark instead of a sort
+        seen = np.zeros(n, dtype=bool)
+        seen[mem] = True
+        mem_unique = int(seen.sum()) == len(mem)
+    else:                                  # negative ids would wrap: keep the sort
+        mem_unique = len(np.unique(mem)) == len(mem)
+    check("csr_covers_every_universe_member", int(umask[pc].sum()) == len(mem) and mem_unique)
     ho = man.get("holdout", {})
     cu = len(universe)
     want_val = universe[draw_val_clusters(cu, float(ho.get("val_ratio", 0)),
                                           int(ho.get("seed", HOLDOUT_SEED)))] if cu else val
     check("val_reproducible_from_seed", np.array_equal(val, want_val))
     check("val_sorted_unique_in_universe", np.all(np.diff(val) > 0) and np.all(umask[val]))
-    check("train_is_universe_minus_val",
-          np.array_equal(train, np.setdiff1d(universe, val)) and not np.isin(val, train).any())
+    # umask[val] above already raised on val >= c; negative val wraps, so keep the sort
+    if checks["universe_is_the_mask"] and (len(val) == 0 or val.min() >= 0):
+        rest = umask.copy()                # universe is the mask: minus val without a sort
+        rest[val] = False
+        train_ok = np.array_equal(train, np.flatnonzero(rest))
+    else:
+        train_ok = np.array_equal(train, np.setdiff1d(universe, val))
+    check("train_is_universe_minus_val", train_ok and not np.isin(val, train).any())
     check("val_rep_rows_are_the_held_out_representatives", np.array_equal(val_rep, rep_row[val]))
     lens, sro_shards = read_pool_lengths(pool_dir)
     check("shard_row_offsets_match_the_shards", np.array_equal(sro, sro_shards))
