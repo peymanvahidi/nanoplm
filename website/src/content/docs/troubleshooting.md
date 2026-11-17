@@ -34,31 +34,11 @@ Set [`dataset_dir`](/nanoplm/reference/pretrain/#pretrain-pretraining-dataset_di
 
 Never set `inferred_grad_accum_steps`, `global_batch_seqs`, or `achieved_global_batch_tokens`. They are runtime outputs that happen to live on the same dataclass.
 
-:::danger[The silent one: a leftover `pure_torch:` mapping]
-Old configs wrote `pure_torch` as a **block**:
-
-```yaml
-pure_torch:
-  enabled: false     # <- does nothing
-  use_compile: true
-```
-
-On current nanoPLM, `pure_torch` is a **top-level boolean**, and the loader evaluates it with `bool(...)`. A non-empty mapping is truthy, so `{enabled: false}` turns pure-torch **on**. There is no error and no warning: you get a backend you did not ask for. Delete the block and use a bare `pure_torch: true` (the template default).
-:::
-
 ## Pretraining won't start
 
-**`Pretraining requires pure_torch: true. The HF Trainer pretraining path is no longer supported.`**
+**`pure_torch` and `--pure-torch` were removed**
 
-Pure-torch must be selected: either in the YAML or on the CLI. The stock template already sets `pure_torch: true`, so this usually means a hand-written config is missing the key, has it set to false, or you used `pretrain run` without the flag. There is no HF-Trainer path.
-
-```bash
-# YAML path (template default is pure_torch: true)
-nanoplm pretrain from-yaml
-
-# Flag-driven path still needs the explicit flag
-nanoplm pretrain run --dataset-dir output/data/pretrain_data --pure-torch
-```
+Pretraining always uses the pure-torch path, so the key and the flag are no longer needed. Old YAMLs and checkpoints with `pure_torch: true` still load with a warning; `pure_torch: false` is an error. Delete the key and drop the flag.
 
 **`train_loader yields 3 micro-batches per rank per pass, fewer than grad_accum=8: one optimizer step (global_batch_tokens=...) is larger than a pass over the train set. Lower global_batch_tokens or use a larger dataset.`**
 
@@ -212,7 +192,7 @@ If one replica would span the whole world there is nothing to replicate: that is
 
 ## FP8 errors
 
-FP8 goes through Transformer Engine: pure-torch swaps eligible blocks for TE modules and runs them under a TE autocast. Transformer Engine is therefore required for `fp8: true`, even though nanoPLM has no separate TE backend.
+FP8 goes through Transformer Engine: nanoPLM swaps eligible blocks for TE modules and runs them under a TE autocast. Transformer Engine is therefore required for `fp8: true`, even though nanoPLM has no separate TE backend.
 
 **`fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`**
 
@@ -239,16 +219,7 @@ CPU activation offload is the fussiest FP8 feature. All four of these are hard e
 
 ## Model config errors
 
-Several architecture features are mutually exclusive, and several are pure-torch only.
-
-**`model.use_canon_layers=true requires pure_torch: true (or --pure-torch). Canon layers are not implemented in the HF path.`**
-
-The same message shape appears for `use_noble`, `use_diff_attn_v2`, and `use_paired_head_attention`. MoE and recycling have their own wording:
-
-- **`MoE is currently implemented only in the pure-torch path. Disable use_moe or use --pure-torch.`**
-- **`Huginn-style recycling (recycling_loop_count > 1) is implemented only in the pure-torch path. Use --pure-torch with recycling_loop_count>1.`**
-
-Keep pure-torch (the template default).
+Several architecture features are mutually exclusive.
 
 ### Incompatible pairs
 
@@ -264,7 +235,7 @@ Keep pure-torch (the template default).
 
 ### MoE
 
-MoE has three prerequisites beyond pure-torch:
+MoE has three prerequisites:
 
 - **`use_moe=True requires mlp_activation in {'swiglu', 'srelu'}.`**
 - **`MoE requires use_packing=True`** and **`MoE requires use_static_inp_size=True`**: both default to `true`, so this fires only if you turned them off.

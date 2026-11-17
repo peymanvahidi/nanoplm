@@ -14,7 +14,7 @@ This is where the checkpoint format pays off. `eval.yaml` needs **a path and a l
 Benchmarking runs on [biotrainer](https://github.com/sacdallago/biotrainer) 2.1.1, which the standard
 [install](/nanoplm/start/install/) already includes.
 
-Evaluation loads **pure-torch checkpoints only**. That is one more reason to keep the stock `pure_torch: true` default when you pretrain, as [2. Pretrain](/nanoplm/pipeline/pretrain/) recommends.
+Evaluation loads **nanoPLM checkpoints only**, which is what [2. Pretrain](/nanoplm/pipeline/pretrain/) produces.
 
 :::note[Removed frameworks]
 The old `pbc` and `flip` probe suites were dropped in the move to biotrainer

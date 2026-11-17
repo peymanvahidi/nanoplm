@@ -257,16 +257,10 @@ Template written to: <cwd>/pretrain.yaml
 ### pretrain from-yaml
 
 ```
-nanoplm pretrain from-yaml [CONFIG] [--pure-torch]
+nanoplm pretrain from-yaml [CONFIG]
 ```
 
 Runs pretraining from a config with `model:`, `pretraining:`, and `resume:` blocks. `CONFIG` defaults to `pretrain.yaml`.
-
-| Flag | Meaning | Default |
-| --- | --- | --- |
-| `--pure-torch` | Force the pure-torch model and training loop | off (YAML `pure_torch: true` is the template default) |
-
-The stock template sets top-level `pure_torch: true`, so a normal `from-yaml` run needs no flag. Pure-torch is the only pretraining backend; a config with neither the YAML key nor the flag stops with `Pretraining requires pure_torch: true.`
 
 ```bash
 nanoplm pretrain from-yaml
@@ -289,10 +283,10 @@ torchrun --nproc-per-node=4 $(which nanoplm) pretrain from-yaml
 ### pretrain run
 
 ```
-nanoplm pretrain run --dataset-dir DIR [OPTIONS] --pure-torch
+nanoplm pretrain run --dataset-dir DIR [OPTIONS]
 ```
 
-Flag-driven pretraining without a YAML file. `--dataset-dir` is the only required option; `--pure-torch` **is** mandatory here because there is no YAML default to fall back on. Every flag maps to a `pretrain.yaml` key of the same name, so the [pretrain.yaml reference](/nanoplm/reference/pretrain/) is the authoritative source for meanings and defaults.
+Flag-driven pretraining without a YAML file. `--dataset-dir` is the only required option. Every flag maps to a `pretrain.yaml` key of the same name, so the [pretrain.yaml reference](/nanoplm/reference/pretrain/) is the authoritative source for meanings and defaults.
 
 - **Dataset and output**: `--dataset-dir`, `--ckp-dir`.
 - **Batch and duration**: `--micro-batch-seqs`, `--global-batch-tokens`, `--global-batch-warmup-steps`, `--train-tokens`, `--max-steps`, `--stable-tokens`, `--stable-steps`, `--decay-tokens`, `--decay-steps`.
@@ -300,7 +294,7 @@ Flag-driven pretraining without a YAML file. `--dataset-dir` is the only require
 - **MLM**: `--mlm-probability`, `--mlm-masking-strategy`, `--mlm-span-mean-length`, `--mlm-span-max-length`, `--mask-replace-prob`, `--random-token-prob`, `--keep-probability`, `--mlm-standard-amino-acids-only/--mlm-all-non-special-tokens`.
 - **Precision**: `--bf16`, `--tf32`, `--fp8`, `--fp8-target`, `--fp8-recipe`, `--fp8-format`, `--fp8-amax-history-len`, `--fp8-reduce-amax`, `--fp8-skip-last-n-layers`.
 - **Distributed**: `--multi-gpu`, `--distributed-mode [fsdp|ddp]`, `--fsdp-shard-granularity`, `--fsdp-reshard-after-forward`, `--world-size`, `--ddp-bucket-cap-mb`.
-- **Model**: `--hidden-size`, `--intermediate-size`, `--num-hidden-layers`, `--num-attention-heads`, `--num-kv-heads`, `--norm-type`, `--mlp-activation`, `--classifier-activation`, `--wo-init`, `--fused-qkv`, `--fused-up-gate`, `--attn-layer-pattern`, `--activation-checkpointing`, and the pure-torch feature toggles (`--use-canon-layers`, `--use-repo`, `--use-mhc-lite`, `--use-diff-attn-v2`, `--use-paired-head-attention`, `--use-qk-norm`, `--use-resid-lambdas`, `--use-x0-lambdas`, `--use-prores`).
+- **Model**: `--hidden-size`, `--intermediate-size`, `--num-hidden-layers`, `--num-attention-heads`, `--num-kv-heads`, `--norm-type`, `--mlp-activation`, `--classifier-activation`, `--wo-init`, `--fused-qkv`, `--fused-up-gate`, `--attn-layer-pattern`, `--activation-checkpointing`, and the feature toggles (`--use-canon-layers`, `--use-repo`, `--use-mhc-lite`, `--use-diff-attn-v2`, `--use-paired-head-attention`, `--use-qk-norm`, `--use-resid-lambdas`, `--use-x0-lambdas`, `--use-prores`).
 - **Resume**: `--resume/--no-resume`, `--resume-checkpoint-dir`, `--resume-mode`, `--resume-decay-tokens`, `--resume-decay-steps`, `--resume-decay-shape`, `--resume-lr-decay-to-fraction`.
 - **Logging and debug**: `--logging-steps`, `--eval-steps`, `--save-steps`, `--seed`, `--project-name`, `--run-name`, `--debug-non-finite-params`, `--debug-layerwise-metrics`, `--debug-layerwise-log-every`.
 
@@ -310,7 +304,7 @@ Flag-driven pretraining without a YAML file. `--dataset-dir` is the only require
 
 ## eval
 
-`nanoplm eval` scores a checkpoint on zero-shot and supervised probe benchmarks through biotrainer 2.1.1's autoeval. It loads **pure-torch checkpoints only**. Fields are documented in the [eval.yaml reference](/nanoplm/reference/eval/). The old probe suites (`pbc`, `flip`) were dropped in the biotrainer 2.0.0 migration; passing them fails with a message naming the supported frameworks.
+`nanoplm eval` scores a checkpoint on zero-shot and supervised probe benchmarks through biotrainer 2.1.1's autoeval. It loads **nanoPLM checkpoints only**. Fields are documented in the [eval.yaml reference](/nanoplm/reference/eval/). The old probe suites (`pbc`, `flip`) were dropped in the biotrainer 2.0.0 migration; passing them fails with a message naming the supported frameworks.
 
 ### eval get-yaml
 

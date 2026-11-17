@@ -16,13 +16,13 @@ Each flag below carries one of four verdicts:
 - **Caveat**: the run proceeds and the flag works, with a correctness or performance qualifier attached.
 - **Compatible**: known to work with recycling.
 
-The **Condition** column matters: some entries fire only in a particular state. `pure_torch` is listed as rejected *when it is false*, which is the matrix's way of saying recycling requires the pure-torch backend.
+The **Condition** column matters: some entries fire only in a particular state.
 
 The matrix is generated from `recycling_compatibility.yaml` (the same rules file the trainer reads when it validates your config), so what you see here is exactly what the tool enforces.
 
-## Recycling is pure-torch only
+## Recycling
 
-Pure-torch is the only pretraining backend, so the `pure_torch is False` entry is really about the Hugging Face `Trainer` path, which is no longer supported: a config that does not select pure-torch never reaches the trainer at all. See [Recycling](/nanoplm/guides/recycling/) for what the feature does and when it pays off.
+See [Recycling](/nanoplm/guides/recycling/) for what the feature does and when it pays off.
 
 If one of these combinations fails your run, [Troubleshooting](/nanoplm/troubleshooting/) has the exact error text and the fix.
 

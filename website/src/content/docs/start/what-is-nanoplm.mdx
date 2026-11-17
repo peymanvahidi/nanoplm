@@ -46,7 +46,6 @@ identical.
 
    ```bash frame="terminal"
    nanoplm pretrain from-yaml
-   # Using pure-torch model and training loop
    # Total Trainable Parameters: 2705952
    # Flash attention available: True
    # [step 1/154] loss=3.4412 lr=5.00e-06 grad_norm=1.8834 tok/s=412,190 ...
@@ -73,11 +72,6 @@ Full install details (clusters, verify, benchmarking): [Install](/nanoplm/start/
 The defaults are wired to chain: `data.yaml` writes shards to `output/data/pretrain_data/`, which
 is exactly where `pretrain.yaml` looks for them. The one value the defaults cannot guess is
 `eval.checkpoint_dir`: open `eval.yaml` and point it at the run you trained above.
-
-:::note
-The stock `pretrain.yaml` sets `pure_torch: true`, so `from-yaml` needs no backend flag.
-Pure-torch is the only pretraining backend.
-:::
 
 For the real thing (a tiny model trained and evaluated end to end, with the edits spelled out),
 follow [Your first PLM](/nanoplm/start/first-plm/).
