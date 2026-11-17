@@ -21,8 +21,10 @@ class ShardedDataset(Dataset):
     - shard_NNNN.idx.npy: numpy .npy file containing int32 array of sequence lengths
 
     Uses np.memmap for zero-copy reads. Memmaps are created lazily so that
-    spawn-based DataLoader workers (macOS default) only pickle lightweight
-    metadata (paths + offsets), not the mapped data itself.
+    DataLoader workers never pickle the mapped data itself.  The per-shard
+    offset arrays are not small: at 358M sequences they take GBs.  Forked
+    workers share them copy-on-write; spawn workers (macOS default) unpickle
+    their own copy each.
     """
 
     def __init__(self, data_dir: str, pad_token_id: int = 0, shuffle: bool = True) -> None:
@@ -74,7 +76,7 @@ class ShardedDataset(Dataset):
         if log:
             logger.info(f"Found {len(self._bin_paths)} binary shards in {self.data_dir}")
 
-        # Load index files (small arrays, always kept in memory)
+        # Load index files, kept in memory (GBs at 358M sequences; see class docstring)
         self._offsets: List[np.ndarray] = []  # per-shard cumulative byte offsets
         self.lengths: List[int] = []
 
@@ -300,6 +302,10 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
         if sampler.shuffle:
             g = torch.Generator()
             g.manual_seed(sampler.seed + epoch)
+            # Must match DistributedSampler, so torch.randperm stays.  Below
+            # 214,748,364 items it draws by 32-bit modulo, which biases
+            # positions (up to about 2% at 200M, 0.6% at 60M; every item still
+            # appears once per pass).  The 358M mix is above that threshold.
             order = torch.randperm(n, generator=g).numpy()
         else:
             order = np.arange(n, dtype=np.int64)
@@ -480,6 +486,10 @@ class TokenPackingDataset(torch.utils.data.IterableDataset):
                          self.dataset[i]
                          for i in islice(self.sampler, worker_info.id + skip_samples, None, worker_info.num_workers)
                      )
+             elif isinstance(self.sampler, torch.utils.data.DistributedSampler):
+                 # The rank sampler's order, usually memoized by len(): no second permutation.
+                 (idx,) = self._distributed_worker_indices(1, self.sampler.epoch)
+                 iterator = (self.dataset[i] for i in idx[skip_samples:].tolist())
              else:
                  indices = islice(self.sampler, skip_samples, None)
                  iterator = (self.dataset[i] for i in indices)

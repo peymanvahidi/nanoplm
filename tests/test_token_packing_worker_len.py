@@ -196,6 +196,39 @@ def test_forked_workers_inherit_indices_after_len(monkeypatch, tmp_path):
     assert len(drawn) == 2 and os.getpid() not in drawn
 
 
+@pytest.mark.parametrize("nw", [0, 1])
+def test_single_worker_reuses_indices_after_len(monkeypatch, tmp_path, nw):
+    """With 0 or 1 workers, iterating after len() draws no second permutation."""
+    log = tmp_path / "randperm_pids"
+    real = torch.randperm
+
+    def logging_randperm(*args, **kwargs):
+        with open(log, "a") as f:
+            f.write(f"{os.getpid()}\n")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "randperm", logging_randperm)
+
+    def pids():
+        out = [int(x) for x in log.read_text().split()] if log.exists() else []
+        log.unlink(missing_ok=True)
+        return out
+
+    ds = LengthsDataset(_lengths(5)[:301])
+    packed = _packed(ds, 2, 1, nw, epoch=2)
+    expected = _reference_stream(ds, 2, 1, nw, 2, False)
+    pids()
+
+    len(packed)
+    assert pids() == [os.getpid()]
+    loader = DataLoader(
+        packed, batch_size=None, num_workers=nw, collate_fn=lambda b: b,
+        multiprocessing_context="fork" if nw else None,
+    )
+    assert [[int(s["input_ids"][0]) for s in b] for b in loader] == expected
+    assert pids() == []
+
+
 def test_len_draws_one_permutation(monkeypatch):
     ds = LengthsDataset(_lengths())
     packed = _packed(ds, 4, 2, 4, epoch=1)
