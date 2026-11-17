@@ -12,6 +12,10 @@ from torch.utils.data import Dataset
 from nanoplm.utils import logger
 from nanoplm.data.infra.validation import ValidationError
 
+# Shards with fewer bytes than this keep their offsets as uint32 (half the memory);
+# readers take differences of increasing offsets or int() them, so values match.
+UINT32_OFFSETS_MAX_BYTES = 2**32
+
 
 class ShardedDataset(Dataset):
     """Dataset for loading pre-tokenized sequences from flat binary shards via memmap.
@@ -102,6 +106,8 @@ class ShardedDataset(Dataset):
                 )
 
             offsets = np.concatenate([[0], np.cumsum(sizes)])
+            if expected_bytes < UINT32_OFFSETS_MAX_BYTES:
+                offsets = offsets.astype(np.uint32)
 
             self._offsets.append(offsets)
             self.lengths.append(len(sizes))
