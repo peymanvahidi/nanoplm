@@ -104,7 +104,7 @@ SwissProt holds 9% of the training sequences but gets 20% of the draws, so the r
 
 The numbers are estimates that ignore packing waste. For a cluster source, `size` counts clusters. W&B stores the table in the run config as `data_mixture`.
 
-A source with `epochs` below 1 trains on a part of itself, spread over the whole source. Each new epoch of a source reads it in a new order, and a cluster source draws new members. A `decay` resume starts the mix again from its first epoch, as described in [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
+A source with `epochs` below 1 trains on a part of itself, spread over the whole source. Each new epoch of a source reads it in a new order, and a cluster source draws new members. A `continue` or `decay` resume picks the mix up where the checkpoint stopped, at the same epoch and position of each source; see [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
 
 ## Validation
 
@@ -121,7 +121,7 @@ Setting `val_ratio` or `val_size` on a source is an error. So is setting both. E
 Error: sources.swissprot would need 669,400 val sequences but has 570,000; lower data_params.val_ratio or use data_params.val_size
 ```
 
-Each source's share depends on the size of every source, so `from-yaml` counts each source after its filter (a `count` stage), then a `val_split` stage works out the shares. A source's split reruns only when its share changes. Changing a weight changes the shares, so it reruns `val_split`, the mixture and each source whose share moved. Nothing is downloaded or filtered again. A plain source splits and tokenizes again; a cluster source rebuilds only `cluster_index`, not its tokenized members. The `Rebuild:` line before the run cannot see this yet: it says the sources are up to date.
+Each source's share depends on the size of every source, so `from-yaml` counts each source after its filter (a `count` stage), then a `val_split` stage works out the shares. Adding a source or changing a weight changes the shares, so it reruns `val_split`, the mixture and the split of every source whose val count moved, which is nearly always all of them. Nothing is downloaded or filtered again. Every plain source splits and tokenizes again; a cluster source rebuilds only `cluster_index`, not its tokenized members. See [Compare several ratios](#compare-several-ratios) for the `Rebuild:` line.
 
 Each eval logs:
 
@@ -149,20 +149,22 @@ The listed sources get all the eval batches, and `eval/loss` averages over them 
 
 ## Compare several ratios
 
-If you change only the weights and rerun `from-yaml`, it redraws the validation split (see [Validation](#validation)). A plain source then splits and tokenizes again; a cluster source keeps its tokenized members. The line before the run only shows the first stages:
+If you change only the weights and rerun `from-yaml`, it redraws the validation split (see [Validation](#validation)). Every plain source then splits and tokenizes again; a cluster source keeps its tokenized members and rebuilds only `cluster_index`. The line before the run says so:
 
 ```text
-Rebuild: swissprot: up to date; uniref50: up to date; val_split: may rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)
+Rebuild: swissprot: 4 of 8 stages may rerun; uniref50: 4 of 8 stages may rerun; val_split: may rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)
 ```
+
+For a plain source the four are `split`, `pre-tokenize` (train and val) and `write_manifest`. Its `check`, `shuffle`, `filter` and `count` stages, and any download, do not rerun; DVC prints `didn't change, skipping` for them.
 
 That replaces the mix in `output_dir`. To keep several ratios side by side, give each ratio its own folder with its own `data.yaml`; each one builds its sources again. To skip the downloads, set each `fasta` to the file the first build downloaded, for example `../base/output/data/pretrain_data/downloads/uniprot_sprot.fasta.gz`. A local file is read where it is. Each ratio shares the validation split out by its own weights, so the ratios hold out different sequences.
 
 ## Add, remove or rename a source
 
-Adding a source builds only that source and the `mixture` stage:
+Adding a source builds that source, and it changes every source's share of the validation split. So every plain source splits and tokenizes again, a cluster source rebuilds its `cluster_index`, and `val_split` and `mixture` rerun:
 
 ```text
-Rebuild: swissprot: up to date; uniref50: up to date; pdb: 7 of 7 stages may rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)
+Rebuild: swissprot: 4 of 8 stages may rerun; uniref50: 4 of 8 stages may rerun; pdb: 8 of 8 stages may rerun; val_split: may rerun; mixture: may rerun. (DVC skips a stage its run cache already has.)
 ```
 
 Removing or renaming a source deletes nothing. `from-yaml` lists the files left behind on every run until they are gone:
