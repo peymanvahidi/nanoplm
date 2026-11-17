@@ -288,6 +288,28 @@ def test_packed_length_is_recomputed_for_each_epoch(built):
     assert len(lens) > 1
 
 
+@pytest.mark.parametrize("workers", [2, 4])
+@pytest.mark.parametrize("source", ["mixture", "cluster"])
+def test_packed_length_is_exact_per_worker_over_two_epochs(built, source, workers):
+    """len() equals what a multi-worker DataLoader yields, on every rank, for a mixture
+    with a cluster source and for the cluster source alone, and stays exact after
+    set_epoch moves to the next pass (the cached length is dropped)."""
+    root, folders, _ = built
+    if source == "mixture":
+        dataset_dir, m = root, _write(root, folders, {"a": 0.5, "b": 0.2, "c": 0.3})
+    else:
+        dataset_dir, m = folders["c"], read_manifest(folders["c"])
+    world = 2
+    for rank in range(world):
+        packed = _packed(dataset_dir, m, world=world, rank=rank)
+        packed.set_num_workers(workers)
+        for epoch in (0, 1):
+            packed.set_epoch(epoch)
+            n = len(packed)
+            assert n > 0
+            assert n == len(_batches(packed, workers)), (source, workers, rank, epoch)
+
+
 def test_fingerprint_follows_the_weights(built, tmp_path):
     _, folders, _ = built
     fp = []
