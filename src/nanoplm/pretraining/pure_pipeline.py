@@ -1979,8 +1979,9 @@ def _check_pass_len(
     synced_len: int, grad_accum: int, global_batch_tokens, pass_idx: Optional[int] = None
 ) -> Optional[str]:
     """Raise when a pass has fewer micro-batches per rank than one optimizer step
-    needs. ``pass_idx`` None is the startup check of pass 0; it returns a warning when
-    the pass is within SHORT_PASS_MARGIN of that limit."""
+    needs. ``pass_idx`` None is the startup check of the first pass (the resume pass
+    on a resume); it returns a warning when the pass is within SHORT_PASS_MARGIN of
+    that limit."""
     fix = "Lower global_batch_tokens or use a larger dataset."
     if synced_len < grad_accum:
         where = "per pass" if pass_idx is None else f"in pass {pass_idx + 1}"
@@ -2538,6 +2539,14 @@ def _read_training_state(checkpoint_dir: str) -> dict:
             f"Could not parse training state at {state_path}: {exc}. "
             "The checkpoint may be corrupt (e.g. truncated by a crash mid-write)."
         ) from exc
+
+
+def _first_len_epoch(resume_config) -> int:
+    """The pass whose packed length startup computes first: the checkpoint's
+    epoch on a resume (0 when it has no training_state), else 0."""
+    if resume_config and resume_config.is_resume:
+        return int(_read_training_state(resume_config.checkpoint_dir).get("epoch", 0))
+    return 0
 
 
 def _checkpoint_muon_orthogonalizer(checkpoint_dir) -> tuple[str, ...]:
@@ -3437,8 +3446,10 @@ def run_pure_pretraining(
             epoch_setter.set_epoch(epoch_)
         return sync_train_len(len(train_loader))
 
-    synced_len = _synced_len_at(0)
-    synced_len_epoch = 0
+    # A resume computes its own pass's length here, so the resume block below
+    # does not compute it a second time.
+    synced_len_epoch = _first_len_epoch(resume_config)
+    synced_len = _synced_len_at(synced_len_epoch)
     if synced_len == 0:
         raise RuntimeError(
             "train_loader is empty (synced_len=0); cannot satisfy the token budget. "

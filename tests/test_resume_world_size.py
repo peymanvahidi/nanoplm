@@ -7,7 +7,12 @@ from pathlib import Path
 
 import torch
 
-from nanoplm.pretraining.pure_pipeline import _rescale_resume_data_step, _save_checkpoint
+from nanoplm.pretraining.config import ResumeConfig
+from nanoplm.pretraining.pure_pipeline import (
+    _first_len_epoch,
+    _rescale_resume_data_step,
+    _save_checkpoint,
+)
 
 
 def test_same_world_size_unchanged():
@@ -88,3 +93,20 @@ def test_training_state_saves_world_size_and_num_workers(tmp_path):
     state = json.loads((Path(tmp_path) / "checkpoint-5" / "training_state.json").read_text())
     assert state["world_size"] == 16 and state["num_workers"] == 3
     assert state["epoch_data_step"] == 7 and state["epoch_data_len"] == 826
+
+
+def test_first_len_epoch_no_resume():
+    assert _first_len_epoch(None) == 0
+    assert _first_len_epoch(ResumeConfig(is_resume=False, checkpoint_dir="/nonexistent")) == 0
+
+
+def test_first_len_epoch_reads_checkpoint_epoch(tmp_path):
+    (tmp_path / "training_state.json").write_text(json.dumps({"global_step": 50, "epoch": 3}))
+    assert _first_len_epoch(ResumeConfig(is_resume=True, checkpoint_dir=str(tmp_path))) == 3
+
+
+def test_first_len_epoch_without_training_state(tmp_path):
+    # Old checkpoint: no training_state.json, or one without "epoch", gives pass 0.
+    assert _first_len_epoch(ResumeConfig(is_resume=True, checkpoint_dir=str(tmp_path))) == 0
+    (tmp_path / "training_state.json").write_text(json.dumps({"global_step": 50}))
+    assert _first_len_epoch(ResumeConfig(is_resume=True, checkpoint_dir=str(tmp_path))) == 0
