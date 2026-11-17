@@ -5,6 +5,7 @@ output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml'
 
 # weight = share of training sequences (not tokens); weights must sum to 1.
 sources:
+  # downloads about 53 GB (uniref90.fasta.gz + uniref50.xml.gz) and needs about 182 GB of disk
   uniref50:
     fasta: uniref50
     weight: 1.0
@@ -32,7 +33,8 @@ data_params:
   max_seqs: -1           # counts clusters here: -1 = all
   min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
-  val_ratio: 0.0044      # share of the mix's clusters held out for validation
+  val_ratio: 0.0044      # share of the clusters held out for validation; 0.0044 is for UniRef50
+                         # (145k of 32.9M clusters). For your own data use 0.01-0.1, or val_size
   # OR (together you'll get error, comment one out)
   # val_size: 150000
   drop_invalid_sequences: true   # false: stop on records with unknown characters instead of dropping them

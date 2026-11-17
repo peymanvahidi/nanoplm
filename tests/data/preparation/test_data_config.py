@@ -36,7 +36,8 @@ def test_the_template_is_one_plain_swissprot_source():
     cfg = _parse(_template())
     assert not cfg.legacy and list(cfg.sources) == ["swissprot"]
     src = cfg.source
-    assert src.fasta == SPROT and src.weight == 1.0
+    # one source needs no weight; the template shows it only in the mix example
+    assert src.fasta == SPROT and src.weight is None
     assert src.cluster is None and src.overrides == ()
     assert src.params["max_seqs"] == 20000 and src.key("max_seqs") == "data_params.max_seqs"
     out = "output/data/pretrain_data"
@@ -188,9 +189,10 @@ def _uncomment(text: str, start: str, end: str) -> str:
 
 
 def test_the_templates_commented_mix_parses():
-    """Uncommenting another_source and lowering swissprot's weight gives a mix."""
+    """Uncommenting another_source and giving swissprot a weight gives a mix."""
     text = _uncomment(load_template("data_pretrain"), "  # another_source:", "data_params:")
-    got = _parse(yaml.safe_load(text.replace("weight: 1.0", "weight: 0.9")))
+    text = re.sub(r"(\n  swissprot:[^\n]*\n)", r"\1    weight: 0.9\n", text, count=1)
+    got = _parse(yaml.safe_load(text))
     assert got.is_mixture and {n: s.weight for n, s in got.sources.items()} == {
         "swissprot": 0.9, "another_source": 0.1}
     assert got.sources["another_source"].fasta == "data/my_proteins.fasta"
@@ -464,6 +466,16 @@ def test_the_old_layout_is_source_main():
     assert "data_dirs is the old data.yaml layout" in hint and 'source named "main"' in hint
     assert ('output_dir: "output/data/pretrain_data"\nsources:\n  main:\n    fasta: swissprot'
             in hint)
+    assert "Switch before your first run with this nanoPLM version" in hint
+    # the download is not there (relative to cwd), so there is nothing to skip
+    assert "To skip the download" not in hint
+
+
+def test_the_old_layout_hint_offers_the_download_only_when_it_exists(tmp_path):
+    gz = tmp_path / "output/data/raw/sequences.fasta.gz"
+    gz.parent.mkdir(parents=True)
+    gz.write_bytes(b"")
+    hint = _parse(copy.deepcopy(OLD), tmp_path).warnings[0]
     assert 'To skip the download, set fasta: "output/data/raw/sequences.fasta.gz"' in hint
 
 

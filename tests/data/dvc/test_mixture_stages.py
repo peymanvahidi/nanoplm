@@ -441,6 +441,6 @@ def test_from_yaml_one_cluster_source_with_val_size(tmp_path):
 def test_shuffle_false_in_a_mix_is_an_error():
     cfg = _mix(**THREE)
     cfg["data_params"]["shuffle"] = False
-    with pytest.raises(DataConfigError, match="shuffle: false is not supported for a mix yet; "
-                                              "it comes with the mixes redesign"):
+    with pytest.raises(DataConfigError, match="shuffle: false is not supported for a mix. "
+                                              "Remove it, or train on one source"):
         _stages(cfg)

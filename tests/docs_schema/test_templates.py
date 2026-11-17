@@ -43,7 +43,8 @@ def test_data_template_has_top_level_scalar_sources_and_data_params():
     # Fields under the example source name carry it as their entry; the name
     # itself is not a field.
     assert by_key[("sources", "fasta")].entry == "swissprot"
-    assert by_key[("sources", "weight")].entry == "swissprot"
+    # weight ships only in the commented mix example (overlay.yaml documents it)
+    assert ("sources", "weight") not in by_key
     assert ("sources", "swissprot") not in by_key
     assert by_key[("data_params", "max_seqs")].entry == ""
     assert {f.section for f in fields} == {"", "sources", "data_params"}

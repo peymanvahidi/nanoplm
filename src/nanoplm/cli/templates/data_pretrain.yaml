@@ -4,29 +4,28 @@ output_dir: "output/data/pretrain_data"   # every file goes here; pretrain.yaml'
 # Cluster aware subsampling: https://peymanvahidi.github.io/nanoplm/guides/cluster-subsampling/
 #   or start from a ready-made file: nanoplm data get-yaml --subsampling (add --force to replace this file)
 
-# weight = share of training sequences (not tokens); weights must sum to 1.
 sources:
-  swissprot:
+  swissprot:             # a name you pick; it also names its folder under output_dir
     fasta: swissprot     # swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa (.gz/.zst)
-    weight: 1.0
-    # max_seq_len: 1024  # overrides data_params.max_seq_len for this source only
 
+  # A second source makes a mix; then every source needs a weight:
+  # weight = share of training sequences (not tokens); weights must sum to 1.
   # another_source:
   #   fasta: "data/my_proteins.fasta"
-  #   weight: 0.1        # then lower the other weights so they sum to 1
+  #   weight: 0.1
+  #   max_seq_len: 1024  # overrides data_params.max_seq_len for this source only
 
 data_params:
   max_seqs: 20000        # -1 = all
   min_seq_len: 20        # shorter sequences are dropped
   max_seq_len: 512       # longer sequences are dropped
-  val_ratio: 0.1         # share of the mix held out for validation
-  # OR (together you'll get error, comment one out)
-  # val_size: 150000
+  val_ratio: 0.1         # share held out for validation
+  # val_size: 150000   # or a count of val sequences instead; set only one
   drop_invalid_sequences: true   # false: stop on records with unknown characters instead of dropping them
 
   # Rarely changed
   shuffle: true          # shuffle before the train / val split; false also trains in file order
   shuffle_seed: 24
-  samples_per_shard: 2000  # sequences per shard file; raised automatically for large cluster datasets
-  max_workers: 2         # tokenizer processes and MMseqs2 threads; -1 = all cores
+  samples_per_shard: 2000  # sequences per shard file
+  max_workers: 2         # tokenizer processes; -1 = all cores
   register_tokens: 0     # 0, 1 or 2 scratch tokens after EOS

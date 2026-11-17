@@ -323,7 +323,7 @@ def test_prepared_was_removed(tmp_path, monkeypatch, cfg):
 
 
 def test_fix_flips_an_override_too(tmp_path, monkeypatch):
-    cfg = re.sub(r"(    weight: 1.0[^\n]*\n)", r"\1    drop_invalid_sequences: false\n",
+    cfg = re.sub(r"(    fasta: swissprot[^\n]*\n)", r"\1    drop_invalid_sequences: false\n",
                  load_template("data_pretrain"), count=1)
     _dry(tmp_path, monkeypatch, cfg)
     r = _run(tmp_path / "data.yaml", "--fix", "--dry-run")

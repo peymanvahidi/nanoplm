@@ -580,8 +580,7 @@ def _check_mix(sources: dict, name_of: str) -> None:
         raise DataConfigError(f"{name_of}: {err}")
     if any(s.params.get("shuffle") is False for s in sources.values()):
         raise DataConfigError(f"{name_of}: data_params.shuffle: false is not supported for a "
-                              "mix yet; it comes with the mixes redesign. Remove it, or train "
-                              "on one source")
+                              "mix. Remove it, or train on one source")
 
 
 def _source_paths(src: Source) -> dict:
@@ -646,8 +645,10 @@ _OLD_INTERMEDIATES = ("extracted_fasta", "validation_dir", "shuffled_fasta", "fi
                       "splitted_fasta_dir")
 
 
-def migration_hint(config: dict) -> str:
-    """The deprecation warning for a data_dirs config, with the block to paste in."""
+def migration_hint(config: dict, base_dir=None) -> str:
+    """The deprecation warning for a data_dirs config, with the block to paste in.
+
+    ``base_dir`` is data.yaml's directory, where relative paths are looked up."""
     dirs = config.get("data_dirs") or {}
     fasta = dirs.get("url") or dirs.get("local_fasta")
     shortcut = next((k for k, v in FASTA_SHORTCUTS.items() if v == fasta), None)
@@ -668,10 +669,12 @@ def migration_hint(config: dict) -> str:
         "",
         f"{rename}The new layout keeps intermediate files under output_dir/{LEGACY_NAME}/, "
         "so the first run after switching rebuilds them.",
+        "Switch before your first run with this nanoPLM version: the old layout reruns "
+        "from the download step.",
     ]
     compressed = dirs.get("compressed_fasta")
     old = [dirs[k] for k in _OLD_INTERMEDIATES if dirs.get(k)]
-    if dirs.get("url") and compressed:
+    if dirs.get("url") and compressed and (Path(base_dir or ".") / compressed).is_file():
         lines.append(f'To skip the download, set fasta: "{compressed}" (the file already '
                      "downloaded; it is read where it is, so keep it).")
     elif compressed and dirs.get("local_fasta") and is_compressed(dirs["local_fasta"]):
@@ -699,7 +702,7 @@ def parse_data_config(config: dict, base_dir=None, name_of: str = "data.yaml") -
             raise DataConfigError(f"{name_of}: data_params.val_size needs the sources layout; "
                                   "use val_ratio with data_dirs")
         src = legacy_source(config)
-        warnings = [migration_hint(config)]
+        warnings = [migration_hint(config, base_dir)]
         warnings += [f"data_params.{k} is no longer used and is ignored; remove it"
                      for k in LEGACY_IGNORED if k in params]
         return DataConfig(output_dir=src.output_dir, sources={src.name: src}, legacy=True,
