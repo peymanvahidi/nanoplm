@@ -48,7 +48,6 @@ def test_from_yaml_injects_register_tokens_from_manifest(tmp_path):
     _write_manifest_with_register_tokens(dataset_dir, n=2)
 
     yaml_cfg = {
-        "pure_torch": True,
         "model": {
             "hidden_size": 64,
             "intermediate_size": 128,

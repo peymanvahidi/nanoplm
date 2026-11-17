@@ -323,6 +323,9 @@ def _resolve_config_from_manifest(distill_config: DistillationConfig) -> Distill
     dataset_dir = Path(distill_config.dataset_dir)
     manifest = read_manifest(dataset_dir)
 
+    if getattr(manifest, "is_mixture", False):
+        raise ValueError(f"{dataset_dir} is a pretraining mixture; distillation reads one "
+                         "dataset. Point dataset_dir at one of its sources.")
     if isinstance(manifest, PretrainManifest):
         return _resolve_from_pretrain_manifest(distill_config, manifest, dataset_dir)
 

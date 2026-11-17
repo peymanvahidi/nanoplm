@@ -29,6 +29,57 @@ class BatchSetup:
     achieved_global_batch_tokens: int
 
 
+def batch_rounding_warning(
+    target_tokens: int,
+    achieved_tokens: int,
+    world_size: int,
+    micro_batch_seqs: int,
+    max_seq_len: int,
+) -> Optional[str]:
+    """Return a warning when grad_accum rounding moves the global batch off target.
+
+    grad_accum is ceil(target / (micro_batch_seqs * max_seq_len * world_size)),
+    so a rank count that does not divide the target overshoots it. Returns
+    None when the target is met exactly.
+    """
+    if int(achieved_tokens) == int(target_tokens):
+        return None
+    per_rank_seqs = int(target_tokens) // max(1, int(max_seq_len))
+    return (
+        f"Global batch is {achieved_tokens:,} tokens, not the target "
+        f"global_batch_tokens={target_tokens:,} ({achieved_tokens / target_tokens:.2f}x), "
+        f"because grad_accum rounds up at world_size={world_size} with "
+        f"micro_batch_seqs={micro_batch_seqs} x max_seq_len={max_seq_len}. "
+        f"To hit the target, use a GPU count that divides "
+        f"{per_rank_seqs // max(1, int(micro_batch_seqs)):,} "
+        f"(target sequences / micro_batch_seqs), or set micro_batch_seqs so that "
+        f"micro_batch_seqs x world_size divides {per_rank_seqs:,}."
+    )
+
+
+def check_num_workers_agree(per_rank: list[int]) -> None:
+    """Raise when DataLoader num_workers differs between ranks.
+
+    The per-worker samplers split each rank's share by worker count, and the
+    data position saved at a checkpoint assumes the same count on every rank.
+    ``num_workers: auto`` is resolved per rank from its CPU affinity, so an
+    uneven SLURM binding can give ranks different counts.
+    """
+    values = sorted({int(v) for v in per_rank})
+    if len(values) > 1:
+        by_count = {v: [r for r, x in enumerate(per_rank) if int(x) == v] for v in values}
+        detail = "; ".join(
+            f"{v} on rank(s) {', '.join(map(str, rs[:8]))}{', ...' if len(rs) > 8 else ''}"
+            for v, rs in by_count.items()
+        )
+        raise RuntimeError(
+            f"num_workers differs between ranks ({detail}). Every rank must use the "
+            f"same DataLoader worker count. Set num_workers to a fixed integer in "
+            f"pretrain.yaml, or give every task the same number of CPUs "
+            f"(num_workers: auto uses min(4, task CPUs - 1))."
+        )
+
+
 def compute_batch_setup(
     cfg: PretrainingConfig,
     max_seq_len: int,
@@ -58,6 +109,12 @@ def compute_batch_setup(
         f"grad_accum={grad_accum}, "
         f"achieved={achieved_tokens:,} tok"
     )
+    msg = batch_rounding_warning(
+        cfg.global_batch_tokens, achieved_tokens, effective_world_size,
+        cfg.micro_batch_seqs, max_seq_len,
+    )
+    if msg and is_global_main():
+        logger.warning(msg)
 
     return BatchSetup(
         grad_accum_steps=grad_accum,

@@ -8,7 +8,9 @@ def test_fix_flag_flips_drop_invalid_in_config(tmp_path, monkeypatch):
     """from-yaml --fix should set drop_invalid_sequences=true in data.yaml."""
     from nanoplm.cli.templates import load_template
     cfg = tmp_path / "data.yaml"
-    cfg.write_text(load_template("data_pretrain"))
+    cfg.write_text(load_template("data_pretrain").replace(
+        "drop_invalid_sequences: true", "drop_invalid_sequences: false"))
+    assert "drop_invalid_sequences: true" not in cfg.read_text()
     # Stub dvc — return object must expose .returncode AND .stdout (used by is_git_subdir)
     monkeypatch.setattr("subprocess.run",
                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())

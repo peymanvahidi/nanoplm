@@ -14,7 +14,7 @@ This page exists so that a reader who runs `nanoplm --help`, sees a `distill` gr
 Two concrete symptoms, not hypotheticals:
 
 - **Its templates still reference `pipeline_mode`.** That key was removed from the data pipeline and is now *rejected* on load. The distillation templates never got the memo.
-- **`nanoplm eval` cannot read a distillation checkpoint.** Evaluation loads pure-torch pretrained models only. So even a distillation run that completes leaves you with a checkpoint the rest of the tool cannot score.
+- **`nanoplm eval` cannot read a distillation checkpoint.** Evaluation loads nanoPLM pretrained models only. So even a distillation run that completes leaves you with a checkpoint the rest of the tool cannot score.
 
 The pretraining path, by contrast, is what the project is for and what everything else is built around.
 

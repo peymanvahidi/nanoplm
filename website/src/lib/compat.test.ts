@@ -15,10 +15,8 @@ describe('loadCompat', () => {
     expect(lam.reason).toBeTruthy();
   });
 
-  it('keeps the inverted-polarity condition on pure_torch', () => {
-    const pt = loadCompat().pipeline.find((f) => f.flag === 'pure_torch')!;
-    expect(pt.status).toBe('reject');
-    expect(pt.condition).toBe('pure_torch is False');
+  it('has no pure_torch pipeline entry any more', () => {
+    expect(loadCompat().pipeline.some((f) => f.flag === 'pure_torch')).toBe(false);
   });
 
   it('lists explicitly-allowed flags and the trigger', () => {

@@ -78,18 +78,12 @@
         "use_canon_layers": {
           "type": "boolean",
           "default": false,
-          "description": "Advanced architecture features (pure-torch Triton-fused kernels) Canon depthwise-conv token-mixing layers",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
+          "description": "Advanced architecture features (Triton-fused kernels) Canon depthwise-conv token-mixing layers",
           "x-nanoplm-advanced": true
         },
         "canon_layers_mode": {
           "type": "string",
           "default": "abcd",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_canon_layers",
@@ -101,9 +95,6 @@
           "type": "boolean",
           "default": false,
           "description": "mHC-lite multi-stream residual mixing",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "mhc_n_streams": {
@@ -131,9 +122,6 @@
             "layer",
             "sublayers"
           ],
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true,
           "x-nanoplm-visible-when": {
             "field": "use_mhc_lite",
@@ -145,18 +133,12 @@
           "type": "boolean",
           "default": false,
           "description": "Differential Attention V2",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "use_repo": {
           "type": "boolean",
           "default": false,
           "description": "Residual Proportional Output",
-          "x-nanoplm-backend": [
-            "pure_torch"
-          ],
           "x-nanoplm-advanced": true
         },
         "use_resid_lambdas": {
@@ -474,13 +456,7 @@
       "activation_checkpointing",
       "attn_layer_pattern"
     ],
-    "pipeline_reject": [
-      {
-        "flag": "pure_torch",
-        "reason": "Recycling lands only in pure_pipeline.py for v1; the HF path is out of scope.",
-        "condition": "pure_torch is False"
-      }
-    ],
+    "pipeline_reject": [],
     "pipeline_caveat": [
       {
         "flag": "fp8",

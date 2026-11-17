@@ -4,6 +4,7 @@ import {
   toRows,
   toGroups,
   groupSlug,
+  sectionPrefix,
   stripEnumRestatement,
   type FieldSchema,
   type Surface,
@@ -31,13 +32,10 @@ describe('toRows', () => {
     expect(rows.find((r) => r.key === 'run_name')?.description).toBeTruthy();
   });
 
-  it('surfaces enum and backend tags', () => {
+  it('surfaces enum values', () => {
     const rows = toRows(pretrain as Surface, 'pretraining');
     const opt = rows.find((r) => r.key === 'optimizer')!;
     expect(opt.enum).toContain('normuon');
-    const model = toRows(pretrain as Surface, 'model');
-    const canon = model.find((r) => r.key === 'use_canon_layers')!;
-    expect(canon.backend).toContain('pure_torch');
   });
 
   it('includes the commented-out duration budgets, marked advanced', () => {
@@ -84,7 +82,9 @@ describe('toRows', () => {
     // reference showed as `null · default null`: no hint of what the field takes.
     const pre = pretrain as Surface;
     const rows = [
-      ...toRows(data as Surface, 'data_dirs'),
+      ...toRows(data as Surface),
+      ...toRows(data as Surface, 'sources'),
+      ...toRows(data as Surface, 'sources.cluster_subsampling'),
       ...toRows(data as Surface, 'data_params'),
       ...toRows(pre, 'model'),
       ...toRows(pre, 'pretraining'),
@@ -206,10 +206,10 @@ describe('toRows', () => {
   });
 
   describe('groupSlug', () => {
-    it('keeps underscores so a backend name survives', () => {
+    it('keeps underscores in the slug', () => {
       expect(
-        groupSlug('pretrain-model', 'Recycling / Huginn architecture (pure_torch only)'),
-      ).toBe('pretrain-model-group-recycling-huginn-architecture-pure_torch-only');
+        groupSlug('pretrain-model', 'torch_compile knobs (inductor)'),
+      ).toBe('pretrain-model-group-torch_compile-knobs-inductor');
       expect(groupSlug('pretrain-model', 'Norms & MLP')).toBe('pretrain-model-group-norms-mlp');
     });
   });
@@ -239,6 +239,26 @@ describe('toRows', () => {
       withFieldGroups(input, 'reference/pretrain');
       expect(input[0].children[0].children).toEqual([]);
     });
+  });
+
+  it('reads the data surface\'s top-level field, source spec and nested block', () => {
+    const d = data as Surface;
+    // No section: only the top-level scalar, not the sections beside it.
+    expect(toRows(d).map((r) => r.key)).toEqual(['output_dir']);
+    // `sources` is a name -> spec map; its rows are the spec's fields.
+    const spec = toRows(d, 'sources').map((r) => r.key);
+    expect(spec).toEqual(expect.arrayContaining(['fasta', 'weight', 'cluster_subsampling']));
+    expect(spec).not.toContain('prepared');
+    const cluster = toRows(d, 'sources.cluster_subsampling');
+    // clusters is required: no default, and no enum since it also takes a .tsv path
+    const clusters = cluster.find((r) => r.key === 'clusters');
+    expect(clusters?.required).toBe(true);
+    expect(clusters && 'default' in clusters).toBe(false);
+    expect(clusters?.enum).toBeUndefined();
+    expect(cluster.find((r) => r.key === 'members')?.required).toBeUndefined();
+    // Nested blocks are named by their last segment, so guide links keep resolving.
+    expect(sectionPrefix(d, 'sources.cluster_subsampling')).toBe('data-cluster_subsampling');
+    expect(toRows(d, 'no.such.block')).toEqual([]);
   });
 
   it('reads a flat (sectionless) eval surface and marks required fields', () => {

@@ -3,96 +3,139 @@
   "x-nanoplm-surface": "data",
   "type": "object",
   "properties": {
-    "data_dirs": {
+    "output_dir": {
+      "type": "string",
+      "default": "output/data/pretrain_data",
+      "description": "every file goes here; pretrain.yaml's dataset_dir points here"
+    },
+    "sources": {
       "type": "object",
-      "properties": {
-        "url": {
-          "type": "string",
-          "default": "https://ftp.uniprot.org/pub/databases/uniprot/knowledgebase/complete/uniprot_sprot.fasta.gz"
-        },
-        "local_fasta": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null,
-          "description": "optional local .fasta or .fasta.gz file (skips network download)"
-        },
-        "compressed_fasta": {
-          "type": "string",
-          "default": "output/data/raw/sequences.fasta.gz",
-          "description": "unused if source is a plain .fasta (URL or local_fasta)"
-        },
-        "extracted_fasta": {
-          "type": "string",
-          "default": "output/data/raw/sequences.fasta"
-        },
-        "validation_dir": {
-          "type": "string",
-          "default": "output/data/validation"
-        },
-        "shuffled_fasta": {
-          "type": "string",
-          "default": "output/data/raw/sequences_shuffled.fasta"
-        },
-        "filtered_fasta": {
-          "type": "string",
-          "default": "output/data/filter/sequences_filtered.fasta"
-        },
-        "splitted_fasta_dir": {
-          "type": "string",
-          "default": "output/data/split"
-        },
-        "output_dir": {
-          "type": "string",
-          "default": "output/data/pretrain_data"
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "fasta": {
+            "type": [
+              "string",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa (.gz/.zst); or a list of URLs and local files, merged in list order",
+            "examples": [
+              "swissprot"
+            ]
+          },
+          "weight": {
+            "type": "number",
+            "default": 1.0,
+            "description": "Share of training sequences (not tokens) drawn from this source. Weights must sum to 1 (within 1e-6); with one source it is 1 or left out. The weights also share out the validation split, so changing them redraws it: every plain source splits and tokenizes again, a cluster source rebuilds only its index. A cluster source counts one sample per cluster visit."
+          },
+          "cluster_subsampling": {
+            "type": [
+              "boolean",
+              "object"
+            ],
+            "default": false,
+            "properties": {
+              "members": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "default": null,
+                "description": "The sequences training draws from: uniref90, uniref100, or a UniRef90/100 FASTA URL/path. Leave it out to use this source's fasta."
+              },
+              "clusters": {
+                "type": "string",
+                "description": "Where the clusters come from: uniprot (UniProt's UniRef50 clusters, for UniRef90/100 members), headers (CL:<representative> tags in the FASTA headers), mmseqs2 (clusters the sequences; hours on large data), or a .tsv / .tsv.gz / .tsv.zst file of representative<TAB>member lines (a path or a URL). Called clustering before."
+              },
+              "identity": {
+                "type": "number",
+                "default": 0.5,
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "description": "mmseqs2 only: min sequence identity within a cluster"
+              },
+              "coverage": {
+                "type": "number",
+                "default": 0.8,
+                "exclusiveMinimum": 0,
+                "maximum": 1,
+                "description": "mmseqs2 only: min alignment coverage"
+              }
+            },
+            "required": [
+              "clusters"
+            ],
+            "description": "Turns on cluster subsampling for this source: each epoch trains on one random member of every cluster. A mapping with clusters turns it on; false, or no key, turns it off. max_seqs and val_ratio then count clusters, not sequences."
+          }
         }
-      }
+      },
+      "description": "One entry per source, keyed by a name you pick (letters, digits and _). Each names a fasta to build from. Any data_params field but val_ratio, val_size, shuffle and shuffle_seed set on a source overrides the default for that source. Several sources make a mix: each is built on its own and training draws from them by weight."
     },
     "data_params": {
       "type": "object",
       "properties": {
-        "seqs_num": {
+        "max_seqs": {
           "type": "integer",
           "default": 20000,
-          "description": "FASTA pipeline"
+          "description": "-1 = all"
         },
         "min_seq_len": {
           "type": "integer",
-          "default": 20
+          "default": 20,
+          "description": "shorter sequences are dropped"
         },
         "max_seq_len": {
           "type": "integer",
-          "default": 512
+          "default": 512,
+          "description": "longer sequences are dropped"
         },
         "val_ratio": {
           "type": "number",
-          "default": 0.1
-        },
-        "shuffle": {
-          "type": "boolean",
-          "default": true
-        },
-        "shuffle_seed": {
-          "type": "integer",
-          "default": 24
+          "default": 0.1,
+          "description": "share held out for validation"
         },
         "drop_invalid_sequences": {
           "type": "boolean",
-          "default": false
+          "default": true,
+          "description": "false: stop on records with unknown characters instead of dropping them"
+        },
+        "val_size": {
+          "type": "integer",
+          "default": null,
+          "minimum": 1,
+          "description": "A fixed number of validation sequences (clusters, for a cluster source) for the whole mix, instead of val_ratio. Set only one of the two. In a mix it is shared out by the source weights."
+        },
+        "shuffle": {
+          "type": "boolean",
+          "default": true,
+          "description": "shuffle before the train / val split; false also trains in file order",
+          "x-nanoplm-group": "Rarely changed"
+        },
+        "shuffle_seed": {
+          "type": "integer",
+          "default": 24,
+          "x-nanoplm-group": "Rarely changed"
         },
         "samples_per_shard": {
           "type": "integer",
           "default": 2000,
-          "description": "Shard generation"
+          "description": "sequences per shard file",
+          "x-nanoplm-group": "Rarely changed"
         },
         "max_workers": {
           "type": "integer",
-          "default": 2
+          "default": 2,
+          "description": "tokenizer processes; -1 = all cores",
+          "x-nanoplm-group": "Rarely changed"
         },
         "register_tokens": {
           "type": "integer",
-          "default": 0
+          "default": 0,
+          "description": "0, 1 or 2 scratch tokens after EOS",
+          "x-nanoplm-group": "Rarely changed"
         }
       }
     }

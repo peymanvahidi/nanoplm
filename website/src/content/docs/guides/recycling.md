@@ -22,14 +22,13 @@ model:
                                      # recurrent block = L - P - C = 8 weight-tied layers
 ```
 
-It is **pure-torch only** (the stock template already selects pure-torch):
+Launch it from the stock template:
 
 ```bash
 nanoplm pretrain from-yaml
 ```
 
 ```
-Using pure-torch model and training loop
 Total Trainable Parameters: 62893760
 Flash attention available: True
 # ...
@@ -129,8 +128,6 @@ pretraining:
   recycling_loop_count_curriculum: "1_sqrt"           # start shallow, deepen over the first 25%
   recycling_pretraining_eval_loop_counts: [1, 4]      # is depth 4 actually beating depth 1?
 # ...
-
-pure_torch: true
 ```
 
 ```bash

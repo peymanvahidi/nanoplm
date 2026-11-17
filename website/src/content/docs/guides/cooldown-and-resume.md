@@ -74,7 +74,7 @@ Resume schedule built [continue]: start_step=15000, total_steps=39000, schedule=
 # ...
 ```
 
-Continue reads the *original* schedule back out of the checkpoint's `training_state.json` (the schedule name, warmup length, total steps, stable and decay boundaries, shape, and floor) and fast-forwards two things: the LR curve, so step 15,001 gets exactly the LR it would have had, and the dataloader, so you resume at the sequence you were on rather than replaying data you have already seen. (If the dataset fingerprint changed, it says so and restarts the pass from the beginning instead of pretending.)
+Continue reads the *original* schedule back out of the checkpoint's `training_state.json` (the schedule name, warmup length, total steps, stable and decay boundaries, shape, and floor) and fast-forwards two things: the LR curve, so step 15,001 gets exactly the LR it would have had, and the dataloader, so you resume at the sequence you were on rather than replaying data you have already seen. (If the dataset fingerprint changed, it says so and restarts the pass from the beginning instead of pretending.) On a different number of GPUs, the saved position is rescaled to the new count and a warning says it is an estimate: a little data may repeat or be skipped.
 
 Nothing in `pretraining:` needs to change. Continue does not take a new budget, a new peak LR, or a new schedule.
 

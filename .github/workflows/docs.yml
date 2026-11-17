@@ -13,8 +13,7 @@
 # mirror of the generator's input set is a liability rather than a saving: add an
 # input to the generator, forget to add it here, and the drift gate below quietly
 # stops running for that file. The schema job is stdlib + PyYAML and takes
-# seconds, and it is the only place in CI that runs pytest at all, so it runs on
-# everything.
+# seconds, so it runs on everything. The CPU test suite is in tests.yml.
 name: docs
 
 on:

@@ -52,11 +52,7 @@ The pretraining stage reads the shards and `.data_manifest` the [data stage](/na
 
 Read those startup lines. They are the config after nanoPLM has resolved it: the sequence length came from the manifest, the gradient accumulation was inferred, and your token budget became 504 optimizer steps. If any of those numbers surprise you, stop the run now rather than in six hours.
 
-## The pure-torch backend
-
-The stock template ships `pure_torch: true` at the bottom of `pretrain.yaml`, so `nanoplm pretrain from-yaml` already runs the pure-torch backend. You do **not** need `--pure-torch` for a normal YAML run.
-
-Pure-torch is nanoPLM's hand-written model and training loop, and the only pretraining backend. Leave the key set: a config without it stops with `Pretraining requires pure_torch: true.`
+If `dataset_dir` is a [mix of several sources](/nanoplm/guides/mixing/), a table with one row per source replaces the three `Budget` lines. It shows how many times training reads each source.
 
 ## A config that really runs
 
@@ -83,8 +79,6 @@ pretraining:
   warmup_steps: 100
   stable_tokens: 60000000       # tokens up to the decay boundary: warmup is INSIDE this
   decay_tokens: 6000000         # extra tokens spent annealing the LR down
-
-pure_torch: true                # template default; the run stops without it
 ```
 
 Those four `model:` keys are the only ones you must supply; the rest of the block is optional. The [reference](/nanoplm/reference/pretrain/) lists a value for them, but that is the number the template pre-fills, not a fallback: leave them out of a hand-written config and the run stops. In `pretraining:`, only `dataset_dir` is strictly required: but a `wsd` schedule needs a budget, so `stable_tokens` and `decay_tokens` come with it.
@@ -183,6 +177,17 @@ Four keys decide the size of your model, and they are the four you must always s
 The rest of the block is a long tail of `use_*` flags: alternative attention schemes, mixture-of-experts, low-rank branches, weight-tied recurrence. **They all default to off**, and none of them is needed for a good model. Each is documented in the [pretrain.yaml reference](/nanoplm/reference/pretrain/), and which ones can be combined is in the [compatibility matrix](/nanoplm/reference/compatibility/). Get a baseline trained first; then turn one on and measure.
 
 Two keys are conspicuously absent from `model:`, and now you know why: `max_seq_len` and `num_register_tokens` come from `.data_manifest`. The data stage decided them; the model inherits them.
+
+## Seeds
+
+Two seeds take part in a run, one per config file:
+
+| Seed | Sets |
+| --- | --- |
+| `pretrain.yaml`'s `seed` | The order training reads the train set in, the draw between sources in a [mix](/nanoplm/guides/mixing/), which member each cluster gives in [cluster subsampling](/nanoplm/guides/cluster-subsampling/#seeds-and-shuffle), the masking, and the model init. Changing it needs no data rebuild. |
+| `data.yaml`'s `shuffle_seed` | The shuffle before the train / val split, so which sequences are held out for validation. With cluster subsampling, which clusters are held out. Changing it rebuilds part of the data. |
+
+`data.yaml`'s `shuffle: false` turns off the shuffle before the split and makes training read the train set in file order. With cluster subsampling the validation clusters are still a random draw with `shuffle_seed`, and the member draw stays random. The data stage writes it into `.data_manifest`, so `pretrain.yaml` has no key for it. See [the data config](/nanoplm/pipeline/data/#the-whole-config).
 
 ## Resuming
 

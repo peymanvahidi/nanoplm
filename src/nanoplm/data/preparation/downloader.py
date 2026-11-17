@@ -1,6 +1,7 @@
 import os
 import ssl
 import certifi
+import urllib.error
 import urllib.request
 from pathlib import Path
 from tqdm import tqdm
@@ -59,12 +60,18 @@ class Downloader:
         )
         request = urllib.request.Request(self.url)
 
-        with opener.open(request) as response:
+        try:
+            response_cm = opener.open(request)
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            raise DownloadError(f"{self.url}: {e}") from e
+
+        with response_cm as response:
             total_size_header = response.headers.get("Content-Length")
             total_size = int(total_size_header) if total_size_header else 0
 
             try:
                 with atomic_write_path(self.output_path) as tmp:
+                    written = 0
                     with tqdm(
                         total=total_size if total_size > 0 else None,
                         unit="B",
@@ -78,9 +85,18 @@ class Downloader:
                                 if not chunk:
                                     break
                                 out_file.write(chunk)
+                                written += len(chunk)
                                 pbar.update(len(chunk))
+                    # Raised inside atomic_write_path so the temp file is removed.
+                    if total_size_header and written != total_size:
+                        raise DownloadError(
+                            f"{self.url}: got {written} of {total_size} bytes; "
+                            "the download stopped early, run again"
+                        )
+            except DownloadError:
+                raise
             except Exception as e:
-                raise DownloadError(f"Error downloading dataset: {e}")
+                raise DownloadError(f"{self.url}: error downloading: {e}") from e
 
     def _build_ssl_context(self) -> ssl.SSLContext:
         """Create a secure SSL context, preferring the certifi CA bundle when available."""

@@ -337,6 +337,18 @@ def validate_pretrain_dataset(
         manifest = read_manifest(dataset_dir)
     validate_manifest_for_pipeline(manifest, expected_mode="pretrain")
 
+    if manifest.is_mixture:
+        # every source's shards, each source checked against the hash the mix recorded
+        from nanoplm.data.infra.mixture import load_sources
+        train_shards, val_shards = [], []
+        for s in load_sources(dataset_dir, manifest):
+            logger.info(f"Validating mixture source {s.name} ({s.dir})...")
+            train_shards += validate_pretrain_shards(s.dir / s.manifest.train_dir,
+                                                     check_contents=True)
+            val_shards += validate_pretrain_shards(s.dir / s.manifest.val_dir,
+                                                   check_contents=True)
+        return {'manifest': manifest, 'train_shards': train_shards, 'val_shards': val_shards}
+
     # Get shard directories from typed manifest
     train_dir = dataset_dir / manifest.train_dir
     val_dir = dataset_dir / manifest.val_dir

@@ -16,8 +16,7 @@ def compat_rules() -> dict:
         "trigger": matrix["trigger"],
         "feature": matrix.get("feature", ""),
         # `condition` is retained on every list because, per recycling_compatibility.py,
-        # it is human-readable doc text that disambiguates inverted-polarity flags
-        # (e.g. pure_torch is rejected only "pure_torch is False" — it is REQUIRED).
+        # it is human-readable doc text that disambiguates inverted-polarity flags.
         "model_reject": [{"flag": e["flag"], "reason": e["reason"], "condition": e.get("condition", "")}
                          for e in mf.get("reject", [])],
         "model_warn": [{"flag": e["flag"], "message": e.get("message", ""),

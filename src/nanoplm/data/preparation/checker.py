@@ -13,6 +13,7 @@ class CheckResult:
     total_sequences: int
     invalid_count: int
     empty_count: int
+    trailing_stop_count: int = 0
 
 
 class Checker:
@@ -53,6 +54,7 @@ class Checker:
             report_json_path=report_json,
         )
 
+        first_ids = _first_ids(invalid_ids) if native_result.invalid_count > 0 else []
         # If drop_invalid is False, blank out invalid_ids.txt so the filter
         # stage never excludes anything. The invalid.fasta sidecar still
         # contains the problem records for human inspection.
@@ -63,9 +65,25 @@ class Checker:
             total_sequences=native_result.total_sequences,
             invalid_count=native_result.invalid_count,
             empty_count=native_result.empty_count,
+            trailing_stop_count=native_result.trailing_stop_count,
         )
 
-        if result.invalid_count > 0:
+        n_stop = result.trailing_stop_count
+        if n_stop > 0:
+            logger.warning(
+                f"check: removing the trailing '*' (stop codon) from {n_stop:,} "
+                f"record{'s' if n_stop != 1 else ''} "
+                f"(first: {', '.join(native_result.first_trailing_stop_ids)})"
+            )
+
+        if result.invalid_count > 0 and self.drop_invalid:
+            logger.warning(
+                f"check: dropping {result.invalid_count:,} "
+                f"record{'s' if result.invalid_count != 1 else ''} with characters outside "
+                f"the amino-acid alphabet or empty (first: {', '.join(first_ids)}); "
+                f"see {invalid_fasta}"
+            )
+        elif result.invalid_count > 0:
             logger.warning(
                 f"check: found {result.invalid_count} invalid sequence(s); "
                 f"see {invalid_fasta}"
@@ -75,3 +93,15 @@ class Checker:
                 f"check: validated {result.total_sequences} sequences; no problems found"
             )
         return result
+
+
+def _first_ids(ids_path: Path, n: int = 3) -> list:
+    """The first n ids in invalid_ids.txt (one per line)."""
+    out = []
+    with open(ids_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.strip():
+                out.append(line.strip())
+                if len(out) == n:
+                    break
+    return out

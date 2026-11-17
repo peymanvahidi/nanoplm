@@ -392,6 +392,17 @@ def _fake_cublas_header(root, version="13.6.0.2", subdir="include"):
     return inc
 
 
+def _fake_cublas_wheel(root, version="13.1.1.3"):
+    """A fake nvidia-cublas dist-info on PYTHONPATH, so step_cublas sees a wheel
+    to align even in a venv without one (the CPU torch wheel in CI)."""
+    site = root / "fake_site"
+    info = site / f"nvidia_cublas-{version}.dist-info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: nvidia-cublas\nVersion: {version}\n")
+    return {"PYTHONPATH": str(site)}
+
+
 def _source(snippet, extra_env=None):
     env = {**os.environ, "VIRTUAL_ENV": sys.prefix}
     env.update(extra_env or {})
@@ -437,7 +448,7 @@ def test_cublas_wheel_is_aligned_with_the_build_toolkit(tmp_path):
     bindir = _fake_bin(tmp_path)
     _fake_cublas_header(tmp_path, "13.6.0.2")
     r = _run(["--force"], path=f"{bindir}:{SYS_PATH}",
-             extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1", **_fake_cublas_wheel(tmp_path)})
     assert r.returncode == 0, r.stderr
     assert "pip install --no-deps nvidia-cublas==13.6.0.2" in r.stdout
     # Must run LAST: every step that installs a torch-dependent dist re-resolves
@@ -571,7 +582,7 @@ def test_cublas_alignment_is_the_last_install_step(tmp_path):
     bindir = _fake_bin(tmp_path)
     _fake_cublas_header(tmp_path, "13.6.0.2")
     r = _run(["--force"], path=f"{bindir}:{SYS_PATH}",
-             extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1", **_fake_cublas_wheel(tmp_path)})
     assert r.returncode == 0, r.stderr
     cublas_at = r.stdout.index("nvidia-cublas==13.6.0.2")
     for later in ("dion.git", "--branch v2.16", "flash-attention3-wheels",
@@ -699,3 +710,75 @@ def test_step_te_resolves_headers_before_building(tmp_path):
     for header in ("nccl.h", "cudnn.h"):
         assert f"{header} is not on the toolkit's include path -- added" in r.stdout
     assert r.stdout.index("to CPATH") < r.stdout.index("--branch v2.16")
+
+
+def test_mmseqs_is_opt_in_and_pinned(tmp_path):
+    bindir = _fake_bin(tmp_path)
+    env = {"NANOPLM_DEPS_DRY_RUN": "1"}
+    plain = _run(["--force"], path=f"{bindir}:{SYS_PATH}", extra_env=env)
+    assert plain.returncode == 0, plain.stderr
+    assert "soedinglab/MMseqs2" not in plain.stdout
+    withm = _run(["--force", "--with-mmseqs"], path=f"{bindir}:{SYS_PATH}", extra_env=env)
+    assert withm.returncode == 0, withm.stderr
+    assert "soedinglab/MMseqs2/releases/download/18-8cc5c/mmseqs-linux-" in withm.stdout
+    assert f"-> {sys.prefix}/bin/mmseqs" in withm.stdout
+    # after every GPU-stack step
+    assert withm.stdout.index("soedinglab/MMseqs2") > withm.stdout.index("quack-kernels")
+
+
+def test_mmseqs_only_skips_the_gpu_preflight(tmp_path):
+    # no nvcc on PATH: a full install would fail preflight, --mmseqs-only must not care
+    bindir = _fake_bin(tmp_path, with_nvcc=False)
+    r = _run(["--mmseqs-only", "--force"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"NANOPLM_DEPS_DRY_RUN": "1"})
+    assert r.returncode == 0, r.stderr
+    assert "DRY> download https://github.com/soedinglab/MMseqs2" in r.stdout
+    assert "torch" not in r.stdout
+
+
+def test_mmseqs_pins_are_sha256_gated():
+    text = SCRIPT.read_text()
+    assert 'MMSEQS_SHA256="bd9b0234da5949ad528d5b5f9ea4cda9c1e23dce14b46c0791d4d919a76e61ce"' in text
+    assert 'MMSEQS_SHA256="06c9a031331562e37eed3da79ef859d30a1a3ac5c5e334411dfaee5da5e9c0d0"' in text
+    assert "sha256sum -c" in text.split("step_mmseqs()")[1].split("main()")[0]
+
+
+def _mmseqs_venv(tmp_path, version):
+    """A throwaway venv: bin/python plus a fake mmseqs that prints `version`."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(sys.executable)
+    mm = venv / "bin" / "mmseqs"
+    mm.write_text(f'#!/bin/bash\n[ "$1" = version ] && echo {version}\n')
+    mm.chmod(0o755)
+    return venv
+
+
+def _marking_curl(tmp_path):
+    """A curl that leaves a marker and fails, so no test reaches the network."""
+    bindir = tmp_path / "curlbin"
+    bindir.mkdir()
+    marker = tmp_path / "curl-called"
+    (bindir / "curl").write_text(f'#!/bin/bash\ntouch "{marker}"\nexit 1\n')
+    (bindir / "curl").chmod(0o755)
+    return bindir, marker
+
+
+def test_mmseqs_rerun_skips_the_pinned_binary(tmp_path):
+    # `mmseqs version` prints the commit (8cc5ce36...), not the release number 18
+    venv = _mmseqs_venv(tmp_path, "8cc5ce367b5638c4306c2d7cfc652dd099a4643f")
+    bindir, marker = _marking_curl(tmp_path)
+    r = _run(["--mmseqs-only"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"VIRTUAL_ENV": str(venv)})
+    assert r.returncode == 0, r.stderr
+    assert "mmseqs 18-8cc5c present; skipping." in r.stdout
+    assert not marker.exists()
+
+
+def test_mmseqs_other_version_is_replaced(tmp_path):
+    venv = _mmseqs_venv(tmp_path, "45111b641859ed0ddd875b94d6fd1aef1a675b7e")
+    bindir, marker = _marking_curl(tmp_path)
+    r = _run(["--mmseqs-only"], path=f"{bindir}:{SYS_PATH}",
+             extra_env={"VIRTUAL_ENV": str(venv)})
+    assert r.returncode != 0 and "MMseqs2 download failed" in r.stdout + r.stderr
+    assert marker.exists()

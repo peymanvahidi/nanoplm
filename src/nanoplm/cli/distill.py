@@ -688,7 +688,7 @@ def get_yaml(output: Optional[str], force: bool):
         "  classifier_activation: \"gelu\"\n"
         "  projection_layer: true  # Set to false if student hidden_size matches teacher (1024)\n"
         "\n"
-        "  # Advanced architecture features (pure-torch Triton-fused kernels)\n"
+        "  # Advanced architecture features (Triton-fused kernels)\n"
         "  use_canon_layers: false       # Canon depthwise-conv token-mixing layers\n"
         "  canon_layers_mode: \"abcd\"\n"
         "  use_mhc_lite: false           # mHC-lite multi-stream residual mixing\n"

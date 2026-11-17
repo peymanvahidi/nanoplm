@@ -73,7 +73,6 @@ class _FakeModel:
 def _base_args(dataset_dir, tmp_path):
     return [
         "run",
-        "--pure-torch",
         "--world-size",
         "1",
         "--dataset-dir",

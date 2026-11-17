@@ -22,7 +22,7 @@ data_params:
   val_ratio: 0.1
   shuffle: true
   shuffle_seed: 24
-  drop_invalid_sequences: false
+  drop_invalid_sequences: true
   device: "auto"
 
   teacher_model: "prott5"

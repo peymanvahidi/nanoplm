@@ -23,12 +23,8 @@ def test_visibility_gate_for_recycling_fields():
 def test_trigger_is_loop_count_gt_1():
     assert gates.compat_rules()["trigger"] == "recycling_loop_count > 1"
 
-def test_pipeline_reject_keeps_inverting_condition():
-    # The condition string disambiguates the inverted polarity for the compat
-    # matrix: pure_torch is rejected only when False (i.e. it is REQUIRED).
-    rules = gates.compat_rules()
-    pt = next(r for r in rules["pipeline_reject"] if r["flag"] == "pure_torch")
-    assert pt["condition"] == "pure_torch is False"
+def test_pipeline_reject_is_empty():
+    assert gates.compat_rules()["pipeline_reject"] == []
 
 def test_allow_lists_present_for_matrix():
     # The explicitly-compatible ("green") flags are first-class compat-matrix content.

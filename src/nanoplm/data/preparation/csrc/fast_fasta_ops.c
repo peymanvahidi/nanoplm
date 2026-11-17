@@ -372,9 +372,16 @@ static int process_filter_record(
         return 0;
     }
 
-    if ((long long)seq->len >= (long long)min_seq_len &&
-        (long long)seq->len <= (long long)max_seq_len) {
-        if (write_record(out, header, seq) != 0) {
+    /* A trailing '*' is a stop codon (e.g. Prodigal output): drop it before the
+     * length check. A '*' anywhere else is caught by validate_fasta_native. */
+    DynBuf trimmed = *seq;
+    if (trimmed.len > 0 && trimmed.data[trimmed.len - 1] == '*') {
+        trimmed.len--;
+    }
+
+    if ((long long)trimmed.len >= (long long)min_seq_len &&
+        (long long)trimmed.len <= (long long)max_seq_len) {
+        if (write_record(out, header, &trimmed) != 0) {
             set_error(error_msg, error_cap, "Failed writing filtered FASTA record: %s", strerror(errno));
             return -1;
         }
@@ -1094,7 +1101,11 @@ API_EXPORT int nanoplm_shuffle_fasta(
  *
  * Validation rules:
  *   - Allowed AA alphabet: ACDEFGHIKLMNPQRSTVWY (standard 20)
- *                          BJOUXZ (ambiguous) * (stop codon)
+ *                          BJOUXZ (ambiguous)
+ *   - One trailing '*' (stop codon) is allowed; the filter strips it. Valid
+ *     records that end in one are counted (trailing_stop_count, with the
+ *     first ids). A '*' anywhere else, including a second one at the end
+ *     ("**"), makes the sequence invalid.
  *   - A sequence is "empty"   if it has no AA characters.
  *   - A sequence is "invalid" if any AA character is outside the
  *     allowed alphabet, OR if the sequence is empty.
@@ -1108,6 +1119,8 @@ API_EXPORT int nanoplm_shuffle_fasta(
  *     (e.g. 'a' is treated the same as 'A').
  *   - Whitespace inside AA lines is silently stripped: a line
  *     containing "MA G V" is treated as "MAGV".
+ *   - Headers and sequence lines are read with the filter's helpers, so a
+ *     header like "> b" has the id "b" here and in the filter.
  *
  * Return codes:
  *   0              success
@@ -1115,8 +1128,9 @@ API_EXPORT int nanoplm_shuffle_fasta(
  *   other non-zero  error (err_buf populated)
  * ============================================================ */
 
-/* Allowed amino-acid alphabet (27 chars incl. stop codon). */
-static const char VALID_AA_CHARS[] = "ACDEFGHIKLMNPQRSTVWYBJOUXZacdefghiklmnpqrstvwybjouxz*";
+/* Allowed amino-acid alphabet (26 letters, either case). A trailing '*' is
+ * handled in PROCESS_RECORD. */
+static const char VALID_AA_CHARS[] = "ACDEFGHIKLMNPQRSTVWYBJOUXZacdefghiklmnpqrstvwybjouxz";
 
 static int is_valid_aa_char(unsigned char c) {
     /* Use a 256-entry lookup table built once. */
@@ -1143,12 +1157,17 @@ static uint64_t fnv1a(const char *s) {
 }
 
 /* Extract the sequence id from a header string (after '>').
- * id = bytes up to first whitespace or '\0'.
+ * id = the first whitespace-separated word, like Python's header.split()[0]
+ * in cluster_table / cluster_index. The validator and the filter both call it
+ * on a header stored by dynbuf_set_header_from_line, so an id written to
+ * invalid_ids.txt is the id the filter looks up.
  * Caller must free the returned string. Returns NULL on alloc failure. */
 static char *extract_seq_id(const char *header) {
+    while (*header && is_whitespace((unsigned char)*header)) {
+        header++;
+    }
     size_t n = 0;
-    while (header[n] && header[n] != ' ' && header[n] != '\t' &&
-           header[n] != '\r' && header[n] != '\n') {
+    while (header[n] && !is_whitespace((unsigned char)header[n])) {
         n++;
     }
     char *id = (char *)malloc(n + 1);
@@ -1240,6 +1259,8 @@ API_EXPORT int validate_fasta_native(
     long long empty_count    = 0;
     char first_invalid_id[201];
     first_invalid_id[0] = '\0';
+    long long trailing_stop_count = 0;
+    char first_stop_ids[3][201];
 
     char *linebuf = NULL;
     size_t linecap = 0;
@@ -1275,8 +1296,12 @@ API_EXPORT int validate_fasta_native(
     #define PROCESS_RECORD() do { \
         total_sequences++; \
         seq_checked++; \
+        /* one trailing '*' (stop codon) is not a residue */ \
+        size_t _n = cur_seq.len; \
+        if (_n > 0 && cur_seq.data[_n - 1] == '*') _n--; \
+        int _had_stop = (_n < cur_seq.len); \
         /* Check for empty sequence */ \
-        if (cur_seq.len == 0) { \
+        if (_n == 0) { \
             empty_count++; \
             invalid_count++; \
             char *_sid3 = extract_seq_id(cur_header.data ? cur_header.data : ""); \
@@ -1293,17 +1318,30 @@ API_EXPORT int validate_fasta_native(
             if (cur_header.data && cur_header.len > 0) \
                 fwrite(cur_header.data, 1, cur_header.len, finv_fa); \
             fputc('\n', finv_fa); \
+            if (cur_seq.len > 0) \
+                fwrite(cur_seq.data, 1, cur_seq.len, finv_fa); \
             fputc('\n', finv_fa); \
         } else { \
             /* Check for invalid AA chars */ \
             int _bad = 0; \
-            for (size_t _i = 0; _i < cur_seq.len; _i++) { \
+            for (size_t _i = 0; _i < _n; _i++) { \
                 if (!is_valid_aa_char((unsigned char)cur_seq.data[_i])) { \
                     _bad = 1; \
                     break; \
                 } \
             } \
-            if (_bad) EMIT_INVALID(); \
+            if (_bad) { \
+                EMIT_INVALID(); \
+            } else if (_had_stop) { \
+                if (trailing_stop_count < 3) { \
+                    char *_sid4 = extract_seq_id(cur_header.data ? cur_header.data : ""); \
+                    char *_dst = first_stop_ids[trailing_stop_count]; \
+                    strncpy(_dst, _sid4 ? _sid4 : "", 200); \
+                    _dst[200] = '\0'; \
+                    free(_sid4); \
+                } \
+                trailing_stop_count++; \
+            } \
         } \
     } while (0)
 
@@ -1321,37 +1359,23 @@ API_EXPORT int validate_fasta_native(
             if (have_record) {
                 PROCESS_RECORD();
             }
-            /* Store new header (strip '>' and trailing whitespace) */
-            const char *hstart = linebuf + 1;
-            ssize_t hlen = linelen - 1;
-            while (hlen > 0 && (linebuf[hlen] == '\n' || linebuf[hlen] == '\r' ||
-                                 linebuf[hlen] == ' '  || linebuf[hlen] == '\t')) {
-                hlen--;
-            }
-            if (dynbuf_reserve(&cur_header, (size_t)hlen + 1) != 0) {
+            /* Store the header and read the sequence the way the filter does
+             * (same helpers), so both see the same record and the same id. */
+            if (dynbuf_set_header_from_line(&cur_header, linebuf + 1,
+                                            (size_t)(linelen - 1)) != 0) {
                 set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
                 rc = 1;
                 goto cleanup;
             }
-            if (hlen > 0) memcpy(cur_header.data, hstart, (size_t)hlen);
-            cur_header.len = (size_t)hlen;
-            cur_header.data[cur_header.len] = '\0';
             /* Reset sequence buffer */
             cur_seq.len = 0;
             if (cur_seq.data) cur_seq.data[0] = '\0';
             have_record = 1;
         } else if (have_record) {
-            /* Sequence line — accumulate (skip whitespace) */
-            for (ssize_t _i = 0; _i < linelen; _i++) {
-                unsigned char _c = (unsigned char)linebuf[_i];
-                if (_c == '\n' || _c == '\r' || _c == ' ' || _c == '\t') continue;
-                if (dynbuf_reserve(&cur_seq, cur_seq.len + 2) != 0) {
-                    set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
-                    rc = 1;
-                    goto cleanup;
-                }
-                cur_seq.data[cur_seq.len++] = (char)_c;
-                cur_seq.data[cur_seq.len]   = '\0';
+            if (dynbuf_append_seq_line(&cur_seq, linebuf, (size_t)linelen) != 0) {
+                set_error(err_buf, err_buf_size, "validate_fasta_native: out of memory");
+                rc = 1;
+                goto cleanup;
             }
         }
     }
@@ -1384,7 +1408,13 @@ API_EXPORT int validate_fasta_native(
         fprintf(frep, "  \"empty_count\": %lld,\n",    empty_count);
         fprintf(frep, "  \"first_invalid_id\": ");
         write_json_string(frep, first_invalid_id);
-        fprintf(frep, "\n}\n");
+        fprintf(frep, ",\n  \"trailing_stop_count\": %lld,\n", trailing_stop_count);
+        fprintf(frep, "  \"first_trailing_stop_ids\": [");
+        for (long long _k = 0; _k < trailing_stop_count && _k < 3; _k++) {
+            if (_k) fputs(", ", frep);
+            write_json_string(frep, first_stop_ids[_k]);
+        }
+        fprintf(frep, "]\n}\n");
         fclose(frep);
     }
     rc = 0;

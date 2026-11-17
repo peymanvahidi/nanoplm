@@ -26,7 +26,6 @@ from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
 from nanoplm.pretraining.pure_pipeline import run_pure_pretraining
 
 from nanoplm.pretraining.models.modern_bert.model import (
-    ProtModernBertMLM,
     ProtModernBertMLMConfig,
 )
 from nanoplm.pretraining.models.modern_bert.pure_model import PureProtModernBertMLM
@@ -80,8 +79,12 @@ def _resolve_effective_world_size(cfg: PretrainingConfig) -> int:
 
 
 def _populate_batch_setup(cfg: PretrainingConfig) -> None:
+    from nanoplm.data.infra.mixture import MixtureError
     dataset_dir = Path(cfg.dataset_dir)
-    validation_result = validate_pretrain_dataset(dataset_dir)
+    try:
+        validation_result = validate_pretrain_dataset(dataset_dir)
+    except MixtureError as exc:
+        raise click.ClickException(f"{dataset_dir}: {exc}") from exc
     manifest = validation_result["manifest"]
 
     effective_world_size = _resolve_effective_world_size(cfg)
@@ -122,17 +125,11 @@ def _normalize_distributed_mode(value: str) -> str:
     return mode
 
 
-def _validate_distributed_mode(
-    cfg: PretrainingConfig,
-    *,
-    pure_torch: bool,
-) -> None:
+def _validate_distributed_mode(cfg: PretrainingConfig) -> None:
     cfg.distributed_mode = _normalize_distributed_mode(cfg.distributed_mode)
     cfg.ddp_bucket_cap_mb = int(cfg.ddp_bucket_cap_mb)
     if cfg.ddp_bucket_cap_mb <= 0:
         raise click.ClickException("ddp_bucket_cap_mb must be > 0.")
-    if not pure_torch:
-        return
     if cfg.distributed_mode in {"ddp", "hsdp"} and not cfg.multi_gpu:
         raise click.ClickException(
             f"distributed_mode={cfg.distributed_mode} requires multi_gpu=true."
@@ -150,13 +147,29 @@ def _validate_distributed_mode(
         raise click.ClickException("fsdp_reduce_dtype must be fp32 or bf16.")
 
 
-def _check_pipeline_supported(pure_torch: bool) -> None:
-    """Pretraining requires pure_torch (spec section 14)."""
-    if not pure_torch:
-        raise ValueError(
-            "Pretraining requires pure_torch: true. "
-            "The HF Trainer pretraining path is no longer supported."
-        )
+_PURE_TORCH_GONE = "pretraining always uses the pure-torch path"
+
+
+def _check_pure_torch_key(raw: dict) -> None:
+    """Accept the removed top-level ``pure_torch`` key of old YAMLs and checkpoint configs.
+
+    ``pure_torch: true`` loads with a deprecation warning; ``pure_torch: false``
+    asked for the HF Trainer path, which no longer exists.
+    """
+    if not isinstance(raw, dict) or "pure_torch" not in raw:
+        return
+    if raw["pure_torch"]:
+        logger.warning(f"pure_torch is no longer needed; {_PURE_TORCH_GONE}.")
+        return
+    raise click.ClickException(
+        f"pure_torch: false is no longer supported; {_PURE_TORCH_GONE}. "
+        "Remove the pure_torch key."
+    )
+
+
+def _warn_pure_torch_flag(pure_torch: bool) -> None:
+    if pure_torch:
+        logger.warning(f"--pure-torch is no longer needed; {_PURE_TORCH_GONE}.")
 
 
 @click.group(name="pretrain", cls=ConfigErrorGroup, sections=YAML_FIRST_SECTIONS)
@@ -216,7 +229,7 @@ def pretrain():
     "--repo-rope-warmup-steps",
     type=int,
     default=None,
-    help="Number of optimizer steps before enabling RePO RoPE offsets (pure-torch only). "
+    help="Number of optimizer steps before enabling RePO RoPE offsets. "
     "If unset, defaults to --warmup-steps.",
 )
 @click.option(
@@ -462,7 +475,7 @@ def pretrain():
     "--debug-memory-snapshot/--no-debug-memory-snapshot",
     default=False,
     show_default=True,
-    help="Pure-torch only: record CUDA allocator history and dump a memory_viz pickle to "
+    help="Record CUDA allocator history and dump a memory_viz pickle to "
     "<run root>/memory_snapshots/ on OOM (and at --debug-memory-snapshot-step). "
     "All ranks record; LOCAL_RANK 0 takes the scheduled dump, an OOM dumps on the rank "
     "that hit it.",
@@ -538,7 +551,7 @@ def pretrain():
 @click.option(
     "--fp8/--no-fp8",
     default=False,
-    help="Enable FP8 Linear matmuls in the pure-torch path (CUDA only, best on H100+)",
+    help="Enable FP8 Linear matmuls (CUDA only, best on H100+)",
 )
 @click.option(
     "--fp8-target",
@@ -546,7 +559,7 @@ def pretrain():
     default="mlp",
     show_default=True,
     help=(
-        "Pure-torch FP8 target(s): mlp, attn_wqkv, attn_wo. "
+        "FP8 target(s): mlp, attn_wqkv, attn_wo. "
         "Combine with commas, e.g. attn_wqkv,attn_wo."
     ),
 )
@@ -555,7 +568,7 @@ def pretrain():
     type=click.IntRange(min=0),
     default=0,
     show_default=True,
-    help="Pure-torch FP8: leave the final N transformer layers in bf16.",
+    help="FP8: leave the final N transformer layers in bf16.",
 )
 @click.option(
     "--fp8-recipe",
@@ -763,7 +776,7 @@ def pretrain():
     "--classifier-activation",
     type=click.Choice(["relu", "gelu", "srelu"], case_sensitive=False),
     default="gelu",
-    help="Classifier activation (srelu is supported only in the pure-torch path)",
+    help="Classifier activation",
 )
 @click.option(
     "--use-resid-lambdas/--no-use-resid-lambdas",
@@ -796,7 +809,7 @@ def pretrain():
 @click.option(
     "--use-canon-layers/--no-use-canon-layers",
     default=False,
-    help="Enable bidirectional Canon-ABCD local mixing layers (pure-torch path only)",
+    help="Enable bidirectional Canon-ABCD local mixing layers",
 )
 @click.option(
     "--canon-layers-mode",
@@ -814,7 +827,7 @@ def pretrain():
 @click.option(
     "--use-repo/--no-use-repo",
     default=False,
-    help="Enable RePO: learned per-head positions replacing fixed RoPE indices (pure-torch only)",
+    help="Enable RePO: learned per-head positions replacing fixed RoPE indices",
 )
 @click.option(
     "--repo-after-n-layers",
@@ -858,12 +871,12 @@ def pretrain():
     "--use-diff-attn-v2/--no-use-diff-attn-v2",
     default=False,
     help="Enable Differential Attention V2: doubles query heads, applies differential "
-    "subtraction for noise cancellation in attention (pure-torch only).",
+    "subtraction for noise cancellation in attention.",
 )
 @click.option(
     "--use-paired-head-attention/--no-use-paired-head-attention",
     default=False,
-    help="Enable paired-head attention (pure-torch only). "
+    help="Enable paired-head attention. "
     "Mutually exclusive with --use-diff-attn-v2.",
 )
 @click.option(
@@ -901,7 +914,7 @@ def pretrain():
 @click.option(
     "--use-mhc-lite/--no-use-mhc-lite",
     default=False,
-    help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing (pure-torch only). "
+    help="Enable mHC-lite: multi-stream residual with doubly stochastic mixing. "
     "Not compatible with --use-resid-lambdas.",
 )
 @click.option(
@@ -915,13 +928,13 @@ def pretrain():
     type=click.Choice(["layer", "sublayers"], case_sensitive=False),
     default="layer",
     show_default=True,
-    help="mHC-lite wrapping level (pure-torch only): 'layer' wraps the full transformer layer; "
+    help="mHC-lite wrapping level: 'layer' wraps the full transformer layer; "
     "'sublayers' wraps attention and MLP residual branches separately.",
 )
 @click.option(
     "--use-compile-max-autotune/--no-use-compile-max-autotune",
     default=False,
-    help="Pure-torch only: compile with torch.compile(mode='max-autotune-no-cudagraphs'). "
+    help="Compile with torch.compile(mode='max-autotune-no-cudagraphs'). "
     "May improve throughput, but increases compile time significantly at run start.",
 )
 @click.option(
@@ -931,21 +944,21 @@ def pretrain():
         case_sensitive=False,
     ),
     default=None,
-    help="Pure-torch only: explicit torch.compile(mode=...). Unset uses Inductor's default "
+    help="Explicit torch.compile(mode=...). Unset uses Inductor's default "
     "mode (or max-autotune-no-cudagraphs when --use-compile-max-autotune); set it and it "
     "overrides that flag. 'reduce-overhead' enables CUDA graphs.",
 )
 @click.option(
     "--compile-triton-persistent-reductions/--no-compile-triton-persistent-reductions",
     default=False,
-    help="Pure-torch only: TorchInductor Triton setting. Disable to avoid shared-memory "
+    help="TorchInductor Triton setting. Disable to avoid shared-memory "
     "resource errors in some fused reduction kernels (e.g. LayerNorm backward at large hidden dims) "
     "while keeping torch.compile enabled.",
 )
 @click.option(
     "--compile-triton-mix-order-reduction/--no-compile-triton-mix-order-reduction",
     default=False,
-    help="Pure-torch only: TorchInductor Triton setting. Mix-order reductions can generate "
+    help="TorchInductor Triton setting. Mix-order reductions can generate "
     "persistent reduction kernels that exceed shared memory limits on some shapes. "
     "Disable to prefer legacy reductions while keeping torch.compile enabled.",
 )
@@ -953,7 +966,8 @@ def pretrain():
     "--pure-torch",
     is_flag=True,
     default=False,
-    help="Use custom pure-torch model and training loop instead of HF Trainer",
+    hidden=True,
+    help="Deprecated no-op: pretraining always uses the pure-torch path.",
 )
 def run(
     # dataset/output
@@ -1095,6 +1109,7 @@ def run(
 ):
     """Run MLM pretraining with ModernBERT backbone."""
 
+    _warn_pure_torch_flag(pure_torch)
     _check_muon_available(optimizer)
 
     # Build config from CLI arguments
@@ -1186,37 +1201,13 @@ def run(
         profiler_record_shapes=profiler_record_shapes,
     )
 
-    if use_canon_layers and not pure_torch:
-        raise click.ClickException(
-            "use_canon_layers requires --pure-torch. "
-            "Canon layers are not implemented in the HF path."
-        )
-    if classifier_activation.lower() == "srelu" and not pure_torch:
-        raise click.ClickException(
-            "classifier_activation=srelu requires --pure-torch. "
-            "The default HF path supports only relu/gelu."
-        )
-    if (
-        num_kv_heads is not None
-        and num_kv_heads != num_attention_heads
-        and not pure_torch
-    ):
-        raise click.ClickException(
-            "GQA requires --pure-torch. "
-            "The default HF path does not implement num_kv_heads != num_attention_heads."
-        )
-    if (use_mhc_lite or mhc_lite_wrapping_level.lower() != "layer") and not pure_torch:
-        raise click.ClickException(
-            "mHC-lite requires --pure-torch. "
-            "Set that mode (or disable mHC-lite settings)."
-        )
     if use_mhc_lite and use_resid_lambdas:
         raise click.ClickException(
             "use_mhc_lite and use_resid_lambdas are mutually exclusive. "
             "resid_lambdas scales the hidden state before each layer, which breaks "
             "mHC-lite's doubly-stochastic stability guarantees."
         )
-    _validate_distributed_mode(cfg, pure_torch=pure_torch)
+    _validate_distributed_mode(cfg)
 
     _populate_batch_setup(cfg)
 
@@ -1263,39 +1254,17 @@ def run(
     )
 
     _set_seed_for_init(seed)
-    if use_diff_attn_v2 and not pure_torch:
-        raise click.ClickException(
-            "use_diff_attn_v2 requires --pure-torch. "
-            "Differential Attention V2 is not implemented in the HF path."
-        )
-    if use_paired_head_attention and not pure_torch:
-        raise click.ClickException(
-            "use_paired_head_attention requires --pure-torch. "
-            "Paired head attention is not implemented in the HF path."
-        )
     if use_paired_head_attention and use_diff_attn_v2:
         raise click.ClickException(
             "use_paired_head_attention and use_diff_attn_v2 are mutually exclusive."
         )
-    # Fail fast before any heavy manifest/model instantiation: only the
-    # pure_torch pipeline is supported. The HF Trainer pretraining path is
-    # no longer supported.
-    try:
-        _check_pipeline_supported(pure_torch)
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
-
     try:
         _validate_duration_config(cfg)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
     manifest = _load_manifest_and_inject(cfg, model_cfg)
-    if pure_torch:
-        logger.info("Using pure-torch model and training loop")
-        model = PureProtModernBertMLM(model_cfg)
-    else:
-        model = ProtModernBertMLM(model_cfg)
+    model = PureProtModernBertMLM(model_cfg)
 
     model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
@@ -1323,13 +1292,12 @@ def run(
         raise click.ClickException("--resume requires --resume-checkpoint-dir")
     _validate_resume_config_modes(resume_cfg)
 
-    if pure_torch:
-        run_pure_pretraining(
-            model=model,
-            pretrain_config=cfg,
-            manifest=manifest,
-            resume_config=resume_cfg if resume_cfg.is_resume else None,
-        )
+    run_pure_pretraining(
+        model=model,
+        pretrain_config=cfg,
+        manifest=manifest,
+        resume_config=resume_cfg if resume_cfg.is_resume else None,
+    )
 
 
 @pretrain.command("from-yaml")
@@ -1344,7 +1312,8 @@ def run(
     "--pure-torch",
     is_flag=True,
     default=False,
-    help="Use custom pure-torch model and training loop instead of HF Trainer",
+    hidden=True,
+    help="Deprecated no-op: pretraining always uses the pure-torch path.",
 )
 def from_yaml(config: str, pure_torch: bool):
     """Run pretraining from a YAML file with training and model parameters.
@@ -1365,9 +1334,8 @@ def from_yaml(config: str, pure_torch: bool):
     model_dict = raw.get("model")
     resume_dict = raw.get("resume")
 
-    # Support pure_torch from YAML or CLI flag (CLI flag takes precedence)
-    if not pure_torch:
-        pure_torch = bool(raw.get("pure_torch", False))
+    _warn_pure_torch_flag(pure_torch)
+    _check_pure_torch_key(raw)
 
     # validate and load config
     pretrain_config = _load_pretrain_config(pretrain_dict)
@@ -1382,41 +1350,11 @@ def from_yaml(config: str, pure_torch: bool):
     model_config = _load_model_config(model_dict)
     resume_config = _load_resume_config(resume_dict)
     _validate_resume_config_modes(resume_config)
-    if getattr(model_config, "use_noble", False) and not pure_torch:
-        raise click.ClickException(
-            "model.use_noble=true requires pure_torch: true (or --pure-torch). "
-            "NOBLE is not implemented in the HF path."
-        )
-    if model_config.use_canon_layers and not pure_torch:
-        raise click.ClickException(
-            "model.use_canon_layers=true requires pure_torch: true (or --pure-torch). "
-            "Canon layers are not implemented in the HF path."
-        )
-    if (
-        model_config.use_mhc_lite
-        or str(getattr(model_config, "mhc_lite_wrapping_level", "layer")).lower()
-        != "layer"
-    ) and not pure_torch:
-        raise click.ClickException(
-            "model.use_mhc_lite=true (or model.mhc_lite_wrapping_level != 'layer') "
-            "requires pure_torch: true / --pure-torch. "
-            "mHC-lite is not implemented in the HF path."
-        )
     if model_config.use_mhc_lite and model_config.use_resid_lambdas:
         raise click.ClickException(
             "model.use_mhc_lite=true is not compatible with model.use_resid_lambdas=true. "
             "resid_lambdas scales the hidden state before each layer, which breaks "
             "mHC-lite's doubly-stochastic stability guarantees."
-        )
-    if getattr(model_config, "use_diff_attn_v2", False) and not pure_torch:
-        raise click.ClickException(
-            "model.use_diff_attn_v2=true requires pure_torch: true (or --pure-torch). "
-            "Differential Attention V2 is not implemented in the HF path."
-        )
-    if getattr(model_config, "use_paired_head_attention", False) and not pure_torch:
-        raise click.ClickException(
-            "model.use_paired_head_attention=true requires pure_torch: true (or --pure-torch). "
-            "Paired head attention is not implemented in the HF path."
         )
     if getattr(model_config, "use_paired_head_attention", False) and getattr(
         model_config, "use_diff_attn_v2", False
@@ -1424,34 +1362,12 @@ def from_yaml(config: str, pure_torch: bool):
         raise click.ClickException(
             "model.use_paired_head_attention=true is not compatible with model.use_diff_attn_v2=true."
         )
-    if str(
-        getattr(model_config, "classifier_activation", "gelu")
-    ).lower() == "srelu" and not pure_torch:
-        raise click.ClickException(
-            "model.classifier_activation=srelu requires pure_torch: true / --pure-torch. "
-            "The HF path supports only relu/gelu."
-        )
-    if (
-        getattr(model_config, "num_kv_heads", None) is not None
-        and model_config.num_kv_heads != model_config.num_attention_heads
-        and not pure_torch
-    ):
-        raise click.ClickException(
-            "model.num_kv_heads != model.num_attention_heads requires "
-            "pure_torch: true / --pure-torch. The HF path does not implement GQA."
-        )
-    _validate_distributed_mode(pretrain_config, pure_torch=pure_torch)
+    _validate_distributed_mode(pretrain_config)
     _populate_batch_setup(pretrain_config)
-
-    # Fail fast before any heavy model instantiation: only the pure_torch
-    # pipeline is supported.
-    _check_pipeline_supported(pure_torch)
 
     manifest = _load_manifest_and_inject(pretrain_config, model_config)
     _set_seed_for_init(pretrain_config.seed)
-    if pure_torch:
-        logger.info("Using pure-torch model and training loop")
-        model = PureProtModernBertMLM(config=model_config)
+    model = PureProtModernBertMLM(config=model_config)
 
     model_parameters = list(filter(lambda p: p.requires_grad, model.parameters()))
     total_params = sum(p.numel() for p in model_parameters)
@@ -1466,13 +1382,12 @@ def from_yaml(config: str, pure_torch: bool):
         logger.info(f"Active Parameters (per token): {total_params - inactive}")
     logger.info(f"Flash attention available: {is_flash_attention_available()}")
 
-    if pure_torch:
-        run_pure_pretraining(
-            model=model,
-            pretrain_config=pretrain_config,
-            manifest=manifest,
-            resume_config=resume_config if resume_config.is_resume else None,
-        )
+    run_pure_pretraining(
+        model=model,
+        pretrain_config=pretrain_config,
+        manifest=manifest,
+        resume_config=resume_config if resume_config.is_resume else None,
+    )
 
 
 @pretrain.command("get-yaml")
@@ -1704,8 +1619,13 @@ def _load_manifest_and_inject(
 
     Returns the manifest so it can be passed to the pipeline entry point.
     """
+    from nanoplm.data.infra.mixture import MixtureError, resolve_eval_sources
     manifest = read_manifest(pretrain_config.dataset_dir)
     validate_manifest_for_pipeline(manifest, expected_mode="pretrain")
+    try:
+        resolve_eval_sources(pretrain_config.eval_sources, manifest)
+    except MixtureError as exc:
+        raise click.ClickException(f"pretraining.{exc}") from exc
     model_config.num_register_tokens = manifest.num_register_tokens
     logger.info(
         f"Injected manifest.num_register_tokens = {manifest.num_register_tokens} "

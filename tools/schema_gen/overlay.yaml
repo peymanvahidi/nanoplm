@@ -3,8 +3,10 @@
 #
 # Two namespaces live in this file:
 #
-#  1. Flat field annotations, keyed "<section>.<field>". Any of:
-#     enum, minimum, maximum, backend, advanced, auto_computed, type, items.
+#  1. Flat field annotations, keyed "<section>.<field>" (a bare "<field>" for a
+#     top-level scalar or a section itself). Any of: enum, minimum, maximum,
+#     backend, advanced, auto_computed, type, items, group, default, description;
+#     a section may also set `map: true` (see the data block).
 #     A field whose template default is `null` MUST set `type` to a nullable
 #     union (e.g. `type: [integer, "null"]`); emit.py refuses to guess one.
 #     Every enum below is transcribed from the authoritative validator: the
@@ -20,6 +22,8 @@
 # click.Choice --optimizer
 pretraining.optimizer:
   enum: [adamw, stable_adamw, muon, normuon, nordion2]
+# PretrainingConfig.eval_sources: "all" or a list of mixture source names
+pretraining.eval_sources: { type: [string, array], items: { type: string } }
 # click.Choice --lr-schedule + _validate_duration_config's `valid` set
 pretraining.lr_schedule:
   enum: [wsd, warmup_stable, cosine, linear]
@@ -42,65 +46,58 @@ pretraining.mlm_masking_strategy:
   enum: [token, span]
 
 # FP8 recipe knobs (recipe/format/amax are Transformer-Engine constructs, read
-# by fp8.py's te_fp8_recipe_from_config on the pure-torch path).
+# by fp8.py's te_fp8_recipe_from_config).
 pretraining.fp8_recipe:
   enum: [delayed, current, block, mxfp8, nvfp4]
-  backend: [pure_torch]
 pretraining.fp8_format:
   enum: [hybrid, e4m3]
-  backend: [pure_torch]
-pretraining.fp8_amax_history_len: { backend: [pure_torch], advanced: true }
-pretraining.fp8_reduce_amax: { backend: [pure_torch], advanced: true }
+pretraining.fp8_amax_history_len: { advanced: true }
+pretraining.fp8_reduce_amax: { advanced: true }
 # More FP8 knobs. fp8_target gets NO enum on purpose: any
 # COMBINATION of mlp / attn_wqkv / attn_wo is legal (_normalize_fp8_targets),
 # so a closed value list would be a lie.
-pretraining.fp8_target: { backend: [pure_torch] }
-pretraining.fp8_skip_last_n_layers: { backend: [pure_torch] }
-pretraining.fp8_cpu_activation_offload: { backend: [pure_torch], advanced: true }
-pretraining.fp8_cpu_activation_offload_layers: { backend: [pure_torch], advanced: true }
-pretraining.fp8_cpu_activation_offload_retain_buffers: { backend: [pure_torch], advanced: true }
+pretraining.fp8_cpu_activation_offload: { advanced: true }
+pretraining.fp8_cpu_activation_offload_layers: { advanced: true }
+pretraining.fp8_cpu_activation_offload_retain_buffers: { advanced: true }
 
-# torch.compile / TorchInductor knobs: pure-torch pipeline only.
-pretraining.use_compile_max_autotune: { backend: [pure_torch], advanced: true }
-pretraining.compile_triton_persistent_reductions: { backend: [pure_torch], advanced: true }
-pretraining.compile_triton_mix_order_reduction: { backend: [pure_torch], advanced: true }
+# torch.compile / TorchInductor knobs.
+pretraining.use_compile_max_autotune: { advanced: true }
+pretraining.compile_triton_persistent_reductions: { advanced: true }
+pretraining.compile_triton_mix_order_reduction: { advanced: true }
 
-# Layerwise debug metrics (in-graph taps) exist only on the pure-torch path.
-pretraining.debug_layerwise_metrics: { backend: [pure_torch], advanced: true }
-pretraining.debug_layerwise_log_every: { backend: [pure_torch], advanced: true }
+# Layerwise debug metrics (in-graph taps).
+pretraining.debug_layerwise_metrics: { advanced: true }
+pretraining.debug_layerwise_log_every: { advanced: true }
 
-# RePO exists only on the pure-torch path.
-pretraining.repo_rope_warmup_steps: { backend: [pure_torch], advanced: true }
+# RePO.
+pretraining.repo_rope_warmup_steps: { advanced: true }
 
-# Huginn-style recycling: pure-torch only (ProtModernBertMLM rejects
+# Huginn-style recycling (the HF ProtModernBertMLM rejects
 # recycling_loop_count > 1). Enums come from
 # pretraining/recycling/scheduler.py's validators.
-pretraining.recycling_bptt: { backend: [pure_torch], advanced: true }
+pretraining.recycling_bptt: { advanced: true }
 pretraining.recycling_loop_count_sampling:
   enum: [fixed, lognormal_poisson]
-  backend: [pure_torch]
   advanced: true
-pretraining.recycling_loop_count_sigma: { backend: [pure_torch], advanced: true }
+pretraining.recycling_loop_count_sigma: { advanced: true }
 pretraining.recycling_loop_count_curriculum:
   enum: ["none", linear, "1_sqrt"]
-  backend: [pure_torch]
   advanced: true
-pretraining.recycling_loop_count_curriculum_steps: { backend: [pure_torch], advanced: true }
+pretraining.recycling_loop_count_curriculum_steps: { advanced: true }
 pretraining.recycling_pretraining_eval_loop_counts:
   type: [array, "null"]
   items: { type: integer }
-  backend: [pure_torch]
   advanced: true
 
-# Loopie stochastic depth: only meaningful with model.use_loopie, pure-torch only.
-pretraining.loopie_loop_count_jitter: { backend: [pure_torch], advanced: true, minimum: 0 }
+# Loopie stochastic depth: only meaningful with model.use_loopie.
+pretraining.loopie_loop_count_jitter: { advanced: true, minimum: 0 }
 
-# NOBLE LR scaling: only meaningful with model.use_noble, which is pure-torch only.
-pretraining.noble_base_lr: { backend: [pure_torch], advanced: true }
-pretraining.noble_lr_gamma: { backend: [pure_torch], advanced: true }
-pretraining.noble_lr_gamma_M: { backend: [pure_torch], advanced: true }
-pretraining.noble_freq_lr_mult: { backend: [pure_torch], advanced: true }
-pretraining.noble_phase_lr_mult: { backend: [pure_torch], advanced: true }
+# NOBLE LR scaling: only meaningful with model.use_noble.
+pretraining.noble_base_lr: { advanced: true }
+pretraining.noble_lr_gamma: { advanced: true }
+pretraining.noble_lr_gamma_M: { advanced: true }
+pretraining.noble_freq_lr_mult: { advanced: true }
+pretraining.noble_phase_lr_mult: { advanced: true }
 
 # auto-computed / not user-facing (documented as such, excluded from form):
 pretraining.world_size: { auto_computed: false }   # 'auto' allowed, keep visible
@@ -129,34 +126,58 @@ model.activation_checkpointing_mode:
 # _resolve_canon_kernel_size -> {3, 5, 7}
 model.canon_layers_kernel_size:
   enum: [3, 5, 7]
-  backend: [pure_torch]
   advanced: true
-model.canon_layers_mode: { backend: [pure_torch], advanced: true }
-model.use_canon_layers: { backend: [pure_torch], advanced: true }
-model.use_repo: { backend: [pure_torch], advanced: true }
-model.use_mhc_lite: { backend: [pure_torch], advanced: true }
+model.canon_layers_mode: { advanced: true }
+model.use_canon_layers: { advanced: true }
+model.use_repo: { advanced: true }
+model.use_mhc_lite: { advanced: true }
 model.mhc_lite_wrapping_level:
   enum: [layer, sublayers]
-  backend: [pure_torch]
   advanced: true
-model.use_diff_attn_v2: { backend: [pure_torch], advanced: true }
-model.use_paired_head_attention: { backend: [pure_torch], advanced: true }
-model.use_noble: { backend: [pure_torch], advanced: true }
+model.use_diff_attn_v2: { advanced: true }
+model.use_paired_head_attention: { advanced: true }
+model.use_noble: { advanced: true }
 # _NOBLE_TARGET_ROLES in models/modern_bert/config.py
 model.noble_targets:
   enum: [all, attn, ffn, qkv, out]
-  backend: [pure_torch]
   advanced: true
-model.use_moe: { backend: [pure_torch], advanced: true }
-model.recycling_loop_count: { backend: [pure_torch], advanced: true }
-model.use_huginn_looping: { backend: [pure_torch], advanced: true }
-model.use_loopie: { backend: [pure_torch], advanced: true }
-model.loopie_loop_count: { backend: [pure_torch], advanced: true }
+model.use_moe: { advanced: true }
+model.recycling_loop_count: { advanced: true }
+model.use_huginn_looping: { advanced: true }
+model.use_loopie: { advanced: true }
+model.loopie_loop_count: { advanced: true }
 # ModernBertConfig.__post_init__: None (full BPTT) or int >= 1.
-model.loopie_bptt: { type: [integer, "null"], minimum: 1, backend: [pure_torch], advanced: true }
+model.loopie_bptt: { type: [integer, "null"], minimum: 1, advanced: true }
 
 # ----------------------------------------------------------------------- data
-data_dirs.local_fasta: { type: [string, "null"] }
+# A bare key annotates a top-level entry of the file. `map: true` marks a
+# section whose keys are names the user picks, each holding a spec: the
+# template's fields under its example entry (`swissprot:`) describe every entry,
+# and are emitted as the section's additionalProperties.
+# A column-0 `key: value` is documented only when marked top_level here.
+output_dir: { top_level: true }
+sources:
+  map: true
+  description: >-
+    One entry per source, keyed by a name you pick (letters, digits and _). Each
+    names a fasta to build from. Any data_params field but val_ratio, val_size,
+    shuffle and shuffle_seed set on a source overrides the default for that source.
+    Several sources make a mix: each is built on its own and training draws from
+    them by weight.
+# data_config._fasta: a string, or a list of URLs / paths merged in list order
+sources.fasta:
+  type: [string, array]
+  items: { type: string }
+  description: >-
+    swissprot, trembl, uniref50, uniref90, uniref100, a URL, or a local .fasta/.fa
+    (.gz/.zst); or a list of URLs and local files, merged in list order
+# data_config.PARAM_FIELDS order; the template's plain `# Rarely changed`
+# heading opens this block.
+data_params.shuffle: { group: Rarely changed }
+data_params.shuffle_seed: { group: Rarely changed }
+data_params.samples_per_shard: { group: Rarely changed }
+data_params.max_workers: { group: Rarely changed }
+data_params.register_tokens: { group: Rarely changed }
 
 # --------------------------------------------------------------- distillation
 # Optional[int]; null = MHA. The flat key also matches the pretrain template's
@@ -170,7 +191,7 @@ distillation.lr_scheduler:
 # ----------------------------------------------------------------------- eval
 eval.zero_shot_method:
   enum: [masked_marginals, wt_marginals, pseudoperplexity]
-eval.loop_count: { backend: [pure_torch], advanced: true, minimum: 1 }
+eval.loop_count: { advanced: true, minimum: 1 }
 # Both also take a bare string; null keeps the datasets default.
 eval.framework: { type: [array, string], items: { type: string } }
 eval.pbc_supervised_datasets: { type: [array, string, "null"], items: { type: string } }
@@ -329,8 +350,7 @@ x-extra-fields:
         type: string
         default: null
         advanced: true
-        backend: [pure_torch]
-        group: torch.compile knobs (pure_torch only)
+        group: torch.compile knobs
         enum: [default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs]
         description: >-
           Explicit mode passed to torch.compile for the training graph. Unset
@@ -347,7 +367,6 @@ x-extra-fields:
         type: boolean
         default: false
         advanced: true
-        backend: [pure_torch]
         group: Debug
         description: >-
           Record the CUDA caching allocator's history (allocation stacks and
@@ -367,7 +386,6 @@ x-extra-fields:
         type: integer
         default: -1
         advanced: true
-        backend: [pure_torch]
         group: Debug
         description: >-
           Also dump a memory snapshot right after this optimizer step, giving a
@@ -380,7 +398,6 @@ x-extra-fields:
         default: 100000
         minimum: 1
         advanced: true
-        backend: [pure_torch]
         group: Debug
         description: >-
           Number of allocator events kept in the memory-history ring buffer;
@@ -392,7 +409,6 @@ x-extra-fields:
         type: boolean
         default: false
         advanced: true
-        backend: [pure_torch]
         group: Profiler
         description: >-
           Record per-operator input shapes in the PyTorch profiler trace. Shape
@@ -413,6 +429,71 @@ x-extra-fields:
           additional anneal optimizer steps to run from the checkpoint. Set
           exactly one of decay_tokens or decay_steps, never both. mode: continue
           accepts no decay_* field at all.
+  # The source keys the data template ships commented out
+  # (data_config.SOURCE_KEYS).
+  data:
+    sources:
+      # data_config._weight: optional with one source (then 1); required in a mix.
+      # The template ships it only in the commented second-source example.
+      weight:
+        type: number
+        default: 1.0
+        description: >-
+          Share of training sequences (not tokens) drawn from this source. Weights must
+          sum to 1 (within 1e-6); with one source it is 1 or left out. The weights also
+          share out the validation split, so changing them redraws it: every plain
+          source splits and tokenizes again, a cluster source rebuilds only its index.
+          A cluster source counts one sample per cluster visit.
+      cluster_subsampling:
+        type: [boolean, object]
+        default: false
+        description: >-
+          Turns on cluster subsampling for this source: each epoch trains on one
+          random member of every cluster. A mapping with clusters turns it on;
+          false, or no key, turns it off. max_seqs and val_ratio then count
+          clusters, not sequences.
+        properties:
+          # cluster_config.resolve_cluster_plan: left out or null = this source's fasta.
+          members:
+            type: [string, "null"]
+            default: null
+            description: >-
+              The sequences training draws from: uniref90, uniref100, or a UniRef90/100
+              FASTA URL/path. Leave it out to use this source's fasta.
+          # cluster_config.CLUSTERS, or a cluster file (cluster_config.TSV_SUFFIXES);
+          # the old name `clustering` still works (data_config.OLD_CLUSTER_KEYS).
+          # Required: no default key (emit lists it in the block's `required`).
+          clusters:
+            type: string
+            description: >-
+              Where the clusters come from: uniprot (UniProt's UniRef50 clusters, for
+              UniRef90/100 members), headers (CL:<representative> tags in the FASTA
+              headers), mmseqs2 (clusters the sequences; hours on large data), or a
+              .tsv / .tsv.gz / .tsv.zst file of representative<TAB>member lines (a path
+              or a URL). Called clustering before.
+          # cluster_config._fraction: a number in (0, 1]; 0 itself is rejected
+          identity:
+            type: number
+            default: 0.5
+            exclusiveMinimum: 0
+            maximum: 1
+            description: "mmseqs2 only: min sequence identity within a cluster"
+          coverage:
+            type: number
+            default: 0.8
+            exclusiveMinimum: 0
+            maximum: 1
+            description: "mmseqs2 only: min alignment coverage"
+    # shipped commented out: it excludes val_ratio (data_config._val_setting)
+    data_params:
+      val_size:
+        type: integer
+        default: null
+        minimum: 1
+        description: >-
+          A fixed number of validation sequences (clusters, for a cluster source)
+          for the whole mix, instead of val_ratio. Set only one of the two. In a mix
+          it is shared out by the source weights.
   distill:
     distillation:
       adam_beta1:

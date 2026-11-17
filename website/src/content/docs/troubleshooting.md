@@ -34,31 +34,11 @@ Set [`dataset_dir`](/nanoplm/reference/pretrain/#pretrain-pretraining-dataset_di
 
 Never set `inferred_grad_accum_steps`, `global_batch_seqs`, or `achieved_global_batch_tokens`. They are runtime outputs that happen to live on the same dataclass.
 
-:::danger[The silent one: a leftover `pure_torch:` mapping]
-Old configs wrote `pure_torch` as a **block**:
-
-```yaml
-pure_torch:
-  enabled: false     # <- does nothing
-  use_compile: true
-```
-
-On current nanoPLM, `pure_torch` is a **top-level boolean**, and the loader evaluates it with `bool(...)`. A non-empty mapping is truthy, so `{enabled: false}` turns pure-torch **on**. There is no error and no warning: you get a backend you did not ask for. Delete the block and use a bare `pure_torch: true` (the template default).
-:::
-
 ## Pretraining won't start
 
-**`Pretraining requires pure_torch: true. The HF Trainer pretraining path is no longer supported.`**
+**`pure_torch` and `--pure-torch` were removed**
 
-Pure-torch must be selected: either in the YAML or on the CLI. The stock template already sets `pure_torch: true`, so this usually means a hand-written config is missing the key, has it set to false, or you used `pretrain run` without the flag. There is no HF-Trainer path.
-
-```bash
-# YAML path (template default is pure_torch: true)
-nanoplm pretrain from-yaml
-
-# Flag-driven path still needs the explicit flag
-nanoplm pretrain run --dataset-dir output/data/pretrain_data --pure-torch
-```
+Pretraining always uses the pure-torch path, so the key and the flag are no longer needed. Old YAMLs and checkpoints with `pure_torch: true` still load with a warning; `pure_torch: false` is an error. Delete the key and drop the flag.
 
 **`train_loader yields 3 micro-batches per rank per pass, fewer than grad_accum=8: one optimizer step (global_batch_tokens=...) is larger than a pass over the train set. Lower global_batch_tokens or use a larger dataset.`**
 
@@ -212,7 +192,7 @@ If one replica would span the whole world there is nothing to replicate: that is
 
 ## FP8 errors
 
-FP8 goes through Transformer Engine: pure-torch swaps eligible blocks for TE modules and runs them under a TE autocast. Transformer Engine is therefore required for `fp8: true`, even though nanoPLM has no separate TE backend.
+FP8 goes through Transformer Engine: nanoPLM swaps eligible blocks for TE modules and runs them under a TE autocast. Transformer Engine is therefore required for `fp8: true`, even though nanoPLM has no separate TE backend.
 
 **`fp8=True in the pure-torch pipeline now requires Transformer Engine. Install transformer-engine or run without fp8.`**
 
@@ -239,16 +219,7 @@ CPU activation offload is the fussiest FP8 feature. All four of these are hard e
 
 ## Model config errors
 
-Several architecture features are mutually exclusive, and several are pure-torch only.
-
-**`model.use_canon_layers=true requires pure_torch: true (or --pure-torch). Canon layers are not implemented in the HF path.`**
-
-The same message shape appears for `use_noble`, `use_diff_attn_v2`, and `use_paired_head_attention`. MoE and recycling have their own wording:
-
-- **`MoE is currently implemented only in the pure-torch path. Disable use_moe or use --pure-torch.`**
-- **`Huginn-style recycling (recycling_loop_count > 1) is implemented only in the pure-torch path. Use --pure-torch with recycling_loop_count>1.`**
-
-Keep pure-torch (the template default).
+Several architecture features are mutually exclusive.
 
 ### Incompatible pairs
 
@@ -264,7 +235,7 @@ Keep pure-torch (the template default).
 
 ### MoE
 
-MoE has three prerequisites beyond pure-torch:
+MoE has three prerequisites:
 
 - **`use_moe=True requires mlp_activation in {'swiglu', 'srelu'}.`**
 - **`MoE requires use_packing=True`** and **`MoE requires use_static_inp_size=True`**: both default to `true`, so this fires only if you turned them off.
@@ -286,38 +257,60 @@ Routing constraints: `moe_top_k` must satisfy `1 <= moe_top_k <= moe_num_experts
 
 ## Data pipeline
 
+### data.yaml won't load
+
+`nanoplm data from-yaml` checks the whole file before any stage runs and names the key it stopped at. In these messages the source is named `sp`.
+
+| Message | Fix |
+| --- | --- |
+| `sources.sp.fasta must be a shortcut (swissprot, trembl, uniref50, uniref90, uniref100) or a URL or path that ends with .fasta or .fa (optionally .gz or .zst), got: swisprot` | Fix the spelling, or give a URL or a `.fasta` / `.fa` path (optionally `.gz` / `.zst`). |
+| `sources.sp: unknown key weigth (allowed: fasta, weight, ...)` | A typo, or a key at the wrong level. The message lists the keys allowed there. |
+| `sources.sp.prepared was removed. To train on that folder as it is, set pretrain.yaml's dataset_dir to it; ...` | A source can no longer point at a folder another `data.yaml` built. To train on that folder alone, set `dataset_dir` in `pretrain.yaml` to it. To use it in a mix, set `fasta` to the FASTA that folder was built from. To compare weights side by side, see [Mixing datasets](/nanoplm/guides/mixing/#compare-several-ratios). |
+| `unknown key fasta (allowed: output_dir, sources, data_params)` | `fasta` goes under a source name. Indent it as `sources:`, then `sp:`, then `fasta:`. |
+| `output_dir is required (the folder pretrain.yaml's dataset_dir points at)` | Add `output_dir` at the top level. |
+| `sources.sp needs a weight (its share of training sequences; the weights must sum to 1)` | Every source of a mix needs a `weight`. See [Mixing datasets](/nanoplm/guides/mixing/). |
+| `the weights must sum to 1 (they are shares of training sequences): 0.5 (sp) + 0.4 (tr) = 0.9` | Change the weights so they add up to 1. |
+| `sources.sp.weight is 0.5; with one source the weight must be 1 (or leave it out)` | Set `weight: 1.0` or delete it. |
+| `data_dirs is the old layout; use output_dir + sources without data_dirs` | The file has both layouts. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml). |
+| `data.yaml:5: duplicate key 'fasta' (first on line 4)` | The same key appears twice in one block. Delete one. |
+
+For errors about a `cluster_subsampling` block, or MMseqs2 not found, see the [cluster subsampling guide](/nanoplm/guides/cluster-subsampling/#errors-and-warnings).
+
+`Warning: data_dirs is the old data.yaml layout` is not an error. The old file still runs. See [Move an old data.yaml](/nanoplm/pipeline/data/#move-an-old-datayaml).
+
 ### The `check` stage fails on invalid sequences
 
-By default [`drop_invalid_sequences`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences) is `false`, which means the `check` stage **exits non-zero** the moment it finds an invalid sequence and halts the pipeline. That is deliberate: you should see what is in your FASTA before you train on it.
+**`Error: Validation found 2 problematic sequence(s).`**
 
-Inspect `invalid.fasta` and `validation.json` in the `validation_dir`. Note that `invalid_ids.txt` is **empty** in this mode, so nothing downstream drops records by accident.
+You set [`drop_invalid_sequences: false`](/nanoplm/reference/data/#data-data_params-drop_invalid_sequences), so the `check` stage stops the pipeline when a sequence has a residue it does not recognise. Look at `output_dir/<source>/validation/invalid.fasta`. Then run `nanoplm data from-yaml --fix` to drop those sequences and continue ([details](/nanoplm/pipeline/data/#invalid-sequences)).
 
-To proceed, drop them:
+**`WARNING check: dropping 2 records with characters outside the amino-acid alphabet or empty`**
 
-```bash
-nanoplm data from-yaml --fix
-```
+Not an error. With the default `drop_invalid_sequences: true` the `filter` stage drops those records. They are listed in the `invalid.fasta` the warning names.
 
-`--fix` rewrites `data_params.drop_invalid_sequences: true` in your config **in place**, then reruns. The `check` stage now records the offending IDs in `invalid_ids.txt`, `filter` excludes them, and the run continues. Setting the key by hand is equivalent:
+### `--dry-run` refuses or stops early
 
-```yaml title="data.yaml"
-data_params:
-  drop_invalid_sequences: true
-```
+**`Error: --dry-run needs an initialized DVC repo and will not create one.`**
+
+Run `nanoplm data from-yaml` once without `--dry-run`, or run `dvc init` in the folder of `data.yaml`.
+
+**`The dry run stops after get_members_fasta, get_cluster_xml: DVC cannot preview the stages that read their outputs until those exist.`**
+
+This is not an error. A download has not happened yet, so the preview ends there. The real run goes on past it.
 
 ### The dataset was prepared for the wrong pipeline
 
 **`Dataset was prepared for 'distillation' pipeline, but 'pretrain' was expected.`**
 
-[`dataset_dir`](/nanoplm/reference/pretrain/#pretrain-pretraining-dataset_dir) points at a distillation dataset (HDF5 teacher embeddings), not pretraining shards. Point it at the `output_dir` from a `nanoplm data from-yaml` run made **without** `--distillation`.
+[`dataset_dir`](/nanoplm/reference/pretrain/#pretrain-pretraining-dataset_dir) points at a distillation dataset (HDF5 teacher embeddings), not pretraining shards. Point it at the `output_dir` of a `data.yaml` from `nanoplm data get-yaml` without `--distillation`.
 
 ### Outputs land somewhere unexpected
 
-Paths in `data.yaml` resolve relative to the directory you **run the command from**, not to the YAML file. Run every command from one project root, or use absolute paths.
+`nanoplm data from-yaml` runs every stage in the folder `data.yaml` is in, so relative paths in `data.yaml` start from there, not from the folder you run the command in. Use an absolute `output_dir` to put outputs elsewhere. The run log is the exception. It goes to `output/logs/` under the folder you run the command in.
 
 ### Editing `.data_manifest` by hand
 
-Don't. It is generated, it carries a `# DO NOT EDIT THIS FILE MANUALLY.` header, and it records the exact parameters the binary shards were built with. If you need different `max_seq_len` or `samples_per_shard`, change `data.yaml` and re-run `nanoplm data from-yaml` so the shards and the manifest are regenerated together.
+Don't. The manifest records the settings the shards were built with, so a hand edit makes it disagree with the shards. To change `max_seq_len` or `samples_per_shard`, change `data.yaml` and run `nanoplm data from-yaml` again. It rebuilds the shards and the manifest together.
 
 ## Still stuck?
 

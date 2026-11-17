@@ -12,6 +12,7 @@ from typing import Literal
 TemplateName = Literal[
     "pretrain",
     "data_pretrain",
+    "data_pretrain_subsampling",
     "data_distill",
     "eval",
 ]
@@ -19,6 +20,7 @@ TemplateName = Literal[
 _TEMPLATE_FILES: dict[str, str] = {
     "pretrain": "pretrain.yaml",
     "data_pretrain": "data_pretrain.yaml",
+    "data_pretrain_subsampling": "data_pretrain_subsampling.yaml",
     "data_distill": "data_distill.yaml",
     "eval": "eval.yaml",
 }

@@ -61,6 +61,9 @@ class NativeValidateResult:
     total_sequences: int
     invalid_count: int
     empty_count: int
+    # valid records that end in one '*' (the filter strips it), and their first ids
+    trailing_stop_count: int = 0
+    first_trailing_stop_ids: tuple = ()
 
 
 def _is_disabled() -> bool:
@@ -455,6 +458,8 @@ def validate_fasta_native(
             total_sequences=report["total_sequences"],
             invalid_count=report["invalid_count"],
             empty_count=report["empty_count"],
+            trailing_stop_count=report.get("trailing_stop_count", 0),
+            first_trailing_stop_ids=tuple(report.get("first_trailing_stop_ids", ())),
         )
     except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
         raise NativeFastaOpsError(
