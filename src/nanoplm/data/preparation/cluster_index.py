@@ -24,6 +24,11 @@ ClusterSampledDataset opens either):
   shard_row_offsets.npy       int64       cumulative rows per shard
   pool_manifest.json          counts, holdout, cap, and the verify block
 
+With ``submembers_tsv`` (the sub-cluster table, same format) the build also writes the
+sub-cluster arrays of ``subclusters`` (sub_members, sub_offsets, cluster_sub_offsets,
+pool_subcluster), a ``subclusters`` manifest block and tool_version 2; the arrays above
+stay byte-identical. Without it every output is the one-level index.
+
 The universe rule: a cluster is in it iff its representative record survived the
 length filter, i.e. is a pool row. Training draws members uniformly over all n_c
 surviving members, representative included.
@@ -54,6 +59,7 @@ from nanoplm.data.preparation.cluster_table import (  # noqa: F401  (re-exported
 from nanoplm.utils import logger
 
 TOOL_VERSION = 1
+TOOL_VERSION_SUBCLUSTERS = 2
 # The experiment's holdout seed: rebuilding on its release with its val_ratio (0.0044)
 # reproduces its val_clusters.npy exactly.
 HOLDOUT_SEED = 20260918
@@ -207,13 +213,17 @@ def build_cluster_index(
     level: Optional[str] = None,
     clusters_info: Optional[dict] = None,
     cluster_xml: Optional[str] = None,
+    submembers_tsv: Optional[Path] = None,
+    subclusters_info: Optional[dict] = None,
 ) -> dict:
     """Write the cluster index for the pool in ``pool_dir`` (built from ``fasta``).
 
     ``tokenizer`` (optional) re-tokenizes a few hundred FASTA records with the shard
     writer and compares them to their pool rows byte for byte; the token-length rule
     alone cannot see an equal-length reorder. ``cluster_xml`` is the uniref50.xml.gz
-    members.tsv came from, named when the two releases disagree.
+    members.tsv came from, named when the two releases disagree. ``submembers_tsv`` (the
+    canonical sub-cluster table, e.g. UniRef90 -> UniRef100) adds the two-level arrays;
+    ``subclusters_info`` (e.g. {"source": ...}) goes into their manifest block.
     """
     t0 = time.time()
     fasta, pool_dir = Path(fasta), Path(pool_dir)
@@ -258,31 +268,66 @@ def build_cluster_index(
     pool_is_rep = np.empty(n, dtype=bool)
     pool_cluster[order] = np.asarray(u_cluster[pos])
     pool_is_rep[order] = np.asarray(u_is_rep[pos])
-    del order, sk, pos, hit, keys, table, u_keys, u_cluster, u_is_rep
+    del pos, hit, keys, table, u_keys, u_cluster, u_is_rep
+    pool_sub = n_sub_table = None
+    if submembers_tsv is not None:
+        from nanoplm.data.preparation import subclusters as sc
+        submembers_tsv = Path(submembers_tsv)
+        logger.info(f"cluster index: reading {submembers_tsv}")
+        sub_table = read_members_table(submembers_tsv)
+        n_sub_table = len(sub_table.sizes)
+        pool_sub = sc.join_pool_rows(sk, order, n, sub_table)
+        del sub_table
+    del order, sk
 
     arrays, counts, cap = aggregate(pool_cluster, pool_is_rep, raw_sizes, val_ratio,
                                     max_clusters, holdout_seed)
+    if pool_sub is not None:
+        sub_arrays, sub_counts = sc.build_subcluster_arrays(
+            pool_cluster, pool_sub, arrays["cluster_members"], arrays["cluster_offsets"],
+            n_sub_table, str(submembers_tsv))
+        del pool_sub
     index_dir.mkdir(parents=True, exist_ok=True)
+    if submembers_tsv is None:     # stale sub arrays of an earlier two-level build
+        from nanoplm.data.preparation import subclusters as sc
+        for name in sc.ALL_ARRAYS:
+            (index_dir / f"{name}.npy").unlink(missing_ok=True)
     arrays.update(pool_cluster=pool_cluster, pool_is_rep=pool_is_rep, pool_lengths=lengths,
                   shard_row_offsets=sro, cluster_raw_sizes=raw_sizes)
     for name, arr in arrays.items():
         _save(index_dir / f"{name}.npy", arr)
+    if submembers_tsv is not None:
+        for name, arr in sub_arrays.items():
+            _save(index_dir / f"{name}.npy", arr)
 
     tc = arrays["train_clusters"]
     n_c = arrays["cluster_sizes_filtered"]
     sums = _cluster_length_sums(lengths, arrays["cluster_members"], arrays["cluster_offsets"])
     g2u = arrays["global_to_universe"]
     expected_tokens = float((sums[g2u[tc]] / n_c[tc]).sum())
+    sub_block = None
+    if submembers_tsv is not None:
+        sub_counts["train_subclusters"] = int(
+            np.diff(sub_arrays["cluster_sub_offsets"].astype(np.int64))[g2u[tc]].sum())
+        sub_block = sc.manifest_block(
+            submembers_tsv, subclusters_info, sub_counts,
+            sc.subcluster_digest(*(sub_arrays[k] for k in sc.SUB_ARRAYS)),
+            int(round(expected_tokens)))
+        expected_tokens = sc.expected_tokens_per_pass(
+            lengths, sub_arrays["sub_members"], sub_arrays["sub_offsets"],
+            sub_arrays["cluster_sub_offsets"], g2u[tc])
+        del sub_arrays
     counts.update(pool_rows=n, pool_tokens=int(lengths.sum(dtype=np.int64)), shards=len(sro) - 1,
                   expected_tokens_per_pass=int(round(expected_tokens)),
                   val_rep_tokens=int(lengths[arrays["val_rep_rows"]].sum(dtype=np.int64)))
     manifest = {
         "tool": "nanoplm.data.preparation.cluster_index",
-        "tool_version": TOOL_VERSION,
+        "tool_version": TOOL_VERSION if sub_block is None else TOOL_VERSION_SUBCLUSTERS,
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "level": level,
         "clusters": {"table": str(members_tsv), "hash_function": uh.HASH_NAME,
                      **(clusters_info or {})},
+        **({} if sub_block is None else {"subclusters": sub_block}),
         "pool": {"fasta": str(fasta), "fasta_size_bytes": fasta.stat().st_size,
                  "shards": str(pool_dir)},
         "filter": {"max_seq_len": max_seq_len,
@@ -292,8 +337,9 @@ def build_cluster_index(
                     "drawn_from": "universe-local cluster indices, numpy Generator(PCG64)"
                                   ".choice(replace=False, shuffle=False), sorted"},
         "cap": cap,
-        "sampling": "one visit per train cluster per pass; the member is uniform over all "
-                    "n_c surviving members, representative included",
+        "sampling": ("one visit per train cluster per pass; the member is uniform over all "
+                     "n_c surviving members, representative included") if sub_block is None
+                    else sc.SAMPLING,
         "seconds": round(time.time() - t0, 1),
     }
     _write_json(index_dir / INDEX_MANIFEST, manifest)
@@ -559,5 +605,8 @@ def verify_cluster_index(index_dir: Path, pool_dir: Path) -> dict:
     check("shard_row_offsets_match_the_shards", np.array_equal(sro, sro_shards))
     check("pool_lengths_is_the_concatenated_shard_index", np.array_equal(lengths, lens))
     check("shard_count_below_the_sort_cliff", len(sro) - 1 < SHARD_SORT_CLIFF)
+    if "subclusters" in man or (ix / "sub_members.npy").exists():
+        from nanoplm.data.preparation import subclusters as sc
+        sc.verify_subclusters(ix, man, pc, universe, off, mem, check)
     failures = [k for k, v in checks.items() if not v]
     return {"ok": not failures, "checks": checks, "failures": failures}
