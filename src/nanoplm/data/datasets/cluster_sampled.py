@@ -173,7 +173,8 @@ class ClusterSampledDataset(ShardedDataset):
                 logger.warning(
                     f"{ix}: this index has no UniRef90 sub-clusters, so members are drawn "
                     "uniformly over the whole UniRef50 cluster. Rebuild it: nanoplm data "
-                    f"from-yaml data.yaml {where}.")
+                    f"from-yaml data.yaml {where}; this changes the draw, so a run resumed "
+                    "on the rebuilt index restarts its current pass.")
 
     def _open_subclusters(self, man: dict) -> None:
         """Memory-map the two-level arrays when the index has them (all three, and the

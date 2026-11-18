@@ -100,6 +100,40 @@ def test_uniref100_input(release, tmp_path):
     assert m.cluster_level == "uniref100"
 
 
+# The keys of a cluster dataset's .data_manifest before two-level indexes existed; a
+# one-level build must keep exactly these, so its file and its mixture hash stay the same.
+ONE_LEVEL_KEYS = [
+    "pipeline_mode", "seqs_num", "min_seq_len", "max_seq_len", "val_ratio", "train_dir",
+    "val_dir", "train_sequences", "val_sequences", "num_register_tokens", "created_at",
+    "sharded", "samples_per_shard", "total_train_tokens", "cluster_index_dir",
+    "cluster_level", "pool_sequences", "pool_tokens"]
+
+
+def test_manifest_records_cluster_draw_only_for_a_two_level_index(release, tmp_path):
+    import yaml
+    from nanoplm.data.preparation import cluster_index as ci
+    from nanoplm.data.preparation import uniref_hierarchy as uh
+
+    cfg, m = _prepare(tmp_path, release, level="uniref100")
+    out = cfg.output_dir
+    one = (out / ".data_manifest").read_text()
+    assert m.cluster_draw is None and "cluster_draw" not in one
+    assert list(yaml.safe_load(one)) == ONE_LEVEL_KEYS
+    # same pool and members, now with the UniRef90 sub-cluster table
+    idx = out / "cluster_index"
+    uh.xml_to_members_tsv(release.xml, tmp_path / "m.tsv", "uniref100",
+                          sub_out=tmp_path / "sub.tsv")
+    ci.build_cluster_index(cfg.filtered_fasta, out / "train", idx / "members.tsv",
+                           idx / "index", MAX_LEN, 0.1, level="uniref100",
+                           submembers_tsv=tmp_path / "sub.tsv")
+    m2 = cp.write_cluster_manifest(out, MIN_LEN, MAX_LEN, 0.1, 101)
+    two = yaml.safe_load((out / ".data_manifest").read_text())
+    assert m2.cluster_draw == "two_level" and two["cluster_draw"] == "two_level"
+    assert [k for k in two if k != "cluster_draw"] == ONE_LEVEL_KEYS
+    assert read_manifest(out) == m2
+    assert open_train_dataset(out, m2, seed=0).cluster_draw == "two_level"
+
+
 def test_seqs_num_caps_clusters(release, tmp_path):
     _, m = _prepare(tmp_path, release, seqs_num=120)
     assert m.seqs_num == 120 and m.val_sequences == 12 and m.train_sequences == 108

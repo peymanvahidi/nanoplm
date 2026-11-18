@@ -54,5 +54,6 @@ def cluster_source(root: Path, seed: int = 0, n_small: int = 300, two_level: boo
         val_ratio=0.01, train_dir="train", val_dir="val", train_sequences=n_train,
         val_sequences=7, samples_per_shard=1000, total_train_tokens=n_train * 70,
         cluster_index_dir="cluster_index", cluster_level="uniref90",
-        pool_sequences=len(pool.lengths), pool_tokens=int(pool.lengths.sum())))
+        pool_sequences=len(pool.lengths), pool_tokens=int(pool.lengths.sum()),
+        cluster_draw="two_level" if two_level else None))
     return root, pool

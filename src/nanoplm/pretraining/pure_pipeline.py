@@ -2196,6 +2196,7 @@ def _save_checkpoint(
     model_config=None, manifest=None,
     pretrain_config=None, total_steps=None, warmup_steps=None,
     dataset_fingerprint=None,
+    cluster_draw=None,
     epoch_data_step: Optional[int] = None,
     epoch_sub_batch_step: Optional[int] = None,
     batch_split_divisor: Optional[int] = None,
@@ -2256,6 +2257,8 @@ def _save_checkpoint(
         training_state["warmup_steps"] = warmup_steps
     if dataset_fingerprint is not None:
         training_state["dataset_fingerprint"] = dataset_fingerprint
+    if cluster_draw is not None:
+        training_state["cluster_draw"] = cluster_draw
     if epoch_data_step is not None:
         training_state["epoch_data_step"] = int(epoch_data_step)
     if epoch_sub_batch_step is not None:
@@ -2546,6 +2549,48 @@ def _read_training_state(checkpoint_dir: str) -> dict:
             f"Could not parse training state at {state_path}: {exc}. "
             "The checkpoint may be corrupt (e.g. truncated by a crash mid-write)."
         ) from exc
+
+
+def _draw_text(draw: str) -> str:
+    """A cluster member draw in plain words, for the start-up log."""
+    return ("two-level (UniRef90 sub-cluster, then member)" if draw == "two_level"
+            else "uniform")
+
+
+def _train_cluster_draw(train_ds):
+    """The member draw of a cluster train set ('uniform' / 'two_level'), {source: draw}
+    over the cluster sources of a mixture, None for anything else. Saved in
+    training_state so a resume can say when the draw changed."""
+    if isinstance(train_ds, ClusterSampledDataset):
+        return train_ds.cluster_draw
+    draws = {n: d.cluster_draw for n, d in zip(getattr(train_ds, "names", ()),
+                                                 getattr(train_ds, "datasets", ()))
+             if isinstance(d, ClusterSampledDataset)}
+    return draws or None
+
+
+def _dataset_changed_warning(old_fp: str, new_fp: str, old_draw, new_draw) -> str:
+    """The resume warning for a changed dataset fingerprint. It names a change of the
+    cluster member draw; a checkpoint without ``cluster_draw`` counts as uniform.
+    It only names a change it can know: same shape on both sides (str/str, or a
+    source present in both dicts), or no key in the checkpoint. A str/dict switch
+    or a source missing from the checkpoint's dict says nothing."""
+    msg = (f"Dataset changed since checkpoint (fingerprint {old_fp} → {new_fp}). "
+           "Dataloader will start from batch 0 instead of fast-forwarding.")
+    new = new_draw if isinstance(new_draw, dict) else {None: new_draw}
+    if old_draw is None:                       # no key: everything was uniform
+        old = {name: "uniform" for name in new}
+    elif isinstance(old_draw, dict):
+        old = old_draw if isinstance(new_draw, dict) else {}
+    else:
+        old = {} if isinstance(new_draw, dict) else {None: old_draw}
+    for name, draw in new.items():
+        was = old.get(name)
+        if draw is not None and was is not None and draw != was:
+            of = "" if name is None else f" of {name}"
+            msg += (f" The cluster member draw{of} changed from {was.replace('_', '-')} "
+                    f"to {draw.replace('_', '-')}.")
+    return msg
 
 
 def _first_len_epoch(resume_config) -> int:
@@ -2950,6 +2995,7 @@ def run_pure_pretraining(
             raise FileNotFoundError(f"Shard directory not found: {d}")
 
     train_ds = open_train_dataset(dataset_dir, manifest, seed=pretrain_config.seed)
+    _cluster_draw = _train_cluster_draw(train_ds)
     # A mixture evaluates each source on its own val set (eval_sets); any other dataset
     # keeps one val set and today's eval.
     mixture = MixturePlan.open(dataset_dir, manifest, pretrain_config)
@@ -2959,6 +3005,9 @@ def run_pure_pretraining(
         # path forwards to the dataset
         if not pretrain_config.use_packing:
             raise ValueError(f"{dataset_dir} is a mixture, which needs use_packing=true.")
+        if _cluster_draw:
+            logger.info("Mixture member draw: " + ", ".join(
+                f"{n} {_draw_text(d)}" for n, d in _cluster_draw.items()))
     elif isinstance(train_ds, ClusterSampledDataset):
         # The member draw moves with set_epoch, which only the packing path
         # forwards to the dataset (the non-packing path sets the sampler's epoch
@@ -2969,9 +3018,11 @@ def run_pure_pretraining(
             )
         logger.info(
             "Cluster-sampled train set (%s pool): %d train clusters per pass, one member "
-            "each, drawn with seed %d; pool %d sequences / %d tokens; ~%d tokens per pass",
+            "each, drawn with seed %d; pool %d sequences / %d tokens; ~%d tokens per pass; "
+            "member draw: %s",
             manifest.cluster_level, manifest.train_sequences, pretrain_config.seed,
             manifest.pool_sequences, manifest.pool_tokens, manifest.total_train_tokens,
+            _draw_text(_cluster_draw),
         )
     else:
         logger.info("Using ShardedDataset for pre-tokenized binary shards")
@@ -3650,11 +3701,9 @@ def run_pure_pretraining(
             _ckp_fp = _ckp_state.get("dataset_fingerprint")
             if _ckp_fp is not None and _ckp_fp != _dataset_fingerprint:
                 _dataset_changed = True
-                logger.warning(
-                    f"Dataset changed since checkpoint (fingerprint {_ckp_fp} → "
-                    f"{_dataset_fingerprint}). Dataloader will start from batch 0 "
-                    f"instead of fast-forwarding."
-                )
+                logger.warning(_dataset_changed_warning(
+                    _ckp_fp, _dataset_fingerprint, _ckp_state.get("cluster_draw"),
+                    _cluster_draw))
             elif _ckp_fp is None and is_main:
                 logger.info(
                     "Checkpoint has no dataset fingerprint (pre-upgrade checkpoint). "
@@ -4167,6 +4216,7 @@ def run_pure_pretraining(
             model_config=_model_config, manifest=_manifest, pretrain_config=pretrain_config,
             total_steps=total_steps, warmup_steps=warmup_steps,
             dataset_fingerprint=_dataset_fingerprint,
+            cluster_draw=_cluster_draw,
             tokens_seen=tokens_seen,
             achieved_global_batch_tokens=achieved_global_batch_tokens,
             stable_steps=horizon.stable_steps, decay_steps=horizon.decay_steps,

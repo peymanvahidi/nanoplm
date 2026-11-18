@@ -483,6 +483,7 @@ def test_mixture_over_a_two_level_source(tmp_path):
     a = plain_source(tmp_path / "a", 300, tag=5, seed=1)
     c, _ = cluster_source(tmp_path / "c", seed=3, two_level=True)
     mx.write_mixture(tmp_path, [("a", a, 0.6, "a.fasta"), ("c", c, 0.4, "c.fasta")])
+    assert read_manifest(c).cluster_draw == "two_level"     # the source manifest's key
     mix = open_train_dataset(tmp_path, read_manifest(tmp_path), seed=5)
     assert mix.datasets[1].cluster_draw == "two_level"
     for e in (0, 3):
