@@ -49,16 +49,17 @@ def _save(path: Path, arr) -> None:
         np.save(f, arr)
 
 
-def build_pool(root: Path, seed: int = 0, n_small: int = 1500, n_shards: int = 6) -> Pool:
+def build_pool(root: Path, seed: int = 0, n_small: int = 1500, n_shards: int = 6,
+               special_sizes=SPECIAL_SIZES) -> Pool:
     """Write pool shards and a verified index under ``root``.
 
     Clusters: ``n_small`` with 1..5 members (about half singletons), one of each size
-    in SPECIAL_SIZES, and a few clusters that are NOT in the universe (their rep did
+    in ``special_sizes``, and a few clusters that are NOT in the universe (their rep did
     not survive). Rows are scattered over the pool so no cluster is contiguous.
     """
     rng = np.random.default_rng(seed)
     small = np.where(rng.random(n_small) < 0.5, 1, rng.integers(2, 6, n_small))
-    sizes_u = np.concatenate([small, SPECIAL_SIZES]).astype(np.int64)
+    sizes_u = np.concatenate([small, special_sizes]).astype(np.int64)
     rng.shuffle(sizes_u)
     n_outside = 40
     n_global = len(sizes_u) + n_outside
@@ -101,7 +102,7 @@ def build_pool(root: Path, seed: int = 0, n_small: int = 1500, n_shards: int = 6
     n_u = sizes[universe].astype(np.int64)
     offsets = np.zeros(len(universe) + 1, dtype=np.int64)
     np.cumsum(n_u, out=offsets[1:])
-    # hold out 60 small clusters; the SPECIAL_SIZES ones stay in train for the tests
+    # hold out 60 small clusters; the special_sizes ones stay in train for the tests
     small_local = np.flatnonzero(n_u <= 5)
     val_local = np.sort(rng.choice(small_local, size=60, replace=False))
     in_val = np.zeros(len(universe), dtype=bool)
@@ -121,3 +122,45 @@ def build_pool(root: Path, seed: int = 0, n_small: int = 1500, n_shards: int = 6
     sizes_out = sizes.copy()
     sizes_out[~in_u] = 0
     return Pool(pool_dir, index_dir, labels, sizes_out, train, val, lengths)
+
+
+def random_subclusters(pool: Pool, seed: int = 0) -> np.ndarray:
+    """A pool row -> sub-cluster label map: every cluster's rows split at random into
+    1..n_c sub-clusters of unequal sizes. Labels are global (no label in two clusters)."""
+    rng = np.random.default_rng(seed)
+    n_c = np.bincount(pool.pool_cluster)
+    k = rng.integers(1, n_c + 1)[pool.pool_cluster]          # sub-clusters of the row's cluster
+    local = np.minimum(rng.geometric(0.5, len(k)) - 1, k - 1)  # skewed sizes
+    return pool.pool_cluster.astype(np.int64) * 100_000 + local
+
+
+def write_subclusters(index_dir: Path, sub_of_row: np.ndarray,
+                      manifest_extra: dict | None = None) -> str:
+    """Add the two-level arrays and the manifest's ``subclusters`` block to an index
+    written by build_pool, by brute force from ``sub_of_row`` (pool row -> sub-cluster
+    label; a label must lie inside one cluster). Returns the digest written."""
+    off = np.load(index_dir / "cluster_offsets.npy")
+    mem = np.load(index_dir / "cluster_members.npy")
+    sub_members, sub_sizes, per_cluster = [], [], []
+    for u in range(len(off) - 1):
+        rows = np.sort(mem[off[u]:off[u + 1]])
+        groups = {}
+        for r in rows.tolist():                       # ascending: first row first
+            groups.setdefault(int(sub_of_row[r]), []).append(r)
+        for g in groups.values():                     # dict order = order of first row
+            sub_members += g
+            sub_sizes.append(len(g))
+        per_cluster.append(len(groups))
+    sm = np.asarray(sub_members, dtype=np.int32)
+    so = np.concatenate([[0], np.cumsum(sub_sizes)]).astype(np.uint32)
+    cso = np.concatenate([[0], np.cumsum(per_cluster)]).astype(np.uint32)
+    h = hashlib.sha256()
+    for name, a in (("sub_members", sm), ("sub_offsets", so), ("cluster_sub_offsets", cso)):
+        _save(index_dir / f"{name}.npy", a)
+        h.update(name.encode() + a.tobytes())
+    digest = "sha256:" + h.hexdigest()
+    man_path = index_dir / "pool_manifest.json"
+    man = json.loads(man_path.read_text())
+    man.update(tool_version=2, subclusters={"digest": digest}, **(manifest_extra or {}))
+    man_path.write_text(json.dumps(man))
+    return digest

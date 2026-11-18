@@ -7,7 +7,7 @@ import numpy as np
 
 from nanoplm.data.infra.manifest import PretrainManifest, write_manifest
 
-from tests.data.datasets.cluster_pool import build_pool
+from tests.data.datasets.cluster_pool import build_pool, random_subclusters, write_subclusters
 
 
 def write_shards(folder: Path, lengths, seed: int, tag: int) -> None:
@@ -41,10 +41,12 @@ def plain_source(root: Path, n_train: int, tag: int, seed: int = 0, n_val: int =
     return root
 
 
-def cluster_source(root: Path, seed: int = 0, n_small: int = 300):
+def cluster_source(root: Path, seed: int = 0, n_small: int = 300, two_level: bool = False):
     """A cluster-sampled source (build_pool's pool and index) with a manifest; returns
-    (folder, pool)."""
+    (folder, pool). ``two_level`` adds random sub-clusters to the index."""
     pool = build_pool(root, seed=seed, n_small=n_small, n_shards=3)
+    if two_level:
+        write_subclusters(pool.index_dir, random_subclusters(pool, seed))
     write_shards(root / "val", [20] * 7, seed + 5, 3)
     n_train = len(pool.train_clusters)
     write_manifest(root, PretrainManifest(
