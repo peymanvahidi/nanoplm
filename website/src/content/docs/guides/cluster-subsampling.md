@@ -31,11 +31,12 @@ sources:
     cluster_subsampling:
       members: uniref90  # train on these sequences; leave out to use this fasta
       clusters: uniprot  # uniprot, headers (CL: tags in the FASTA headers), mmseqs2 (slow: hours), or a .tsv of representative<TAB>member
+      # uniref100 members are drawn through their UniRef90 sub-cluster: a sub-cluster first, then a member in it
 ```
 
 nanoPLM downloads `uniref90.fasta.gz` and `uniref50.xml.gz`, the file that lists each cluster's members. It never downloads the UniRef50 FASTA itself.
 
-- [`members`](/nanoplm/reference/data/#data-cluster_subsampling-members) names the sequences that training draws from. Leave it out to use the source's own `fasta`. `uniref90` and `uniref100` are shortcuts for UniProt's files. A URL or path must be a UniRef90 or UniRef100 FASTA.
+- [`members`](/nanoplm/reference/data/#data-cluster_subsampling-members) names the sequences that training draws from. Leave it out to use the source's own `fasta`. `uniref90` and `uniref100` are shortcuts for UniProt's files. `uniref100` members are drawn through their UniRef90 cluster: see [Two-level draw](#two-level-draw-for-uniref100-members). A URL or path must be a UniRef90 or UniRef100 FASTA.
 - [`clusters`](/nanoplm/reference/data/#data-cluster_subsampling-clusters) says where the clusters come from. It is required and has no default. See [Where the clusters come from](#where-the-clusters-come-from). Older configs call it `clustering`; that still works, and `from-yaml` asks you to rename it.
 - [`identity`](/nanoplm/reference/data/#data-cluster_subsampling-identity) and [`coverage`](/nanoplm/reference/data/#data-cluster_subsampling-coverage) only apply when MMseqs2 makes the clusters. Setting them to other values with another cluster source is an error.
 
@@ -154,6 +155,60 @@ sources:
 
 Whichever source the clusters come from, nanoPLM writes them to one table, `output_dir/cluster_index/members.tsv`, with one `cluster_id<TAB>sequence_id` line per member and the representative first.
 
+## Two-level draw for UniRef100 members
+
+With `clusters: uniprot` and `members: uniref100`, the members of a UniRef50 cluster are grouped one level further, by their UniRef90 cluster. Such a group is a **sub-cluster**. Each epoch, a cluster first picks one of its sub-clusters, each with the same chance, then one member inside it, again each with the same chance.
+
+Before, the draw was one pick over all UniRef100 members of the cluster. A sub-cluster with many near-identical sequences was then drawn far more often than a sub-cluster with one. For example:
+
+```text
+UniRef50 cluster, 501 UniRef100 members
+├── UniRef90 sub-cluster A: 500 members
+└── UniRef90 sub-cluster B: 1 member
+```
+
+| Chance per epoch | One pick over all members (before) | Two levels (now) |
+| --- | --- | --- |
+| the member of B | 1 in 501 (0.2%) | 1 in 2 (50%) |
+| one member of A | 1 in 501 (0.2%) | 1 in 1,000 (0.1%) |
+
+There is nothing to configure. `uniref50.xml.gz`, which the build already downloads, lists each member's UniRef90 cluster. The `cluster_members` stage writes these sub-clusters to a second table, `cluster_index/submembers.tsv` (`subcluster_id<TAB>sequence_id`), and `cluster_index` adds them to the index. The dataset's `.data_manifest` then says `cluster_draw: two_level`, and the training log says `member draw two_level`.
+
+On UniRef50 clusters with UniRef100 members (release 2026_03, 20-2048 residues):
+
+- 30.1% of the training clusters have more than one sub-cluster. They hold 86.6% of the members.
+- The chances change in 12.7% of the draws of an epoch. The other clusters have one sub-cluster, or sub-clusters of equal size, so their draw is the same as before.
+- Tokens per epoch rise by 0.08%. Token budgets need no change.
+
+Where it applies:
+
+| Source | Draw |
+| --- | --- |
+| `clusters: uniprot`, `members: uniref100` | two levels |
+| `clusters: uniprot`, `members: uniref90` | one level: the members are UniRef90 sequences, and there is nothing below them |
+| `headers`, `mmseqs2` or a `.tsv` file | one level, every member with the same chance |
+
+### A dataset built before sub-clusters
+
+An index built before this has no sub-clusters. Training on it keeps the old draw, one pick over all members, and warns once at the start:
+
+```text
+.../cluster_index/index: this index has no UniRef90 sub-clusters, so members are drawn uniformly over the whole UniRef50 cluster. Rebuild it: nanoplm data from-yaml data.yaml in /work/data_uniref50_u100; this changes the draw, so a run resumed on the rebuilt index restarts its current pass.
+```
+
+To add the sub-clusters, run `nanoplm data from-yaml data.yaml` again in the same folder. It reruns `cluster_members` and `cluster_index`. It also reruns `cluster_pool` (about 5 min) and the manifest stage (in a mix, also `count`, `val_split` and the mixture manifest), because their code changed; `train/` and `val/` come out the same. Nothing is downloaded again. In a mix, run it on the mix's `data.yaml`. On UniRef50 with UniRef100 members it costs about 12 GB more disk (20-2048 residues):
+
+| | Without sub-clusters | With sub-clusters |
+| --- | --- | --- |
+| `cluster_members` (XML scan) | about 5 min | 7-8 min |
+| `cluster_index` | about 12 min | about 16 min |
+| `submembers.tsv` | none | about 9 GB |
+| index arrays | 4.1 GB | 6.5 GB (+2.4 GB) |
+
+The rebuild changes the dataset fingerprint, a hash of the training data that checkpoints store. A run resumed on the rebuilt index restarts its current epoch from the start, with a warning; see [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/#resume-a-run-that-died). To keep the old draw, for runs in progress or for a comparison, build the new dataset in a new folder instead.
+
+Switching a source's `members` from `uniref100` back to `uniref90` leaves the old `submembers.tsv` (about 9 GB) on disk; you can delete it.
+
 ## Read the table
 
 `from-yaml` prints a table before any stage runs ([columns explained here](/nanoplm/pipeline/data/#read-the-table-before-the-run)). With cluster subsampling, it also lists the cluster file, where the clusters come from and what the source trains on. For the UniRef example above:
@@ -212,7 +267,7 @@ Measured on UniProt release 2026_03 on a login node, in decimal GB.
 | **Total disk** | **about 182 GB** | **about 330 GB** |
 | Needed for training | about 27 GB (`train/`, `cluster_index/`, `val/`) | about 50 GB |
 
-The total assumes DVC's linked cache, the default in a new folder (see [Disk use and the DVC cache](/nanoplm/pipeline/data/#disk-use-and-the-dvc-cache)). With a copy cache it is about 343 GB and 640 GB. On a busy GPFS file system, a first run takes 15-50 min longer while DVC hashes the outputs.
+The total assumes DVC's linked cache, the default in a new folder (see [Disk use and the DVC cache](/nanoplm/pipeline/data/#disk-use-and-the-dvc-cache)). With a copy cache it is about 343 GB and 640 GB. The UniRef100 column is without sub-clusters; they add about 11 GB and 7 min (see [Two-level draw](#two-level-draw-for-uniref100-members)). On a busy GPFS file system, a first run takes 15-50 min longer while DVC hashes the outputs.
 
 nanoPLM downloads `uniref50.xml.gz` once into `output_dir/downloads/` and keeps it, even after a new UniProt release. If the members FASTA and the XML come from different UniProt releases, the `cluster_index` stage fails with an error that names the XML. Delete the XML so the next run downloads the current one.
 

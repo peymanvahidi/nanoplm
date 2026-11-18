@@ -67,7 +67,7 @@ A mix also has these rules:
 
 ### With cluster subsampling
 
-This mix trains on one UniRef90 member of each UniRef50 cluster per epoch. See [cluster subsampling](/nanoplm/guides/cluster-subsampling/).
+This mix trains on one UniRef90 member of each UniRef50 cluster per epoch. With `members: uniref100`, a cluster first picks one of its UniRef90 sub-clusters and then a UniRef100 member inside it (see [two-level draw](/nanoplm/guides/cluster-subsampling/#two-level-draw-for-uniref100-members)). See [cluster subsampling](/nanoplm/guides/cluster-subsampling/).
 
 ```yaml title="data.yaml"
 output_dir: "output/data/pretrain_data"

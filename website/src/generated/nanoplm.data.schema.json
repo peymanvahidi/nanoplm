@@ -44,7 +44,7 @@
                   "null"
                 ],
                 "default": null,
-                "description": "The sequences training draws from: uniref90, uniref100, or a UniRef90/100 FASTA URL/path. Leave it out to use this source's fasta."
+                "description": "The sequences training draws from: uniref90, uniref100, or a UniRef90/100 FASTA URL/path. Leave it out to use this source's fasta. With clusters: uniprot, uniref100 members are drawn through their UniRef90 sub-cluster: a sub-cluster first, then a member in it."
               },
               "clusters": {
                 "type": "string",
