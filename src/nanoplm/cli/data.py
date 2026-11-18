@@ -863,6 +863,8 @@ def cluster_pool(input, output, max_seq_len, samples_per_shard, register_tokens,
 
 @data.command("cluster-index", hidden=True)
 @click.option("--members-tsv", required=True, type=click.Path(exists=True, dir_okay=False))
+@click.option("--submembers-tsv", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="The sub-cluster table (same format): a two-level index.")
 @click.option("--fasta", required=True, type=click.Path(exists=True, dir_okay=False))
 @click.option("--pool", required=True, type=click.Path(exists=True, file_okay=False))
 @click.option("--index-dir", required=True, type=click.Path(file_okay=False))
@@ -878,9 +880,9 @@ def cluster_pool(input, output, max_seq_len, samples_per_shard, register_tokens,
               help="The UniProt XML members.tsv came from, named in a release-mismatch error.")
 @click.option("--seed", type=int, default=HOLDOUT_SEED, show_default=True,
               help="Seed of the val cluster draw and the --seqs-num cap (data.yaml shuffle_seed).")
-def cluster_index_cmd(members_tsv, fasta, pool, index_dir, val_dir, max_seq_len, val_ratio,
-                      val_count_file, samples_per_shard, seqs_num, register_tokens, cluster_xml,
-                      seed):
+def cluster_index_cmd(members_tsv, submembers_tsv, fasta, pool, index_dir, val_dir,
+                      max_seq_len, val_ratio, val_count_file, samples_per_shard, seqs_num,
+                      register_tokens, cluster_xml, seed):
     """Internal: build the cluster index and the validation gathers."""
     from nanoplm.data.preparation.cluster_pipeline import build_index_and_val
     if (val_ratio is None) == (val_count_file is None):
@@ -892,7 +894,8 @@ def cluster_index_cmd(members_tsv, fasta, pool, index_dir, val_dir, max_seq_len,
     man = build_index_and_val(Path(fasta), Path(pool), Path(members_tsv), Path(index_dir),
                               Path(val_dir), max_seq_len, val_ratio, samples_per_shard,
                               seqs_num, register_tokens, holdout_seed=seed,
-                              cluster_xml=Path(cluster_xml) if cluster_xml else None)
+                              cluster_xml=Path(cluster_xml) if cluster_xml else None,
+                              submembers_tsv=Path(submembers_tsv) if submembers_tsv else None)
     c = man["counts"]
     if want is not None and (c["val_clusters"], c["clusters_in_universe"]) != (
             want["val"], want["units"]):

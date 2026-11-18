@@ -464,6 +464,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     }
     tsv = str(plan.members_tsv)
     info = str(plan.members_tsv.with_suffix(".json"))
+    # UniRef100 members: the XML scan also writes their UniRef90 sub-clusters
+    sub = str(plan.submembers_tsv) if plan.submembers_tsv else None
     # cluster_table.build_members_table runs this stage; an edit elsewhere in the cluster
     # prep code must not rerun the XML scan or MMseqs2
     members_deps = [filtered, dep("src/nanoplm/data/preparation/cluster_table.py")]
@@ -510,6 +512,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
         # the unfiltered one keeps a min/max_seq_len change from rerunning the XML scan
         cmd = (f"nanoplm data cluster-members --source uniref_xml --level {plan.members_level} "
                f"--fasta {members_fasta} --xml {xml} -o {tsv}")
+        if sub:
+            cmd += f" --sub-out {sub}"
         members_deps[0] = members_fasta
         members_deps += [xml, dep("src/nanoplm/data/preparation/uniref_hierarchy.py")]
     else:
@@ -521,7 +525,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                f"--coverage {value('coverage')} "
                f"--tmp-dir {plan.mmseqs_tmp} -o {tsv}")
         members_params += [f"{block_key}.{k}" for k in ("identity", "coverage") if changed(k)]
-    stages["cluster_members"] = {"cmd": cmd, "deps": members_deps, "outs": [tsv, info]}
+    stages["cluster_members"] = {"cmd": cmd, "deps": members_deps,
+                                 "outs": [tsv, info] + ([sub] if sub else [])}
     if members_params:
         stages["cluster_members"]["params"] = [{params_filename: members_params}]
     if src.val_from_split:
@@ -534,7 +539,8 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
     index_dir = str(plan.index_dir)
     stages["cluster_index"] = {
         "cmd": (f"nanoplm data cluster-index --members-tsv {tsv} "
-                f"--fasta {filtered} --pool {out}/train "
+                + (f"--submembers-tsv {sub} " if sub else "")
+                + f"--fasta {filtered} --pool {out}/train "
                 f"--index-dir {index_dir} --val-dir {out}/val "
                 f"--max-seq-len {ref('max_seq_len')} {_val_arg(src)} "
                 f"--samples-per-shard {ref('samples_per_shard')} "
@@ -543,12 +549,15 @@ def _cluster_stages(src: Source, plan, params_filename: str) -> dict:
                 f"--seed {ref('shuffle_seed')}"
                 + (f" --cluster-xml {plan.xml_path}" if plan.xml_path else "")),
         # build_index_and_val runs it; cluster_index reads members.tsv with
-        # cluster_table and hashes accessions with uniref_hierarchy
-        "deps": [tsv, info, filtered, f"{out}/train",
+        # cluster_table and hashes accessions with uniref_hierarchy (and builds the
+        # sub-cluster arrays with subclusters)
+        "deps": [tsv, info, *([sub] if sub else []), filtered, f"{out}/train",
                  dep("src/nanoplm/data/preparation/cluster_pipeline.py"),
                  dep("src/nanoplm/data/preparation/cluster_index.py"),
                  dep("src/nanoplm/data/preparation/cluster_table.py"),
-                 dep("src/nanoplm/data/preparation/uniref_hierarchy.py")] + _val_deps(src),
+                 dep("src/nanoplm/data/preparation/uniref_hierarchy.py")]
+                + ([dep("src/nanoplm/data/preparation/subclusters.py")] if sub else [])
+                + _val_deps(src),
         **_params(params_filename, [key("max_seq_len"), *_val_key(src),
                                       key("samples_per_shard"), key("max_seqs"),
                                       key("register_tokens"), key("shuffle_seed")]),

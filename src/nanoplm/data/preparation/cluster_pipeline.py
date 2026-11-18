@@ -10,6 +10,7 @@ Stages (``nanoplm data from-yaml`` runs them as DVC stages; see _dvc_yaml_gen):
   get_cluster_xml        uniref50.xml.gz (UniProt clusters only)
   cluster_members        cluster_index/members.tsv from the XML or MMseqs2
                          (cluster_table.build_members_table)
+                         (+ submembers.tsv with UniRef100 members)
   cluster_index          cluster_index/index/ arrays and val/ (held-out reps)
   write_manifest         .data_manifest with cluster_index_dir
 
@@ -95,6 +96,8 @@ def build_index_and_val(filtered_fasta: Path, pool_dir: Path, members_tsv: Path,
                                              "coverage", "cov_mode") if k in info},
         cluster_xml=str(cluster_xml) if cluster_xml else None,
         submembers_tsv=submembers_tsv,
+        # the members table's source labels the sub-cluster table too: for uniprot
+        # sources both come from the same XML
         subclusters_info=({"source": info["source"]} if submembers_tsv and "source" in info
                           else None))
     rep = np.load(Path(index_dir) / "val_rep_rows.npy")
