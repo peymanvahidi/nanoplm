@@ -2158,19 +2158,26 @@ def _rescale_resume_data_step(
         what.append(f"{int(saved_world_size)} -> {int(world_size)} GPUs")
     if _differs(saved_num_workers, num_workers):
         what.append(f"num_workers {int(saved_num_workers)} -> {int(num_workers)}")
+    frac = ""
     if saved_len is not None and pass_len is not None:
         if _differs(saved_len, pass_len):
             what.append(f"pass length {int(saved_len)} -> {int(pass_len)} micro-steps")
         new_step = int(round(data_step * int(pass_len) / int(saved_len)))
+        frac = f"{100.0 * data_step / int(saved_len):.1f}% of the pass"
+        same = "the position in the pass is the same"
     else:
         new_step = int(round(data_step * int(saved_world_size) / int(world_size)))
+        same = "the position in the pass is about the same"
     if new_step == data_step:
-        pos = f"data position kept at micro-step {data_step}"
+        pos = f"the data position is kept at micro-step {data_step}"
+        pos += f", {frac}." if frac else "."
     else:
-        pos = f"data position rescaled from micro-step {data_step} to {new_step}"
+        pos = f"the data position moves from micro-step {data_step} to {new_step}"
+        pos += f", still {frac}." if frac else ", scaled by the GPU ratio."
+        pos += f" A pass has a different number of steps on this layout; {same}."
     return new_step, True, [
-        f"Resumed with a different data layout ({', '.join(what)}): {pos}. "
-        f"Within this pass a little data may repeat or be skipped."
+        f"Resumed with a different data layout ({', '.join(what)}): {pos} "
+        f"A little data may repeat or be skipped within this pass."
     ]
 
 

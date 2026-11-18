@@ -32,7 +32,8 @@ def test_scale_up_halves_position():
     assert step == round(101 * 16 / 32) and changed
     assert len(warns) == 1
     assert "16 -> 32 GPUs" in warns[0]
-    assert "may repeat or be skipped" in warns[0]
+    assert "moves from micro-step 101 to 50, scaled by the GPU ratio." in warns[0]
+    assert "%" not in warns[0] and "may repeat or be skipped" in warns[0]
 
 
 def test_scale_down_doubles_position():
@@ -51,6 +52,8 @@ def test_pass_fraction_and_pass_end():
     step, changed, warns = _rescale_resume_data_step(413, 16, 8, 4, 4, 826, 1654)
     assert (step, changed) == (827, True) and len(warns) == 1
     assert "16 -> 8 GPUs" in warns[0] and "pass length 826 -> 1654" in warns[0]
+    assert "moves from micro-step 413 to 827, still 50.0% of the pass." in warns[0]
+    assert "the position in the pass is the same" in warns[0]
     # A finished pass maps to the end of the new pass: next pass, no message.
     assert _rescale_resume_data_step(826, 16, 8, 4, 4, 826, 1654) == (1654, True, [])
     step, _, _ = _rescale_resume_data_step(825, 16, 32, 4, 4, 826, 409)
@@ -79,8 +82,8 @@ def test_num_workers_only_change_sets_layout_changed():
 def test_unchanged_step_says_kept():
     step, changed, warns = _rescale_resume_data_step(100, 16, 16, 4, 8, 826, 826)
     assert (step, changed) == (100, True) and len(warns) == 1
-    assert "data position kept at micro-step 100" in warns[0]
-    assert "rescaled" not in warns[0] and "may repeat or be skipped" in warns[0]
+    assert "data position is kept at micro-step 100, 12.1% of the pass." in warns[0]
+    assert "moves" not in warns[0] and "may repeat or be skipped" in warns[0]
 
 
 def test_training_state_saves_world_size_and_num_workers(tmp_path):
