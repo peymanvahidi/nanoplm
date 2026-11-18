@@ -4,6 +4,7 @@ Same outer behavior as the HF Trainer pipeline (datasets, run naming,
 checkpoint layout, resume mechanics), but the training loop is plain torch.
 """
 
+import functools
 import gc
 import json
 import math
@@ -57,7 +58,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
 
 from nanoplm.data.infra.manifest import validate_manifest_for_pipeline, DataManifest
@@ -160,6 +161,25 @@ def _set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+_RANK_SEED_STRIDE = 1_000_003  # prime; above any worker count; 128 ranks stay far below 2**32
+
+
+def _seed_worker_for_rank(rank: int, worker_id: int) -> None:
+    """Give this rank's DataLoader workers their own RNG streams (the MLM masks).
+
+    PyTorch seeds worker i with base_seed + i, and base_seed is the same on
+    every rank (same _set_seed, same restored checkpoint RNG), so the first
+    batch of each worker would draw the same mask positions on all ranks.
+    Rank 0 keeps PyTorch's seeding, so single-GPU runs are unchanged.
+    """
+    if rank == 0:
+        return
+    seed = (get_worker_info().seed + rank * _RANK_SEED_STRIDE) % 2**32
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -3441,10 +3461,13 @@ def run_pure_pretraining(
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
     )
+    # Train workers only: per-rank mask streams. Eval masks must not change.
+    train_worker_init = functools.partial(
+        _seed_worker_for_rank, dist.get_rank() if distributed and dist.is_initialized() else 0)
     if use_packing:
-        train_loader = DataLoader(train_ds, batch_size=None, collate_fn=collator, **dl_kwargs)
+        train_loader = DataLoader(train_ds, batch_size=None, collate_fn=collator, worker_init_fn=train_worker_init, **dl_kwargs)
     else:
-        train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=collator, drop_last=False, **dl_kwargs)
+        train_loader = DataLoader(train_ds, sampler=train_sampler, batch_size=pretrain_config.micro_batch_seqs, collate_fn=collator, drop_last=False, worker_init_fn=train_worker_init, **dl_kwargs)
     if mixture:
         from nanoplm.data.infra.mixture import eval_workers
         eval_loader = None
