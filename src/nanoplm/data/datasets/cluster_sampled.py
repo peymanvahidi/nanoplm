@@ -192,13 +192,29 @@ class ClusterSampledDataset(ShardedDataset):
         u = int(self._g2u[c])
         return int(self._off[u + 1]) - int(self._off[u])
 
-    def pool_row(self, idx: int) -> int:
-        """Pool row visited at position idx in the current epoch."""
-        c = int(self._tc[idx])
+    # ---- the member draw: every path below goes through these two -------------
+    def _draw_row(self, cluster: int, pass_idx: int) -> int:
+        """Pool row cluster ``cluster`` (a global cluster id) gives in pass ``pass_idx``."""
+        c = int(cluster)
         u = int(self._g2u[c])
         start = int(self._off[u])
-        slot = member_slot(self.seed, c, self._epoch, int(self._off[u + 1]) - start)
+        slot = member_slot(self.seed, c, int(pass_idx), int(self._off[u + 1]) - start)
         return int(self._members[start + slot])
+
+    def _draw_rows(self, clusters: np.ndarray, passes) -> np.ndarray:
+        """Vectorized ``_draw_row``: pool row of each cluster in ``clusters`` (global
+        ids) at ``passes`` (one int or an array broadcast against ``clusters``). The
+        result has ``cluster_members.npy``'s dtype."""
+        tc = np.asarray(clusters)
+        uloc = np.asarray(self._g2u[tc], dtype=np.int64)
+        start = np.asarray(self._off[uloc], dtype=np.int64)
+        size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
+        slot = member_slots_vec(self.seed, tc, passes, size)
+        return np.asarray(self._members[start + slot])
+
+    def pool_row(self, idx: int) -> int:
+        """Pool row visited at position idx in the current epoch."""
+        return self._draw_row(self._tc[idx], self._epoch)
 
     def rows_for_epoch(self, epoch: Optional[int] = None) -> np.ndarray:
         """Pool row of every train position at ``epoch`` (default: the current one)."""
@@ -206,9 +222,7 @@ class ClusterSampledDataset(ShardedDataset):
         out = np.empty(self._n, dtype=np.int64)
         for a in range(0, self._n, VEC_CHUNK):
             b = min(a + VEC_CHUNK, self._n)
-            start, size = self._segments(a, b)
-            slot = member_slots_vec(self.seed, np.asarray(self._tc[a:b]), e, size)
-            out[a:b] = self._members[start + slot]
+            out[a:b] = self._draw_rows(self._tc[a:b], e)
         return out
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -219,11 +233,7 @@ class ClusterSampledDataset(ShardedDataset):
     def item_at(self, idx: int, epoch: int) -> Dict[str, torch.Tensor]:
         """Position ``idx`` with the member of pass ``epoch``, whatever the current epoch
         is. A mixture keeps one pass counter per source and reads through this."""
-        c = int(self._tc[idx])
-        u = int(self._g2u[c])
-        start = int(self._off[u])
-        slot = member_slot(self.seed, c, int(epoch), int(self._off[u + 1]) - start)
-        return self.read_pool_row(int(self._members[start + slot]))
+        return self.read_pool_row(self._draw_row(self._tc[idx], epoch))
 
     def lengths_at(self, idx: np.ndarray, epochs: np.ndarray) -> np.ndarray:
         """Token count of the member position ``idx[i]`` gives in pass ``epochs[i]``."""
@@ -232,23 +242,14 @@ class ClusterSampledDataset(ShardedDataset):
         lengths = self.pool_lengths()
         for a in range(0, len(idx), VEC_CHUNK):
             b = min(a + VEC_CHUNK, len(idx))
-            tc = np.asarray(self._tc[idx[a:b]])
-            uloc = np.asarray(self._g2u[tc], dtype=np.int64)
-            start = np.asarray(self._off[uloc], dtype=np.int64)
-            size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
-            slot = member_slots_vec(self.seed, tc, np.asarray(epochs)[a:b], size)
-            out[a:b] = lengths[self._members[start + slot]]
+            rows = self._draw_rows(self._tc[idx[a:b]], np.asarray(epochs)[a:b])
+            out[a:b] = lengths[rows]
         return out
 
     def rows_at(self, idx: np.ndarray, epochs) -> np.ndarray:
         """Pool row the member position ``idx[i]`` gives in pass ``epochs[i]`` (or one
         pass for all)."""
-        tc = np.asarray(self._tc[np.asarray(idx, dtype=np.int64)])
-        uloc = np.asarray(self._g2u[tc], dtype=np.int64)
-        start = np.asarray(self._off[uloc], dtype=np.int64)
-        size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
-        slot = member_slots_vec(self.seed, tc, epochs, size)
-        return np.asarray(self._members[start + slot])
+        return self._draw_rows(self._tc[np.asarray(idx, dtype=np.int64)], epochs)
 
     def read_pool_row(self, row: int) -> Dict[str, torch.Tensor]:
         """Pool row ``row``, read the way ShardedDataset.__getitem__ reads its rows.
