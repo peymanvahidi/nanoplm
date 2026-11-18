@@ -269,3 +269,39 @@ def test_members_json_is_the_same_after_an_identical_rebuild(release, tmp_path, 
         a, b = first.with_suffix(".json"), second.with_suffix(".json")
         assert a.read_bytes() == b.read_bytes()
         assert not {"seconds", "input"} & set(json.loads(a.read_text()))
+
+
+def test_cluster_members_sub_out(release, tmp_path):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    base = ["cluster-members", "--source", "uniref_xml", "--xml", str(release.xml)]
+    r = CliRunner().invoke(data, base + ["--fasta", str(release.fasta100), "--level", "uniref100",
+                                         "-o", str(tmp_path / "m.tsv"),
+                                         "--sub-out", str(tmp_path / "s.tsv")])
+    assert r.exit_code == 0, r.output
+    assert "UniRef90 sub-clusters" in r.output
+    assert len(ct.read_members_table(tmp_path / "s.tsv").sizes) == len(release.u90)
+    r = CliRunner().invoke(data, base + ["--fasta", str(release.fasta90), "--level", "uniref90",
+                                         "-o", str(tmp_path / "m90.tsv"),
+                                         "--sub-out", str(tmp_path / "s90.tsv")])
+    assert r.exit_code != 0 and "--sub-out needs" in r.output
+    assert not (tmp_path / "m90.tsv").exists()
+
+
+def test_cluster_members_sub_out_must_differ_from_output(release, tmp_path):
+    from click.testing import CliRunner
+    from nanoplm.cli.data import data
+    (tmp_path / "d").mkdir()
+    r = CliRunner().invoke(data, ["cluster-members", "--source", "uniref_xml",
+                                  "--xml", str(release.xml), "--fasta", str(release.fasta100),
+                                  "--level", "uniref100", "-o", str(tmp_path / "m.tsv"),
+                                  "--sub-out", str(tmp_path / "d" / ".." / "m.tsv")])
+    assert r.exit_code != 0 and "--sub-out must differ" in r.output
+    assert not (tmp_path / "m.tsv").exists()
+
+
+def test_sub_out_needs_the_uniref_xml_source(release, tmp_path):
+    with pytest.raises(ValueError, match="only from the uniref_xml source, not 'mmseqs'"):
+        build_members_table("mmseqs", tmp_path / "m.tsv", fasta=release.fasta100,
+                            sub_out=tmp_path / "s.tsv")
+    assert not (tmp_path / "m.tsv").exists() and not (tmp_path / "s.tsv").exists()

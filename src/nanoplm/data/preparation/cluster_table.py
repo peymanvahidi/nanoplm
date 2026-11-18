@@ -270,20 +270,25 @@ VOLATILE_STATS = ("input", "seconds")
 def build_members_table(source: str, out_tsv: Path, *, fasta: Path, level: Optional[str] = None,
                         xml: Optional[Path] = None, identity: float = 0.5,
                         coverage: float = 0.8, tmp_dir: Optional[Path] = None,
-                        mmseqs: Optional[str] = None, threads: Optional[int] = None) -> dict:
+                        mmseqs: Optional[str] = None, threads: Optional[int] = None,
+                        sub_out: Optional[Path] = None) -> dict:
     """members.tsv (and members.json, its stats) from one of the two sources. ``fasta``
     is the member FASTA (filtered for mmseqs; any of them for the uniref_xml level check).
 
     members.json is a DVC output that cluster_index depends on, so it holds only what
     the table is: no timing and no input path, which would rerun cluster_index after an
-    identical rebuild. The timing goes to the log."""
+    identical rebuild. The timing goes to the log. ``sub_out`` (uniref_xml at level
+    uniref100 only) also writes the UniRef90 sub-cluster table there."""
     out_tsv = Path(out_tsv)
     if source == "uniref_xml":
         got = detect_uniref_level(Path(fasta))
         if got != level:
             raise ValueError(f"{fasta} holds {got} sequences, but the plan expects {level}; "
                              "check cluster_subsampling.members and fasta")
-        stats = uh.xml_to_members_tsv(xml, out_tsv, level)
+        stats = uh.xml_to_members_tsv(xml, out_tsv, level, sub_out=sub_out)
+    elif sub_out is not None:
+        raise ValueError(f"a sub-cluster table (sub_out) comes only from the uniref_xml "
+                         f"source, not {source!r}")
     elif source == "mmseqs":
         stats = mmseqs_members_tsv(fasta, out_tsv, identity, coverage,
                                    tmp_dir or out_tsv.parent / ".mmseqs_tmp",

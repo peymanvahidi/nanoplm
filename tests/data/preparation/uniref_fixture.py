@@ -29,6 +29,7 @@ class Release:
     u90: dict = field(default_factory=dict)
     u100: dict = field(default_factory=dict)
     cluster_ids: list = field(default_factory=list)
+    sub90: dict = field(default_factory=dict)     # UniRef100 accession -> its UniRef90's
     literal_differs: int = 0
 
 
@@ -108,6 +109,7 @@ def make_release(root: Path, n_clusters: int = 400, seed: int = 3) -> Release:
             for j, acc100 in enumerate(u100s):
                 seq100 = seq90 if j == 0 else _seq(rng, _length(rng))
                 rel.u100[acc100] = (c, i == 0 and j == 0, seq100)
+                rel.sub90[acc100] = acc90
                 u100_records.append((f"UniRef100_{acc100}", "Test n=1 Tax=X", seq100))
         lines += ['<sequence length="3">MKV</sequence>', "</entry>"]
         entries.append("\n".join(lines) + "\n")

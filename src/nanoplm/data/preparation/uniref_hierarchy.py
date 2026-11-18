@@ -15,6 +15,13 @@ Representatives:
              val clusters as the UniRef90 build of the same release. If the entry has no
              such UniRef100 id, the literal representativeMember's id is used and counted.
 
+With ``sub_out`` (UniRef100 level only) the same scan also writes ``submembers.tsv``,
+the UniRef90 sub-cluster of every UniRef100 member in the same canonical format:
+``UniRef90_X<TAB>UniRef100_Y``, grouped by UniRef90 id (first appearance inside the
+entry, members in XML order). Every member record lists its UniRef100 id and, on the
+next line, its UniRef90 id; the scan fails if the two do not alternate, if one
+UniRef100 id sits under two UniRef90 ids, or if one UniRef90 id appears in two entries.
+
 An entry with no or two representative blocks, or a member id before the
 representative block, fails loudly. The 64-bit accession hash used for joins
 (FNV-1a-64 + murmur3 fmix64) lives here too.
@@ -31,6 +38,7 @@ import shutil
 import subprocess
 import threading
 import time
+from array import array
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -55,6 +63,7 @@ U100_PREFIX = U100_GREP + b"UniRef100_"
 REP_OPEN = b"<representativeMember>"
 REP_CLOSE = b"</representativeMember>"
 ROOT_CLOSE = b"</UniRef50>"
+RECORD_OPEN = b"<dbReference "   # starts every member / representative record
 QUOTE = 0x22
 READ_BLOCK = 1 << 22
 
@@ -142,16 +151,19 @@ def hash_strings(accs, salt: int = 0) -> np.ndarray:
 # --------------------------------------------------------- the filtered stream
 
 
-def _patterns(level: str) -> list:
-    # a UniRef100 table also needs the UniRef90 rep id, to pick the paired rep
+def _patterns(level: str, records: bool = False) -> list:
+    # a UniRef100 table also needs the UniRef90 rep id, to pick the paired rep;
+    # pairing scans (``records``) also need the record boundary
     props = [U90_GREP] if level == "uniref90" else [U90_GREP, U100_GREP]
+    if records:
+        props.append(RECORD_OPEN)
     return [ENTRY_PREFIX, *props, REP_OPEN, REP_CLOSE, ROOT_CLOSE]
 
 
 @contextlib.contextmanager
-def _filtered_lines(path: Path, level: str) -> Iterator[tuple]:
+def _filtered_lines(path: Path, level: str, records: bool = False) -> Iterator[tuple]:
     """Yield (blocks, finish): blocks of grep-filtered XML lines; finish() -> (ok, detail)."""
-    pats = _patterns(level)
+    pats = _patterns(level, records)
     gz = str(path).endswith(".gz")
     grep = shutil.which("grep")
     if grep is None:
@@ -262,7 +274,7 @@ def read_release(path: Path) -> dict:
 
 class _Entry:
     __slots__ = ("u50", "u90", "u100", "seen90", "seen100", "rep_blocks", "rep90", "rep100",
-                 "in_rep")
+                 "in_rep", "sub", "pending")
 
     def __init__(self, u50: bytes):
         self.u50 = u50
@@ -274,6 +286,41 @@ class _Entry:
         self.rep90: list = []
         self.rep100: list = []
         self.in_rep = False
+        self.sub: Optional[dict] = None      # UniRef100 -> UniRef90 (pairing scans only)
+        self.pending: Optional[bytes] = None  # UniRef100 id waiting for its UniRef90 line
+
+
+class _PairIssues:
+    """Pairing problems, counted over the whole scan; raised once at the end."""
+
+    def __init__(self):
+        self.count = {"order": 0, "conflict": 0}
+        self.examples = {"order": [], "conflict": []}
+
+    def add(self, kind: str, text: str) -> None:
+        self.count[kind] += 1
+        if len(self.examples[kind]) < 5:
+            self.examples[kind].append(text)
+
+    def check(self) -> None:
+        msgs = []
+        if self.count["order"]:
+            msgs.append(f"{self.count['order']:,} member records where the UniRef100 ID and "
+                        "UniRef90 ID lines do not alternate (first: "
+                        + "; ".join(self.examples["order"]) + ")")
+        if self.count["conflict"]:
+            msgs.append(f"{self.count['conflict']:,} UniRef100 ids listed under two "
+                        "UniRef90 ids (first: " + "; ".join(self.examples["conflict"]) + ")")
+        if msgs:
+            raise HierarchyError("cannot pair UniRef100 members with UniRef90 sub-clusters: "
+                                 + "; ".join(msgs))
+
+
+def _end_pairs(cur: _Entry, issues: _PairIssues) -> None:
+    if cur.pending is not None:
+        issues.add("order", f"entry UniRef50_{cur.u50.decode()}: UniRef100_"
+                            f"{cur.pending.decode()} has no UniRef90 line")
+        cur.pending = None
 
 
 def _add(entry: _Entry, acc: bytes, ids: list, seen: set, rep_ids: list, what: str) -> None:
@@ -290,10 +337,25 @@ def _add(entry: _Entry, acc: bytes, ids: list, seen: set, rep_ids: list, what: s
     ids.append(acc)
 
 
-def iter_entries(blocks) -> Iterator[_Entry]:
-    """Parse filtered XML lines into entries; the caller checks completeness."""
+def iter_entries(blocks, pairs: Optional[_PairIssues] = None) -> Iterator[_Entry]:
+    """Parse filtered XML lines into entries; the caller checks completeness.
+
+    With ``pairs``, every entry also gets ``sub`` (UniRef100 -> UniRef90 of each member
+    record) and pairing problems are counted in ``pairs``."""
     o90, o100, oe = len(U90_PREFIX), len(U100_PREFIX), len(ENTRY_PREFIX)
     cur: Optional[_Entry] = None
+
+    def new_entry(line):
+        e = _Entry(line[oe:line.index(QUOTE, oe)])
+        if pairs is not None:
+            e.sub = {}
+        return e
+
+    def done(e):
+        if pairs is not None:
+            _end_pairs(e, pairs)
+        return e
+
     saw_close = False
     tail = b""
     for block in blocks:
@@ -308,15 +370,35 @@ def iter_entries(blocks) -> Iterator[_Entry]:
                     continue
                 if not line.startswith(U90_PREFIX):
                     raise HierarchyError(f"unexpected UniRef90 id property: {line[:120]!r}")
-                _add(cur, line[o90:line.index(QUOTE, o90)], cur.u90, cur.seen90, cur.rep90,
-                     "UniRef90")
+                acc = line[o90:line.index(QUOTE, o90)]
+                _add(cur, acc, cur.u90, cur.seen90, cur.rep90, "UniRef90")
+                if pairs is not None:          # pair it with the UniRef100 line before
+                    p = cur.pending
+                    if p is None:
+                        pairs.add("order", f"entry UniRef50_{cur.u50.decode()}: UniRef90_"
+                                           f"{acc.decode()} follows no UniRef100 line")
+                    else:
+                        old = cur.sub.setdefault(p, acc)
+                        if old != acc:
+                            pairs.add("conflict", f"entry UniRef50_{cur.u50.decode()}: "
+                                      f"UniRef100_{p.decode()} under UniRef90_{old.decode()} "
+                                      f"and UniRef90_{acc.decode()}")
+                        cur.pending = None
             elif line.startswith(U100_GREP):
                 if cur is None:
                     continue
                 if not line.startswith(U100_PREFIX):
                     raise HierarchyError(f"unexpected UniRef100 id property: {line[:120]!r}")
-                _add(cur, line[o100:line.index(QUOTE, o100)], cur.u100, cur.seen100, cur.rep100,
-                     "UniRef100")
+                acc = line[o100:line.index(QUOTE, o100)]
+                _add(cur, acc, cur.u100, cur.seen100, cur.rep100, "UniRef100")
+                if pairs is not None:
+                    if cur.pending is not None:
+                        pairs.add("order", f"entry UniRef50_{cur.u50.decode()}: UniRef100_"
+                                           f"{cur.pending.decode()} has no UniRef90 line")
+                    cur.pending = acc
+            elif line.startswith(RECORD_OPEN):     # only in pairing scans: close the record
+                if cur is not None and pairs is not None:
+                    _end_pairs(cur, pairs)
             elif line.startswith(REP_OPEN):
                 if cur is not None:
                     cur.rep_blocks += 1
@@ -326,15 +408,15 @@ def iter_entries(blocks) -> Iterator[_Entry]:
                     cur.in_rep = False
             elif line.startswith(ENTRY_PREFIX):
                 if cur is not None:
-                    yield cur
-                cur = _Entry(line[oe:line.index(QUOTE, oe)])
+                    yield done(cur)
+                cur = new_entry(line)
             elif ROOT_CLOSE in line:
                 if cur is not None:
-                    yield cur
+                    yield done(cur)
                     cur = None
                 saw_close = True
     if ROOT_CLOSE in tail and cur is not None:
-        yield cur
+        yield done(cur)
         cur = None
         saw_close = True
     if not saw_close:
@@ -368,10 +450,66 @@ def _members(entry: _Entry, level: str, stats: dict) -> list:
     return ids
 
 
-def xml_to_members_tsv(xml_path, out_tsv, level: str = "uniref90") -> dict:
-    """Write the canonical members table for ``level`` from uniref50.xml(.gz)."""
+def _sub_lines(entry: _Entry, sub_hashes: array) -> bytes:
+    """submembers.tsv lines of one entry: grouped by UniRef90 id, first appearance first."""
+    sub = entry.sub
+    if len(entry.u90) == len(entry.u100):    # every sub-cluster a singleton (most entries)
+        groups = {sub[a]: (a,) for a in entry.u100}
+    else:
+        groups = {}
+        for a100 in entry.u100:
+            groups.setdefault(sub[a100], []).append(a100)
+    sub_hashes.extend(map(_id_hash, groups))    # checked for repeats across entries at the end
+    out = []
+    for a90, a100s in groups.items():
+        c = b"UniRef90_" + a90 + b"\tUniRef100_"
+        out.extend(c + a + b"\n" for a in a100s)
+    return b"".join(out)
+
+
+_id_hash = hash   # 64-bit, salted per process; a test swaps it to force collisions
+
+
+def _check_subclusters_unique(sub_hashes: array, members_tsv: Path, sub_tsv: Path) -> None:
+    """Fail if one UniRef90 id heads sub-clusters in two UniRef50 entries.
+
+    The hashes only find suspects (a false collision among ~1e8 ids is rare but real);
+    suspects are confirmed on the exact ids by reading both tables back, whose rows are
+    in the same entry order (each entry writes one row per UniRef100 member to both)."""
+    h = np.sort(np.frombuffer(sub_hashes, dtype=np.int64))
+    twice = h[1:][h[1:] == h[:-1]]
+    if not len(twice):
+        return
+    suspects = set(np.unique(twice).tolist())
+    clusters: dict = {}
+    prev, hit = None, False
+    with open(members_tsv, "rb") as fm, open(sub_tsv, "rb") as fs:
+        for lm, ls in zip(fm, fs):
+            a90 = ls[9:ls.index(b"\t")]                      # after "UniRef90_"
+            if a90 != prev:
+                prev, hit = a90, _id_hash(a90) in suspects
+            if hit:
+                clusters.setdefault(a90, set()).add(lm[:lm.index(b"\t")].decode())
+    bad = sorted((a.decode(), sorted(c)) for a, c in clusters.items() if len(c) > 1)
+    if not bad:
+        logger.info(f"cluster table: {len(suspects):,} UniRef90 id hash collisions, "
+                    "none a real repeat")
+        return
+    ex = "; ".join(f"UniRef90_{a} in {' and '.join(c)}" for a, c in bad[:5])
+    raise HierarchyError(f"{len(bad):,} UniRef90 ids appear in two UniRef50 entries (first: "
+                         f"{ex}); a sub-cluster must lie inside one cluster")
+
+
+def xml_to_members_tsv(xml_path, out_tsv, level: str = "uniref90", sub_out=None) -> dict:
+    """Write the canonical members table for ``level`` from uniref50.xml(.gz).
+
+    With ``sub_out`` (``level="uniref100"`` only), also write the UniRef90 sub-cluster
+    table there (``subcluster_id<TAB>sequence_id``, same canonical format)."""
     if level not in UNIREF_LEVELS:
         raise ValueError(f"level must be one of {UNIREF_LEVELS}, got {level!r}")
+    if sub_out is not None and level != "uniref100":
+        raise ValueError("a sub-cluster table (sub_out) needs level uniref100: UniRef90 "
+                         "members have no level below them")
     xml_path, out_tsv = Path(xml_path), Path(out_tsv)
     if not xml_path.exists():
         raise FileNotFoundError(f"UniRef50 XML not found: {xml_path}")
@@ -381,24 +519,43 @@ def xml_to_members_tsv(xml_path, out_tsv, level: str = "uniref90") -> dict:
              "paired_rep_differs_from_literal": 0, "paired_rep_missing": 0}
     logger.info(f"cluster table: scanning {xml_path} for UniRef50 -> {level} membership")
     out_tsv.parent.mkdir(parents=True, exist_ok=True)
-    with atomic_write_path(out_tsv) as tmp, open(tmp, "wb", buffering=1 << 24) as out:
-        with _filtered_lines(xml_path, level) as (blocks, finish):
-            for entry in iter_entries(blocks):
+    issues = _PairIssues() if sub_out is not None else None
+    sub_hashes = array("q")
+    with contextlib.ExitStack() as stack:
+        tmp = stack.enter_context(atomic_write_path(out_tsv))
+        out = stack.enter_context(open(tmp, "wb", buffering=1 << 24))
+        sub = None
+        if sub_out is not None:
+            sub_out = Path(sub_out)
+            sub_out.parent.mkdir(parents=True, exist_ok=True)
+            sub_tmp = stack.enter_context(atomic_write_path(sub_out))
+            sub = stack.enter_context(open(sub_tmp, "wb", buffering=1 << 24))
+        with _filtered_lines(xml_path, level, records=sub is not None) as (blocks, finish):
+            for entry in iter_entries(blocks, issues):
                 ids = _members(entry, level, stats)
                 c = b"UniRef50_" + entry.u50 + b"\t" + seq_prefix
                 out.write(b"".join(c + a + b"\n" for a in ids))
+                if sub is not None and not (issues.count["order"] or issues.count["conflict"]):
+                    sub.write(_sub_lines(entry, sub_hashes))
                 stats["clusters"] += 1
                 stats["members"] += len(ids)
                 stats["singletons"] += len(ids) == 1
             clean, detail = finish()
         if not clean:
             raise HierarchyError(f"{xml_path} is incomplete ({detail})")
+        if issues is not None:
+            issues.check()
+            out.flush()
+            sub.flush()
+            _check_subclusters_unique(sub_hashes, Path(tmp), Path(sub_tmp))
     if stats["clusters"] == 0:
         raise HierarchyError(f"{xml_path} holds no UniRef50 entries")
     if stats["paired_rep_missing"]:
         logger.warning(f"cluster table: {stats['paired_rep_missing']:,} entries have no "
                        "UniRef100 id paired with their UniRef90 representative; their "
                        "literal representativeMember is used")
+    if sub_out is not None:
+        stats["subclusters"] = len(sub_hashes)
     stats.update(level=level, source="uniref50_xml", input=str(xml_path),
                  **read_release(xml_path), seconds=round(time.time() - t0, 1))
     logger.info(f"cluster table: {stats['clusters']:,} UniRef50 clusters, "

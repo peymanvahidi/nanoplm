@@ -810,9 +810,18 @@ def get_cluster_xml(url: str, output: str):
 @click.option("--threads", type=int,
               default=lambda: int(os.environ.get("NANOPLM_MAX_WORKERS", "2")),
               show_default="$NANOPLM_MAX_WORKERS or 2")
+@click.option("--sub-out", type=click.Path(dir_okay=False), default=None,
+              help="Also write the UniRef90 sub-cluster table here "
+                   "(--source uniref_xml --level uniref100 only).")
 def cluster_members(source, fasta, output, level, xml, tsv, identity, coverage, tmp_dir,
-                    threads):
+                    threads, sub_out):
     """Internal: write the canonical cluster table (cluster_id<TAB>sequence_id)."""
+    if sub_out and (source != "uniref_xml" or level != "uniref100"):
+        raise click.UsageError("--sub-out needs --source uniref_xml --level uniref100: "
+                               "only UniRef100 members have UniRef90 sub-clusters")
+    if sub_out and Path(sub_out).resolve() == Path(output).resolve():
+        raise click.UsageError("--sub-out must differ from --output: the two tables are "
+                               "written side by side")
     if source in ("tsv", "headers"):
         from nanoplm.data.preparation.cluster_import import (ClusterImportError,
                                                              import_members_table)
@@ -827,8 +836,10 @@ def cluster_members(source, fasta, output, level, xml, tsv, identity, coverage, 
     stats = build_members_table(source, Path(output), fasta=Path(fasta), level=level,
                                 xml=Path(xml) if xml else None, identity=identity,
                                 coverage=coverage, tmp_dir=Path(tmp_dir) if tmp_dir else None,
-                                threads=threads)
+                                threads=threads, sub_out=Path(sub_out) if sub_out else None)
     click.echo(f"Wrote {output}: {stats['clusters']:,} clusters, {stats['members']:,} sequences")
+    if sub_out:
+        click.echo(f"Wrote {sub_out}: {stats['subclusters']:,} UniRef90 sub-clusters")
 
 
 @data.command("cluster-pool", hidden=True)
