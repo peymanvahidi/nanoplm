@@ -104,7 +104,7 @@ SwissProt holds 9% of the training sequences but gets 20% of the draws, so the r
 
 The numbers are estimates that ignore packing waste. For a cluster source, `size` counts clusters. W&B stores the table in the run config as `data_mixture`.
 
-A source with `epochs` below 1 trains on a part of itself, spread over the whole source. Each new epoch of a source reads it in a new order, and a cluster source draws new members. A `continue` or `decay` resume picks the mix up where the checkpoint stopped, at the same epoch and position of each source; see [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
+A source with `epochs` below 1 trains on a part of itself, spread over the whole source. Each new epoch of a source reads it in a new order, and a cluster source draws new members. A `continue` or `decay` resume picks the mix up where the checkpoint stopped, at the same epoch and position of each source (with the same number of GPUs, `num_workers` and `micro_batch_seqs`); see [Cooldown and resuming](/nanoplm/guides/cooldown-and-resume/).
 
 ## Validation
 

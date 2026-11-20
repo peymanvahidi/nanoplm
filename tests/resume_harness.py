@@ -9,7 +9,10 @@ steps, bwarm, mode ("single" | "dist"), resume (checkpoint dir or null),
 dist_mode (pipeline distributed_mode; default "ddp" for "dist" and "fsdp" for
 "single", since the pipeline rejects ddp without multi_gpu), len_overreport
 (add this to the train loader length the pipeline syncs; default 0),
-eval_steps / logging_steps (default: never), max_wallclock_hours (default unset).
+eval_steps / logging_steps (default: never), max_wallclock_hours (default unset),
+packing (use_packing, with a CPU stand-in for flash-attn varlen; default false),
+workers (num_workers, default 0), fail_rank (that rank's skip_batches(k>0) raises,
+so the resume falls back to replay; default none).
 
 Forces CPU and makes torch.compile the identity. Records, for every training
 sub-batch the loop moves to the device, (global_step, epoch, micro_step,
@@ -82,11 +85,38 @@ def _fresh_model():
     ))
 
 
+def _cpu_varlen(q, k, v, cu_seqlens_q=None, softmax_scale=None, **_):
+    """flash_attn_varlen_func on CPU: plain SDPA per packed sequence."""
+    out = torch.empty_like(q)
+    cu = cu_seqlens_q.tolist()
+    for a, b in zip(cu[:-1], cu[1:]):
+        if b > a:
+            qs, ks, vs = (t[a:b].transpose(0, 1) for t in (q, k, v))
+            out[a:b] = torch.nn.functional.scaled_dot_product_attention(
+                qs, ks, vs, scale=softmax_scale).transpose(0, 1)
+    return out
+
+
 def run_phase(spec: dict) -> None:
     from nanoplm.data.infra.manifest import read_manifest
     from nanoplm.pretraining.config import PretrainingConfig, ResumeConfig
     from nanoplm.cli.pretrain import _populate_batch_setup
     import nanoplm.pretraining.pure_pipeline as pp
+
+    if spec.get("packing"):
+        import nanoplm.pretraining.models.modern_bert.modeling as _m
+        _m._HAS_FLASH_VARLEN, _m._flash_varlen_fn = True, _cpu_varlen
+    rank_env = int(os.environ.get("RANK", "0"))
+    if spec.get("fail_rank") is not None and rank_env == spec["fail_rank"]:
+        from nanoplm.data.datasets.pretrain import TokenPackingDataset
+        _skip = TokenPackingDataset.skip_batches
+
+        def _fail(self, k):
+            if k > 0:
+                raise ValueError("forced skip_batches failure")
+            return _skip(self, k)
+
+        TokenPackingDataset.skip_batches = _fail
 
     dist_mode = spec["mode"] == "dist"
     world = int(os.environ.get("WORLD_SIZE", "1")) if dist_mode else 1
@@ -97,8 +127,9 @@ def run_phase(spec: dict) -> None:
         micro_batch_seqs=spec["micro"], global_batch_tokens=gbt, warmup_steps=1,
         lr_schedule="warmup_stable", train_tokens=gbt * spec["steps"],
         global_batch_warmup_steps=spec.get("bwarm", 0),
-        bf16=False, tf32=False, fp8=False, use_packing=False, use_static_inp_size=False,
-        multi_gpu=dist_mode, world_size=world, num_workers=0,
+        bf16=False, tf32=False, fp8=False, use_packing=bool(spec.get("packing")),
+        use_static_inp_size=False, multi_gpu=dist_mode, world_size=world,
+        num_workers=spec.get("workers", 0),
         eval_steps=spec.get("eval_steps", 10_000_000), save_steps=10_000_000,
         logging_steps=spec.get("logging_steps", 10_000_000),
         max_wallclock_hours=spec.get("max_wallclock_hours"),
@@ -115,7 +146,7 @@ def run_phase(spec: dict) -> None:
         _sync = pp._TrainLenSync.__call__
         pp._TrainLenSync.__call__ = lambda self, n: _sync(self, n + over)
 
-    log, msgs = [], []
+    log, msgs, first_micro = [], [], set()
     orig_move = pp._move_batch_to_device
 
     def _hook(batch, device):
@@ -125,8 +156,9 @@ def run_phase(spec: dict) -> None:
             if lab is not None:  # undo masking: masked ids depend on RNG draws
                 ids = torch.where(lab != -100, lab, ids)
             # Reads pure_pipeline's loop locals by name: renaming global_step/epoch/
-            # micro_step/sub_batch_idx there breaks this with a KeyError.
+            # micro_step/sub_batch_idx/first_micro there breaks this with a KeyError.
             L = f.f_locals
+            first_micro.add(L["first_micro"])
             log.append([L["global_step"], L["epoch"], L["micro_step"],
                         L["sub_batch_idx"], ids.tolist()])
         return orig_move(batch, device)
@@ -159,9 +191,11 @@ def run_phase(spec: dict) -> None:
     pp.run_pure_pretraining(_fresh_model(), cfg, manifest, resume_config=rc)
     resume_lines = [m for m in msgs if m.startswith("Resume continue:")]
     pass_lines = [m for m in msgs if m.startswith("Data pass ")]  # rank 0 only
+    skip_lines = [m for m in msgs if m.startswith("Resume: skipping")]  # rank 0 only
     Path(f"{spec['out']}.rank{rank}.json").write_text(json.dumps(
         {"log": log, "resume_lines": resume_lines, "pass_lines": pass_lines,
-         "events": events}))
+         "events": events, "skip_lines": skip_lines,
+         "first_micro": sorted(first_micro)}))
 
 
 if __name__ == "__main__":

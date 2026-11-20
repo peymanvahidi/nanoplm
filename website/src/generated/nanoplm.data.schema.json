@@ -122,13 +122,13 @@
         "samples_per_shard": {
           "type": "integer",
           "default": 2000,
-          "description": "sequences per shard file",
+          "description": "sequences per shard file; raised automatically for large cluster datasets",
           "x-nanoplm-group": "Rarely changed"
         },
         "max_workers": {
           "type": "integer",
           "default": 2,
-          "description": "tokenizer processes; -1 = all cores",
+          "description": "tokenizer processes and MMseqs2 threads; -1 = all cores",
           "x-nanoplm-group": "Rarely changed"
         },
         "register_tokens": {

@@ -273,3 +273,30 @@ def test_stop_step_evaluates_once(tmp_path, case):
     base = _setup(tmp_path, _SCENARIOS["mid_pass"], 2, "dist")
     out = _run(tmp_path, "a", dict(base, ckp_dir=str(tmp_path / "ck"), **over), 2)
     assert out[0]["events"] == out[1]["events"] == expected, [o["events"] for o in out]
+
+
+@pytest.mark.parametrize("fail_rank", [None, 1], ids=["exact_skip", "replay_fallback"])
+def test_packed_resume_with_workers_matches_uninterrupted(tmp_path, fail_rank):
+    """Packing, 2 workers, 2 ranks, a mid-pass resume: the loop starts the loader
+    at the saved batch (exact skip). If one rank's skip_batches fails, every rank
+    replays instead. Either way run(N) + resume equals run(N+M)."""
+    N, M = 3, 3
+    base = dict(dataset_dir=str(_dataset(tmp_path, 120)), micro=2, ga=2, bwarm=0,
+                mode="dist", packing=True, workers=2)
+    full = _run(tmp_path, "full", dict(base, ckp_dir=str(tmp_path / "full"), steps=N + M), 2)
+    a = _run(tmp_path, "a", dict(base, ckp_dir=str(tmp_path / "split"), steps=N), 2)
+    trunk = _ckpt(tmp_path / "split")
+    st = _state(trunk)
+    assert st["global_step"] == N and st["epoch_data_step"] > 0, st  # mid-pass
+    src = tmp_path / "trunk_copy" / trunk.parent.name / trunk.name
+    shutil.copytree(trunk, src)
+    b = _run(tmp_path, "b", dict(base, ckp_dir=str(tmp_path / "split"), steps=N + M,
+                                 resume=str(src), fail_rank=fail_rank), 2)
+    k = st["epoch_data_step"]
+    how = "by exact skip" if fail_rank is None else "by replay"
+    assert len(b[0]["skip_lines"]) == 1 and how in b[0]["skip_lines"][0], b[0]["skip_lines"]
+    # Both ranks took the same branch: the loop's first_micro is k on an exact skip, 0 on replay.
+    for r in range(2):
+        assert b[r]["first_micro"] == [k if fail_rank is None else 0], (r, b[r]["first_micro"])
+        assert a[r]["log"] + b[r]["log"] == full[r]["log"], f"rank {r} diverges"
+    assert _state(_ckpt(tmp_path / "split"))["global_step"] == N + M

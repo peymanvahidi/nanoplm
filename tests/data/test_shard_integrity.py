@@ -50,3 +50,28 @@ def test_second_shard_mismatch_is_still_caught(tmp_path):
 
     with pytest.raises(ValidationError, match=r"shard_0001\.bin"):
         ShardedDataset(str(tmp_path))
+
+
+def _snapshot(ds):
+    rows = np.array([5, 0, 2, 5, 3])
+    return ([ds[i]["input_ids"].tolist() for i in range(len(ds))],
+            ds.get_all_sequence_lengths().tolist(), ds.row_lengths_at(rows).tolist(),
+            ds.row_lengths_at(rows).dtype, ds.fingerprint(), ds.total_tokens)
+
+
+def test_offsets_are_uint32_below_the_limit_and_int64_reads_the_same(tmp_path, monkeypatch):
+    import nanoplm.data.datasets.pretrain as pretrain
+
+    _write_shard(tmp_path, "shard_0000", [3, 4, 5])
+    _write_shard(tmp_path, "shard_0001", [6, 0, 7])
+    ds = ShardedDataset(str(tmp_path))
+    assert [o.dtype for o in ds._offsets] == [np.uint32, np.uint32]
+    ref = _snapshot(ds)
+    assert ref[3] == np.int32 and ref[5] == 25
+
+    # 13 bytes: the 12-byte shard stays uint32, the 13-byte one goes int64
+    for limit, dtypes in ((13, [np.uint32, np.int64]), (1, [np.int64, np.int64])):
+        monkeypatch.setattr(pretrain, "UINT32_OFFSETS_MAX_BYTES", limit)
+        ds64 = ShardedDataset(str(tmp_path))
+        assert [o.dtype for o in ds64._offsets] == dtypes
+        assert _snapshot(ds64) == ref

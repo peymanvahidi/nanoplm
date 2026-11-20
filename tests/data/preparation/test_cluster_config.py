@@ -235,7 +235,7 @@ def test_cluster_warnings_name_the_source_and_its_own_override(tmp_path):
     w = _plan(cfg).warnings
     assert ("sources.src: val_ratio=0.2 (from data_params) holds out 20.0% of the "
             "clusters for validation; to train on more of them, lower data_params.val_ratio "
-            "or set data_params.val_size (a count)") in w
+            "or set data_params.val_size (a count; in a mix, the total for all sources)") in w
     assert not any("0.0044" in x for x in w)
 
 

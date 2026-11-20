@@ -39,22 +39,41 @@ def batch_rounding_warning(
     """Return a warning when grad_accum rounding moves the global batch off target.
 
     grad_accum is ceil(target / (micro_batch_seqs * max_seq_len * world_size)),
-    so a rank count that does not divide the target overshoots it. Returns
-    None when the target is met exactly.
+    so the global batch is a whole number of micro-steps on all GPUs and can
+    overshoot the target. Returns None when the target is met exactly.
     """
-    if int(achieved_tokens) == int(target_tokens):
+    target, achieved, world = int(target_tokens), int(achieved_tokens), int(world_size)
+    if achieved == target:
         return None
-    per_rank_seqs = int(target_tokens) // max(1, int(max_seq_len))
-    return (
-        f"Global batch is {achieved_tokens:,} tokens, not the target "
-        f"global_batch_tokens={target_tokens:,} ({achieved_tokens / target_tokens:.2f}x), "
-        f"because grad_accum rounds up at world_size={world_size} with "
-        f"micro_batch_seqs={micro_batch_seqs} x max_seq_len={max_seq_len}. "
-        f"To hit the target, use a GPU count that divides "
-        f"{per_rank_seqs // max(1, int(micro_batch_seqs)):,} "
-        f"(target sequences / micro_batch_seqs), or set micro_batch_seqs so that "
-        f"micro_batch_seqs x world_size divides {per_rank_seqs:,}."
-    )
+    micro = max(1, int(micro_batch_seqs) * int(max_seq_len))  # tokens per GPU per micro-step
+    step = micro * world  # tokens per micro-step on all GPUs
+    over = (achieved - target) / max(1, target)
+    if round(over * 100, 1) != 0:
+        diff = f"{over:+.1%}"
+    elif round(over * 100, 2) != 0:
+        diff = f"{over:+.2%}"
+    else:
+        diff = f"{achieved - target:+,} token{'s' * (achieved - target != 1)}"
+    msg = f"Global batch is {achieved:,} tokens, not global_batch_tokens={target:,} ({diff}). "
+    multiple = target % micro == 0  # some GPU count hits the target
+    mbs_ok = target % (max(1, int(max_seq_len)) * world) == 0  # some micro_batch_seqs does
+    n = target // micro
+    gpu_fix = "use 1 GPU" if n == 1 else f"use a GPU count that divides {n:,}"
+    on = f"one micro-step on {world} GPU{'s' * (world != 1)} is"
+    shape = f"({world} x {micro_batch_seqs} x {max_seq_len})"
+    no_gpu = "" if multiple else (
+        f" No GPU count hits {target:,} with micro_batch_seqs={micro_batch_seqs}.")
+    if step > target:
+        lower = "lower micro_batch_seqs" + ("" if mbs_ok else " to shrink the overshoot")
+        fixes = f", {lower}, or {gpu_fix}" if multiple else f" or {lower}"
+        return msg + (f"Why: {on} already {step:,} tokens {shape}. "
+                      f"Fix: set global_batch_tokens={step:,}{fixes}.{no_gpu}")
+    msg += (f"Why: {on} {step:,} tokens {shape} and an optimizer step uses whole "
+            f"micro-steps, here {achieved // step:,}. ")
+    if not multiple:
+        return msg + (f"Fix: set global_batch_tokens={achieved:,}"
+                      f"{', or change micro_batch_seqs' if mbs_ok else ''}.{no_gpu}")
+    return msg + f"Fix: {gpu_fix}, or set global_batch_tokens={achieved:,}."
 
 
 def check_num_workers_agree(per_rank: list[int]) -> None:

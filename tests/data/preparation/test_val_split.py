@@ -163,3 +163,36 @@ def test_count_universe_clusters_counts_reps_in_the_pool(tmp_path, monkeypatch):
     assert vs.count_universe_clusters(pool, tsv) == 2
     assert vs.count_universe_clusters(pool, tsv, max_clusters=1) == 1
     assert vs.count_universe_clusters(pool, tsv, max_clusters=5) == 2
+
+
+def _old_ids(data: bytes):
+    import re
+    return re.compile(rb"^>(\S*)", re.M).findall(data)
+
+
+@pytest.mark.parametrize("data", [
+    b"",
+    b"\n",
+    b"ACGT\n>a x\nMK\n>b\nMK",  # first line not a header, no trailing newline
+    b">a\r\nMK\r\n>b y\r\nMK\r\n",  # CRLF: ids end before \r
+    b">only",
+    b">>a\n>\n> b\n",
+])
+def test_header_ids_edge_inputs_match_the_old_regex(tmp_path, monkeypatch, data):
+    f = tmp_path / "x.fasta"
+    f.write_bytes(data)
+    for chunk in (1, 2, 3, 1 << 20):
+        monkeypatch.setattr(vs, "_CHUNK", chunk)
+        assert [i for ids in vs._header_ids(f) for i in ids] == _old_ids(data)
+        assert vs.count_fasta_records(f) == len(_old_ids(data))
+
+
+def test_header_ids_match_the_old_regex_on_random_fasta_like_bytes(tmp_path, monkeypatch):
+    import random
+    rng = random.Random(0)
+    f = tmp_path / "x.fasta"
+    for _ in range(200):
+        data = bytes(rng.choice(b">\n\r A") for _ in range(rng.randrange(60)))
+        f.write_bytes(data)
+        monkeypatch.setattr(vs, "_CHUNK", rng.randrange(1, 9))
+        assert [i for ids in vs._header_ids(f) for i in ids] == _old_ids(data)

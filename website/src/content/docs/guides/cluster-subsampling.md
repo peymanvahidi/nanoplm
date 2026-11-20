@@ -45,10 +45,10 @@ Here `max_seqs`, `val_ratio` and `val_size` count clusters, not sequences; `max_
 Warning: sources.uniref50: max_seqs=20000 (from data_params) trains on at most 20,000 clusters; set sources.uniref50.max_seqs: -1 to use all of them
 ```
 
-It also warns when validation holds out more than 10% of the clusters, or more than 10,000 clusters at a share above 1%. With one source and `max_seqs` set, `from-yaml` knows the count before any stage runs. Otherwise (a mix, `val_size` or `max_seqs: -1`) the `cluster_index` stage warns once it has counted the clusters:
+It also warns when validation holds out more than 10% of the clusters, or more than 10,000 clusters at a share above 1%. With one source and `max_seqs` set, `from-yaml` knows the count before any stage runs. The `cluster_index` stage warns again once it has counted the clusters; in a mix or with `val_size` that is the only warning; with `max_seqs: -1`, `from-yaml` warns first only when `val_ratio` is above 0.1:
 
 ```text
-Warning: cluster index: validation holds out 1,645,000 of 32,900,000 clusters (5.0%); to train on more of them, lower data_params.val_ratio or set data_params.val_size (a count)
+Warning: cluster index: validation holds out 1,645,000 of 32,900,000 clusters (5.0%); to train on more of them, lower data_params.val_ratio or set data_params.val_size (a count; in a mix, the total for all sources)
 ```
 
 One `uniref50` source with `val_ratio: 0.0044` and `shuffle_seed: 20260918` holds out the same clusters as the experiment; with another `shuffle_seed` it holds out as many clusters, but a different set. In a [mix](/nanoplm/guides/mixing/#validation), the validation split is shared out by weight, so UniRef50 gets a different number of clusters and they are a different set.
@@ -236,7 +236,7 @@ nanoPLM downloads `uniref50.xml.gz` once into `output_dir/downloads/` and keeps 
 | `...identity / coverage only apply when MMseqs2 makes the clusters` | Remove them, or set `clusters: mmseqs2`. |
 | `sources.<name>: these members are clustered with MMseqs2, but mmseqs was not found` | `nanoplm deps install --mmseqs-only`, a release binary on `PATH`, or `NANOPLM_MMSEQS=/path/to/mmseqs`. |
 | `...val_ratio=... of at most ... clusters (max_seqs) holds out 0; cluster subsampling needs at least one train and one val cluster` | Raise `data_params.val_ratio` to the value the message names, or set `max_seqs: -1`. |
-| (stage) `val_ratio=... over ... clusters holds out 0; need at least one train and one val cluster` | The `cluster_index` stage counted fewer clusters than `max_seqs`. Raise `data_params.val_ratio` to the value the message names, or set `data_params.val_size`. |
+| (stage) `val_ratio=... over ... clusters holds out 0; need at least one train and one val cluster` | The `cluster_index` stage counted too few clusters for this `val_ratio` (for example fewer than `max_seqs`). Raise `data_params.val_ratio` to the value the message names, or set `data_params.val_size`. |
 | `... is a cluster-sampled dataset, which needs use_packing=true.` (at pretraining start) | Set `use_packing: true` in `pretrain.yaml`. |
 | `... was built by the data-sampler experiment scripts ...` (at pretraining start) | `dataset_dir` is a folder from the old experiment scripts. Rebuild it with `nanoplm data from-yaml`. |
 | Warning: `...clustering is now called clusters; the old name still works` | Rename the key. If it was `uniprot` or `mmseqs2`, the rename reruns `cluster_members` once. |

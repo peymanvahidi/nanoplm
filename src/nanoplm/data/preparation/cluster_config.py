@@ -74,7 +74,7 @@ EXPERIMENT_VAL_RATIO = 0.0044
 WARN_VAL_SHARE = 0.10
 WARN_VAL_CLUSTERS = 10_000
 VAL_HOLDOUT_FIX = ("to train on more of them, lower data_params.val_ratio or set "
-                   "data_params.val_size (a count)")
+                   "data_params.val_size (a count; in a mix, the total for all sources)")
 
 
 def holdout_matters(held: Optional[int], share: float) -> bool:

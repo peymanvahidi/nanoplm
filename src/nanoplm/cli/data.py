@@ -1164,6 +1164,29 @@ def from_yaml(
             raise click.ClickException(
                 f"Failed to initialize DVC in {cwd}. Details: {e}"
             )
+    elif dvc_dir.exists() and not dry_run and cfg is not None and not cfg.legacy:
+        # A repo initialised by hand (or before linking was the default) copies every
+        # output into the cache; link new outputs the same way the init path does.
+        # An unset key gives exit 0 and empty stdout (dvc 3.67); older dvc exits 251.
+        # Any other non-zero exit (dvc missing or broken, corrupt .dvc/config) is an error.
+        query_cmd = _DVC + ["config", "cache.type"]
+        try:
+            query = subprocess.run(query_cmd, cwd=str(cwd), capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise click.ClickException(f"Failed to read cache.type in {cwd}. Details: {e}")
+        if query.returncode not in (0, 251):
+            raise click.ClickException(
+                f"Failed to read cache.type in {cwd}: '{' '.join(query_cmd)}' exited "
+                f"{query.returncode}. Details: {(query.stderr or '').strip()}")
+        if not (query.stdout or "").strip():
+            try:
+                subprocess.run(_DVC + ["config", "cache.type", _CACHE_TYPE], cwd=str(cwd),
+                               check=True)
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                raise click.ClickException(
+                    f"Failed to set cache.type in {cwd}. Details: {e}")
+            click.echo(f"DVC cache.type was unset in {cwd}; set it to {_CACHE_TYPE}, "
+                       "so new outputs are linked into the cache, not copied")
 
     # Build environment for repro
     device = data_params.get("device")
