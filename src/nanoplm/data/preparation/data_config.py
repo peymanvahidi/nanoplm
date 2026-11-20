@@ -25,6 +25,7 @@ The sources layout puts everything under ``output_dir``:
   <source>/                 that source's intermediate FASTAs, validation/ and split/
   train/ val/ .data_manifest   the dataset pretrain.yaml's dataset_dir points at
   cluster_index/            members.tsv and the index (cluster subsampling only)
+                            (+ submembers.tsv with UniRef100 members)
 
 With several sources, train/ val/ cluster_index/ and .data_manifest of each source go
 into ``<source>/`` (Source.data_dir) and ``output_dir/.data_manifest`` is the mixture

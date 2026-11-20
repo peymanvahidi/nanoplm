@@ -12,6 +12,7 @@ sources:
     cluster_subsampling:
       members: uniref90  # train on these sequences; leave out to use this fasta
       clusters: uniprot  # uniprot, headers (CL: tags in the FASTA headers), mmseqs2 (slow: hours), or a .tsv of representative<TAB>member
+      # uniref100 members are drawn through their UniRef90 sub-cluster: a sub-cluster first, then a member in it
 
   # Your own FASTA with a cluster file:
   # my_data:

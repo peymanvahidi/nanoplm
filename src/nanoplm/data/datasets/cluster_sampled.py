@@ -10,6 +10,15 @@ the member it returns is drawn uniformly from the cluster's ``n_c`` surviving me
     slot = splitmix64(splitmix64(member_seed_key(seed) ^ c) ^ epoch) % n_c
     row  = cluster_members[cluster_offsets[global_to_universe[c]] + slot]
 
+An index built with sub-clusters (UniRef90 inside UniRef50, ``sub_*.npy``) draws in two
+levels from the same key: a sub-cluster uniformly, then a member uniformly inside it:
+
+    z    = splitmix64(splitmix64(member_seed_key(seed) ^ c) ^ epoch)
+    j    = cluster_sub_offsets[u] + z % n_sub(u)
+    row  = sub_members[sub_offsets[j] + splitmix64(z ^ SUB_TAG) % size(j)]
+
+When every sub-cluster is a singleton this is the uniform draw above, row for row.
+
 The draw is a pure function of (seed, cluster, epoch). It holds no RNG state, so the
 member a cluster gives in an epoch does not depend on num_workers, fetch order, world
 size or resume. The order of the visits does: the sampler permutes cluster positions
@@ -38,6 +47,10 @@ from nanoplm.utils import logger
 
 # b"RTMEMB": separates the member stream from anything else keyed on the same seed
 MEMBER_TAG = 0x52_54_4D_45_4D_42
+# b"RTSUBC": the second-level (member inside the sub-cluster) stream
+SUB_TAG = 0x52_54_53_55_42_43
+# the two-level index's memory-mapped arrays, all present or all absent
+SUB_ARRAYS = ("sub_members", "sub_offsets", "cluster_sub_offsets")
 # rows_for_epoch works in chunks so its temporaries stay small at 33M clusters
 VEC_CHUNK = 1 << 22
 
@@ -45,6 +58,8 @@ INDEX_MANIFEST = "pool_manifest.json"
 # Identity of the member draw. Part of the fingerprint, so a change to the draw is a
 # dataset change for resume purposes. Kept equal to the shim's tag on purpose.
 _FINGERPRINT_TAG = b"runtime-cluster-sampler-v1"
+# added (with the manifest's sub-array digest) for a two-level index only
+_SUB_FINGERPRINT_TAG = b"two-level-subcluster-draw-v1"
 
 
 # ------------------------------------------------------------------ the stateless draw
@@ -63,15 +78,20 @@ def member_slot(seed: int, cluster: int, epoch: int, n: int) -> int:
     return member_key(seed, cluster, epoch) % int(n)
 
 
-def member_slots_vec(seed: int, clusters: np.ndarray, epoch, n: np.ndarray) -> np.ndarray:
-    """Vectorized ``member_slot``; returns the same values. ``epoch`` is one int or an
-    array broadcast against ``clusters`` (a mixture draws each item at its own pass)."""
+def member_keys_vec(seed: int, clusters: np.ndarray, epoch) -> np.ndarray:
+    """Vectorized ``member_key`` (uint64). ``epoch`` is one int or an array broadcast
+    against ``clusters`` (a mixture draws each item at its own pass)."""
     k0 = np.uint64(member_seed_key(seed))
     e = np.asarray(epoch)
     e = np.uint64(int(e) & MASK64) if e.ndim == 0 else e.astype(np.uint64)
     with np.errstate(over="ignore"):
         z = splitmix64_vec(np.asarray(clusters).astype(np.uint64) ^ k0)
-        z = splitmix64_vec(z ^ e)
+        return splitmix64_vec(z ^ e)
+
+
+def member_slots_vec(seed: int, clusters: np.ndarray, epoch, n: np.ndarray) -> np.ndarray:
+    """Vectorized ``member_slot``; returns the same values."""
+    z = member_keys_vec(seed, clusters, epoch)
     return (z % np.asarray(n).astype(np.uint64)).astype(np.int64)
 
 
@@ -136,13 +156,57 @@ class ClusterSampledDataset(ShardedDataset):
         self._n = len(self._tc)
         if self._n == 0:
             raise RuntimeError(f"{ix}/train_clusters.npy is empty")
+        self._open_subclusters(man)
         if check:
             self._check_index(pool_rows)
         if log:
             logger.info(
                 f"Cluster-sampled train set: {self._n:,} train clusters over "
                 f"{pool_rows:,} pool rows, {len(self._members):,} members, "
-                f"seed={seed}, index={ix}")
+                f"member draw {self.cluster_draw}, seed={seed}, index={ix}")
+            if (self._cso is None and int(os.environ.get("RANK") or 0) == 0
+                    and man.get("level") == "uniref100"
+                    and (man.get("clusters") or {}).get("source") == "uniref50_xml"):
+                home = next((p for p in list(ix.resolve().parents)[:4]
+                             if (p / "data.yaml").exists()), None)
+                where = f"in {home}" if home else "in the dataset folder"
+                logger.warning(
+                    f"{ix}: this index has no UniRef90 sub-clusters, so members are drawn "
+                    "uniformly over the whole UniRef50 cluster. Rebuild it: nanoplm data "
+                    f"from-yaml data.yaml {where}; this changes the draw, so a run resumed "
+                    "on the rebuilt index restarts its current pass.")
+
+    def _open_subclusters(self, man: dict) -> None:
+        """Memory-map the two-level arrays when the index has them (all three, and the
+        manifest's ``subclusters`` block with its digest); refuse a half-built index."""
+        ix = self.index_dir
+        present = [(ix / f"{n}.npy").exists() for n in SUB_ARRAYS]
+        block = man.get("subclusters")
+        self._sub_digest = None
+        self._sub_members = self._so = self._cso = None
+        if not any(present) and block is None:
+            return
+        if not all(present) or block is None:
+            missing = [f"{n}.npy" for n, p in zip(SUB_ARRAYS, present) if not p]
+            raise RuntimeError(
+                f"{ix}: the sub-cluster index is incomplete: "
+                + (f"{INDEX_MANIFEST} has a 'subclusters' block but {', '.join(missing)} "
+                   "is missing" if block is not None else
+                   f"sub-cluster arrays exist but {INDEX_MANIFEST} has no 'subclusters' "
+                   "block" + (f" (and {', '.join(missing)} is missing)" if missing else ""))
+                + "; rebuild the cluster index")
+        digest = block.get("digest") if isinstance(block, dict) else None
+        if not isinstance(digest, str) or not digest:
+            raise RuntimeError(f"{ix}/{INDEX_MANIFEST}: 'subclusters' block has no digest")
+        self._sub_digest = digest
+        self._sub_members = np.load(ix / "sub_members.npy", mmap_mode="r")
+        self._so = np.load(ix / "sub_offsets.npy", mmap_mode="r")
+        self._cso = np.load(ix / "cluster_sub_offsets.npy", mmap_mode="r")
+
+    @property
+    def cluster_draw(self) -> str:
+        """'two_level' (sub-cluster, then member) or 'uniform' (member of the cluster)."""
+        return "uniform" if self._cso is None else "two_level"
 
     def _check_index(self, pool_rows: int) -> None:
         """One pass over the index in the main process; workers skip it."""
@@ -155,6 +219,49 @@ class ClusterSampledDataset(ShardedDataset):
             chunk = self._members[a:a + VEC_CHUNK]
             if int(chunk.min()) < 0 or int(chunk.max()) >= pool_rows:
                 raise RuntimeError("cluster_members.npy points outside the pool")
+        if self._cso is not None:
+            self._check_subclusters(pool_rows)
+
+    def _check_subclusters(self, pool_rows: int) -> None:
+        """Shapes, end points and per-train-cluster nesting of the sub-cluster CSR; one
+        chunked pass over sub_offsets and sub_members. The full set checks (same rows
+        per cluster, order) are the index verify's job."""
+        sm, so, cso, off = self._sub_members, self._so, self._cso, self._off
+
+        def bad(what):
+            return RuntimeError(f"{self.index_dir}: sub-cluster arrays are inconsistent: {what}")
+
+        for name, a in (("sub_members", sm), ("sub_offsets", so),
+                        ("cluster_sub_offsets", cso)):
+            if a.ndim != 1 or a.dtype.kind not in "iu":
+                raise bad(f"{name}.npy is not a 1-d integer array ({a.dtype}, {a.shape})")
+        if len(sm) != len(self._members):
+            raise bad(f"sub_members has {len(sm):,} rows, cluster_members {len(self._members):,}")
+        if len(cso) != len(off):
+            raise bad(f"cluster_sub_offsets has {len(cso):,} entries, cluster_offsets "
+                      f"{len(off):,}")
+        if len(so) < 2 or int(so[0]) != 0 or int(so[-1]) != len(sm):
+            raise bad(f"sub_offsets must run from 0 to {len(sm):,}")
+        if int(cso[0]) != 0 or int(cso[-1]) != len(so) - 1:
+            raise bad(f"cluster_sub_offsets must run from 0 to {len(so) - 1:,} sub-clusters")
+        for a in range(0, len(so) - 1, VEC_CHUNK):
+            chunk = np.asarray(so[a:a + VEC_CHUNK + 1], dtype=np.int64)
+            if (np.diff(chunk) < 1).any():
+                raise bad("sub_offsets is not strictly increasing (an empty sub-cluster)")
+        for a in range(0, len(sm), VEC_CHUNK):
+            chunk = sm[a:a + VEC_CHUNK]
+            if int(chunk.min()) < 0 or int(chunk.max()) >= pool_rows:
+                raise bad("sub_members points outside the pool")
+        for a in range(0, self._n, VEC_CHUNK):
+            uloc = np.asarray(self._g2u[np.asarray(self._tc[a:a + VEC_CHUNK])], dtype=np.int64)
+            s0 = np.asarray(cso[uloc], dtype=np.int64)
+            s1 = np.asarray(cso[uloc + 1], dtype=np.int64)
+            if (s1 <= s0).any():
+                raise bad("a train cluster has no sub-cluster")
+            if (np.asarray(so[s0], dtype=np.int64) != np.asarray(off[uloc], dtype=np.int64)).any() \
+                    or (np.asarray(so[s1], dtype=np.int64)
+                        != np.asarray(off[uloc + 1], dtype=np.int64)).any():
+                raise bad("a train cluster's sub-clusters do not span its cluster_offsets segment")
 
     def _segments(self, a: int, b: int):
         """CSR (start, size) of train positions [a, b)."""
@@ -192,13 +299,46 @@ class ClusterSampledDataset(ShardedDataset):
         u = int(self._g2u[c])
         return int(self._off[u + 1]) - int(self._off[u])
 
+    # ---- the member draw: every path below goes through these two -------------
+    def _draw_row(self, cluster: int, pass_idx: int) -> int:
+        """Pool row cluster ``cluster`` (a global cluster id) gives in pass ``pass_idx``."""
+        c = int(cluster)
+        u = int(self._g2u[c])
+        if self._cso is None:
+            start = int(self._off[u])
+            slot = member_slot(self.seed, c, int(pass_idx), int(self._off[u + 1]) - start)
+            return int(self._members[start + slot])
+        z = member_key(self.seed, c, int(pass_idx))
+        s0 = int(self._cso[u])
+        j = s0 + z % (int(self._cso[u + 1]) - s0)
+        a = int(self._so[j])
+        return int(self._sub_members[a + splitmix64(z ^ SUB_TAG) % (int(self._so[j + 1]) - a)])
+
+    def _draw_rows(self, clusters: np.ndarray, passes) -> np.ndarray:
+        """Vectorized ``_draw_row``: pool row of each cluster in ``clusters`` (global
+        ids) at ``passes`` (one int or an array broadcast against ``clusters``). The
+        result has ``cluster_members.npy``'s dtype."""
+        tc = np.asarray(clusters)
+        uloc = np.asarray(self._g2u[tc], dtype=np.int64)
+        if self._cso is None:
+            start = np.asarray(self._off[uloc], dtype=np.int64)
+            size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
+            slot = member_slots_vec(self.seed, tc, passes, size)
+            return np.asarray(self._members[start + slot])
+        # offsets may be uint32: widen to int64 before any add; hashing stays uint64
+        z = member_keys_vec(self.seed, tc, passes)
+        s0 = np.asarray(self._cso[uloc], dtype=np.int64)
+        n_sub = np.asarray(self._cso[uloc + 1], dtype=np.int64) - s0
+        j = s0 + (z % n_sub.astype(np.uint64)).astype(np.int64)
+        a = np.asarray(self._so[j], dtype=np.int64)
+        size = np.asarray(self._so[j + 1], dtype=np.int64) - a
+        with np.errstate(over="ignore"):
+            z2 = splitmix64_vec(z ^ np.uint64(SUB_TAG))
+        return np.asarray(self._sub_members[a + (z2 % size.astype(np.uint64)).astype(np.int64)])
+
     def pool_row(self, idx: int) -> int:
         """Pool row visited at position idx in the current epoch."""
-        c = int(self._tc[idx])
-        u = int(self._g2u[c])
-        start = int(self._off[u])
-        slot = member_slot(self.seed, c, self._epoch, int(self._off[u + 1]) - start)
-        return int(self._members[start + slot])
+        return self._draw_row(self._tc[idx], self._epoch)
 
     def rows_for_epoch(self, epoch: Optional[int] = None) -> np.ndarray:
         """Pool row of every train position at ``epoch`` (default: the current one)."""
@@ -206,9 +346,7 @@ class ClusterSampledDataset(ShardedDataset):
         out = np.empty(self._n, dtype=np.int64)
         for a in range(0, self._n, VEC_CHUNK):
             b = min(a + VEC_CHUNK, self._n)
-            start, size = self._segments(a, b)
-            slot = member_slots_vec(self.seed, np.asarray(self._tc[a:b]), e, size)
-            out[a:b] = self._members[start + slot]
+            out[a:b] = self._draw_rows(self._tc[a:b], e)
         return out
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -219,11 +357,7 @@ class ClusterSampledDataset(ShardedDataset):
     def item_at(self, idx: int, epoch: int) -> Dict[str, torch.Tensor]:
         """Position ``idx`` with the member of pass ``epoch``, whatever the current epoch
         is. A mixture keeps one pass counter per source and reads through this."""
-        c = int(self._tc[idx])
-        u = int(self._g2u[c])
-        start = int(self._off[u])
-        slot = member_slot(self.seed, c, int(epoch), int(self._off[u + 1]) - start)
-        return self.read_pool_row(int(self._members[start + slot]))
+        return self.read_pool_row(self._draw_row(self._tc[idx], epoch))
 
     def lengths_at(self, idx: np.ndarray, epochs: np.ndarray) -> np.ndarray:
         """Token count of the member position ``idx[i]`` gives in pass ``epochs[i]``."""
@@ -232,23 +366,14 @@ class ClusterSampledDataset(ShardedDataset):
         lengths = self.pool_lengths()
         for a in range(0, len(idx), VEC_CHUNK):
             b = min(a + VEC_CHUNK, len(idx))
-            tc = np.asarray(self._tc[idx[a:b]])
-            uloc = np.asarray(self._g2u[tc], dtype=np.int64)
-            start = np.asarray(self._off[uloc], dtype=np.int64)
-            size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
-            slot = member_slots_vec(self.seed, tc, np.asarray(epochs)[a:b], size)
-            out[a:b] = lengths[self._members[start + slot]]
+            rows = self._draw_rows(self._tc[idx[a:b]], np.asarray(epochs)[a:b])
+            out[a:b] = lengths[rows]
         return out
 
     def rows_at(self, idx: np.ndarray, epochs) -> np.ndarray:
         """Pool row the member position ``idx[i]`` gives in pass ``epochs[i]`` (or one
         pass for all)."""
-        tc = np.asarray(self._tc[np.asarray(idx, dtype=np.int64)])
-        uloc = np.asarray(self._g2u[tc], dtype=np.int64)
-        start = np.asarray(self._off[uloc], dtype=np.int64)
-        size = np.asarray(self._off[uloc + 1], dtype=np.int64) - start
-        slot = member_slots_vec(self.seed, tc, epochs, size)
-        return np.asarray(self._members[start + slot])
+        return self._draw_rows(self._tc[np.asarray(idx, dtype=np.int64)], epochs)
 
     def read_pool_row(self, row: int) -> Dict[str, torch.Tensor]:
         """Pool row ``row``, read the way ShardedDataset.__getitem__ reads its rows.
@@ -293,6 +418,9 @@ class ClusterSampledDataset(ShardedDataset):
         h.update((int(self.seed) & MASK64).to_bytes(8, "little"))
         for a in range(0, self._n, VEC_CHUNK):
             h.update(np.asarray(self._tc[a:a + VEC_CHUNK], dtype=np.int64).tobytes())
+        if self._sub_digest is not None:
+            h.update(_SUB_FINGERPRINT_TAG)
+            h.update(self._sub_digest.encode())
         return h.hexdigest()[:16]
 
     @property

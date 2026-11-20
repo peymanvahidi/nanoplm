@@ -168,3 +168,100 @@ def test_malformed_entries_fail_loudly(tmp_path, entry, match):
     src = _write(tmp_path, _xml(entry))
     with pytest.raises(uh.HierarchyError, match=match):
         uh.xml_to_members_tsv(src, tmp_path / "m.tsv")
+
+
+# ------------------------------------------------------------ sub-clusters ---
+
+
+def test_submembers_match_ground_truth_and_members_unchanged(release, tmp_path):
+    from nanoplm.data.preparation.cluster_table import read_members_table
+    uh.xml_to_members_tsv(release.xml, tmp_path / "plain.tsv", level="uniref100")
+    stats = uh.xml_to_members_tsv(release.xml, tmp_path / "m.tsv", level="uniref100",
+                                  sub_out=tmp_path / "sub.tsv")
+    assert (tmp_path / "m.tsv").read_bytes() == (tmp_path / "plain.tsv").read_bytes()
+    rows = _rows(tmp_path / "sub.tsv")
+    got = {m[len("UniRef100_"):]: s[len("UniRef90_"):] for s, m in rows}
+    assert len(got) == len(rows) == len(release.sub90)
+    assert got == release.sub90
+    subs = [s for s, _ in rows]
+    firsts = [s for i, s in enumerate(subs) if i == 0 or s != subs[i - 1]]
+    assert len(firsts) == len(set(firsts)) == stats["subclusters"] == len(release.u90)
+    # every sub-cluster lies inside one cluster of members.tsv
+    cluster_of = {m: c for c, m in _rows(tmp_path / "m.tsv")}
+    for s in set(subs):
+        assert len({cluster_of[m] for t, m in rows if t == s}) == 1
+    table = read_members_table(tmp_path / "sub.tsv")
+    assert len(table.keys) == len(rows) and len(table.sizes) == len(firsts)
+
+
+def test_submembers_same_with_the_python_filter(release, tmp_path, monkeypatch):
+    uh.xml_to_members_tsv(release.xml, tmp_path / "m.tsv", "uniref100", sub_out=tmp_path / "a")
+    real_which = uh.shutil.which
+    monkeypatch.setattr(uh.shutil, "which", lambda n: None if n == "grep" else real_which(n))
+    uh.xml_to_members_tsv(release.xml, tmp_path / "m.tsv", "uniref100", sub_out=tmp_path / "b")
+    assert (tmp_path / "a").read_bytes() == (tmp_path / "b").read_bytes()
+
+
+def _rec(w, u100, u90):
+    lines = [f"<{w}>", f'<dbReference type="UniProtKB ID" id="{u100 or u90}_TEST">']
+    if u100:
+        lines.append(f'<property type="UniRef100 ID" value="UniRef100_{u100}"/>')
+    if u90:
+        lines.append(f'<property type="UniRef90 ID" value="UniRef90_{u90}"/>')
+    return lines + ["</dbReference>", f"</{w}>"]
+
+
+def _entry100(u50, recs):
+    lines = [f'<entry id="UniRef50_{u50}">']
+    for i, (u100, u90) in enumerate(recs):
+        lines += _rec("representativeMember" if i == 0 else "member", u100, u90)
+    return "\n".join(lines + ["</entry>"]) + "\n"
+
+
+def test_submembers_small_table(tmp_path):
+    src = _write(tmp_path, _xml(_entry100("A1", [("A1", "A1"), ("B2", "B2"), ("C3", "A1"),
+                                                 ("C3", "A1"), ("D4", "B2")])
+                                + _entry100("E5", [("E5", "E5")])))
+    uh.xml_to_members_tsv(src, tmp_path / "m.tsv", "uniref100", sub_out=tmp_path / "s.tsv")
+    assert (tmp_path / "s.tsv").read_text() == (
+        "UniRef90_A1\tUniRef100_A1\nUniRef90_A1\tUniRef100_C3\n"
+        "UniRef90_B2\tUniRef100_B2\nUniRef90_B2\tUniRef100_D4\n"
+        "UniRef90_E5\tUniRef100_E5\n")
+
+
+@pytest.mark.parametrize("entries,match", [
+    (_entry100("A1", [("A1", "A1"), ("B2", None), ("C3", "A1")]), "1 member records .*B2"),
+    (_entry100("A1", [("A1", "A1"), (None, "B2")]), "do not alternate.*UniRef90_B2 follows"),
+    # one record without UniRef90, the next without UniRef100: never paired across records
+    (_entry100("A1", [("A1", "A1"), ("B2", None), (None, "C3")]),
+     "2 member records .*UniRef100_B2 has no UniRef90 line; .*UniRef90_C3 follows no UniRef100"),
+    (_entry100("A1", [("A1", "A1"), ("B2", None)]), "UniRef100_B2 has no UniRef90"),
+    (_entry100("A1", [("A1", "A1"), ("B2", "A1"), ("B2", "C3")]),
+     "1 UniRef100 ids listed under two UniRef90 ids.*UniRef90_A1 and UniRef90_C3"),
+    (_entry100("A1", [("A1", "A1")]) + _entry100("B2", [("B2", "B2"), ("C3", "A1")]),
+     "1 UniRef90 ids appear in two UniRef50 entries .first: UniRef90_A1 in UniRef50_A1 and "
+     "UniRef50_B2"),
+])
+def test_submembers_bad_pairing_fails(tmp_path, entries, match):
+    src = _write(tmp_path, _xml(entries))
+    uh.xml_to_members_tsv(src, tmp_path / "ok.tsv", "uniref100")      # members alone pass
+    with pytest.raises(uh.HierarchyError, match=match):
+        uh.xml_to_members_tsv(src, tmp_path / "m.tsv", "uniref100", sub_out=tmp_path / "s.tsv")
+    assert not (tmp_path / "m.tsv").exists() and not (tmp_path / "s.tsv").exists()
+
+
+def test_submembers_need_uniref100(release, tmp_path):
+    with pytest.raises(ValueError, match="needs level uniref100"):
+        uh.xml_to_members_tsv(release.xml, tmp_path / "m.tsv", "uniref90",
+                              sub_out=tmp_path / "s.tsv")
+
+
+def test_submembers_hash_collisions_are_confirmed_on_exact_ids(release, tmp_path, monkeypatch):
+    uh.xml_to_members_tsv(release.xml, tmp_path / "m.tsv", "uniref100", sub_out=tmp_path / "a")
+    monkeypatch.setattr(uh, "_id_hash", lambda b: len(b) % 3)   # nearly every id collides
+    uh.xml_to_members_tsv(release.xml, tmp_path / "m.tsv", "uniref100", sub_out=tmp_path / "b")
+    assert (tmp_path / "a").read_bytes() == (tmp_path / "b").read_bytes()
+    src = _write(tmp_path, _xml(_entry100("A1", [("A1", "A1"), ("D4", "D4")])
+                                + _entry100("B2", [("B2", "B2"), ("C3", "A1")])))
+    with pytest.raises(uh.HierarchyError, match="UniRef90_A1 in UniRef50_A1 and UniRef50_B2"):
+        uh.xml_to_members_tsv(src, tmp_path / "x.tsv", "uniref100", sub_out=tmp_path / "s.tsv")

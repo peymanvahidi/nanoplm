@@ -10,6 +10,7 @@ Stages (``nanoplm data from-yaml`` runs them as DVC stages; see _dvc_yaml_gen):
   get_cluster_xml        uniref50.xml.gz (UniProt clusters only)
   cluster_members        cluster_index/members.tsv from the XML or MMseqs2
                          (cluster_table.build_members_table)
+                         (+ submembers.tsv with UniRef100 members)
   cluster_index          cluster_index/index/ arrays and val/ (held-out reps)
   write_manifest         .data_manifest with cluster_index_dir
 
@@ -79,9 +80,12 @@ def build_index_and_val(filtered_fasta: Path, pool_dir: Path, members_tsv: Path,
                         index_dir: Path, val_dir: Path, max_seq_len: int, val_ratio: float,
                         samples_per_shard: int, seqs_num: int = -1, register_tokens: int = 0,
                         holdout_seed: int = ci.HOLDOUT_SEED,
-                        cluster_xml: Optional[Path] = None) -> dict:
+                        cluster_xml: Optional[Path] = None,
+                        submembers_tsv: Optional[Path] = None) -> dict:
     """The cluster index, then val/ (the held-out clusters' representatives).
-    ``cluster_xml`` is the UniProt XML members.tsv came from, named if the releases differ."""
+    ``cluster_xml`` is the UniProt XML members.tsv came from, named if the releases differ.
+    ``submembers_tsv`` (the sub-cluster table) makes it a two-level index; it comes from
+    the same source as members.tsv."""
     info_path = Path(members_tsv).with_suffix(".json")
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
     man = ci.build_cluster_index(
@@ -90,7 +94,12 @@ def build_index_and_val(filtered_fasta: Path, pool_dir: Path, members_tsv: Path,
         tokenizer=_tokenizer(register_tokens), level=info.get("level"),
         clusters_info={k: info[k] for k in ("source", "release_version", "identity",
                                              "coverage", "cov_mode") if k in info},
-        cluster_xml=str(cluster_xml) if cluster_xml else None)
+        cluster_xml=str(cluster_xml) if cluster_xml else None,
+        submembers_tsv=submembers_tsv,
+        # the members table's source labels the sub-cluster table too: for uniprot
+        # sources both come from the same XML
+        subclusters_info=({"source": info["source"]} if submembers_tsv and "source" in info
+                          else None))
     rep = np.load(Path(index_dir) / "val_rep_rows.npy")
     ci.write_row_gather(pool_dir, rep, val_dir, samples_per_shard)
     return man
@@ -123,6 +132,7 @@ def write_cluster_manifest(output_dir: Path, min_seq_len: int, max_seq_len: int,
         cluster_level=man.get("level") or man.get("clusters", {}).get("source"),
         pool_sequences=c["pool_rows"],
         pool_tokens=c["pool_tokens"],
+        cluster_draw="two_level" if man.get("subclusters") else None,
     )
     write_manifest(output_dir, manifest)
     return manifest

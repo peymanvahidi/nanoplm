@@ -52,6 +52,7 @@ DEFAULT_IDENTITY = 0.5
 DEFAULT_COVERAGE = 0.8
 INDEX_SUBDIR = "cluster_index"
 MEMBERS_TSV = "members.tsv"
+SUBMEMBERS_TSV = "submembers.tsv"   # UniRef90 sub-cluster of every UniRef100 member
 ARRAYS_SUBDIR = "index"          # cluster_index/index: the arrays ClusterSampledDataset reads
 CLUSTER_INDEX_DIR = f"{INDEX_SUBDIR}/{ARRAYS_SUBDIR}"   # relative to output_dir (manifest)
 MMSEQS_TMP = ".mmseqs_tmp"
@@ -279,6 +280,15 @@ class ClusterPlan:
     @property
     def members_tsv(self) -> Path:
         return self.output_dir / INDEX_SUBDIR / MEMBERS_TSV
+
+    @property
+    def submembers_tsv(self) -> Optional[Path]:
+        """The sub-cluster table, or None. UniProt clusters over UniRef100 members always
+        have one (UniRef90, from the same XML scan): the index then draws a sub-cluster,
+        then a member. Every other source is one level."""
+        if self.cluster_source == "uniref_xml" and self.members_level == "uniref100":
+            return self.output_dir / INDEX_SUBDIR / SUBMEMBERS_TSV
+        return None
 
     @property
     def index_dir(self) -> Path:

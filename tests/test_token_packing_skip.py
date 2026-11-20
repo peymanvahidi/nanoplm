@@ -127,16 +127,18 @@ def test_uncovered_settings_raise_and_leave_no_plan(bad):
 # ------------------------------------------------------------- mixture with a cluster source
 
 
-def test_skip_on_a_mixture_with_a_cluster_source(tmp_path):
+@pytest.mark.parametrize("two_level", [False, True])
+def test_skip_on_a_mixture_with_a_cluster_source(tmp_path, two_level):
     from nanoplm.data.datasets import open_train_dataset
     from nanoplm.data.infra import mixture as mx
     from nanoplm.data.infra.manifest import read_manifest
     from tests.data.datasets.mixture_sources import cluster_source, plain_source
 
     a = plain_source(tmp_path / "a", 300, tag=5, seed=1)
-    c, _ = cluster_source(tmp_path / "c", seed=3)
+    c, _ = cluster_source(tmp_path / "c", seed=3, two_level=two_level)
     mx.write_mixture(tmp_path, [("a", a, 0.6, "a.fasta"), ("c", c, 0.4, "c.fasta")])
     d = open_train_dataset(tmp_path, read_manifest(tmp_path), seed=5)
+    assert d.datasets[1].cluster_draw == ("two_level" if two_level else "uniform")
     sampler = DistributedSampler(d, num_replicas=2, rank=1, shuffle=True, seed=5)
     packed = TokenPackingDataset(d, max_tokens_per_batch=512, drop_last=True,
                                  sampler=sampler, num_workers=2)

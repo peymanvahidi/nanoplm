@@ -74,6 +74,9 @@ class PretrainManifest(DataManifestBase):
     cluster_level: Optional[str] = None  # "uniref90" or "uniref100"
     pool_sequences: Optional[int] = None
     pool_tokens: Optional[int] = None
+    # "two_level" when the cluster index has UniRef90 sub-clusters (draw a sub-cluster,
+    # then a member). None (not written) is the uniform draw over the cluster's members.
+    cluster_draw: Optional[str] = None
 
     # False: training reads the train set in file order (data.yaml shuffle: false). None
     # (the default, not written) means shuffled, so other manifests stay as they were.

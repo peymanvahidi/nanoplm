@@ -107,6 +107,53 @@ def test_uniref50_url_uniref90_members_stages():
         "uniref50", {"clusters": "mmseqs2"}))["cluster_index"]["cmd"]
 
 
+def test_uniref100_members_also_write_the_subcluster_table():
+    """UniRef100 members: the XML scan also writes submembers.tsv (UniRef90 sub-clusters)
+    and the index stage reads it; no data.yaml key turns it on."""
+    st = _stages(_source("uniref50", {"members": "uniref100", "clusters": "uniprot"}))
+    ix = f"{OUT}/cluster_index"
+    cm, ci = st["cluster_members"], st["cluster_index"]
+    assert cm["cmd"] == ("nanoplm data cluster-members --source uniref_xml --level uniref100 "
+                         f"--fasta {OUT}/src/uniref100.fasta "
+                         f"--xml {OUT}/downloads/uniref50.xml.gz -o {ix}/members.tsv "
+                         f"--sub-out {ix}/submembers.tsv")
+    assert cm["outs"] == [f"{ix}/members.tsv", f"{ix}/members.json", f"{ix}/submembers.tsv"]
+    assert "params" not in cm
+    assert ci["cmd"].startswith(f"nanoplm data cluster-index --members-tsv {ix}/members.tsv "
+                                f"--submembers-tsv {ix}/submembers.tsv --fasta ")
+    assert ci["deps"][:3] == [f"{ix}/members.tsv", f"{ix}/members.json",
+                              f"{ix}/submembers.tsv"]
+    assert any(d.endswith("subclusters.py") for d in ci["deps"])
+    assert ci["outs"] == [f"{ix}/index", f"{OUT}/val"]     # the sub arrays are in index/
+    # the cluster count for val_split needs only members.tsv
+    cfg = _source("uniref50", {"members": "uniref100", "clusters": "uniprot"}, val_size=10)
+    del cfg["data_params"]["val_ratio"]
+    assert "submembers" not in str(_stages(cfg)["count"])
+
+
+@pytest.mark.parametrize("block", [{"members": "uniref90", "clusters": "uniprot"},
+                                   {"members": "uniref100", "clusters": "mmseqs2"},
+                                   {"members": "uniref90", "clusters": "mmseqs2"}])
+def test_no_subcluster_table_without_uniref100_members_and_uniprot(block):
+    text = generate_dvc_yaml(_source("uniref50", block), "pretrain", "data.yaml")
+    assert "submembers" not in text and "--sub-out" not in text
+    assert "subclusters.py" not in text
+
+
+def test_a_mix_gives_the_subcluster_table_only_to_the_uniref100_source():
+    from tests.data.dvc.test_mixture_stages import _mix, _stages as _mix_stages
+    st = _mix_stages(_mix(
+        u={"fasta": "uniref50", "weight": 0.5, "cluster_subsampling":
+           {"members": "uniref100", "clusters": "uniprot"}},
+        v={"fasta": "uniref50", "weight": 0.5, "cluster_subsampling":
+           {"members": "uniref90", "clusters": "uniprot"}}))
+    for stage in ("cluster_members", "cluster_index"):
+        assert "submembers.tsv" in str(st[f"u-{stage}"])
+        assert "submembers" not in str(st[f"v-{stage}"])
+    assert any(d.endswith("subclusters.py") for d in st["u-cluster_index"]["deps"])
+    assert not any(d.endswith("subclusters.py") for d in st["v-cluster_index"]["deps"])
+
+
 def test_writing_a_cluster_default_out_changes_nothing(tmp_path):
     """identity 0.5 and coverage 0.8 are what a left-out key means, so writing them gives
     the same dvc.yaml (no new DVC param, no rerun)."""
@@ -182,6 +229,10 @@ def test_cluster_index_passes_seed_to_the_draw(tmp_path, monkeypatch):
         r = CliRunner().invoke(data, base + extra)
         assert r.exit_code == 0, r.output
         assert got["holdout_seed"] == seed
+        assert got["submembers_tsv"] is None
+    r = CliRunner().invoke(data, base + ["--submembers-tsv", str(f)])
+    assert r.exit_code == 0, r.output
+    assert got["submembers_tsv"] == f
 
 
 def test_mmseqs_params_only_reach_cluster_members(tmp_path):
@@ -319,6 +370,47 @@ def test_from_yaml_end_to_end_with_uniprot_clusters(tmp_path):
     _from_yaml(tmp_path, env)
     m = read_manifest(out)
     assert m.cluster_index_dir is None and m.train_sequences > 0
+
+
+@pytest.mark.parametrize("level, draw", [("uniref100", "two_level"), ("uniref90", "uniform")])
+def test_from_yaml_end_to_end_draws_two_levels_from_uniref100_members(tmp_path, monkeypatch,
+                                                                      level, draw):
+    """UniRef50 fasta + UniRef100 members builds a two-level index with no extra key;
+    UniRef90 members stay one level, without the rebuild warning."""
+    from nanoplm.data.datasets import ClusterSampledDataset, open_train_dataset
+    from nanoplm.data.datasets import cluster_sampled
+    from nanoplm.data.infra.manifest import read_manifest
+    from tests.data.preparation.uniref_fixture import make_release
+    rel = make_release(tmp_path / "src", n_clusters=120)
+    u50 = tmp_path / "src/reps.fasta"              # UniRef50 by its headers only
+    u50.write_text(rel.fasta90.read_text().replace(">UniRef90_", ">UniRef50_"))
+    members = rel.fasta100 if level == "uniref100" else rel.fasta90
+    downloads = tmp_path / OUT / "downloads"
+    downloads.mkdir(parents=True)
+    shutil.copy(rel.xml, downloads / "uniref50.xml.gz")
+    env = _project(tmp_path, {"clusters": "uniprot", "members": str(members)}, str(u50))
+    env.pop("NANOPLM_MMSEQS", None)
+    _from_yaml(tmp_path, env)
+    out = tmp_path / OUT
+    sub = out / "cluster_index/submembers.tsv"
+    assert sub.exists() == (level == "uniref100")
+    if level == "uniref100":           # every UniRef100 member under its own UniRef90
+        pairs = [ln.split("\t") for ln in sub.read_text().splitlines()]
+        assert len(pairs) == len(rel.sub90)
+        assert all(rel.sub90[m.removeprefix("UniRef100_")] == s.removeprefix("UniRef90_")
+                   for s, m in pairs)
+    said = []
+    monkeypatch.setattr(cluster_sampled.logger, "warning", lambda msg, *a: said.append(msg))
+    monkeypatch.delenv("RANK", raising=False)
+    m = read_manifest(out)
+    assert m.cluster_level == level
+    written = yaml.safe_load((out / ".data_manifest").read_text())
+    assert written.get("cluster_draw", "absent") == (
+        "two_level" if draw == "two_level" else "absent")
+    ds = open_train_dataset(out, m, seed=3)
+    assert isinstance(ds, ClusterSampledDataset) and ds.cluster_draw == draw
+    assert said == []
+    assert _status(tmp_path, env) == set()
 
 
 @pytest.mark.skipif(MMSEQS is None, reason="mmseqs not installed")
