@@ -1128,7 +1128,7 @@ class ModernBertEncoderLayer(nn.Module):
                         x_in = h + (x_in - x_in.detach())
                     else:
                         x_in = self._forward_once(x_in, **once_kwargs)
-                    x_in = self.repeat_tap(x_in, rep)
+                    x_in = self.repeat_tap(x_in, rep, token_mask)
                 return x_in
 
             if self._use_internal_layer_ac():
@@ -1184,7 +1184,7 @@ class ModernBertEncoderLayer(nn.Module):
                 x = h + (x - x.detach())
             else:
                 x = self._forward_once(x, **kwargs)
-            x = self.repeat_tap(x, rep)
+            x = self.repeat_tap(x, rep, kwargs.get("token_mask"))
         return x
 
     def _forward_once(
@@ -1704,7 +1704,7 @@ class MHCLiteBlock(nn.Module):
                 x_streams, self.layer, self.W_all.weight, alpha3,
                 self.W_all.bias.float(), self.perm_mat_pad.float(), merge=self.merge_residual, **kwargs,
             )
-        return self.repeat_tap(out, 0)
+        return self.repeat_tap(out, 0, kwargs.get("token_mask"))
 
 
 class MHCLiteSublayersLayer(nn.Module):
@@ -1743,7 +1743,7 @@ class MHCLiteSublayersLayer(nn.Module):
         x_streams = self.mhc_attn(x_streams, **kwargs)
         if self.mhc_mlp is not None:
             x_streams = self.mhc_mlp(x_streams, **kwargs)
-        return self.repeat_tap(x_streams, 0)
+        return self.repeat_tap(x_streams, 0, kwargs.get("token_mask"))
 
 
 def _block_owns_layer_checkpoint(block: nn.Module, loop_count=None) -> bool:
@@ -2608,7 +2608,8 @@ class ModernBertModel(nn.Module):
         if self.config.use_mhc_lite:
             x = self._mhc_readout(x)
         return run_flush(
-            self._cpu_offload_flush, self.final_norm_tap(self.final_norm(x))
+            self._cpu_offload_flush,
+            self.final_norm_tap(self.final_norm(x), attention_mask),
         )
 
 
@@ -2869,14 +2870,17 @@ class ModernBertForMaskedLM(nn.Module):
     def get_output_embeddings(self) -> nn.Linear:
         return self.decoder
 
-    def _lm_logits(self, x: torch.Tensor) -> torch.Tensor:
+    def _lm_logits(
+        self, x: torch.Tensor, token_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """head -> decoder -> logit tap.  The single scoring path.
 
         Every branch in ``forward`` goes through here so the debug logit stats
         see exactly the elements that are scored (the sparse path passes
-        ``x[keep]``).
+        ``x[keep]``). Pad rows are left out: ``token_mask`` on the dense
+        padded path, ``logit_tap.valid_token_count`` on the packed path.
         """
-        return self.logit_tap(self.decoder(self.head(x)))
+        return self.logit_tap(self.decoder(self.head(x)), token_mask)
 
     def forward(
         self,
@@ -2895,7 +2899,12 @@ class ModernBertForMaskedLM(nn.Module):
         # any path branches, is what makes the accumulation safe when a layer
         # runs more than once per forward -- Huginn recycling iterations or
         # Loopie repeats -- instead of each execution clobbering the last.
-        if self.config.use_moe:
+        # The debug taps only accumulate in training, so eval skips the walk.
+        # num_valid_tokens marks the real-token prefix of a packed batch (None
+        # elsewhere): the taps leave the trailing pad segment out of their
+        # stats, exactly as MoELayer leaves it out of its routing stats.
+        _tap_types = (RepeatTap, StatsTap) if self.training else ()
+        if self.config.use_moe or _tap_types:
             from .moe import MoELayer as _MoELayer
             for _module in self.modules():
                 if isinstance(_module, _MoELayer):
@@ -2903,6 +2912,8 @@ class ModernBertForMaskedLM(nn.Module):
                     _module.last_aux_loss = None
                     _module.last_z_loss = None
                     _module.last_aux_count = None
+                    _module.valid_token_count = num_valid_tokens
+                elif _tap_types and isinstance(_module, _tap_types):
                     _module.valid_token_count = num_valid_tokens
 
         # ---- static packed path (pre-flattened by collator) ---------------
@@ -3022,10 +3033,12 @@ class ModernBertForMaskedLM(nn.Module):
             keep = flat_labels != self.sparse_pred_ignore_index
             x = x[keep]
             flat_labels = flat_labels[keep]
+            logit_mask = None  # x[keep] holds scored, hence real, tokens only
         else:
             flat_labels = labels
+            logit_mask = attention_mask
 
-        logits = self._lm_logits(x)
+        logits = self._lm_logits(x, logit_mask)
 
         loss = None
         if labels is not None:
