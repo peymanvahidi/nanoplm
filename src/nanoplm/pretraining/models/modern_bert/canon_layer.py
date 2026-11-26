@@ -304,7 +304,8 @@ class ModernBertCanonLayer(nn.Module):
             )
         # Outside the checkpoint, like the forward hook this replaced: one
         # sample per call, all in slot 0 (a Canon layer has no loop index).
-        return self.repeat_tap(out, 0)
+        # attention_mask is the padded path's token mask (None when packed).
+        return self.repeat_tap(out, 0, attention_mask)
 
     def _forward_dispatch(
         self,
