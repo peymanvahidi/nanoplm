@@ -36,20 +36,26 @@ from nanoplm.pretraining.models.modern_bert.taps import RepeatTap, StatsTap
 from nanoplm.utils.logger import logger
 
 
-def _is_sharded(t: torch.Tensor) -> bool:
-    """True if ``t`` is a DTensor with at least one Shard placement.
+def _replica_count(t: torch.Tensor, world: int) -> float:
+    """How many ranks hold each element of ``t``.
 
-    Replicated DTensors and plain Tensors return False — every rank already
-    holds the full data, so SUM-reducing local squared sums would overcount
-    by world_size.
+    ``flush()`` SUM-reduces every rank's local squared sum, which counts each
+    element once per rank that holds it, so the local sum is divided by this
+    first. A plain Tensor or a fully replicated DTensor is whole on every rank:
+    ``world`` copies. A DTensor sharded over some mesh dims has one shard per
+    combination of those dims, and each shard sits on ``world / n_shards``
+    ranks: 1 under FSDP, the replicate-group size under HSDP (FSDP2 places HSDP
+    parameters and gradients as ``(Replicate(), Shard(0))``).
     """
     placements = getattr(t, "placements", None)
-    if placements is None:
-        return False
-    for p in placements:
+    mesh = getattr(t, "device_mesh", None)
+    if placements is None or mesh is None:
+        return float(world)
+    n_shards = 1
+    for dim, p in enumerate(placements):
         if getattr(p, "is_shard", None) is not None and p.is_shard():
-            return True
-    return False
+            n_shards *= mesh.size(dim)
+    return max(1.0, world / n_shards)
 
 
 _BLOCK_CLASS_NAMES = (
@@ -291,9 +297,10 @@ class LayerwiseDebugTracker:
         per-rank collective queues mismatched and trigger NCCL deadlocks
         several steps later. The local-shard form avoids that entirely.
         """
-        # For replicated DTensors and plain Tensors, every rank already holds
-        # the same data; pre-dividing by world_size cancels the SUM-reduce
-        # overcount in flush().
+        # Every rank that holds a copy of an element adds its square in the
+        # SUM-reduce in flush(), so divide each local sum by the number of
+        # copies: world for plain Tensors and replicated DTensors, the
+        # replicate-group size for HSDP shards, 1 for FSDP shards.
         world = (
             dist.get_world_size()
             if self.distributed and dist.is_initialized()
@@ -305,8 +312,9 @@ class LayerwiseDebugTracker:
                 w = p.data
                 w_local = w.to_local() if hasattr(w, "to_local") else w
                 w_sq = w_local.float().pow(2).sum()
-                if world > 1 and not _is_sharded(w):
-                    w_sq = w_sq / world
+                copies = _replica_count(w, world)
+                if copies > 1:
+                    w_sq = w_sq / copies
                 self.weight_norm_buf[i].copy_(w_sq)
 
                 g = p.grad
@@ -315,8 +323,9 @@ class LayerwiseDebugTracker:
                     continue
                 g_local = g.to_local() if hasattr(g, "to_local") else g
                 g_sq = g_local.float().pow(2).sum()
-                if world > 1 and not _is_sharded(g):
-                    g_sq = g_sq / world
+                copies = _replica_count(g, world)
+                if copies > 1:
+                    g_sq = g_sq / copies
                 self.grad_norm_buf[i].copy_(g_sq)
         self._step_recorded = True
 
@@ -370,7 +379,8 @@ class LayerwiseDebugTracker:
             world = dist.get_world_size()
             dist.all_reduce(sum_buf, op=dist.ReduceOp.SUM)
             # Only residual/logit stats want a mean across ranks. Grad/weight
-            # squared sums are SUM-correct as-is.
+            # squared sums are SUM-correct as-is (record_step_boundary already
+            # divided each by its number of copies).
             sum_buf[gw_end:].div_(world)
             dist.all_reduce(max_buf, op=dist.ReduceOp.MAX)
 
